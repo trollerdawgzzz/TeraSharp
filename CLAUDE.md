@@ -10,81 +10,59 @@ conflicts. Everything you need is on disk. **Read the decompile, don't guess fro
 
 ---
 
-## 0. State of play (updated after session 3 — see status/STATUS.md)
+## 0. State of play (updated after session 4 + live testing)
 
-**Sessions 2–3 are merged into `D:\v100\TERA_SERVER.100\TeraSharp` and verified: `dotnet build TeraSharp.sln`
-clean, `dotnet run --project src/TeraSharp.Arbiter.Tests` → 76 passed.** Nothing has been run live yet.
+**The repo is now under git.** `git init` done, baseline committed. Before editing, run `git status` to see a
+clean tree; when you finish, the human reviews `git diff` and commits. This is the safety net after three
+sessions where cloud-workspace edits failed to reach D:. **You must write files to
+`D:\v100\TERA_SERVER.100\TeraSharp` and prove it with `git status` before claiming a task done.** Do not create
+new top-level folders (a past session wrote to `D:\TeraSharp` by mistake — wrong path, missing the project).
 
-**IMPORTANT for Cowork sessions:** previous sessions edited a cloud workspace and only wrote back on request.
-Before starting, print the absolute path you're editing and confirm it's `D:\v100\TERA_SERVER.100\TeraSharp`.
-After every task, run the build and test runner *on D:\* and confirm the count increased. If files only exist
-in your workspace, write them to D:\ immediately. `InternalsVisibleTo("TeraSharp.Arbiter.Tests")` is in the
-main csproj — keep test-facing helpers `internal`, not `public`.
+### FILE OWNERSHIP — do not cross this line
+The live network path is tested only against the real WorldServer + client, which you cannot run. Unit tests
+pass in isolation while the live path breaks (this exact thing shipped a tunnel-routing bug behind 7 green
+tests). Therefore:
 
-Done and tested (byte-exact vs capture): logout/exit/cancel flow; all login-time `SDB_*` handlers real
-(replay table no longer serves any login-sequence request); `AS_ENTER_WORLD` built from `CharacterRecord`;
-character create/delete/name-check; `S_PREPARE_EXIT`/`S_EXIT` inline defs; auth gate (`TERASHARP_AUTH`,
-default off). Read `status/STATUS.md` for the per-task details and the unresolved decompile facts.
+- **Cowork MAY edit (pure logic, unit-testable, no live-behavior risk):**
+  `World/DbProxyHandlers.cs`, `World/DbProxyStaticData.cs`, `Persistence/CharacterStore.cs`,
+  `Handlers/CharacterHandlers.cs`, `Protocol/*` (codec), and `src/TeraSharp.Arbiter.Tests/`.
+- **Cowork MUST NOT edit (live path — the human owns these, verified on the server):**
+  `World/WorldBridge.cs`, `Network/*` (GameSession, TcpServer, PacketDispatcher, Crypto),
+  `Handlers/WorldEntry.cs`, `Handlers/HandlerRegistry.cs`, `Handlers/LoginHandlers.cs`, `Program.cs`.
+  If a task seems to need a change in one of these, STOP and write the proposed change into STATUS.md as a
+  request for the human to apply and test — do not edit the file.
 
-**Blocked on the human (live server):** logout acceptance test, create-a-character test (does World initialise
-a fresh character from `DBS_USER_ENTERWORLD found=0`?), auth-reject test, and the two-client capture for task 2.
+### Live-verified truths (supersede everything below; do not "fix" these)
+- **Login works end-to-end** against the real WorldServer: character spawns in Velika with real NPCs, and the
+  world blob persists across logins (SQLite). Verified live.
+- **The ~40 login-time `SDB_*` are served by the replay table**, NOT by synthetic builders. A session replaced
+  them with hand-built "empty list" replies; that DESYNCED World (`SDB_USER_LOAD_INVENTORY` 0x27A2 returns a
+  3235-byte item list, not an empty list) and hung login. `DbProxyHandlers.TryHandle` now intercepts ONLY:
+  enter-world (0x2711), update-user-data (0x27CB), and the logout saves (0x27FA/0x2924/0x2768/0x2936/0x2897);
+  everything else falls through to replay. **Do not route login-time SDB_* back through DbProxy.** The synthetic
+  builders remain in the file only for their unit tests.
+- **Lobby-return / exit leave values are (type=1, reason=8)** — the same as disconnect. The decompile suggested
+  (3,0) for lobby, but (3,0) makes World ack with 0x13AA and never run the save; (1,8) drives the full
+  save + `SA_LEAVE_WORLD`. WorldServer confirms `LeaveWorldStart ... LeaveWorldType[1] LogoutReason[8]`. The
+  `LeaveValues` table and its test still say lobby=(3,0) and must be updated to (1,8) — that mismatch is a
+  known open item (see below).
+- **Single-player tunnel fast path is in `WorldBridge.HandleFrame`:** with exactly one registered session the
+  tunnel ignores the routing key and uses one shared reorder queue (the broadcast behavior that worked for
+  login and logout). The per-key routing a session added stalled the logout despawn burst. Multi-player routing
+  stays deferred until a real two-login capture exists.
 
-**Corrections settled by the decompile (don't undo):**
-  - `AS_CANCEL_SKILL_STRICTLY` (0x1460) **is** sent before every `AS_LEAVE_WORLD`.
-  - `AS_LEAVE_WORLD` (0x1392) = `[u64 gameId][u32 leaveWorldType][u32 logoutReason][u32 playerId]`;
-    lobby = (3, 0), exit = (1, 8).
-  - Lobby flow: `AS_USER_REQUEST_EXIT` (0x14FF `[u32 playerId]`) at button press → `S_PREPARE_RETURN_TO_LOBBY` →
-    countdown → 0x1460 + 0x1392 → World saves → `SA_LEAVE_WORLD` (0x1393) → `AS_ARBITER_USER_DELETE`
-    (0x1433 `[gameId][gameId]`, live gameId) → `S_RETURN_TO_LOBBY`. Cancel = `AS_USER_CANCEL_REQUEST_EXIT` (0x1500).
-  - gameId low part is assigned by the Arbiter (capture: playerId 1, gameId low byte 6). Never derive it from
-    characterId in World-facing messages; enter/leave must simply agree.
-  - `0x13AA` = `SA_DEL_FROM_INTER_PARTY_MATCH_POOL`, no reply owed.
-- Test project: `src/TeraSharp.Arbiter.Tests` — a **console runner** (nuget unreachable from the build box; no
-  xUnit). Exits non-zero on failure. One `[Test]` per handler against bytes from `D:\packetlogs\arb_world.log`.
+### Known open items (human will handle the live ones)
+- `LeaveValues(LeaveMode.Lobby)` should return (1,8), not (3,0); update the value and the
+  `LeaveWorld_Lobby_uses_type3_reason0` test to match (rename to reflect (1,8)). This is a pure-logic change —
+  Cowork may make it.
+- The test project was renamed to `Program.cs.bak` at one point to unblock a server-only build, then restored.
+  Ensure `src/TeraSharp.Arbiter.Tests/Program.cs` is the live one and the solution builds with it.
+- Live logout end-to-end (save + `0x1393`→`0x1433` + spawn-where-you-logged-out) is being verified by the
+  human right now; treat its result as authoritative over any test.
 
-## What to do this session (no live server — build + test only)
+---
 
-Work in order. Build after every change; run the test runner before you stop.
-
-**G. Second-pass hardening of what exists.**
-- Every `DbProxyHandlers` case: confirm the request-id offset is read from the decompile handler, not inferred
-  from the capture. Where a handler currently returns a static template (TUTORIAL, REPUTATION, QUEST_LIST,
-  ACHIEVEMENT, FATIGABILITY, SEREN_GUIDE, GUILD_SEARCH, 0x293B), read the decompiled writer and document the
-  field layout in a comment above the template so the next person can make it dynamic. Don't make them dynamic
-  yet — just document.
-- `WorldEntry.BuildEnterWorldPayload`: the two u64s at frame 22..37 are timestamps in the capture. Determine
-  from the writer what they are (login time? last logout?) and fill them from real values. Same for the u32s
-  at 50 (`7E F9 02 00` = 194942) and 78..89 (20446, 2000, 5).
-- Remove the stale `0x27CC` from the `0x1507` replay entry (it now has a real handler) — check
-  `WorldReplayTable` still needs to exist at all for the login path; if only the startup handshake uses it,
-  say so in STATUS.md.
-
-**H. Multi-player groundwork that doesn't need the 2-login capture.**
-- Per-session reorder buffers in `WorldBridge` (currently one global seq/buffer). Key them by whatever
-  `RegisterPlayer` uses. Keep the single-player path byte-identical (tests must still pass).
-- `OnTunnelToClient` → `RouteToClient(key, packet)` with a fallback to broadcast when the key is unknown.
-  Leave the *choice* of key (`conn` vs `idx` at 13F7 header [20]/[24]) as a single constant with a comment; the
-  human's capture will settle it. Add a test that two registered sessions with different keys each receive only
-  their own packets.
-- `AS_BYPASS_FROM_CLIENT` already carries the gameId; confirm every C→W path uses the session's gameId.
-
-**I. Social systems the Arbiter owns — read-only first.**
-- Friends: `C_FRIEND_LIST`/`S_FRIEND_LIST`, `C_ADD_FRIEND`, `C_DEL_FRIEND`, block list. Currently
-  `WorldEntry` sends hardcoded `S_FRIEND_LIST`/`S_USER_BLOCK_LIST`/`S_FRIEND_GROUP_LIST` bytes. Back them with
-  tables in `CharacterStore` (`friends(character_id, friend_id)`, `blocks`) and generate the packets via the
-  defs. Keep the sent bytes identical for an empty list (test).
-- Whisper: `C_WHISPER` → `S_WHISPER` to the target session by name, `S_WHISPER_ERROR` if offline. Needs a
-  name→session registry (`Program.Sessions` or on `WorldBridge`). Test with two fake sessions.
-- Do NOT start guilds or parties. Party state drives World via `AS_DO_*_PARTY` and needs live verification.
-
-**J. Chat channels.** `C_CHAT` already handles say. Add channel routing for `S_CHAT` by `channel` field
-(say=0 to nearby — leave to World; global/trade/whisper/party are Arbiter-owned). Global chat = broadcast to all
-in-world sessions. Read `Handler_C_CHAT` in the decompile for the channel enum and what gets forwarded to World
-vs handled locally; document the enum in `ChatHandlers.cs`.
-
-When you stop: **replace** `status/STATUS.md` with what changed, what's verified by test vs compiled only,
-what's blocked on the human, and any decompile facts you couldn't resolve. Then run the build + tests on
-`D:\` one final time and put the counts in STATUS.md.
+## Reference: earlier task list (most of this is DONE — see "Real vs. replayed" and STATUS.md)
 
 ---
 
