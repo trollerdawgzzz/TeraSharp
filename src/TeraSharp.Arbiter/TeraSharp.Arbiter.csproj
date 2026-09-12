@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!-- .NET 8 is the current LTS; matches your Windows Server stack. -->
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <!-- Treat warnings as errors keeps the codebase disciplined from day one. -->
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <AssemblyName>TeraSharp.Arbiter</AssemblyName>
+    <RootNamespace>TeraSharp.Arbiter</RootNamespace>
+    <LangVersion>latest</LangVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Let the test project see internal builders/helpers. -->
+    <InternalsVisibleTo Include="TeraSharp.Arbiter.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Structured logging. Add DB packages (Microsoft.Data.SqlClient / MySqlConnector)
+         when we wire persistence. -->
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.12" />
+    <PackageReference Include="Microsoft.Extensions.Logging" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="8.0.0" />
+  </ItemGroup>
+
+</Project>

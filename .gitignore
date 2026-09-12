@@ -1,0 +1,4 @@
+bin/
+obj/
+*.7z
+TeraSharp-publish/

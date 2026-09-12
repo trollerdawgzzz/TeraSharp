@@ -1,0 +1,918 @@
+using System.Reflection;
+using TeraSharp.Arbiter.Handlers;
+using TeraSharp.Arbiter.World;
+
+namespace TeraSharp.Arbiter.Tests;
+
+/// <summary>
+/// Minimal test harness: every public static method tagged [Test] is run; it throws on
+/// failure. Exit code = number of failures, so `dotnet run` is the CI gate.
+/// Ground-truth bytes are from D:\packetlogs\arb_world.log (the real ArbiterServer logout).
+/// </summary>
+[AttributeUsage(AttributeTargets.Method)]
+public sealed class TestAttribute : Attribute { }
+
+public static class Program
+{
+    public static int Main()
+    {
+        int pass = 0, fail = 0;
+        foreach (var m in typeof(Tests).GetMethods(BindingFlags.Public | BindingFlags.Static))
+        {
+            if (m.GetCustomAttribute<TestAttribute>() == null) continue;
+            try { m.Invoke(null, null); Console.WriteLine($"  PASS  {m.Name}"); pass++; }
+            catch (TargetInvocationException ex)
+            {
+                Console.WriteLine($"  FAIL  {m.Name}: {ex.InnerException?.Message}");
+                fail++;
+            }
+        }
+        Console.WriteLine($"\n{pass} passed, {fail} failed");
+        return fail;
+    }
+}
+
+public static class Hex
+{
+    public static byte[] B(string hex)
+    {
+        var parts = hex.Split(new[] { ' ', '\n', '\r', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+        var b = new byte[parts.Length];
+        for (int i = 0; i < parts.Length; i++) b[i] = Convert.ToByte(parts[i], 16);
+        return b;
+    }
+
+    public static string S(byte[] b) => string.Join(' ', b.Select(x => x.ToString("X2")));
+
+    public static void Eq(byte[] actual, byte[] expected, string what)
+    {
+        if (actual.Length != expected.Length || !actual.SequenceEqual(expected))
+            throw new Exception($"{what}\n   expected: {S(expected)}\n   actual:   {S(actual)}");
+    }
+
+    public static void Eq(byte[] actual, string expectedHex, string what) => Eq(actual, B(expectedHex), what);
+
+    public static void True(bool cond, string what) { if (!cond) throw new Exception(what); }
+}
+
+public static class Tests
+{
+    // Live gameId/playerId for the seeded character: gameId 0x80000AF00006 in the capture.
+    const ulong GameId = 0x80000AF00006UL;
+    const uint PlayerId = 1;
+
+    // --- AS_LEAVE_WORLD (0x1392) trailer: [u64 gameId][u32 type][u32 reason][u32 playerId] ---
+
+    [Test] public static void LeaveWorld_Exit_matches_capture()
+    {
+        // Capture frame 1012 (AS_LEAVE_WORLD on the real logout): exit values type=1, reason=8.
+        Hex.Eq(WorldBridge.BuildLeaveWorldPayload(GameId, PlayerId, LeaveMode.Exit),
+            "06 00 F0 0A 00 80 00 00  01 00 00 00  08 00 00 00  01 00 00 00",
+            "AS_LEAVE_WORLD exit payload");
+    }
+
+    [Test] public static void LeaveWorld_Disconnect_equals_Exit()
+    {
+        Hex.Eq(WorldBridge.BuildLeaveWorldPayload(GameId, PlayerId, LeaveMode.Disconnect),
+            WorldBridge.BuildLeaveWorldPayload(GameId, PlayerId, LeaveMode.Exit),
+            "disconnect uses the same wire values as exit");
+    }
+
+    [Test] public static void LeaveWorld_Lobby_uses_type3_reason0()
+    {
+        // Decompile (User::OnLeaveWorldTick): a lobby return sends type=3, reason=0.
+        Hex.Eq(WorldBridge.BuildLeaveWorldPayload(GameId, PlayerId, LeaveMode.Lobby),
+            "06 00 F0 0A 00 80 00 00  03 00 00 00  00 00 00 00  01 00 00 00",
+            "AS_LEAVE_WORLD lobby payload");
+    }
+
+    [Test] public static void LeaveWorld_playerId_is_distinct_from_type()
+    {
+        // Regression for the old bug: playerId was written where leaveWorldType belongs.
+        var p = WorldBridge.BuildLeaveWorldPayload(GameId, playerId: 42, LeaveMode.Lobby);
+        Hex.True(BitConverter.ToUInt32(p, 8) == 3, "offset 8 is leaveWorldType (3), not playerId");
+        Hex.True(BitConverter.ToUInt32(p, 16) == 42, "offset 16 is playerId (42)");
+    }
+
+    // --- SA_LEAVE_WORLD (0x1393) -> AS_ARBITER_USER_DELETE (0x1433), live gameId ---
+
+    [Test] public static void ArbiterUserDelete_echoes_gameId_twice()
+    {
+        // Capture frame 1086.
+        Hex.Eq(WorldBridge.BuildArbiterUserDeletePayload(GameId),
+            "06 00 F0 0A 00 80 00 00  06 00 F0 0A 00 80 00 00",
+            "AS_ARBITER_USER_DELETE payload");
+    }
+
+    [Test] public static void ArbiterUserDelete_uses_live_gameId_from_SA_LEAVE_WORLD()
+    {
+        // Capture frame 1085 (SA_LEAVE_WORLD payload): gameId is at payload offset 8.
+        var sa = Hex.B("20 00 90 C7 58 01 00 00  06 00 F0 0A 00 80 00 00  01 00 00 00  08 00 00 00  05 00 00 00  6F 02 00 00");
+        ulong gameId = BitConverter.ToUInt64(sa, 8);
+        Hex.True(gameId == GameId, $"parsed gameId {gameId:X} != {GameId:X}");
+        Hex.Eq(WorldBridge.BuildArbiterUserDeletePayload(gameId),
+            "06 00 F0 0A 00 80 00 00  06 00 F0 0A 00 80 00 00",
+            "delete built from the live SA_LEAVE_WORLD gameId");
+    }
+
+    // --- Logout save sequence: reqId echoed from the live request ---
+
+    [Test] public static void Save_27FB_echoes_reqId_at_280()
+    {
+        // Real 0x27FA request is 1488 bytes with reqId 0x37 at payload offset 280 (frame 0x11e,
+        // confirmed in the decompiled writer). Reply 0x27FB = [u32 reqId][u8 1] (frame 1070).
+        var req = new byte[1488];
+        BitConverter.GetBytes(0x37u).CopyTo(req, 280);
+        Hex.Eq(DbProxyHandlers.BuildReqIdAck(req, 280), "37 00 00 00 01", "DBS 0x27FB");
+    }
+
+    [Test] public static void Save_2925_matches_capture()
+    {
+        var req = Hex.B("16 00 00 00 00 00 00 00  38 00 00 00  01 00 00 00"); // frame 1071
+        Hex.Eq(DbProxyHandlers.BuildReqIdAck(req, 8), "38 00 00 00 01", "DBS 0x2925"); // frame 1072
+    }
+
+    [Test] public static void Save_2769_matches_capture()
+    {
+        var req = Hex.B("1E 00 00 00 00 00 00 00  1E 00 00 00 00 00 00 00  39 00 00 00  01 00 00 00"); // 1073
+        Hex.Eq(DbProxyHandlers.BuildDbs2769(req),
+            "1B 00 00 00 00 00 00 00  1B 00 00 00 00 00 00 00  39 00 00 00  01", "DBS 0x2769"); // 1074
+    }
+
+    [Test] public static void Save_2937_matches_capture()
+    {
+        var req = Hex.B("3A 00 00 00  01 00 00 00  45 01 A5 6A  00 00 00 00"); // frame 1077
+        Hex.Eq(DbProxyHandlers.BuildDbs2937(req),
+            "3A 00 00 00  00 03 00 00  00 00 00 00 00", "DBS 0x2937"); // frame 1082
+    }
+
+    [Test] public static void Save_ack_echoes_live_reqId_not_captured_one()
+    {
+        // Prove we echo the LIVE value: a different reqId must appear in the reply.
+        var req = Hex.B("16 00 00 00 00 00 00 00  99 00 00 00  01 00 00 00");
+        Hex.Eq(DbProxyHandlers.BuildReqIdAck(req, 8), "99 00 00 00 01", "live reqId echoed");
+    }
+
+    [Test] public static void DailyQuest_ack_reqId_at_16()
+    {
+        var req = new byte[20];
+        BitConverter.GetBytes(0x4Du).CopyTo(req, 16);
+        Hex.Eq(DbProxyHandlers.BuildReqIdAck(req, 16), "4D 00 00 00 01", "DBS 0x2898");
+    }
+
+    // --- DBS_USER_ENTERWORLD (0x2738) ---
+
+    [Test] public static void EnterWorld_notFound_is_13_bytes()
+    {
+        // replyId 1 (capture 0x2711 frame 241), no blob -> found=0.
+        Hex.Eq(DbProxyHandlers.BuildDbsUserEnterWorld(1, null),
+            "13 00 00 00  00 00 00 00  01 00 00 00  00", "DBS_USER_ENTERWORLD not-found");
+    }
+
+    [Test] public static void EnterWorld_found_header_and_length()
+    {
+        var blob = new byte[DbProxyHandlers.WorldBlobSize];
+        var reply = DbProxyHandlers.BuildDbsUserEnterWorld(1, blob);
+        Hex.True(reply.Length == 13 + DbProxyHandlers.WorldBlobSize, "found reply length = 13 + 15312");
+        // [u32 off=19][u32 blobLen=15312=0x3BD0][u32 replyId=1][u8 found=1]
+        Hex.Eq(reply.Take(13).ToArray(), "13 00 00 00  D0 3B 00 00  01 00 00 00  01", "DBS found header");
+    }
+
+    [Test] public static void LeaveValues_table()
+    {
+        Hex.True(WorldBridge.LeaveValues(LeaveMode.Lobby) == (3u, 0u), "lobby=(3,0)");
+        Hex.True(WorldBridge.LeaveValues(LeaveMode.Exit) == (1u, 8u), "exit=(1,8)");
+        Hex.True(WorldBridge.LeaveValues(LeaveMode.Disconnect) == (1u, 8u), "disconnect=(1,8)");
+    }
+
+    // =========================================================================
+    // Login-time DB-proxy handler tests (vs arb_world.log captured bytes)
+    // =========================================================================
+
+    // --- Empty-list Type 1: [off=19][count=0][reqId][ok] ---
+
+    [Test] public static void EmptyListType1_inventory_matches_capture()
+    {
+        // Frame 244/245: 0x27A2→0x27A3, reqId=2
+        var req = Hex.B("02 00 00 00 01 00 00 00");
+        Hex.Eq(DbProxyHandlers.BuildEmptyListType1(req, 0),
+            "13 00 00 00 00 00 00 00 02 00 00 00 01", "DBS 0x27A3 (inventory)");
+    }
+
+    [Test] public static void EmptyListType1_recipe_matches_capture()
+    {
+        // Frame 252/253: 0x2760→0x2761, reqId=5
+        var req = Hex.B("05 00 00 00 01 00 00 00");
+        Hex.Eq(DbProxyHandlers.BuildEmptyListType1(req, 0),
+            "13 00 00 00 00 00 00 00 05 00 00 00 01", "DBS 0x2761 (item_recipe)");
+    }
+
+    [Test] public static void EmptyListType1_additionalReward_ok0()
+    {
+        // Frame 276/277: 0x2967→0x2968, reqId=0x11, ok=0
+        var req = Hex.B("11 00 00 00 01 00 00 00");
+        Hex.Eq(DbProxyHandlers.BuildEmptyListType1(req, 0, ok: 0),
+            "13 00 00 00 00 00 00 00 11 00 00 00 00", "DBS 0x2968 (additional_reward, ok=0)");
+    }
+
+    [Test] public static void EmptyListType1_echoes_live_reqId()
+    {
+        // Different reqId to prove we echo the live value, not a hardcoded one
+        var req = Hex.B("FF 00 00 00 01 00 00 00");
+        Hex.Eq(DbProxyHandlers.BuildEmptyListType1(req, 0),
+            "13 00 00 00 00 00 00 00 FF 00 00 00 01", "Type1 live reqId");
+    }
+
+    // --- Empty-list Type 2: [off=19][count=0][ok][reqId] ---
+
+    [Test] public static void EmptyListType2_promotion_matches_capture()
+    {
+        // Frame 248/249: 0x2912→0x2913, reqId=3
+        var req = Hex.B("03 00 00 00 01 00 00 00");
+        Hex.Eq(DbProxyHandlers.BuildEmptyListType2(req, 0),
+            "13 00 00 00 00 00 00 00 01 03 00 00 00", "DBS 0x2913 (promotion)");
+    }
+
+    [Test] public static void EmptyListType2_promotionCond_matches_capture()
+    {
+        // Frame 250/251: 0x2916→0x2917, reqId=4
+        var req = Hex.B("04 00 00 00 01 00 00 00");
+        Hex.Eq(DbProxyHandlers.BuildEmptyListType2(req, 0),
+            "13 00 00 00 00 00 00 00 01 04 00 00 00", "DBS 0x2917 (promotion_cond)");
+    }
+
+    [Test] public static void EmptyListType2_battleFieldCoolTime_SA_shape()
+    {
+        // Frame 286/287: 0x1521→0x1522 (SA_ shape), reqId=0x16 at payload[8]
+        var req = Hex.B("20 00 90 C7 58 01 00 00 16 00 00 00");
+        Hex.Eq(DbProxyHandlers.BuildEmptyListType2(req, 8),
+            "13 00 00 00 00 00 00 00 01 16 00 00 00", "AS 0x1522 (battle_field_cool_time)");
+    }
+
+    [Test] public static void EmptyListType2_userRestriction_matches_capture()
+    {
+        // Frame 290/291: 0x2833→0x2834, reqId=0x18
+        var req = Hex.B("18 00 00 00 01 00 00 00");
+        Hex.Eq(DbProxyHandlers.BuildEmptyListType2(req, 0),
+            "13 00 00 00 00 00 00 00 01 18 00 00 00", "DBS 0x2834 (user_restriction)");
+    }
+
+    // --- OkReqId: [ok=1][reqId] ---
+
+    [Test] public static void FriendInfo_matches_capture()
+    {
+        // Frame 351/356: 0x2910→0x2911, reqId=0x2B
+        var req = Hex.B("2B 00 00 00 01 00 00 00");
+        Hex.Eq(DbProxyHandlers.BuildOkReqId(req, 0),
+            "01 2B 00 00 00", "DBS 0x2911 (friend_info)");
+    }
+
+    // --- Quest progress ---
+
+    [Test] public static void QuestProgress_matches_capture()
+    {
+        // Frame 306/307: 0x2902→0x2903, reqId=0x20, playerId=1
+        var req = Hex.B("20 00 00 00 01 00 00 00");
+        Hex.Eq(DbProxyHandlers.BuildQuestProgress(req),
+            "20 00 00 00 01 00 00 00 00 00 00 00 00", "DBS 0x2903 (quest_progress)");
+    }
+
+    // --- Achieve list ---
+
+    [Test] public static void AchieveList_matches_capture()
+    {
+        // Frame 381/382: 0x2981→0x2982, reqId=0x30
+        var req = Hex.B("30 00 00 00 01 00 00 00");
+        Hex.Eq(DbProxyHandlers.BuildAchieveList(req),
+            "00 00 00 00 00 00 00 00 30 00 00 00 01", "DBS 0x2982 (achieve_list)");
+    }
+
+    // --- World event (uses BuildReqIdAck at offset 0) ---
+
+    [Test] public static void WorldEvent_matches_capture()
+    {
+        // Frame 663/664: 0x27B3→0x27B4, reqId=0x36
+        var req = Hex.B("36 00 00 00 01 00 00 00 00 00 00 00");
+        Hex.Eq(DbProxyHandlers.BuildReqIdAck(req, 0),
+            "36 00 00 00 01", "DBS 0x27B4 (world_event)");
+    }
+
+    // --- Servant handlers (SA_ shape: [u64 gameId][u32 reqId][u32 playerId]) ---
+
+    [Test] public static void ServantData_matches_capture()
+    {
+        // Frame 260/261: 0x1539→0x153A, reqId=9, playerId=1
+        var req = Hex.B("20 00 90 C7 58 01 00 00 09 00 00 00 01 00 00 00");
+        Hex.Eq(DbProxyHandlers.BuildServantData(req),
+            "00 00 00 00 00 00 00 00 09 00 00 00 01 01 00 00 00",
+            "AS 0x153A (servant_data)");
+    }
+
+    [Test] public static void ServantAdventureData_matches_capture()
+    {
+        // Frame 262/263: 0x153B→0x153C, reqId=0xA, playerId=1
+        var req = Hex.B("20 00 90 C7 58 01 00 00 0A 00 00 00 01 00 00 00");
+        Hex.Eq(DbProxyHandlers.BuildServantAdventureData(req),
+            "00 00 00 00 00 00 00 00 0A 00 00 00 01 01 00 00 00 00 00 00 00",
+            "AS 0x153C (servant_adventure_data)");
+    }
+
+    [Test] public static void ServantStorageData_matches_capture()
+    {
+        // Frame 264/265: 0x1537→0x1538, reqId=0xB, playerId=1
+        var req = Hex.B("20 00 90 C7 58 01 00 00 0B 00 00 00 01 00 00 00");
+        Hex.Eq(DbProxyHandlers.BuildServantStorageData(req),
+            "0B 00 00 00 01 00 00 00 00", "AS 0x1538 (servant_storage_data)");
+    }
+
+    [Test] public static void ServantAutoPotionData_matches_capture()
+    {
+        // Frame 266/267: 0x152F→0x1530, reqId=0xC, playerId=1
+        var req = Hex.B("20 00 90 C7 58 01 00 00 0C 00 00 00 01 00 00 00");
+        Hex.Eq(DbProxyHandlers.BuildServantAutoPotionData(req),
+            "0C 00 00 00 01 00 00 00 00 FF FF FF FF 00 00 00 00 FF FF FF FF",
+            "AS 0x1530 (servant_auto_potion)");
+    }
+
+    [Test] public static void ServantAutoFeedData_matches_capture()
+    {
+        // Frame 268/269: 0x1533→0x1534, reqId=0xD, playerId=1
+        var req = Hex.B("20 00 90 C7 58 01 00 00 0D 00 00 00 01 00 00 00");
+        Hex.Eq(DbProxyHandlers.BuildServantAutoFeedData(req),
+            "0D 00 00 00 01 00 00 00 00 FF FF FF FF 00 00 00 00 FF FF FF FF",
+            "AS 0x1534 (servant_auto_feed)");
+    }
+
+    // --- PetLoad (175 bytes) ---
+
+    [Test] public static void PetLoad_matches_capture()
+    {
+        // Frame 270/271: 0x1415→0x1416, reqId=0xE, playerId=1
+        var req = Hex.B("20 00 90 C7 58 01 00 00 0E 00 00 00 01 00 00 00");
+        var actual = DbProxyHandlers.BuildPetLoad(req);
+        Hex.True(actual.Length == 175, $"PetLoad length {actual.Length} != 175");
+        // Verify header offsets + reqId + playerId
+        Hex.Eq(actual.Take(20).ToArray(),
+            "1F 00 00 00 2D 00 00 00 88 00 00 00 0E 00 00 00 01 00 00 00",
+            "PetLoad header (offsets + reqId + playerId)");
+        // Verify name "NONAME\0" at payload offset 25
+        Hex.Eq(actual.Skip(25).Take(14).ToArray(),
+            "4E 00 4F 00 4E 00 41 00 4D 00 45 00 00 00",
+            "PetLoad NONAME string");
+        // Verify trailing static config at offset 163
+        Hex.Eq(actual.Skip(163).ToArray(),
+            "F7 7F 00 00 01 00 00 00 57 01 00 00",
+            "PetLoad trailing config");
+        // Verify middle is all zeros (offsets 39..162)
+        Hex.True(actual.Skip(39).Take(124).All(b => b == 0), "PetLoad middle zeros");
+    }
+
+    // --- Extrapoint data (53 bytes) ---
+
+    [Test] public static void ExtrapointData_matches_capture()
+    {
+        // Frame 318/319: 0x1554→0x1555, reqId=0x27, playerId=1 (SDB shape)
+        var req = Hex.B("27 00 00 00 01 00 00 00");
+        var actual = DbProxyHandlers.BuildExtrapointData(req);
+        Hex.True(actual.Length == 53, $"ExtrapointData length {actual.Length} != 53");
+        Hex.Eq(actual.Take(6).ToArray(),
+            "27 00 00 00 01 01",
+            "ExtrapointData header (reqId + pid_low + ok)");
+        Hex.True(actual.Skip(6).All(b => b == 0), "ExtrapointData trailing zeros");
+    }
+
+    // --- BattleFieldEnterCount (21 bytes, timestamp differs) ---
+
+    [Test] public static void BattleFieldEnterCount_structure()
+    {
+        // Frame 288/289: 0x155D→0x155E, reqId=0x17 (SA_ shape, reqId at payload[8])
+        // Capture has a timestamp at [13..20] but our empty-state builder writes 0.
+        var req = Hex.B("20 00 90 C7 58 01 00 00 17 00 00 00");
+        var actual = DbProxyHandlers.BuildBattleFieldEnterCount(req);
+        Hex.True(actual.Length == 21, $"BFEnterCount length {actual.Length} != 21");
+        // listOff=27, count=0, ok=1, reqId=0x17
+        Hex.Eq(actual.Take(13).ToArray(),
+            "1B 00 00 00 00 00 00 00 01 17 00 00 00",
+            "BFEnterCount header (listOff + count + ok + reqId)");
+    }
+
+    // =========================================================================
+    // Remaining 16 login-time handlers (programmatic + static-data)
+    // =========================================================================
+
+    // --- 0x2867→0x2868: three empty lists + [ok][reqId] ---
+
+    [Test] public static void Build2868_matches_capture()
+    {
+        // Frame: 0x2867→0x2868, reqId=0x14
+        var req = Hex.B("14 00 00 00 01 00 00 00");
+        Hex.Eq(DbProxyHandlers.Build2868_ThreeEmptyLists(req),
+            "23 00 00 00 00 00 00 00 23 00 00 00 00 00 00 00 23 00 00 00 00 00 00 00 01 14 00 00 00",
+            "DBS 0x2868 (three empty lists)");
+    }
+
+    // --- 0x2869→0x286A: empty list + timestamp (structure check, timestamp differs) ---
+
+    [Test] public static void Build286A_structure()
+    {
+        // reqId=0x15; capture has real timestamp at [13..20], we write 0
+        var req = Hex.B("15 00 00 00 01 00 00 00");
+        var actual = DbProxyHandlers.Build286A_EmptyListTimestamp(req);
+        Hex.True(actual.Length == 21, $"0x286A length {actual.Length} != 21");
+        // Verify structure: listOff=27, count=0, ok=1, reqId=0x15
+        Hex.Eq(actual.Take(13).ToArray(),
+            "1B 00 00 00 00 00 00 00 01 15 00 00 00",
+            "0x286A header (listOff + count + ok + reqId)");
+    }
+
+    // --- 0x2900→0x2901: two empty lists + [reqId][ok] ---
+
+    [Test] public static void Build2901_matches_capture()
+    {
+        // reqId=0x1F
+        var req = Hex.B("1F 00 00 00 01 00 00 00");
+        Hex.Eq(DbProxyHandlers.Build2901_TwoEmptyLists(req),
+            "1B 00 00 00 00 00 00 00 1B 00 00 00 00 00 00 00 1F 00 00 00 01",
+            "DBS 0x2901 (two empty lists)");
+    }
+
+    // --- 0x28B7→0x28B6: [ok][reqId][u32 0][u64 -1] (opcode is op-1!) ---
+
+    [Test] public static void Build28B6_matches_capture()
+    {
+        // reqId=0x1A
+        var req = Hex.B("1A 00 00 00 01 00 00 00");
+        Hex.Eq(DbProxyHandlers.Build28B6(req),
+            "01 1A 00 00 00 00 00 00 00 FF FF FF FF FF FF FF FF",
+            "DBS 0x28B6 (op-1 anomaly)");
+    }
+
+    // --- 0x28B0→0x28B1: two empty lists + [ok][reqId] + 20 zeros ---
+
+    [Test] public static void Build28B1_matches_capture()
+    {
+        // reqId=0x19
+        var req = Hex.B("19 00 00 00 01 00 00 00");
+        Hex.Eq(DbProxyHandlers.Build28B1_ReferAFriend(req),
+            "2F 00 00 00 00 00 00 00 2F 00 00 00 00 00 00 00 01 19 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00",
+            "DBS 0x28B1 (refer_a_friend)");
+    }
+
+    // --- 0x2975→0x2976: 16 zeros + [reqId][ok] + 20 zeros ---
+
+    [Test] public static void Build2976_matches_capture()
+    {
+        // reqId=0x28
+        var req = Hex.B("28 00 00 00 01 00 00 00");
+        Hex.Eq(DbProxyHandlers.Build2976(req),
+            "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 28 00 00 00 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00",
+            "DBS 0x2976");
+    }
+
+    // --- 0x2986→0x2987: 32 zeros + [reqId][ok] + trailing (16B request) ---
+
+    [Test] public static void Build2987_matches_capture()
+    {
+        // reqId=0x31, 16-byte request
+        var req = Hex.B("31 00 00 00 01 00 00 00 00 00 00 00 01 00 00 00");
+        Hex.Eq(DbProxyHandlers.Build2987(req),
+            "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 31 00 00 00 01 01 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00",
+            "DBS 0x2987");
+    }
+
+    // --- 0x290C multi-reply: 0x15B1 + 0x2847 + 0x143E + 0x290D ---
+
+    [Test] public static void Build15B1_matches_capture()
+    {
+        // playerId=1
+        Hex.Eq(DbProxyHandlers.Build15B1(1),
+            "01 00 00 00 00 00 00 00",
+            "AS 0x15B1 (acquire_friendship_gage)");
+    }
+
+    [Test] public static void Build2847_matches_capture()
+    {
+        // playerId=1
+        Hex.Eq(DbProxyHandlers.Build2847(1),
+            "00 00 00 00 00 00 00 00 01 00 00 00",
+            "0x2847");
+    }
+
+    [Test] public static void Build143E_structure()
+    {
+        // playerId=1; capture has real timestamp at [12..15], we write 0
+        var actual = DbProxyHandlers.Build143E(1);
+        Hex.True(actual.Length == 24, $"0x143E length {actual.Length} != 24");
+        // Verify pid at [0..3]
+        Hex.True(BitConverter.ToUInt32(actual, 0) == 1, "0x143E playerId");
+        // Verify trailing 0xFFFFFFFF at [20..23]
+        Hex.True(BitConverter.ToUInt32(actual, 20) == 0xFFFFFFFF, "0x143E trailing -1");
+    }
+
+    [Test] public static void Build290D_matches_capture()
+    {
+        // 0x290D = BuildOkReqId with reqId=0x2C from the 0x290C request
+        var req = Hex.B("2C 00 00 00 01 00 00 00 01 00 00 00 34 01 00 00");
+        Hex.Eq(DbProxyHandlers.BuildOkReqId(req, 0),
+            "01 2C 00 00 00",
+            "DBS 0x290D (ok + reqId)");
+    }
+
+    // --- Static-data handlers: template reproduction + live-reqId-echo ---
+
+    [Test] public static void StaticData_Tutorial_length_and_reqId()
+    {
+        Hex.True(DbProxyStaticData.Tutorial.Length == 45, $"Tutorial len {DbProxyStaticData.Tutorial.Length} != 45");
+        // With capture reqId=0x07, output should match the template exactly
+        var req = Hex.B("07 00 00 00 01 00 00 00");
+        var actual = DbProxyHandlers.BuildFromStaticData(DbProxyStaticData.Tutorial, DbProxyStaticData.TutorialReqIdOffset, req);
+        Hex.Eq(actual, DbProxyStaticData.Tutorial, "Tutorial with capture reqId reproduces template");
+        // Different reqId patches correctly
+        var req2 = Hex.B("FF 00 00 00 01 00 00 00");
+        var actual2 = DbProxyHandlers.BuildFromStaticData(DbProxyStaticData.Tutorial, DbProxyStaticData.TutorialReqIdOffset, req2);
+        Hex.True(BitConverter.ToUInt32(actual2, DbProxyStaticData.TutorialReqIdOffset) == 0xFF, "Tutorial live reqId echo");
+    }
+
+    [Test] public static void StaticData_Reputation_length_and_reqId()
+    {
+        Hex.True(DbProxyStaticData.Reputation.Length == 65, $"Reputation len {DbProxyStaticData.Reputation.Length} != 65");
+        var req = Hex.B("0F 00 00 00 01 00 00 00");
+        var actual = DbProxyHandlers.BuildFromStaticData(DbProxyStaticData.Reputation, DbProxyStaticData.ReputationReqIdOffset, req);
+        Hex.Eq(actual, DbProxyStaticData.Reputation, "Reputation with capture reqId reproduces template");
+    }
+
+    [Test] public static void StaticData_Load293B_length_and_reqId()
+    {
+        Hex.True(DbProxyStaticData.Load293B.Length == 46, $"Load293B len {DbProxyStaticData.Load293B.Length} != 46");
+        var req = Hex.B("10 00 00 00 01 00 00 00");
+        var actual = DbProxyHandlers.BuildFromStaticData(DbProxyStaticData.Load293B, DbProxyStaticData.Load293BReqIdOffset, req);
+        Hex.Eq(actual, DbProxyStaticData.Load293B, "Load293B with capture reqId reproduces template");
+    }
+
+    [Test] public static void StaticData_Fatigability_length_and_reqId()
+    {
+        Hex.True(DbProxyStaticData.Fatigability.Length == 45, $"Fatigability len {DbProxyStaticData.Fatigability.Length} != 45");
+        var req = Hex.B("23 00 00 00 01 00 00 00");
+        var actual = DbProxyHandlers.BuildFromStaticData(DbProxyStaticData.Fatigability, DbProxyStaticData.FatigabilityReqIdOffset, req);
+        Hex.Eq(actual, DbProxyStaticData.Fatigability, "Fatigability with capture reqId reproduces template");
+    }
+
+    [Test] public static void StaticData_SerenGuide_length_and_reqId()
+    {
+        Hex.True(DbProxyStaticData.SerenGuide.Length == 65, $"SerenGuide len {DbProxyStaticData.SerenGuide.Length} != 65");
+        var req = Hex.B("26 00 00 00 01 00 00 00");
+        var actual = DbProxyHandlers.BuildFromStaticData(DbProxyStaticData.SerenGuide, DbProxyStaticData.SerenGuideReqIdOffset, req);
+        Hex.Eq(actual, DbProxyStaticData.SerenGuide, "SerenGuide with capture reqId reproduces template");
+    }
+
+    [Test] public static void StaticData_EpPerk_length_and_reqId()
+    {
+        Hex.True(DbProxyStaticData.EpPerk.Length == 113, $"EpPerk len {DbProxyStaticData.EpPerk.Length} != 113");
+        var req = Hex.B("2D 00 00 00 01 00 00 00");
+        var actual = DbProxyHandlers.BuildFromStaticData(DbProxyStaticData.EpPerk, DbProxyStaticData.EpPerkReqIdOffset, req);
+        Hex.Eq(actual, DbProxyStaticData.EpPerk, "EpPerk with capture reqId reproduces template");
+    }
+
+    [Test] public static void StaticData_QuestList_length_and_reqId()
+    {
+        Hex.True(DbProxyStaticData.QuestList.Length == 1377, $"QuestList len {DbProxyStaticData.QuestList.Length} != 1377");
+        var req = Hex.B("12 00 00 00 01 00 00 00");
+        var actual = DbProxyHandlers.BuildFromStaticData(DbProxyStaticData.QuestList, DbProxyStaticData.QuestListReqIdOffset, req);
+        Hex.Eq(actual, DbProxyStaticData.QuestList, "QuestList with capture reqId reproduces template");
+    }
+
+    [Test] public static void StaticData_Achievement_length_and_reqId()
+    {
+        Hex.True(DbProxyStaticData.Achievement.Length == 1501, $"Achievement len {DbProxyStaticData.Achievement.Length} != 1501");
+        var req = Hex.B("13 00 00 00 01 00 00 00");
+        var actual = DbProxyHandlers.BuildFromStaticData(DbProxyStaticData.Achievement, DbProxyStaticData.AchievementReqIdOffset, req);
+        Hex.Eq(actual, DbProxyStaticData.Achievement, "Achievement with capture reqId reproduces template");
+    }
+
+    // --- AS_ENTER_WORLD (0x138E) builder tests ---
+
+    [Test] public static void BuildEnterWorld_length_is_183()
+    {
+        var chr = new TeraSharp.Arbiter.Game.FakeCharacter();
+        var payload = WorldEntry.BuildEnterWorldPayload(GameId, chr);
+        Hex.True(payload.Length == 183, $"AS_ENTER_WORLD payload length {payload.Length} != 183");
+    }
+
+    [Test] public static void BuildEnterWorld_offsets_correct()
+    {
+        var chr = new TeraSharp.Arbiter.Game.FakeCharacter();
+        var p = WorldEntry.BuildEnterWorldPayload(GameId, chr);
+        // off1 = 0, off2 = 0
+        Hex.True(BitConverter.ToUInt32(p, 0) == 0, "off1 should be 0");
+        Hex.True(BitConverter.ToUInt32(p, 4) == 0, "off2 should be 0");
+        // off3 = 173 (frame-relative offset to raw data: 6 header + 167 payload)
+        Hex.True(BitConverter.ToUInt32(p, 8) == 173, $"off3={BitConverter.ToUInt32(p, 8)} != 173");
+        // off4 = 16 (raw data length)
+        Hex.True(BitConverter.ToUInt32(p, 12) == 16, $"off4={BitConverter.ToUInt32(p, 12)} != 16");
+    }
+
+    [Test] public static void BuildEnterWorld_playerId_at_offset_32()
+    {
+        var chr = new TeraSharp.Arbiter.Game.FakeCharacter { Id = 42 };
+        var p = WorldEntry.BuildEnterWorldPayload(GameId, chr);
+        Hex.True(BitConverter.ToUInt32(p, 32) == 42, $"playerId={BitConverter.ToUInt32(p, 32)} != 42");
+    }
+
+    [Test] public static void BuildEnterWorld_gameId_at_offset_84()
+    {
+        var chr = new TeraSharp.Arbiter.Game.FakeCharacter();
+        var p = WorldEntry.BuildEnterWorldPayload(GameId, chr);
+        ulong gid = BitConverter.ToUInt64(p, 84);
+        // Writer masks high bit: gameId & 0x7FFFFFFFFFFFFFFF
+        ulong expected = GameId & 0x7FFFFFFFFFFFFFFFUL;
+        Hex.True(gid == expected, $"gameId=0x{gid:X} != 0x{expected:X}");
+    }
+
+    [Test] public static void BuildEnterWorld_zone_at_offset_48()
+    {
+        var chr = new TeraSharp.Arbiter.Game.FakeCharacter { Zone = 7005 };
+        var p = WorldEntry.BuildEnterWorldPayload(GameId, chr);
+        Hex.True(BitConverter.ToUInt32(p, 48) == 7005, $"zone={BitConverter.ToUInt32(p, 48)} != 7005");
+    }
+
+    [Test] public static void BuildEnterWorld_position_floats()
+    {
+        var chr = new TeraSharp.Arbiter.Game.FakeCharacter { X = -1002.486f, Y = 7205.064f, Z = 2172.0f };
+        var p = WorldEntry.BuildEnterWorldPayload(GameId, chr);
+        float x = BitConverter.ToSingle(p, 56);
+        float y = BitConverter.ToSingle(p, 60);
+        float z = BitConverter.ToSingle(p, 64);
+        Hex.True(Math.Abs(x - (-1002.486f)) < 0.01f, $"x={x} != -1002.486");
+        Hex.True(Math.Abs(y - 7205.064f) < 0.01f, $"y={y} != 7205.064");
+        Hex.True(Math.Abs(z - 2172.0f) < 0.01f, $"z={z} != 2172.0");
+    }
+
+    [Test] public static void BuildEnterWorld_level_at_offset_68()
+    {
+        var chr = new TeraSharp.Arbiter.Game.FakeCharacter { Level = 65 };
+        var p = WorldEntry.BuildEnterWorldPayload(GameId, chr);
+        Hex.True(BitConverter.ToUInt32(p, 68) == 65, $"level={BitConverter.ToUInt32(p, 68)} != 65");
+    }
+
+    [Test] public static void BuildEnterWorld_capture_character_matches_known_fields()
+    {
+        // Verify that building with the capture character's values produces
+        // matching bytes at all known field offsets vs. the captured frame.
+        var capturePayload = Hex.B(
+            "00 00 00 00 00 00 00 00 AD 00 00 00 10 00 00 00 " +
+            "90 34 4F D8 59 01 00 00 20 00 90 C7 58 01 00 00 " +
+            "01 00 00 00 01 00 00 00 00 00 00 00 7E F9 02 00 " +
+            "5D 1B 00 00 00 00 00 00 1D 9F 7A C4 83 28 E1 45 " +
+            "00 C0 07 45 01 00 00 00 DE 4F 00 00 D0 07 00 00 " +
+            "05 00 00 00 06 00 F0 0A 00 80 00 00 00 00 00 00 " +
+            "00 00 00 00 00 00 00 06 00 00 00 00 00 00 00 00 " +
+            "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 " +
+            "00 03 00 00 00 14 00 00 00 07 00 00 00 03 00 00 " +
+            "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 " +
+            "00 00 00 00 00 00 00 00 3C 10 B8 00 00 00 00 00 " +
+            "00 00 00 00 00 00 00");
+
+        // Build with values matching the captured character
+        var chr = new TeraSharp.Arbiter.Game.FakeCharacter
+        {
+            Id = PlayerId, Zone = 7005, Level = 1,
+            X = BitConverter.ToSingle(capturePayload, 56),
+            Y = BitConverter.ToSingle(capturePayload, 60),
+            Z = BitConverter.ToSingle(capturePayload, 64),
+        };
+        var built = WorldEntry.BuildEnterWorldPayload(GameId, chr);
+
+        // Structural fields must match
+        Hex.True(built.Length == capturePayload.Length, "length mismatch");
+        // Offsets match
+        Hex.True(BitConverter.ToUInt32(built, 0) == BitConverter.ToUInt32(capturePayload, 0), "off1");
+        Hex.True(BitConverter.ToUInt32(built, 4) == BitConverter.ToUInt32(capturePayload, 4), "off2");
+        Hex.True(BitConverter.ToUInt32(built, 8) == BitConverter.ToUInt32(capturePayload, 8), "off3");
+        Hex.True(BitConverter.ToUInt32(built, 12) == BitConverter.ToUInt32(capturePayload, 12), "off4");
+        // PlayerId matches
+        Hex.True(BitConverter.ToUInt32(built, 32) == BitConverter.ToUInt32(capturePayload, 32), "playerId");
+        // Zone matches
+        Hex.True(BitConverter.ToUInt32(built, 48) == BitConverter.ToUInt32(capturePayload, 48), "zone");
+        // Position floats match (byte-exact since we copied the float bits)
+        Hex.Eq(built[56..68], capturePayload[56..68], "position xyz");
+        // GameId matches (capture: 0x80000AF00006 & 0x7FFF... = 0xAF00006)
+        Hex.True(BitConverter.ToUInt64(built, 84) == BitConverter.ToUInt64(capturePayload, 84), "gameId");
+        // World-config fields match capture defaults
+        Hex.True(BitConverter.ToUInt32(built, 44) == BitConverter.ToUInt32(capturePayload, 44), "modelId");
+        Hex.True(BitConverter.ToUInt32(built, 72) == BitConverter.ToUInt32(capturePayload, 72), "unk@72");
+        Hex.True(BitConverter.ToUInt32(built, 76) == BitConverter.ToUInt32(capturePayload, 76), "unk@76");
+        Hex.True(BitConverter.ToUInt32(built, 80) == BitConverter.ToUInt32(capturePayload, 80), "unk@80");
+        Hex.True(BitConverter.ToUInt32(built, 129) == BitConverter.ToUInt32(capturePayload, 129), "config@129");
+    }
+
+    // --- Character data (0x2738) builder tests ---
+
+    [Test] public static void BuildCharacterData_found_structure()
+    {
+        byte[] fakeBlob = new byte[15312]; // all zeros
+        fakeBlob[0] = 0xAB; fakeBlob[15311] = 0xCD; // sentinels
+        var p = WorldEntry.BuildCharacterDataPayload(1, fakeBlob);
+        Hex.True(p.Length == 13 + 15312, $"found payload length {p.Length}");
+        Hex.True(BitConverter.ToUInt32(p, 0) == 19, "blob offset should be 19 (frame-relative)");
+        Hex.True(BitConverter.ToUInt32(p, 4) == 15312, "blob length");
+        Hex.True(BitConverter.ToUInt32(p, 8) == 1, "playerId");
+        Hex.True(p[12] == 1, "found flag");
+        Hex.True(p[13] == 0xAB, "blob start sentinel");
+        Hex.True(p[13 + 15311] == 0xCD, "blob end sentinel");
+    }
+
+    [Test] public static void BuildCharacterData_not_found_structure()
+    {
+        var p = WorldEntry.BuildCharacterDataPayload(7, null);
+        Hex.True(p.Length == 13, $"not-found payload length {p.Length}");
+        Hex.True(BitConverter.ToUInt32(p, 0) == 19, "blob offset");
+        Hex.True(BitConverter.ToUInt32(p, 4) == 0, "blob length should be 0");
+        Hex.True(BitConverter.ToUInt32(p, 8) == 7, "playerId");
+        Hex.True(p[12] == 0, "found flag should be 0");
+    }
+
+    // =========================================================================
+    // Character creation / deletion logic (Task C)
+    // =========================================================================
+
+    // --- TemplateId formula: 10101 + race*200 + gender*100 + class ---
+
+    [Test] public static void TemplateId_default_matches_FakeCharacter()
+    {
+        // FakeCharacter default: race=4, gender=1, class=12 -> 11013
+        int t = CharacterHandlers.ComputeTemplateId(race: 4, gender: 1, cls: 12);
+        Hex.True(t == 11013, $"templateId {t} != 11013");
+    }
+
+    [Test] public static void TemplateId_human_male_warrior()
+    {
+        // race=0 (Human), gender=0 (Male), class=0 (Warrior) -> 10101
+        int t = CharacterHandlers.ComputeTemplateId(race: 0, gender: 0, cls: 0);
+        Hex.True(t == 10101, $"templateId {t} != 10101");
+    }
+
+    [Test] public static void TemplateId_formula_components()
+    {
+        // Verify each component contributes the right amount
+        int baseVal = CharacterHandlers.ComputeTemplateId(0, 0, 0);
+        int raceAdd = CharacterHandlers.ComputeTemplateId(1, 0, 0) - baseVal;
+        int genderAdd = CharacterHandlers.ComputeTemplateId(0, 1, 0) - baseVal;
+        int classAdd = CharacterHandlers.ComputeTemplateId(0, 0, 1) - baseVal;
+        Hex.True(raceAdd == 200, $"race contribution {raceAdd} != 200");
+        Hex.True(genderAdd == 100, $"gender contribution {genderAdd} != 100");
+        Hex.True(classAdd == 1, $"class contribution {classAdd} != 1");
+    }
+
+    [Test] public static void TemplateId_elin_class12()
+    {
+        // Elin = race 4, female = gender 1 (only option for Elin), class 12
+        // 10101 + 800 + 100 + 12 = 11013
+        Hex.True(CharacterHandlers.ComputeTemplateId(4, 1, 12) == 11013, "Elin class12");
+    }
+
+    // --- Name validation ---
+
+    [Test] public static void IsValidName_rejects_short()
+    {
+        Hex.True(!CharacterHandlers.IsValidName("A"), "single char should be rejected");
+        Hex.True(!CharacterHandlers.IsValidName(""), "empty should be rejected");
+        Hex.True(!CharacterHandlers.IsValidName(null), "null should be rejected");
+    }
+
+    [Test] public static void IsValidName_rejects_long()
+    {
+        Hex.True(!CharacterHandlers.IsValidName(new string('A', 17)), "17 chars should be rejected");
+    }
+
+    [Test] public static void IsValidName_accepts_valid()
+    {
+        Hex.True(CharacterHandlers.IsValidName("Ab"), "2 chars should be accepted");
+        Hex.True(CharacterHandlers.IsValidName("ValidCharName"), "normal name accepted");
+        Hex.True(CharacterHandlers.IsValidName(new string('A', 16)), "16 chars accepted");
+    }
+
+    [Test] public static void IsValidName_rejects_whitespace()
+    {
+        Hex.True(!CharacterHandlers.IsValidName("   "), "whitespace-only rejected");
+    }
+
+    // --- Inline def registration (Task D: S_EXIT / S_PREPARE_EXIT) ---
+
+    [Test] public static void RegisterIfMissing_creates_def()
+    {
+        var log = Microsoft.Extensions.Logging.LoggerFactory.Create(b => { }).CreateLogger("test");
+        var reg = new TeraSharp.Arbiter.Protocol.DefinitionRegistry(log);
+        Hex.True(!reg.Has("S_TEST_PACKET"), "should not exist before register");
+        reg.RegisterIfMissing("S_TEST_PACKET", ("int32", "value"), ("byte", "flag"));
+        Hex.True(reg.Has("S_TEST_PACKET"), "should exist after register");
+        var def = reg.Get("S_TEST_PACKET");
+        Hex.True(def != null, "def should not be null");
+        Hex.True(def!.Fields.Count == 2, $"field count {def.Fields.Count} != 2");
+        Hex.True(def.Fields[0].Name == "value", $"field0 name '{def.Fields[0].Name}' != 'value'");
+        Hex.True(def.Fields[1].Name == "flag", $"field1 name '{def.Fields[1].Name}' != 'flag'");
+    }
+
+    [Test] public static void RegisterIfMissing_does_not_overwrite()
+    {
+        var log = Microsoft.Extensions.Logging.LoggerFactory.Create(b => { }).CreateLogger("test");
+        var reg = new TeraSharp.Arbiter.Protocol.DefinitionRegistry(log);
+        reg.RegisterIfMissing("S_EXIT", ("int32", "category"));
+        var def1 = reg.Get("S_EXIT");
+        // Try to register again with different fields — should not overwrite
+        reg.RegisterIfMissing("S_EXIT", ("int32", "other"), ("byte", "extra"));
+        var def2 = reg.Get("S_EXIT");
+        Hex.True(def2!.Fields.Count == def1!.Fields.Count, "should not overwrite existing def");
+    }
+
+    // =========================================================================
+    // Account auth (Task E)
+    // =========================================================================
+
+    [Test] public static void AuthEnabled_defaults_to_false()
+    {
+        // TERASHARP_AUTH is not set in the test env -> Program.AuthEnabled should be false.
+        // (Program.AuthEnabled is set from env in Main; in tests it retains the default false.)
+        Hex.True(!TeraSharp.Arbiter.Program.AuthEnabled, "AuthEnabled should default to false");
+    }
+
+    [Test] public static void ValidateAccount_rejects_when_api_unreachable()
+    {
+        // With no tera-api running, ValidateAccount should return false (fail-closed).
+        // Point at a port nothing is listening on.
+        var saved = TeraSharp.Arbiter.Program.AuthApiUrl;
+        TeraSharp.Arbiter.Program.AuthApiUrl = "http://127.0.0.1:19999";
+        try
+        {
+            bool result = LoginHandlers.ValidateAccount("testaccount");
+            Hex.True(!result, "ValidateAccount should reject when API unreachable");
+        }
+        finally { TeraSharp.Arbiter.Program.AuthApiUrl = saved; }
+    }
+
+    // =========================================================================
+    // Task G — Second-pass hardening
+    // =========================================================================
+
+    [Test] public static void EpPerk_constant_renamed_from_GuildSearch()
+    {
+        // Verify the constant exists and points to the correct opcode (0x27B9).
+        Hex.True(DbProxyHandlers.SDB_EP_PERK == 0x27B9, $"SDB_EP_PERK=0x{DbProxyHandlers.SDB_EP_PERK:X4} != 0x27B9");
+    }
+
+    [Test] public static void StaticData_EpPerk_reqId_at_offset_8()
+    {
+        // Verify the reqId offset is 8 and patching works at a non-capture reqId.
+        var req = Hex.B("AA 00 00 00 01 00 00 00");
+        var actual = DbProxyHandlers.BuildFromStaticData(DbProxyStaticData.EpPerk, DbProxyStaticData.EpPerkReqIdOffset, req);
+        Hex.True(BitConverter.ToUInt32(actual, 8) == 0xAA, "EpPerk reqId patched at offset 8");
+        // Rest of template unchanged
+        Hex.True(actual.Length == 113, "EpPerk length preserved after patch");
+        Hex.True(actual[12] == DbProxyStaticData.EpPerk[12], "EpPerk byte after reqId unchanged");
+    }
+
+    [Test] public static void EnterWorld_handle1_is_zero()
+    {
+        // Decompile: [16..23] is an opaque ClientSession pointer. We send 0.
+        var chr = new TeraSharp.Arbiter.Game.FakeCharacter();
+        var p = WorldEntry.BuildEnterWorldPayload(GameId, chr);
+        Hex.True(BitConverter.ToUInt64(p, 16) == 0, "handle1 at [16..23] should be 0");
+    }
+
+    [Test] public static void EnterWorld_handle2_is_gameId()
+    {
+        // Decompile: [24..31] is User 'this' pointer. We send gameId for routing.
+        var chr = new TeraSharp.Arbiter.Game.FakeCharacter();
+        var p = WorldEntry.BuildEnterWorldPayload(GameId, chr);
+        Hex.True(BitConverter.ToUInt64(p, 24) == GameId, $"handle2 at [24..31] should be gameId");
+    }
+
+    [Test] public static void EnterWorld_tunnelSlot_at_80()
+    {
+        // Decompile: [80..83] is PacketBypassManager::BypassStart() return = 5.
+        var chr = new TeraSharp.Arbiter.Game.FakeCharacter();
+        var p = WorldEntry.BuildEnterWorldPayload(GameId, chr);
+        Hex.True(BitConverter.ToUInt32(p, 80) == 5, $"tunnel slot at [80] should be 5");
+    }
+
+    [Test] public static void AllStaticTemplates_reqId_within_bounds()
+    {
+        // Verify every static template's reqIdOffset + 4 <= template.Length.
+        Hex.True(DbProxyStaticData.TutorialReqIdOffset + 4 <= DbProxyStaticData.Tutorial.Length, "Tutorial reqId bounds");
+        Hex.True(DbProxyStaticData.ReputationReqIdOffset + 4 <= DbProxyStaticData.Reputation.Length, "Reputation reqId bounds");
+        Hex.True(DbProxyStaticData.Load293BReqIdOffset + 4 <= DbProxyStaticData.Load293B.Length, "Load293B reqId bounds");
+        Hex.True(DbProxyStaticData.FatigabilityReqIdOffset + 4 <= DbProxyStaticData.Fatigability.Length, "Fatigability reqId bounds");
+        Hex.True(DbProxyStaticData.SerenGuideReqIdOffset + 4 <= DbProxyStaticData.SerenGuide.Length, "SerenGuide reqId bounds");
+        Hex.True(DbProxyStaticData.EpPerkReqIdOffset + 4 <= DbProxyStaticData.EpPerk.Length, "EpPerk reqId bounds");
+        Hex.True(DbProxyStaticData.QuestListReqIdOffset + 4 <= DbProxyStaticData.QuestList.Length, "QuestList reqId bounds");
+        Hex.True(DbProxyStaticData.AchievementReqIdOffset + 4 <= DbProxyStaticData.Achievement.Length, "Achievement reqId bounds");
+    }
+
+    [Test] public static void BuildFromStaticData_does_not_mutate_template()
+    {
+        // Patching a live reqId must clone, not modify the shared template array.
+        var before = (byte[])DbProxyStaticData.Tutorial.Clone();
+        var req = Hex.B("99 00 00 00 01 00 00 00");
+        DbProxyHandlers.BuildFromStaticData(DbProxyStaticData.Tutorial, DbProxyStaticData.TutorialReqIdOffset, req);
+        Hex.Eq(DbProxyStaticData.Tutorial, before, "Tutorial template must not be mutated");
+    }
+}

@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Self-contained console test runner. A normal xUnit/MSTest project can't be
+    restored here (nuget.org is unreachable from the build box and the test
+    frameworks aren't in the offline package cache), so this project depends only
+    on the Arbiter project and the BCL. It exits non-zero if any check fails, so
+    `dotnet run` doubles as the CI gate. Each [Test] method targets one handler
+    and compares against bytes captured in D:\packetlogs\arb_world.log.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>TeraSharp.Arbiter.Tests</AssemblyName>
+    <RootNamespace>TeraSharp.Arbiter.Tests</RootNamespace>
+    <LangVersion>latest</LangVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\TeraSharp.Arbiter\TeraSharp.Arbiter.csproj" />
+  </ItemGroup>
+
+</Project>
