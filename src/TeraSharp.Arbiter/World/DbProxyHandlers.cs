@@ -722,7 +722,26 @@ public sealed class DbProxyHandlers
             _log.LogInformation("DBS_USER_ENTERWORLD: sent world blob for '{Name}' (id {Id}) from DB, pos {Pos}", chr!.Name, playerId, BlobPos(chr.WorldBlob!));
 
         link.SendFrame(DBS_USER_ENTERWORLD, BuildDbsUserEnterWorld(replyId, found ? chr!.WorldBlob : null));
+
+        // The real Arbiter follows the blob with DBS_USER_RESTRICTION (0x2830) ~3 ms later
+        // (lobby_tap.log pkt 131): [u32 off=22][u32 count=0][u64 gameId]. This is the only A->W
+        // frame that differs between two logins in the real capture, and chat/whisper bans live
+        // in the restriction record World initialises from it. gameId form: 0x80000AF00000|id,
+        // unmasked, as sent in AS_ENTER_WORLD [24] and captured (01 00 F0 0A 00 80 00 00).
+        if (found)
+            link.SendFrame(DBS_USER_RESTRICTION, BuildDbsUserRestriction(0x80000AF00000UL | (ulong)(uint)playerId));
         return true;
+    }
+
+    public const ushort DBS_USER_RESTRICTION = 0x2830;
+
+    /// <summary>DBS_USER_RESTRICTION (0x2830): [u32 listOff=22][u32 count=0][u64 gameId] — 16 bytes (capture pkt 131).</summary>
+    public static byte[] BuildDbsUserRestriction(ulong gameId)
+    {
+        var p = new byte[16];
+        BitConverter.GetBytes(22u).CopyTo(p, 0);   // 6-byte header + 16-byte payload = 22 = empty list at end
+        BitConverter.GetBytes(gameId).CopyTo(p, 8);
+        return p;
     }
 
     /// <summary>
