@@ -9,23 +9,32 @@ streams of work from getting tangled.
 1. Start every session with:
    `cd D:\v100\TERA_SERVER.100\TeraSharp; git status --short; git log --oneline -3`. The tree must be clean.
    If `git status` shows changes you did not make, STOP and tell the human — do not touch them.
-2. Create your branch from current master before the first edit: `git checkout -b cowork/Tn master`
-   (Tn = the task id from the queue below). All edits, all commits, go on that branch. **Never commit to
-   `master`, never merge, never rebase, never `git checkout master -- <file>`, never force anything.**
-3. Write only inside `D:\v100\TERA_SERVER.100\TeraSharp\`. Generated data (opcode tables, extracted bytes)
-   goes in the repo under `data/` or `status/`, not in `D:\packetlogs\` or anywhere else on D:. Never create
-   new top-level folders on D:.
+2. **You cannot run git** (no shell on the human's machine). The human creates a git worktree for your task
+   before you write anything: `git worktree add D:\v100\TERA_SERVER.100\TeraSharp-cowork -b cowork/Tn master`.
+   **Write only under `D:\v100\TERA_SERVER.100\TeraSharp-cowork\`** (same layout as the main repo). Never
+   write into `D:\v100\TERA_SERVER.100\TeraSharp\` — that is the human's `master` working tree. When done,
+   tell the human which files you wrote; he commits on the branch, builds, tests, merges, removes the worktree.
+   If the worktree folder does not exist, STOP and ask for it — do not write anywhere else.
+3. Generated data (opcode tables, extracted bytes) goes in the worktree under `data/` or `status/`, not in
+   `D:\packetlogs\` or anywhere else on D:. Never create new top-level folders on D:.
 4. Only the files in the "diffs welcome" list below. Human-owned files: describe the change in chat, do not
    edit.
-5. Commit on your branch with a message starting with the task id (`T1: ...`). Small, single-purpose commits.
-6. Before you stop: `dotnet build TeraSharp.sln` and `dotnet run --project src\TeraSharp.Arbiter.Tests` must
-   pass; then paste `git log --oneline master..HEAD`, `git diff --stat master..HEAD` and the test output in
-   chat. If anything is unverified, say so.
+5. You may build/test in your own container by copying sources out, but say so explicitly — the human
+   re-runs `dotnet build` + tests on his box before merging. Small, single-purpose tasks; one per worktree.
+6. Before you stop: list every file you wrote (full paths), the test names you added, and the notes you did
+   NOT act on. Nothing else is required of you on the git side.
 7. Read the files you're changing in the same session you change them — master may have moved since the
    docs were written.
 
-Human side (for reference): `git checkout master; git merge --no-ff cowork/Tn` after review, or
-`git branch -D cowork/Tn` to throw it away. Conflicts are resolved by the human at merge time, never by you.
+Human side (for reference):
+```
+cd D:\v100\TERA_SERVER.100\TeraSharp
+git worktree add ..\TeraSharp-cowork -b cowork/Tn master      # before starting Cowork
+# ... Cowork writes into ..\TeraSharp-cowork ...
+cd ..\TeraSharp-cowork; git add -A; git commit -m "Tn: ..."; dotnet build TeraSharp.sln; dotnet run --project src\TeraSharp.Arbiter.Tests
+cd ..\TeraSharp; git merge --no-ff cowork/Tn; git worktree remove ..\TeraSharp-cowork; git branch -d cowork/Tn
+```
+Conflicts are resolved by the human at merge time, never by Cowork.
 
 These rules exist because four sessions in a row reported "done" with work that never reached disk, or
 landed in a stray `D:\TeraSharp` copy and had to be merged by hand. Branch-only + prove-it-with-git ends that.
@@ -133,22 +142,14 @@ Pick the first unchecked task. Each one: decompile/capture first, unit test agai
 on `cowork/Tn`, then paste `git log --oneline master..HEAD` + `git diff --stat master..HEAD` + test output in
 chat. If a task needs a human-owned file, describe the exact change in chat instead of editing it.
 
-- [ ] **T1 — Tests for the DLM-unblock handlers.** In `src/TeraSharp.Arbiter.Tests/Program.cs`, add
-  byte-exact tests (captured request -> expected reply, plus a live-reqId-echo assertion) for: `0x2899->0x289A`,
-  `0x2910->0x2911`, `0x290C` (5 frames, order `0x15B1 0x2847 0x1440 0x143E 0x290D`), `0x27B9->0x27BA`,
-  `0x2736->0x2737`, `0x2930->0x2931`, `0x27B3->0x27B4`, `0x1562->0x1563`. Bytes are in `lobby_tap.log`
-  (02:51:10–02:52:07) and in the comments next to each constant in `DbProxyHandlers.cs`. Also a test that
-  `WorldReplayTable.Load` never produces an entry for request op `0x143F`.
+- [x] **T1 — Tests for the DLM-unblock handlers.** DONE (branch cowork/T1, +18 tests).
 - [ ] **T2 — Opcode names for `0x27xx–0x29xx`.** Generate `data/dbproxy_opcodes.txt` in the repo (`0xNNNN|NAME`)
   from the `case 0xNNNN: return "DBS_/SDB_...";` switch in `WorldServer.exe.c` (~line 247000; use
   `Select-String`, never open the file whole). Then add a tiny `DbProxyOpcodeNames` lookup in
   `World/DbProxyStaticData.cs` (or a new file in `World/`) that `DbProxyHandlers` uses in its log lines.
   Pure data, no live behaviour.
-- [ ] **T3 — `0x2830 DBS_USER_RESTRICTION` after `0x2738`.** Real Arbiter sends it 3 ms after the blob:
-  payload `[u32 off=22][u32 count=0][u64 gameId]` (`lobby_tap.log` packet 131). Add it to
-  `OnUserEnterWorld` using the gameId `0x80000AF00000 | playerId` (that is what our `WorldEntry` uses today);
-  read `Handler_SDB_USER_RESTRICTION` / the World-side `Handler_DBS_USER_RESTRICTION` to confirm the layout
-  and write the test. This is the #1 suspect for the respawn-position bug.
+- [x] **T3 — `0x2830 DBS_USER_RESTRICTION` after `0x2738`.** DONE on master (DbProxyHandlers.OnUserEnterWorld,
+  `BuildDbsUserRestriction`). Still wants a byte-exact test against `lobby_tap.log` pkt 131.
 - [ ] **T4 — `0x15E0 AS_REQUEST_DUNGEON_PHASE_USER_RESET` push.** Real Arbiter sends `0x15E0`
   `[u32 playerId][u32 0][u64 timestamp]` right before `0x286A` (`lobby_tap.log` packet 173). We never send it.
   Decide from the decompile whether it belongs in the `0x2869` handler (then allow-list `0x2869` — its builder
