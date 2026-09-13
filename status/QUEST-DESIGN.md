@@ -1,22 +1,26 @@
 # Quest persistence — design (T17)
 
-> ## ONE CAPTURE WOULD SETTLE THE REST
+> ## THE CAPTURE ARRIVED — LIST 2 IS THE COMPLETED IDS
 >
-> Log the existing **"Test"** character in against the real `ArbiterServer.exe` with
-> `arbiter-world-tap.js` running, and read the single `0x272D` reply it sends. That character has
-> three completed quests (59901, 59902, 59903) and one in progress (59904), so its reply is the
-> only thing that can tell us:
+> `D:\packetlogs\arb_world_2026-09-13T11-33-30-680Z.log` **seq 881** is the "Test" login this
+> file was asking for: three completed quests (59901, 59902, 59903) and one in progress (59904).
+> The answers:
 >
-> - whether **list 1** is the completed-quest list and **list 2** the completed ids,
-> - whether list 0 is active-only or active+complete,
-> - and probably what record field **`[24]`** means.
+> - **list 0** is active-only — one 80-byte record, quest 59904;
+> - **list 1** is empty even for a character with completed quests, so it is not the completed
+>   list;
+> - **list 2** is `vector<int>` of the **completed quest ids**, 12 bytes for those three;
+> - **list 5** is *not* a constant: it carries 2026-09-12 07:00 in both `0x272D` replies of that
+>   capture, the same daily-reset stamp the `0x148D` cool-time records carry, so it is
+>   server-wide and not per character.
 >
-> Until then TeraSharp **stores completed quests but does not serve them**: World will offer those
-> three quests again on the next login. Everything else in T17 is implemented and byte-exact.
+> Served since T21. Still unknown: what record fields **`[24]`** and **`[64]`** mean, and what
+> list 1 and list 4 are ever used for.
 
-**Status (updated after T17 part 2): the active-quest half is implemented.** `0x272C -> 0x272D` is
-rebuilt from stored rows and `0x272E -> 0x272F` is a real write handler; see §8. Two things in the
-original T17 brief did not survive contact with the captures — see §7.
+**Status (updated after T21): both halves are implemented, completed quests included.**
+`0x272C -> 0x272D` is rebuilt from stored rows with the completed ids in list 2, and
+`0x272E -> 0x272F` is a real write handler; see §8. Two things in the original T17 brief did not
+survive contact with the captures — see §7.
 
 Sources, in the order they win:
 
@@ -65,8 +69,10 @@ Observed replies:
 | cap_newchar seq 342 | 79 | 0 | 0 | 20 B | **the brand-new character** |
 | lobby_tap seq 167 | 159 | 1 rec | 0 | 20 B | dob, first login of the World process |
 | lobby_tap seq 950 | 1383 | 1 rec | 18 recs | 20 B | dob, relog |
+| arb_world 2026-09-13 seq 395 | 159 | 1 rec | 0 | 20 B | dob again |
+| arb_world 2026-09-13 seq 881 | **171** | 1 rec | 0 | 20 B | **Test: list 2 = 3 ints** |
 
-Lists 1, 2 and 4 are empty in all three. **List 3 is global, not per-character** — the handler
+Lists 1 and 4 are empty in all five, list 2 in all but seq 881. **List 3 is global, not per-character** — the handler
 fills it from `GlobalDailyQuestSeed::GetGlobalDailyQuestSeed`, which is why it is empty on the
 first login of a World process and 18 records on the relog. Sending it empty is what makes World
 generate the seeds itself and send the 17 `0x2899` items we already answer
@@ -77,9 +83,32 @@ The 20-byte list-5 blob is `[u32 ?][DateTime 16 B]`, the DateTime in the Arbiter
 
 ```
 new character   00 00 00 00 | B2 07 01 00 01 00 00 00 | 00*8     -> 1970-01-01, i.e. never
-dob relog       00 00 7F 90 | EA 07 09 00 0C 00 07 00 | 00*8     -> 2026-09-12 07:xx
+dob relog       00 00 7F 90 | EA 07 09 00 0C 00 07 00 | 00*8     -> 2026-09-12 07:00
+seq 395 / 881   00 00 00 00 | EA 07 09 00 0C 00 07 00 | 00*8     -> 2026-09-12 07:00
 ```
 
+The same `2026-09-12 07:00` appears in the `0x148D` `DungeonCoolTimeElem` records of that capture
+(`status/ENTER-WORLD-FALLBACK.md` §4), so it is a **server-wide daily-reset stamp**, not per
+character. `BuildDbs272D` defaults to the "never" form and takes an override so seq 881 can be
+reproduced byte for byte; nothing we have lets us compute the real value, and World accepted
+"never" for a character that had not played.
+
+### List 2: completed quest ids
+
+`arb_world_2026-09-13T11-33-30-680Z.log` seq 881, "Test" (playerId 2), 171-byte frame:
+
+```
+payload  [0]  59 / 80     list 0   one 80-byte QuestData: dbid 5, quest 59904, status 1, step 1
+         [8]  139 / 0     list 1   empty
+         [16] 139 / 12    list 2   FD E9 00 00  FE E9 00 00  FF E9 00 00   = 59901, 59902, 59903
+         [24] 151 / 0     list 3   empty
+         [32] 151 / 0     list 4   empty
+         [40] 151 / 20    list 5   00 00 00 00 | 2026-09-12 07:00
+         [48] ok = 1      [49] reqId = 0x63
+```
+
+Plain little-endian u32s in ascending quest id, which is also insertion order. Completed quests do
+**not** also appear in list 0.
 ## 2. `SDB_SET_QUEST_INFO` 0x272E → `DBS_SET_QUEST_INFO` 0x272F
 
 Request, min frame 0x24 (36):
@@ -230,21 +259,18 @@ belong in list 0 and concatenates their `record` blobs.
 
 ## 6. What is NOT resolvable from the captures
 
-**Where completed quests go in the reply.** Lists 1 and 2 are empty in all three captured
-`0x272D` replies, and neither capture contains a login by a character with a completed quest —
-"Test" completes three quests and then the capture ends; dob's only quest is active at step 1
-both times. So there is no evidence for:
+**Settled by T21** (`arb_world_2026-09-13T11-33-30-680Z.log` seq 881): list 0 is active-only and
+list 2 carries the completed quest ids as plain u32s. `RawQuestHelper::InsertRawCompletedQuestData`
+and `QuestDataManager::RefreshCacheCompletedQuestData` were the right smell after all.
 
-- whether list 0 is active-only or active+complete,
-- whether list 1 is the completed-quest list and list 2 the completed **ids** (the names
-  `RawQuestHelper::InsertRawCompletedQuestData` and
-  `QuestDataManager::RefreshCacheCompletedQuestData` in the Arbiter suggest exactly that, but
-  suggestion is not evidence),
-- what `[24]` and `[64]` in the record mean.
+**Still unresolved:**
 
-A capture that settles it is cheap: take the "Test" character, log in against the real
-ArbiterServer with the tap running, and read the one `0x272D`. Everything in §5 works for active
-quests today; completion is guesswork until that capture exists.
+- **What list 1 and list 4 are for.** Both are empty in all five captured replies, including the
+  one from a character with three completed quests. `vector<QuestData>` and
+  `vector<DailyQuestExCompleteCount>` are the template argument names; nothing has ever filled
+  them.
+- **Record fields `[24]` and `[64]`.**
+- **The list-5 DateTime.** Server-wide, and we cannot compute it. We send "never".
 
 ## 7. Two corrections to the T17 brief
 
@@ -290,11 +316,13 @@ quests today; completion is guesswork until that capture exists.
   and 0 otherwise, reward atoms echoed through `CloneAtomList` with T13's op-7 allocation rule.
   A record that cannot be sliced is still acked (an unanswered per-user DB item head-blocks the
   queue) but nothing is stored.
-- `OnLoadQuestList` / `BuildDbs272D` — list 0 from the stored active rows, lists 1-4 empty
-  (list 3 deliberately, so World seeds itself), list 5 the "never" trailer. dob (playerId 1) keeps
-  the captured 1377-byte reply until he has rows of his own.
-- Completed quests are counted and named in a warning on every load, pointing at this file.
+- `OnLoadQuestList` / `BuildDbs272D` — list 0 from the stored active rows, **list 2 the completed
+  quest ids** (T21), lists 1/3/4 empty (list 3 deliberately, so World seeds itself), list 5 the
+  "never" trailer unless the caller overrides it. dob (playerId 1) keeps the captured 1377-byte
+  reply until he has rows of his own.
+- The "STORED BUT NOT SERVED" warning is gone: completed quests are served.
 
-Verified in Python against `cap_newchar.log`, not built: all 28 `0x272F` replies rebuild byte for
-byte (given the capture's questDbIds 2-5), and `BuildDbs272D` with no rows reproduces seq 342's
-73-byte payload exactly.
+Verified in Python against both captures, not built: all 28 `0x272F` replies rebuild byte for byte
+(given the capture's questDbIds 2-5); `BuildDbs272D` with no rows reproduces cap_newchar seq 342's
+73-byte payload exactly; and with the capture's one active record, the three completed ids and its
+trailer it reproduces arb_world seq 881's 165-byte payload exactly.

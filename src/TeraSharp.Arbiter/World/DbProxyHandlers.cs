@@ -188,6 +188,107 @@ public sealed class DbProxyHandlers
     public const ushort SA_REQUEST_ENTER_DUNGEON = 0x13BE;  public const ushort AS_REQUEST_ENTER_DUNGEON = 0x13BF;
     public const ushort SA_RESPONSE_ENTER_DUNGEON = 0x13C0; public const ushort AS_RESPONSE_ENTER_DUNGEON = 0x13C1;
     public const uint WorldId = 0x0AF0; // planet 2800 (DAT_140e2d020), first u32 of every PDId
+
+    // --- DungeonEnterContext field offsets, in 0x13BE/0x13C0 PAYLOAD terms ---
+    // The context is 176 bytes at payload 8 (frame 0x0E). Offsets recovered from
+    // Handler_SA_RESPONSE_ENTER_DUNGEON in ArbiterServer.exe.c, cross-checked against the
+    // padding gaps already documented for DungeonReplyPaddingBytes below (payload 51 is the
+    // pad after the u8 at 50; payload 153..155 the pad after the u8 at 152), and against
+    // D:\packetlogs\arb_world_2026-09-13T11-33-30-680Z.log seq 1137 (0x13BE) / 1159 (0x13C0).
+    public const int DungeonCtxOffset = 8;                 // ctx+0
+    public const int DungeonCtxDungeonId = 8;              // ctx+0    9827 in the capture
+    public const int DungeonCtxWorldId = 28;               // ctx+20   0x0AF0
+    public const int DungeonCtxPlayerId = 32;              // ctx+24   UserDbId
+    public const int DungeonCtxEnterX = 36;                // ctx+28   where the player stood
+    public const int DungeonCtxSetReturnPoint = 50;        // ctx+42   u8, "commit the return point"
+    public const int DungeonCtxReturnX = 52;               // ctx+44   float
+    public const int DungeonCtxReturnY = 56;               // ctx+48   float
+    public const int DungeonCtxReturnZ = 60;               // ctx+52   float
+    public const int DungeonCtxReturnZone = 64;            // ctx+56   u32 continent
+    public const int DungeonCtxInstancePdId = 148;         // ctx+140  filled in by the 0x13C0 reply
+    public const int DungeonCtxSuccess = 152;              // ctx+144  u8, 1 on the 0x13C0 reply
+
+    // --- Enter-world failure + retry (T21) ---
+    //
+    // SA_ENTER_WORLD_FAIL (0x138D, 38 B fixed). Field names from the Arbiter's own packet
+    // dumper for "SA_ENTER_WORLD_FAIL"; the reader is Handler_SA_ENTER_WORLD_FAIL, which
+    // requires frame > 0x25 and takes ContinuousDungeonId from frame 0x1e and FailReason from
+    // frame 0x22.  Ground truth: arb_world_2026-09-13T11-33-30-680Z.log seq 836.
+    //   [0]  u64 ArbiterClient   (echo of AS_ENTER_WORLD [16])
+    //   [8]  u64 ArbiterUser     (echo of AS_ENTER_WORLD [24] - our gameId)
+    //   [16] u32 Ticket          (echo of AS_ENTER_WORLD [80] - our tunnel key)
+    //   [20] u32 LastIndex
+    //   [24] u32 ContinuousDungeonId  (the continent World refused: 9827)
+    //   [28] u32 FailReason           (2 in the capture)
+    //
+    // The handler schedules a User::DoTimerJob 3000 ms out; the job is
+    // User::EnterWorldFail(reason, continuousDungeonId), which
+    //   - gives up (LeaveWorldType 3, disconnect) unless the reason is 1, 2 or 3;
+    //   - for reason 1 or 2 sets ChannelInstanceId = -1 and takes continent + position from the
+    //     continent fallback table, THEN overrides both from the stored SysReturnLoc when
+    //     `0 < User+0x1a8`;
+    //   - re-sends AS_ENTER_WORLD with a fresh Ticket and ContinuousDungeonId = the refused
+    //     continent.
+    // seq 836 -> 841/842/843 is exactly 3.014 s apart, which is that timer.
+    public const ushort SA_ENTER_WORLD_FAIL = 0x138D;
+    public const ushort AS_ENTER_WORLD = 0x138E;
+    public const int EnterWorldFailMinPayload = 0x26 - 6;      // 32
+    public const int EnterWorldFailArbiterClientOffset = 0;
+    public const int EnterWorldFailArbiterUserOffset = 8;
+    public const int EnterWorldFailTicketOffset = 16;
+    public const int EnterWorldFailLastIndexOffset = 20;
+    public const int EnterWorldFailDungeonIdOffset = 24;
+    public const int EnterWorldFailReasonOffset = 28;
+    /// <summary>The real Arbiter's retry delay (FUN_14003e660(..., job, 3000, 0)).</summary>
+    public const int EnterWorldRetryDelayMs = 3000;
+
+    // AS_ENTER_WORLD (0x138E, 183-byte payload) field offsets, from the Arbiter's own packet
+    // dumper for "AS_ENTER_WORLD" (frame offsets 0x16..0xad converted to payload):
+    //   [16] ArbiterClient u64   [24] ArbiterUser u64      [32] UserDbId
+    //   [36] AccountDbId u64     [44] SessionKey           [48] ContinentId
+    //   [52] ChannelInstanceId   [56..67] x/y/z            [68] EnterWorldType
+    //   [72] Direction           [76] VisibleRange         [80] Ticket
+    //   [84] GameId u64          [92] PcBangUser u8        [93] NewMemberAccount u8
+    //   [94] PartyId u64         [102] IsSysParty u8       [103] SubscriptionFeeType
+    //   [107] AccountRestrictionLevel                      [111] AdminLevel
+    //   [115] TutorialUser u8    [116] LeaveParty u8       [117] BotPenalty
+    //   [121] SharedDBTCat u64   [129] CharacterSocketNum  [133] MaxSharedIncCharSocketCount
+    //   [137] MaxSharedIncWarePageCount                    [141] MaxSharedIncStyleWarePageCount
+    //   [145] SharedIncCharSocketCount                     [149] SharedIncWarePageCount
+    //   [153] SharedIncStyleWarePageCount                  [157] ContinuousDungeonId
+    //   [161] ExCrestPoint       [165] UseOptionalItem u8  [166] MentoringReturnUser u8
+    //   [167..182] EtcData
+    // Only the six the retry touches are named here; Handlers/WorldEntry.cs owns the builder.
+    public const int EnterWorldPayloadSize = 183;
+    public const int EnterWorldContinentIdOffset = 48;
+    public const int EnterWorldChannelInstanceIdOffset = 52;
+    public const int EnterWorldPositionOffset = 56;
+    public const int EnterWorldTicketOffset = 80;
+    public const int EnterWorldContinuousDungeonIdOffset = 157;
+
+    // AS_CACHE_DUNGEON_COOL_TIME_TO_WORLD (0x148D). Writer:
+    // SendToSession<PKT_AS_CACHE_DUNGEON_COOL_TIME_TO_WORLD_WRITE,int,int,const unsigned char*>
+    //   [0] u32 blobOffset (frame-relative, always 18)   [4] u32 blobLength   [8] u32 playerId
+    //   [12..] the blob
+    // The blob is one 52-byte DungeonCoolTimeElem - the same record DBS_LOAD_DUNGEON_COOL_TIME
+    // (0x2868) carries in its first list, byte for byte (capture seq 885 == seq 842's blob):
+    //   +0  u32 dungeonId            +4  u32 channelInstanceId
+    //   +8  16-byte DateTime         +24 16-byte DateTime
+    //   +40 u32 / +44 u32 / +48 u32  counters
+    // The two 16-byte DateTimes decode as u16 year, month, day, hour, minute, second + 4 pad
+    // on the two values seen (1970-01-01 00:00 = "never", 2026-09-12 07:00), which is INFERRED
+    // from those two points, not from a decompiled writer - so they are handled as opaque
+    // blobs here and DungeonCoolTimeNever is the literal "never" bytes.
+    public const ushort AS_CACHE_DUNGEON_COOL_TIME_TO_WORLD = 0x148D;
+    public const int CacheDungeonCoolTimeHeader = 12;
+    public const int DungeonCoolTimeRecordSize = 52;
+    public const int DungeonCoolTimeDateSize = 16;
+    /// <summary>The 1970-01-01 00:00 DateTime the capture uses for "no cool time recorded".</summary>
+    public static readonly byte[] DungeonCoolTimeNever =
+    {
+        0xB2, 0x07, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    };
     // Servant handlers: request [u64 gameId][u32 reqId][u32 playerId], reqId at payload[8]
     public const ushort SA_LOAD_SERVANT_DATA = 0x1539;             // -> 0x153A
     public const ushort SA_LOAD_SERVANT_ADVENTURE_DATA = 0x153B;   // -> 0x153C
@@ -256,15 +357,18 @@ public sealed class DbProxyHandlers
     // SDB_LOAD_QUEST_LIST (0x272C) -> DBS_LOAD_QUEST_LIST (0x272D)
     //   req  [0] u32 reqId  [4] u32 playerId
     //   rsp  53-byte header: six [u32 offset][u32 length] pairs, then [48] u8 ok, [49] u32 reqId
-    //        list 0  vector<QuestData>                 80 B each   <- what we serve
-    //        list 1  vector<QuestData>                             <- layout unverified
-    //        list 2  vector<int>                                   <- layout unverified
+    //        list 0  vector<QuestData>                 80 B each   <- in-progress quests
+    //        list 1  vector<QuestData>                 80 B each   <- always empty in every capture
+    //        list 2  vector<int>                        4 B each   <- COMPLETED quest ids (T21)
     //        list 3  vector<DailyQuestSeed>            68 B each   <- GLOBAL, kept empty on purpose:
     //                World then generates the seeds itself and sends the 17 0x2899 items we answer
     //        list 4  vector<DailyQuestExCompleteCount>
     //        list 5  a fixed 20-byte [u32][DateTime] trailer
     //   Offsets are frame-relative, so an empty reply has every offset at 59 (= 6 + 53).
     //   Ground truth for the empty case: cap_newchar.log seq 342, a 73-byte payload.
+    //   Ground truth for list 2: arb_world_2026-09-13T11-33-30-680Z.log seq 881, a 171-byte
+    //   payload for "Test" (playerId 2) - list 0 one 80-byte record for quest 59904, list 2 the
+    //   three ints 59901/59902/59903, everything else empty. T21.
     //
     // SDB_SET_QUEST_INFO (0x272E) -> DBS_SET_QUEST_INFO (0x272F)
     //   req  30-byte header: [0] u32 recordOff [4] u32 recordLen=80 [8] u32 atomOff
@@ -293,10 +397,13 @@ public sealed class DbProxyHandlers
     public const int QuestListOkOffset = 48;
     public const int QuestListReqIdOffset = 49;
     /// <summary>
-    /// List 5 of 0x272D: [u32 0][DateTime]. The "never" (1970-01-01) form the real Arbiter sent
-    /// for the brand-new character in cap_newchar.log seq 342. dob's relog carries a real date
-    /// there; we have nothing to put in it, and World accepted "never" for a character that had
-    /// not played.
+    /// List 5 of 0x272D: [u32 0][16-byte DateTime]. The "never" (1970-01-01) form the real
+    /// Arbiter sent for the brand-new character in cap_newchar.log seq 342. It is NOT a
+    /// constant: the 2026-09-13 relog capture carries 2026-09-12 07:00 in both 0x272D replies,
+    /// the same DateTime the 0x148D cool-time records carry, so it is a server-wide daily-reset
+    /// stamp and not per character. We have nothing to put in it and World accepted "never" for
+    /// a character that had not played, so "never" is the default; BuildDbs272D takes an
+    /// override so the capture can be reproduced byte for byte.
     /// </summary>
     public static readonly byte[] QuestListTrailer =
     {
@@ -480,6 +587,27 @@ public sealed class DbProxyHandlers
         _log = log;
     }
 
+    // ---- Session hooks (T21) ----
+    // SA_ENTER_WORLD_FAIL arrives with the two opaque handles we put in AS_ENTER_WORLD and
+    // nothing else that identifies the player: no UserDbId, no gameId-to-character map. Only
+    // the session layer has that, and WorldBridge._players is private, so the two facts this
+    // handler needs come in through hooks. Both are optional: unwired, the handler still logs
+    // the failure in full and simply cannot retry (the client sits on the loading screen, which
+    // is what happens today anyway).
+
+    /// <summary>
+    /// Our AS_ENTER_WORLD ArbiterUser handle (the gameId) -> the character id it was sent for,
+    /// or 0 when no live session owns it. Wire to WorldBridge's player map.
+    /// </summary>
+    public Func<ulong, int>? PlayerIdForGameId { get; set; }
+
+    /// <summary>
+    /// Re-send AS_ENTER_WORLD for that session with the stored fallback applied - the caller
+    /// looks the return point up itself (CharacterStore.GetDungeonReturn) because it also owns
+    /// every other field of the packet. Wire to Handlers/WorldEntry.ResendEnterWorld.
+    /// </summary>
+    public Action<EnterWorldFailure>? ResendEnterWorld { get; set; }
+
     /// <summary>
     /// THE ALLOW-LIST. True when <see cref="TryHandle"/> answers this opcode itself; false sends
     /// it to the replay table, which replies with the CAPTURED DLM id and wedges the user if the
@@ -527,6 +655,7 @@ public sealed class DbProxyHandlers
             case SDB_UPDATE_USER_ACTPOINT:          // 0x297C = [reqId][01]
             case SA_REQUEST_ENTER_DUNGEON:          // 0x13BF (zone change step 1)
             case SA_RESPONSE_ENTER_DUNGEON:         // 0x13C1 (zone change step 2)
+            case SA_ENTER_WORLD_FAIL:               // 0x148D pushes + a re-sent 0x138E (T21)
             case SDB_LOAD_2869:          // 0x15E0 push + 0x286A, both carrying the live reset time
             case AS_PROMOTION_LIST_REQ:  // 0x147D -> 0x1484 + 24 x 0x147E (timestamps = now) + 0x1480
             // --- T15: the per-user writes World sends during play. Each one is a DLM item; a
@@ -597,7 +726,9 @@ public sealed class DbProxyHandlers
                 var r = BuildAsRequestEnterDungeon(payload);
                 if (r == null) return false;
                 _log.LogInformation("SA_REQUEST_ENTER_DUNGEON: player {Pid} -> dungeon/zone {Dg} ({Len} B)",
-                    BitConverter.ToUInt32(payload, 32), BitConverter.ToUInt32(payload, 8), payload.Length);
+                    BitConverter.ToUInt32(payload, DungeonCtxPlayerId),
+                    BitConverter.ToUInt32(payload, DungeonCtxDungeonId), payload.Length);
+                RecordDungeonEntry(payload, response: false);
                 link.SendFrame(AS_REQUEST_ENTER_DUNGEON, r);
                 return true;
             }
@@ -605,9 +736,11 @@ public sealed class DbProxyHandlers
             {
                 var r = BuildAsResponseEnterDungeon(payload);
                 if (r == null) return false;
+                RecordDungeonEntry(payload, response: true);
                 link.SendFrame(AS_RESPONSE_ENTER_DUNGEON, r);
                 return true;
             }
+            case SA_ENTER_WORLD_FAIL: return OnEnterWorldFail(link, payload);
 
             // --- Login-time: empty-list Type 1 [off=19][count=0][reqId][ok=1], reqId at payload[0] ---
             // (0x27A2 inventory is handled by OnLoadInventory above)
@@ -794,6 +927,211 @@ public sealed class DbProxyHandlers
         return r;
     }
 
+    // =====================================================================
+    // T21 - enter-world failure and the fallback retry.
+    // Research and capture evidence: status/ENTER-WORLD-FALLBACK.md.
+    // =====================================================================
+
+    /// <summary>One SA_ENTER_WORLD_FAIL (0x138D), parsed. Field names are the Arbiter's own.</summary>
+    public readonly record struct EnterWorldFailure(
+        ulong ArbiterClient, ulong ArbiterUser, uint Ticket, uint LastIndex,
+        uint ContinuousDungeonId, uint FailReason);
+
+    /// <summary>Null when the frame is shorter than the real handler's length check.</summary>
+    public static EnterWorldFailure? ParseEnterWorldFail(byte[] payload)
+    {
+        if (payload is null || payload.Length < EnterWorldFailMinPayload) return null;
+        return new EnterWorldFailure(
+            BitConverter.ToUInt64(payload, EnterWorldFailArbiterClientOffset),
+            BitConverter.ToUInt64(payload, EnterWorldFailArbiterUserOffset),
+            BitConverter.ToUInt32(payload, EnterWorldFailTicketOffset),
+            BitConverter.ToUInt32(payload, EnterWorldFailLastIndexOffset),
+            BitConverter.ToUInt32(payload, EnterWorldFailDungeonIdOffset),
+            BitConverter.ToUInt32(payload, EnterWorldFailReasonOffset));
+    }
+
+    /// <summary>
+    /// User::EnterWorldFail opens with <c>if (2 &lt; reason - 1) { LeaveWorldType 3; disconnect; }</c>,
+    /// i.e. it only ever retries reasons 1, 2 and 3. The capture's reason is 2.
+    /// </summary>
+    public static bool IsRetryableEnterWorldFailure(uint reason) => reason - 1 < 3;
+
+    /// <summary>
+    /// SA_ENTER_WORLD_FAIL. Sends the two AS_CACHE_DUNGEON_COOL_TIME_TO_WORLD pushes the real
+    /// Arbiter sends for the refused instance, then asks the session layer to re-send
+    /// AS_ENTER_WORLD with the stored return point. Both steps need facts only that layer has,
+    /// so both are behind hooks; with neither wired this still logs the failure in full.
+    /// </summary>
+    private bool OnEnterWorldFail(WorldLink link, byte[] payload)
+    {
+        var parsed = ParseEnterWorldFail(payload);
+        if (parsed == null)
+        {
+            _log.LogError("SA_ENTER_WORLD_FAIL: {Len} B payload, the real handler needs {Need}",
+                payload.Length, EnterWorldFailMinPayload);
+            return false;
+        }
+        var f = parsed.Value;
+
+        _log.LogWarning(
+            "SA_ENTER_WORLD_FAIL: World refused enter-world - gameId 0x{G:X}, ticket {T}, "
+            + "continent {C}, reason {R}",
+            f.ArbiterUser, f.Ticket, f.ContinuousDungeonId, f.FailReason);
+
+        if (!IsRetryableEnterWorldFailure(f.FailReason))
+        {
+            _log.LogError(
+                "SA_ENTER_WORLD_FAIL: reason {R} is outside 1-3, which is where the real Arbiter "
+                + "stops retrying and drops the user. Not retrying.", f.FailReason);
+            return true;
+        }
+
+        int playerId = PlayerIdForGameId?.Invoke(f.ArbiterUser) ?? 0;
+        if (playerId <= 0)
+        {
+            _log.LogWarning("SA_ENTER_WORLD_FAIL: no live session owns gameId 0x{G:X} - "
+                + "skipping the 0x148D cool-time pushes", f.ArbiterUser);
+        }
+        else
+        {
+            foreach (var push in BuildCacheDungeonCoolTimePushes(playerId, (int)f.ContinuousDungeonId))
+                link.SendFrame(AS_CACHE_DUNGEON_COOL_TIME_TO_WORLD, push);
+        }
+
+        if (ResendEnterWorld is null)
+        {
+            _log.LogError(
+                "SA_ENTER_WORLD_FAIL: ResendEnterWorld is not wired, so no AS_ENTER_WORLD retry "
+                + "goes out and the client stays on the loading screen. "
+                + "See status/ENTER-WORLD-FALLBACK.md for the one-line wiring.");
+            return true;
+        }
+        ResendEnterWorld(f);
+        return true;
+    }
+
+    /// <summary>
+    /// The pair of 0x148D payloads the real Arbiter sends between the failure and the retry
+    /// (capture seq 841/842). Both carry one 52-byte DungeonCoolTimeElem for the refused
+    /// instance; in the capture they differ only in the two counters at +40/+44 (1,1 then 0,0),
+    /// which is the cool-time list followed by the clear-count list.
+    /// <para>We keep no dungeon cool-time state, so both go out as "never entered": the
+    /// timestamps are <see cref="DungeonCoolTimeNever"/> and the counters are 0. That is a
+    /// deliberate deviation - it can only ever let a player back in, never lock one out.</para>
+    /// </summary>
+    private List<byte[]> BuildCacheDungeonCoolTimePushes(int playerId, int dungeonId)
+    {
+        var chr = _store is null ? null : _store.GetCharacter(playerId);
+        uint pdId = (uint)(chr?.InstancePdId ?? 0);
+        var record = BuildDungeonCoolTimeRecord(dungeonId, pdId, null, null, 0, 0, 0);
+        return new List<byte[]>
+        {
+            BuildCacheDungeonCoolTime(playerId, record),
+            BuildCacheDungeonCoolTime(playerId, record),
+        };
+    }
+
+    /// <summary>
+    /// AS_CACHE_DUNGEON_COOL_TIME_TO_WORLD (0x148D): [u32 blobOffset=18][u32 blobLen][u32 playerId]
+    /// + one <see cref="DungeonCoolTimeRecordSize"/>-byte record.
+    /// </summary>
+    public static byte[] BuildCacheDungeonCoolTime(int playerId, byte[] record)
+    {
+        ArgumentNullException.ThrowIfNull(record);
+        if (record.Length != DungeonCoolTimeRecordSize)
+            throw new ArgumentException(
+                $"cool-time record must be {DungeonCoolTimeRecordSize} bytes, got {record.Length}", nameof(record));
+        var r = new byte[CacheDungeonCoolTimeHeader + record.Length];
+        BitConverter.GetBytes((uint)(6 + CacheDungeonCoolTimeHeader)).CopyTo(r, 0);   // 18, frame-relative
+        BitConverter.GetBytes((uint)record.Length).CopyTo(r, 4);
+        BitConverter.GetBytes(playerId).CopyTo(r, 8);
+        record.CopyTo(r, CacheDungeonCoolTimeHeader);
+        return r;
+    }
+
+    /// <summary>
+    /// One 52-byte DungeonCoolTimeElem. The two DateTimes are passed as raw 16-byte blobs
+    /// (null = <see cref="DungeonCoolTimeNever"/>) because their field layout is inferred from
+    /// two capture values, not from a decompiled writer.
+    /// </summary>
+    public static byte[] BuildDungeonCoolTimeRecord(
+        int dungeonId, uint channelInstanceId, byte[]? firstEntry, byte[]? lastEntry,
+        uint counter0, uint counter1, uint counter2)
+    {
+        var a = firstEntry ?? DungeonCoolTimeNever;
+        var b = lastEntry ?? DungeonCoolTimeNever;
+        if (a.Length != DungeonCoolTimeDateSize || b.Length != DungeonCoolTimeDateSize)
+            throw new ArgumentException($"a DateTime is {DungeonCoolTimeDateSize} bytes");
+        var r = new byte[DungeonCoolTimeRecordSize];
+        BitConverter.GetBytes(dungeonId).CopyTo(r, 0);
+        BitConverter.GetBytes(channelInstanceId).CopyTo(r, 4);
+        a.CopyTo(r, 8);
+        b.CopyTo(r, 24);
+        BitConverter.GetBytes(counter0).CopyTo(r, 40);
+        BitConverter.GetBytes(counter1).CopyTo(r, 44);
+        BitConverter.GetBytes(counter2).CopyTo(r, 48);
+        return r;
+    }
+
+    /// <summary>
+    /// The retry form of an AS_ENTER_WORLD payload: the original with continent, channel
+    /// instance, position, ticket and ContinuousDungeonId replaced and nothing else touched.
+    /// That is exactly what User::EnterWorldFail produces - capture seq 835 -> seq 843 differ in
+    /// those five fields and no others. Null for a payload that is not 183 bytes.
+    /// </summary>
+    public static byte[]? BuildEnterWorldRetryPayload(
+        byte[] original, int zone, float x, float y, float z,
+        uint channelInstanceId, uint ticket, uint continuousDungeonId)
+    {
+        if (original is null || original.Length != EnterWorldPayloadSize) return null;
+        var r = (byte[])original.Clone();
+        BitConverter.GetBytes((uint)zone).CopyTo(r, EnterWorldContinentIdOffset);
+        BitConverter.GetBytes(channelInstanceId).CopyTo(r, EnterWorldChannelInstanceIdOffset);
+        BitConverter.GetBytes(x).CopyTo(r, EnterWorldPositionOffset);
+        BitConverter.GetBytes(y).CopyTo(r, EnterWorldPositionOffset + 4);
+        BitConverter.GetBytes(z).CopyTo(r, EnterWorldPositionOffset + 8);
+        BitConverter.GetBytes(ticket).CopyTo(r, EnterWorldTicketOffset);
+        BitConverter.GetBytes(continuousDungeonId).CopyTo(r, EnterWorldContinuousDungeonIdOffset);
+        return r;
+    }
+
+    /// <summary>
+    /// Persist the return point a dungeon entry carries, so a relog into the instance has
+    /// somewhere to fall back to. Called from both halves of the handshake: the request already
+    /// carries the return continent and position, the response adds the ChannelInstanceId
+    /// WorldServer allocated.
+    /// <para>DEVIATION, on purpose: the real Arbiter only commits the return point when
+    /// DungeonEnterContext+42 is set and CLEARS it otherwise (User::CleanSysReturnLoc). In the
+    /// only capture we have that flag is 0 on both halves, yet the DB clearly held a valid
+    /// return point at login - so some other call site set it and clearing here would leave us
+    /// with no fallback at all. We store whatever the context carries and never clear;
+    /// CharacterStore.ClearDungeonReturn is there for when that flag's source is found.</para>
+    /// </summary>
+    private void RecordDungeonEntry(byte[] payload, bool response)
+    {
+        if (_store is null || payload.Length < ResponseEnterDungeonMinPayload) return;
+        int playerId = (int)BitConverter.ToUInt32(payload, DungeonCtxPlayerId);
+        if (playerId <= 0) return;
+
+        int dungeonId = (int)BitConverter.ToUInt32(payload, DungeonCtxDungeonId);
+        int returnZone = (int)BitConverter.ToUInt32(payload, DungeonCtxReturnZone);
+        if (returnZone > 0)
+            _store.SaveDungeonReturn(playerId, dungeonId, returnZone,
+                BitConverter.ToSingle(payload, DungeonCtxReturnX),
+                BitConverter.ToSingle(payload, DungeonCtxReturnY),
+                BitConverter.ToSingle(payload, DungeonCtxReturnZ));
+
+        if (!response) return;
+        if (payload[DungeonCtxSuccess] == 0)
+        {
+            _log.LogWarning("SA_RESPONSE_ENTER_DUNGEON: player {Pid} was NOT admitted to {Dg}", playerId, dungeonId);
+            return;
+        }
+        int pdId = (int)BitConverter.ToUInt32(payload, DungeonCtxInstancePdId);
+        _store.SaveInstancePdId(playerId, pdId);
+        _log.LogInformation("Player {Pid} is in dungeon {Dg}, instance 0x{Pd:X8}", playerId, dungeonId, pdId);
+    }
+
     /// <summary>
     /// AS_LEARN_ALL_CREST_ACQUIRABLE (0x1464): every requested (crestId, value) echoed back as learned.
     /// Payload: [u32 count][u32 firstOff=19][u32 reqId][u8 ok=1] + 16-B entries with frame-relative links.
@@ -962,37 +1300,47 @@ public sealed class DbProxyHandlers
 
         var active = _store.GetActiveQuestRecords(playerId);
         var completed = _store.GetCompletedQuestIds(playerId);
-        if (completed.Count > 0)
-            _log.LogWarning(
-                "SDB_LOAD_QUEST_LIST: player {Pid} has {N} completed quest(s) ({Ids}) STORED BUT NOT SERVED - "
-                + "the 0x272D list 1/2 layout is unverified (status/QUEST-DESIGN.md); World will offer them again",
-                playerId, completed.Count, string.Join(", ", completed));
-
-        _log.LogInformation("SDB_LOAD_QUEST_LIST: player {Pid} -> {N} active quest(s)", playerId, active.Count);
-        link.SendFrame(0x272D, BuildDbs272D(active, reqId));
+        _log.LogInformation("SDB_LOAD_QUEST_LIST: player {Pid} -> {N} active quest(s), {C} completed",
+            playerId, active.Count, completed.Count);
+        link.SendFrame(0x272D, BuildDbs272D(active, completed, reqId));
         return true;
     }
 
-    /// <summary>
-    /// DBS_LOAD_QUEST_LIST (0x272D) built from stored rows: list 0 is the active quest records,
-    /// lists 1-4 are empty (list 3 deliberately so — World then seeds itself and sends the 17
-    /// 0x2899 items we answer), list 5 is the "never" trailer. With no rows this is
-    /// byte-identical to cap_newchar.log seq 342.
-    /// </summary>
+    /// <summary>Quest-list reply with no completed quests. Kept for the callers that predate T21.</summary>
     public static byte[] BuildDbs272D(IReadOnlyList<byte[]> activeQuestRecords, uint reqId)
+        => BuildDbs272D(activeQuestRecords, Array.Empty<int>(), reqId, null);
+
+    /// <summary>
+    /// DBS_LOAD_QUEST_LIST (0x272D) built from stored rows: list 0 is the in-progress quest
+    /// records, list 2 the completed quest ids as plain u32s, lists 1/3/4 empty (list 3
+    /// deliberately so — World then seeds itself and sends the 17 0x2899 items we answer),
+    /// list 5 the daily-reset trailer (<see cref="QuestListTrailer"/> unless overridden).
+    /// With no rows at all this is byte-identical to cap_newchar.log seq 342; with the capture's
+    /// rows and trailer it is byte-identical to arb_world_2026-09-13T11-33-30-680Z.log seq 881.
+    /// </summary>
+    public static byte[] BuildDbs272D(
+        IReadOnlyList<byte[]> activeQuestRecords, IReadOnlyList<int> completedQuestIds,
+        uint reqId, byte[]? trailer = null)
     {
         ArgumentNullException.ThrowIfNull(activeQuestRecords);
-        int listLength = activeQuestRecords.Count * QuestRecordSize;
-        var r = new byte[QuestListReplyHeader + listLength + QuestListTrailer.Length];
+        ArgumentNullException.ThrowIfNull(completedQuestIds);
+        var tail = trailer ?? QuestListTrailer;
+        int list0 = activeQuestRecords.Count * QuestRecordSize;
+        int list2 = completedQuestIds.Count * 4;
+        var r = new byte[QuestListReplyHeader + list0 + list2 + tail.Length];
 
         uint bodyStart = 6 + QuestListReplyHeader;                 // 59, frame-relative
-        uint afterList0 = bodyStart + (uint)listLength;
+        uint afterList0 = bodyStart + (uint)list0;
+        uint afterList2 = afterList0 + (uint)list2;
         BitConverter.GetBytes(bodyStart).CopyTo(r, 0);
-        BitConverter.GetBytes((uint)listLength).CopyTo(r, 4);
-        for (int slot = 1; slot <= 4; slot++)                      // lists 1-4: empty, same offset
-            BitConverter.GetBytes(afterList0).CopyTo(r, slot * 8);
-        BitConverter.GetBytes(afterList0).CopyTo(r, 40);           // list 5: the trailer
-        BitConverter.GetBytes((uint)QuestListTrailer.Length).CopyTo(r, 44);
+        BitConverter.GetBytes((uint)list0).CopyTo(r, 4);
+        BitConverter.GetBytes(afterList0).CopyTo(r, 8);            // list 1: empty
+        BitConverter.GetBytes(afterList0).CopyTo(r, 16);           // list 2: completed ids
+        BitConverter.GetBytes((uint)list2).CopyTo(r, 20);
+        BitConverter.GetBytes(afterList2).CopyTo(r, 24);           // list 3: empty (daily seeds)
+        BitConverter.GetBytes(afterList2).CopyTo(r, 32);           // list 4: empty
+        BitConverter.GetBytes(afterList2).CopyTo(r, 40);           // list 5: the trailer
+        BitConverter.GetBytes((uint)tail.Length).CopyTo(r, 44);
         r[QuestListOkOffset] = 1;
         BitConverter.GetBytes(reqId).CopyTo(r, QuestListReqIdOffset);
 
@@ -1004,7 +1352,12 @@ public sealed class DbProxyHandlers
             rec.CopyTo(r, at);
             at += QuestRecordSize;
         }
-        QuestListTrailer.CopyTo(r, at);
+        foreach (int id in completedQuestIds)
+        {
+            BitConverter.GetBytes(id).CopyTo(r, at);
+            at += 4;
+        }
+        tail.CopyTo(r, at);
         return r;
     }
 
