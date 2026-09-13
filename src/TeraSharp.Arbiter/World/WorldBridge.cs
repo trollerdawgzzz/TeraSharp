@@ -41,7 +41,7 @@ internal sealed class TunnelReorderBuffer
 /// sessions and round-robins tunnel packets across them; each 0x13F7 frame
 /// carries a sequence number (payload[30..31] >> 3) so we can reorder.
 ///
-///   Frame: [u32 totalLength][u16 opcode][payload]   â€” plaintext.
+///   Frame: [u32 totalLength][u16 opcode][payload]   ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â plaintext.
 ///
 /// Tunnel routing: each player gets a unique tunnel key (allocated by
 /// <see cref="AllocateTunnelKey"/>). The key is sent to World in AS_ENTER_WORLD
@@ -169,7 +169,7 @@ public sealed class WorldBridge
     /// Deliver a reordered client packet to the session that owns the given tunnel key.
     /// Falls back to broadcasting to all registered sessions when the key is unknown
     /// (e.g. World sends a packet before we've registered the player, or uses a key
-    /// we don't recognise yet â€” the two-login capture will clarify).
+    /// we don't recognise yet ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â the two-login capture will clarify).
     /// </summary>
     internal void RouteToClient(uint key, byte[] packet)
     {
@@ -184,7 +184,7 @@ public sealed class WorldBridge
             deliver(packet);
             return;
         }
-        // Broadcast fallback: unknown key â†’ send to all registered sessions.
+        // Broadcast fallback: unknown key ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ send to all registered sessions.
         List<Action<byte[]>> all;
         lock (_reorderLock)
             all = _tunnels.Values
@@ -192,7 +192,7 @@ public sealed class WorldBridge
                 .Select(t => t.Deliver!)
                 .ToList();
         if (all.Count > 0)
-            _log.LogDebug("Tunnel key {Key} unknown â€” broadcasting to {N} session(s)", key, all.Count);
+            _log.LogDebug("Tunnel key {Key} unknown ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â broadcasting to {N} session(s)", key, all.Count);
         foreach (var d in all) d(packet);
     }
 
@@ -324,7 +324,7 @@ public sealed class WorldBridge
                 if (deliver != null)
                     foreach (var (k, p) in deliver) RouteToClient(k, p);
                 else
-                    RouteToClient(key, clientPkt); // unknown key â€” broadcast immediately
+                    RouteToClient(key, clientPkt); // unknown key ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â broadcast immediately
                 return;
             }
 
@@ -340,7 +340,7 @@ public sealed class WorldBridge
                 if (responses.Count == 0) { _log.LogDebug("  no replay for 0x{Op:X4}", op); }
                 foreach (var (rop, rbody) in responses)
                 {
-                    // DBS_UPDATE_USER_DATA (0x27CC) must never come from replay â€” it carries
+                    // DBS_UPDATE_USER_DATA (0x27CC) must never come from replay ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â it carries
                     // a reqId that only makes sense for the live request. DbProxy handles it.
                     if (rop == DbProxyHandlers.DBS_UPDATE_USER_DATA)
                     {
@@ -414,8 +414,14 @@ public sealed class WorldBridge
     /// <summary>LeaveWorldType/LogoutReason pair the real Arbiter sends for each leave path.</summary>
     public static (uint type, uint reason) LeaveValues(LeaveMode mode) => mode switch
     {
-        LeaveMode.Lobby => (3u, 0u),   // User::OnLeaveWorldTick, flag 0x3fe8 == 0
-        _ => (1u, 8u),                 // Exit / Disconnect, flag 0x3fe8 == 1
+        // From User::OnLeaveWorldTick (Arb_part_029.c): lobby branch sets (type=3, reason=0),
+        // exit/disconnect branch sets (type=1, reason=8). Confirmed by the WorldServer crash
+        // "Critical Error LeaveWorld type[1] reason[8]" when (1,8) was wrongly used for a lobby
+        // return. Do NOT change these without a matching WorldServer capture.
+        // Capture's working AS_LEAVE_WORLD used (1,8) for the button leave; the earlier crash
+        // was a duplicate leave (disconnect path re-sending after the button leave), now guarded
+        // in GameSession.LeaveWorld. Keep (1,8) to match the capture World accepts.
+        _ => (1u, 8u),
     };
 
     /// <summary>

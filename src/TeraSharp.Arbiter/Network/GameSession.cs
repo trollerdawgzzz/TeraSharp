@@ -139,6 +139,11 @@ public sealed class GameSession : IDisposable
     public void LeaveWorld()
     {
         if (!InWorld) return;
+        // If a lobby/exit leave already started (button press), World has already been told
+        // to leave and is despawning/despawned. A second AS_LEAVE_WORLD would hit World after
+        // the user is gone -> GetUser fails -> "Critical Error LeaveWorld" and a World crash.
+        // Only send the disconnect leave if no leave is in progress.
+        if (Interlocked.CompareExchange(ref _leaveFinished, 1, 0) == 1) { InWorld = false; return; }
         InWorld = false;
         _leaveFallback?.Cancel();
         var w = Program.World;
