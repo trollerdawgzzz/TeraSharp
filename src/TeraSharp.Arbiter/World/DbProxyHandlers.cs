@@ -251,7 +251,65 @@ public sealed class DbProxyHandlers
     public const ushort SDB_FATIGABILITY_LIST = 0x2908;     // -> 0x2909 (45B, reqId@9)
     public const ushort SDB_SEREN_GUIDE = 0x2942;           // -> 0x2943 (65B, reqId@8)
     public const ushort SDB_EP_PERK = 0x27B9;               // -> 0x27BA (113B, reqId@8)
-    public const ushort SDB_QUEST_LIST = 0x272C;            // -> 0x272D (1377B, reqId@49)
+    // --- Quests (T17). Layouts and the capture evidence: status/QUEST-DESIGN.md ---
+    //
+    // SDB_LOAD_QUEST_LIST (0x272C) -> DBS_LOAD_QUEST_LIST (0x272D)
+    //   req  [0] u32 reqId  [4] u32 playerId
+    //   rsp  53-byte header: six [u32 offset][u32 length] pairs, then [48] u8 ok, [49] u32 reqId
+    //        list 0  vector<QuestData>                 80 B each   <- what we serve
+    //        list 1  vector<QuestData>                             <- layout unverified
+    //        list 2  vector<int>                                   <- layout unverified
+    //        list 3  vector<DailyQuestSeed>            68 B each   <- GLOBAL, kept empty on purpose:
+    //                World then generates the seeds itself and sends the 17 0x2899 items we answer
+    //        list 4  vector<DailyQuestExCompleteCount>
+    //        list 5  a fixed 20-byte [u32][DateTime] trailer
+    //   Offsets are frame-relative, so an empty reply has every offset at 59 (= 6 + 53).
+    //   Ground truth for the empty case: cap_newchar.log seq 342, a 73-byte payload.
+    //
+    // SDB_SET_QUEST_INFO (0x272E) -> DBS_SET_QUEST_INFO (0x272F)
+    //   req  30-byte header: [0] u32 recordOff [4] u32 recordLen=80 [8] u32 atomOff
+    //                        [12] u32 atomLen [16] u32 reqId [20] u32 sqlType [24] u32 playerId
+    //                        [28] u8 [29] u8, then the 80-byte record, then reward atoms
+    //   rsp  29-byte header: the same four slots, [16] reqId, [20] sqlType, [24] u8 ok,
+    //                        [25] u32 questDbId, then the record and the atoms
+    //   The reply is NOT a plain echo: on an INSERT write (sqlType 22) the Arbiter allocates the
+    //   quest's DB id and returns it at [25]; World keeps it (DBStartQuestContext::SetQuestDbId)
+    //   and puts it in record+0 on every later write. Every other sqlType returns 0 there.
+    //   Reward atoms are the same 856-byte ItemTransactionAtom as 0x2768 and follow the same
+    //   rule: an op-7 insert arriving with item id 0 gets a fresh one (capture seq 1804: 0 -> 13).
+    //   Verified: all 28 request/response pairs in cap_newchar.log rebuild byte for byte.
+    public const ushort SDB_SET_QUEST_INFO = 0x272E; public const ushort DBS_SET_QUEST_INFO = 0x272F;
+    public const int QuestRecordSize = 80;
+    public const int QuestSetRequestHeader = 30;
+    public const int QuestSetReplyHeader = 29;
+    /// <summary>sqlType 22 = INSERT: the only write that gets a questDbId back.</summary>
+    public const uint QuestSqlTypeInsert = 22;
+    public const int QuestRecordDbIdOffset = 0;
+    public const int QuestRecordQuestIdOffset = 4;
+    public const int QuestRecordStatusOffset = 8;
+    public const int QuestRecordStepOffset = 12;
+
+    public const int QuestListReplyHeader = 53;
+    public const int QuestListOkOffset = 48;
+    public const int QuestListReqIdOffset = 49;
+    /// <summary>
+    /// List 5 of 0x272D: [u32 0][DateTime]. The "never" (1970-01-01) form the real Arbiter sent
+    /// for the brand-new character in cap_newchar.log seq 342. dob's relog carries a real date
+    /// there; we have nothing to put in it, and World accepted "never" for a character that had
+    /// not played.
+    /// </summary>
+    public static readonly byte[] QuestListTrailer =
+    {
+        0x00, 0x00, 0x00, 0x00, 0xB2, 0x07, 0x01, 0x00, 0x01, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    };
+    /// <summary>
+    /// playerId 1 is "dob", whose 1377-byte reply is in DbProxyStaticData. Keep serving it until
+    /// he has quest rows of his own, or his in-flight quest disappears from under him.
+    /// </summary>
+    public const int CapturedQuestPlayerId = 1;
+
+    public const ushort SDB_QUEST_LIST = 0x272C;            // -> 0x272D
     public const ushort SDB_USER_ACHIEVEMENT = 0x27F8;      // -> 0x27F9 (1501B, reqId@304)
 
 
@@ -450,6 +508,7 @@ public sealed class DbProxyHandlers
             case SDB_DAILY_QUEST:
             case SDB_DAILY_QUEST_SEED:
             case SDB_UPDATE_EXP_LEVEL:   // 0x273C = [reqId][ok]; also writes level/exp to the row
+            case SDB_SET_QUEST_INFO:     // 0x272F: quest write, allocates the questDbId
             case SDB_QUEST_LIST:
             // Post-seed-burst steps (lobby_tap.log 02:51:11.15x): 0x2910 -> 0x290C -> 0x27B9.
             // These MUST echo the live DLM id. The replay table attributed 0x290D to the
@@ -502,6 +561,7 @@ public sealed class DbProxyHandlers
             case SDB_USER_LOAD_INVENTORY: return OnLoadInventory(link, payload);
             case AS_PROMOTION_LIST_REQ: return OnPromotionListRequest(link);
             case SDB_UPDATE_EXP_LEVEL: return OnUpdateExpLevel(link, payload);
+            case SDB_SET_QUEST_INFO: return OnSetQuestInfo(link, payload);
 
             // --- Logout save sequence (reqId echoed from the live request) ---
             case SDB_SAVE_27FA: link.SendFrame(DBS_SAVE_27FB, BuildReqIdAck(payload, 280)); return true;
@@ -627,7 +687,7 @@ public sealed class DbProxyHandlers
             case SDB_FATIGABILITY_LIST:   link.SendFrame(0x2909, BuildFromStaticData(DbProxyStaticData.Fatigability, DbProxyStaticData.FatigabilityReqIdOffset, payload)); return true;
             case SDB_SEREN_GUIDE:         link.SendFrame(0x2943, BuildFromStaticData(DbProxyStaticData.SerenGuide, DbProxyStaticData.SerenGuideReqIdOffset, payload)); return true;
             case SDB_EP_PERK:             link.SendFrame(0x27BA, BuildFromStaticData(DbProxyStaticData.EpPerk, DbProxyStaticData.EpPerkReqIdOffset, payload)); return true;
-            case SDB_QUEST_LIST:          link.SendFrame(0x272D, BuildFromStaticData(DbProxyStaticData.QuestListEmpty, DbProxyStaticData.QuestListEmptyReqIdOffset, payload)); return true;
+            case SDB_QUEST_LIST:          return OnLoadQuestList(link, payload);
             case SDB_USER_ACHIEVEMENT:    link.SendFrame(0x27F9, BuildFromStaticData(DbProxyStaticData.Achievement, DbProxyStaticData.AchievementReqIdOffset, payload)); return true;
 
             default:
@@ -803,6 +863,151 @@ public sealed class DbProxyHandlers
 
         link.SendFrame(DBS_SAVE_2769, reply);
         return true;
+    }
+
+    // ---- Quests: SDB_SET_QUEST_INFO (0x272E) / SDB_LOAD_QUEST_LIST (0x272C) ----
+
+    /// <summary>
+    /// One quest write. Stores the 80-byte record last-write-wins on (playerId, questId) and
+    /// replies with the questDbId the row got. See the constants above for the layout.
+    /// </summary>
+    private bool OnSetQuestInfo(WorldLink link, byte[] payload)
+    {
+        if (payload.Length < QuestSetRequestHeader)
+        {
+            _log.LogWarning("SDB_SET_QUEST_INFO too short ({Len} B)", payload.Length);
+            return false;
+        }
+        int recordOffset = (int)BitConverter.ToUInt32(payload, 0) - 6;
+        int recordLength = (int)BitConverter.ToUInt32(payload, 4);
+        uint sqlType = BitConverter.ToUInt32(payload, 20);
+        int playerId = (int)BitConverter.ToUInt32(payload, 24);
+
+        if (recordLength != QuestRecordSize || recordOffset < 0 || recordOffset + recordLength > payload.Length)
+        {
+            // Reply anyway: an unanswered per-user DB item head-blocks the whole queue
+            // (status/HANDOFF.md section 1). Just do not invent a row from a record we cannot read.
+            _log.LogWarning("SDB_SET_QUEST_INFO: bad quest record (offset {Off}, length {Len}, payload {P}) for player {Pid} - acking without storing",
+                recordOffset + 6, recordLength, payload.Length, playerId);
+            link.SendFrame(DBS_SET_QUEST_INFO, BuildDbs272F(payload, questDbId: 0, _store.NextItemId));
+            return true;
+        }
+
+        var record = new byte[QuestRecordSize];
+        Array.Copy(payload, recordOffset, record, 0, QuestRecordSize);
+        int questId = (int)BitConverter.ToUInt32(record, QuestRecordQuestIdOffset);
+        int status = (int)BitConverter.ToUInt32(record, QuestRecordStatusOffset);
+        int step = (int)BitConverter.ToUInt32(record, QuestRecordStepOffset);
+
+        int questDbId = _store.UpsertQuest(playerId, questId, status, step, record);
+        _log.LogDebug("SDB_SET_QUEST_INFO: player {Pid} quest {Q} sqlType {T} status {S} step {P} -> questDbId {Db}",
+            playerId, questId, sqlType, status, step, questDbId);
+
+        // Only an INSERT write is told the id; every other write already carries it in record+0.
+        link.SendFrame(DBS_SET_QUEST_INFO,
+            BuildDbs272F(payload, sqlType == QuestSqlTypeInsert ? questDbId : 0, _store.NextItemId));
+        return true;
+    }
+
+    /// <summary>
+    /// DBS_SET_QUEST_INFO (0x272F): the request's quest record and reward atoms under the
+    /// 29-byte reply header, with <paramref name="questDbId"/> at [25] and freshly allocated item
+    /// ids in any op-7 atom that arrived with 0 (the same rule as <see cref="BuildDbs2769"/>;
+    /// <paramref name="allocateItemId"/> is called once per such atom).
+    /// </summary>
+    public static byte[] BuildDbs272F(byte[] request, int questDbId, Func<int> allocateItemId)
+    {
+        ArgumentNullException.ThrowIfNull(allocateItemId);
+        byte[] record = SliceQuestRecord(request);
+        byte[] atoms = CloneAtomList(request, 8, allocateItemId);
+
+        var r = new byte[QuestSetReplyHeader + record.Length + atoms.Length];
+        uint recordOffset = 6 + QuestSetReplyHeader;                  // 35, frame-relative
+        BitConverter.GetBytes(recordOffset).CopyTo(r, 0);
+        BitConverter.GetBytes((uint)record.Length).CopyTo(r, 4);
+        BitConverter.GetBytes(recordOffset + (uint)record.Length).CopyTo(r, 8);
+        BitConverter.GetBytes((uint)atoms.Length).CopyTo(r, 12);
+        if (request.Length >= 24) Array.Copy(request, 16, r, 16, 8);  // reqId, sqlType
+        r[24] = 1;                                                    // ok — 1 on every captured reply
+        BitConverter.GetBytes(questDbId).CopyTo(r, 25);
+        record.CopyTo(r, QuestSetReplyHeader);
+        atoms.CopyTo(r, QuestSetReplyHeader + record.Length);
+        return r;
+    }
+
+    private static byte[] SliceQuestRecord(byte[] request)
+    {
+        if (request.Length < QuestSetRequestHeader) return Array.Empty<byte>();
+        int off = (int)BitConverter.ToUInt32(request, 0) - 6;
+        int len = (int)BitConverter.ToUInt32(request, 4);
+        if (len != QuestRecordSize || off < 0 || off + len > request.Length) return Array.Empty<byte>();
+        var r = new byte[len];
+        Array.Copy(request, off, r, 0, len);
+        return r;
+    }
+
+    /// <summary>
+    /// One quest-list load. Rebuilds the reply from the character's stored rows; falls back to
+    /// the captured 1377-byte reply for dob (playerId 1) until he has rows of his own.
+    /// </summary>
+    private bool OnLoadQuestList(WorldLink link, byte[] payload)
+    {
+        uint reqId = payload.Length >= 4 ? BitConverter.ToUInt32(payload, 0) : 0;
+        int playerId = payload.Length >= 8 ? (int)BitConverter.ToUInt32(payload, 4) : 0;
+
+        if (_store is null || (playerId == CapturedQuestPlayerId && _store.CountQuests(playerId) == 0))
+        {
+            link.SendFrame(0x272D, BuildFromStaticData(
+                DbProxyStaticData.QuestListEmpty, DbProxyStaticData.QuestListEmptyReqIdOffset, payload));
+            return true;
+        }
+
+        var active = _store.GetActiveQuestRecords(playerId);
+        var completed = _store.GetCompletedQuestIds(playerId);
+        if (completed.Count > 0)
+            _log.LogWarning(
+                "SDB_LOAD_QUEST_LIST: player {Pid} has {N} completed quest(s) ({Ids}) STORED BUT NOT SERVED - "
+                + "the 0x272D list 1/2 layout is unverified (status/QUEST-DESIGN.md); World will offer them again",
+                playerId, completed.Count, string.Join(", ", completed));
+
+        _log.LogInformation("SDB_LOAD_QUEST_LIST: player {Pid} -> {N} active quest(s)", playerId, active.Count);
+        link.SendFrame(0x272D, BuildDbs272D(active, reqId));
+        return true;
+    }
+
+    /// <summary>
+    /// DBS_LOAD_QUEST_LIST (0x272D) built from stored rows: list 0 is the active quest records,
+    /// lists 1-4 are empty (list 3 deliberately so — World then seeds itself and sends the 17
+    /// 0x2899 items we answer), list 5 is the "never" trailer. With no rows this is
+    /// byte-identical to cap_newchar.log seq 342.
+    /// </summary>
+    public static byte[] BuildDbs272D(IReadOnlyList<byte[]> activeQuestRecords, uint reqId)
+    {
+        ArgumentNullException.ThrowIfNull(activeQuestRecords);
+        int listLength = activeQuestRecords.Count * QuestRecordSize;
+        var r = new byte[QuestListReplyHeader + listLength + QuestListTrailer.Length];
+
+        uint bodyStart = 6 + QuestListReplyHeader;                 // 59, frame-relative
+        uint afterList0 = bodyStart + (uint)listLength;
+        BitConverter.GetBytes(bodyStart).CopyTo(r, 0);
+        BitConverter.GetBytes((uint)listLength).CopyTo(r, 4);
+        for (int slot = 1; slot <= 4; slot++)                      // lists 1-4: empty, same offset
+            BitConverter.GetBytes(afterList0).CopyTo(r, slot * 8);
+        BitConverter.GetBytes(afterList0).CopyTo(r, 40);           // list 5: the trailer
+        BitConverter.GetBytes((uint)QuestListTrailer.Length).CopyTo(r, 44);
+        r[QuestListOkOffset] = 1;
+        BitConverter.GetBytes(reqId).CopyTo(r, QuestListReqIdOffset);
+
+        int at = QuestListReplyHeader;
+        foreach (var rec in activeQuestRecords)
+        {
+            if (rec.Length != QuestRecordSize)
+                throw new ArgumentException($"quest record must be {QuestRecordSize} bytes, got {rec.Length}", nameof(activeQuestRecords));
+            rec.CopyTo(r, at);
+            at += QuestRecordSize;
+        }
+        QuestListTrailer.CopyTo(r, at);
+        return r;
     }
 
     /// <summary>
@@ -1716,9 +1921,29 @@ public sealed class DbProxyHandlers
             _log.LogWarning("SDB_USER_LOAD_INVENTORY: starter_inventory.bin not found - falling back to replay (World will reject it for player {Pid})", playerId);
             return false;
         }
+        // T14: the kit the real Arbiter would have created for this character's class
+        // (CreateCharData.xml). Falls back to the captured glaiver list when we do not know the
+        // class — an unknown class is better served the six items that are live-verified to get
+        // past SA_ENTER_WORLD_FAILED than nothing at all.
+        // _store is null in the pure-protocol unit tests; a class kit needs the row.
+        var chr = _store is null ? null : _store.GetCharacter(playerId);
+        int classId = chr?.Class ?? -1;
+        var kit = StarterInventory.Build(template, classId, playerId, reqId);
+
         link.SendFrame(DBS_USER_LOAD_POCKET_DATA, BuildEmptyListType1(payload, 0));
-        link.SendFrame(DBS_USER_LOAD_INVENTORY, BuildStarterInventory(template, reqId, (uint)playerId));
-        _log.LogInformation("SDB_USER_LOAD_INVENTORY: player {Pid} -> starter inventory (6 items, owner patched)", playerId);
+        if (kit != null)
+        {
+            link.SendFrame(DBS_USER_LOAD_INVENTORY, kit);
+            _log.LogInformation("SDB_USER_LOAD_INVENTORY: player {Pid} -> {N} starter items for class {Cls} ({Name})",
+                playerId, StarterInventory.ForClass(classId)!.Count, classId,
+                classId >= 0 && classId < StarterInventory.ClassNames.Length ? StarterInventory.ClassNames[classId] : "?");
+        }
+        else
+        {
+            link.SendFrame(DBS_USER_LOAD_INVENTORY, BuildStarterInventory(template, reqId, (uint)playerId));
+            _log.LogWarning("SDB_USER_LOAD_INVENTORY: player {Pid} has no class kit (class {Cls}) - serving the captured glaiver list",
+                playerId, classId);
+        }
         return true;
     }
 

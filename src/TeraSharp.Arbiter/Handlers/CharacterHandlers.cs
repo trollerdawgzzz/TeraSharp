@@ -76,21 +76,42 @@ public sealed class CharacterHandlers
     // ---- Start position ----
 
     /// <summary>
-    /// Where a brand-new character starts.
+    /// Where a brand-new character starts, from
+    /// <c>Executable\Datasheet\CreateCharData.xml</c> (T16).
     ///
-    /// <para>The real Arbiter reads this per class from its CharacterData tables
-    /// (<c>Handler_C_CREATE_USER</c> calls FUN_1409ab7c0(charDataMgr, class, out) and uses the
-    /// zone+x/y/z it returns, falling back to FUN_1409acbb0(race, gender, class)). We do not
-    /// have those tables, so <b>every class currently gets the one start position we have
-    /// ground truth for</b>: zone 5, (16260, 1253, -4410) — the values in the starter blob the
-    /// real server sent for "Test" (cap_newchar.log packet 133). Replace this with a per-class
-    /// table when one is extracted; the shape of the method is already per-class.</para>
+    /// <para>The real Arbiter resolves this in <c>CreateUserCallback</c> in two steps. It first
+    /// asks <c>DatasheetManager::GetCreateCharData(classId, out)</c> for the class row and uses
+    /// that row's <c>&lt;InitPos&gt;</c> — but only if the row carries a non-zero continent AND a
+    /// non-zero x/y/z. Otherwise it falls back to
+    /// <c>DatasheetManager::GetInitLocData(race, gender, class, out)</c>, which scans
+    /// <c>&lt;InitLoc&gt;</c> for a row whose race/gender/class bitmasks all match and, failing
+    /// that, takes the row flagged <c>default</c>.</para>
+    ///
+    /// <para>In the shipped datasheet that resolves to exactly two answers. Only one of the 13
+    /// classes has an <c>&lt;InitPos&gt;</c>:</para>
+    /// <code>
+    ///   &lt;Char class="soulless" createdLevel="50" firstInvenSize="48"&gt;
+    ///     &lt;InitPos continent="7087" pos="-48077,-52002,642" dist="0" dir="-111"/&gt;
+    /// </code>
+    /// <para>and there is a single <c>&lt;InitLoc default="true"&gt;</c> with
+    /// <c>continent="5" pos="16260,1253,-4410" dist="100" dir="-18"</c>. Because that one row is
+    /// the default, <c>GetInitLocData</c> returns it for every (race, gender, class) — so race
+    /// and gender cannot change the answer with this data, and this method does not take a
+    /// gender. Add the parameter if a gendered <c>&lt;InitLoc&gt;</c> row ever appears.</para>
+    ///
+    /// <para>The default is also exactly the position in the starter blob the real server sent
+    /// for "Test" (cap_newchar.log packet 133), which is where this value came from before the
+    /// datasheet was found — so nothing changes for the 12 non-soulless classes.</para>
+    ///
+    /// <para>Not modelled: the datasheet's <c>dist</c> (spawn scatter radius) and <c>dir</c>
+    /// (facing). The real Arbiter carries both into the new character's row; we have no field
+    /// for either, and the blob offsets for them are unidentified.</para>
     /// </summary>
     internal static (int Zone, float X, float Y, float Z) StartPositionFor(int race, int cls)
     {
         // Experiment knob (2026-09-14): TERASHARP_START_OVERRIDE="zone,x,y,z", e.g. "7005,2679.8,9148,1870"
         // (dob's Velika position). Used to isolate "first enter into a fresh World fails for zone-5
-        // characters". Remove once a per-class start table exists.
+        // characters". Wins over the datasheet so it can still be used to bisect a live problem.
         var ov = Environment.GetEnvironmentVariable("TERASHARP_START_OVERRIDE");
         if (!string.IsNullOrWhiteSpace(ov))
         {
@@ -102,8 +123,18 @@ public sealed class CharacterHandlers
                 && float.TryParse(p[3], System.Globalization.NumberStyles.Float, inv, out var ozz))
                 return (oz, ox, oy, ozz);
         }
-        return (5, 16260f, 1253f, -4410f);
+
+        return cls == SoullessClassId ? SoullessStart : DefaultStart;
     }
+
+    /// <summary>Class id 8 — the one class with its own <c>&lt;InitPos&gt;</c>.</summary>
+    internal const int SoullessClassId = 8;
+
+    /// <summary><c>&lt;InitLoc default="true"&gt;</c>: Island of Dawn.</summary>
+    internal static readonly (int Zone, float X, float Y, float Z) DefaultStart = (5, 16260f, 1253f, -4410f);
+
+    /// <summary><c>&lt;Char class="soulless"&gt;&lt;InitPos&gt;</c>.</summary>
+    internal static readonly (int Zone, float X, float Y, float Z) SoullessStart = (7087, -48077f, -52002f, 642f);
 
     // ---- Name validation ----
 

@@ -593,6 +593,22 @@ CREATE TABLE IF NOT EXISTS blocks (
   PRIMARY KEY (character_id, blocked_id)
 );
 
+CREATE TABLE IF NOT EXISTS quests (
+  -- id is the questDbId the Arbiter returns on an INSERT write (sqlType 22) and that World then
+  -- carries in every later write for the quest (DBStartQuestContext::SetQuestDbId). It has to be
+  -- persistent, so it is the row id, not a counter: a process counter would hand World a
+  -- different id for the same quest after a restart.
+  id         INTEGER PRIMARY KEY,
+  owner_id   INTEGER NOT NULL REFERENCES characters(id),
+  quest_id   INTEGER NOT NULL,
+  status     INTEGER NOT NULL,          -- record+8:  1 = in progress, 2 = complete
+  step       INTEGER NOT NULL,          -- record+12
+  record     BLOB    NOT NULL,          -- the raw 80-byte QuestData, last write wins
+  updated_at TEXT    NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (owner_id, quest_id)
+);
+CREATE INDEX IF NOT EXISTS ix_quests_owner ON quests(owner_id);
+
 -- Monotonic id sequences the DB-proxy layer hands to WorldServer. Not SQLite rowids: the
 -- values leave the process (DBS_ITEM_SINGLE returns them to World, which keys its in-memory
 -- items by them), so they must keep climbing across restarts even with no table behind them.
@@ -846,6 +862,106 @@ SELECT last_insert_rowid();";
             cmd.Parameters.AddWithValue("$z", z);
             cmd.Parameters.AddWithValue("$id", characterId);
             cmd.ExecuteNonQuery();
+        }
+    }
+
+    // ---- Quests (T17) ----
+
+    /// <summary>Status value meaning "completed" in the 80-byte record at +8.</summary>
+    public const int QuestStatusComplete = 2;
+
+    /// <summary>
+    /// Last-write-wins upsert of one quest, keyed (owner, quest). Returns the row id, which is
+    /// the <c>questDbId</c> the 0x272F reply carries back on an INSERT write — see
+    /// status/QUEST-DESIGN.md. The id is allocated on the first write for a quest and never
+    /// changes after, so World's copy stays valid across restarts.
+    /// </summary>
+    public int UpsertQuest(int ownerId, int questId, int status, int step, byte[] record)
+    {
+        ArgumentNullException.ThrowIfNull(record);
+        lock (_lock)
+        {
+            int id;
+            using (var sel = _db.CreateCommand())
+            {
+                sel.CommandText = "SELECT id FROM quests WHERE owner_id = $o AND quest_id = $q";
+                sel.Parameters.AddWithValue("$o", ownerId);
+                sel.Parameters.AddWithValue("$q", questId);
+                var existing = sel.ExecuteScalar();
+                id = existing is null or DBNull ? 0 : Convert.ToInt32(existing);
+            }
+
+            using var cmd = _db.CreateCommand();
+            if (id != 0)
+            {
+                cmd.CommandText =
+                    "UPDATE quests SET status = $s, step = $p, record = $r, updated_at = datetime('now') WHERE id = $id";
+                cmd.Parameters.AddWithValue("$id", id);
+            }
+            else
+            {
+                cmd.CommandText =
+                    "INSERT INTO quests(owner_id, quest_id, status, step, record) VALUES($o, $q, $s, $p, $r); " +
+                    "SELECT last_insert_rowid();";
+                cmd.Parameters.AddWithValue("$o", ownerId);
+                cmd.Parameters.AddWithValue("$q", questId);
+            }
+            cmd.Parameters.AddWithValue("$s", status);
+            cmd.Parameters.AddWithValue("$p", step);
+            cmd.Parameters.AddWithValue("$r", record);
+
+            if (id != 0) { cmd.ExecuteNonQuery(); return id; }
+            id = Convert.ToInt32(cmd.ExecuteScalar()!);
+            _log.LogInformation("Quest {Q} started for character {Id} (questDbId {Db})", questId, ownerId, id);
+            return id;
+        }
+    }
+
+    /// <summary>
+    /// The raw 80-byte records for a character's quests that are still in progress, oldest row
+    /// first. Completed quests are deliberately excluded: nothing in any capture shows where the
+    /// 0x272D reply puts them (status/QUEST-DESIGN.md).
+    /// </summary>
+    public List<byte[]> GetActiveQuestRecords(int ownerId)
+    {
+        lock (_lock)
+        {
+            var list = new List<byte[]>();
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT record FROM quests WHERE owner_id = $o AND status <> $c ORDER BY id";
+            cmd.Parameters.AddWithValue("$o", ownerId);
+            cmd.Parameters.AddWithValue("$c", QuestStatusComplete);
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) list.Add((byte[])r["record"]);
+            return list;
+        }
+    }
+
+    /// <summary>Quest ids this character has completed — stored, but not served yet.</summary>
+    public List<int> GetCompletedQuestIds(int ownerId)
+    {
+        lock (_lock)
+        {
+            var list = new List<int>();
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT quest_id FROM quests WHERE owner_id = $o AND status = $c ORDER BY id";
+            cmd.Parameters.AddWithValue("$o", ownerId);
+            cmd.Parameters.AddWithValue("$c", QuestStatusComplete);
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) list.Add(r.GetInt32(0));
+            return list;
+        }
+    }
+
+    /// <summary>Total quest rows for a character, of any status.</summary>
+    public int CountQuests(int ownerId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT COUNT(*) FROM quests WHERE owner_id = $o";
+            cmd.Parameters.AddWithValue("$o", ownerId);
+            return (int)(long)cmd.ExecuteScalar()!;
         }
     }
 
