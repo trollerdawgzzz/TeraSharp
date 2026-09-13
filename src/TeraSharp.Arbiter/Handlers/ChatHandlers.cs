@@ -41,12 +41,12 @@ public sealed class ChatHandlers
     /// <summary>Channels that broadcast to every connected session.</summary>
     internal static bool IsBroadcastChannel(uint channel) => channel switch
     {
-        (uint)ChatChannel.Say       => true,  // proximity → broadcast (no spatial yet)
+        (uint)ChatChannel.Say       => true,  // proximity Ã¢â€ â€™ broadcast (no spatial yet)
         (uint)ChatChannel.Area      => true,  // zone-wide
         (uint)ChatChannel.Trade     => true,  // global
         (uint)ChatChannel.Megaphone => true,  // global shout
         (uint)ChatChannel.Global    => true,  // global
-        (uint)ChatChannel.Emote     => true,  // proximity → broadcast (no spatial yet)
+        (uint)ChatChannel.Emote     => true,  // proximity Ã¢â€ â€™ broadcast (no spatial yet)
         (uint)ChatChannel.Lfg       => true,  // global
         _ => false,
     };
@@ -64,22 +64,36 @@ public sealed class ChatHandlers
         string plain = StripFont(message);
         _log.LogInformation("[CHAT ch={Ch}] {Name}: {Msg}", channel, name, plain);
 
-        // Server commands
+        // Server commands (handled locally, both modes)
         if (plain.StartsWith("!"))
         {
             HandleCommand(s, plain[1..].Trim());
             return true;
         }
 
+        // IN-WORLD: the real Arbiter forwards C_CHAT to WorldServer, which broadcasts and
+        // sends S_CHAT back through the tunnel (0x13F7). Verified in the Arbiter<->World tap:
+        // S_CHAT arrives wrapped in 0x13F7, never as a direct Arbiter packet. A direct S_CHAT
+        // injection does NOT render in-world (the client reads chat from the tunnel stream;
+        // that's why !test/S_SYSTEM_MESSAGE showed but chat didn't). So forward to World.
+        if (s.InWorld)
+        {
+            if (s.Opcodes.TryGetCode("C_CHAT", out ushort cop))
+            {
+                var pkt = new byte[body.Length + 4];
+                pkt[0] = (byte)pkt.Length; pkt[1] = (byte)(pkt.Length >> 8);
+                pkt[2] = (byte)cop; pkt[3] = (byte)(cop >> 8);
+                body.Span.CopyTo(pkt.AsSpan(4));
+                s.ForwardToWorld(pkt);
+            }
+            return true;
+        }
+
+        // STANDALONE (no World): handle locally so chat still works offline.
         if (IsBroadcastChannel(channel))
-        {
             BroadcastChat(s, channel, message);
-        }
         else
-        {
-            // Party/Guild/Raid/Private: echo to sender (no membership tracking yet)
             SendChat(s, channel, s.GameId, name, message);
-        }
         return true;
     }
 

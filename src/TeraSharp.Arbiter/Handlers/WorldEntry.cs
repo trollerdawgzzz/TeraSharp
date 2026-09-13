@@ -9,7 +9,7 @@ namespace TeraSharp.Arbiter.Handlers;
 /// <summary>
 /// When WorldServer is connected, character select hands the player over to
 /// the real WorldServer. Arbiter first acknowledges the selection to the client
-/// (S_SELECT_USER + content flags — these are Arbiter-owned), then sends
+/// (S_SELECT_USER + content flags â€” these are Arbiter-owned), then sends
 /// 0x138E (player enter) + 0x2738 (char data) to World, which drives the rest
 /// via the 0x13F7 tunnel.
 /// </summary>
@@ -23,7 +23,7 @@ public static class WorldEntry
         var chr = s.SelectedCharacter;
         if (chr == null) { log.LogWarning("EnterWorld: no selected character"); return false; }
 
-        // 1. Arbiter-side acknowledgement — closes the character select screen.
+        // 1. Arbiter-side acknowledgement â€” closes the character select screen.
         s.SendByDef("S_SELECT_USER", new Dictionary<string, object>
         {
             ["unk1"] = 1, ["unk2"] = 0, ["unk3"] = 72339069014638592UL,
@@ -45,7 +45,7 @@ public static class WorldEntry
         //    RegisterPlayer (inside EnterWorld) creates a fresh reorder buffer.
         s.EnterWorld();
 
-        // 4. Tell World about the player — built from character data, not replayed.
+        // 4. Tell World about the player â€” built from character data, not replayed.
         var enterPayload = BuildEnterWorldPayload(s.GameId, chr, s.TunnelKey);
         w.SendFrame(WorldBridge.OpPlayerEnter, enterPayload);
 
@@ -54,6 +54,14 @@ public static class WorldEntry
         var record = store?.GetCharacter((int)chr.Id);
         var charDataPayload = BuildCharacterDataPayload((int)chr.Id, record?.WorldBlob);
         w.SendFrame(WorldBridge.OpCharacterData, charDataPayload);
+
+        // Chat/UI settings are Arbiter-owned and World never sends them. Without the chat-option
+        // setting the client's chat window has no channel tabs configured, so S_CHAT arrives but
+        // never renders (system messages use a separate UI path, which is why !test showed but
+        // chat didn't). Send them here so the chat window initializes in World mode too.
+        ClientSettingsHandlers.SendUserSetting(s);
+        ClientSettingsHandlers.SendUiSetting(s);
+        ClientSettingsHandlers.SendChatOption(s);
 
         log.LogInformation("Handed session {Id} to WorldServer (gameId {G}, char '{Name}')",
             s.Id, s.GameId, chr.Name);
@@ -92,12 +100,12 @@ public static class WorldEntry
         w.U32(6 + 167);                     // off3: frame-relative offset to raw data (=173)
         w.U32(16);                          // off4: raw data length
 
-        // [16..23] Opaque handle 1 — Account::GetClientSession() pointer (WorldSession+0x768).
+        // [16..23] Opaque handle 1 â€” Account::GetClientSession() pointer (WorldSession+0x768).
         //          World stores it, echoes it in some SA_ messages, but does not use it for
         //          routing. Zero is safe for a private server.
         w.U64(0);
 
-        // [24..31] Opaque handle 2 — User struct 'this' pointer in the real Arbiter.
+        // [24..31] Opaque handle 2 â€” User struct 'this' pointer in the real Arbiter.
         //          World echoes this in SA_ messages (e.g. 0x1626).  We send gameId so
         //          WorldBridge can route by it when multi-player lands.
         w.U64(gameId);
@@ -190,7 +198,7 @@ public static class WorldEntry
         // [167..182] Raw data (16 bytes from WorldSession+0x3f48). Zeros for a fresh
         //            session; World populates from the blob.
         // Capture: 00 3C 10 B8 00 00 00 00 00 00 00 00 00 00 00 00
-        // Use zeros — World re-reads from blob anyway.
+        // Use zeros â€” World re-reads from blob anyway.
 
         return buf;
     }

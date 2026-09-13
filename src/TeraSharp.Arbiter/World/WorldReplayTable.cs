@@ -79,6 +79,16 @@ public sealed class WorldReplayTable
             if (fromWorld)
             {
                 if (op is WorldBridge.OpTunnelToClient or WorldBridge.OpHeartbeat14 or WorldBridge.OpHeartbeat6) continue;
+                // World replies to Arbiter-initiated pushes, never requests. In arb_world.log the
+                // Arbiter's 0x290D (DBS reply to 0x290C, carrying a DLM id) happened to follow
+                // 0x143F, so it was attributed here and replayed with the captured id, which
+                // head-blocked the 0x290C DLMItem. Seal whatever is pending and never map these.
+                if (op is 0x143F /* SA_UPDATE_FIELD_POINT */)
+                {
+                    if (pending != null) sealedOps.Add(pendingOp);
+                    pending = null;
+                    continue;
+                }
                 if (pending != null) sealedOps.Add(pendingOp);
                 if (table._byRequest.ContainsKey(op)) { pending = null; continue; } // already captured
                 pending = new Entry { RequestBody = body };

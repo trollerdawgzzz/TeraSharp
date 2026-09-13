@@ -109,7 +109,7 @@ public sealed class DbProxyHandlers
     public const ushort SDB_LOAD_REFER_A_FRIEND = 0x28B0;  // -> 0x28B1: two empty lists + [ok][reqId] + 20 zeros
     public const ushort SDB_LOAD_2975 = 0x2975;            // -> 0x2976: 16 zeros + [reqId][ok] + 20 zeros
     public const ushort SDB_LOAD_2986 = 0x2986;            // -> 0x2987: 32 zeros + [reqId][ok] + trailing (16B request)
-    public const ushort SDB_LOAD_290C = 0x290C;            // -> multi-reply: 0x15B1 + 0x2847 + 0x143E + 0x290D
+    public const ushort SDB_LOAD_290C = 0x290C;            // -> pushes 0x15B1 + 0x2847 + 0x1440 + 0x143E, then 0x290D
 
     // --- Remaining login-time SDB_* (static data from capture, reqId patched at runtime) ---
     public const ushort SDB_TUTORIAL_SIMPLE_TIP = 0x2872;   // -> 0x2873 (45B, reqId@8)
@@ -148,6 +148,13 @@ public sealed class DbProxyHandlers
             case SDB_DAILY_QUEST:
             case SDB_DAILY_QUEST_SEED:
             case SDB_QUEST_LIST:
+            // Post-seed-burst steps (lobby_tap.log 02:51:11.15x): 0x2910 -> 0x290C -> 0x27B9.
+            // These MUST echo the live DLM id. The replay table attributed 0x290D to the
+            // World push-reply 0x143F (which carries no id), so it went out with the captured
+            // id, DLMExistManager::Find missed, and the 0x290C item head-blocked the user.
+            case SDB_LOAD_FRIEND_INFO:   // 0x2911 = [01][reqId]  (capture: 01 3D 00 00 00)
+            case SDB_LOAD_290C:          // 0x290D = [01][reqId]  (capture: 01 3E 00 00 00)
+            case SDB_EP_PERK:            // 0x27BA = static, reqId@8 (capture: 05.. 27.. 3F 00 00 00)
                 break;               // handled by the real switch below
             default:
                 return false;        // -> replay table
@@ -213,9 +220,14 @@ public sealed class DbProxyHandlers
             case SDB_LOAD_2986: link.SendFrame(0x2987, Build2987(payload)); return true;
             case SDB_LOAD_290C:
             {
+                // Real Arbiter (lobby_tap.log 02:51:10.846-.870) pushes, in this order:
+                //   0x15B1 AS_ACQUIRE_FRIENDSHIP_GAGE, 0x2847, 0x1440 AS_RESET_FIELD_POINT_COMPLETE,
+                //   0x143E AS_USER_FIELD_POINT_INFO  (World answers 0x143F, no reply needed)
+                // then 0x290D [01][reqId] (02:51:11.173: 01 3E 00 00 00).
                 uint pid = payload.Length >= 8 ? BitConverter.ToUInt32(payload, 4) : 0;
                 link.SendFrame(0x15B1, Build15B1(pid));
                 link.SendFrame(0x2847, Build2847(pid));
+                link.SendFrame(0x1440, Build1440(pid));
                 link.SendFrame(0x143E, Build143E(pid));
                 link.SendFrame(0x290D, BuildOkReqId(payload, 0));
                 return true;
@@ -605,6 +617,9 @@ public sealed class DbProxyHandlers
         BitConverter.GetBytes(playerId).CopyTo(r, 0);
         return r;
     }
+
+    /// <summary>AS_RESET_FIELD_POINT_COMPLETE (0x1440): [u32 playerId] — 4 bytes (capture: 01 00 00 00).</summary>
+    public static byte[] Build1440(uint playerId) => BitConverter.GetBytes(playerId);
 
     /// <summary>0x2847: [u64 0][u32 playerId] — 12 bytes.</summary>
     public static byte[] Build2847(uint playerId)
