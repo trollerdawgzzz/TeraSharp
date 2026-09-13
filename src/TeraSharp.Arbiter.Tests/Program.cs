@@ -1661,4 +1661,350 @@ array items
         Hex.True(body[48] == 1, "u8 success at payload[48]");
         Hex.True(BitConverter.ToUInt32(body, 49) == 0x63, "reqId echoed at payload[49]");
     }
+
+    // =====================================================================
+    // T1 — byte-exact tests for the handlers that unblock the per-user DLM
+    // queue (the ones made real for the logout/relog fix).
+    //
+    // Ground truth: D:\packetlogs\lobby_tap.log, real ArbiterServer, login +
+    // logout-button lobby return + relog, 2026-09-13T02:51:10–02:52:07.
+    // Frame = [u32 len][u16 op][payload]; the bytes below are PAYLOADS
+    // (frame len - 6), reframed from the tap's TCP chunks.
+    //
+    // Every one of these replies carries a DLM id (WorldServer.exe.c:3510311
+    // DLMItem::CompleteMyself is only reached when DLMExistManager::Find hits).
+    // A reply that echoes the CAPTURED id instead of the live one misses that
+    // lookup, the item never completes, and every later per-user DB message for
+    // that user — including UserLeaveWorld, the only emitter of SA_LEAVE_WORLD —
+    // head-blocks for the life of the World process. So each handler gets two
+    // tests: the captured bytes, and a live-id echo that must differ from the
+    // capture.
+    // =====================================================================
+
+    /// <summary>
+    /// Runs one DbProxyHandlers.TryHandle against a real WorldLink wired to a loopback
+    /// socket pair, and returns the frames the handler actually put on the wire, in order.
+    /// WorldLink is sealed and writes straight to its socket (and drops everything when the
+    /// socket is not connected), so a real pair is the only way to capture its output
+    /// without touching the human-owned WorldBridge.cs.
+    /// </summary>
+    static List<(ushort op, byte[] body)> RunHandler(ushort op, byte[] requestPayload, int expectedFrames)
+    {
+        var log = QuietLog();
+        using var listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        listener.Bind(new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, 0));
+        listener.Listen(1);
+
+        using var client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        client.Connect((System.Net.IPEndPoint)listener.LocalEndPoint!);
+        using var peer = listener.Accept();
+
+        var bridge = new WorldBridge(WorldReplayTable.Load("/nonexistent", log), log);
+        var link = new WorldLink(1, client, bridge, log);
+        var handlers = new DbProxyHandlers(null!, log);   // these handlers never touch the store
+
+        Hex.True(handlers.TryHandle(bridge, link, op, requestPayload),
+            $"0x{op:X4} must be in the TryHandle allow-list (the FIRST switch) — "
+            + "anything not listed there falls through to the replay table and goes out "
+            + "with the captured DLM id");
+
+        var buf = new List<byte>();
+        var tmp = new byte[1 << 16];
+        var frames = new List<(ushort op, byte[] body)>();
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (sw.ElapsedMilliseconds < 3000)
+        {
+            while (peer.Available > 0)
+            {
+                int n = peer.Receive(tmp);
+                if (n <= 0) break;
+                for (int i = 0; i < n; i++) buf.Add(tmp[i]);
+            }
+            frames.Clear();
+            int pos = 0;
+            while (buf.Count - pos >= 6)
+            {
+                int len = buf[pos] | (buf[pos + 1] << 8) | (buf[pos + 2] << 16) | (buf[pos + 3] << 24);
+                if (len < 6 || buf.Count - pos < len) break;
+                ushort fop = (ushort)(buf[pos + 4] | (buf[pos + 5] << 8));
+                frames.Add((fop, buf.GetRange(pos + 6, len - 6).ToArray()));
+                pos += len;
+            }
+            if (frames.Count >= expectedFrames) break;
+            Thread.Sleep(5);
+        }
+        Hex.True(frames.Count == expectedFrames,
+            $"0x{op:X4} should send {expectedFrames} frame(s), sent {frames.Count}");
+        return frames;
+    }
+
+    /// <summary>Single-reply convenience wrapper.</summary>
+    static (ushort op, byte[] body) RunHandler1(ushort op, byte[] requestPayload)
+        => RunHandler(op, requestPayload, 1)[0];
+
+    /// <summary>Clones a captured request and stamps a live DLM id at the given payload offset.</summary>
+    static byte[] WithLiveId(byte[] capturedRequest, int reqIdPayloadOffset, uint liveId)
+    {
+        var live = (byte[])capturedRequest.Clone();
+        BitConverter.GetBytes(liveId).CopyTo(live, reqIdPayloadOffset);
+        return live;
+    }
+
+    // ---- captured payloads (lobby_tap.log, reframed) ----
+
+    // 0x2899 SDB_UPDATE_DAILY_QUEST_SEED, 3rd of the 17 seeds, 02:51:11.089Z. reqId 0x2D @8.
+    static readonly byte[] Cap2899ReqSeed3 = Hex.B(@"
+        16 00 00 00  44 00 00 00  2D 00 00 00  01 00 00 00
+        5B 02 00 00  00 00 00 00  EA 07 09 00  0C 00 07 00
+        00 00 00 00  00 00 00 00  00 00 00 00  00 00 00 00
+        00 00 00 00  00 00 00 00  00 00 00 00  00 00 00 00
+        00 00 00 00  00 00 00 00  00 00 00 00  00 00 00 00
+        00 00 00 00");
+    // 0x2910 SDB_LOAD_FRIEND_INFO, 02:51:11.154Z. reqId 0x3D @0.
+    static readonly byte[] Cap2910Req = Hex.B("3D 00 00 00  01 00 00 00  01 00 00 00  0F 00 00 00  00");
+    // 0x290C, 02:51:11.169Z. reqId 0x3E @0, playerId 1 @4.
+    static readonly byte[] Cap290CReq = Hex.B("3E 00 00 00  01 00 00 00  01 00 00 00  02 01 00 00");
+    // 0x27B9 SDB_EP_PERK, 02:51:11.174Z. reqId 0x3F @0.
+    static readonly byte[] Cap27B9Req = Hex.B("3F 00 00 00  01 00 00 00");
+    // 0x2736 SDB_END_START_QUEST_LIST, 02:51:15.399Z. reqId 0x44 @0 — the whole payload.
+    static readonly byte[] Cap2736Req = Hex.B("44 00 00 00");
+    // 0x2930, 02:52:07.111Z (post-spawn). reqId 0x82 @0, then [u64 gameId][u32 playerId].
+    static readonly byte[] Cap2930Req = Hex.B("82 00 00 00  20 00 88 C7  BA 01 00 00  01 00 00 00");
+    // 0x27B3 SDB_LOAD_WORLD_EVENT, 02:52:07.112Z. reqId 0x83 @0.
+    static readonly byte[] Cap27B3Req = Hex.B("83 00 00 00  01 00 00 00  00 00 00 00");
+    // 0x1562 SA_CLEAR_BATTLE_FIELD_ENTER_COUNT — absent from lobby_tap.log (it only fires on the
+    // daily battlefield-count reset). Layout is from Handler_SA_CLEAR_BATTLE_FIELD_ENTER_COUNT,
+    // Arb_part_062.c:4752: reads the reqId at frame+0xe (= payload[8]) and the gameId at
+    // frame+0x12, and replies 0x1563 = [u8 ok][u32 reqId] (FUN_140350eb0(pkt,0x1563),
+    // FUN_1403513d0 = u8, FUN_14013d0b0 = u32, in that order).
+    static readonly byte[] Cap1562Req = Hex.B(
+        "06 00 F0 0A  00 80 00 00   5A 00 00 00   00 00 00 00  00 00 00 00");
+
+    // ---- 0x2899 -> 0x289A ----
+
+    [Test] public static void Handler_2899_replies_289A_with_captured_bytes()
+    {
+        var (op, body) = RunHandler1(DbProxyHandlers.SDB_DAILY_QUEST_SEED, Cap2899ReqSeed3);
+        Hex.True(op == 0x289A, $"reply opcode must be 0x289A, got 0x{op:X4}");
+        Hex.Eq(body, "2D 00 00 00 01", "DBS_UPDATE_DAILY_QUEST_SEED (lobby_tap.log 02:51:11.089Z)");
+    }
+
+    [Test] public static void Handler_2899_echoes_live_reqId_not_capture()
+    {
+        var (op, body) = RunHandler1(DbProxyHandlers.SDB_DAILY_QUEST_SEED,
+            WithLiveId(Cap2899ReqSeed3, 8, 0x0BAD));
+        Hex.True(op == 0x289A, "reply opcode");
+        Hex.True(BitConverter.ToUInt32(body, 0) == 0x0BAD,
+            $"0x289A must echo the LIVE DLM id 0x0BAD, carried 0x{BitConverter.ToUInt32(body, 0):X}");
+        Hex.True(BitConverter.ToUInt32(body, 0) != 0x2D, "must not carry the captured id 0x2D");
+    }
+
+    // ---- 0x2910 -> 0x2911 ----
+
+    [Test] public static void Handler_2910_replies_2911_with_captured_bytes()
+    {
+        var (op, body) = RunHandler1(DbProxyHandlers.SDB_LOAD_FRIEND_INFO, Cap2910Req);
+        Hex.True(op == 0x2911, $"reply opcode must be 0x2911, got 0x{op:X4}");
+        // lobby_tap.log 02:51:11.169Z A->W: 01 3D 00 00 00 — ok byte FIRST, then the id.
+        Hex.Eq(body, "01 3D 00 00 00", "DBS 0x2911 = [u8 ok][u32 reqId]");
+    }
+
+    [Test] public static void Handler_2910_echoes_live_reqId_not_capture()
+    {
+        var (_, body) = RunHandler1(DbProxyHandlers.SDB_LOAD_FRIEND_INFO,
+            WithLiveId(Cap2910Req, 0, 0x0BAD));
+        Hex.True(body[0] == 1, "ok byte stays at payload[0]");
+        Hex.True(BitConverter.ToUInt32(body, 1) == 0x0BAD,
+            $"0x2911 must echo the LIVE id at payload[1], carried 0x{BitConverter.ToUInt32(body, 1):X}");
+        Hex.True(BitConverter.ToUInt32(body, 1) != 0x3D, "must not carry the captured id 0x3D");
+    }
+
+    // ---- 0x290C -> four Arbiter pushes + 0x290D ----
+
+    [Test] public static void Handler_290C_sends_five_frames_in_capture_order()
+    {
+        var f = RunHandler(DbProxyHandlers.SDB_LOAD_290C, Cap290CReq, 5);
+        var ops = f.Select(x => x.op).ToArray();
+        Hex.True(ops.SequenceEqual(new ushort[] { 0x15B1, 0x2847, 0x1440, 0x143E, 0x290D }),
+            "order must be 0x15B1 0x2847 0x1440 0x143E 0x290D (lobby_tap.log 02:51:10.846–11.173); got "
+            + string.Join(' ', ops.Select(o => "0x" + o.ToString("X4"))));
+
+        // AS_ACQUIRE_FRIENDSHIP_GAGE — 02:51:10.846Z
+        Hex.Eq(f[0].body, "01 00 00 00  00 00 00 00", "0x15B1 = [u32 playerId][u32 0]");
+        // 0x2847 — 02:51:10.846Z
+        Hex.Eq(f[1].body, "00 00 00 00  00 00 00 00  01 00 00 00", "0x2847 = [u64 0][u32 playerId]");
+        // AS_RESET_FIELD_POINT_COMPLETE — 02:51:10.870Z
+        Hex.Eq(f[2].body, "01 00 00 00", "0x1440 = [u32 playerId]");
+        // AS_USER_FIELD_POINT_INFO — 02:51:10.870Z. The capture carries a live timestamp at
+        // payload[12..15] (9E 0F A6 6A); we send an empty field-point state, so that u32 is 0.
+        // Everything else is byte-identical to the capture.
+        Hex.Eq(f[3].body,
+            "01 00 00 00  00 00 00 00  00 00 00 00  00 00 00 00  00 00 00 00  FF FF FF FF",
+            "0x143E = [u32 pid][u64 0][u32 timestamp=0][u32 0][u32 -1]");
+        // DBS reply — 02:51:11.173Z
+        Hex.Eq(f[4].body, "01 3E 00 00 00", "0x290D = [u8 ok][u32 reqId]");
+    }
+
+    [Test] public static void Handler_290C_echoes_live_reqId_not_capture()
+    {
+        var f = RunHandler(DbProxyHandlers.SDB_LOAD_290C, WithLiveId(Cap290CReq, 0, 0x0BAD), 5);
+        var last = f[4];
+        Hex.True(last.op == 0x290D, $"last frame must be 0x290D, got 0x{last.op:X4}");
+        Hex.True(BitConverter.ToUInt32(last.body, 1) == 0x0BAD,
+            $"0x290D must echo the LIVE id, carried 0x{BitConverter.ToUInt32(last.body, 1):X}");
+        Hex.True(BitConverter.ToUInt32(last.body, 1) != 0x3E,
+            "must not carry the captured id 0x3E — that is exactly the bug the replay table had "
+            + "(0x290D was attributed to the 0x143F push-reply and went out stale)");
+        // the four pushes are keyed on playerId, not the DLM id, so they must not move
+        Hex.Eq(f[0].body, "01 00 00 00  00 00 00 00", "0x15B1 unchanged by a different DLM id");
+    }
+
+    // ---- 0x27B9 -> 0x27BA ----
+
+    [Test] public static void Handler_27B9_replies_27BA_with_captured_bytes()
+    {
+        var (op, body) = RunHandler1(DbProxyHandlers.SDB_EP_PERK, Cap27B9Req);
+        Hex.True(op == 0x27BA, $"reply opcode must be 0x27BA, got 0x{op:X4}");
+        Hex.True(body.Length == 113, $"payload must be 113 bytes (119-byte frame), got {body.Length}");
+        // lobby_tap.log 02:51:11.174Z, verbatim.
+        Hex.Eq(body, @"
+            05 00 00 00  27 00 00 00  3F 00 00 00  01 00 00 00
+            00 00 00 00  00 00 00 00  00 00 00 00  00 00 00 00
+            00 27 00 00  00 37 00 00  00 00 00 00  00 00 00 00
+            00 37 00 00  00 47 00 00  00 00 00 00  00 00 00 00
+            00 47 00 00  00 57 00 00  00 00 00 00  00 00 00 00
+            00 57 00 00  00 67 00 00  00 00 00 00  00 00 00 00
+            00 67 00 00  00 00 00 00  00 00 00 00  00 00 00 00
+            00", "DBS_EP_PERK 0x27BA");
+    }
+
+    [Test] public static void Handler_27B9_echoes_live_reqId_not_capture()
+    {
+        var (_, body) = RunHandler1(DbProxyHandlers.SDB_EP_PERK, WithLiveId(Cap27B9Req, 0, 0x0BAD));
+        Hex.True(BitConverter.ToUInt32(body, DbProxyStaticData.EpPerkReqIdOffset) == 0x0BAD,
+            "0x27BA is a captured template — the live DLM id must be patched in at payload[8]");
+        Hex.True(BitConverter.ToUInt32(body, 8) != 0x3F, "must not carry the captured id 0x3F");
+        Hex.True(body.Length == 113, "patching the id must not change the length");
+    }
+
+    // ---- 0x2736 -> 0x2737 ----
+
+    [Test] public static void Handler_2736_replies_2737_with_captured_bytes()
+    {
+        var (op, body) = RunHandler1(DbProxyHandlers.SDB_END_START_QUEST_LIST, Cap2736Req);
+        Hex.True(op == 0x2737, $"reply opcode must be 0x2737, got 0x{op:X4}");
+        // lobby_tap.log 02:51:15.400Z: 44 00 00 00 01
+        Hex.Eq(body, "44 00 00 00 01", "DBS_END_START_QUEST_LIST = [u32 reqId][u8 ok=1]");
+    }
+
+    [Test] public static void Handler_2736_echoes_live_reqId_not_capture()
+    {
+        var (_, body) = RunHandler1(DbProxyHandlers.SDB_END_START_QUEST_LIST,
+            WithLiveId(Cap2736Req, 0, 0x0BAD));
+        Hex.True(BitConverter.ToUInt32(body, 0) == 0x0BAD,
+            "0x2737 must echo the live id — the replay table used to serve it from the 0x15AE "
+            + "pair, i.e. with a captured id, and head-blocked the user from spawn onward");
+        Hex.True(BitConverter.ToUInt32(body, 0) != 0x44, "must not carry the captured id 0x44");
+    }
+
+    // ---- 0x2930 -> 0x2931 ----
+
+    [Test] public static void Handler_2930_replies_2931_with_captured_bytes()
+    {
+        var (op, body) = RunHandler1(DbProxyHandlers.SDB_LOAD_2930, Cap2930Req);
+        Hex.True(op == 0x2931, $"reply opcode must be 0x2931, got 0x{op:X4}");
+        // lobby_tap.log 02:52:07.112Z: 82 00 00 00 01 00 — six bytes, note the trailing 00.
+        Hex.Eq(body, "82 00 00 00 01 00", "DBS 0x2931 = [u32 reqId][u8 ok=1][u8 0]");
+    }
+
+    [Test] public static void Handler_2930_echoes_live_reqId_not_capture()
+    {
+        var (_, body) = RunHandler1(DbProxyHandlers.SDB_LOAD_2930, WithLiveId(Cap2930Req, 0, 0x0BAD));
+        Hex.True(BitConverter.ToUInt32(body, 0) == 0x0BAD, "0x2931 must echo the live id");
+        Hex.True(BitConverter.ToUInt32(body, 0) != 0x82, "must not carry the captured id 0x82");
+        Hex.True(body.Length == 6, $"payload must stay 6 bytes, got {body.Length}");
+    }
+
+    // ---- 0x27B3 -> 0x27B4 ----
+
+    [Test] public static void Handler_27B3_replies_27B4_with_captured_bytes()
+    {
+        var (op, body) = RunHandler1(DbProxyHandlers.SDB_LOAD_WORLD_EVENT, Cap27B3Req);
+        Hex.True(op == 0x27B4, $"reply opcode must be 0x27B4, got 0x{op:X4}");
+        // lobby_tap.log 02:52:07.112Z: 83 00 00 00 01
+        Hex.Eq(body, "83 00 00 00 01", "DBS_LOAD_WORLD_EVENT = [u32 reqId][u8 ok=1]");
+    }
+
+    [Test] public static void Handler_27B3_echoes_live_reqId_not_capture()
+    {
+        var (_, body) = RunHandler1(DbProxyHandlers.SDB_LOAD_WORLD_EVENT,
+            WithLiveId(Cap27B3Req, 0, 0x0BAD));
+        Hex.True(BitConverter.ToUInt32(body, 0) == 0x0BAD, "0x27B4 must echo the live id");
+        Hex.True(BitConverter.ToUInt32(body, 0) != 0x83, "must not carry the captured id 0x83");
+    }
+
+    // ---- 0x1562 -> 0x1563 ----
+
+    [Test] public static void Handler_1562_replies_1563_per_decompile()
+    {
+        var (op, body) = RunHandler1(DbProxyHandlers.SA_CLEAR_BATTLE_FIELD_ENTER_COUNT, Cap1562Req);
+        Hex.True(op == DbProxyHandlers.AS_CLEAR_BATTLE_FIELD_ENTER_COUNT,
+            $"reply opcode must be 0x1563, got 0x{op:X4}");
+        // Arb_part_062.c:4769 writes u8 (ok) then u32 (the reqId read from frame+0xe).
+        Hex.Eq(body, "01  5A 00 00 00", "AS_CLEAR_BATTLE_FIELD_ENTER_COUNT = [u8 ok][u32 reqId@payload[8]]");
+    }
+
+    [Test] public static void Handler_1562_echoes_live_reqId_not_capture()
+    {
+        var (_, body) = RunHandler1(DbProxyHandlers.SA_CLEAR_BATTLE_FIELD_ENTER_COUNT,
+            WithLiveId(Cap1562Req, 8, 0x0BAD));
+        Hex.True(body[0] == 1, "ok byte first");
+        Hex.True(BitConverter.ToUInt32(body, 1) == 0x0BAD,
+            $"0x1563 must echo the LIVE id, carried 0x{BitConverter.ToUInt32(body, 1):X}");
+        Hex.True(BitConverter.ToUInt32(body, 1) != 0x5A, "must not carry the request's original id 0x5A");
+    }
+
+    // ---- WorldReplayTable must never treat 0x143F as a request ----
+
+    [Test]
+    public static void Replay_never_creates_a_request_entry_for_143F()
+    {
+        // 0x143F SA_UPDATE_FIELD_POINT is World's ANSWER to our 0x143E push, never a request.
+        // In arb_world.log our 0x290D (the DBS reply to 0x290C, carrying a DLM id) happened to
+        // follow it on the wire, so the loader attributed 0x290D to 0x143F and replayed it with
+        // the captured id — which is exactly what head-blocked the 0x290C item.
+        var path = WriteTapLog(
+            (true,  Hex.B("13 00 00 00 3F 14  01 00 00 00  00 00 00 00  00 00 00 00  00")),
+            (false, Hex.B("0B 00 00 00 0D 29  01 3E 00 00 00")));
+        try
+        {
+            var table = WorldReplayTable.Load(path, QuietLog());
+            Hex.True(table.GetResponses(0x143F).Count == 0,
+                "0x143F must never become a request entry — a reply attributed to it goes out "
+                + "with the CAPTURED DLM id and wedges the user's DLM queue forever");
+            Hex.True(table.GetResponses(0x143F, Hex.B("01 00 00 00")).Count == 0,
+                "same with a live request supplied");
+        }
+        finally { File.Delete(path); }
+    }
+
+    [Test]
+    public static void Replay_143F_seals_the_pending_request_before_it()
+    {
+        // A 0x143F arriving while another request is pending must also SEAL that request, so a
+        // later Arbiter frame cannot be misattributed backwards to it.
+        var path = WriteTapLog(
+            (true,  Cap27A2Req),
+            (true,  Hex.B("13 00 00 00 3F 14  01 00 00 00  00 00 00 00  00 00 00 00  00")),
+            (false, Hex.B("0B 00 00 00 0D 29  01 3E 00 00 00")));
+        try
+        {
+            var table = WorldReplayTable.Load(path, QuietLog());
+            Hex.True(table.GetResponses(0x143F).Count == 0, "0x143F still has no entry");
+            Hex.True(table.GetResponses(0x27A2).Count == 0,
+                "the pending 0x27A2 was sealed by the 0x143F, so the following 0x290D must not "
+                + "be attributed to it either");
+        }
+        finally { File.Delete(path); }
+    }
 }
