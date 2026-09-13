@@ -2,22 +2,57 @@
 
 ## ⚠ READ THIS BLOCK FIRST — WORKSPACE RULES (non-negotiable)
 
-Every past autonomous session lost work by writing to the wrong place. Before editing ANY file:
+**Cowork is READ-ONLY on the human's machine. Do not create, modify, move or delete any file under `D:\`.**
+The human keeps the tree clean via git and applies your work himself. This replaces every earlier rule
+about "proving writes landed" — there are no writes.
 
-1. Run `git rev-parse --show-toplevel`. It MUST print `D:/v100/TERA_SERVER.100/TeraSharp` (or the backslash
-   form). If it prints anything else, or errors, STOP — you are in the wrong tree. Do not proceed.
-2. NEVER create or write to `D:\TeraSharp` — that is a stray wrong path a past session made. The only correct
-   root is `D:\v100\TERA_SERVER.100\TeraSharp`.
-3. Your sandbox filesystem is NOT the human's D: drive. "I wrote the file" is not enough — you must PROVE it
-   landed: after every write, run `git status --short` and confirm the file appears in the list. If it does
-   not appear, the write did not reach the real tree — stop and tell the human; do not keep going.
-4. When you finish, run `git status --short` and `git diff --stat` and paste them so the human can review and
-   commit. Do not assume your changes persisted.
-5. If a task's output is small (findings, a proposed patch, analysis), prefer pasting it **directly into the
-   chat** over writing a file — the file write is the step that keeps failing.
+1. You may read anything under `D:\v100\TERA_SERVER.100\` and `D:\packetlogs\`. You may run read-only commands
+   (`git status`, `git log`, `git diff`, `Select-String`, `Get-Content`, `dotnet build`, `dotnet run --project
+   src/TeraSharp.Arbiter.Tests`). Building/testing is fine because it only touches `bin/` and `obj/`.
+2. **Deliver every change as a unified diff pasted in chat**, one code block per file, made against the
+   current `git HEAD` (`git diff` format, `a/` `b/` prefixes, correct hunk headers). The human runs
+   `git apply` and commits. If the change is a new file, paste its full contents with the intended path.
+3. Before writing a diff, read the current file from disk in the same session — the human may have committed
+   since your last read. State the `git log --oneline -1` you based the diff on.
+4. Keep diffs small and single-purpose (one task from the queue = one diff set). Include the test diff with
+   the code diff.
+5. If a task needs a change in a human-owned file (list below), do not diff it — describe the exact change in
+   chat and stop.
+6. Findings, analysis, proposed patches: **in chat**, never as files.
+7. **Every diff starts with a header line** `Based on: <sha> <subject>` (from `git log --oneline -1` at the
+   moment you read the files). The human applies it on a branch with `git apply --3way`; if the base is
+   stale the apply fails and the human will paste the error back — re-read the files and re-issue the diff.
 
-These five rules exist because four sessions in a row reported "done" with work that never reached disk, or
-landed in `D:\TeraSharp` (a partial copy missing the project), forcing a painful manual merge. Do not repeat it.
+Human side (for reference, so you know how your work lands):
+```
+git checkout -b cowork/Tn master
+git apply --3way --check cowork-Tn.patch
+git apply --3way cowork-Tn.patch
+dotnet build TeraSharp.sln; dotnet run --project src\TeraSharp.Arbiter.Tests
+git commit -am "Tn: ..."; git checkout master; git merge --no-ff cowork/Tn
+```
+The human's own work goes straight to `master`; Cowork work always arrives via a `cowork/*` branch.
+
+These rules exist because four sessions in a row reported "done" with work that never reached disk, or
+landed in a stray `D:\TeraSharp` copy and had to be merged by hand. Read-only + diffs-in-chat ends that.
+
+### Decompiles on disk (full Ghidra output, both binaries)
+- **ArbiterServer.exe**: `D:\v100\TERA_SERVER.100\Arb_part_000.c` … `Arb_part_095.c` (~60 MB total). The
+  spec for what WE must send. `Select-String -Path "Arb_part_*.c" -Pattern 'Handler_SDB_NAME\('`, then read a
+  ~100-line window around the hit.
+- **WorldServer.exe**: `D:\v100\TERA_SERVER.100\world_decompiled\WorldServer.exe.c` (ONE 125 MB file, 4.47 M
+  lines). The authority for what World EXPECTS (`Handler_DBS_*`, DLM lifecycle, opcode->name switch ~line
+  247000). NEVER open it whole; `Select-String -SimpleMatch` for the line, then a small windowed read.
+- Both are complete. When notes and decompile disagree, the decompile wins.
+
+### Packet definitions on disk (client protocol)
+- `D:\v100\TERA_SERVER.100\tera_v100_MASTER_FINAL\` — all 4548 client packet `.def` files for protocol
+  376012, one per packet (`C_*` / `S_*`), with field names and types. This is the authority for any
+  client<->Arbiter packet layout; the codec in `Protocol/` is driven by these files. Opcode numbers come from
+  `tera-server-proxy\data\data.json` (`maps."376012"`). Use both before decoding anything by hand.
+- Arbiter<->World opcodes: `D:\packetlogs\world_opcodes.txt` (`AS_/SA_/DSA_/BSA_`) and the opcode->name switch
+  in `WorldServer.exe.c` ~line 247000 (covers `SDB_/DBS_` too). There are no `.def` files for the internal
+  protocol — layouts come from the decompiled writers/handlers (section 5 recipe).
 
 ---
 
@@ -32,25 +67,21 @@ Read `status/STATUS.md` after this file. Everything you need is on disk. **Read 
 
 ## 0. State of play (updated after session 4 + live testing)
 
-**The repo is now under git.** `git init` done, baseline committed. Before editing, run `git status` to see a
-clean tree; when you finish, the human reviews `git diff` and commits. This is the safety net after three
-sessions where cloud-workspace edits failed to reach D:. **You must write files to
-`D:\v100\TERA_SERVER.100\TeraSharp` and prove it with `git status` before claiming a task done.** Do not create
-new top-level folders (a past session wrote to `D:\TeraSharp` by mistake — wrong path, missing the project).
+**The repo is under git.** Cowork is read-only; the human applies diffs and commits. Start every session with
+`git status` (clean) and `git log --oneline -3` so your diffs are against the right base.
 
-### FILE OWNERSHIP — do not cross this line
-The live network path is tested only against the real WorldServer + client, which you cannot run. Unit tests
-pass in isolation while the live path breaks (this exact thing shipped a tunnel-routing bug behind 7 green
-tests). Therefore:
+### FILE OWNERSHIP
+Cowork never edits files (see rules above). This list says which files Cowork may **propose diffs for** and
+which it may only **describe changes to**. The live network path is tested only against the real WorldServer
++ client, which Cowork cannot run; unit tests pass in isolation while the live path breaks.
 
-- **Cowork MAY edit (pure logic, unit-testable, no live-behavior risk):**
-  `World/DbProxyHandlers.cs`, `World/DbProxyStaticData.cs`, `Persistence/CharacterStore.cs`,
-  `Handlers/CharacterHandlers.cs`, `Protocol/*` (codec), and `src/TeraSharp.Arbiter.Tests/`.
-- **Cowork MUST NOT edit (live path — the human owns these, verified on the server):**
+- **Diffs welcome (pure logic, unit-testable, no live-behavior risk):**
+  `World/DbProxyHandlers.cs`, `World/DbProxyStaticData.cs`, `World/WorldReplayTable.cs`,
+  `Persistence/CharacterStore.cs`, `Handlers/CharacterHandlers.cs`, `Handlers/SocialHandlers.cs`,
+  `Handlers/ChatHandlers.cs`, `Protocol/*` (codec), `src/TeraSharp.Arbiter.Tests/`, `status/*.md`.
+- **Describe only, never diff (live path — the human owns these, verified on the server):**
   `World/WorldBridge.cs`, `Network/*` (GameSession, TcpServer, PacketDispatcher, Crypto),
   `Handlers/WorldEntry.cs`, `Handlers/HandlerRegistry.cs`, `Handlers/LoginHandlers.cs`, `Program.cs`.
-  If a task seems to need a change in one of these, STOP and write the proposed change into STATUS.md as a
-  request for the human to apply and test — do not edit the file.
 
 ### Live-verified truths (supersede everything below; do not "fix" these)
 - **Login works end-to-end** against the real WorldServer: character spawns in Velika with real NPCs, and the
@@ -60,40 +91,93 @@ tests). Therefore:
   StreamReader or `Select-String -SimpleMatch <name>` to get line numbers, then read a small window. This is
   the authority for anything World does (enter, leave, spawn, DB-proxy expectations) — `Arb_part_*.c` is the
   Arbiter only.
-- **Logout / Switch-Characters is FIXED (root cause found in the World decompile).** World's
-  `Handler_AS_LEAVE_WORLD` looks up the user by (worldId, playerId); if the user is already gone it logs
-  `Critical Error LeaveWorld planet[..] user[..] type[..] reason[..]` and the process dies. We were sending
-  `AS_LEAVE_WORLD` **twice**: once from the button (`CompleteLeaveToWorld`) and again when the socket closed
-  (`LeaveWorld`/`Close`). The first leave despawned the player; the second hit World after despawn -> crash.
-  Fix: a single `_leaveFinished` gate (`Interlocked.CompareExchange`) shared by the button path
-  (`OnWorldLeaveConfirmed`) and the disconnect path (`LeaveWorld`) so `AS_LEAVE_WORLD` is sent exactly once.
-- **`AS_LEAVE_WORLD` (0x1392) is (type=1, reason=8) for lobby AND exit AND disconnect.** The capture's working
-  leave frame is `1A 00 00 00 92 13 | gameId(8) | 01 00 00 00 | 08 00 00 00 | 01 00 00 00` = type 1, reason 8,
-  playerId 1. The decompile's OnLeaveWorldTick shows a (3,0) lobby branch, but that path is for a different
-  state; the packet World actually accepts on the wire is (1,8). `LeaveValues` returns (1,8) for every mode.
-  The 3 lobby unit tests that still expect (3,0) must be updated to (1,8).
-- **The ~40 login-time `SDB_*` are served by the replay table**, NOT by synthetic builders. A session replaced
-  them with hand-built "empty list" replies; that DESYNCED World (`SDB_USER_LOAD_INVENTORY` 0x27A2 returns a
-  3235-byte item list, not an empty list) and hung login. `DbProxyHandlers.TryHandle` now intercepts ONLY:
-  enter-world (0x2711), update-user-data (0x27CB), and the logout saves (0x27FA/0x2924/0x2768/0x2936/0x2897);
-  everything else falls through to replay. **Do not route login-time SDB_* back through DbProxy.**
+- **Logout -> lobby -> relog WORKS (live-verified 2026-09-13, 21:13 run).** Root cause of every "hangs on
+  relog / Critical Error LeaveWorld" was the same thing: a per-user WorldServer **DLMItem head-block**
+  (read `status/HANDOFF.md` §1). World serialises every per-user DB message; one `DBS_*` reply that carries a
+  stale/captured id (or never arrives) silently blocks every later item for that user, including
+  `UserLeaveWorld` — so `SA_LEAVE_WORLD` never comes, our 5 s fallback fakes the lobby return, and the next
+  `C_SELECT_USER` stalls at `0x1626` because World still has the character. Fixed by making these real, all
+  echoing the LIVE reqId, in `DbProxyHandlers` (each verified against `lobby_tap.log` bytes or the decompile):
+  `0x2899` seeds (+ empty 159 B `0x272D` so World takes the seed branch), `0x2910`, `0x290C` (+ pushes
+  `0x15B1 0x2847 0x1440 0x143E`), `0x27B9`, `0x2736`, `0x2930`, `0x27B3`, `0x1562`, plus the 5 logout saves;
+  and `WorldReplayTable` no longer treats `0x143F` as a request. **Any new `no replay for 0xNNNN` on a
+  per-user opcode is a wedge waiting to happen — make it a real handler with live id echo.**
+- **`AS_LEAVE_WORLD` (0x1392) = `[u64 gameId][u32 type][u32 reason][u32 playerId]`**; lobby = (3,0),
+  disconnect = (1,0) (both from `lobby_tap.log`; older capture's disconnect was (1,8)). `LeaveValues` is (3,0)
+  for lobby. The type/reason are only read once `UserLeaveWorld` reaches the head of the DLM queue — they were
+  never the blocker.
+- **Login-time `SDB_*`: replay is fine when the reply carries no live id; anything that echoes a DLM id must be
+  a real handler.** The earlier "synthetic empty list desynced World" lesson still stands for data-bearing
+  replies (0x27A2 returns a 3235 B item list) — never replace those with constructed empties. But the replay
+  table's id-echo can only patch ids it can find in BOTH captured request and response; where it can't
+  (0x290D after 0x143F, 0x2737 after 0x15AE) the replayed reply goes out with the CAPTURED id and wedges the
+  user. The `TryHandle` allow-list (first switch) is the source of truth for what is real.
 - **Single-player tunnel fast path is in `WorldBridge.HandleFrame`:** with exactly one registered session the
   tunnel ignores the routing key and uses one shared reorder queue (the broadcast behavior that worked for
   login and logout). The per-key routing a session added stalled the logout despawn burst. Multi-player routing
   stays deferred until a real two-login capture exists.
 
-### Repo is under git — use it every session
-`git init` done; commits exist. **Start each session with `git status` (should be clean) and `git log --oneline -3`.**
-Work only in `D:\v100\TERA_SERVER.100\TeraSharp`. When you finish, the human reviews `git diff` and commits
-(good) or `git checkout -- <file>` (bad). This is the safety net after three sessions where cloud-workspace
-edits failed to reach D:. Prove your writes landed with `git status` before claiming a task done.
+### Repo is under git
+Read-only for Cowork. Human workflow per diff: `git apply --check`, `git apply`, build, tests, live test if it
+touches a handler, commit.
 
 ### Known open items
-- Update the 3 failing lobby `LeaveValues` tests to expect (1,8) (pure test change — Cowork may do it).
-- Live logout end-to-end (single leave -> save -> `0x1393`->`0x1433` -> spawn-where-you-logged-out, and NO
-  `Critical Error` in the WorldServer console) is being verified by the human now; its result is authoritative.
-- Log level is currently `Trace` in Program.cs for tunnel debugging — turn back to `Debug` once logout is
-  confirmed (that's a Program.cs change, human-owned).
+- **Respawn position.** After relog the character spawns at the captured default (-449, 6239, 1956), not where
+  it logged out. The real server restores from the blob (blob offset 220 = x,y,z floats; `lobby_tap.log` 2nd
+  login spawned at the 1st session's logout pos while `AS_ENTER_WORLD` was byte-identical). `DbProxyHandlers`
+  now logs `blob pos` on every save and on enter-world; the next live run decides whether World isn't writing
+  the position into the blob on our side (suspect: missing `0x2830` after `0x2738`, STATUS §3c) or ignores it.
+- 5 s `SA_LEAVE_WORLD` fallback in `GameSession` should be 15 s and log loudly (human-owned).
+- gameId should increment per login (real: `...0001` then `...0002`); we reuse `...0001` (human-owned).
+- Log level is `Trace` in Program.cs — back to `Debug` (human-owned).
+
+---
+
+## Cowork task queue (safe, self-contained, all inside the "diffs welcome" set)
+
+Pick the first unchecked task. Each one: decompile/capture first, unit test against captured bytes, then
+**paste the diffs in chat** (see workspace rules). Never write to disk. If a task needs a human-owned file,
+describe the exact change in chat instead.
+
+- [ ] **T1 — Tests for the DLM-unblock handlers.** In `src/TeraSharp.Arbiter.Tests/Program.cs`, add
+  byte-exact tests (captured request -> expected reply, plus a live-reqId-echo assertion) for: `0x2899->0x289A`,
+  `0x2910->0x2911`, `0x290C` (5 frames, order `0x15B1 0x2847 0x1440 0x143E 0x290D`), `0x27B9->0x27BA`,
+  `0x2736->0x2737`, `0x2930->0x2931`, `0x27B3->0x27B4`, `0x1562->0x1563`. Bytes are in `lobby_tap.log`
+  (02:51:10–02:52:07) and in the comments next to each constant in `DbProxyHandlers.cs`. Also a test that
+  `WorldReplayTable.Load` never produces an entry for request op `0x143F`.
+- [ ] **T2 — Opcode names for `0x27xx–0x29xx`.** Generate `D:\packetlogs\dbproxy_opcodes.txt` (`0xNNNN|NAME`)
+  from the `case 0xNNNN: return "DBS_/SDB_...";` switch in `WorldServer.exe.c` (~line 247000; use
+  `Select-String`, never open the file whole). Then add a tiny `DbProxyOpcodeNames` lookup in
+  `World/DbProxyStaticData.cs` (or a new file in `World/`) that `DbProxyHandlers` uses in its log lines.
+  Pure data, no live behaviour.
+- [ ] **T3 — `0x2830 DBS_USER_RESTRICTION` after `0x2738`.** Real Arbiter sends it 3 ms after the blob:
+  payload `[u32 off=22][u32 count=0][u64 gameId]` (`lobby_tap.log` packet 131). Add it to
+  `OnUserEnterWorld` using the gameId `0x80000AF00000 | playerId` (that is what our `WorldEntry` uses today);
+  read `Handler_SDB_USER_RESTRICTION` / the World-side `Handler_DBS_USER_RESTRICTION` to confirm the layout
+  and write the test. This is the #1 suspect for the respawn-position bug.
+- [ ] **T4 — `0x15E0 AS_REQUEST_DUNGEON_PHASE_USER_RESET` push.** Real Arbiter sends `0x15E0`
+  `[u32 playerId][u32 0][u64 timestamp]` right before `0x286A` (`lobby_tap.log` packet 173). We never send it.
+  Decide from the decompile whether it belongs in the `0x2869` handler (then allow-list `0x2869` — its builder
+  `Build286A_EmptyListTimestamp` already exists; verify the timestamp field against the capture first).
+- [ ] **T5 — Replay-table hygiene.** In `World/WorldReplayTable.cs`, add an explicit set of one-way World
+  opcodes that must never become request entries: `0x1436 0x15A8 0x159A 0x2958 0x13FA 0x13CC 0x1626 0x1441
+  0x143F 0x15B5 0x13AA 0x13F2 0x13E5 0x164D 0x293E`. Same "seal pending, skip" treatment as `0x143F`. Add a
+  test. Kills the `no replay for` noise and prevents mis-attribution.
+- [ ] **T6 — Per-session position from the blob (read-only).** Extend `CharacterStore.SaveWorldBlob` to also
+  update `zone/x/y/z` on the `characters` row from blob offsets 208 (u32 zone-ish), 220/224/228 (x,y,z) so the
+  character-select screen and future `AS_ENTER_WORLD` builder have real data. Do NOT modify the blob.
+  Confirm the zone offset against the decompile before trusting 208.
+- [ ] **T7 — Remaining post-spawn / periodic `SDB_*`.** Grep `lobby_tap.log` for every W->A opcode in
+  `0x27xx–0x29xx` and `0x13xx–0x16xx` that is not in the `TryHandle` allow-list, list them in STATUS.md with
+  the reply layout from the decompile, and implement the ones that are pure ack/echo (`[reqId][ok]`,
+  `[ok][reqId]`). Skip anything data-bearing.
+- [ ] **T8 — Character creation** (`Handler_C_CREATE_USER` Arb_part_079.c:9510; `full_capture.log` has the
+  client bytes). `Handlers/CharacterHandlers.cs` + `CharacterStore`. Test whether `DBS_USER_ENTERWORLD found=0`
+  makes World initialise a fresh character; if so creation is a DB row + `S_CREATE_USER`. Then delete + name
+  check.
+- [ ] **T9 — Docs.** Update `status/STATUS.md` §0–§1 to reflect that logout/relog is fixed, list the handlers
+  above as real, and move the remaining human-owned items (3a is done; 3b done; 3c=T3; 3d, 3e still open) into
+  a short "human TODO" list.
 
 ---
 
@@ -125,7 +209,8 @@ D:\v100\TERA_SERVER.100\
                 SpawnReplay.cs          standalone-mode only
       World\    WorldBridge.cs          :7802, 25 links, tunnel+reorder, control msgs, IsReady, leave, player registry
                 WorldReplayTable.cs     captured World request->response table with request-id echo
-                DbProxyHandlers.cs      REAL: enter-world, update-user-data, daily-quest-count, the 5 logout saves
+                DbProxyHandlers.cs      REAL: enter-world, update-user-data, quest list/seeds, the post-seed and
+                                        post-spawn DLM items, the 5 logout saves, 0x1562 (see section 0)
       Persistence\ CharacterStore.cs    SQLite: accounts, characters (+ 15312-byte world_blob)
       Game\     FakeAccount.cs          session view of account/characters, loaded from store
     src\TeraSharp.Arbiter.Tests\        console test runner (see section 0)
@@ -213,9 +298,9 @@ messages** (`SDB_X` from World -> `DBS_X` from us). That DB-proxy layer is most 
 | Client settings blobs | replayed bytes (client defaults — fine) |
 | World handshake | replayed (static — fine) |
 | `AS_ENTER_WORLD` | replayed with gameId patch — task B |
-| Enter-world, update-user-data, daily-quest-count, 5 logout saves | **real + tested** |
-| ~40 other login-time `SDB_*` | replayed with id echo — task A |
-| Logout/exit/cancel | real + tested, pending live run |
+| Enter-world, update-user-data, quest list + 17 seeds, post-seed/post-spawn items, 5 logout saves, 0x1562 | **real + live-verified** |
+| ~30 other login-time `SDB_*` (no live id in reply) | replayed with id echo — fine, convert only if a wedge appears |
+| Logout/exit/cancel | **real + live-verified** (relog works; respawn position open, see section 0) |
 | Char create/delete | not implemented — task C |
 | Account auth | accept-all — task E |
 | Multiple players | blocked on 2-login capture |
@@ -259,7 +344,10 @@ a gameId must be a real handler.
   when one leaks through.
 - `S_SELECT_USER` must go to the client before the World handoff.
 - Replay-table attribution: a World frame followed by an Arbiter frame is not always request/response.
-  Client-triggered opcodes are excluded in `WorldReplayTable`; keep that list current.
+  Client-triggered opcodes are excluded in `WorldReplayTable`; keep that list current. **A replayed `DBS_*`
+  attributed to the wrong request goes out with the captured DLM id and wedges the user forever** (that was
+  0x290D-after-0x143F and 0x2737-after-0x15AE). Restart WorldServer before every live test — a wedged queue
+  from the previous run makes a correct fix look broken.
 - Seeded character "dob" (id 1). The name is inside the blob; don't rename it.
 - The client's "TERA / Battle Arena" picker after server select is the 100.02 client, not fixable server-side.
 - Don't "fix" things the decompile contradicts. Two earlier assumptions (0x1460 unnecessary; gameId derivable)
