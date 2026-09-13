@@ -47,7 +47,18 @@ Read this file, then `CLAUDE.md`, then `status/HANDOFF.md` §1 (DLMItems), then
 - T6 (Cowork): characters row now gets zone/x/y/z from every blob save and level/exp from
   `0x273B S_UPDATE_EXP_LEVEL` (level 0 = exp-only update; ok = row-updated).
 
-## The crash we were fixing when this was written
+## The crash we were fixing when this was written — SOLVED 02:02
+
+Root cause: `WorldEntry.EnterWorld` step 5 sent a pre-emptive `0x2738` right after `AS_ENTER_WORLD`
+with `[8] = playerId` where World expects a DLM id. On a fresh World the low ids belong to the
+load contexts World creates right after the real enter-world completes, so the stray frame
+"completed" e.g. `DBLoadPromotionContext` with an enter-world payload -> crash in its
+`ExecuteCommit`. Removed; `DbProxyHandlers.OnUserEnterWorld` answers `0x2711` with the live id.
+Minidump analysis recipe (PowerShell, no WinDbg) is in this chat's history: parse streams 4
+(modules), 6 (exception), 3 (threads); scan the faulting thread's stack for addresses inside
+WorldServer.exe; map `WorldServer+0xNNN` to `FUN_1400NNN` in the decompile.
+
+Old notes from the hunt (kept for context):
 
 Symptom: a **level-1 character entering a FRESH World process** → World silent after our
 `DBS_USER_ENTERWORLD`, minidump written the same second, process dies ~45 s later (writing a 30 GB
@@ -83,6 +94,12 @@ and look for the next caller.
   (rolls at midnight). Minidumps next to WorldServer.exe.
 
 ## Rules that bit us
+
+- **Never send a `DBS_*` reply World didn't ask for.** Every DBS_ carries a DLM id that World looks up
+  in DLMExistManager; an unsolicited one (the pre-emptive 0x2738 WorldEntry used to send with
+  playerId in the id slot) completes whichever item currently holds that id. It only "worked" for
+  playerId 1 by coincidence and crashed a fresh World for every other character (found via minidump
+  stack walk, 2026-09-14 01:55). Pushes (AS_*, no id) are fine; replies are not.
 
 - `[IO.File]` in PowerShell uses the process CWD (system32) — always full paths.
 - Two `git worktree add` with the same folder: the second fails silently and Cowork writes into
