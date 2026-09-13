@@ -616,6 +616,24 @@ CREATE TABLE IF NOT EXISTS counters (
   name  TEXT PRIMARY KEY,
   value INTEGER NOT NULL
 );
+
+-- Opaque client option blobs, saved by the client and replayed to it at login — T19.
+-- The Arbiter stores these verbatim and never parses them: they are the client's own
+-- serialised UI state (keybinds, hotbars, chat tabs, window layout). Two scopes, exactly
+-- as the real ArbiterServer has them:
+--   User::SaveClientSetting    (Arb_part_029.c:18757) -> spSaveClientSettingForUser,    per character
+--   Account::SaveClientSetting (Arb_part_065.c:9779)  -> spSaveClientSettingForAccount, per account
+-- Both reject a blob of 0 bytes or more than 9000; see CharacterStore.MaxClientSettingBytes.
+CREATE TABLE IF NOT EXISTS client_settings (
+  character_id INTEGER PRIMARY KEY REFERENCES characters(id),
+  blob         BLOB NOT NULL,
+  updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS account_settings (
+  account_id INTEGER PRIMARY KEY REFERENCES accounts(id),
+  blob       BLOB NOT NULL,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 ");
         // CREATE TABLE IF NOT EXISTS does nothing to a DB that already has `characters`, so
         // columns added later need their own idempotent step. terasharp.db predates `exp`.
@@ -640,6 +658,99 @@ CREATE TABLE IF NOT EXISTS counters (
         using var cmd = _db.CreateCommand();
         cmd.CommandText = sql;
         cmd.ExecuteNonQuery();
+    }
+
+
+    // ---- Client settings (T19) ----
+
+    /// <summary>
+    /// Largest blob either scope will store. The real Arbiter's <c>User::SaveClientSetting</c>
+    /// (Arb_part_029.c:18757) and <c>Account::SaveClientSetting</c> (Arb_part_065.c:9779) both
+    /// open with <c>if (len == 0 || 9000 &lt; len) { log; return; }</c> — a save outside that range
+    /// is dropped and the previously stored blob is left alone. The in-memory buffer behind it is
+    /// declared <c>unsigned char(&amp;)[9000]</c> in the S_LOAD writer's signature.
+    /// </summary>
+    public const int MaxClientSettingBytes = 9000;
+
+    /// <summary>
+    /// Store one character's client settings, replacing whatever was there. Returns false — and
+    /// changes nothing — for a blob the real Arbiter would have refused (empty, or over
+    /// <see cref="MaxClientSettingBytes"/>). The client saves several times per session, so this
+    /// is an upsert, not an insert.
+    /// </summary>
+    public bool SaveClientSetting(long characterId, byte[] blob)
+    {
+        if (blob == null || blob.Length == 0 || blob.Length > MaxClientSettingBytes)
+        {
+            _log.LogWarning("SaveClientSetting: refusing a {Len}-byte blob for character {Id} (the real Arbiter drops 0 and >{Max})",
+                blob?.Length ?? -1, characterId, MaxClientSettingBytes);
+            return false;
+        }
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = @"
+INSERT INTO client_settings(character_id, blob, updated_at) VALUES($c, $b, datetime('now'))
+ON CONFLICT(character_id) DO UPDATE SET blob = excluded.blob, updated_at = excluded.updated_at";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            cmd.Parameters.AddWithValue("$b", blob);
+            cmd.ExecuteNonQuery();
+        }
+        _log.LogDebug("Saved {Len} bytes of client settings for character {Id}", blob.Length, characterId);
+        return true;
+    }
+
+    /// <summary>One character's stored client settings, or null when nothing has been saved yet.</summary>
+    public byte[]? LoadClientSetting(long characterId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT blob FROM client_settings WHERE character_id = $c";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            using var r = cmd.ExecuteReader();
+            if (!r.Read()) return null;
+            var blob = (byte[])r["blob"];
+            return blob.Length == 0 ? null : blob;
+        }
+    }
+
+    /// <summary>Account-scope equivalent of <see cref="SaveClientSetting"/>.</summary>
+    public bool SaveAccountSetting(long accountId, byte[] blob)
+    {
+        if (blob == null || blob.Length == 0 || blob.Length > MaxClientSettingBytes)
+        {
+            _log.LogWarning("SaveAccountSetting: refusing a {Len}-byte blob for account {Id} (the real Arbiter drops 0 and >{Max})",
+                blob?.Length ?? -1, accountId, MaxClientSettingBytes);
+            return false;
+        }
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = @"
+INSERT INTO account_settings(account_id, blob, updated_at) VALUES($a, $b, datetime('now'))
+ON CONFLICT(account_id) DO UPDATE SET blob = excluded.blob, updated_at = excluded.updated_at";
+            cmd.Parameters.AddWithValue("$a", accountId);
+            cmd.Parameters.AddWithValue("$b", blob);
+            cmd.ExecuteNonQuery();
+        }
+        _log.LogDebug("Saved {Len} bytes of account settings for account {Id}", blob.Length, accountId);
+        return true;
+    }
+
+    /// <summary>One account's stored client settings, or null when nothing has been saved yet.</summary>
+    public byte[]? LoadAccountSetting(long accountId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT blob FROM account_settings WHERE account_id = $a";
+            cmd.Parameters.AddWithValue("$a", accountId);
+            using var r = cmd.ExecuteReader();
+            if (!r.Read()) return null;
+            var blob = (byte[])r["blob"];
+            return blob.Length == 0 ? null : blob;
+        }
     }
 
     // ---- Accounts ----

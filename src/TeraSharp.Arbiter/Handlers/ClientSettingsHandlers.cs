@@ -50,7 +50,6 @@ public static class ClientSettingsHandlers
 
     public static void SendChatOption(GameSession s) => s.SendRawBody("S_REPLY_CLIENT_CHAT_OPTION_SETTING", ChatOption);
     public static void SendUiSetting(GameSession s) => s.SendRawBody("S_REPLY_CLIENT_UI_SETTING", UiSetting);
-    public static void SendUserSetting(GameSession s) => s.SendRawBody("S_LOAD_CLIENT_USER_SETTING", UserSetting);
 
     public static bool OnRequestChatOption(GameSession s, ReadOnlyMemory<byte> body) { SendChatOption(s); return true; }
     public static bool OnRequestUiSetting(GameSession s, ReadOnlyMemory<byte> body) { SendUiSetting(s); return true; }
@@ -60,6 +59,196 @@ public static class ClientSettingsHandlers
         s.SendByDef("S_SAVE_CLIENT_CHAT_OPTION_SETTING", new Dictionary<string, object> { ["result"] = (byte)1 });
         return true;
     }
+
+
+    // =====================================================================
+    // T19 — persisting the client's own option blobs.
+    //
+    // The client serialises its whole UI state — keybinds, hotbars, chat tabs, window layout,
+    // inventory sort — and hands it to the Arbiter, which stores it verbatim and hands it back at
+    // the next login. There are two scopes and they are separate rows:
+    //
+    //   per CHARACTER  C_SAVE_CLIENT_USER_SETTING    (40143 / 0x9CCF) -> S_LOAD_CLIENT_USER_SETTING    (28404 / 0x6EF4)
+    //   per ACCOUNT    C_SAVE_CLIENT_ACCOUNT_SETTING                  -> S_LOAD_CLIENT_ACCOUNT_SETTING (52869 / 0xCE85)
+    //
+    // Body layout, all four packets, from the .def files (`bytes data`) and confirmed against the
+    // capture: [u16 offset][u16 count][count bytes]. The offset is PACKET-relative — it counts the
+    // 4-byte [u16 len][u16 opcode] header — so a blob that starts right after the descriptor has
+    // offset 8, and its first byte is body[4]. The real handler reads exactly that:
+    // Handler_C_SAVE_CLIENT_USER_SETTING (Arb_part_041.c:11024) takes `param_2` as the PACKET
+    // start and uses param_2[2] (offset) and param_2[3] (count).
+    //
+    // What the real Arbiter does with it:
+    //   * User::SaveClientSetting (Arb_part_029.c:18757) / Account::SaveClientSetting
+    //     (Arb_part_065.c:9779): drop the save outright when count is 0 or above 9000, otherwise
+    //     write it to SQL and keep a copy. Nothing is parsed.
+    //   * User::SendClientSetting (Arb_part_029.c:19563) writes opcode 0x6EF4, backpatches
+    //     [offset][count] and appends the stored bytes — UNCONDITIONALLY, so a character with
+    //     nothing stored gets an 8-byte packet whose body is `08 00 00 00`. That is exactly
+    //     cap_newchar_client.log packet 309, the first login of the brand-new character "Test".
+    //     Account::SendClientSetting does the same (it only logs when the length is 0).
+    //
+    // When the client saves: NOT only at logout. cap_newchar_client.log has
+    // C_SAVE_CLIENT_USER_SETTING at packets 350, 2293 and 2297 — after the first spawn, after an
+    // inventory change and after achievement progress — with the blob growing 991 -> 999 -> 1002
+    // bytes. So the store has to be an upsert and has to tolerate a save at any moment.
+    // C_SAVE_CLIENT_ACCOUNT_SETTING appears in neither capture: the account blob only changes
+    // when the player edits account-scope options.
+    //
+    // When the server sends: S_LOAD_CLIENT_ACCOUNT_SETTING goes out twice — once right after
+    // S_GET_USER_LIST at the lobby, and once in the post-spawn burst — and
+    // S_LOAD_CLIENT_USER_SETTING only in that burst, immediately after the account one:
+    //   S_FRIEND_GROUP_LIST, S_FRIEND_LIST, S_UPDATE_FRIEND_INFO,
+    //   S_LOAD_CLIENT_ACCOUNT_SETTING, S_LOAD_CLIENT_USER_SETTING
+    // (cap packets 306-309, lobby_proxy 265-268 and 920-923). TeraSharp already sends the user one
+    // at that exact point, from HandlerRegistry's C_LOAD_TOPO_FIN in-world branch; T19 does not
+    // move it. See status/CLIENT-SETTINGS.md for the one-line change that adds the account one.
+    // =====================================================================
+
+    /// <summary>
+    /// Opcodes as they appear in the capture. The live path resolves names through the opcode
+    /// table, not these; they are here to document the capture and to let the tests frame a body
+    /// without loading data.json.
+    /// </summary>
+    public const ushort OpCSaveClientUserSetting = 0x9CCF;    // 40143
+    public const ushort OpSLoadClientUserSetting = 0x6EF4;    // 28404
+    public const ushort OpSLoadClientAccountSetting = 0xCE85; // 52869
+
+    /// <summary>Frame header: [u16 length][u16 opcode]. The blob descriptor's offset counts it.</summary>
+    public const int PacketHeaderSize = 4;
+    /// <summary>Body header: [u16 offset][u16 count].</summary>
+    public const int BlobDescriptorSize = 4;
+    /// <summary>Offset a blob gets when it starts right after the descriptor: 4 + 4.</summary>
+    public const int BlobOffset = PacketHeaderSize + BlobDescriptorSize;
+
+    /// <summary>
+    /// The body of an S_LOAD_* that carries nothing: <c>08 00 00 00</c>. Byte-identical to
+    /// cap_newchar_client.log packet 309, which is what the real server sent "Test" — a character
+    /// created minutes earlier — on its first login.
+    /// </summary>
+    public static byte[] EmptySettingBody() => new byte[] { BlobOffset, 0, 0, 0 };
+
+    /// <summary>
+    /// Pull the blob out of a C_SAVE_* body. <paramref name="body"/> excludes the 4-byte packet
+    /// header, but the descriptor's offset includes it, hence the -PacketHeaderSize.
+    ///
+    /// <para>Returns an empty span for the shapes the real handler treats as "no data": a zero
+    /// offset, an offset at or past the end of the packet, or a count that runs off the end. The
+    /// real handler passes NULL to SaveClientSetting in those cases, which then refuses the save
+    /// because the length check comes first — so an empty result must NOT clear what is stored.</para>
+    /// </summary>
+    public static ReadOnlySpan<byte> ParseSettingBlob(ReadOnlySpan<byte> body)
+    {
+        if (body.Length < BlobDescriptorSize) return ReadOnlySpan<byte>.Empty;
+        int offset = body[0] | (body[1] << 8);
+        int count = body[2] | (body[3] << 8);
+        if (count <= 0) return ReadOnlySpan<byte>.Empty;
+
+        int start = offset - PacketHeaderSize;             // offset is packet-relative
+        if (offset == 0 || start < BlobDescriptorSize) return ReadOnlySpan<byte>.Empty;
+        if (start > body.Length || count > body.Length - start) return ReadOnlySpan<byte>.Empty;
+        return body.Slice(start, count);
+    }
+
+    /// <summary>
+    /// Build an S_LOAD_* body around a stored blob: [u16 offset=8][u16 count][blob]. A null or
+    /// empty blob gives <see cref="EmptySettingBody"/>, which is what the real Arbiter sends when
+    /// it has nothing stored.
+    /// </summary>
+    public static byte[] BuildSettingBody(byte[]? blob)
+    {
+        if (blob == null || blob.Length == 0) return EmptySettingBody();
+        var body = new byte[BlobDescriptorSize + blob.Length];
+        body[0] = (byte)BlobOffset; body[1] = (byte)(BlobOffset >> 8);
+        body[2] = (byte)blob.Length; body[3] = (byte)(blob.Length >> 8);
+        blob.CopyTo(body, BlobDescriptorSize);
+        return body;
+    }
+
+    /// <summary>
+    /// The captured default: the body TeraSharp has always sent for S_LOAD_CLIENT_USER_SETTING,
+    /// served to any character that has never saved. It is one real character's settings
+    /// (lobby_proxy.log packet 268 = the blob "Test" itself saved at cap packet 350 — the two are
+    /// byte-identical, so it is simply what a client saves once it has drawn its default UI).
+    ///
+    /// <para>NOTE: the real Arbiter would send <see cref="EmptySettingBody"/> here instead — see
+    /// the block comment above. We keep the captured default because HandlerRegistry's in-world
+    /// branch relies on this packet to get the chat window processing S_CHAT, and that is
+    /// live-verified behaviour nobody wants to disturb on a hunch. Switching to parity is one
+    /// line: return EmptySettingBody(). status/CLIENT-SETTINGS.md has the argument.</para>
+    /// </summary>
+    public static byte[] DefaultUserSettingBody() => (byte[])UserSetting.Clone();
+
+    /// <summary>
+    /// The default for S_LOAD_CLIENT_ACCOUNT_SETTING: EMPTY. Unlike the user one there is no
+    /// incumbent captured default to preserve, and the only account blob in the captures is the
+    /// human's own account options (graphics, sound, interface) — handing those to every new
+    /// account would be the same mistake as the shared starter blob in T18. Empty is what the real
+    /// Arbiter sends for an account with nothing stored.
+    /// </summary>
+    public static byte[] DefaultAccountSettingBody() => EmptySettingBody();
+
+    /// <summary>
+    /// S_LOAD_CLIENT_USER_SETTING: the character's stored blob, or the captured default.
+    /// Timing is the caller's business — HandlerRegistry sends this from the C_LOAD_TOPO_FIN
+    /// in-world branch and T19 deliberately does not change that.
+    /// </summary>
+    public static void SendUserSetting(GameSession s)
+    {
+        byte[]? stored = null;
+        long charId = CharacterIdOf(s);
+        if (charId > 0) stored = Program.Store?.LoadClientSetting(charId);
+        s.SendRawBody("S_LOAD_CLIENT_USER_SETTING",
+            stored != null ? BuildSettingBody(stored) : DefaultUserSettingBody());
+    }
+
+    /// <summary>S_LOAD_CLIENT_ACCOUNT_SETTING: the account's stored blob, or the empty form.</summary>
+    public static void SendAccountSetting(GameSession s)
+    {
+        var stored = Program.Store?.LoadAccountSetting((long)s.Account.AccountId);
+        s.SendRawBody("S_LOAD_CLIENT_ACCOUNT_SETTING",
+            stored != null ? BuildSettingBody(stored) : DefaultAccountSettingBody());
+    }
+
+    /// <summary>
+    /// C_SAVE_CLIENT_USER_SETTING. No reply: the capture has none, and the client does not wait
+    /// for one (unlike C_SAVE_CLIENT_UI_SETTING, which gets S_SAVE_CLIENT_UI_SETTING).
+    /// </summary>
+    public static bool OnSaveUserSetting(GameSession s, ReadOnlyMemory<byte> body)
+    {
+        long charId = CharacterIdOf(s);
+        var blob = ParseSettingBlob(body.Span);
+        if (charId <= 0)
+        {
+            // No character selected yet — the real handler falls back to the session's lobby user;
+            // we have nowhere to put it, so drop it rather than write it under the wrong id.
+            return true;
+        }
+        if (blob.IsEmpty)
+        {
+            // Same as the real Arbiter: a zero-length save is refused and the stored blob stands.
+            return true;
+        }
+        Program.Store?.SaveClientSetting(charId, blob.ToArray());
+        return true;
+    }
+
+    /// <summary>C_SAVE_CLIENT_ACCOUNT_SETTING. No reply, same as the user one.</summary>
+    public static bool OnSaveAccountSetting(GameSession s, ReadOnlyMemory<byte> body)
+    {
+        var blob = ParseSettingBlob(body.Span);
+        if (blob.IsEmpty) return true;
+        Program.Store?.SaveAccountSetting((long)s.Account.AccountId, blob.ToArray());
+        return true;
+    }
+
+    /// <summary>
+    /// The character these settings belong to. <c>SelectedCharacter</c> is set at C_SELECT_USER and
+    /// is what the whole post-spawn burst keys off; PlayerId is the same value once in world and is
+    /// the fallback for a session that has a player but no cached record.
+    /// </summary>
+    private static long CharacterIdOf(GameSession s)
+        => s.SelectedCharacter != null ? s.SelectedCharacter.Id : s.PlayerId;
 
     private static byte[] ParseHex(string hex)
     {

@@ -4861,6 +4861,248 @@ array items
         Hex.True(!seen.Contains("5/1"), "Baraka is male-only; a female row would mean the table is wrong");
     }
 
+
+    // =====================================================================
+    // T19 — client settings round-trip.
+    //
+    // Ground truth: data/cap_client_settings.bin, whole CLIENT frames (with the 4-byte
+    // [u16 len][u16 opcode] header) lifted out of the decrypted client captures. Keys are the
+    // packet numbers; the one from lobby_proxy.log is offset by 100000. See data/cap_client_settings.md.
+    //
+    //   308     S_LOAD_CLIENT_ACCOUNT_SETTING   622 B  account blob, 614 bytes
+    //   309     S_LOAD_CLIENT_USER_SETTING        8 B  EMPTY — "Test" had never saved
+    //   350     C_SAVE_CLIENT_USER_SETTING      999 B  the first save that character made
+    //   2297    C_SAVE_CLIENT_USER_SETTING     1010 B  a later, bigger save
+    //   100268  S_LOAD_CLIENT_USER_SETTING      999 B  the blob replayed to dob at login
+    // =====================================================================
+
+    static Dictionary<uint, byte[]>? LoadClientSettingsCaptureOrSkip() => LoadTsisOrSkip("cap_client_settings.bin");
+
+    /// <summary>Body of a captured client frame (everything past [u16 len][u16 opcode]).</summary>
+    static byte[] FrameBody(byte[] frame) => frame[ClientSettingsHandlers.PacketHeaderSize..];
+
+    /// <summary>
+    /// Wrap a body the way GameSession.Frame does — [u16 totalLength][u16 opcode][body] — so it
+    /// can be compared to a captured client frame. (The other Frame() in this file builds the
+    /// Arbiter&lt;-&gt;World shape, which has a u32 length and a 6-byte header.)
+    /// </summary>
+    static byte[] ClientFrame(ushort opcode, byte[] body)
+    {
+        var p = new byte[body.Length + 4];
+        p[0] = (byte)p.Length; p[1] = (byte)(p.Length >> 8);
+        p[2] = (byte)opcode;   p[3] = (byte)(opcode >> 8);
+        body.CopyTo(p, 4);
+        return p;
+    }
+
+    [Test]
+    public static void ClientSettings_capture_frames_have_the_opcodes_and_shape_we_think()
+    {
+        var cap = LoadClientSettingsCaptureOrSkip();
+        if (cap == null) return;
+
+        foreach (var (seq, op) in new (uint, ushort)[]
+        {
+            (309u, ClientSettingsHandlers.OpSLoadClientUserSetting),
+            (100268u, ClientSettingsHandlers.OpSLoadClientUserSetting),
+            (350u, ClientSettingsHandlers.OpCSaveClientUserSetting),
+            (2297u, ClientSettingsHandlers.OpCSaveClientUserSetting),
+            (308u, ClientSettingsHandlers.OpSLoadClientAccountSetting),
+        })
+        {
+            var f = cap[seq];
+            Hex.True(BitConverter.ToUInt16(f, 0) == f.Length,
+                $"packet {seq}: the length field must match the frame ({BitConverter.ToUInt16(f, 0)} vs {f.Length})");
+            Hex.True(BitConverter.ToUInt16(f, 2) == op,
+                $"packet {seq}: expected opcode 0x{op:X4}, frame carries 0x{BitConverter.ToUInt16(f, 2):X4}");
+            // Every one of the four packets is a single `bytes data` field: [u16 offset][u16 count].
+            int off = BitConverter.ToUInt16(f, 4), count = BitConverter.ToUInt16(f, 6);
+            Hex.True(off == ClientSettingsHandlers.BlobOffset,
+                $"packet {seq}: the blob offset is packet-relative and always 8, got {off}");
+            Hex.True(count == f.Length - ClientSettingsHandlers.BlobOffset,
+                $"packet {seq}: count {count} should be the rest of the frame ({f.Length - ClientSettingsHandlers.BlobOffset})");
+        }
+    }
+
+    [Test]
+    public static void ClientSettings_parses_the_captured_save_packet()
+    {
+        var cap = LoadClientSettingsCaptureOrSkip();
+        if (cap == null) return;
+
+        var blob = ClientSettingsHandlers.ParseSettingBlob(FrameBody(cap[350])).ToArray();
+        Hex.True(blob.Length == 991, $"cap packet 350 carries a 991-byte blob, parsed {blob.Length}");
+        // The offset is packet-relative, so the blob starts at body[4] — get that wrong by four
+        // and the stored settings are shifted and the client throws them away.
+        Hex.Eq(blob, cap[350][ClientSettingsHandlers.BlobOffset..], "the blob is the frame past byte 8");
+
+        var big = ClientSettingsHandlers.ParseSettingBlob(FrameBody(cap[2297])).ToArray();
+        Hex.True(big.Length == 1002, $"cap packet 2297 carries a 1002-byte blob, parsed {big.Length}");
+    }
+
+    [Test]
+    public static void ClientSettings_the_save_and_the_load_carry_the_same_bytes()
+    {
+        // The Arbiter stores the blob verbatim and replays it verbatim: the body of the C_SAVE the
+        // client sent and the body of the S_LOAD the server sent back are byte-identical. That is
+        // the whole contract, and it is why this feature is a store and nothing else.
+        var cap = LoadClientSettingsCaptureOrSkip();
+        if (cap == null) return;
+        Hex.Eq(FrameBody(cap[350]), FrameBody(cap[100268]),
+            "C_SAVE (cap 350) and S_LOAD (lobby_proxy 268) must carry identical bodies");
+    }
+
+    [Test]
+    public static void ClientSettings_S_LOAD_is_byte_exact_against_the_capture()
+    {
+        // Re-framing the stored blob must reproduce the real server's packet exactly.
+        var cap = LoadClientSettingsCaptureOrSkip();
+        if (cap == null) return;
+
+        var blob = ClientSettingsHandlers.ParseSettingBlob(FrameBody(cap[350])).ToArray();
+        var frame = ClientFrame(ClientSettingsHandlers.OpSLoadClientUserSetting,
+                          ClientSettingsHandlers.BuildSettingBody(blob));
+        Hex.Eq(frame, cap[100268], "S_LOAD_CLIENT_USER_SETTING rebuilt from the stored blob");
+    }
+
+    [Test]
+    public static void ClientSettings_default_body_is_the_captured_one_and_frames_byte_exact()
+    {
+        // The default TeraSharp has always served IS the capture: framing it must give back
+        // lobby_proxy.log packet 268 to the byte.
+        var cap = LoadClientSettingsCaptureOrSkip();
+        if (cap == null) return;
+
+        var frame = ClientFrame(ClientSettingsHandlers.OpSLoadClientUserSetting,
+                          ClientSettingsHandlers.DefaultUserSettingBody());
+        Hex.Eq(frame, cap[100268], "the captured default must frame to the captured S_LOAD packet");
+
+        // ...and it must be a copy, or a caller could scribble on the shared template.
+        var a = ClientSettingsHandlers.DefaultUserSettingBody();
+        a[4] ^= 0xFF;
+        Hex.Eq(ClientSettingsHandlers.DefaultUserSettingBody(), FrameBody(cap[100268]),
+            "DefaultUserSettingBody must hand out a fresh copy each time");
+    }
+
+    [Test]
+    public static void ClientSettings_empty_form_matches_the_capture()
+    {
+        // What the real Arbiter sends a character that has never saved: an 8-byte packet whose
+        // body is 08 00 00 00. cap_newchar_client.log packet 309, the first login of a character
+        // created minutes earlier.
+        var cap = LoadClientSettingsCaptureOrSkip();
+        if (cap == null) return;
+
+        Hex.Eq(ClientSettingsHandlers.EmptySettingBody(), FrameBody(cap[309]), "the empty body");
+        Hex.Eq(ClientFrame(ClientSettingsHandlers.OpSLoadClientUserSetting, ClientSettingsHandlers.EmptySettingBody()),
+            cap[309], "the empty S_LOAD_CLIENT_USER_SETTING frame");
+        Hex.Eq(ClientSettingsHandlers.BuildSettingBody(null), FrameBody(cap[309]), "null blob -> empty body");
+        Hex.Eq(ClientSettingsHandlers.BuildSettingBody(Array.Empty<byte>()), FrameBody(cap[309]), "empty blob -> empty body");
+        // The account default is the empty form too (see the note on DefaultAccountSettingBody).
+        Hex.Eq(ClientSettingsHandlers.DefaultAccountSettingBody(), FrameBody(cap[309]), "the account default is empty");
+    }
+
+    [Test]
+    public static void ClientSettings_round_trip_through_the_store()
+    {
+        var cap = LoadClientSettingsCaptureOrSkip();
+        if (cap == null) return;
+
+        using var store = new TeraSharp.Arbiter.Persistence.CharacterStore(":memory:", QuietLog());
+        const long charId = 42;
+
+        Hex.True(store.LoadClientSetting(charId) == null, "nothing stored to begin with");
+
+        var first = ClientSettingsHandlers.ParseSettingBlob(FrameBody(cap[350])).ToArray();
+        Hex.True(store.SaveClientSetting(charId, first), "the first save must be accepted");
+        Hex.Eq(store.LoadClientSetting(charId)!, first, "the stored blob must come back verbatim");
+
+        // The client saves repeatedly and the blob grows; the second save must replace the first.
+        var second = ClientSettingsHandlers.ParseSettingBlob(FrameBody(cap[2297])).ToArray();
+        Hex.True(second.Length != first.Length, "the two captured saves should differ in size");
+        Hex.True(store.SaveClientSetting(charId, second), "the second save must be accepted");
+        Hex.Eq(store.LoadClientSetting(charId)!, second, "the newer blob wins");
+
+        // ...and it comes back out as the packet the client expects.
+        Hex.Eq(ClientSettingsHandlers.BuildSettingBody(store.LoadClientSetting(charId)),
+            FrameBody(cap[2297]), "the S_LOAD body rebuilt from the store equals the C_SAVE body");
+
+        // Other characters are unaffected.
+        Hex.True(store.LoadClientSetting(43) == null, "a different character has nothing stored");
+    }
+
+    [Test]
+    public static void ClientSettings_account_scope_is_a_separate_row()
+    {
+        var cap = LoadClientSettingsCaptureOrSkip();
+        if (cap == null) return;
+
+        using var store = new TeraSharp.Arbiter.Persistence.CharacterStore(":memory:", QuietLog());
+        var accountBlob = ClientSettingsHandlers.ParseSettingBlob(FrameBody(cap[308])).ToArray();
+        Hex.True(accountBlob.Length == 614, $"cap packet 308 carries a 614-byte account blob, parsed {accountBlob.Length}");
+
+        Hex.True(store.LoadAccountSetting(1) == null, "nothing stored to begin with");
+        Hex.True(store.SaveAccountSetting(1, accountBlob), "the account save must be accepted");
+        Hex.Eq(store.LoadAccountSetting(1)!, accountBlob, "the account blob must come back verbatim");
+
+        // Saving account settings must not touch the character row and vice versa.
+        Hex.True(store.LoadClientSetting(1) == null, "the character scope is a different table");
+        var userBlob = ClientSettingsHandlers.ParseSettingBlob(FrameBody(cap[350])).ToArray();
+        store.SaveClientSetting(1, userBlob);
+        Hex.Eq(store.LoadAccountSetting(1)!, accountBlob, "the account blob survives a character save");
+
+        Hex.Eq(ClientFrame(ClientSettingsHandlers.OpSLoadClientAccountSetting,
+                     ClientSettingsHandlers.BuildSettingBody(store.LoadAccountSetting(1))),
+            cap[308], "S_LOAD_CLIENT_ACCOUNT_SETTING rebuilt from the store");
+    }
+
+    [Test]
+    public static void ClientSettings_store_refuses_what_the_real_Arbiter_refuses()
+    {
+        // User::SaveClientSetting / Account::SaveClientSetting both open with
+        //   if (len == 0 || 9000 < len) { log; return; }
+        // so an out-of-range save is dropped and whatever was stored stays stored.
+        using var store = new TeraSharp.Arbiter.Persistence.CharacterStore(":memory:", QuietLog());
+        int max = TeraSharp.Arbiter.Persistence.CharacterStore.MaxClientSettingBytes;
+        Hex.True(max == 9000, $"the cap is 9000 bytes, got {max}");
+
+        var good = new byte[max];
+        good[0] = 1;
+        Hex.True(store.SaveClientSetting(7, good), "a 9000-byte blob is exactly at the limit and must be accepted");
+        Hex.True(store.LoadClientSetting(7)!.Length == max, "and must come back whole");
+
+        Hex.True(!store.SaveClientSetting(7, Array.Empty<byte>()), "a zero-length save must be refused");
+        Hex.True(!store.SaveClientSetting(7, new byte[max + 1]), "a 9001-byte save must be refused");
+        Hex.True(store.LoadClientSetting(7)!.Length == max, "a refused save must leave the stored blob alone");
+
+        Hex.True(!store.SaveAccountSetting(7, Array.Empty<byte>()), "account scope: zero-length refused");
+        Hex.True(!store.SaveAccountSetting(7, new byte[max + 1]), "account scope: oversize refused");
+    }
+
+    [Test]
+    public static void ClientSettings_malformed_save_parses_to_empty_instead_of_throwing()
+    {
+        // A save the real handler treats as "no data" — it passes NULL to SaveClientSetting, which
+        // then refuses because the length check runs first. Ours must reach the same outcome and,
+        // above all, must not clear what is already stored.
+        var cases = new (string what, byte[] body)[]
+        {
+            ("truncated descriptor", new byte[] { 8, 0 }),
+            ("zero offset",          new byte[] { 0, 0, 4, 0, 1, 2, 3, 4 }),
+            ("offset inside the descriptor", new byte[] { 4, 0, 4, 0, 1, 2, 3, 4 }),
+            ("offset past the end",  new byte[] { 0xFF, 0xFF, 4, 0, 1, 2, 3, 4 }),
+            ("count past the end",   new byte[] { 8, 0, 0xFF, 0x7F, 1, 2, 3, 4 }),
+            ("zero count",           new byte[] { 8, 0, 0, 0 }),
+        };
+        foreach (var (what, body) in cases)
+            Hex.True(ClientSettingsHandlers.ParseSettingBlob(body).IsEmpty,
+                $"{what}: should parse to an empty blob");
+
+        // A one-byte blob is still a real blob.
+        var ok = ClientSettingsHandlers.ParseSettingBlob(new byte[] { 8, 0, 1, 0, 0xAB }).ToArray();
+        Hex.True(ok.Length == 1 && ok[0] == 0xAB, "a 1-byte blob must survive the bounds checks");
+    }
+
     /// <summary>Walks up from the test binary looking for a repo-relative file; null if not found.</summary>
     static string? FindRepoFile(string relative)
     {
