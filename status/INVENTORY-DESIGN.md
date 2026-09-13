@@ -314,8 +314,12 @@ forever (`status/HANDOFF.md` §1) — losing one enchant is recoverable, wedging
 
 Implementation order, smallest useful step first:
 
-1. Echo `0x2769` properly (atoms through, insert ids filled). No storage yet. This alone unblocks
-   picking anything up, and is testable byte-exact against seq 2072/2211/2290/2306/3477.
+1. ~~Echo `0x2769` properly (atoms through, insert ids filled). No storage yet.~~ **Done (T13).**
+   `DbProxyHandlers.BuildDbs2769` copies both atom lists through under the 21-byte header and
+   fills `atom+16` from `CharacterStore.NextItemId` for every op-7 atom that arrives with 0; the
+   counter lives in a `counters` table so ids keep climbing across restarts. Byte-exact against
+   seq 2072→2073 and 2211→2213 (`data/cap_item_single.bin`). Still no item storage: World's
+   writes are acknowledged and forgotten, so the items are gone on the next login.
 2. `items` table + rebuild `0x27A4` from it, seeded at character creation with the six starter
    records. Replaces `BuildStarterInventory`.
 3. Apply ops 7, 2, 11, 3, 36 to the table. Money (op 9) onto the characters row.

@@ -147,8 +147,10 @@ public static class Tests
 
     [Test] public static void Save_2769_matches_capture()
     {
+        // arb_world.log frame 1073: the logout flush, both lists empty, so the allocator is
+        // never reached. T13 covers the non-empty forms.
         var req = Hex.B("1E 00 00 00 00 00 00 00  1E 00 00 00 00 00 00 00  39 00 00 00  01 00 00 00"); // 1073
-        Hex.Eq(DbProxyHandlers.BuildDbs2769(req),
+        Hex.Eq(DbProxyHandlers.BuildDbs2769(req, () => throw new Exception("an empty list must not allocate an item id")),
             "1B 00 00 00 00 00 00 00  1B 00 00 00 00 00 00 00  39 00 00 00  01", "DBS 0x2769"); // 1074
     }
 
@@ -3251,6 +3253,248 @@ array items
                 "playerId 1 must fall through to the replay table, not get the starter inventory");
         }
         finally { DbProxyHandlers.SetStarterInventoryForTest(null); }
+    }
+
+    // =====================================================================
+    // T13 — SDB_ITEM_SINGLE (0x2768) -> DBS_ITEM_SINGLE (0x2769) is a real echo.
+    //
+    // Before this, TeraSharp answered every 0x2768 with two EMPTY lists. That is fine for the
+    // three empty flush frames World sends at enter-world / zone change / logout, and wrong for
+    // every real one: World gets back none of the atoms it just wrote, and on an insert it gets
+    // item DB id 0 for the item it thinks it saved.
+    //
+    // Ground truth: data/cap_item_single.bin — the four frames from cap_newchar.log, extracted
+    // so the tests do not need D:\packetlogs. See data/cap_item_single.md and
+    // status/INVENTORY-DESIGN.md.
+    //   2072 -> 2073   one atom, op 7 (insert)      only change in 856 B: [16] 0 -> 15
+    //   2211 -> 2213   five atoms, ops 6,11,6,11,7  atoms 0..3 identical, atom 4 [16] 0 -> 16
+    // =====================================================================
+
+    /// <summary>Hands out ids from a fixed start and counts how often it was asked.</summary>
+    sealed class IdCounter
+    {
+        private int _next;
+        public int Calls { get; private set; }
+        public IdCounter(int first) => _next = first;
+        public int Next() { Calls++; return _next++; }
+    }
+
+    /// <summary>data/cap_item_single.bin keyed by capture sequence number, or null with a note.</summary>
+    static Dictionary<uint, byte[]>? LoadItemSingleCaptureOrSkip()
+    {
+        var path = FindRepoFile(Path.Combine("data", "cap_item_single.bin"));
+        if (path == null) { Console.WriteLine("        (skipped: data/cap_item_single.bin not found)"); return null; }
+
+        var b = File.ReadAllBytes(path);
+        Hex.True(b.Length > 8 && b[0] == (byte)'T' && b[1] == (byte)'S' && b[2] == (byte)'I' && b[3] == (byte)'S',
+            "cap_item_single.bin must start with the TSIS magic");
+        int count = (int)BitConverter.ToUInt32(b, 4);
+        var map = new Dictionary<uint, byte[]>();
+        int o = 8;
+        for (int i = 0; i < count; i++)
+        {
+            Hex.True(o + 10 <= b.Length, $"cap_item_single.bin: truncated header for record {i}");
+            uint seq = BitConverter.ToUInt32(b, o);
+            int len = (int)BitConverter.ToUInt32(b, o + 6);
+            o += 10;
+            Hex.True(o + len <= b.Length, $"cap_item_single.bin: truncated payload for seq {seq}");
+            map[seq] = b[o..(o + len)];
+            o += len;
+        }
+        Hex.True(o == b.Length, "cap_item_single.bin: trailing bytes after the last record");
+        return map;
+    }
+
+    /// <summary>Payload offset of the atom list whose [offset][length] pair sits at headerOffset.</summary>
+    static int AtomListStart(byte[] request, int headerOffset)
+        => (int)BitConverter.ToUInt32(request, headerOffset) - 6;
+
+    [Test] public static void ItemSingle_2072_echoes_the_insert_atom_with_the_allocated_id()
+    {
+        var cap = LoadItemSingleCaptureOrSkip();
+        if (cap == null) return;
+
+        var ids = new IdCounter(15);   // the id the real Arbiter handed out for this frame
+        var reply = DbProxyHandlers.BuildDbs2769(cap[2072], ids.Next);
+
+        Hex.Eq(reply, cap[2073], "DBS_ITEM_SINGLE (cap_newchar.log seq 2072 -> 2073)");
+        Hex.True(ids.Calls == 1, $"exactly one id should be allocated for one insert atom, got {ids.Calls}");
+    }
+
+    [Test] public static void ItemSingle_2211_echoes_five_atoms_byte_exact()
+    {
+        var cap = LoadItemSingleCaptureOrSkip();
+        if (cap == null) return;
+
+        var ids = new IdCounter(16);
+        var reply = DbProxyHandlers.BuildDbs2769(cap[2211], ids.Next);
+
+        Hex.Eq(reply, cap[2213], "DBS_ITEM_SINGLE (cap_newchar.log seq 2211 -> 2213)");
+        Hex.True(ids.Calls == 1, $"only the one op-7 atom of five may allocate, got {ids.Calls}");
+    }
+
+    [Test] public static void ItemSingle_reply_header_is_21_bytes_and_offsets_follow_the_lists()
+    {
+        var cap = LoadItemSingleCaptureOrSkip();
+        if (cap == null) return;
+        var req = cap[2211];
+        var reply = DbProxyHandlers.BuildDbs2769(req, new IdCounter(16).Next);
+
+        int lenA = (int)BitConverter.ToUInt32(reply, 4);
+        Hex.True(BitConverter.ToUInt32(reply, 0) == 27, "list A offset is frame-relative 27 (6 + 21)");
+        Hex.True(lenA == 5 * DbProxyHandlers.ItemAtomSize, $"list A is 5 x 856, got {lenA}");
+        Hex.True(BitConverter.ToUInt32(reply, 8) == 27 + lenA, "list B starts right after list A");
+        Hex.True(BitConverter.ToUInt32(reply, 12) == 0, "list B is empty in this capture");
+        Hex.True(BitConverter.ToUInt32(reply, 16) == BitConverter.ToUInt32(req, 16), "reqId echoed from the request");
+        Hex.True(reply[20] == 1, "ok = 1, as on every captured reply");
+        // The Arbiter's reply frame is the request frame minus 3 (24-byte header -> 21-byte).
+        Hex.True(reply.Length == req.Length - 3, $"reply payload should be {req.Length - 3}, got {reply.Length}");
+    }
+
+    [Test] public static void ItemSingle_only_the_insert_atom_changes()
+    {
+        // Every other byte of every atom must survive: World matches its in-memory items against
+        // what comes back, and ops 2/6/9/11 carry no Arbiter-side result at all.
+        var cap = LoadItemSingleCaptureOrSkip();
+        if (cap == null) return;
+
+        var req = cap[2211];
+        var reply = DbProxyHandlers.BuildDbs2769(req, new IdCounter(16).Next);
+        int inStart = AtomListStart(req, 0), len = (int)BitConverter.ToUInt32(req, 4);
+
+        var changed = new List<int>();
+        for (int i = 0; i < len; i++)
+            if (req[inStart + i] != reply[DbProxyHandlers.ItemSingleReplyHeader + i]) changed.Add(i);
+
+        // atom 4 (the op 7), field +16, and nothing else — the low byte of the id is the only
+        // one that differs because 0 -> 16 fits in a byte.
+        int expected = 4 * DbProxyHandlers.ItemAtomSize + DbProxyHandlers.ItemAtomDbIdOffset;
+        Hex.True(changed.Count == 1 && changed[0] == expected,
+            $"only atom 4's item DB id may change; changed offsets [{string.Join(",", changed.Take(12))}]");
+        Hex.True(BitConverter.ToUInt32(reply, DbProxyHandlers.ItemSingleReplyHeader + expected) == 16,
+            "the allocated id must land at atom+16");
+
+        // And the four non-insert atoms are untouched, checked as whole atoms.
+        for (int a = 0; a < 4; a++)
+        {
+            var before = req[(inStart + a * DbProxyHandlers.ItemAtomSize)..(inStart + (a + 1) * DbProxyHandlers.ItemAtomSize)];
+            var after = reply[(DbProxyHandlers.ItemSingleReplyHeader + a * DbProxyHandlers.ItemAtomSize)
+                              ..(DbProxyHandlers.ItemSingleReplyHeader + (a + 1) * DbProxyHandlers.ItemAtomSize)];
+            uint op = BitConverter.ToUInt32(before, DbProxyHandlers.ItemAtomOpOffset);
+            Hex.Eq(after, before, $"atom {a} (op {op}) must be echoed verbatim");
+        }
+    }
+
+    [Test] public static void ItemSingle_does_not_reallocate_a_nonzero_item_id()
+    {
+        // An insert that already carries an id is World restating one it knows about. Handing it
+        // a different id would orphan the item.
+        var cap = LoadItemSingleCaptureOrSkip();
+        if (cap == null) return;
+
+        var req = (byte[])cap[2072].Clone();
+        int idAt = AtomListStart(req, 0) + DbProxyHandlers.ItemAtomDbIdOffset;
+        BitConverter.GetBytes(99u).CopyTo(req, idAt);
+
+        var ids = new IdCounter(15);
+        var reply = DbProxyHandlers.BuildDbs2769(req, ids.Next);
+
+        Hex.True(ids.Calls == 0, $"an atom that already has an id must not allocate, allocated {ids.Calls}");
+        Hex.True(BitConverter.ToUInt32(reply, DbProxyHandlers.ItemSingleReplyHeader + DbProxyHandlers.ItemAtomDbIdOffset) == 99,
+            "the id World sent must be echoed unchanged");
+    }
+
+    [Test] public static void ItemSingle_empty_flush_matches_the_capture()
+    {
+        // cap_newchar.log seq 519 (enter-world), 2540 (zone change) and 4179 (logout) are all
+        // this: a 30-byte frame with both lists empty, answered with a 27-byte one.
+        var req = Hex.B("1E 00 00 00  00 00 00 00  1E 00 00 00  00 00 00 00  44 00 00 00  02 00 00 00");
+        Hex.Eq(DbProxyHandlers.BuildDbs2769(req, new IdCounter(1000).Next),
+            "1B 00 00 00  00 00 00 00  1B 00 00 00  00 00 00 00  44 00 00 00  01",
+            "DBS_ITEM_SINGLE empty flush (cap_newchar.log seq 519 -> 520)");
+    }
+
+    [Test] public static void ItemSingle_malformed_list_still_gets_a_well_formed_reply()
+    {
+        // A length that is not a whole number of atoms, or one that runs off the end. Echoing a
+        // half atom would be worse than echoing none, but NOT replying head-blocks the user's DLM
+        // queue for the life of the World process (status/HANDOFF.md section 1), so a reply must
+        // still go out — with the live reqId.
+        foreach (var (name, lenA) in new[] { ("not a multiple of 856", 100), ("longer than the payload", 856) })
+        {
+            var req = new byte[DbProxyHandlers.ItemSingleRequestHeader];
+            BitConverter.GetBytes(30u).CopyTo(req, 0);
+            BitConverter.GetBytes((uint)lenA).CopyTo(req, 4);
+            BitConverter.GetBytes(30u).CopyTo(req, 8);
+            BitConverter.GetBytes(0x0BADu).CopyTo(req, 16);
+
+            var reply = DbProxyHandlers.BuildDbs2769(req, new IdCounter(1000).Next);
+            Hex.True(reply.Length == DbProxyHandlers.ItemSingleReplyHeader, $"{name}: reply should be the bare header");
+            Hex.True(BitConverter.ToUInt32(reply, 16) == 0x0BAD, $"{name}: the live DLM id must still be echoed");
+            Hex.True(reply[20] == 1, $"{name}: ok byte still set");
+            Hex.True(DbProxyHandlers.DeclaredAtomCount(req, 0) != 0,
+                $"{name}: the header claims atoms, so the handler can spot the mismatch and log it");
+        }
+    }
+
+    [Test] public static void Handler_2768_allocates_from_the_store_and_ids_keep_climbing()
+    {
+        var cap = LoadItemSingleCaptureOrSkip();
+        if (cap == null) return;
+
+        using var store = new TeraSharp.Arbiter.Persistence.CharacterStore(":memory:", QuietLog());
+        int first = TeraSharp.Arbiter.Persistence.CharacterStore.FirstItemId;
+
+        var (op1, body1) = RunHandler1(DbProxyHandlers.SDB_SAVE_2768, cap[2072], store);
+        Hex.True(op1 == DbProxyHandlers.DBS_SAVE_2769, $"reply opcode must be 0x2769, got 0x{op1:X4}");
+        Hex.True(BitConverter.ToUInt32(body1, DbProxyHandlers.ItemSingleReplyHeader + DbProxyHandlers.ItemAtomDbIdOffset) == first,
+            $"the first insert should get id {first}");
+
+        var (_, body2) = RunHandler1(DbProxyHandlers.SDB_SAVE_2768, cap[2072], store);
+        Hex.True(BitConverter.ToUInt32(body2, DbProxyHandlers.ItemSingleReplyHeader + DbProxyHandlers.ItemAtomDbIdOffset) == first + 1,
+            "the next insert must get a different id — reusing one orphans World's item");
+
+        // Everything except that id is still the captured reply.
+        var expected = (byte[])cap[2073].Clone();
+        BitConverter.GetBytes(first).CopyTo(expected, DbProxyHandlers.ItemSingleReplyHeader + DbProxyHandlers.ItemAtomDbIdOffset);
+        Hex.Eq(body1, expected, "the live reply is the captured one with our own id in it");
+    }
+
+    [Test] public static void CharacterStore_item_ids_are_monotonic_and_survive_reopen()
+    {
+        var dbPath = Path.Combine(Path.GetTempPath(), $"terasharp_t13_{Guid.NewGuid():N}.db");
+        try
+        {
+            int first = TeraSharp.Arbiter.Persistence.CharacterStore.FirstItemId;
+            int last;
+            using (var store = new TeraSharp.Arbiter.Persistence.CharacterStore(dbPath, QuietLog()))
+            {
+                Hex.True(store.NextItemId() == first, $"the first id should be {first}");
+                Hex.True(store.NextItemId() == first + 1, "ids increment");
+                // A run of three, contiguous, returning the first.
+                int run = store.ReserveItemIds(3);
+                Hex.True(run == first + 2, $"ReserveItemIds(3) should return {first + 2}, got {run}");
+                last = store.NextItemId();
+                Hex.True(last == first + 5, $"the run must consume all three ids, next was {last}");
+            }
+            // Reopening must not reset the sequence: World keys items by these ids and a restart
+            // that starts over hands out ids it already used.
+            using (var store = new TeraSharp.Arbiter.Persistence.CharacterStore(dbPath, QuietLog()))
+                Hex.True(store.NextItemId() == last + 1,
+                    $"after reopen the next id should be {last + 1}, got a restarted sequence");
+        }
+        finally
+        {
+            try { File.Delete(dbPath); } catch { /* best effort */ }
+        }
+    }
+
+    [Test] public static void CharacterStore_ReserveItemIds_rejects_a_bad_count()
+    {
+        using var store = new TeraSharp.Arbiter.Persistence.CharacterStore(":memory:", QuietLog());
+        bool threw = false;
+        try { store.ReserveItemIds(0); } catch (ArgumentOutOfRangeException) { threw = true; }
+        Hex.True(threw, "ReserveItemIds(0) must be rejected");
     }
 
     /// <summary>

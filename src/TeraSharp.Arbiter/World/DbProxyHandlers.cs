@@ -47,6 +47,42 @@ public sealed class DbProxyHandlers
     public const ushort SDB_SAVE_27FA = 0x27FA; public const ushort DBS_SAVE_27FB = 0x27FB; // reqId @280
     public const ushort SDB_SAVE_2924 = 0x2924; public const ushort DBS_SAVE_2925 = 0x2925; // reqId @8
     public const ushort SDB_SAVE_2768 = 0x2768; public const ushort DBS_SAVE_2769 = 0x2769; // reqId @16
+
+    // --- SDB_ITEM_SINGLE (0x2768) -> DBS_ITEM_SINGLE (0x2769), T13 ---
+    // Not a logout-only save: this is every inventory write World makes (pick up, use, move,
+    // combine, money). Handler_SDB_ITEM_SINGLE (ArbiterServer.exe.c FUN_14074aca0, tracer line
+    // 1271688) needs frame >= 0x1E and reads, FRAME-relative:
+    //   [6]  u32 offsetA  [10] u32 lengthA      list A, bytes; offsets are frame-relative
+    //   [14] u32 offsetB  [18] u32 lengthB      list B, same shape, executed after A
+    //   [22] u32 reqId    [26] u32 playerId
+    // then lengthX / 0x358 records of 856 bytes, each an ItemTransactionAtom. The reply writer
+    // (FUN_1406ec9e0) emits four backpatch slots, the id and the ok byte -- a 21-byte header --
+    // then both lists, so the reply frame is the request frame minus 3.
+    //
+    // The reply is the atoms ECHOED BACK, not an empty list. Verified against cap_newchar.log:
+    //   2072 -> 2073   one atom, op 7   only byte change in 856:  [16] 0 -> 15
+    //   2211 -> 2213   five atoms       atoms 0..3 (ops 6,11,6,11) identical; atom 4 (op 7) [16] 0 -> 16
+    //   2290/2306/3477 (ops 2, 2, 9)    byte-identical
+    // So: copy the atoms through, and for an insert whose item DB id is still 0, fill in the id
+    // the Arbiter allocated. World keys its in-memory item by that id -- returning 0, or dropping
+    // the atoms entirely (what we did before T13), loses the item World thinks it just saved.
+    //
+    // Atom layout, atom-relative (status/INVENTORY-DESIGN.md has the rest):
+    //   [0] u32 index in the list   [4] u32 operation   [16] u32 item DB id (0 = allocate one)
+    //   [24] u32 item template id   [48] u32 slot       [0x50] i64 signed amount delta
+    public const int ItemAtomSize = 0x358;              // 856
+    public const int ItemAtomOpOffset = 4;
+    public const int ItemAtomDbIdOffset = 16;
+    /// <summary>0x2768 payload header: two [offset][length] pairs, reqId, playerId.</summary>
+    public const int ItemSingleRequestHeader = 24;
+    /// <summary>0x2769 payload header: the same two pairs, reqId, ok byte.</summary>
+    public const int ItemSingleReplyHeader = 21;
+    /// <summary>
+    /// The insert operation -- the only op in the capture that arrives with item DB id 0 and
+    /// comes back with one filled in. Derived from the World-side builders; see
+    /// status/INVENTORY-DESIGN.md section 4 for the rest of the enum.
+    /// </summary>
+    public const uint TsInsertItem = 7;
     public const ushort SDB_SAVE_2936 = 0x2936; public const ushort DBS_SAVE_2937 = 0x2937; // reqId @0
     public const ushort SDB_DAILY_QUEST = 0x2897; public const ushort DBS_DAILY_QUEST = 0x2898; // reqId @16
 
@@ -265,7 +301,7 @@ public sealed class DbProxyHandlers
             // --- Logout save sequence (reqId echoed from the live request) ---
             case SDB_SAVE_27FA: link.SendFrame(DBS_SAVE_27FB, BuildReqIdAck(payload, 280)); return true;
             case SDB_SAVE_2924: link.SendFrame(DBS_SAVE_2925, BuildReqIdAck(payload, 8)); return true;
-            case SDB_SAVE_2768: link.SendFrame(DBS_SAVE_2769, BuildDbs2769(payload)); return true;
+            case SDB_SAVE_2768: return OnItemSingle(link, payload);
             case SDB_SAVE_2936: link.SendFrame(DBS_SAVE_2937, BuildDbs2937(payload)); return true;
             case SDB_DAILY_QUEST: link.SendFrame(DBS_DAILY_QUEST, BuildReqIdAck(payload, 16)); return true;
             case SDB_DAILY_QUEST_SEED: link.SendFrame(DBS_DAILY_QUEST_SEED, BuildReqIdAck(payload, 8)); return true;
@@ -479,18 +515,99 @@ public sealed class DbProxyHandlers
         return r;
     }
 
-    /// <summary>DBS_SAVE_2769: [u32 off][u32 0][u32 off][u32 0][u32 reqId][u8 1] — two empty lists.
-    /// off = reply frame length (6 + 21 = 27), matching the capture exactly.</summary>
-    public static byte[] BuildDbs2769(byte[] request)
+    /// <summary>
+    /// SDB_ITEM_SINGLE (0x2768) -> DBS_ITEM_SINGLE (0x2769). See the constants above.
+    /// </summary>
+    private bool OnItemSingle(WorldLink link, byte[] payload)
     {
-        uint reqId = 16 + 4 <= request.Length ? BitConverter.ToUInt32(request, 16) : 0;
-        var r = new byte[21];
-        const uint off = 27; // 6-byte frame header + 21-byte payload
-        BitConverter.GetBytes(off).CopyTo(r, 0);
-        BitConverter.GetBytes(off).CopyTo(r, 8);
+        int declaredA = DeclaredAtomCount(payload, 0), declaredB = DeclaredAtomCount(payload, 8);
+        var reply = BuildDbs2769(payload, _store.NextItemId);
+        int echoedA = (int)BitConverter.ToUInt32(reply, 4) / ItemAtomSize;
+        int echoedB = (int)BitConverter.ToUInt32(reply, 12) / ItemAtomSize;
+        uint playerId = payload.Length >= ItemSingleRequestHeader ? BitConverter.ToUInt32(payload, 20) : 0;
+
+        if (echoedA != declaredA || echoedB != declaredB)
+            _log.LogWarning(
+                "SDB_ITEM_SINGLE: could not echo the atom lists for player {Pid} (declared {DA}/{DB}, echoed {EA}/{EB}, "
+                + "payload {Len} B) - World will lose the items it just wrote", playerId, declaredA, declaredB, echoedA, echoedB, payload.Length);
+        else if (declaredA + declaredB > 0)
+            _log.LogInformation("SDB_ITEM_SINGLE: echoed {N} transaction atom(s) for player {Pid}",
+                declaredA + declaredB, playerId);
+
+        link.SendFrame(DBS_SAVE_2769, reply);
+        return true;
+    }
+
+    /// <summary>
+    /// Atom count the request's own header claims for the list at <paramref name="headerOffset"/>
+    /// (0 or 8), counted the way the real handler does it: <c>(length - 1) / 0x358 + 1</c>. That
+    /// rounds up, so a length that is not a whole number of atoms still reports the atoms World
+    /// thinks it sent and the caller can see that we echoed fewer.
+    /// </summary>
+    public static int DeclaredAtomCount(byte[] request, int headerOffset)
+    {
+        if (headerOffset + 8 > request.Length) return 0;
+        int length = (int)BitConverter.ToUInt32(request, headerOffset + 4);
+        return length <= 0 ? 0 : (length - 1) / ItemAtomSize + 1;
+    }
+
+    /// <summary>
+    /// DBS_ITEM_SINGLE (0x2769): the request's two atom lists echoed back under the 21-byte
+    /// reply header, with a freshly allocated item DB id written into every insert atom that
+    /// arrived with 0. <paramref name="allocateItemId"/> is called once per such atom, in list
+    /// order — pass <c>CharacterStore.NextItemId</c>.
+    ///
+    /// <para>A list whose header does not describe a whole number of 856-byte atoms inside the
+    /// payload is echoed as empty rather than half-copied; the caller compares
+    /// <see cref="DeclaredAtomCount"/> against the reply and logs the mismatch. Replying with a
+    /// short list is bad, but not replying at all head-blocks the user's DLM queue forever
+    /// (status/HANDOFF.md section 1).</para>
+    /// </summary>
+    public static byte[] BuildDbs2769(byte[] request, Func<int> allocateItemId)
+    {
+        ArgumentNullException.ThrowIfNull(allocateItemId);
+        uint reqId = request.Length >= ItemSingleRequestHeader ? BitConverter.ToUInt32(request, 16) : 0;
+
+        byte[] listA = CloneAtomList(request, 0, allocateItemId);
+        byte[] listB = CloneAtomList(request, 8, allocateItemId);
+
+        var r = new byte[ItemSingleReplyHeader + listA.Length + listB.Length];
+        uint offA = 6 + ItemSingleReplyHeader;                 // 27, frame-relative
+        uint offB = offA + (uint)listA.Length;
+        BitConverter.GetBytes(offA).CopyTo(r, 0);
+        BitConverter.GetBytes((uint)listA.Length).CopyTo(r, 4);
+        BitConverter.GetBytes(offB).CopyTo(r, 8);
+        BitConverter.GetBytes((uint)listB.Length).CopyTo(r, 12);
         BitConverter.GetBytes(reqId).CopyTo(r, 16);
-        r[20] = 1;
+        r[20] = 1;                                             // ok — 1 on every captured reply
+        listA.CopyTo(r, ItemSingleReplyHeader);
+        listB.CopyTo(r, ItemSingleReplyHeader + listA.Length);
         return r;
+    }
+
+    /// <summary>Copy one atom list out of the request, allocating ids for the inserts in it.</summary>
+    private static byte[] CloneAtomList(byte[] request, int headerOffset, Func<int> allocateItemId)
+    {
+        if (headerOffset + 8 > request.Length) return Array.Empty<byte>();
+        int frameOffset = (int)BitConverter.ToUInt32(request, headerOffset);
+        int length = (int)BitConverter.ToUInt32(request, headerOffset + 4);
+        if (length <= 0) return Array.Empty<byte>();
+
+        int start = frameOffset - 6;                            // offsets in the frame count the header
+        if (start < ItemSingleRequestHeader || length % ItemAtomSize != 0 || start + length > request.Length)
+            return Array.Empty<byte>();
+
+        var atoms = new byte[length];
+        Array.Copy(request, start, atoms, 0, length);
+        for (int o = 0; o + ItemAtomSize <= atoms.Length; o += ItemAtomSize)
+        {
+            if (BitConverter.ToUInt32(atoms, o + ItemAtomOpOffset) != TsInsertItem) continue;
+            // An insert that already carries an id is World re-stating one it knows; only a 0
+            // means "give me one".
+            if (BitConverter.ToUInt32(atoms, o + ItemAtomDbIdOffset) != 0) continue;
+            BitConverter.GetBytes(allocateItemId()).CopyTo(atoms, o + ItemAtomDbIdOffset);
+        }
+        return atoms;
     }
 
     /// <summary>DBS_SAVE_2937: [u32 reqId][u32 0x300][u32 0] (13 bytes), reqId at request offset 0.</summary>

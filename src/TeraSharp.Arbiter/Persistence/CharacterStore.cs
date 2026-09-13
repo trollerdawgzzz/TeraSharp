@@ -332,6 +332,14 @@ CREATE TABLE IF NOT EXISTS blocks (
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   PRIMARY KEY (character_id, blocked_id)
 );
+
+-- Monotonic id sequences the DB-proxy layer hands to WorldServer. Not SQLite rowids: the
+-- values leave the process (DBS_ITEM_SINGLE returns them to World, which keys its in-memory
+-- items by them), so they must keep climbing across restarts even with no table behind them.
+CREATE TABLE IF NOT EXISTS counters (
+  name  TEXT PRIMARY KEY,
+  value INTEGER NOT NULL
+);
 ");
         // CREATE TABLE IF NOT EXISTS does nothing to a DB that already has `characters`, so
         // columns added later need their own idempotent step. terasharp.db predates `exp`.
@@ -580,6 +588,49 @@ SELECT last_insert_rowid();";
             cmd.ExecuteNonQuery();
         }
     }
+
+    // ---- Id sequences ----
+
+    /// <summary>
+    /// First item DB id we hand out. The ids baked into <c>data/starter_inventory.bin</c> are
+    /// 7..12 and every character is currently served that same list, so the counter starts well
+    /// clear of them. (In the capture the real Arbiter's sequence was still in the teens; ours
+    /// only has to be non-zero, distinct and monotonic.)
+    /// </summary>
+    public const int FirstItemId = 1000;
+
+    /// <summary>One fresh item DB id.</summary>
+    public int NextItemId() => ReserveItemIds(1);
+
+    /// <summary>
+    /// Reserve <paramref name="count"/> consecutive item DB ids and return the first. The
+    /// counter lives in <c>counters</c>, so ids never repeat across a restart — a repeat would
+    /// hand World an id it already has an item for.
+    /// </summary>
+    public int ReserveItemIds(int count)
+    {
+        if (count < 1) throw new ArgumentOutOfRangeException(nameof(count), count, "count must be at least 1");
+        lock (_lock)
+        {
+            using (var bump = _db.CreateCommand())
+            {
+                bump.CommandText =
+                    "INSERT INTO counters(name, value) VALUES($k, $seed) " +
+                    "ON CONFLICT(name) DO UPDATE SET value = value + $n";
+                bump.Parameters.AddWithValue("$k", ItemIdCounter);
+                bump.Parameters.AddWithValue("$seed", FirstItemId + count - 1);
+                bump.Parameters.AddWithValue("$n", count);
+                bump.ExecuteNonQuery();
+            }
+            using var sel = _db.CreateCommand();
+            sel.CommandText = "SELECT value FROM counters WHERE name = $k";
+            sel.Parameters.AddWithValue("$k", ItemIdCounter);
+            int last = Convert.ToInt32(sel.ExecuteScalar()!);
+            return last - count + 1;
+        }
+    }
+
+    private const string ItemIdCounter = "item_id";
 
     public void DeleteCharacter(int id)
     {
