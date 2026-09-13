@@ -117,7 +117,30 @@ public sealed class DbProxyHandlers
 
     // --- Remaining login-time SDB_* (programmatic builders) ---
     public const ushort SDB_LOAD_2867 = 0x2867;            // -> 0x2868: three empty lists + [ok][reqId]
-    public const ushort SDB_LOAD_2869 = 0x2869;            // -> 0x286A: empty list + [ok][reqId] + timestamp
+    // SDB_LOAD_DUNGEON_PHASE_LEVEL (0x2869). Handler_SDB_LOAD_DUNGEON_PHASE_LEVEL
+    // (ArbiterServer.exe.c FUN_14074df40) calls DungeonInfoManager::GetDungeonPhaseInfoList()
+    // (FUN_1407168f0) on user+0x6140, which calls CheckAndResetDungeonPhaseUser(DateTime::Now)
+    // (FUN_14070d430). When the stored last-reset time is older than the daily reset boundary
+    // that clears the user's phase list, stores the new reset time at mgr+0x70, and BROADCASTS
+    // AS_REQUEST_DUNGEON_PHASE_USER_RESET (0x15E0) to every registered World session. The
+    // handler then reads that same freshly-written reset time back (mgr+0x61b0) and puts it in
+    // the 0x286A trailer -- which is why both carry the identical u64 in the capture.
+    //   lobby_tap.log 02:51:10.705-.709, packets 172/173/174:
+    //     172 W->A 0x2869  15 00 00 00  01 00 00 00
+    //     173 A->W 0x15E0  01 00 00 00  00 00 00 00  9e 0f a6 6a 00 00 00 00
+    //     174 A->W 0x286A  1b 00 00 00  00 00 00 00  01  15 00 00 00  9e 0f a6 6a 00 00 00 00
+    //   0x6AA60F9E = 1789267870 = 2026-09-13T02:51:10Z, i.e. plain unix seconds, == capture time.
+    // We keep no dungeon-phase state, so every 0x2869 is a reset from World's point of view and
+    // the push always goes out.
+    public const ushort SDB_LOAD_2869 = 0x2869;            // -> 0x15E0 push + 0x286A: empty list + [ok][reqId] + timestamp
+    // World's Handler_AS_REQUEST_DUNGEON_PHASE_USER_RESET (WorldServer.exe.c FUN_1410...,
+    // scope tracer at line 2995424) requires frame length >= 0x16 and reads
+    //   [6] u32 playerId   -> user lookup; unknown user = no-op
+    //   [10] u32 continentId -> 0 resets every continent, non-zero resets just that one
+    //   [14] u64 resetTime -> stored as the user's dungeon-phase reset time
+    // It sends no reply, so this is a fire-and-forget push and not a DLM item.
+    public const ushort AS_REQUEST_DUNGEON_PHASE_USER_RESET = 0x15E0;
+    public const ushort DBS_LOAD_DUNGEON_PHASE_LEVEL = 0x286A;
     public const ushort SDB_LOAD_2900 = 0x2900;            // -> 0x2901: two empty lists + [reqId][ok]
     public const ushort SDB_LOAD_28B7 = 0x28B7;            // -> 0x28B6: [ok][reqId][u32 0][u64 -1] (reply is op-1!)
     public const ushort SDB_LOAD_REFER_A_FRIEND = 0x28B0;  // -> 0x28B1: two empty lists + [ok][reqId] + 20 zeros
@@ -174,10 +197,15 @@ public sealed class DbProxyHandlers
             case SDB_LOAD_2930:            // 0x2931 = [reqId][01][00]   (capture: 82 00 00 00 01 00)
             case SDB_LOAD_WORLD_EVENT:     // 0x27B4 = [reqId][01]       (capture: 83 00 00 00 01)
             case SA_CLEAR_BATTLE_FIELD_ENTER_COUNT: // 0x1563 = [01][reqId@8]  (decompile Arb_part_062.c:4769)
+            case SDB_LOAD_2869:          // 0x15E0 push + 0x286A, both carrying the live reset time
                 break;               // handled by the real switch below
             default:
                 return false;        // -> replay table
         }
+
+        // Name the opcode in the log so a real handler is distinguishable from a replay at a
+        // glance (DbProxyOpcodeNames is generated from WorldServer.exe.c; logging only).
+        _log.LogDebug("DbProxy handling {Op} len={Len}", DbProxyOpcodeNames.Describe(op), payload.Length + 6);
 
         switch (op)
         {
@@ -236,7 +264,16 @@ public sealed class DbProxyHandlers
 
             // --- Remaining login-time: programmatic builders ---
             case SDB_LOAD_2867: link.SendFrame(0x2868, Build2868_ThreeEmptyLists(payload)); return true;
-            case SDB_LOAD_2869: link.SendFrame(0x286A, Build286A_EmptyListTimestamp(payload)); return true;
+            case SDB_LOAD_2869:
+            {
+                // The real Arbiter pushes 0x15E0 first, then answers 0x286A, and both carry the
+                // SAME reset time (see the comment on SDB_LOAD_2869 above).
+                ulong resetTime = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                uint pid = payload.Length >= 8 ? BitConverter.ToUInt32(payload, 4) : 0;
+                link.SendFrame(AS_REQUEST_DUNGEON_PHASE_USER_RESET, Build15E0(pid, resetTime));
+                link.SendFrame(DBS_LOAD_DUNGEON_PHASE_LEVEL, Build286A_EmptyListTimestamp(payload, resetTime));
+                return true;
+            }
             case SDB_LOAD_2900: link.SendFrame(0x2901, Build2901_TwoEmptyLists(payload)); return true;
             case SDB_LOAD_28B7: link.SendFrame(0x28B6, Build28B6(payload)); return true; // reply opcode is op-1!
             case SDB_LOAD_REFER_A_FRIEND: link.SendFrame(0x28B1, Build28B1_ReferAFriend(payload)); return true;
@@ -556,14 +593,37 @@ public sealed class DbProxyHandlers
     /// Same shape as BuildBattleFieldEnterCount but SDB-shape request (reqId at payload[0]).
     /// Capture has a real timestamp; we use 0 (no data).
     /// </summary>
-    public static byte[] Build286A_EmptyListTimestamp(byte[] request)
+    /// <summary>
+    /// DBS_LOAD_DUNGEON_PHASE_LEVEL (0x286A): [u32 listOff=27][u32 listByteLen=0][u8 ok=1]
+    /// [u32 reqId][u64 resetTime] - 21 bytes. Field order and types are the writer in
+    /// Handler_SDB_LOAD_DUNGEON_PHASE_LEVEL (FUN_14074df40): FUN_140350eb0(0x286a), two
+    /// back-patched u32 slots, FUN_1403513d0 (u8 ok = user found), FUN_14013d0b0 (u32 reqId
+    /// read from frame+6), FUN_140351270 (u64 reset time). Ground truth: lobby_tap.log pkt 174.
+    /// </summary>
+    public static byte[] Build286A_EmptyListTimestamp(byte[] request, ulong resetTimeUnixSeconds = 0)
     {
         uint reqId = request.Length >= 4 ? BitConverter.ToUInt32(request, 0) : 0;
         var r = new byte[21];
         BitConverter.GetBytes(27u).CopyTo(r, 0); // listOff = 6 + 21
         r[8] = 1; // ok
         BitConverter.GetBytes(reqId).CopyTo(r, 9);
-        // r[13..20] = 0 (timestamp)
+        BitConverter.GetBytes(resetTimeUnixSeconds).CopyTo(r, 13);
+        return r;
+    }
+
+    /// <summary>
+    /// AS_REQUEST_DUNGEON_PHASE_USER_RESET (0x15E0): [u32 playerId][u32 continentId=0]
+    /// [u64 resetTime] - 16 bytes, matching writer FUN_1407acf70 (u32, u32, u64) and the
+    /// offsets World's handler reads (frame+6, frame+10, frame+14; min frame length 0x16).
+    /// continentId 0 is what CheckAndResetDungeonPhaseUser(DateTime) passes, and tells World
+    /// to reset every continent. One-way: World sends no reply. Ground truth: lobby_tap.log pkt 173.
+    /// </summary>
+    public static byte[] Build15E0(uint playerId, ulong resetTimeUnixSeconds)
+    {
+        var r = new byte[16];
+        BitConverter.GetBytes(playerId).CopyTo(r, 0);
+        // r[4..7] = continentId 0
+        BitConverter.GetBytes(resetTimeUnixSeconds).CopyTo(r, 8);
         return r;
     }
 

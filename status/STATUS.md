@@ -1,181 +1,139 @@
 # TeraSharp — Status (2026-09-13)
 
-Read `status/HANDOFF.md` first if you are new. Workspace rules are at the top of `CLAUDE.md`.
+Read `status/HANDOFF.md` first if you are new — especially section 1 (DLMItems). Workspace rules
+are at the top of `CLAUDE.md`.
 
 Build: `dotnet build TeraSharp.sln` -> 0 warnings, 0 errors.
-Tests: `dotnet run --project src/TeraSharp.Arbiter.Tests` -> **115 passed, 0 failed**
-(105 baseline + 4 replay id-echo + 6 daily-quest/quest-list).
+Tests: `dotnet run --project src/TeraSharp.Arbiter.Tests` -> **149** (134 before the T2/T3/T4/T5
+branches, +15 from them). Re-run to confirm the count after merging.
 
 ---
 
-## 0. The open bug and the diagnosis
+## 0. State of play — logout/relog is FIXED
 
-**Symptom.** Logout button -> World logs `LeaveWorldStart` then `DespawnComplete`, then sends
-nothing: no `0x2924`, no `0x2936`, no `0x27CB`, no `SA_LEAVE_WORLD` (0x1393). The character is
-never deleted from World's user map, so the next `C_SELECT_USER` hangs. Only a World restart
-clears it.
-
-**It is not a logout bug.** Diffing `D:\packetlogs\ts-logout.log` (TeraSharp) against
-`D:\packetlogs\lobby_tap.log` (real ArbiterServer, a working logout + relog) shows the two runs are
-frame-for-frame identical from `AS_ENTER_WORLD` through `SA_ENTER_WORLD` (0x138C) - and then:
+**Live-verified 2026-09-13, 21:13 and 21:46 runs.** Logout button -> countdown -> char select ->
+select again -> spawn where you logged out. The full chain runs:
 
 ```
-real:       W 0x2899 -> A 0x289A   x17     then 0x2910, 0x290C, 0x27B9, 0x2768, 0x2936,
-                                            0x2981, 0x2986, spawn, 0x2736, 0x27CB x2,
-                                            0x2930, 0x27B3 ... and later the logout chain
-TeraSharp:  W 0x2897                       and then NEVER another per-user DB message,
-                                            ~19 seconds before the Logout button was pressed
+0x13AA -> 0x27FA -> 0x2924 -> 0x2768 -> 0x2936 -> 0x27CB (blob saved) -> 0x1393 -> 0x1433
 ```
 
-In the whole TeraSharp run, `0x2736 0x27CB 0x2910 0x2981 0x2986 0x290C 0x27B9 0x2930 0x27B3 0x2768
-0x2936` appear **zero** times. The world blob is never saved during play either. Non-DB traffic
-(`0x2958`, `0x159A`, `0x13AA`, `0x15B5`, `0x15AE`, `0x1507`) keeps flowing throughout.
+No `forcing delete`, no World crash, relog spawns at the logout position.
 
-That is the signature of a head-blocked per-user DLM queue (see `status/HANDOFF.md` section 1). The
-gate is `DLManager::Execute` (`WorldServer.exe.c` 534211): an item whose predecessor never called
-`CompleteMyself` waits silently forever, and with it every later per-user DB message including
-`UserLeaveWorld`, which is the only thing that emits `SA_LEAVE_WORLD`.
+**The root cause of every "hangs on relog / Critical Error LeaveWorld" was one thing:** a per-user
+WorldServer **DLMItem head-block** (`status/HANDOFF.md` section 1). World serialises every per-user
+DB message; one `DBS_*` reply that carries a stale or captured DLM id — or never arrives — silently
+blocks every later item for that user, including `UserLeaveWorld`, which is the only thing that
+emits `SA_LEAVE_WORLD`. The 5 s fallback then fakes the lobby return and the next `C_SELECT_USER`
+stalls at `0x1626` because World still holds the character.
 
-**Why the daily-quest step diverges.** `0x272C` -> `0x272D` (`DBS_LOAD_QUEST_LIST`) is served from a
-captured template. The captured form is 1383 bytes and carries 17 daily-quest seeds stamped
-**2026-09-12**. Serving that to World on any later day makes its quest manager take the "these
-dailies are stale, reset the completed count" branch - `SDB_UPDATE_DAILY_QUEST_COMPLETE_COUNT`
-(0x2897) - instead of the "seed today's dailies" branch the real server drives. The real Arbiter
-returns a **159-byte** form with an empty daily-seed section on a first login, and World then emits
-`SDB_UPDATE_DAILY_QUEST_SEED` (0x2899) 17 times.
+It was never a logout bug, never a leave-reason bug, and never a missing trigger. **Any new
+`no replay for 0xNNNN` on a per-user opcode is the next wedge waiting to happen.**
 
-`0x2899` is the **only** W->A opcode present in `lobby_tap.log` and absent from `arb_world.log`, so
-the replay table has no entry for it and TeraSharp answered it with nothing.
+### Two facts that used to be wrong in these notes
+
+- `AS_LEAVE_WORLD` (0x1392) = `[u64 gameId][u32 leaveWorldType][u32 logoutReason][u32 playerId]`.
+  Lobby return is **(3,0)**, disconnect is (1,0) — both from `lobby_tap.log`; the older
+  `arb_world.log` disconnect used (1,8). The type/reason are only read once `UserLeaveWorld`
+  reaches the head of the DLM queue, so they were never the blocker.
+- Respawn position is **done**. `WorldEntry.BuildEnterWorldPayload` now sends `param_9 = 0xFFFFFFFF`
+  (payload[52]) and takes x/y/z from blob offset 220 when a blob exists, so World restores from the
+  blob. Live-verified: logout save == relog enter-world == first save after respawn.
 
 ---
 
-## 1. What changed in this commit
+## 1. What is REAL (not replayed)
 
-Three files, all in the Cowork-editable set. Pure logic + data; no live-path files touched.
+All in `World/DbProxyHandlers.cs`, all echoing the **live** DLM id from the request, each verified
+against `D:\packetlogs\lobby_tap.log` bytes or the decompiled writer. The `TryHandle` allow-list
+(the FIRST switch) is the source of truth for this list — anything not in it falls through to the
+replay table.
 
-### `World/DbProxyStaticData.cs`
-- Added `QuestListEmpty` (153-byte payload / 159-byte frame) + `QuestListEmptyReqIdOffset = 49`.
-  Bytes are verbatim from `lobby_tap.log` 02:51:10.648Z, real ArbiterServer, first login of the day
-  for playerId 1. Same 53-byte header as the existing `QuestList`, but `dailyQuestSeedSize` at [28]
-  is **0**. The old 1383-byte `QuestList` template is kept, unused, for reference.
+| Opcode | Name | Reply | Note |
+|---|---|---|---|
+| 0x2711 | `SDB_USER_ENTERWORLD` | 0x2738 + **0x2830** | world blob from SQLite; `DBS_USER_RESTRICTION` follows it (T3) |
+| 0x27CB | `SDB_UPDATE_USER_DATA` | 0x27CC | the periodic + logout blob save |
+| 0x272C | `SDB_LOAD_QUEST_LIST` | 0x272D | **empty** 159 B form, so World takes the seed branch |
+| 0x2899 | `SDB_UPDATE_DAILY_QUEST_SEED` | 0x289A | fires 17x at enter-world; absent from `arb_world.log` |
+| 0x2897 | `SDB_UPDATE_DAILY_QUEST_COMPLETE_COUNT` | 0x2898 | |
+| 0x2910 | `SDB_UPDATE_FATIGABILITY_POINT` | 0x2911 | |
+| 0x290C | `SDB_INIT_LOSS_LOGINTIME_REVISION_SECOND` | 0x290D | also pushes 0x15B1, 0x2847, 0x1440, 0x143E |
+| 0x27B9 | `SDB_USER_LOAD_EP_PERK` | 0x27BA | |
+| 0x2869 | `SDB_LOAD_DUNGEON_PHASE_LEVEL` | **0x15E0** + 0x286A | T4 — both carry the same live reset time |
+| 0x2736 | `SDB_END_START_QUEST_LIST` | 0x2737 | post-spawn |
+| 0x2930 | `SDB_UPDATE_HOLD_CHARACTER_STATUS` | 0x2931 | post-spawn |
+| 0x27B3 | `SDB_UPDATE_DAILY_LIMIT_EP_EXP` | 0x27B4 | post-spawn |
+| 0x1562 | `SA_CLEAR_BATTLE_FIELD_ENTER_COUNT` | 0x1563 | daily reset, can fire mid-session |
+| 0x27FA | `SDB_UPDATE_USER_ACHIEVEMENT` | 0x27FB | logout save |
+| 0x2924 | `SDB_UPDATE_PASSIVITY_COOLTIME` | 0x2925 | logout save |
+| 0x2768 | `SDB_ITEM_SINGLE` | 0x2769 | logout save |
+| 0x2936 | `SDB_CHECK_DAILY_ATTENDANCE` | 0x2937 | logout save |
 
-### `World/DbProxyHandlers.cs`
-- Added `SDB_DAILY_QUEST_SEED = 0x2899` / `DBS_DAILY_QUEST_SEED = 0x289A` and a real handler:
-  reply `[u32 reqId][u8 1]`, reqId read from request **payload[8]**. Verified against World's
-  writer and the capture (`req ...2b 00 00 00 01 00 00 00 59 02...` -> `rsp 2b 00 00 00 01`).
-- Added `SDB_DAILY_QUEST_SEED` and `SDB_QUEST_LIST` to the `TryHandle` allow-list (the first switch;
-  anything not listed there falls through to the replay table).
-- `SDB_QUEST_LIST` now builds from `QuestListEmpty` instead of the stale `QuestList`.
+Names are from the opcode switch in `WorldServer.exe.c` (see `data/dbproxy_opcodes.txt`, T2). Several
+C# constants in `DbProxyHandlers` still carry older guessed names (`SDB_LOAD_FRIEND_INFO` for 0x2910,
+`SDB_LOAD_WORLD_EVENT` for 0x27B3, `SDB_LOAD_2930`, `SDB_LOAD_290C`) — the table above is correct.
 
-### `src/TeraSharp.Arbiter.Tests/Program.cs`
-- 6 new tests: `DailyQuestSeed_ack_matches_capture`, `DailyQuestSeed_echoes_live_reqId_not_capture`,
-  `DailyQuestSeed_opcodes_are_2899_289A`, `QuestListEmpty_matches_capture_bytes`,
-  `QuestListEmpty_has_no_daily_quest_seeds`, `QuestListEmpty_echoes_live_reqId_at_49`.
-- (From the previous commit: 4 tests pinning the `WorldReplayTable` id-echo contract.)
+`World/WorldReplayTable.cs` also now refuses to make a request entry out of any one-way World
+opcode (`OneWayFromWorld`, T5), which kills the `no replay for` noise and the mis-attribution that
+caused the 0x143F -> 0x290D wedge.
 
-**The two changes must ship together.** Serving the empty quest list is what makes World emit the 17
-seeds; without the `0x2899` handler that is strictly worse than before.
+### Still replayed, and fine
 
----
-
-## 2. How to test this live
-
-1. Publish and deploy as usual.
-2. **Restart WorldServer** before the test - a previous run may have left a wedged DLM queue.
-3. Log in. In the Arbiter log you should now see `W->A 0x2899` **17 times** during enter-world,
-   with no `no replay for 0x2899`, and then `0x2910 / 0x290C / 0x27B9 / 0x2768 / 0x2936 / 0x2981 /
-   0x2986`, and after spawn `0x2736` and `0x27CB`.
-4. `W->A 0x27CB` appearing at all is the first real proof the queue is draining - it never appeared
-   before.
-5. Then press Logout and look for `0x27FA -> 0x2924 -> 0x2768 -> 0x2936 -> 0x27CB -> 0x1393 -> 0x1433`.
-
-If `0x2899` appears but the chain still stops after it, capture the WorldServer console for the
-enter-world window - `Critical Error`, `Fail to get User`, and quest-manager lines land there.
-
-### To revert
-`git revert <this commit>` - or `git checkout <prev> -- src/TeraSharp.Arbiter/World/DbProxyHandlers.cs src/TeraSharp.Arbiter/World/DbProxyStaticData.cs`.
-Nothing else depends on these two symbols.
-
----
-
-## 3. Applied by hand this session (WorldBridge.cs, human-owned)
-
-### a) APPLIED - `World/WorldBridge.cs` line 339: the replay id echo never ran
-
-```csharp
-var responses = _replay.GetResponses(op);          // current: 1-arg overload
-var responses = _replay.GetResponses(op, payload); // fix
-```
-
-`WorldReplayTable` has two overloads; the 1-arg one passes `liveRequest = null`, and with null the
-`IdMap` patch loop is skipped entirely. It is the only call site, so **every replayed `DBS_*` has
-always gone out carrying the captured DLM id**. On a freshly started World the live ids happen to
-reproduce the captured sequence (the counter starts at 1 in both), which is why the first login
-after a World restart works; any divergence after that is permanent until the next restart.
-`payload` is already in scope in that `default:` branch. 4 tests pin this contract.
-
-### b) APPLIED - `World/WorldBridge.cs`: `LeaveValues(Lobby)` now returns (3,0)
-
-`lobby_tap.log` confirms the lobby return uses **(3,0)**:
-
-```
-A->W 0x1392  01 00 f0 0a 00 80 00 00 | 03 00 00 00 | 00 00 00 00 | 01 00 00 00
-```
-
-and the same capture's disconnect leave uses (1,0), while the older capture's disconnect used (1,8).
-Exit/Disconnect keep (1,8) - the pair World accepted in both captures. The three `LeaveValues`
-lobby tests were flipped to match.
-
-## 3b. Still open (human-owned files)
-
-### c) `DBS_USER_RESTRICTION` (0x2830) is never sent
-
-The real Arbiter sends it ~3 ms after `DBS_USER_ENTERWORLD`:
-`[u32 off=22][u32 count=0][u64 LIVE gameId]`. In TeraSharp, `DbProxy.TryHandle` intercepts `0x2711`
-and returns true, so the replay pair (`0x2738` + `0x2830`) is skipped and only the blob goes out.
-Unproven whether World needs it; the real Arbiter always sends it.
-
-### d) gameId and tunnelKey should increment per login
-
-A full byte-diff of the two `AS_ENTER_WORLD` (0x138E) frames in `lobby_tap.log` - both 183-byte
-payloads - shows the real Arbiter varies exactly these fields between login #1 and the relog:
-
-```
-payload[80]      tunnelKey   0        -> 1          (WorldEntry pins it to 5)
-payload[84..91]  gameId      ...0001  -> ...0002    (WorldEntry reuses ...0001 every time)
-payload[52..73]  zone/position floats (the character had moved; expected)
-```
-
-So `WorldEntry.BuildEnterWorldPayload` puts the gameId in the right place - it just never changes.
-Both look like per-session counters on the real server.
-
-### e) The 5 s `SA_LEAVE_WORLD` fallback is too tight
-
-The real countdown between the final `0x14FF` and `0x1392` is ~10 s, and the save chain takes ~80 ms
-once it runs. `Session ...: SA_LEAVE_WORLD not received in 5s - forcing delete` will mask real
-failures; consider 15 s and log loudly.
+- **World startup handshake** — static config, never varies.
+- **Client settings blobs** — client defaults.
+- **~30 login-time `SDB_*` whose reply carries no live id.** Convert one to a real handler only if
+  it wedges. **Do not** replace a data-bearing replayed reply with a synthetic empty one:
+  `SDB_USER_LOAD_INVENTORY` (0x27A2) returns a 3235-byte item list, and a past session desynced
+  World by emptying it.
+- `AS_ENTER_WORLD` (0x138E) is built for real by `WorldEntry`, but from a captured template with
+  gameId, tunnelKey and position patched in.
 
 ---
 
-## 4. Also true, lower priority
+## 2. Human TODO (human-owned files — Cowork cannot touch these)
 
-- `0x2736` has no replay entry, so `0x15AE` inherited its `0x2737` response - we send a bogus
-  `DBS_END_START_QUEST_LIST` on every spawn.
-- `0x15B1` / `0x2847` / `0x143E` are Arbiter-**initiated** pushes during the seed burst (World
-  answers `0x143F`), not responses to `0x290C`. The replay table attributes them to `0x290C`, so we
-  send them late; we never send `0x1440` (`AS_RESET_FIELD_POINT_COMPLETE`) at all.
-- `0x147D` is answered with `0x1484`, not the `0x147E x23 + 0x1480` the notes describe.
+1. **`Network/GameSession.cs`: raise the `SA_LEAVE_WORLD` fallback from 5 s to 15 s and log loudly.**
+   The real countdown between the final `0x14FF` and `0x1392` is ~10 s and the save chain takes
+   ~80 ms once it runs, so 5 s will mask real failures as "forcing delete".
+2. **`Handlers/WorldEntry.cs`: gameId and tunnelKey should increment per login.** A byte-diff of the
+   two `AS_ENTER_WORLD` frames in `lobby_tap.log` (both 183-byte payloads) shows the real Arbiter
+   varies exactly these between login #1 and the relog:
+   `payload[80]` tunnelKey `0 -> 1` (we pin 5); `payload[84..91]` gameId `...0001 -> ...0002`
+   (we reuse `...0001`). Both look like per-session counters.
+3. **`Program.cs`: log level back from `Trace` to `Debug`.**
+4. Optional, one line: `World/WorldBridge.cs` line ~337 logs `W->A #{Id} 0x{Op:X4}`. Swapping the
+   opcode for `DbProxyOpcodeNames.Describe(op)` names every DB-proxy opcode in the log.
+
+Done and no longer open: (3a) the replay id echo now passes the live payload; (3b) `LeaveValues`
+lobby returns (3,0); (3c) `DBS_USER_RESTRICTION` (0x2830) is sent after `DBS_USER_ENTERWORLD`.
+
+---
+
+## 3. Also true, lower priority
+
 - `BuildDbs2937` hardcodes `ok = 0`. That byte-matches the logout capture but not the login one
   (`2f 00 00 00 01 03 ...` = ok 1), so World runs `DBCheckDailyAttendance::OnFail` every login.
   Harmless today; make it explicit when someone models daily attendance.
-- Multi-player tunnel routing is still single-player fast-path only; needs a two-login capture.
-- Character creation, real account auth (tera-api), guild/party/mail: not implemented.
+- `0x147D` is answered with `0x1484`, not the `0x147E x23 + 0x1480` the older notes describe.
+- The real Arbiter sends `0x15E0` only when a dungeon-phase reset actually fires. We keep no phase
+  state, so we send it on every `0x2869` — harmless (World just restamps the reset time) but not
+  byte-identical on a second login the same day.
+- Multi-player tunnel routing is single-player fast-path only (`WorldBridge.HandleFrame` ignores the
+  routing key when exactly one session is registered). Needs a real two-login capture.
+- Character creation (T8), real account auth via `tera-api`, guild/party/friends/mail: not started.
 
 ---
 
-## 5. Note on tooling
+## 4. Testing and tooling
 
-We can capture **both** protocols and should do so before any protocol guesswork:
-`arbiter-world-tap.js` for Arbiter<->World (plaintext), and `tera-server-proxy` (or a decrypted dump
-inside `GameSession`) for client<->server. All 4548 client `.def` files are on disk, so any client
-packet can be decoded by name. See `status/HANDOFF.md` section 5.
+- **Always restart WorldServer before a live test.** A wedged DLM queue from the previous run makes
+  a correct fix look broken.
+- Log lines to grep after a run: `no replay for 0x` (a per-user opcode here is a future wedge),
+  `forcing delete` (the leave never completed), `blob pos`, `0x1393`.
+- `arbiter-world-tap.js` taps Arbiter<->World (plaintext); `tera-server-proxy` (or a decrypted dump
+  inside `GameSession`) taps client<->server. All 4548 client `.def` files are on disk, so any
+  client packet decodes by name. See `status/HANDOFF.md` section 5.
+- Both captures are TCP chunks — reframe by u32 length; a chunk can hold several frames and a frame
+  can span chunks. `lobby_tap.log` (login + working logout + relog + second leave) is newer and much
+  more complete than `arb_world.log` — but note the **replay table is loaded from `arb_world.log`**,
+  so an opcode present only in `lobby_tap.log` has no replay entry at all.
