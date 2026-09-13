@@ -120,7 +120,7 @@ public sealed class LoginHandlers
 
         s.SendByDef("S_GET_USER_LIST", new Dictionary<string, object>
         {
-            ["characters"] = characters, ["veteran"] = false, ["bonusBufSec"] = 0, ["maxCharacters"] = 3,
+            ["characters"] = characters, ["veteran"] = false, ["bonusBufSec"] = 0, ["maxCharacters"] = CharacterHandlers.MaxCharactersPerAccount,
             ["first"] = true, ["more"] = false, ["leftDelTimeAccountOver"] = 0,
             ["deletionSectionClassifyLevel"] = 5, ["deleteCharacterExpireHour1"] = 0, ["deleteCharacterExpireHour2"] = 72,
         });
