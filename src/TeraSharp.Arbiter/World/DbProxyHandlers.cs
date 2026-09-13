@@ -210,6 +210,7 @@ public sealed class DbProxyHandlers
             case SDB_EP_PERK:            // 0x27BA = static, reqId@8 (capture: 05.. 27.. 3F 00 00 00)
             // Post-spawn steps (lobby_tap.log 02:52:07.09x-.11x).
             case SDB_END_START_QUEST_LIST: // 0x2737 = [reqId][01]
+            case SDB_USER_LOAD_INVENTORY:  // 0x27A3 + 0x27A4: starter inventory for every character except the captured one
             case SDB_LOAD_2930:            // 0x2931 = [reqId][01][00]   (capture: 82 00 00 00 01 00)
             case SDB_LOAD_WORLD_EVENT:     // 0x27B4 = [reqId][01]       (capture: 83 00 00 00 01)
             case SA_CLEAR_BATTLE_FIELD_ENTER_COUNT: // 0x1563 = [01][reqId@8]  (decompile Arb_part_062.c:4769)
@@ -229,6 +230,7 @@ public sealed class DbProxyHandlers
         {
             case SDB_USER_ENTERWORLD: return OnUserEnterWorld(link, payload);
             case SDB_UPDATE_USER_DATA: return OnUpdateUserData(link, payload);
+            case SDB_USER_LOAD_INVENTORY: return OnLoadInventory(link, payload);
 
             // --- Logout save sequence (reqId echoed from the live request) ---
             case SDB_SAVE_27FA: link.SendFrame(DBS_SAVE_27FB, BuildReqIdAck(payload, 280)); return true;
@@ -260,7 +262,7 @@ public sealed class DbProxyHandlers
             }
 
             // --- Login-time: empty-list Type 1 [off=19][count=0][reqId][ok=1], reqId at payload[0] ---
-            case SDB_USER_LOAD_INVENTORY:       link.SendFrame((ushort)(op + 1), BuildEmptyListType1(payload, 0)); return true;
+            // (0x27A2 inventory is handled by OnLoadInventory above)
             case SDB_LOAD_ITEM_RECIPE:          link.SendFrame((ushort)(op + 1), BuildEmptyListType1(payload, 0)); return true;
             case SDB_LOAD_SKILL_PROF:           link.SendFrame((ushort)(op + 1), BuildEmptyListType1(payload, 0)); return true;
             case SDB_LOAD_TELEPORT_TO_POS_LIST: link.SendFrame((ushort)(op + 1), BuildEmptyListType1(payload, 0)); return true;
@@ -861,6 +863,87 @@ public sealed class DbProxyHandlers
     }
 
     public const ushort DBS_USER_RESTRICTION = 0x2830;
+
+    // ---- SDB_USER_LOAD_INVENTORY (0x27A2) -> DBS_USER_LOAD_POCKET_DATA (0x27A3) + DBS_USER_LOAD_INVENTORY (0x27A4) ----
+    // The inventory reply is data-bearing and OWNED: every item carries the owner's playerId. The
+    // replay table serves dob's captured list (owner 1, level-58 gear) to everyone, and World
+    // answers a mismatch with SA_ENTER_WORLD_FAILED (0x138D) + "EnterWorld Failed" (seen live
+    // for 'test' and 'testtwo', 2026-09-14 00:35). The real Arbiter sent a 6-item starter list
+    // for the new character (cap_newchar.log 05:49:03.191, 3235-byte frame):
+    //   0x27A3 payload: [u32 off=19][u32 count=0][u32 reqId][u8 ok=1]   (empty pocket list)
+    //   0x27A4 payload: [u32 off=19][u32 len=3216][u32 reqId][u8 0][6 x 536-byte items]
+    //     item+16 = u32 owner playerId (payload 29, 565, 1101, 1637, 2173, 2709)
+    // data/starter_inventory.bin is that 3229-byte payload verbatim. Until inventory is persisted
+    // (PERSISTENCE-MAP.md) every character other than the captured playerId 1 gets the starter
+    // list with reqId + owner patched; playerId 1 keeps the replay-table capture.
+    public const ushort DBS_USER_LOAD_POCKET_DATA = 0x27A3;
+    public const ushort DBS_USER_LOAD_INVENTORY = 0x27A4;
+    public const int StarterInventorySize = 3229;
+    public const int StarterInventoryItemStart = 13;
+    public const int StarterInventoryItemSize = 536;
+    public const int StarterInventoryOwnerOffset = 16;
+    public const int CapturedInventoryPlayerId = 1;
+    private static byte[]? _starterInventory;
+
+    private bool OnLoadInventory(WorldLink link, byte[] payload)
+    {
+        if (payload.Length < 8) return false;
+        uint reqId = BitConverter.ToUInt32(payload, 0);
+        int playerId = (int)BitConverter.ToUInt32(payload, 4);
+        if (playerId == CapturedInventoryPlayerId) return false;     // dob: replay-table capture
+
+        var template = LoadStarterInventory();
+        if (template == null)
+        {
+            _log.LogWarning("SDB_USER_LOAD_INVENTORY: starter_inventory.bin not found - falling back to replay (World will reject it for player {Pid})", playerId);
+            return false;
+        }
+        link.SendFrame(DBS_USER_LOAD_POCKET_DATA, BuildEmptyListType1(payload, 0));
+        link.SendFrame(DBS_USER_LOAD_INVENTORY, BuildStarterInventory(template, reqId, (uint)playerId));
+        _log.LogInformation("SDB_USER_LOAD_INVENTORY: player {Pid} -> starter inventory (6 items, owner patched)", playerId);
+        return true;
+    }
+
+    /// <summary>Starter inventory payload with the live DLM id at [8] and the owner playerId in every item.</summary>
+    public static byte[] BuildStarterInventory(byte[] template, uint reqId, uint playerId)
+    {
+        var r = (byte[])template.Clone();
+        BitConverter.GetBytes(reqId).CopyTo(r, 8);
+        for (int off = StarterInventoryItemStart + StarterInventoryOwnerOffset; off + 4 <= r.Length; off += StarterInventoryItemSize)
+            BitConverter.GetBytes(playerId).CopyTo(r, off);
+        return r;
+    }
+
+    /// <summary>Test seam.</summary>
+    internal static void SetStarterInventoryForTest(byte[]? t) => _starterInventory = t;
+
+    private static byte[]? LoadStarterInventory()
+    {
+        if (_starterInventory != null) return _starterInventory;
+        foreach (var candidate in StarterInventoryCandidates())
+        {
+            if (candidate == null || !File.Exists(candidate)) continue;
+            var bytes = File.ReadAllBytes(candidate);
+            if (bytes.Length != StarterInventorySize) continue;
+            return _starterInventory = bytes;
+        }
+        return null;
+    }
+
+    private static IEnumerable<string?> StarterInventoryCandidates()
+    {
+        yield return Environment.GetEnvironmentVariable("TERASHARP_STARTER_INVENTORY");
+        var blob = Environment.GetEnvironmentVariable("TERASHARP_STARTER_BLOB");
+        if (!string.IsNullOrEmpty(blob)) yield return Path.Combine(Path.GetDirectoryName(blob) ?? ".", "starter_inventory.bin");
+        string? dir = AppContext.BaseDirectory;
+        for (int i = 0; i < 8 && !string.IsNullOrEmpty(dir); i++)
+        {
+            yield return Path.Combine(dir, "data", "starter_inventory.bin");
+            dir = Path.GetDirectoryName(dir.TrimEnd(Path.DirectorySeparatorChar));
+        }
+        var root = Environment.GetEnvironmentVariable("TERASHARP_DATA") ?? @"D:\v100\TERA_SERVER.100";
+        yield return Path.Combine(root, "TeraSharp", "data", "starter_inventory.bin");
+    }
 
     /// <summary>
     /// Live gameId per playerId, set by LoginHandlers.OnSelectUser. gameId is a per-login counter
