@@ -113,6 +113,14 @@ and look for the next caller.
 
 ## Next steps (in order)
 
+**Scope reference (2026-09-14 ~06:20).** `status/arbiter_c_handlers.txt` (~270 `C_` handlers the real
+Arbiter serves) and `status/arbiter_s_packets.txt` (~200 `S_` it builds via the PDL template writer -
+a lower bound). HandlerRegistry registers 44. By area: login/lobby/characters/settings/exit (done),
+chat+block (done; whisper/private channels not), friends (lists only), party + matching (30, none),
+guild (60, none), trade broker (20, none), lord/election/city war (15, none), petition/reports (12),
+admin (25), events/attendance/shop/VIP (20), TBA battlepass (10), appearance/name change/rankings (25).
+Priority for a populated server: multiplayer routing -> party -> guild -> broker -> friends/whisper.
+
 **Update 2026-09-14 ~05:40.** T21 merged + wired (WorldBridge.PlayerForGameId, WorldEntry.ResendEnterWorld,
 Program.cs hooks; AS_ENTER_WORLD [68] is EnterWorldType=1 not level, [52] = stored instance PDId when the
 saved zone is that instance). 278 tests, shipped 71437b1. **Live test pending**: new character -> teleport
