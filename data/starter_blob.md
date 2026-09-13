@@ -2,7 +2,8 @@
 for a never-entered character ("Test", playerId 2, cap_newchar.log 05:49:03). Use as the template for
 character creation. Per-character fields (diff vs dob's blob):
   112  u32 playerId, then UTF-16LE name (null-terminated)
-  208..238  start zone/section + x,y,z floats at 220/224/228 (Test: zone 5, 16260, 1253, -4410)
+  208..238  HP at 208 (u32), 216 u32, x,y,z floats at 220/224/228, u32 at 232, ZONE at 236 (u32;
+            Test: 5 = Island of Dawn, later 9827; dob: 7005 Velika). NOT 208 as earlier notes said.
   304, 416, 430..445  level/exp/misc counters
   6772  two timestamps (1970-01-01 = never)
   15053..15310  trailing flags/counters

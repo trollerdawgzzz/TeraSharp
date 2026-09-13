@@ -159,24 +159,18 @@ chat. If a task needs a human-owned file, describe the exact change in chat inst
   0x143F 0x15B5 0x13AA 0x13F2 0x13E5 0x164D 0x293E`. Same "seal pending, skip" treatment as `0x143F`. Add a
   test. Kills the `no replay for` noise and prevents mis-attribution.
 - [ ] **T6 — Per-session position from the blob (read-only).** Extend `CharacterStore.SaveWorldBlob` to also
-  update `zone/x/y/z` on the `characters` row from blob offsets 208 (u32 zone-ish), 220/224/228 (x,y,z) so the
+  update `zone/x/y/z` on the `characters` row from blob offsets **236 (u32 zone)**, 220/224/228 (x,y,z) so the
   character-select screen and future `AS_ENTER_WORLD` builder have real data. Do NOT modify the blob.
-  Confirm the zone offset against the decompile before trusting 208.
+  (208 is HP, not zone — verified in cap_newchar.log by T8.)
 - [ ] **T7 — Remaining post-spawn / periodic `SDB_*`.** Grep `lobby_tap.log` for every W->A opcode in
   `0x27xx–0x29xx` and `0x13xx–0x16xx` that is not in the `TryHandle` allow-list, list them in STATUS.md with
   the reply layout from the decompile, and implement the ones that are pure ack/echo (`[reqId][ok]`,
   `[ok][reqId]`). Skip anything data-bearing.
-- [ ] **T8 — Character creation.** Ground truth now exists: `D:\packetlogs\cap_newchar_client.log` pkts
-  30–38 (`C_CAN_CREATE_USER`→`S_CAN_CREATE_USER 01`, `C_CHECK_USERNAME`→`S_CHECK_USERNAME 01`,
-  `C_CREATE_USER` 146 B → `S_CREATE_USER 01`, then `C_GET_USER_LIST` shows the new char) and
-  `cap_newchar.log` 05:49:03 for the first enter-world of that character. The real Arbiter sends a FULL
-  15312-byte starter blob (`found=1`) — saved as `data/starter_blob.bin`, field map in `data/starter_blob.md`.
-  Creation = DB row (name, race/class/gender, appearance from `C_CREATE_USER`) + a copy of the starter blob with
-  playerId+name written at 112 and the class/race start zone + x,y,z at 208/220 (Test: zone 5, 16260, 1253,
-  -4410). Decompile `Handler_C_CREATE_USER` (Arb_part_079.c:9510) for the C_CREATE_USER layout and what it
-  validates. Tests: parse pkt 35, byte-compare the produced blob to `starter_blob.bin` except the patched
-  fields. NOTE: gameId is a per-login counter (0x80000AF00001 for playerId 2) — `WorldEntry`/`DbProxy`
-  currently derive it from playerId; that is a human-owned fix, flag it, don't work around it.
+- [x] **T8 — Character creation.** DONE (cowork/T8): `CharacterHandlers` + `StarterBlob` in `CharacterStore`;
+  starter blob from `data/starter_blob.bin` (must be shipped: `ship.ps1` copies it to `publish/data/`,
+  `TERASHARP_STARTER_BLOB` env on the VM). Every class starts at zone 5 (16260, 1253, -4410) until a per-class
+  start table exists. Open: deferred delete timer; `LoginHandlers` hardcodes `maxCharacters=3`,
+  `isNewCharacter=true` (human-owned); gameId still derived from playerId (human-owned).
 - [ ] **T9 — Docs.** Update `status/STATUS.md` §0–§1 to reflect that logout/relog is fixed, list the handlers
   above as real, and move the remaining human-owned items (3a is done; 3b done; 3c=T3; 3d, 3e still open) into
   a short "human TODO" list.
