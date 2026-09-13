@@ -113,6 +113,22 @@ and look for the next caller.
 
 ## Next steps (in order)
 
+**Update 2026-09-14 ~05:00.** Merged since the milestone: T19 (client settings persist -
+`client_settings`/`account_settings`, `C_SAVE_CLIENT_*` registered, `S_LOAD_CLIENT_ACCOUNT_SETTING`
+sent before the user setting after C_LOAD_TOPO_FIN), T20 (inventory persistence - `items` table
+keyed (owner_id, id), atoms applied for ops 7/2/6/11/9, 0x27A4 rebuilt from rows, starter kit
+inserted on first login). 272 tests. **Capture taken**: `D:\packetlogs\arb_world_2026-09-13T11-33-30-680Z.log`
+(+ `capture_2026-09-13T11-42-27-513Z.log` client side), condensed `cap_relog9827_ctl.txt`, full
+enter-world frames `cap_relog9827_frames.txt`. It shows the real relog-into-instance behaviour:
+AS_ENTER_WORLD into 9827 with [52]=PDId -> World 0x138D (fail) -> Arbiter pushes 0x148D x2 and
+re-sends AS_ENTER_WORLD at the return position saved from the earlier 0x13BE context, with
+[52]=-1 -> spawn on Island of Dawn -> World re-runs the teleport quest itself. Also: 0x272D list 2
+= completed quest ids; the post-handshake config burst is sent right after the handshake.
+**Cowork T21** (worktree `TeraSharp-cowork`, cowork/T8, rebased on master) implements both.
+Netcup is back on TeraSharp (DeploymentConfig `<WorldServerConfig><ArbiterServer port>` must be
+7802; 7812 = the tap). Real-Arbiter capture recipe is in item 1 below - and it needs MS SQL
+(`MSSQL$SQL2022` listens on 1433 when started).
+
 **MILESTONE 2026-09-14 ~03:30: a brand-new character works end-to-end on a fresh World — creation,
 per-class kit, default skills, quests — "everything works like it did on Arbiter" (human).**
 Merged: T14/T15/T16/T17/T18 (248 tests). Merge notes: T15's 0x272E handler was dropped for

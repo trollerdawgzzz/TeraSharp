@@ -139,6 +139,9 @@ public sealed class WorldBridge
         lock (_playersLock) return _players.TryGetValue(gameId, out var s) ? s : null;
     }
 
+    /// <summary>The session that owns a gameId, or null. Used by the 0x138D (SA_ENTER_WORLD_FAIL) handler.</summary>
+    public GameSession? PlayerForGameId(ulong gameId) => FindPlayer(gameId);
+
     /// <summary>Real DB-proxy handlers; checked before the replay table.</summary>
     public DbProxyHandlers? DbProxy { get; set; }
 

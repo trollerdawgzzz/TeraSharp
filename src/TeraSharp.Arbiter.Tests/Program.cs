@@ -665,11 +665,13 @@ public static class Tests
         Hex.True(Math.Abs(z - 2172.0f) < 0.01f, $"z={z} != 2172.0");
     }
 
-    [Test] public static void BuildEnterWorld_level_at_offset_68()
+    [Test] public static void BuildEnterWorld_offset_68_is_EnterWorldType_not_level()
     {
+        // [68] is EnterWorldType (User::EnterWorldStart's enum), 1 in every captured AS_ENTER_WORLD -
+        // never the character level (status/ENTER-WORLD-FALLBACK.md section 5).
         var chr = new TeraSharp.Arbiter.Game.FakeCharacter { Level = 65 };
         var p = WorldEntry.BuildEnterWorldPayload(GameId, chr);
-        Hex.True(BitConverter.ToUInt32(p, 68) == 65, $"level={BitConverter.ToUInt32(p, 68)} != 65");
+        Hex.True(BitConverter.ToUInt32(p, 68) == 1, $"EnterWorldType={BitConverter.ToUInt32(p, 68)} != 1");
     }
 
     [Test] public static void BuildEnterWorld_capture_character_matches_known_fields()

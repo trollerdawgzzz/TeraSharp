@@ -80,6 +80,17 @@ public static class Program
         {
             DbProxy = new DbProxyHandlers(Store, loggerFactory.CreateLogger<DbProxyHandlers>()),
         };
+        // SA_ENTER_WORLD_FAIL (0x138D) hooks: map the gameId World echoes back to the session and
+        // re-send AS_ENTER_WORLD at the stored return point (status/ENTER-WORLD-FALLBACK.md).
+        {
+            var world = World; var dbProxy = World.DbProxy!;
+            dbProxy.PlayerIdForGameId = gameId => (int)(world.PlayerForGameId(gameId)?.SelectedCharacter?.Id ?? 0);
+            dbProxy.ResendEnterWorld = f =>
+            {
+                var s = world.PlayerForGameId(f.ArbiterUser);
+                if (s != null) WorldEntry.ResendEnterWorld(s, f, log);
+            };
+        }
 
         var dispatcher = new PacketDispatcher(loggerFactory.CreateLogger<PacketDispatcher>());
         HandlerRegistry.RegisterAll(dispatcher, opcodes, defs, loggerFactory);

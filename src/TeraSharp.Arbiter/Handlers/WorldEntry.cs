@@ -126,9 +126,16 @@ public static class WorldEntry
         // [48..51] Zone (param_8, User+0x19c)
         w.U32((uint)chr.Zone);
 
-        // [52..55] param_9 (User+0x1a0). Real Arbiter sends -1 (lobby_tap.log pkt 127) and World then
-        //          restores position from the blob; 0 (old capture) makes x/y/z authoritative.
-        w.U32(0xFFFFFFFF);
+        // [52..55] param_9 = ChannelInstanceId (User+0x1a0). -1 for the open world (live-verified,
+        //          lobby_tap.log pkt 127; World then restores position from the blob). A character
+        //          saved INSIDE an instance must carry that instance's ChannelInstanceId - the real
+        //          Arbiter sends 0x0AF00001 for exactly this case (arb_world_2026-09-13 seq 835); World
+        //          then answers SA_ENTER_WORLD_FAIL and we retry at the return point
+        //          (status/ENTER-WORLD-FALLBACK.md).
+        var savedReturn = Program.Store?.GetDungeonReturn((int)chr.Id);
+        w.U32(savedReturn != null && savedReturn.DungeonId == chr.Zone && savedReturn.InstancePdId != 0
+            ? (uint)savedReturn.InstancePdId
+            : 0xFFFFFFFF);
 
         // [56..67] Position float3 (param_10, User+0x18c/190/194)
         // Prefer the blob's last-saved position (offset 220) so this is right even if World honours it.
@@ -141,12 +148,13 @@ public static class WorldEntry
         }
         w.Float(px); w.Float(py); w.Float(pz);
 
-        // [68..71] Likely character level (param_11, FUN_1403860c0 of User). Capture=1.
-        w.U32((uint)chr.Level);
+        // [68..71] EnterWorldType (User::EnterWorldStart's enum) - 1 in every captured AS_ENTER_WORLD.
+        //          NOT the character level (the old code sent chr.Level, which only looked right at level 1).
+        w.U32(1);
 
-        // [72..75] Likely maxHP base (param_12, User+0x1e0, from DB col 76 /
-        //          HeroWorldDataSheet+0x34). Capture=20446.
-        // Real Arbiter copies this from the blob (u32 @304): dob 0x5AC4, fresh char 0xFFFFF334 (cap_newchar pkt 130).
+        // [72..75] Direction (u32 facing) - the real Arbiter copies it from the blob (u32 @304):
+        //          dob 0x5AC4, fresh char 0xFFFFF334 (cap_newchar pkt 130). Field names from the
+        //          Arbiter's AS_ENTER_WORLD dumper, status/ENTER-WORLD-FALLBACK.md section 5.
         w.U32(worldBlob != null && worldBlob.Length >= 308 ? BitConverter.ToUInt32(worldBlob, 304) : 20446u);
 
         // [76..79] Client-reported session parameter (param_13, WorldSession+0x744).
@@ -212,6 +220,40 @@ public static class WorldEntry
         // Use zeros â€” World re-reads from blob anyway.
 
         return buf;
+    }
+
+    /// <summary>
+    /// WorldServer refused AS_ENTER_WORLD (SA_ENTER_WORLD_FAIL, 0x138D). Re-send it pointed at the
+    /// character's stored return point, exactly as User::EnterWorldFail does (status/ENTER-WORLD-FALLBACK.md).
+    /// </summary>
+    public static void ResendEnterWorld(GameSession s, DbProxyHandlers.EnterWorldFailure f, ILogger log)
+    {
+        var w = Program.World;
+        var chr = s.SelectedCharacter;
+        if (w == null || chr == null) return;
+
+        var back = Program.Store?.GetDungeonReturn((int)chr.Id);
+        if (back == null)
+        {
+            log.LogError("EnterWorld retry for '{Name}': no stored return point for continent {C}; "
+                + "the character is stuck. Give it one in the DB (characters.return_zone/x/y/z).",
+                chr.Name, f.ContinuousDungeonId);
+            return;
+        }
+
+        var record = Program.Store?.GetCharacter((int)chr.Id);
+        var first = BuildEnterWorldPayload(s.GameId, chr, record?.WorldBlob, s.TunnelKey);
+        var retry = DbProxyHandlers.BuildEnterWorldRetryPayload(
+            first, back.Zone, back.X, back.Y, back.Z,
+            channelInstanceId: 0xFFFFFFFF,
+            ticket: s.TunnelKey,
+            continuousDungeonId: f.ContinuousDungeonId);
+        if (retry == null) return;
+
+        log.LogWarning("EnterWorld retry for '{Name}': continent {C} refused, falling back to "
+            + "zone {Z} ({X:F0}, {Y:F0}, {Zz:F0})", chr.Name, f.ContinuousDungeonId,
+            back.Zone, back.X, back.Y, back.Z);
+        w.SendFrame(WorldBridge.OpPlayerEnter, retry);
     }
 
     /// <summary>
