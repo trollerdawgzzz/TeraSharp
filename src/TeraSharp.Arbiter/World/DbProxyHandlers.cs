@@ -121,6 +121,16 @@ public sealed class DbProxyHandlers
     //   rsp: [u8 ok][u32 reqId]   (ok = user valid & clear succeeded)
     public const ushort SA_CLEAR_BATTLE_FIELD_ENTER_COUNT = 0x1562; public const ushort AS_CLEAR_BATTLE_FIELD_ENTER_COUNT = 0x1563;
 
+    // SA_LEARN_ALL_CREST_ACQUIRABLE (0x1463) -> AS_LEARN_ALL_CREST_ACQUIRABLE (0x1464).
+    // World sends it at first enter-world for classes that have level-1 crests (a warrior does, the
+    // captured valkyrie did not - hence never seen in a capture). Per-user DLM item: unanswered = no
+    // spawn. Handler_SA_LEARN_ALL_CREST_ACQUIRABLE (Arb_part_062.c:8760):
+    //   req frame: [6]u32 count [10]u32 listOff [14]u64 gameId [22]u32 reqId, entries of 16 B at listOff:
+    //              [u32 thisOff][u32 nextOff][i32 crestId][i32 value] (frame-relative offsets, 0 = end)
+    //   rsp frame: [6]u32 count [10]u32 firstOff [14]u32 reqId [18]u8 ok, then the LEARNED entries in
+    //              the same 16-B shape (User::LearnAllCrest output). We learn everything requested.
+    public const ushort SA_LEARN_ALL_CREST_ACQUIRABLE = 0x1463; public const ushort AS_LEARN_ALL_CREST_ACQUIRABLE = 0x1464;
+
     // --- Zone change / dungeon / quest-teleport handshake (cap_newchar.log 05:52:35) ---
     // World: SA_REQUEST_ENTER_DUNGEON (0x13BE, 215 B) -> we: AS_REQUEST_ENTER_DUNGEON (0x13BF, 215 B)
     // World: SA_RESPONSE_ENTER_DUNGEON (0x13C0, 214 B) -> we: AS_RESPONSE_ENTER_DUNGEON (0x13C1, 214 B)
@@ -243,6 +253,7 @@ public sealed class DbProxyHandlers
             case SDB_LOAD_2930:            // 0x2931 = [reqId][01][00]   (capture: 82 00 00 00 01 00)
             case SDB_LOAD_WORLD_EVENT:     // 0x27B4 = [reqId][01]       (capture: 83 00 00 00 01)
             case SA_CLEAR_BATTLE_FIELD_ENTER_COUNT: // 0x1563 = [01][reqId@8]  (decompile Arb_part_062.c:4769)
+            case SA_LEARN_ALL_CREST_ACQUIRABLE:     // 0x1464 = learned-crest list (all of them)
             case SA_REQUEST_ENTER_DUNGEON:          // 0x13BF (zone change step 1)
             case SA_RESPONSE_ENTER_DUNGEON:         // 0x13C1 (zone change step 2)
             case SDB_LOAD_2869:          // 0x15E0 push + 0x286A, both carrying the live reset time
@@ -276,6 +287,14 @@ public sealed class DbProxyHandlers
             case SDB_END_START_QUEST_LIST: link.SendFrame(DBS_END_START_QUEST_LIST, BuildReqIdAck(payload, 0)); return true;
             case SDB_LOAD_2930:            link.SendFrame(DBS_LOAD_2931, Build2931(payload)); return true;
             case SA_CLEAR_BATTLE_FIELD_ENTER_COUNT: link.SendFrame(AS_CLEAR_BATTLE_FIELD_ENTER_COUNT, BuildOkReqId(payload, 8)); return true;
+            case SA_LEARN_ALL_CREST_ACQUIRABLE:
+            {
+                var r = BuildLearnAllCrest(payload);
+                if (r == null) return false;
+                _log.LogInformation("SA_LEARN_ALL_CREST_ACQUIRABLE: learned {N} crest(s)", BitConverter.ToUInt32(r, 0));
+                link.SendFrame(AS_LEARN_ALL_CREST_ACQUIRABLE, r);
+                return true;
+            }
             case SA_REQUEST_ENTER_DUNGEON:
             {
                 var r = BuildAsRequestEnterDungeon(payload);
@@ -468,6 +487,42 @@ public sealed class DbProxyHandlers
         if (req.Length < ResponseEnterDungeonMinPayload) return null;
         var r = (byte[])req.Clone();
         ZeroDungeonReplyPadding(r);
+        return r;
+    }
+
+    /// <summary>
+    /// AS_LEARN_ALL_CREST_ACQUIRABLE (0x1464): every requested (crestId, value) echoed back as learned.
+    /// Payload: [u32 count][u32 firstOff=19][u32 reqId][u8 ok=1] + 16-B entries with frame-relative links.
+    /// </summary>
+    public static byte[]? BuildLearnAllCrest(byte[] req)
+    {
+        if (req.Length < 20) return null;
+        uint count = BitConverter.ToUInt32(req, 0);
+        int listOff = (int)BitConverter.ToUInt32(req, 4);
+        uint reqId = BitConverter.ToUInt32(req, 16);
+        var entries = new List<(int id, int val)>();
+        int off = listOff - 6;
+        int guard = 0;
+        while (off > 0 && off + 16 <= req.Length && guard++ < 512)
+        {
+            entries.Add((BitConverter.ToInt32(req, off + 8), BitConverter.ToInt32(req, off + 12)));
+            int next = (int)BitConverter.ToUInt32(req, off + 4);
+            if (next == 0) break;
+            off = next - 6;
+        }
+        var r = new byte[13 + 16 * entries.Count];
+        BitConverter.GetBytes((uint)entries.Count).CopyTo(r, 0);
+        BitConverter.GetBytes(entries.Count > 0 ? 19u : 0u).CopyTo(r, 4);
+        BitConverter.GetBytes(reqId).CopyTo(r, 8);
+        r[12] = 1;
+        for (int i = 0; i < entries.Count; i++)
+        {
+            int p = 13 + 16 * i;
+            BitConverter.GetBytes((uint)(19 + 16 * i)).CopyTo(r, p);
+            BitConverter.GetBytes(i + 1 < entries.Count ? (uint)(19 + 16 * (i + 1)) : 0u).CopyTo(r, p + 4);
+            BitConverter.GetBytes(entries[i].id).CopyTo(r, p + 8);
+            BitConverter.GetBytes(entries[i].val).CopyTo(r, p + 12);
+        }
         return r;
     }
 
