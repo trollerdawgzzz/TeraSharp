@@ -113,6 +113,18 @@ and look for the next caller.
 
 ## Next steps (in order)
 
+0. **Where things stand at end of 2026-09-14 (~02:30):** live-verified today: fresh-World first login of a
+   new character (testtwo, zone 5), elinwarrior spawned after the 0x1463 crest handler. Shipped but
+   NOT live-verified: 0x297B/0x297C ack, T13 (0x2769 echo + item id counter), T11/T12 (starter blob
+   identity block). Two Cowork sessions in flight: **T14** (per-class starter inventory from
+   `Executable\Datasheet\CreateCharData.xml` + `ItemTemplate*.xml`, worktree `TeraSharp-cowork`,
+   branch cowork/T8) and **T15** (answer every per-user DB write from PERSISTENCE-MAP.md + a test
+   that every request opcode is handled/one-way/replayed, worktree `TeraSharp-cowork2`, branch
+   cowork/T15). Merge order: T15 first (smaller blast radius), then T14; expect a DbProxyHandlers.cs
+   conflict between them (both add allow-list cases - keep both). Known open: warrior skills locked
+   (valkyrie starter gear + maybe `learnAllSkills` on the CreateCharData row); characters created
+   with TERASHARP_START_OVERRIDE set sit in Velika (testthree, elinwarrior) - delete them.
+
 1. Live-verify the promotion-timestamp fix on a fresh World (see above). Delete old `*_full.dmp`.
 2. Merge Cowork T11 (INVENTORY-DESIGN.md) and T12 (identity block in StarterBlob.Build), then
    create a human warrior and confirm it looks right.
