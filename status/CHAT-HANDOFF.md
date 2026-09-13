@@ -124,6 +124,23 @@ and look for the next caller.
    conflict between them (both add allow-list cases - keep both). Known open: warrior skills locked
    (valkyrie starter gear + maybe `learnAllSkills` on the CreateCharData row); characters created
    with TERASHARP_START_OVERRIDE set sit in Velika (testthree, elinwarrior) - delete them.
+   **Overnight results (all in worktrees, unmerged):** T14 per-class starter kit from
+   `CreateCharData.xml` + `ItemTemplate.xml` (glaiver output byte-identical to the capture, ids
+   allocated in datasheet order, records emitted sorted by pocket/slot); T16 start position from the
+   datasheet (only soulless differs); T17 quest persistence (`quests` table, rowid = questDbId at
+   0x272F payload[25]; 0x272D rebuilt from rows, empty case == 73-byte capture; completed quests
+   stored but not served until a capture of "Test" relogging on the real Arbiter shows list 1/2);
+   T15 every per-user DB write answered + coverage test (`IsHandledRequest` refactor); T18 SKILLS.md:
+   **level-1 skills live in the blob** - 40 passive slots @6880, 500 active @7200, 8 B each
+   `[u32 skillId][u8 0][pad]`, written by `AccountManager::ExecCreateDefaultSkills` from
+   `DefaultSkillSet.xml` (race,gender,class), read back by `User::SendMySkillList`; learned skills
+   persist through the blob save. `StarterBlob.ApplyDefaultSkills` now patches them. Characters
+   created before that keep valkyrie skills - delete and recreate. Live-bug fixed by T17: every
+   character was being handed dob's quest 59901 + 18 stale seeds via `QuestListEmpty`.
+   Merge: cowork/T15 (T15+T18) first, then cowork/T8 (T14+T16+T17); conflicts expected in
+   `DbProxyHandlers.cs` (`IsHandledRequest` case list: keep 0x297B inside it, drop the
+   `HandledOnMasterNotOnThisBranch` exemption; `0x272E`: take T17's handler) and in `PatchedWindows()`
+   in the tests (T12/T18 both extend it - union).
 
 1. Live-verify the promotion-timestamp fix on a fresh World (see above). Delete old `*_full.dmp`.
 2. Merge Cowork T11 (INVENTORY-DESIGN.md) and T12 (identity block in StarterBlob.Build), then

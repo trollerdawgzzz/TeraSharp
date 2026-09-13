@@ -92,19 +92,19 @@ public static class StarterInventory
     /// </summary>
     private static readonly StarterItem[][] ByClass =
     {
-        [0] = new StarterItem[] { new(10001, 1, 14, 1), new(15004, 1, 14, 3), new(15005, 1, 14, 4), new(15006, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // warrior
-        [1] = new StarterItem[] { new(10002, 1, 14, 1), new(15001, 1, 14, 3), new(15002, 1, 14, 4), new(15003, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // lancer
-        [2] = new StarterItem[] { new(10003, 1, 14, 1), new(15004, 1, 14, 3), new(15005, 1, 14, 4), new(15006, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // slayer
-        [3] = new StarterItem[] { new(10004, 1, 14, 1), new(15001, 1, 14, 3), new(15002, 1, 14, 4), new(15003, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // berserker
-        [4] = new StarterItem[] { new(10005, 1, 14, 1), new(15007, 1, 14, 3), new(15008, 1, 14, 4), new(15009, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // sorcerer
-        [5] = new StarterItem[] { new(10006, 1, 14, 1), new(15004, 1, 14, 3), new(15005, 1, 14, 4), new(15006, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // archer
-        [6] = new StarterItem[] { new(10007, 1, 14, 1), new(15007, 1, 14, 3), new(15008, 1, 14, 4), new(15009, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // priest
-        [7] = new StarterItem[] { new(10008, 1, 14, 1), new(15007, 1, 14, 3), new(15008, 1, 14, 4), new(15009, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // elementalist
-        [8] = new StarterItem[] { new(80396, 1, 14, 1), new(80397, 1, 14, 3), new(80398, 1, 14, 4), new(80399, 1, 14, 5), new(6551, 20, 0, 0), new(6561, 20, 0, 1), new(362, 10, 0, 2), new(391, 3, 0, 3), new(200999, 5, 0, 4) },   // soulless
-        [9] = new StarterItem[] { new(55005, 1, 14, 1), new(15001, 1, 14, 3), new(15002, 1, 14, 4), new(15003, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // engineer
-        [10] = new StarterItem[] { new(82005, 1, 14, 1), new(15001, 1, 14, 3), new(15002, 1, 14, 4), new(15003, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // fighter
-        [11] = new StarterItem[] { new(58171, 1, 14, 1), new(15007, 1, 14, 3), new(15008, 1, 14, 4), new(15009, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // assassin
-        [12] = new StarterItem[] { new(59053, 1, 14, 1), new(15004, 1, 14, 3), new(15005, 1, 14, 4), new(15006, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // glaiver
+        new StarterItem[] { new(10001, 1, 14, 1), new(15004, 1, 14, 3), new(15005, 1, 14, 4), new(15006, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // warrior
+        new StarterItem[] { new(10002, 1, 14, 1), new(15001, 1, 14, 3), new(15002, 1, 14, 4), new(15003, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // lancer
+        new StarterItem[] { new(10003, 1, 14, 1), new(15004, 1, 14, 3), new(15005, 1, 14, 4), new(15006, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // slayer
+        new StarterItem[] { new(10004, 1, 14, 1), new(15001, 1, 14, 3), new(15002, 1, 14, 4), new(15003, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // berserker
+        new StarterItem[] { new(10005, 1, 14, 1), new(15007, 1, 14, 3), new(15008, 1, 14, 4), new(15009, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // sorcerer
+        new StarterItem[] { new(10006, 1, 14, 1), new(15004, 1, 14, 3), new(15005, 1, 14, 4), new(15006, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // archer
+        new StarterItem[] { new(10007, 1, 14, 1), new(15007, 1, 14, 3), new(15008, 1, 14, 4), new(15009, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // priest
+        new StarterItem[] { new(10008, 1, 14, 1), new(15007, 1, 14, 3), new(15008, 1, 14, 4), new(15009, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // elementalist
+        new StarterItem[] { new(80396, 1, 14, 1), new(80397, 1, 14, 3), new(80398, 1, 14, 4), new(80399, 1, 14, 5), new(6551, 20, 0, 0), new(6561, 20, 0, 1), new(362, 10, 0, 2), new(391, 3, 0, 3), new(200999, 5, 0, 4) },   // soulless
+        new StarterItem[] { new(55005, 1, 14, 1), new(15001, 1, 14, 3), new(15002, 1, 14, 4), new(15003, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // engineer
+        new StarterItem[] { new(82005, 1, 14, 1), new(15001, 1, 14, 3), new(15002, 1, 14, 4), new(15003, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // fighter
+        new StarterItem[] { new(58171, 1, 14, 1), new(15007, 1, 14, 3), new(15008, 1, 14, 4), new(15009, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // assassin
+        new StarterItem[] { new(59053, 1, 14, 1), new(15004, 1, 14, 3), new(15005, 1, 14, 4), new(15006, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // glaiver
     };
 
     /// <summary>The kit for a class, or null when the class id is not one of the 13.</summary>
@@ -152,7 +152,7 @@ public static class StarterInventory
         {
             var item = kit[order[n]];
             int at = header + n * size;
-            BaseRecordFor(capturedPayload, item.Pocket, item.Slot).CopyTo(payload, at);
+            BaseRecordFor(capturedPayload, item.Pocket, item.Slot).CopyTo(payload.AsSpan(at));
             BitConverter.GetBytes(ids[order[n]]).CopyTo(payload, at + RecordIdOffset);
             BitConverter.GetBytes(item.TemplateId).CopyTo(payload, at + RecordTemplateIdOffset);
             BitConverter.GetBytes(playerId).CopyTo(payload, at + DbProxyHandlers.StarterInventoryOwnerOffset);

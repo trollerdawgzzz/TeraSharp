@@ -354,7 +354,7 @@ public sealed class DbProxyHandlers
     // The atoms follow the T13 rule exactly: an op-7 (insert) atom that arrives with item DB id 0
     // gets one allocated; everything else is echoed verbatim. Verified in the capture at
     // seq 1804 (atom op 7, id 0 -> 13) and 2364 (four atoms, ops 6/11/6/11, ids untouched).
-    public const ushort SDB_SET_QUEST_INFO = 0x272E; public const ushort DBS_SET_QUEST_INFO = 0x272F;
+    // (opcode constants SDB_SET_QUEST_INFO / DBS_SET_QUEST_INFO are declared in the T17 block above)
     /// <summary>0x272E header: two [offset][length] pairs, reqId, sqlType, playerId, 2 flag bytes.</summary>
     public const int QuestInfoRequestHeader = 30;
     /// <summary>0x272F header: the same two pairs, reqId, sqlType, ok, questDbId.</summary>
@@ -531,7 +531,6 @@ public sealed class DbProxyHandlers
             case AS_PROMOTION_LIST_REQ:  // 0x147D -> 0x1484 + 24 x 0x147E (timestamps = now) + 0x1480
             // --- T15: the per-user writes World sends during play. Each one is a DLM item; a
             // missing reply head-blocks the user's queue for the life of the World process. ---
-            case SDB_SET_QUEST_INFO:              // 0x272F = echo + ok + allocated quest row id
             case SDB_USER_LEARN_SKILL:            // 0x278F = echo of the fee atoms + empty skill-period list
             case SDB_ACCOMPLISH_USER_ACHIEVEMENT: // 0x2803 = the newly-accomplished records echoed
             case SDB_UPDATE_REPUTATION_INFO:      // 0x2892 = [ok][reqId]  (ok-first, the odd one out)
@@ -572,7 +571,6 @@ public sealed class DbProxyHandlers
             case SDB_DAILY_QUEST_SEED: link.SendFrame(DBS_DAILY_QUEST_SEED, BuildReqIdAck(payload, 8)); return true;
 
             // --- T15: per-user writes during play (all echo the LIVE reqId) ---
-            case SDB_SET_QUEST_INFO:              return OnSetQuestInfo(link, payload);
             case SDB_USER_LEARN_SKILL:            return OnUserLearnSkill(link, payload);
             case SDB_ACCOMPLISH_USER_ACHIEVEMENT: return OnAccomplishUserAchievement(link, payload);
             case SDB_UPDATE_REPUTATION_INFO:        link.SendFrame(DBS_UPDATE_REPUTATION_INFO, BuildDbs2892(payload)); return true;
@@ -1093,39 +1091,8 @@ public sealed class DbProxyHandlers
 
     // =====================================================================
     // T15 builders. Every one is verified byte-for-byte against data/cap_t15.bin in the tests.
+    // (0x272E/0x272F is handled by T17's OnSetQuestInfo above; the questDbId is the quests row id.)
     // =====================================================================
-
-    /// <summary>
-    /// Quest row ids for 0x272F. The real Arbiter returns the identity of the row its INSERT
-    /// created; World stores it (DBStartQuestContext::SetQuestDbId) and uses it to address the
-    /// row later. We keep no quest table yet - status/PERSISTENCE-MAP.md step 1 - so this is a
-    /// process-wide counter. It only has to be distinct within the World process: nothing
-    /// persists, so a restart that begins again at 1 collides with nothing. When quests become
-    /// real this moves into CharacterStore next to the item-id sequence.
-    /// </summary>
-    private int _nextQuestDbId;
-    private int NextQuestDbId() => Interlocked.Increment(ref _nextQuestDbId);
-
-    /// <summary>SDB_SET_QUEST_INFO (0x272E) -&gt; DBS_SET_QUEST_INFO (0x272F).</summary>
-    private bool OnSetQuestInfo(WorldLink link, byte[] payload)
-    {
-        uint sqlType = payload.Length >= 24 ? BitConverter.ToUInt32(payload, 20) : 0;
-        int declaredAtoms = DeclaredAtomCount(payload, 8);
-        int questDbId = 0;
-        var reply = BuildDbs272F(payload, _store.NextItemId,
-            () => { questDbId = NextQuestDbId(); return questDbId; });
-
-        int echoedAtoms = (int)BitConverter.ToUInt32(reply, 12) / ItemAtomSize;
-        if (echoedAtoms != declaredAtoms)
-            _log.LogWarning("SDB_SET_QUEST_INFO: could not echo the reward atoms (declared {D}, echoed {E}, "
-                + "payload {Len} B) - World will lose the items the quest just granted",
-                declaredAtoms, echoedAtoms, payload.Length);
-
-        _log.LogInformation("SDB_SET_QUEST_INFO: sqlType {Sql}, {N} reward atom(s){Quest}",
-            sqlType, declaredAtoms, questDbId != 0 ? $", quest row id {questDbId}" : "");
-        link.SendFrame(DBS_SET_QUEST_INFO, reply);
-        return true;
-    }
 
     /// <summary>SDB_USER_LEARN_SKILL (0x278E) -&gt; DBS_USER_LEARN_SKILL (0x278F).</summary>
     private bool OnUserLearnSkill(WorldLink link, byte[] payload)

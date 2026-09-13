@@ -3788,6 +3788,12 @@ array items
         {
             using var store = new TeraSharp.Arbiter.Persistence.CharacterStore(":memory:", QuietLog());
             var acct = store.GetOrCreateAccount("t14");
+            // Row 1 is dob's (the replay-table capture); burn it so the test character is not playerId 1.
+            store.CreateCharacter(new TeraSharp.Arbiter.Persistence.CharacterRecord
+            {
+                AccountId = acct.Id, Name = "Placeholder", Gender = 0, Race = 0, Class = 0, Level = 1,
+                TemplateId = 10101, Zone = 5, Appearance = new byte[8], Details = new byte[32], Shape = new byte[64], Position = 1,
+            });
             int id = store.CreateCharacter(new TeraSharp.Arbiter.Persistence.CharacterRecord
             {
                 AccountId = acct.Id, Name = "Rurik", Gender = 0, Race = 0, Class = WarriorClassId,
@@ -4056,6 +4062,12 @@ array items
     {
         using var store = new TeraSharp.Arbiter.Persistence.CharacterStore(":memory:", QuietLog());
         var acct = store.GetOrCreateAccount("t17c");
+        // Row 1 is dob's (kept on the captured 1377-byte reply); burn it so this character gets id 2.
+        store.CreateCharacter(new TeraSharp.Arbiter.Persistence.CharacterRecord
+        {
+            AccountId = acct.Id, Name = "Placeholder", Gender = 0, Race = 0, Class = 0, Level = 1,
+            TemplateId = 10101, Zone = 5, Appearance = new byte[8], Details = new byte[32], Shape = new byte[64], Position = 1,
+        });
         int pid = store.CreateCharacter(new TeraSharp.Arbiter.Persistence.CharacterRecord
         {
             AccountId = acct.Id, Name = "Loader", Gender = 0, Race = 0, Class = 0, Level = 1,
@@ -4227,6 +4239,16 @@ array items
         var cap = LoadT15CaptureOrSkip();
         if (cap == null) return;
         using var store = new TeraSharp.Arbiter.Persistence.CharacterStore(":memory:", QuietLog());
+        // The captured 0x272E is for playerId 2; the quests table has a foreign key on characters,
+        // so rows 1 and 2 must exist. (Merged with T17: the questDbId is the quests row id, so the
+        // SAME quest written twice keeps its id and a DIFFERENT quest gets the next one.)
+        var acct = store.GetOrCreateAccount("t15q");
+        for (int i = 0; i < 2; i++)
+            store.CreateCharacter(new TeraSharp.Arbiter.Persistence.CharacterRecord
+            {
+                AccountId = acct.Id, Name = "Q" + i, Gender = 0, Race = 0, Class = 0, Level = 1,
+                TemplateId = 10101, Zone = 5, Appearance = new byte[8], Details = new byte[32], Shape = new byte[64], Position = 1,
+            });
         var handlers = FreshHandlers(store);
 
         var live = WithLiveId(cap[540], 16, 0x0BAD);     // reqId lives at payload[16]
@@ -4239,8 +4261,17 @@ array items
         uint first = BitConverter.ToUInt32(body1, 25);
         Hex.True(first != 0, "an insert must get a quest row id");
         var (_, body2) = RunHandler1(DbProxyHandlers.SDB_SET_QUEST_INFO, live, store, handlers);
-        Hex.True(BitConverter.ToUInt32(body2, 25) == first + 1,
-            "the next insert must get a different quest row id - reusing one makes World address the wrong quest");
+        Hex.True(BitConverter.ToUInt32(body2, 25) == first,
+            "re-inserting the same quest must keep its row id (last-write-wins on (playerId, questId))");
+
+        // A different quest id -> the next row id.
+        var other = (byte[])live.Clone();
+        int recOff = (int)BitConverter.ToUInt32(other, 0) - 6;
+        BitConverter.GetBytes(BitConverter.ToUInt32(other, recOff + DbProxyHandlers.QuestRecordQuestIdOffset) + 1)
+            .CopyTo(other, recOff + DbProxyHandlers.QuestRecordQuestIdOffset);
+        var (_, body3) = RunHandler1(DbProxyHandlers.SDB_SET_QUEST_INFO, other, store, handlers);
+        Hex.True(BitConverter.ToUInt32(body3, 25) == first + 1,
+            "a different quest must get a different quest row id - reusing one makes World address the wrong quest");
     }
 
     // ---- 0x278E SDB_USER_LEARN_SKILL -> 0x278F ----
