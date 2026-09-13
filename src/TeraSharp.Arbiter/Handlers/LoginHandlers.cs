@@ -1,4 +1,4 @@
-using System.Net.Http;
+﻿using System.Net.Http;
 using Microsoft.Extensions.Logging;
 using TeraSharp.Arbiter.Network;
 using TeraSharp.Arbiter.Game;
@@ -154,7 +154,9 @@ public sealed class LoginHandlers
 
         s.SelectedCharacter = chr;
         // gameId from capture S_LOGIN/S_SPAWN_ME: 140737671856129 = 0x80000AF00001
-        s.GameId = 0x80000AF00000UL | chr.Id;
+        // Per-login counter from the World bridge (restarts at 1 per World process), like the real Arbiter.
+        s.GameId = Program.World != null ? Program.World.AllocateGameId() : 0x80000AF00000UL | chr.Id;
+        TeraSharp.Arbiter.World.DbProxyHandlers.GameIdByPlayer[(int)chr.Id] = s.GameId;
         s.PlayerId = chr.Id;
 
         _log.LogInformation("C_SELECT_USER: entering world as '{Name}' (gameId {GameId})", chr.Name, s.GameId);

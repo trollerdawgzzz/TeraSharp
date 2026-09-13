@@ -1,4 +1,4 @@
-using System.Net;
+﻿using System.Net;
 using System.Net.Sockets;
 using Microsoft.Extensions.Logging;
 using TeraSharp.Arbiter.Network;
@@ -144,6 +144,12 @@ public sealed class WorldBridge
 
     /// <summary>True once WorldServer has completed the startup handshake and can accept players.</summary>
     public bool IsReady { get; private set; }
+
+    /// <summary>gameId low part is a per-login counter that restarts at 1 with each World process
+    /// (cap_newchar.log: fresh World, playerId 2 -> 0x80000AF00001; lobby_tap.log: ...0001 then ...0002).
+    /// It is NOT derived from playerId. Reset when the World handshake completes.</summary>
+    private int _gameIdSeq;
+    public ulong AllocateGameId() => 0x80000AF00000UL | (ulong)(uint)Interlocked.Increment(ref _gameIdSeq);
     public bool IsConnected { get { lock (_lock) return _links.Count > 0; } }
 
     public WorldBridge(WorldReplayTable replay, ILogger log)
@@ -354,6 +360,7 @@ public sealed class WorldBridge
                 if (op == OpHandshakeDone && !IsReady)
                 {
                     IsReady = true;
+                    Interlocked.Exchange(ref _gameIdSeq, 0);
                     _log.LogInformation("WorldServer handshake complete - READY for players");
                 }
                 return;

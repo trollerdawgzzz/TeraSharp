@@ -852,11 +852,22 @@ public sealed class DbProxyHandlers
         // in the restriction record World initialises from it. gameId form: 0x80000AF00000|id,
         // unmasked, as sent in AS_ENTER_WORLD [24] and captured (01 00 F0 0A 00 80 00 00).
         if (found)
-            link.SendFrame(DBS_USER_RESTRICTION, BuildDbsUserRestriction(0x80000AF00000UL | (ulong)(uint)playerId));
+        {
+            ulong gameId = GameIdByPlayer.TryGetValue(playerId, out var g) ? g : 0x80000AF00000UL | (ulong)(uint)playerId;
+            link.SendFrame(DBS_USER_RESTRICTION, BuildDbsUserRestriction(gameId));
+        }
         return true;
     }
 
     public const ushort DBS_USER_RESTRICTION = 0x2830;
+
+    /// <summary>
+    /// Live gameId per playerId, set by LoginHandlers.OnSelectUser. gameId is a per-login counter
+    /// (0x80000AF00000 | n, n restarting at 1 with each World process — cap_newchar.log: playerId 2
+    /// got ...0001), NOT derived from playerId. DBS_USER_RESTRICTION must carry the same value
+    /// AS_ENTER_WORLD used.
+    /// </summary>
+    public static readonly System.Collections.Concurrent.ConcurrentDictionary<int, ulong> GameIdByPlayer = new();
 
     /// <summary>DBS_USER_RESTRICTION (0x2830): [u32 listOff=22][u32 count=0][u64 gameId] — 16 bytes (capture pkt 131).</summary>
     public static byte[] BuildDbsUserRestriction(ulong gameId)
