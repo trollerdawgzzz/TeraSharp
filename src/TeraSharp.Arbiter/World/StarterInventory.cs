@@ -1,0 +1,197 @@
+namespace TeraSharp.Arbiter.World;
+
+/// <summary>One item in a class's starting kit, already placed.</summary>
+/// <param name="TemplateId">itemTemplateId from CreateCharData.xml.</param>
+/// <param name="Amount">amount from CreateCharData.xml (1 for gear, 20 for the potions).</param>
+/// <param name="Pocket">Item record +28: 0 = bag, 14 = worn.</param>
+/// <param name="Slot">Item record +36: bag position, or the INVTYPE for a worn item.</param>
+public readonly record struct StarterItem(int TemplateId, int Amount, int Pocket, int Slot);
+
+/// <summary>
+/// The per-class starting inventory, and the code that renders it as a
+/// <c>DBS_USER_LOAD_INVENTORY</c> (0x27A4) payload.
+///
+/// <para><b>Where the table comes from.</b> The real Arbiter builds a new character's items in
+/// <c>Handler_C_CREATE_USER</c> -> <c>CreateUserCallback</c> ->
+/// <c>DatasheetManager::GetCreateCharData(classId, CreateCharData&amp;)</c> ->
+/// <c>AccountManager::CreateUser_FillInitData</c> -> <c>AccountManager::ExecCreateInitItems</c>,
+/// which writes them straight to its own DB (that is why the six items are already in the very
+/// first 0x27A4 of cap_newchar.log, with no 0x2768 before it). The list it reads is the
+/// <c>CreateCharData</c> datasheet, on disk at
+/// <c>D:\v100\TERA_SERVER.100\Executable\Datasheet\CreateCharData.xml</c>:</para>
+/// <code>
+///   &lt;Char class="glaiver" createdLevel="1"&gt;
+///     &lt;InitItem itemTemplateId="59053" initWear="true"  amount="1"  /&gt;
+///     ...
+///     &lt;InitItem itemTemplateId="6550"  initWear="false" amount="20" /&gt;
+/// </code>
+/// <para>It is keyed by <b>class alone</b> — there is no race or gender dimension, so a "starter
+/// kit per (race, class)" is really per class. <see cref="ByClass"/> below is that file,
+/// transcribed; the class ids are the order of the if-chain in <c>DataSheetReadClass</c>.</para>
+///
+/// <para><b>Where the placement comes from.</b> <c>ExecCreateInitItems</c> wears an item when
+/// <c>initWear</c> is set AND the item has an equipment part, which it turns into an inventory
+/// slot with <c>GetInvenTypeFromEquipPart(EquipmentPart)</c>. The part comes from
+/// <c>ItemTemplate.xml</c>'s <c>combatItemType</c> (EQUIP_WEAPON / EQUIP_ARMOR_BODY / _ARM /
+/// _LEG for everything in this table) and the INVTYPE numbering is spelled out in the comment
+/// block at the top of <c>ItemEquipRestriction.xml</c>:
+/// <c>NON_EQUIP 0, WEAPON 1, HEAD 2, BODY 3, HANDS 4, FEET 5, …</c> — which is exactly what the
+/// capture shows (59053 at slot 1, 15004/5/6 at 3/4/5). Non-equippable items go to the bag at
+/// consecutive slots from 0.</para>
+///
+/// <para><b>Marked as inferred</b>, because the capture only pins the six-item case:
+/// <list type="bullet">
+/// <item>Pocket <see cref="EquippedPocket"/> = 14 for worn items is taken from the captured
+/// records, not derived. It is NOT an INVTYPE (14 is STYLE_HAIR there); the field is something
+/// else that happens to be 14 on all four worn records and 0 on both bag records.</item>
+/// <item>Bag items get slots 0, 1, 2 … in datasheet order. The capture only ever shows two bag
+/// items (6550 at slot 0, 6560 at slot 1, in datasheet order), so slots 2+ — which only
+/// <c>soulless</c> uses — are an extension of that pattern.</item>
+/// <item>The 536-byte records for bag slots 2+ are cloned from the captured bag record, since
+/// there is no captured record at those positions. See <see cref="BaseRecordFor"/>.</item>
+/// </list></para>
+/// </summary>
+public static class StarterInventory
+{
+    /// <summary>Item record +28 for a worn item (from the capture; see the class remarks).</summary>
+    public const int EquippedPocket = 14;
+    /// <summary>Item record +28 for an item in the bag.</summary>
+    public const int BagPocket = 0;
+
+    // --- 536-byte record fields we patch (status/INVENTORY-DESIGN.md section 2) ---
+    public const int RecordIdOffset = 0;
+    public const int RecordTemplateIdOffset = 8;
+    public const int RecordAmountOffset = 24;
+    public const int RecordPocketOffset = 28;
+    public const int RecordSlotOffset = 36;
+
+    /// <summary>
+    /// First item DB id in a starter kit. The capture allocated 7..12 for "Test", and
+    /// <see cref="Persistence.CharacterStore.FirstItemId"/> (1000) deliberately starts above
+    /// them. Starter ids are deterministic rather than drawn from that counter: they have to be
+    /// the same on every login for the same character, and with no items table behind them a
+    /// fresh id per load would hand World a different id for the same item each time.
+    /// </summary>
+    public const int FirstStarterItemId = 7;
+
+    /// <summary>
+    /// Class ids, in the order of the if-chain in the Arbiter's <c>DataSheetReadClass</c> —
+    /// which is also what <c>CharacterHandlers.ComputeTemplateId</c> assumes (race 4, gender 1,
+    /// class 12 -> templateId 11013 -> the capture's Elin female glaiver).
+    /// </summary>
+    public static readonly string[] ClassNames =
+    {
+        "warrior", "lancer", "slayer", "berserker", "sorcerer", "archer", "priest",
+        "elementalist", "soulless", "engineer", "fighter", "assassin", "glaiver",
+    };
+
+    /// <summary>
+    /// CreateCharData.xml, one row per class, in datasheet order — which is the order ids are
+    /// allocated in. The <c>hero</c> row in the file is deliberately absent: "hero" is not a name
+    /// <c>DataSheetReadClass</c> knows, so the real Arbiter cannot parse that row either.
+    /// </summary>
+    private static readonly StarterItem[][] ByClass =
+    {
+        [0] = new StarterItem[] { new(10001, 1, 14, 1), new(15004, 1, 14, 3), new(15005, 1, 14, 4), new(15006, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // warrior
+        [1] = new StarterItem[] { new(10002, 1, 14, 1), new(15001, 1, 14, 3), new(15002, 1, 14, 4), new(15003, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // lancer
+        [2] = new StarterItem[] { new(10003, 1, 14, 1), new(15004, 1, 14, 3), new(15005, 1, 14, 4), new(15006, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // slayer
+        [3] = new StarterItem[] { new(10004, 1, 14, 1), new(15001, 1, 14, 3), new(15002, 1, 14, 4), new(15003, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // berserker
+        [4] = new StarterItem[] { new(10005, 1, 14, 1), new(15007, 1, 14, 3), new(15008, 1, 14, 4), new(15009, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // sorcerer
+        [5] = new StarterItem[] { new(10006, 1, 14, 1), new(15004, 1, 14, 3), new(15005, 1, 14, 4), new(15006, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // archer
+        [6] = new StarterItem[] { new(10007, 1, 14, 1), new(15007, 1, 14, 3), new(15008, 1, 14, 4), new(15009, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // priest
+        [7] = new StarterItem[] { new(10008, 1, 14, 1), new(15007, 1, 14, 3), new(15008, 1, 14, 4), new(15009, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // elementalist
+        [8] = new StarterItem[] { new(80396, 1, 14, 1), new(80397, 1, 14, 3), new(80398, 1, 14, 4), new(80399, 1, 14, 5), new(6551, 20, 0, 0), new(6561, 20, 0, 1), new(362, 10, 0, 2), new(391, 3, 0, 3), new(200999, 5, 0, 4) },   // soulless
+        [9] = new StarterItem[] { new(55005, 1, 14, 1), new(15001, 1, 14, 3), new(15002, 1, 14, 4), new(15003, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // engineer
+        [10] = new StarterItem[] { new(82005, 1, 14, 1), new(15001, 1, 14, 3), new(15002, 1, 14, 4), new(15003, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // fighter
+        [11] = new StarterItem[] { new(58171, 1, 14, 1), new(15007, 1, 14, 3), new(15008, 1, 14, 4), new(15009, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // assassin
+        [12] = new StarterItem[] { new(59053, 1, 14, 1), new(15004, 1, 14, 3), new(15005, 1, 14, 4), new(15006, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // glaiver
+    };
+
+    /// <summary>The kit for a class, or null when the class id is not one of the 13.</summary>
+    public static IReadOnlyList<StarterItem>? ForClass(int classId)
+        => classId >= 0 && classId < ByClass.Length ? ByClass[classId] : null;
+
+    /// <summary>
+    /// Render a class's starting inventory as a 0x27A4 payload:
+    /// <c>[u32 listOff=19][u32 count*536][u32 reqId][u8 0]</c> then the item records.
+    /// Returns null for an unknown class, so the caller can fall back.
+    ///
+    /// <para>Ids are assigned in <b>datasheet order</b> and the records are emitted sorted by
+    /// <b>(pocket, slot)</b> — the two orders differ, and both are forced by the capture: the
+    /// glaiver kit lists 59053 first and gets id 7, while the 0x27A4 payload starts with the
+    /// potions (ids 11 and 12) because they sit at pocket 0.</para>
+    /// </summary>
+    /// <param name="capturedPayload">data/starter_inventory.bin — the 3229-byte captured 0x27A4
+    /// payload, used for its six item records (see <see cref="BaseRecordFor"/>).</param>
+    public static byte[]? Build(byte[] capturedPayload, int classId, int playerId, uint reqId)
+    {
+        ArgumentNullException.ThrowIfNull(capturedPayload);
+        var kit = ForClass(classId);
+        if (kit == null) return null;
+
+        // Ids follow the datasheet order the real Arbiter created the rows in.
+        var ids = new int[kit.Count];
+        for (int i = 0; i < kit.Count; i++) ids[i] = FirstStarterItemId + i;
+
+        // The wire order is by position, not creation order.
+        var order = new int[kit.Count];
+        for (int i = 0; i < order.Length; i++) order[i] = i;
+        Array.Sort(order, (a, b) => kit[a].Pocket != kit[b].Pocket
+            ? kit[a].Pocket.CompareTo(kit[b].Pocket)
+            : kit[a].Slot.CompareTo(kit[b].Slot));
+
+        int size = DbProxyHandlers.StarterInventoryItemSize;
+        int header = DbProxyHandlers.StarterInventoryItemStart;   // 13
+        var payload = new byte[header + kit.Count * size];
+        BitConverter.GetBytes(19u).CopyTo(payload, 0);                       // list offset (frame-relative)
+        BitConverter.GetBytes((uint)(kit.Count * size)).CopyTo(payload, 4);  // list length
+        BitConverter.GetBytes(reqId).CopyTo(payload, 8);
+        payload[12] = 0;                                                     // flag: 0 in the capture
+
+        for (int n = 0; n < order.Length; n++)
+        {
+            var item = kit[order[n]];
+            int at = header + n * size;
+            BaseRecordFor(capturedPayload, item.Pocket, item.Slot).CopyTo(payload, at);
+            BitConverter.GetBytes(ids[order[n]]).CopyTo(payload, at + RecordIdOffset);
+            BitConverter.GetBytes(item.TemplateId).CopyTo(payload, at + RecordTemplateIdOffset);
+            BitConverter.GetBytes(playerId).CopyTo(payload, at + DbProxyHandlers.StarterInventoryOwnerOffset);
+            BitConverter.GetBytes(item.Amount).CopyTo(payload, at + RecordAmountOffset);
+            BitConverter.GetBytes(item.Pocket).CopyTo(payload, at + RecordPocketOffset);
+            BitConverter.GetBytes(item.Slot).CopyTo(payload, at + RecordSlotOffset);
+        }
+        return payload;
+    }
+
+    /// <summary>
+    /// The 536-byte record to start from for a given position.
+    ///
+    /// <para>We cannot synthesise one: about 40 of the 536 bytes are named, ~400 are zero, and
+    /// the rest is uninitialised Arbiter heap (the capture's records carry recognisable
+    /// fragments of its own SQL — status/INVENTORY-DESIGN.md section 2). So every record starts
+    /// as one the real server actually sent and only the six named fields are patched.</para>
+    ///
+    /// <para>Exact match on (pocket, slot) first — that is what makes the glaiver kit come back
+    /// byte-identical to the capture. Otherwise the first record from the same pocket, which is
+    /// <b>inferred</b>: it only happens for bag slots 2+, i.e. soulless.</para>
+    /// </summary>
+    public static ReadOnlySpan<byte> BaseRecordFor(byte[] capturedPayload, int pocket, int slot)
+    {
+        int size = DbProxyHandlers.StarterInventoryItemSize;
+        int start = DbProxyHandlers.StarterInventoryItemStart;
+        int count = (capturedPayload.Length - start) / size;
+
+        int samePocket = -1;
+        for (int i = 0; i < count; i++)
+        {
+            int at = start + i * size;
+            int p = BitConverter.ToInt32(capturedPayload, at + RecordPocketOffset);
+            if (p != pocket) continue;
+            if (BitConverter.ToInt32(capturedPayload, at + RecordSlotOffset) == slot)
+                return capturedPayload.AsSpan(at, size);
+            if (samePocket < 0) samePocket = at;
+        }
+        if (samePocket >= 0) return capturedPayload.AsSpan(samePocket, size);
+        return capturedPayload.AsSpan(start, size);
+    }
+}

@@ -2701,16 +2701,87 @@ array items
         Case(" Test", NameCheck.IllegalCharacter);
     }
 
-    [Test] public static void CreateUser_start_position_is_the_captured_one_for_every_class()
+    // =====================================================================
+    // T16 — start position from Executable\Datasheet\CreateCharData.xml.
+    //
+    // Two answers in the shipped data: <Char class="soulless"><InitPos continent="7087"
+    // pos="-48077,-52002,642"/> for class 8, and the single <InitLoc default="true">
+    // continent="5" pos="16260,1253,-4410" for everyone else, because GetInitLocData falls back
+    // to the default row for every (race, gender, class) when no keyed row matches — and there
+    // is no keyed row.
+    // =====================================================================
+
+    [Test] public static void StartPosition_is_the_datasheet_default_for_every_class_but_soulless()
     {
-        // Documented limitation: no per-class start table has been extracted yet, so every
-        // class gets the one position we have ground truth for (cap_newchar.log packet 133).
+        // The default is also the position in the starter blob the real server sent for "Test"
+        // (cap_newchar.log packet 133), so this is unchanged from before T16 for 12 of 13.
         for (int cls = 0; cls <= 12; cls++)
         {
+            if (cls == CharacterHandlers.SoullessClassId) continue;
             var p = CharacterHandlers.StartPositionFor(race: 4, cls: cls);
             Hex.True(p.Zone == 5 && p.X == 16260f && p.Y == 1253f && p.Z == -4410f,
                 $"class {cls}: got zone {p.Zone} ({p.X},{p.Y},{p.Z})");
         }
+    }
+
+    [Test] public static void StartPosition_soulless_uses_its_own_InitPos()
+    {
+        var p = CharacterHandlers.StartPositionFor(race: 4, cls: CharacterHandlers.SoullessClassId);
+        Hex.True(p.Zone == 7087, $"soulless starts in continent 7087, got {p.Zone}");
+        Hex.True(p.X == -48077f && p.Y == -52002f && p.Z == 642f,
+            $"soulless position: got ({p.X},{p.Y},{p.Z})");
+        Hex.True(p.Zone != CharacterHandlers.DefaultStart.Zone,
+            "soulless must not fall back to the default InitLoc");
+    }
+
+    [Test] public static void StartPosition_ignores_race_and_gender()
+    {
+        // GetInitLocData keys on race/gender/class bitmasks, but the file has exactly one
+        // <InitLoc> and it is the default row, so nothing keyed can match. If a keyed row is
+        // ever added this test is the one that should start failing.
+        for (int race = 0; race < 8; race++)
+        {
+            var p = CharacterHandlers.StartPositionFor(race, cls: 0);
+            Hex.True(p == CharacterHandlers.DefaultStart, $"race {race} changed the start position");
+        }
+    }
+
+    [Test] public static void StartPosition_override_still_wins()
+    {
+        // The bisect knob has to beat the datasheet or it is useless for isolating a live
+        // problem with the zone-5 start.
+        var saved = Environment.GetEnvironmentVariable("TERASHARP_START_OVERRIDE");
+        Environment.SetEnvironmentVariable("TERASHARP_START_OVERRIDE", "7005,2679.8,9148,1870");
+        try
+        {
+            foreach (int cls in new[] { 0, CharacterHandlers.SoullessClassId })
+            {
+                var p = CharacterHandlers.StartPositionFor(race: 4, cls: cls);
+                Hex.True(p.Zone == 7005 && p.X == 2679.8f && p.Y == 9148f && p.Z == 1870f,
+                    $"class {cls}: the override must win, got zone {p.Zone} ({p.X},{p.Y},{p.Z})");
+            }
+        }
+        finally { Environment.SetEnvironmentVariable("TERASHARP_START_OVERRIDE", saved); }
+    }
+
+    [Test] public static void StartPosition_reaches_the_blob_and_the_row()
+    {
+        // BuildRecord writes the start position to both the characters row and blob 220/236,
+        // so a soulless created through the normal path must not land on the Island of Dawn.
+        var template = LoadStarterTemplateOrSkip();
+        if (template == null) return;
+
+        var req = new CreateUserRequest
+        {
+            Race = 7, Gender = 1, Class = CharacterHandlers.SoullessClassId, Name = "Mordred",
+            Appearance = new byte[8], Details = new byte[32], Shape = new byte[64],
+        };
+        var rec = CharacterHandlers.BuildRecord(req, accountId: 1, position: 1, template, playerId: 4);
+        Hex.True(rec.Zone == 7087 && rec.X == -48077f, $"row: zone {rec.Zone} x {rec.X}");
+        Hex.True(BitConverter.ToInt32(rec.WorldBlob!, 236) == 7087, "blob zone at 236");
+        Hex.True(BitConverter.ToSingle(rec.WorldBlob!, 220) == -48077f, "blob x at 220");
+        Hex.True(BitConverter.ToSingle(rec.WorldBlob!, 224) == -52002f, "blob y at 224");
+        Hex.True(BitConverter.ToSingle(rec.WorldBlob!, 228) == 642f, "blob z at 228");
     }
 
     [Test] public static void CharacterStore_create_then_list_round_trip()
@@ -3495,6 +3566,505 @@ array items
         bool threw = false;
         try { store.ReserveItemIds(0); } catch (ArgumentOutOfRangeException) { threw = true; }
         Hex.True(threw, "ReserveItemIds(0) must be rejected");
+    }
+
+    // =====================================================================
+    // T14 — per-class starter inventory from the datasheets.
+    //
+    // Source of truth, both on disk next to the server:
+    //   Executable\Datasheet\CreateCharData.xml   the per-class <InitItem> list
+    //   Executable\Datasheet\ItemTemplate.xml     combatItemType -> equipment part
+    //   Executable\Datasheet\ItemEquipRestriction.xml  the INVTYPE numbering, in its header comment
+    // and the Arbiter's own path: Handler_C_CREATE_USER -> CreateUserCallback ->
+    // DatasheetManager::GetCreateCharData -> AccountManager::ExecCreateInitItems.
+    //
+    // The regression test is the glaiver kit: rendering it must reproduce
+    // data/starter_inventory.bin byte for byte, which pins the table, the placement rule, the id
+    // order and the wire order all at once.
+    // =====================================================================
+
+    const int GlaiverClassId = 12, WarriorClassId = 0, SoullessClassId = 8;
+
+    static int RecInt(byte[] payload, int index, int fieldOffset)
+        => BitConverter.ToInt32(payload,
+            DbProxyHandlers.StarterInventoryItemStart + index * DbProxyHandlers.StarterInventoryItemSize + fieldOffset);
+
+    static int RecCount(byte[] payload)
+        => (payload.Length - DbProxyHandlers.StarterInventoryItemStart) / DbProxyHandlers.StarterInventoryItemSize;
+
+    [Test] public static void StarterInventory_glaiver_rebuilds_the_capture_exactly()
+    {
+        // "Test" was an Elin female glaiver (class 12), playerId 2, and the Arbiter answered its
+        // 0x27A2 (reqId 2) with exactly these bytes.
+        var captured = LoadStarterInventoryOrSkip();
+        if (captured == null) return;
+
+        var built = StarterInventory.Build(captured, GlaiverClassId, playerId: 2, reqId: 2);
+        Hex.True(built != null, "class 12 must have a kit");
+        Hex.Eq(built!, captured, "the glaiver kit must rebuild data/starter_inventory.bin byte for byte");
+    }
+
+    [Test] public static void StarterInventory_warrior_gets_the_warrior_weapon()
+    {
+        var captured = LoadStarterInventoryOrSkip();
+        if (captured == null) return;
+
+        var built = StarterInventory.Build(captured, WarriorClassId, playerId: 5, reqId: 0x0BAD)!;
+        Hex.True(RecCount(built) == 6, $"the warrior kit is 6 items, got {RecCount(built)}");
+
+        // Sorted by (pocket, slot): the two potions, then weapon/body/hands/feet.
+        var templates = Enumerable.Range(0, 6).Select(i => RecInt(built, i, StarterInventory.RecordTemplateIdOffset)).ToArray();
+        Hex.True(templates.SequenceEqual(new[] { 6550, 6560, 10001, 15004, 15005, 15006 }),
+            "warrior templates: [" + string.Join(",", templates) + "]");
+        Hex.True(!templates.Contains(59053), "59053 is the glaiver's glaive and must not follow the template");
+        Hex.True(BitConverter.ToUInt32(built, 8) == 0x0BAD, "the live DLM id belongs at [8]");
+        for (int i = 0; i < 6; i++)
+            Hex.True(RecInt(built, i, DbProxyHandlers.StarterInventoryOwnerOffset) == 5, $"item {i} owner");
+    }
+
+    [Test] public static void StarterInventory_every_class_is_placed_consistently()
+    {
+        var captured = LoadStarterInventoryOrSkip();
+        if (captured == null) return;
+
+        for (int cls = 0; cls < StarterInventory.ClassNames.Length; cls++)
+        {
+            string name = StarterInventory.ClassNames[cls];
+            var kit = StarterInventory.ForClass(cls)!;
+            var built = StarterInventory.Build(captured, cls, playerId: 3, reqId: 1)!;
+
+            Hex.True(built.Length == DbProxyHandlers.StarterInventoryItemStart
+                     + kit.Count * DbProxyHandlers.StarterInventoryItemSize, $"{name}: payload length");
+            Hex.True(BitConverter.ToUInt32(built, 0) == 19, $"{name}: list offset 19");
+            Hex.True(BitConverter.ToUInt32(built, 4) == kit.Count * DbProxyHandlers.StarterInventoryItemSize,
+                $"{name}: list length");
+
+            var seen = new HashSet<(int, int)>();
+            var ids = new HashSet<int>();
+            (int p, int s) prev = (-1, -1);
+            for (int i = 0; i < kit.Count; i++)
+            {
+                int pocket = RecInt(built, i, StarterInventory.RecordPocketOffset);
+                int slot = RecInt(built, i, StarterInventory.RecordSlotOffset);
+                Hex.True(seen.Add((pocket, slot)), $"{name}: two items at pocket {pocket} slot {slot}");
+                Hex.True(ids.Add(RecInt(built, i, StarterInventory.RecordIdOffset)), $"{name}: duplicate item id");
+                Hex.True(RecInt(built, i, DbProxyHandlers.StarterInventoryOwnerOffset) == 3, $"{name}: owner");
+                Hex.True(RecInt(built, i, StarterInventory.RecordAmountOffset) >= 1, $"{name}: amount >= 1");
+                Hex.True(pocket is StarterInventory.BagPocket or StarterInventory.EquippedPocket,
+                    $"{name}: unexpected pocket {pocket}");
+                // Emitted sorted by (pocket, slot).
+                Hex.True(pocket > prev.p || (pocket == prev.p && slot > prev.s),
+                    $"{name}: record {i} at ({pocket},{slot}) is out of order after ({prev.p},{prev.s})");
+                prev = (pocket, slot);
+            }
+            // Every class wears a weapon at INVTYPE_WEAPON = 1.
+            Hex.True(kit.Any(x => x.Pocket == StarterInventory.EquippedPocket && x.Slot == 1),
+                $"{name}: no weapon in slot 1");
+        }
+    }
+
+    [Test] public static void StarterInventory_ids_run_in_datasheet_order_not_wire_order()
+    {
+        // The capture proves the two differ: 59053 is listed first and got id 7, but the payload
+        // starts with the potions (ids 11 and 12) because they sit at pocket 0.
+        var captured = LoadStarterInventoryOrSkip();
+        if (captured == null) return;
+        var built = StarterInventory.Build(captured, GlaiverClassId, playerId: 2, reqId: 2)!;
+
+        var expected = new[] { (6550, 11), (6560, 12), (59053, 7), (15004, 8), (15005, 9), (15006, 10) };
+        for (int i = 0; i < expected.Length; i++)
+        {
+            Hex.True(RecInt(built, i, StarterInventory.RecordTemplateIdOffset) == expected[i].Item1,
+                $"record {i} template");
+            Hex.True(RecInt(built, i, StarterInventory.RecordIdOffset) == expected[i].Item2,
+                $"record {i} item id should be {expected[i].Item2}");
+        }
+        Hex.True(StarterInventory.FirstStarterItemId
+                 < TeraSharp.Arbiter.Persistence.CharacterStore.FirstItemId,
+            "starter ids must sit below the counter T13 hands out for inserts");
+    }
+
+    [Test] public static void StarterInventory_soulless_is_level_50_with_five_bag_items()
+    {
+        // The one class whose kit is not the six-item shape: four worn pieces plus five
+        // consumables. Bag slots 2..4 have no captured record, so those records are cloned from
+        // the captured bag record — the inferred part of this task.
+        var captured = LoadStarterInventoryOrSkip();
+        if (captured == null) return;
+
+        var kit = StarterInventory.ForClass(SoullessClassId)!;
+        Hex.True(kit.Count == 9, $"the soulless kit is 9 items, got {kit.Count}");
+        var built = StarterInventory.Build(captured, SoullessClassId, playerId: 4, reqId: 1)!;
+        Hex.True(RecCount(built) == 9, "nine records");
+
+        var bagSlots = Enumerable.Range(0, 9)
+            .Where(i => RecInt(built, i, StarterInventory.RecordPocketOffset) == StarterInventory.BagPocket)
+            .Select(i => RecInt(built, i, StarterInventory.RecordSlotOffset)).ToArray();
+        Hex.True(bagSlots.SequenceEqual(new[] { 0, 1, 2, 3, 4 }), "bag slots 0..4: [" + string.Join(",", bagSlots) + "]");
+        var worn = Enumerable.Range(0, 9)
+            .Where(i => RecInt(built, i, StarterInventory.RecordPocketOffset) == StarterInventory.EquippedPocket)
+            .Select(i => RecInt(built, i, StarterInventory.RecordSlotOffset)).ToArray();
+        Hex.True(worn.SequenceEqual(new[] { 1, 3, 4, 5 }), "worn slots 1,3,4,5: [" + string.Join(",", worn) + "]");
+    }
+
+    [Test] public static void StarterInventory_patches_only_the_six_named_record_fields()
+    {
+        // Roughly 400 of the 536 bytes are zero, ~40 are named, and the rest is uninitialised
+        // Arbiter heap we cannot synthesise. Every record must therefore be a captured one with
+        // only the named fields changed.
+        var captured = LoadStarterInventoryOrSkip();
+        if (captured == null) return;
+
+        int size = DbProxyHandlers.StarterInventoryItemSize;
+        int start = DbProxyHandlers.StarterInventoryItemStart;
+        var patched = new HashSet<int>();
+        foreach (int off in new[] { StarterInventory.RecordIdOffset, StarterInventory.RecordTemplateIdOffset,
+                                    DbProxyHandlers.StarterInventoryOwnerOffset, StarterInventory.RecordAmountOffset,
+                                    StarterInventory.RecordPocketOffset, StarterInventory.RecordSlotOffset })
+            for (int i = off; i < off + 4; i++) patched.Add(i);
+
+        var built = StarterInventory.Build(captured, WarriorClassId, playerId: 9, reqId: 3)!;
+        for (int r = 0; r < RecCount(built); r++)
+        {
+            int pocket = RecInt(built, r, StarterInventory.RecordPocketOffset);
+            int slot = RecInt(built, r, StarterInventory.RecordSlotOffset);
+            var basis = StarterInventory.BaseRecordFor(captured, pocket, slot).ToArray();
+            for (int i = 0; i < size; i++)
+                if (!patched.Contains(i))
+                    Hex.True(built[start + r * size + i] == basis[i],
+                        $"record {r} byte {i} outside the named fields changed");
+        }
+    }
+
+    [Test] public static void StarterInventory_unknown_class_has_no_kit()
+    {
+        var captured = LoadStarterInventoryOrSkip();
+        if (captured == null) return;
+        Hex.True(StarterInventory.ForClass(-1) == null, "class -1");
+        Hex.True(StarterInventory.ForClass(13) == null, "class 13 (the unparsable 'hero' row)");
+        Hex.True(StarterInventory.Build(captured, 13, 1, 1) == null, "Build must return null so the caller can fall back");
+    }
+
+    [Test] public static void OnLoadInventory_serves_the_kit_for_the_characters_class()
+    {
+        var captured = LoadStarterInventoryOrSkip();
+        if (captured == null) return;
+        DbProxyHandlers.SetStarterInventoryForTest(captured);
+        try
+        {
+            using var store = new TeraSharp.Arbiter.Persistence.CharacterStore(":memory:", QuietLog());
+            var acct = store.GetOrCreateAccount("t14");
+            int id = store.CreateCharacter(new TeraSharp.Arbiter.Persistence.CharacterRecord
+            {
+                AccountId = acct.Id, Name = "Rurik", Gender = 0, Race = 0, Class = WarriorClassId,
+                Level = 1, TemplateId = 10101, Zone = 5,
+                Appearance = new byte[8], Details = new byte[32], Shape = new byte[64], Position = 1,
+            });
+            Hex.True(id != DbProxyHandlers.CapturedInventoryPlayerId,
+                "playerId 1 is reserved for the replay-table capture; this test needs another row");
+
+            var req = new byte[8];
+            BitConverter.GetBytes(0x0BADu).CopyTo(req, 0);
+            BitConverter.GetBytes((uint)id).CopyTo(req, 4);
+            var frames = RunHandler(DbProxyHandlers.SDB_USER_LOAD_INVENTORY, req, 2, store);
+
+            Hex.True(frames[1].op == DbProxyHandlers.DBS_USER_LOAD_INVENTORY, "second frame is 0x27A4");
+            Hex.Eq(frames[1].body, StarterInventory.Build(captured, WarriorClassId, id, 0x0BAD)!,
+                "the handler must serve the warrior kit, not the captured glaiver list");
+            Hex.True(RecInt(frames[1].body, 2, StarterInventory.RecordTemplateIdOffset) == 10001,
+                "a warrior gets 10001, not 59053");
+        }
+        finally { DbProxyHandlers.SetStarterInventoryForTest(null); }
+    }
+
+    // =====================================================================
+    // T17 — quest persistence, active-quest half.
+    //
+    // Ground truth: cap_newchar.log (character "Test", playerId 2) — one 0x272C -> 0x272D and 28
+    // 0x272E -> 0x272F. Layouts, the sqlType/questDbId rule and the evidence for each field are
+    // in status/QUEST-DESIGN.md.
+    //
+    // Completed quests are stored but NOT served: nothing in any capture shows where the 0x272D
+    // reply puts them. Serving them from a guessed list is exactly the move that desynced World
+    // before, so OnLoadQuestList logs loudly instead.
+    // =====================================================================
+
+    // cap_newchar.log seq 342: the brand-new character's DBS_LOAD_QUEST_LIST, reqId 18.
+    static readonly byte[] Cap272DEmpty = Hex.B(@"
+        3B 00 00 00 00 00 00 00 3B 00 00 00 00 00 00 00
+        3B 00 00 00 00 00 00 00 3B 00 00 00 00 00 00 00
+        3B 00 00 00 00 00 00 00 3B 00 00 00 14 00 00 00
+        01 12 00 00 00 00 00 00 00 B2 07 01 00 01 00 00
+        00 00 00 00 00 00 00 00 00");
+
+    // seq 540 -> 541: sqlType 22, quest 59901.
+    static readonly byte[] Cap272EAccept = Hex.B(@"
+        24 00 00 00 50 00 00 00 74 00 00 00 00 00 00 00
+        49 00 00 00 16 00 00 00 02 00 00 00 00 00 00 00
+        00 00 FD E9 00 00 01 00 00 00 01 00 00 00 00 00
+        00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+        00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+        00 00 00 00 00 00 00 00 00 00 00 00 00 00 01 00
+        00 00 00 00 00 00 00 00 00 00 FF FF FF FF");
+    static readonly byte[] Cap272FAccept = Hex.B(@"
+        23 00 00 00 50 00 00 00 73 00 00 00 00 00 00 00
+        49 00 00 00 16 00 00 00 01 02 00 00 00 00 00 00
+        00 FD E9 00 00 01 00 00 00 01 00 00 00 00 00 00
+        00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+        00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+        00 00 00 00 00 00 00 00 00 00 00 00 00 01 00 00
+        00 00 00 00 00 00 00 00 00 FF FF FF FF");
+
+    // seq 1014 -> 1015: sqlType 23, quest 59901.
+    static readonly byte[] Cap272EStep = Hex.B(@"
+        24 00 00 00 50 00 00 00 74 00 00 00 00 00 00 00
+        56 00 00 00 17 00 00 00 02 00 00 00 00 00 02 00
+        00 00 FD E9 00 00 01 00 00 00 02 00 00 00 00 00
+        00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+        00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+        00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+        78 A6 00 00 00 00 00 00 00 00 FF FF FF FF");
+    static readonly byte[] Cap272FStep = Hex.B(@"
+        23 00 00 00 50 00 00 00 73 00 00 00 00 00 00 00
+        56 00 00 00 17 00 00 00 01 00 00 00 00 02 00 00
+        00 FD E9 00 00 01 00 00 00 02 00 00 00 00 00 00
+        00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+        00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+        00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 78
+        A6 00 00 00 00 00 00 00 00 FF FF FF FF");
+
+    // quest 59901: status 2, step 0, questDbId 2 — its last write in the capture.
+    static readonly byte[] CapQuest59901 = Hex.B(@"
+        02 00 00 00 FD E9 00 00 02 00 00 00 00 00 00 00
+        00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+        00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+        00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+        00 00 25 A2 00 00 00 00 00 00 00 00 FF FF FF FF");
+
+    // quest 59902: status 2, step 0, questDbId 3 — its last write in the capture.
+    static readonly byte[] CapQuest59902 = Hex.B(@"
+        03 00 00 00 FE E9 00 00 02 00 00 00 00 00 00 00
+        00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+        00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+        00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+        00 00 9E 1F 00 00 00 00 00 00 00 00 FF FF FF FF");
+
+    // quest 59903: status 2, step 0, questDbId 4 — its last write in the capture.
+    static readonly byte[] CapQuest59903 = Hex.B(@"
+        04 00 00 00 FF E9 00 00 02 00 00 00 00 00 00 00
+        00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+        00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+        00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+        00 00 F1 A6 00 00 00 00 00 00 00 00 FF FF FF FF");
+
+    // quest 59904: status 1, step 1, questDbId 0 — its last write in the capture.
+    static readonly byte[] CapQuest59904 = Hex.B(@"
+        00 00 00 00 00 EA 00 00 01 00 00 00 01 00 00 00
+        00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+        00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+        00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+        01 00 64 A2 00 00 00 00 00 00 00 00 FF FF FF FF");
+
+    /// <summary>The 80-byte record for one quest, with its questDbId at +0 patched in.</summary>
+    static byte[] QuestRecord(byte[] captured, int questDbId)
+    {
+        var r = (byte[])captured.Clone();
+        BitConverter.GetBytes(questDbId).CopyTo(r, DbProxyHandlers.QuestRecordDbIdOffset);
+        return r;
+    }
+
+    [Test] public static void QuestList_empty_matches_the_capture()
+    {
+        // A character with no quest rows must produce exactly what the real Arbiter sent for the
+        // brand-new character: all five lists empty, the 20-byte "never" trailer, ok = 1.
+        Hex.Eq(DbProxyHandlers.BuildDbs272D(Array.Empty<byte[]>(), reqId: 18), Cap272DEmpty,
+            "DBS_LOAD_QUEST_LIST for a character with no quests (cap_newchar.log seq 342)");
+    }
+
+    [Test] public static void QuestList_header_is_53_bytes_with_six_slots()
+    {
+        var one = QuestRecord(CapQuest59904, 4);
+        var built = DbProxyHandlers.BuildDbs272D(new[] { one }, reqId: 0x0BAD);
+
+        Hex.True(built.Length == 53 + 80 + 20, $"53 + 80 + 20, got {built.Length}");
+        Hex.True(BitConverter.ToUInt32(built, 0) == 59, "list 0 starts at frame-relative 59");
+        Hex.True(BitConverter.ToUInt32(built, 4) == 80, "list 0 holds one 80-byte record");
+        for (int slot = 1; slot <= 4; slot++)
+        {
+            Hex.True(BitConverter.ToUInt32(built, slot * 8) == 59 + 80, $"list {slot} offset");
+            Hex.True(BitConverter.ToUInt32(built, slot * 8 + 4) == 0, $"list {slot} must be empty");
+        }
+        Hex.True(BitConverter.ToUInt32(built, 40) == 59 + 80, "list 5 (trailer) offset");
+        Hex.True(BitConverter.ToUInt32(built, 44) == 20, "list 5 length");
+        Hex.True(built[DbProxyHandlers.QuestListOkOffset] == 1, "ok = 1");
+        Hex.True(BitConverter.ToUInt32(built, DbProxyHandlers.QuestListReqIdOffset) == 0x0BAD,
+            "the live DLM id belongs at payload 49");
+        Hex.Eq(built[53..133], one, "the record is copied verbatim");
+        Hex.Eq(built[133..153], DbProxyHandlers.QuestListTrailer, "the trailer is unchanged");
+        // List 3 empty is deliberate: World then generates its own daily-quest seeds and sends
+        // the 17 0x2899 items we already answer.
+        Hex.True(BitConverter.ToUInt32(built, 28) == 0, "the daily-seed list must stay empty");
+    }
+
+    [Test] public static void QuestList_rejects_a_wrong_sized_record()
+    {
+        bool threw = false;
+        try { DbProxyHandlers.BuildDbs272D(new[] { new byte[79] }, 1); }
+        catch (ArgumentException) { threw = true; }
+        Hex.True(threw, "a record that is not 80 bytes must be rejected, not silently truncated");
+    }
+
+    [Test] public static void SetQuestInfo_rebuilds_the_captured_replies()
+    {
+        // seq 540 is the INSERT that allocates the questDbId (the capture's DB gave it 2);
+        // seq 1014 is a step write, which must carry 0 there.
+        Hex.Eq(DbProxyHandlers.BuildDbs272F(Cap272EAccept, questDbId: 2, () => throw new Exception("no atoms here")),
+            Cap272FAccept, "DBS_SET_QUEST_INFO insert (cap_newchar.log seq 540 -> 541)");
+        Hex.Eq(DbProxyHandlers.BuildDbs272F(Cap272EStep, questDbId: 0, () => throw new Exception("no atoms here")),
+            Cap272FStep, "DBS_SET_QUEST_INFO step (cap_newchar.log seq 1014 -> 1015)");
+    }
+
+    [Test] public static void SetQuestInfo_reply_header_is_29_bytes()
+    {
+        var r = DbProxyHandlers.BuildDbs272F(Cap272EAccept, 7, () => 0);
+        Hex.True(BitConverter.ToUInt32(r, 0) == 35, "record at frame-relative 35 (6 + 29)");
+        Hex.True(BitConverter.ToUInt32(r, 4) == 80, "record length");
+        Hex.True(BitConverter.ToUInt32(r, 8) == 115, "atoms start after the record");
+        Hex.True(BitConverter.ToUInt32(r, 16) == BitConverter.ToUInt32(Cap272EAccept, 16), "reqId echoed");
+        Hex.True(BitConverter.ToUInt32(r, 20) == BitConverter.ToUInt32(Cap272EAccept, 20), "sqlType echoed");
+        Hex.True(r[24] == 1, "ok = 1");
+        Hex.True(BitConverter.ToUInt32(r, 25) == 7, "questDbId at payload 25");
+    }
+
+    [Test] public static void SetQuestInfo_reward_atom_gets_an_item_id()
+    {
+        // The 972- and 3540-byte writes carry quest rewards as the same ItemTransactionAtom the
+        // inventory path uses, and an op-7 insert with id 0 must be allocated one (capture seq
+        // 1804: 0 -> 13). Built synthetically here; the atom path itself is T13's tests.
+        int atom = DbProxyHandlers.ItemAtomSize;
+        var req = new byte[30 + 80 + atom];
+        BitConverter.GetBytes(36u).CopyTo(req, 0);
+        BitConverter.GetBytes(80u).CopyTo(req, 4);
+        BitConverter.GetBytes((uint)(36 + 80)).CopyTo(req, 8);
+        BitConverter.GetBytes((uint)atom).CopyTo(req, 12);
+        BitConverter.GetBytes(0x0BADu).CopyTo(req, 16);
+        BitConverter.GetBytes(23u).CopyTo(req, 20);
+        BitConverter.GetBytes(2u).CopyTo(req, 24);
+        Cap272EAccept[30..110].CopyTo(req, 30);
+        BitConverter.GetBytes(DbProxyHandlers.TsInsertItem).CopyTo(req, 110 + DbProxyHandlers.ItemAtomOpOffset);
+
+        var ids = new IdCounter(41);
+        var r = DbProxyHandlers.BuildDbs272F(req, questDbId: 0, ids.Next);
+        Hex.True(ids.Calls == 1, $"one insert atom, one id, got {ids.Calls}");
+        Hex.True(BitConverter.ToUInt32(r, 29 + 80 + DbProxyHandlers.ItemAtomDbIdOffset) == 41,
+            "the allocated item id must land at atom+16");
+        Hex.True(BitConverter.ToUInt32(r, 12) == atom, "the atom is echoed back");
+    }
+
+    [Test] public static void Quests_round_trip_write_then_load()
+    {
+        // Replay the capture's four last-state records, then load. Three of the quests are
+        // complete and must NOT come back; 59904 was in progress at logout and must.
+        using var store = new TeraSharp.Arbiter.Persistence.CharacterStore(":memory:", QuietLog());
+        var acct = store.GetOrCreateAccount("t17");
+        int pid = store.CreateCharacter(new TeraSharp.Arbiter.Persistence.CharacterRecord
+        {
+            AccountId = acct.Id, Name = "Test17", Gender = 1, Race = 4, Class = 12, Level = 1,
+            TemplateId = 11013, Zone = 5, Appearance = new byte[8], Details = new byte[32],
+            Shape = new byte[64], Position = 1,
+        });
+
+        foreach (var rec in new[] { CapQuest59901, CapQuest59902, CapQuest59903, CapQuest59904 })
+        {
+            int qid = BitConverter.ToInt32(rec, DbProxyHandlers.QuestRecordQuestIdOffset);
+            int status = BitConverter.ToInt32(rec, DbProxyHandlers.QuestRecordStatusOffset);
+            int step = BitConverter.ToInt32(rec, DbProxyHandlers.QuestRecordStepOffset);
+            store.UpsertQuest(pid, qid, status, step, rec);
+        }
+        Hex.True(store.CountQuests(pid) == 4, "four quest rows");
+        Hex.True(store.GetCompletedQuestIds(pid).SequenceEqual(new[] { 59901, 59902, 59903 }),
+            "59901-3 completed: [" + string.Join(",", store.GetCompletedQuestIds(pid)) + "]");
+
+        var active = store.GetActiveQuestRecords(pid);
+        Hex.True(active.Count == 1, $"only 59904 is still in progress, got {active.Count}");
+        Hex.Eq(active[0], CapQuest59904, "the stored record comes back byte for byte");
+        Hex.Eq(DbProxyHandlers.BuildDbs272D(active, 5), DbProxyHandlers.BuildDbs272D(new[] { CapQuest59904 }, 5),
+            "the rebuilt reply carries exactly the in-progress quest");
+    }
+
+    [Test] public static void Quests_upsert_is_last_write_wins_and_keeps_the_questDbId()
+    {
+        using var store = new TeraSharp.Arbiter.Persistence.CharacterStore(":memory:", QuietLog());
+        var acct = store.GetOrCreateAccount("t17b");
+        int pid = store.CreateCharacter(new TeraSharp.Arbiter.Persistence.CharacterRecord
+        {
+            AccountId = acct.Id, Name = "Upsert", Gender = 0, Race = 0, Class = 0, Level = 1,
+            TemplateId = 10101, Zone = 5, Appearance = new byte[8], Details = new byte[32],
+            Shape = new byte[64], Position = 1,
+        });
+
+        int first = store.UpsertQuest(pid, 59901, status: 1, step: 1, QuestRecord(CapQuest59901, 0));
+        int again = store.UpsertQuest(pid, 59901, status: 1, step: 5, QuestRecord(CapQuest59901, first));
+        Hex.True(first == again,
+            $"the questDbId must not change between writes ({first} then {again}) — World keeps it in record+0");
+        Hex.True(store.CountQuests(pid) == 1, "the second write updates, it does not insert");
+        Hex.True(store.GetActiveQuestRecords(pid).Count == 1, "still one active quest");
+
+        // A different quest gets its own id, and completing one takes it out of the load.
+        int other = store.UpsertQuest(pid, 59902, 1, 1, QuestRecord(CapQuest59902, 0));
+        Hex.True(other != first, "a second quest gets a different questDbId");
+        store.UpsertQuest(pid, 59901, TeraSharp.Arbiter.Persistence.CharacterStore.QuestStatusComplete, 0, QuestRecord(CapQuest59901, first));
+        Hex.True(store.GetActiveQuestRecords(pid).Count == 1, "the completed quest drops out of the load");
+        Hex.True(store.GetCompletedQuestIds(pid).SequenceEqual(new[] { 59901 }), "and shows up as completed");
+    }
+
+    [Test] public static void Handler_272C_rebuilds_from_the_store_and_echoes_the_live_id()
+    {
+        using var store = new TeraSharp.Arbiter.Persistence.CharacterStore(":memory:", QuietLog());
+        var acct = store.GetOrCreateAccount("t17c");
+        int pid = store.CreateCharacter(new TeraSharp.Arbiter.Persistence.CharacterRecord
+        {
+            AccountId = acct.Id, Name = "Loader", Gender = 0, Race = 0, Class = 0, Level = 1,
+            TemplateId = 10101, Zone = 5, Appearance = new byte[8], Details = new byte[32],
+            Shape = new byte[64], Position = 1,
+        });
+        Hex.True(pid != DbProxyHandlers.CapturedQuestPlayerId, "this test needs a row that is not dob");
+
+        var req = new byte[8];
+        BitConverter.GetBytes(0x0BADu).CopyTo(req, 0);
+        BitConverter.GetBytes((uint)pid).CopyTo(req, 4);
+
+        // No rows yet -> the brand-new-character reply, with our live id.
+        var (op1, body1) = RunHandler1(DbProxyHandlers.SDB_QUEST_LIST, req, store);
+        Hex.True(op1 == 0x272D, $"reply opcode must be 0x272D, got 0x{op1:X4}");
+        var expected = (byte[])Cap272DEmpty.Clone();
+        BitConverter.GetBytes(0x0BADu).CopyTo(expected, DbProxyHandlers.QuestListReqIdOffset);
+        Hex.Eq(body1, expected, "no quest rows -> the captured empty reply with the live DLM id");
+
+        // One active quest -> it comes back in list 0.
+        store.UpsertQuest(pid, 59904, 1, 1, CapQuest59904);
+        var (_, body2) = RunHandler1(DbProxyHandlers.SDB_QUEST_LIST, req, store);
+        Hex.True(BitConverter.ToUInt32(body2, 4) == 80, "list 0 now holds one record");
+        Hex.Eq(body2[53..133], CapQuest59904, "and it is the stored record");
+    }
+
+    [Test] public static void Handler_272C_keeps_dob_on_the_capture_until_he_has_rows()
+    {
+        // playerId 1 is the character the replay-table capture belongs to. Serving him a rebuilt
+        // reply before his rows exist would drop the quest he is mid-way through.
+        using var store = new TeraSharp.Arbiter.Persistence.CharacterStore(":memory:", QuietLog());
+        var req = new byte[8];
+        BitConverter.GetBytes(0x0BADu).CopyTo(req, 0);
+        BitConverter.GetBytes((uint)DbProxyHandlers.CapturedQuestPlayerId).CopyTo(req, 4);
+
+        var (op, body) = RunHandler1(DbProxyHandlers.SDB_QUEST_LIST, req, store);
+        Hex.True(op == 0x272D, "reply opcode");
+        Hex.True(body.Length == DbProxyStaticData.QuestListEmpty.Length,
+            $"dob must still get the captured reply ({DbProxyStaticData.QuestListEmpty.Length} B payload), got {body.Length}");
+        Hex.True(body.Length != DbProxyHandlers.BuildDbs272D(Array.Empty<byte[]>(), 0).Length,
+            "and it must not be the rebuilt empty reply");
+        Hex.True(BitConverter.ToUInt32(body, DbProxyHandlers.QuestListReqIdOffset) == 0x0BAD,
+            "even the captured reply must carry the live DLM id");
     }
 
     /// <summary>

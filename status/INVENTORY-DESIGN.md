@@ -321,7 +321,23 @@ Implementation order, smallest useful step first:
    seq 2072→2073 and 2211→2213 (`data/cap_item_single.bin`). Still no item storage: World's
    writes are acknowledged and forgotten, so the items are gone on the next login.
 2. `items` table + rebuild `0x27A4` from it, seeded at character creation with the six starter
-   records. Replaces `BuildStarterInventory`.
+   records. Replaces `BuildStarterInventory`. **Half done (T14):** `World/StarterInventory.cs`
+   renders the payload from a per-class table instead of the captured glaiver list, so a warrior
+   gets a warrior's gear. Still no storage — the kit is recomputed from the class on every login,
+   so anything the player does to it is lost. The renderer is the piece the items table will
+   reuse; only the source of the rows changes.
+
+   The table is `Executable\Datasheet\CreateCharData.xml`, which is on disk next to the server.
+   The real Arbiter reads it in `Handler_C_CREATE_USER` → `CreateUserCallback` →
+   `DatasheetManager::GetCreateCharData(classId, CreateCharData&)` →
+   `AccountManager::CreateUser_FillInitData` → `AccountManager::ExecCreateInitItems`, which writes
+   the rows to its own DB — that is why the six items are already in the first `0x27A4` with no
+   `0x2768` before it. It is keyed by **class alone**; race and gender do not enter into it.
+   Placement comes from `ItemTemplate.xml`'s `combatItemType` (EQUIP_WEAPON / EQUIP_ARMOR_BODY /
+   _ARM / _LEG) through `GetInvenTypeFromEquipPart`, and the INVTYPE numbering is documented in
+   the header comment of `ItemEquipRestriction.xml`:
+   `NON_EQUIP 0, WEAPON 1, HEAD 2, BODY 3, HANDS 4, FEET 5, …`. Two orders matter and they
+   differ: ids are allocated in datasheet order, the payload is emitted sorted by (pocket, slot).
 3. Apply ops 7, 2, 11, 3, 36 to the table. Money (op 9) onto the characters row.
 4. Everything else stays echo-only until a capture shows it mattering.
 
