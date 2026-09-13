@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using System.Net.Sockets;
 using System.Reflection;
 using TeraSharp.Arbiter.Handlers;
@@ -5844,6 +5844,236 @@ array items
         }
         Hex.True(DbProxyHandlers.IsHandledRequest(DbProxyHandlers.SDB_LOAD_2867),
             "0x2867 must be answered by the handler, not the replay table - the reply carries a DLM id");
+    // ================= T23: the post-handshake config burst + the city-war reply =================
+
+    // The two live instants, straight out of the captures:
+    //   arb_world_2026-09-13T11-33-30-680Z.log  seq 104  0x15BD = 1789299742 = 2026-09-13T11:42:22Z
+    //                                           seq 115  0x14D1 = 1789225200 = 2026-09-12T15:00:00Z
+    //   arb_world.log (2026-09-12)              seq 100  0x15BD = 1789195013 = 2026-09-12T06:36:53Z
+    //                                           seq 101  0x14D1 = 1789138800 = 2026-09-11T15:00:00Z
+    // data/handshake_burst.bin holds the 09-13 frames verbatim, so rebuilding it at the 09-13
+    // instant must reproduce the file and rebuilding it at the 09-12 instant must reproduce the
+    // 09-12 capture. Those two facts are the whole contract.
+    const long BurstCapture0913Now = 1789299742;
+    const long BurstCapture0913Reset = 1789225200;
+    const long BurstCapture0912Now = 1789195013;
+    const long BurstCapture0912Reset = 1789138800;
+
+    /// <summary>The opcode order of the burst, seq 104-126, as captured.</summary>
+    const string BurstOpcodeOrder =
+        "15BD 156B 13C7 157E 15DE 1582 157F 14B3 150D 150E 1510 1511 14D0 14D1 14E1 14EC 1529 28F8 " +
+        "28F8 1556 150A 14E6 1623 149D 149E 149F 149D 149E 149F 149D 149E 149F 149D 149E 149F 149D " +
+        "149E 149F 15B6 15C2 15C5 15D4 15D5 1603 160D 160F 1609 14E9 14E2 14EE 14F2 14F3 14F7 1613 " +
+        "161D 1589 162E 1567 28E3 28E5 28E6 28EB 29E2";
+
+    /// <summary>
+    /// data/handshake_burst.bin as an ordered list, or null (with a printed note) when the repo
+    /// root is not above the test binary. Deliberately NOT LoadTsisOrSkip: that one keys records
+    /// by capture sequence number and the burst has five frames sharing seq 117.
+    /// </summary>
+    static IReadOnlyList<DbProxyHandlers.BurstFrame>? LoadHandshakeBurstOrSkip()
+    {
+        var path = FindRepoFile(Path.Combine("data", DbProxyHandlers.HandshakeBurstFile));
+        if (path == null)
+        {
+            Console.WriteLine($"        (skipped: data/{DbProxyHandlers.HandshakeBurstFile} not found)");
+            return null;
+        }
+        var burst = DbProxyHandlers.ParseBurst(File.ReadAllBytes(path));
+        Hex.True(burst != null, $"data/{DbProxyHandlers.HandshakeBurstFile} must be a well-formed TSIS container");
+        return burst;
+    }
+
+    [Test] public static void HandshakeBurst_file_is_the_63_captured_frames_in_order()
+    {
+        var burst = LoadHandshakeBurstOrSkip();
+        if (burst == null) return;
+
+        Hex.True(burst.Count == DbProxyHandlers.HandshakeBurstFrameCount,
+            $"the burst is {DbProxyHandlers.HandshakeBurstFrameCount} frames, file has {burst.Count}");
+        Hex.True(string.Join(' ', burst.Select(f => f.Op.ToString("X4"))) == BurstOpcodeOrder,
+            "the opcode order must be the captured one (seq 104-126)");
+        Hex.True(burst[0].Seq == 104 && burst[^1].Seq == 126,
+            $"first/last capture seq should be 104/126, got {burst[0].Seq}/{burst[^1].Seq}");
+        Hex.True(burst.Sum(f => f.Payload.Length + 6) == 1082,
+            "the burst is 1082 frame bytes on the wire");
+        Hex.True(!burst.Any(f => f.Op == DbProxyHandlers.AS_DUNGEON_OPEN_1581),
+            "0x1581 belongs to the separate dungeon-open burst and must not be in this file");
+    }
+
+    [Test] public static void HandshakeBurst_rebuilt_at_the_captures_own_instant_is_the_capture()
+    {
+        var burst = LoadHandshakeBurstOrSkip();
+        if (burst == null) return;
+
+        var now = DateTimeOffset.FromUnixTimeSeconds(BurstCapture0913Now);
+        var built = DbProxyHandlers.BuildHandshakeBurst(burst, now);
+
+        Hex.True(built.Count == burst.Count, "one frame out per captured frame");
+        for (int i = 0; i < built.Count; i++)
+        {
+            Hex.True(built[i].op == burst[i].Op, $"frame {i} opcode changed");
+            Hex.Eq(built[i].payload, burst[i].Payload,
+                $"frame {i} (0x{burst[i].Op:X4}, capture seq {burst[i].Seq}) must be byte-identical to the capture");
+        }
+    }
+
+    [Test] public static void HandshakeBurst_live_timestamps_land_in_the_two_slots_that_move()
+    {
+        var burst = LoadHandshakeBurstOrSkip();
+        if (burst == null) return;
+
+        // Rebuild the 09-13 file at the 09-12 capture's instant: the result must BE the 09-12
+        // capture - the two u64s move to that day's values and nothing else changes at all.
+        var now = DateTimeOffset.FromUnixTimeSeconds(BurstCapture0912Now);
+        var built = DbProxyHandlers.BuildHandshakeBurst(burst, now);
+
+        int checkedSync = 0, checkedReset = 0, identical = 0;
+        for (int i = 0; i < built.Count; i++)
+        {
+            var (op, payload) = built[i];
+            if (op == DbProxyHandlers.AS_SYNC_DATE_TIME)
+            {
+                Hex.True(BitConverter.ToUInt64(payload, DbProxyHandlers.SyncDateTimeOffset) == (ulong)BurstCapture0912Now,
+                    "0x15BD payload+0 must be the live unix time");
+                Hex.Eq(payload[8..], burst[i].Payload[8..], "0x15BD: only the u64 may change");
+                checkedSync++;
+            }
+            else if (op == DbProxyHandlers.AS_SET_DARK_RIFT_DAILY_COMPLETED)
+            {
+                Hex.True(BitConverter.ToUInt64(payload, DbProxyHandlers.DarkRiftResetTimeOffset) == (ulong)BurstCapture0912Reset,
+                    "0x14D1 payload+8 must be the daily reset for that day");
+                Hex.Eq(payload[..8], burst[i].Payload[..8], "0x14D1: the list header must not change");
+                checkedReset++;
+            }
+            else
+            {
+                Hex.Eq(payload, burst[i].Payload,
+                    $"0x{op:X4} (capture seq {burst[i].Seq}) has no live field and must be replayed verbatim");
+                identical++;
+            }
+        }
+        Hex.True(checkedSync == 1 && checkedReset == 1,
+            $"exactly one 0x15BD and one 0x14D1 in the burst, saw {checkedSync}/{checkedReset}");
+        Hex.True(identical == burst.Count - 2, "every other frame is a verbatim replay");
+
+        // And the 0x15DE timestamp is one of those: 2026-09-12T03:57:29Z in ALL FOUR captures,
+        // a day apart and on both sides of a daily reset, so it is stored state, not a clock.
+        var lastReset = built.Single(f => f.op == DbProxyHandlers.AS_DUNGEON_PHASE_LAST_RESET_TIME);
+        Hex.True(BitConverter.ToUInt64(lastReset.payload, 4) == 1789185449UL,
+            "0x15DE keeps its captured 2026-09-12T03:57:29Z value");
+    }
+
+    [Test] public static void HandshakeBurst_daily_reset_is_the_most_recent_15_00_utc()
+    {
+        // The four captures.
+        Hex.True(DbProxyHandlers.DailyResetUnixSeconds(DateTimeOffset.FromUnixTimeSeconds(BurstCapture0913Now)) == (ulong)BurstCapture0913Reset,
+            "09-13 11:42 -> 09-12T15:00Z");
+        Hex.True(DbProxyHandlers.DailyResetUnixSeconds(DateTimeOffset.FromUnixTimeSeconds(BurstCapture0912Now)) == (ulong)BurstCapture0912Reset,
+            "09-12 06:36 -> 09-11T15:00Z");
+        Hex.True(DbProxyHandlers.DailyResetUnixSeconds(new DateTimeOffset(2026, 9, 13, 2, 51, 8, TimeSpan.Zero)) == (ulong)BurstCapture0913Reset,
+            "lobby_tap 09-13 02:51 -> 09-12T15:00Z");
+        Hex.True(DbProxyHandlers.DailyResetUnixSeconds(new DateTimeOffset(2026, 9, 13, 5, 49, 3, TimeSpan.Zero)) == (ulong)BurstCapture0913Reset,
+            "cap_newchar 09-13 05:49 -> 09-12T15:00Z");
+
+        // Boundaries.
+        var onTheHour = new DateTimeOffset(2026, 9, 13, 15, 0, 0, TimeSpan.Zero);
+        Hex.True(DbProxyHandlers.DailyResetUnixSeconds(onTheHour) == (ulong)onTheHour.ToUnixTimeSeconds(),
+            "exactly 15:00:00 is its own boundary");
+        Hex.True(DbProxyHandlers.DailyResetUnixSeconds(onTheHour.AddSeconds(-1)) == (ulong)onTheHour.AddDays(-1).ToUnixTimeSeconds(),
+            "14:59:59 still belongs to yesterday's reset");
+        Hex.True(DbProxyHandlers.DailyResetUnixSeconds(onTheHour.AddHours(8)) == (ulong)onTheHour.ToUnixTimeSeconds(),
+            "23:00 the same day is past the boundary");
+        // A non-UTC input must give the same answer as the same instant expressed in UTC.
+        Hex.True(DbProxyHandlers.DailyResetUnixSeconds(onTheHour.ToOffset(TimeSpan.FromHours(9))) == (ulong)onTheHour.ToUnixTimeSeconds(),
+            "the offset the caller happens to carry must not change the answer");
+    }
+
+    [Test] public static void HandshakeBurst_patching_never_touches_the_cached_payload()
+    {
+        var burst = LoadHandshakeBurstOrSkip();
+        if (burst == null) return;
+
+        var sync = burst.Single(f => f.Op == DbProxyHandlers.AS_SYNC_DATE_TIME);
+        var before = (byte[])sync.Payload.Clone();
+        var patched = DbProxyHandlers.PatchBurstFrame(sync.Op, sync.Payload,
+            DateTimeOffset.FromUnixTimeSeconds(BurstCapture0912Now), (ulong)BurstCapture0912Reset);
+
+        Hex.Eq(sync.Payload, before, "the cached TSIS payload must come back unmodified");
+        Hex.True(!ReferenceEquals(patched, sync.Payload), "the patched frame must be a fresh array");
+        Hex.True(BitConverter.ToUInt64(patched, 0) == (ulong)BurstCapture0912Now, "and it carries the new time");
+    }
+
+    [Test] public static void HandshakeBurst_malformed_containers_parse_to_null()
+    {
+        Hex.True(DbProxyHandlers.ParseBurst(null) == null, "null");
+        Hex.True(DbProxyHandlers.ParseBurst(Array.Empty<byte>()) == null, "empty");
+        Hex.True(DbProxyHandlers.ParseBurst(Hex.B("54 53 49 53")) == null, "magic only, no count");
+        Hex.True(DbProxyHandlers.ParseBurst(Hex.B("58 53 49 53 00 00 00 00")) == null, "wrong magic");
+
+        // One good record, then the same bytes truncated and the same bytes with a tail.
+        var good = Hex.B("54 53 49 53  01 00 00 00  68 00 00 00  BD 15  02 00 00 00  AA BB");
+        var parsed = DbProxyHandlers.ParseBurst(good);
+        Hex.True(parsed != null && parsed.Count == 1 && parsed[0].Seq == 104
+                 && parsed[0].Op == 0x15BD && parsed[0].Payload.Length == 2, "a well-formed one-record container");
+        Hex.True(DbProxyHandlers.ParseBurst(good[..^1]) == null, "truncated payload");
+        Hex.True(DbProxyHandlers.ParseBurst(good.Concat(new byte[] { 0 }).ToArray()) == null, "trailing byte");
+    }
+
+    [Test] public static void HandshakeBurst_0x1582_differs_from_the_one_the_handshake_replays()
+    {
+        var burst = LoadHandshakeBurstOrSkip();
+        if (burst == null) return;
+
+        // 0x1582 AS_INIT_TIMELINE_CHANGES is the ONE burst opcode the replay table also emits:
+        // it is the second response to 0x1592 in arb_world.log. That is not a bug to fix - the
+        // real Arbiter sends both, and they differ. The handshake one ends 01 00 00 00, the
+        // burst one 00 00 00 00, in all four captures.
+        var f = burst.Single(x => x.Op == DbProxyHandlers.AS_INIT_TIMELINE_CHANGES);
+        Hex.Eq(f.Payload, "00 00 00 00 00 00 00 00 00 00 00 00",
+            "the burst's 0x1582 is the all-zero variant (the handshake's ends 01 00 00 00)");
+    }
+
+    // --- SDB_RESULT_CITY_WAR (0x295C), cap_newchar.log seq 115 -> 128 + 129 ---
+
+    /// <summary>cap_newchar.log seq 115, 0x295C payload (42-byte frame minus the header).</summary>
+    static readonly byte[] CapCityWarRequest = Hex.B(
+        "00 00 00 00  00 00 00 00  00 00 00 00  00 00 00 00  01 00 00 00  01 00 00 00  00 00 00 00  " +
+        "46 39 A6 6A 00 00 00 00");
+
+    [Test] public static void CityWar_295C_sends_15ED_then_295D_byte_exact()
+    {
+        var frames = RunHandler(DbProxyHandlers.SDB_RESULT_CITY_WAR, CapCityWarRequest, 2);
+
+        Hex.True(frames[0].op == DbProxyHandlers.AS_UPDATE_ADMIN_CITY_WAR_INTEREST_ONLY,
+            $"the broadcast goes first (CityWarEnd runs before the reply is written), got 0x{frames[0].op:X4}");
+        Hex.Eq(frames[0].body, "01 00 00 00 00", "0x15ED (cap_newchar.log seq 128)");
+
+        Hex.True(frames[1].op == DbProxyHandlers.DBS_RESULT_CITY_WAR, $"then the reply, got 0x{frames[1].op:X4}");
+        Hex.Eq(frames[1].body, "01 00 00 00 01 00 00 00", "0x295D (cap_newchar.log seq 129)");
+    }
+
+    [Test] public static void CityWar_295C_echoes_the_live_request_fields()
+    {
+        // Both reply fields are read out of the LIVE request at payload+16 and payload+20
+        // (frame+0x16 / +0x1a in Handler_SDB_RESULT_CITY_WAR) - a replayed 0x295D would carry
+        // the captured 1/1 forever.
+        var req = (byte[])CapCityWarRequest.Clone();
+        BitConverter.GetBytes(0x0A0B0C0Du).CopyTo(req, DbProxyHandlers.CityWarIdOffset);
+        BitConverter.GetBytes(7u).CopyTo(req, DbProxyHandlers.CityWarResultOffset);
+
+        Hex.Eq(DbProxyHandlers.Build15ED(req), "0D 0C 0B 0A 00", "0x15ED carries the live city-war id");
+        Hex.Eq(DbProxyHandlers.BuildDbs295D(req), "0D 0C 0B 0A 07 00 00 00", "0x295D echoes both live u32s");
+    }
+
+    [Test] public static void CityWar_295C_short_frame_falls_through_to_the_replay_table()
+    {
+        // Handler_SDB_RESULT_CITY_WAR requires frame >= 0x2a. Anything shorter than the two
+        // fields we read must decline rather than invent zeros.
+        Hex.True(!HandlerAccepts(DbProxyHandlers.SDB_RESULT_CITY_WAR, new byte[DbProxyHandlers.CityWarResultOffset]),
+            "a short 0x295C must fall through to the replay table");
+        Hex.True(HandlerAccepts(DbProxyHandlers.SDB_RESULT_CITY_WAR, CapCityWarRequest),
+            "the captured 0x295C must be handled");
     }
 
     /// <summary>Walks up from the test binary looking for a repo-relative file; null if not found.</summary>
