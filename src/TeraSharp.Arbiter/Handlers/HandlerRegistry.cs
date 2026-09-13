@@ -73,6 +73,10 @@ public static class HandlerRegistry
             if (s.InWorld)
             {
                 // Arbiter-owned: tell World the player finished loading (0x1439), triggers spawn.
+                // Real Arbiter sends AS_UPDATE_VISITED_SECTION_LIST (0x1439) before 0x1390/0x138F on every
+                // C_LOAD_TOPO_FIN (first spawn AND after a zone change): [u32 off=18][u32 bytes][u32 pid][entries].
+                // Empty list until visited sections are tracked (cap_newchar.log seq 638).
+                Program.World?.SendFrame(WorldBridge.OpUpdateVisitedSection, new byte[] { 18,0,0,0, 0,0,0,0, (byte)s.PlayerId, (byte)(s.PlayerId>>8), (byte)(s.PlayerId>>16), (byte)(s.PlayerId>>24) });
                 Program.World?.NotifyTopoLoaded(s.PlayerId);
                 // Real Arbiter sends these to the client right after C_LOAD_TOPO_FIN (lobby_proxy.log
                 // 263-268), in this order. S_LOAD_CLIENT_USER_SETTING here is what makes the chat

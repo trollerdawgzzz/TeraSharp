@@ -92,6 +92,22 @@ public sealed class DbProxyHandlers
     //   req 26B frame: [6]u64 gameId [14]u32 reqId [18]u64 arg   -> reqId at payload[8]
     //   rsp: [u8 ok][u32 reqId]   (ok = user valid & clear succeeded)
     public const ushort SA_CLEAR_BATTLE_FIELD_ENTER_COUNT = 0x1562; public const ushort AS_CLEAR_BATTLE_FIELD_ENTER_COUNT = 0x1563;
+
+    // --- Zone change / dungeon / quest-teleport handshake (cap_newchar.log 05:52:35) ---
+    // World: SA_REQUEST_ENTER_DUNGEON (0x13BE, 215 B) -> we: AS_REQUEST_ENTER_DUNGEON (0x13BF, 215 B)
+    // World: SA_RESPONSE_ENTER_DUNGEON (0x13C0, 214 B) -> we: AS_RESPONSE_ENTER_DUNGEON (0x13C1, 214 B)
+    // Then World sends 0x13C5 SA_ADD_DUNGEON_CHANNEL + 0x1499 SA_SAVE_ETC_DATA_FOR_MOVE_WORLD (no
+    // reply), saves the blob, the client reloads and sends C_LOAD_TOPO_FIN, and our normal
+    // 0x1439 + 0x1390 + 0x138F spawn it in the new zone.
+    // Handler_SA_REQUEST_ENTER_DUNGEON (Arb_part_062.c:12933) / Handler_SA_RESPONSE_ENTER_DUNGEON
+    // (:13707): reply = PDId [u32 worldId][u32 playerId] + DungeonEnterContext (176 B copied from
+    // frame 0x0E) + DungeonOwnerInfo (frame 0xBE u64, 0xC6 u8, 0xCA u64, 0xD2 u32) [+ u8 bool from
+    // 0xD6 for the request]. On the wire that is the request with the leading u64 user handle
+    // replaced by the PDId; the request form additionally has three context fields the Arbiter
+    // fills from its own state, all 0 in the capture (payload float@44, u32@68, float@146).
+    public const ushort SA_REQUEST_ENTER_DUNGEON = 0x13BE;  public const ushort AS_REQUEST_ENTER_DUNGEON = 0x13BF;
+    public const ushort SA_RESPONSE_ENTER_DUNGEON = 0x13C0; public const ushort AS_RESPONSE_ENTER_DUNGEON = 0x13C1;
+    public const uint WorldId = 0x0AF0; // planet 2800 (DAT_140e2d020), first u32 of every PDId
     // Servant handlers: request [u64 gameId][u32 reqId][u32 playerId], reqId at payload[8]
     public const ushort SA_LOAD_SERVANT_DATA = 0x1539;             // -> 0x153A
     public const ushort SA_LOAD_SERVANT_ADVENTURE_DATA = 0x153B;   // -> 0x153C
@@ -197,6 +213,8 @@ public sealed class DbProxyHandlers
             case SDB_LOAD_2930:            // 0x2931 = [reqId][01][00]   (capture: 82 00 00 00 01 00)
             case SDB_LOAD_WORLD_EVENT:     // 0x27B4 = [reqId][01]       (capture: 83 00 00 00 01)
             case SA_CLEAR_BATTLE_FIELD_ENTER_COUNT: // 0x1563 = [01][reqId@8]  (decompile Arb_part_062.c:4769)
+            case SA_REQUEST_ENTER_DUNGEON:          // 0x13BF (zone change step 1)
+            case SA_RESPONSE_ENTER_DUNGEON:         // 0x13C1 (zone change step 2)
             case SDB_LOAD_2869:          // 0x15E0 push + 0x286A, both carrying the live reset time
                 break;               // handled by the real switch below
             default:
@@ -224,6 +242,22 @@ public sealed class DbProxyHandlers
             case SDB_END_START_QUEST_LIST: link.SendFrame(DBS_END_START_QUEST_LIST, BuildReqIdAck(payload, 0)); return true;
             case SDB_LOAD_2930:            link.SendFrame(DBS_LOAD_2931, Build2931(payload)); return true;
             case SA_CLEAR_BATTLE_FIELD_ENTER_COUNT: link.SendFrame(AS_CLEAR_BATTLE_FIELD_ENTER_COUNT, BuildOkReqId(payload, 8)); return true;
+            case SA_REQUEST_ENTER_DUNGEON:
+            {
+                var r = BuildAsRequestEnterDungeon(payload);
+                if (r == null) return false;
+                _log.LogInformation("SA_REQUEST_ENTER_DUNGEON: player {Pid} -> dungeon/zone {Dg} ({Len} B)",
+                    BitConverter.ToUInt32(payload, 32), BitConverter.ToUInt32(payload, 8), payload.Length);
+                link.SendFrame(AS_REQUEST_ENTER_DUNGEON, r);
+                return true;
+            }
+            case SA_RESPONSE_ENTER_DUNGEON:
+            {
+                var r = BuildAsResponseEnterDungeon(payload);
+                if (r == null) return false;
+                link.SendFrame(AS_RESPONSE_ENTER_DUNGEON, r);
+                return true;
+            }
 
             // --- Login-time: empty-list Type 1 [off=19][count=0][reqId][ok=1], reqId at payload[0] ---
             case SDB_USER_LOAD_INVENTORY:       link.SendFrame((ushort)(op + 1), BuildEmptyListType1(payload, 0)); return true;
@@ -320,6 +354,35 @@ public sealed class DbProxyHandlers
         ack[4] = 1;
         return ack;
     }
+
+    /// <summary>
+    /// AS_REQUEST_ENTER_DUNGEON (0x13BF) from SA_REQUEST_ENTER_DUNGEON (0x13BE).
+    /// Request payload: [0] u64 userHandle, [8] DungeonEnterContext (176 B), then DungeonOwnerInfo
+    /// and a u8 flag. Reply = [u32 WorldId][u32 playerId] + everything from [8] on, with the three
+    /// Arbiter-owned context fields zeroed (payload 44 float, 68 u32, 146 float). playerId is the
+    /// u32 at payload 32 (inside the context, after the PDId World put there). Byte-exact to
+    /// cap_newchar.log seq 2457 -> 2458.
+    /// </summary>
+    public static byte[]? BuildAsRequestEnterDungeon(byte[] req)
+    {
+        if (req.Length < 0xD0) return null;
+        var r = (byte[])req.Clone();
+        uint playerId = BitConverter.ToUInt32(req, 32);
+        BitConverter.GetBytes(WorldId).CopyTo(r, 0);
+        BitConverter.GetBytes(playerId).CopyTo(r, 4);
+        Array.Clear(r, 44, 4);
+        Array.Clear(r, 68, 4);
+        Array.Clear(r, 146, 4);
+        return r;
+    }
+
+    /// <summary>
+    /// AS_RESPONSE_ENTER_DUNGEON (0x13C1) from SA_RESPONSE_ENTER_DUNGEON (0x13C0): the response already
+    /// starts with the PDId and the Arbiter re-emits PDId + context + owner info unchanged, so on the
+    /// wire it is a byte-identical echo (cap_newchar.log seq 2464/2465). Min length 0xD6 per handler.
+    /// </summary>
+    public static byte[]? BuildAsResponseEnterDungeon(byte[] req)
+        => req.Length < 0xD0 ? null : (byte[])req.Clone();
 
     /// <summary>DBS 0x2931: [u32 reqId][u8 ok=1][u8 0] — 6 bytes (lobby_tap.log 02:52:07.112: 82 00 00 00 01 00).</summary>
     public static byte[] Build2931(byte[] request)
