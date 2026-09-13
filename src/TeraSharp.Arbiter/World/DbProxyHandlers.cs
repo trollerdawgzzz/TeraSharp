@@ -695,6 +695,18 @@ public sealed class DbProxyHandlers
     // Payload offset = frame offset - 6.
     private static uint U32(byte[] p, int frameOff) => BitConverter.ToUInt32(p, frameOff - 6);
 
+    /// <summary>
+    /// Diagnostic only: the blob is opaque and we never modify it, but position (x,y,z floats)
+    /// sits at blob offset 220 in every capture (lobby_tap.log: logout blob == last client
+    /// move packet). Logging it lets us verify save/restore without parsing anything else.
+    /// </summary>
+    private static string BlobPos(byte[] blob)
+    {
+        if (blob.Length < 232) return "?";
+        float x = BitConverter.ToSingle(blob, 220), y = BitConverter.ToSingle(blob, 224), z = BitConverter.ToSingle(blob, 228);
+        return $"({x:F1}, {y:F1}, {z:F1})";
+    }
+
     private bool OnUserEnterWorld(WorldLink link, byte[] p)
     {
         if (p.Length < 18) { _log.LogWarning("SDB_USER_ENTERWORLD too short ({Len})", p.Length); return false; }
@@ -707,7 +719,7 @@ public sealed class DbProxyHandlers
             _log.LogWarning("SDB_USER_ENTERWORLD: player {Id} has no world blob (found={F}, len={L}) - replying not-found",
                 playerId, chr != null, chr?.WorldBlob?.Length ?? 0);
         else
-            _log.LogInformation("DBS_USER_ENTERWORLD: sent world blob for '{Name}' (id {Id}) from DB", chr!.Name, playerId);
+            _log.LogInformation("DBS_USER_ENTERWORLD: sent world blob for '{Name}' (id {Id}) from DB, pos {Pos}", chr!.Name, playerId, BlobPos(chr.WorldBlob!));
 
         link.SendFrame(DBS_USER_ENTERWORLD, BuildDbsUserEnterWorld(replyId, found ? chr!.WorldBlob : null));
         return true;
@@ -742,6 +754,7 @@ public sealed class DbProxyHandlers
         {
             var blob = new byte[blobLen];
             Array.Copy(p, payloadBlobOff, blob, 0, blobLen);
+            _log.LogInformation("SDB_UPDATE_USER_DATA: player {Id} blob pos {Pos}", playerId, BlobPos(blob));
             _store.SaveWorldBlob(playerId, blob);
         }
         else
