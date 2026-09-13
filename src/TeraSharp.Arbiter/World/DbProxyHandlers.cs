@@ -50,6 +50,18 @@ public sealed class DbProxyHandlers
     public const ushort SDB_SAVE_2936 = 0x2936; public const ushort DBS_SAVE_2937 = 0x2937; // reqId @0
     public const ushort SDB_DAILY_QUEST = 0x2897; public const ushort DBS_DAILY_QUEST = 0x2898; // reqId @16
 
+    // SDB_UPDATE_DAILY_QUEST_SEED (0x2899) -> DBS_UPDATE_DAILY_QUEST_SEED (0x289A).
+    // World fires this once per daily quest at enter-world (17x in lobby_tap.log) and each one
+    // is a DLMItem serialised on the user's gameId, so an unanswered one head-blocks every
+    // later per-user DB message for the life of the process. It is absent from arb_world.log,
+    // so the replay table has no entry and TryHandle is the only thing that can answer it.
+    //   request  90B frame: [0]u32 blobOff=22 [4]u32 blobLen=68 [8]u32 reqId [12]u32 playerId
+    //                       [16] 68-byte daily-quest seed blob
+    //   reply    11B frame: [0]u32 reqId [4]u8 ok=1
+    // Ground truth (lobby_tap.log 02:51:10.8xx): req ...2b 00 00 00 01 00 00 00 59 02...
+    //                                            rsp 2b 00 00 00 01
+    public const ushort SDB_DAILY_QUEST_SEED = 0x2899; public const ushort DBS_DAILY_QUEST_SEED = 0x289A; // reqId @8
+
     // --- Login-time SDB_* (empty-list Type 1: [off=19][count=0][reqId][ok]) ---
     // Request: [u32 reqId][u32 playerId], reqId at payload[0]
     public const ushort SDB_USER_LOAD_INVENTORY = 0x27A2;       // -> 0x27A3
@@ -134,6 +146,8 @@ public sealed class DbProxyHandlers
             case SDB_SAVE_2768:
             case SDB_SAVE_2936:
             case SDB_DAILY_QUEST:
+            case SDB_DAILY_QUEST_SEED:
+            case SDB_QUEST_LIST:
                 break;               // handled by the real switch below
             default:
                 return false;        // -> replay table
@@ -150,6 +164,7 @@ public sealed class DbProxyHandlers
             case SDB_SAVE_2768: link.SendFrame(DBS_SAVE_2769, BuildDbs2769(payload)); return true;
             case SDB_SAVE_2936: link.SendFrame(DBS_SAVE_2937, BuildDbs2937(payload)); return true;
             case SDB_DAILY_QUEST: link.SendFrame(DBS_DAILY_QUEST, BuildReqIdAck(payload, 16)); return true;
+            case SDB_DAILY_QUEST_SEED: link.SendFrame(DBS_DAILY_QUEST_SEED, BuildReqIdAck(payload, 8)); return true;
 
             // --- Login-time: empty-list Type 1 [off=19][count=0][reqId][ok=1], reqId at payload[0] ---
             case SDB_USER_LOAD_INVENTORY:       link.SendFrame((ushort)(op + 1), BuildEmptyListType1(payload, 0)); return true;
@@ -213,7 +228,7 @@ public sealed class DbProxyHandlers
             case SDB_FATIGABILITY_LIST:   link.SendFrame(0x2909, BuildFromStaticData(DbProxyStaticData.Fatigability, DbProxyStaticData.FatigabilityReqIdOffset, payload)); return true;
             case SDB_SEREN_GUIDE:         link.SendFrame(0x2943, BuildFromStaticData(DbProxyStaticData.SerenGuide, DbProxyStaticData.SerenGuideReqIdOffset, payload)); return true;
             case SDB_EP_PERK:             link.SendFrame(0x27BA, BuildFromStaticData(DbProxyStaticData.EpPerk, DbProxyStaticData.EpPerkReqIdOffset, payload)); return true;
-            case SDB_QUEST_LIST:          link.SendFrame(0x272D, BuildFromStaticData(DbProxyStaticData.QuestList, DbProxyStaticData.QuestListReqIdOffset, payload)); return true;
+            case SDB_QUEST_LIST:          link.SendFrame(0x272D, BuildFromStaticData(DbProxyStaticData.QuestListEmpty, DbProxyStaticData.QuestListEmptyReqIdOffset, payload)); return true;
             case SDB_USER_ACHIEVEMENT:    link.SendFrame(0x27F9, BuildFromStaticData(DbProxyStaticData.Achievement, DbProxyStaticData.AchievementReqIdOffset, payload)); return true;
 
             default: return false;

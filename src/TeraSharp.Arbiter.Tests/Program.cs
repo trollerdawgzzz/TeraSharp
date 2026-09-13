@@ -81,13 +81,16 @@ public static class Tests
             "disconnect uses the same wire values as exit");
     }
 
-    [Test] public static void LeaveWorld_Lobby_uses_type1_reason8()
+    [Test] public static void LeaveWorld_Lobby_uses_type3_reason0()
     {
-        // Live testing confirmed lobby uses the same values as exit/disconnect: type=1, reason=8.
-        // (Decompile showed type=3, reason=0 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â overridden by live observation.)
-        // NOTE: WorldBridge.LeaveValues needs the matching code change (human task).
+        // Ground truth: D:\packetlogs\lobby_tap.log 02:51:52.830Z, real ArbiterServer, a WORKING
+        // Logout-button lobby return followed by a clean relog:
+        //   A->W 0x1392  01 00 f0 0a 00 80 00 00 | 03 00 00 00 | 00 00 00 00 | 01 00 00 00
+        // and World echoes type=3 reason=0 straight back in SA_LEAVE_WORLD (0x1393).
+        // The same capture's socket-close leave uses (1,0); arb_world.log's older disconnect
+        // used (1,8). So the mode genuinely selects the pair - do not collapse them again.
         Hex.Eq(WorldBridge.BuildLeaveWorldPayload(GameId, PlayerId, LeaveMode.Lobby),
-            "06 00 F0 0A 00 80 00 00  01 00 00 00  08 00 00 00  01 00 00 00",
+            "06 00 F0 0A 00 80 00 00  03 00 00 00  00 00 00 00  01 00 00 00",
             "AS_LEAVE_WORLD lobby payload");
     }
 
@@ -95,8 +98,13 @@ public static class Tests
     {
         // Regression for the old bug: playerId was written where leaveWorldType belongs.
         var p = WorldBridge.BuildLeaveWorldPayload(GameId, playerId: 42, LeaveMode.Lobby);
-        Hex.True(BitConverter.ToUInt32(p, 8) == 1, "offset 8 is leaveWorldType (1), not playerId");
+        Hex.True(BitConverter.ToUInt32(p, 8) == 3, "offset 8 is leaveWorldType (3 for lobby), not playerId");
+        Hex.True(BitConverter.ToUInt32(p, 12) == 0, "offset 12 is logoutReason (0 for lobby)");
         Hex.True(BitConverter.ToUInt32(p, 16) == 42, "offset 16 is playerId (42)");
+
+        var e = WorldBridge.BuildLeaveWorldPayload(GameId, playerId: 42, LeaveMode.Exit);
+        Hex.True(BitConverter.ToUInt32(e, 8) == 1, "exit: offset 8 is leaveWorldType (1)");
+        Hex.True(BitConverter.ToUInt32(e, 16) == 42, "exit: offset 16 is playerId (42)");
     }
 
     // --- SA_LEAVE_WORLD (0x1393) -> AS_ARBITER_USER_DELETE (0x1433), live gameId ---
@@ -185,9 +193,10 @@ public static class Tests
 
     [Test] public static void LeaveValues_table()
     {
-        // Live testing: all three modes use (1, 8). Decompile said lobby=(3,0) but live disagrees.
-        // NOTE: WorldBridge.LeaveValues needs the matching code change (human task).
-        Hex.True(WorldBridge.LeaveValues(LeaveMode.Lobby) == (1u, 8u), "lobby=(1,8)");
+        // lobby_tap.log: lobby return = (3,0), socket close = (1,0).
+        // arb_world.log: socket close = (1,8). Exit is untested on the wire; it shares the
+        // disconnect pair, which is what World accepted in both captures.
+        Hex.True(WorldBridge.LeaveValues(LeaveMode.Lobby) == (3u, 0u), "lobby=(3,0)");
         Hex.True(WorldBridge.LeaveValues(LeaveMode.Exit) == (1u, 8u), "exit=(1,8)");
         Hex.True(WorldBridge.LeaveValues(LeaveMode.Disconnect) == (1u, 8u), "disconnect=(1,8)");
     }
@@ -1446,5 +1455,210 @@ array items
         Hex.True(ChatHandlers.StripFont("<FONT color=\"#ffffff\">test</FONT>") == "test", "should strip attrs");
         Hex.True(ChatHandlers.StripFont("plain text") == "plain text", "plain text unchanged");
         Hex.True(ChatHandlers.StripFont("") == "", "empty string OK");
+    }
+
+    // ---------------------------------------------------------------------
+    // WorldReplayTable request-id echo.
+    //
+    // World's DB-proxy items are DLMItems. Each carries a u32 id handed out by
+    // DLMExistManager (a per-World-process counter starting at 1), and the item
+    // only completes when our DBS_* reply comes back carrying THAT id:
+    //   Handler_DBS_* -> DLMExistManager::Find(u32 at frame+6)
+    //                 -> ReceiveFromArbiter (WorldServer.exe.c:3254039) -> CompleteMyself
+    // Find() missing -> the handler returns false and the item never completes.
+    // Every per-user context locks the user's gameId (DLMItem::AddToLockObject,
+    // WorldServer.exe.c:3500208), and DLManager serialises per locked object, so
+    // ONE un-completed item head-blocks every later DB item for that user --
+    // including UserLeaveWorld, which is what emits SA_LEAVE_WORLD (0x1393).
+    //
+    // Replaying a captured reply therefore MUST patch the live id in. These tests
+    // pin that contract. Bytes are from D:\packetlogs\arb_world.log.
+    // ---------------------------------------------------------------------
+
+    /// <summary>Writes a minimal Arbiter&lt;-&gt;World tap log in the format WorldReplayTable.Load parses.</summary>
+    static string WriteTapLog(params (bool fromWorld, byte[] frame)[] frames)
+    {
+        var path = Path.Combine(Path.GetTempPath(), "terasharp_tap_" + Guid.NewGuid().ToString("N") + ".log");
+        var sb = new System.Text.StringBuilder();
+        int n = 1;
+        foreach (var (fromWorld, frame) in frames)
+        {
+            sb.Append('[').Append(n++).Append("] [").Append(fromWorld ? "W->A" : "A->W")
+              .Append("] 2026-09-12T06:37:12.339Z len=").Append(frame.Length).Append('\n');
+            sb.Append(Hex.S(frame)).Append('\n');
+        }
+        File.WriteAllText(path, sb.ToString());
+        return path;
+    }
+
+    static Microsoft.Extensions.Logging.ILogger QuietLog() =>
+        Microsoft.Extensions.Logging.LoggerFactory.Create(b => { }).CreateLogger("test");
+
+    // SDB_USER_LOAD_INVENTORY 0x27A2, capture id = 2 -> DBS 0x27A3, id echoed at payload[8].
+    static readonly byte[] Cap27A2Req = Hex.B("0E 00 00 00 A2 27  02 00 00 00  01 00 00 00");
+    static readonly byte[] Cap27A3Rsp = Hex.B("13 00 00 00 A3 27  13 00 00 00  00 00 00 00  02 00 00 00  01");
+    // SDB_ITEM_SINGLE 0x2768, capture id = 0x2E at payload[16] -> DBS 0x2769, id at payload[16].
+    static readonly byte[] Cap2768Req = Hex.B("1E 00 00 00 68 27  1E 00 00 00  00 00 00 00  1E 00 00 00  00 00 00 00  2E 00 00 00  01 00 00 00");
+    static readonly byte[] Cap2769Rsp = Hex.B("1B 00 00 00 69 27  1B 00 00 00  00 00 00 00  1B 00 00 00  00 00 00 00  2E 00 00 00  01");
+
+    [Test]
+    public static void Replay_27A2_patches_live_reqId()
+    {
+        var path = WriteTapLog((true, Cap27A2Req), (false, Cap27A3Rsp));
+        try
+        {
+            var table = WorldReplayTable.Load(path, QuietLog());
+            // Live request: same shape, DLM id 60 instead of the captured 2.
+            var live = Hex.B("3C 00 00 00  01 00 00 00");
+            var r = table.GetResponses(0x27A2, live);
+            Hex.True(r.Count == 1, $"expected 1 replayed response, got {r.Count}");
+            Hex.True(r[0].op == 0x27A3, $"expected reply 0x27A3, got 0x{r[0].op:X4}");
+            uint echoed = BitConverter.ToUInt32(r[0].body, 8);
+            Hex.True(echoed == 60, $"DBS_ reply must carry the LIVE DLM id 60, carried {echoed}");
+        }
+        finally { File.Delete(path); }
+    }
+
+    [Test]
+    public static void Replay_2768_patches_live_reqId_at_offset_16()
+    {
+        var path = WriteTapLog((true, Cap2768Req), (false, Cap2769Rsp));
+        try
+        {
+            var table = WorldReplayTable.Load(path, QuietLog());
+            var live = Hex.B("1E 00 00 00  00 00 00 00  1E 00 00 00  00 00 00 00  9A 02 00 00  01 00 00 00");
+            var r = table.GetResponses(0x2768, live);
+            Hex.True(r.Count == 1, $"expected 1 replayed response, got {r.Count}");
+            uint echoed = BitConverter.ToUInt32(r[0].body, 16);
+            Hex.True(echoed == 0x29A, $"DBS_ 0x2769 must carry the LIVE DLM id 0x29A, carried 0x{echoed:X}");
+        }
+        finally { File.Delete(path); }
+    }
+
+    [Test]
+    public static void Replay_without_live_request_leaves_stale_capture_id()
+    {
+        // Regression pin for WorldBridge: calling the 1-arg overload skips the id patch
+        // entirely, so the reply goes out with the CAPTURED id. World's DLMExistManager
+        // then cannot find the item, it never completes, and the user's DLM queue
+        // head-blocks forever (no logout saves, no 0x1393, relog hangs until a World
+        // restart resets the id counter). The dispatch site must pass the live payload.
+        var path = WriteTapLog((true, Cap27A2Req), (false, Cap27A3Rsp));
+        try
+        {
+            var table = WorldReplayTable.Load(path, QuietLog());
+            uint stale = BitConverter.ToUInt32(table.GetResponses(0x27A2)[0].body, 8);
+            Hex.True(stale == 2, $"1-arg overload is expected to keep the captured id 2, got {stale}");
+
+            uint patched = BitConverter.ToUInt32(
+                table.GetResponses(0x27A2, Hex.B("3C 00 00 00  01 00 00 00"))[0].body, 8);
+            Hex.True(patched != stale, "the 2-arg overload must differ from the unpatched one");
+        }
+        finally { File.Delete(path); }
+    }
+
+    [Test]
+    public static void Replay_unknown_opcode_returns_no_responses()
+    {
+        var path = WriteTapLog((true, Cap27A2Req), (false, Cap27A3Rsp));
+        try
+        {
+            var table = WorldReplayTable.Load(path, QuietLog());
+            Hex.True(table.GetResponses(0x2958).Count == 0, "0x2958 is fire-and-forget, no replay entry expected");
+        }
+        finally { File.Delete(path); }
+    }
+
+    // ---------------------------------------------------------------------
+    // Daily-quest enter-world step.  Ground truth: D:\packetlogs\lobby_tap.log,
+    // real ArbiterServer, 2026-09-13T02:51:10.
+    //
+    // At enter-world World emits SDB_UPDATE_DAILY_QUEST_SEED (0x2899) once per daily
+    // quest (17x in that capture), strictly serialised: each one is a DLMItem locked on
+    // the user's gameId, so the next is only sent after the previous DBS_ reply. The
+    // opcode does not appear in arb_world.log, so the replay table has no entry for it
+    // and an unanswered one head-blocks every later per-user DB message for the life of
+    // the World process (no 0x27CB during play, no logout saves, no SA_LEAVE_WORLD).
+    // ---------------------------------------------------------------------
+
+    // lobby_tap.log 02:51:10.8xx, first of the 17 seeds. reqId 0x2B at payload[8].
+    static readonly byte[] Cap2899Req = Hex.B(@"
+        16 00 00 00  44 00 00 00  2B 00 00 00  01 00 00 00
+        59 02 00 00  00 00 00 00  EA 07 09 00  0C 00 07 00
+        00 00 00 00  00 00 00 00  00 00 00 00  00 00 00 00
+        00 00 00 00  00 00 00 00  00 00 00 00  00 00 00 00
+        00 00 00 00  00 00 00 00  00 00 00 00  00 00 00 00
+        00 00 00 00");
+
+    [Test]
+    public static void DailyQuestSeed_ack_matches_capture()
+    {
+        // Real Arbiter answered: 2B 00 00 00 01  (11-byte frame, reqId echoed at payload[0]).
+        Hex.Eq(DbProxyHandlers.BuildReqIdAck(Cap2899Req, 8), "2B 00 00 00 01",
+            "DBS_UPDATE_DAILY_QUEST_SEED (0x289A) must be [u32 reqId][u8 1]");
+    }
+
+    [Test]
+    public static void DailyQuestSeed_echoes_live_reqId_not_capture()
+    {
+        var live = (byte[])Cap2899Req.Clone();
+        BitConverter.GetBytes(0x1234u).CopyTo(live, 8);   // a live DLM id
+        var ack = DbProxyHandlers.BuildReqIdAck(live, 8);
+        Hex.True(BitConverter.ToUInt32(ack, 0) == 0x1234,
+            "the ack must carry the LIVE DLM id; a stale one makes DLMExistManager::Find miss "
+            + "and the item never completes");
+        Hex.True(ack.Length == 5, $"payload must be 5 bytes (11-byte frame), got {ack.Length}");
+    }
+
+    [Test]
+    public static void DailyQuestSeed_opcodes_are_2899_289A()
+    {
+        Hex.True(DbProxyHandlers.SDB_DAILY_QUEST_SEED == 0x2899, "request opcode");
+        Hex.True(DbProxyHandlers.DBS_DAILY_QUEST_SEED == 0x289A, "reply opcode");
+    }
+
+    // ---------------------------------------------------------------------
+    // DBS_LOAD_QUEST_LIST (0x272D) — the empty-daily-seed template.
+    //
+    // The 1383-byte `QuestList` template was captured 2026-09-12 and carries 17 daily
+    // seeds stamped with that date. Replaying it on a later day makes World take the
+    // "dailies are stale, reset the completed count" branch (SDB 0x2897) instead of the
+    // "seed today's dailies" branch (SDB 0x2899) that the real server drives. The
+    // 159-byte form below is what the real ArbiterServer returns on a first login.
+    // ---------------------------------------------------------------------
+
+    [Test]
+    public static void QuestListEmpty_matches_capture_bytes()
+    {
+        // Request from lobby_tap.log: reqId 0x12 at payload[0], playerId 1.
+        var req = Hex.B("12 00 00 00  01 00 00 00");
+        var body = DbProxyHandlers.BuildFromStaticData(
+            DbProxyStaticData.QuestListEmpty, DbProxyStaticData.QuestListEmptyReqIdOffset, req);
+        Hex.True(body.Length == 153, $"payload must be 153 bytes (159-byte frame), got {body.Length}");
+        Hex.Eq(body, DbProxyStaticData.QuestListEmpty,
+            "with the captured reqId the reply must be byte-identical to the capture");
+    }
+
+    [Test]
+    public static void QuestListEmpty_has_no_daily_quest_seeds()
+    {
+        // [24] dailyQuestSeedOffset, [28] dailyQuestSeedSize. Size 0 is the whole point:
+        // it is what makes World seed the dailies instead of resetting a stale count.
+        var t = DbProxyStaticData.QuestListEmpty;
+        Hex.True(BitConverter.ToUInt32(t, 24) == 139, "dailyQuestSeedOffset should point past the header");
+        Hex.True(BitConverter.ToUInt32(t, 28) == 0, "dailyQuestSeedSize MUST be 0");
+        // and the stale template must still differ, so a future edit can't silently merge them
+        Hex.True(BitConverter.ToUInt32(DbProxyStaticData.QuestList, 28) != 0,
+            "the 1383-byte QuestList template is the one WITH stale seeds");
+    }
+
+    [Test]
+    public static void QuestListEmpty_echoes_live_reqId_at_49()
+    {
+        var req = Hex.B("63 00 00 00  01 00 00 00");   // live reqId 0x63
+        var body = DbProxyHandlers.BuildFromStaticData(
+            DbProxyStaticData.QuestListEmpty, DbProxyStaticData.QuestListEmptyReqIdOffset, req);
+        Hex.True(body[48] == 1, "u8 success at payload[48]");
+        Hex.True(BitConverter.ToUInt32(body, 49) == 0x63, "reqId echoed at payload[49]");
     }
 }

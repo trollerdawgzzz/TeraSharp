@@ -336,7 +336,7 @@ public sealed class WorldBridge
                 if (op is not (0x138A or 0x15A8 or 0x1436 or 0x164D))
                     _log.LogInformation("W->A #{Id} 0x{Op:X4} len={Len}", link.Id, op, payload.Length + 6);
                 if (DbProxy != null && DbProxy.TryHandle(this, link, op, payload)) return;
-                var responses = _replay.GetResponses(op);
+                var responses = _replay.GetResponses(op, payload);
                 if (responses.Count == 0) { _log.LogDebug("  no replay for 0x{Op:X4}", op); }
                 foreach (var (rop, rbody) in responses)
                 {
@@ -421,6 +421,7 @@ public sealed class WorldBridge
         // Capture's working AS_LEAVE_WORLD used (1,8) for the button leave; the earlier crash
         // was a duplicate leave (disconnect path re-sending after the button leave), now guarded
         // in GameSession.LeaveWorld. Keep (1,8) to match the capture World accepts.
+        LeaveMode.Lobby => (3u, 0u),   // lobby_tap.log 02:51:52: 0x1392 type=3 reason=0
         _ => (1u, 8u),
     };
 
