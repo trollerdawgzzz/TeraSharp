@@ -1757,6 +1757,25 @@ array items
         ushort op, byte[] requestPayload, TeraSharp.Arbiter.Persistence.CharacterStore store)
         => RunHandler(op, requestPayload, 1, store)[0];
 
+    /// <summary>
+    /// TryHandle's verdict without asserting on it, for the cases where declining is the
+    /// correct answer (the request must fall through to the replay table).
+    /// </summary>
+    static bool HandlerAccepts(ushort op, byte[] requestPayload)
+    {
+        var log = QuietLog();
+        using var listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        listener.Bind(new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, 0));
+        listener.Listen(1);
+        using var client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        client.Connect((System.Net.IPEndPoint)listener.LocalEndPoint!);
+        using var peer = listener.Accept();
+
+        var bridge = new WorldBridge(WorldReplayTable.Load("/nonexistent", log), log);
+        var link = new WorldLink(1, client, bridge, log);
+        return new DbProxyHandlers(null!, log).TryHandle(bridge, link, op, requestPayload);
+    }
+
     /// <summary>Clones a captured request and stamps a live DLM id at the given payload offset.</summary>
     static byte[] WithLiveId(byte[] capturedRequest, int reqIdPayloadOffset, uint liveId)
     {
@@ -2753,6 +2772,301 @@ array items
         Hex.True(c.Zone == 5 && c.X == 1f && c.Y == 2f && c.Z == 3f,
             $"short blob must leave zone/x/y/z alone, got zone {c.Zone} ({c.X},{c.Y},{c.Z})");
         Hex.True(c.WorldBlob!.Length == 64, "the blob itself is still stored");
+    }
+
+
+    // =====================================================================
+    // T10 — tests for the zone-change handshake and the starter inventory.
+    //
+    // Ground truth: D:\packetlogs\cap_newchar.log (real ArbiterServer, new
+    // character "Test" playerId 2), reframed by u32 length; the four zone
+    // frames are also listed in D:\packetlogs\cap_newchar_zone.txt.
+    //   2457 W->A 0x13BE 215 B -> 2458 A->W 0x13BF 215 B
+    //   2464 W->A 0x13C0 214 B -> 2465 A->W 0x13C1 214 B
+    //    135 W->A 0x27A2  14 B ->  136 A->W 0x27A3 19 B + 137 A->W 0x27A4 3235 B
+    // Payloads are frame length - 6.
+    // =====================================================================
+
+// Cap13BEReq (209 bytes)
+    static readonly byte[] Cap13BEReq = Hex.B(@"
+        20 A0 FB 4C 6F 02 00 00 63 26 00 00 01 00 00 00
+        00 00 00 00 00 00 00 00 00 00 00 00 F0 0A 00 00
+        02 00 00 00 00 B8 3D C6 00 1C D9 C6 00 48 89 C5
+        00 00 00 C6 B8 39 90 46 3E 03 38 45 00 20 89 C5
+        05 00 00 00 B4 00 DE 00 00 00 00 00 00 00 00 00
+        00 00 64 34 65 F4 00 00 CC 4E 68 C0 F6 7F 00 00
+        20 80 BF EF 80 01 00 00 40 00 00 00 00 00 00 00
+        54 76 92 C0 F6 7F 00 00 A8 D8 CF 92 5F 00 00 00
+        B0 87 FD EC 7C 01 00 00 00 D9 CF 92 5F 00 00 00
+        00 00 9C 42 00 00 00 00 00 00 00 00 00 00 00 00
+        00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+        00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+        00 00 00 00 F0 0A 00 00 02 00 00 00 00 00 00 00
+        00");
+
+// Cap13BFRsp (209 bytes)
+    static readonly byte[] Cap13BFRsp = Hex.B(@"
+        F0 0A 00 00 02 00 00 00 63 26 00 00 01 00 00 00
+        00 00 00 00 00 00 00 00 00 00 00 00 F0 0A 00 00
+        02 00 00 00 00 B8 3D C6 00 1C D9 C6 00 48 89 C5
+        00 00 00 00 B8 39 90 46 3E 03 38 45 00 20 89 C5
+        05 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+        00 00 64 34 65 F4 00 00 CC 4E 68 C0 F6 7F 00 00
+        20 80 BF EF 80 01 00 00 40 00 00 00 00 00 00 00
+        54 76 92 C0 F6 7F 00 00 A8 D8 CF 92 5F 00 00 00
+        B0 87 FD EC 7C 01 00 00 00 D9 CF 92 5F 00 00 00
+        00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+        00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+        00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+        00 00 00 00 F0 0A 00 00 02 00 00 00 00 00 00 00
+        00");
+
+// Cap13C0Req (208 bytes)
+    static readonly byte[] Cap13C0Req = Hex.B(@"
+        F0 0A 00 00 02 00 00 00 63 26 00 00 01 00 00 00
+        00 00 00 00 00 00 00 00 00 00 00 00 F0 0A 00 00
+        02 00 00 00 00 B8 3D C6 00 1C D9 C6 00 48 89 C5
+        00 00 00 00 B8 39 90 46 3E 03 38 45 00 20 89 C5
+        05 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+        00 00 64 34 65 F4 00 00 CC 4E 68 C0 F6 7F 00 00
+        20 80 BF EF 80 01 00 00 40 00 00 00 00 00 00 00
+        54 76 92 C0 F6 7F 00 00 A8 D8 CF 92 5F 00 00 00
+        B0 87 FD EC 7C 01 00 00 00 D9 CF 92 5F 00 00 00
+        00 00 00 00 01 00 F0 0A 01 00 00 00 00 00 00 00
+        00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+        00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+        00 00 00 00 F0 0A 00 00 02 00 00 00 00 00 00 00");
+
+// Cap13C1Rsp (208 bytes)
+    static readonly byte[] Cap13C1Rsp = Hex.B(@"
+        F0 0A 00 00 02 00 00 00 63 26 00 00 01 00 00 00
+        00 00 00 00 00 00 00 00 00 00 00 00 F0 0A 00 00
+        02 00 00 00 00 B8 3D C6 00 1C D9 C6 00 48 89 C5
+        00 00 00 00 B8 39 90 46 3E 03 38 45 00 20 89 C5
+        05 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+        00 00 64 34 65 F4 00 00 CC 4E 68 C0 F6 7F 00 00
+        20 80 BF EF 80 01 00 00 40 00 00 00 00 00 00 00
+        54 76 92 C0 F6 7F 00 00 A8 D8 CF 92 5F 00 00 00
+        B0 87 FD EC 7C 01 00 00 00 D9 CF 92 5F 00 00 00
+        00 00 00 00 01 00 F0 0A 01 00 00 00 00 00 00 00
+        00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+        00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+        00 00 00 00 F0 0A 00 00 02 00 00 00 00 00 00 00");
+
+    // 0x27A2 SDB_USER_LOAD_INVENTORY, cap_newchar.log seq 135, PAYLOAD: [u32 reqId=2][u32 playerId=2].
+    // (Cap27A2Req above is a whole FRAME from the older dob capture and belongs to the replay tests.)
+    static readonly byte[] CapNc27A2Req = Hex.B("02 00 00 00  02 00 00 00");
+    // 0x27A3 DBS_USER_LOAD_POCKET_DATA, seq 136 payload: empty list, Type 1.
+    static readonly byte[] CapNc27A3Rsp = Hex.B("13 00 00 00  00 00 00 00  02 00 00 00  01");
+
+    // ---- 0x13BE -> 0x13BF ----
+
+    [Test] public static void Handler_13BE_replies_13BF_with_captured_bytes()
+    {
+        var (op, body) = RunHandler1(DbProxyHandlers.SA_REQUEST_ENTER_DUNGEON, Cap13BEReq);
+        Hex.True(op == 0x13BF, $"reply opcode must be 0x13BF, got 0x{op:X4}");
+        Hex.Eq(body, Cap13BFRsp, "AS_REQUEST_ENTER_DUNGEON (cap_newchar.log seq 2457 -> 2458)");
+    }
+
+    [Test] public static void Handler_13BE_replaces_the_user_handle_with_the_PDId()
+    {
+        var (_, body) = RunHandler1(DbProxyHandlers.SA_REQUEST_ENTER_DUNGEON, Cap13BEReq);
+        Hex.True(BitConverter.ToUInt32(body, 0) == DbProxyHandlers.WorldId,
+            $"payload[0] must be worldId 0x{DbProxyHandlers.WorldId:X}, got 0x{BitConverter.ToUInt32(body, 0):X}");
+        Hex.True(BitConverter.ToUInt32(body, 4) == 2,
+            $"payload[4] must be the playerId (2), got {BitConverter.ToUInt32(body, 4)}");
+        Hex.True(BitConverter.ToUInt64(body, 0) != BitConverter.ToUInt64(Cap13BEReq, 0),
+            "the request's u64 user handle must NOT survive into the reply");
+    }
+
+    [Test] public static void Handler_13BE_keeps_the_coordinate_at_payload_44()
+    {
+        // Regression: the builder used to Array.Clear(r, 44, 4). Payload 44 is a live
+        // coordinate float that the real Arbiter passes through untouched (the copy loop in
+        // FUN_1406d2180 writes context index 0x0B); only the padding byte at 51 goes to zero.
+        var (_, body) = RunHandler1(DbProxyHandlers.SA_REQUEST_ENTER_DUNGEON, Cap13BEReq);
+        float sent = BitConverter.ToSingle(Cap13BEReq, 44), got = BitConverter.ToSingle(body, 44);
+        Hex.True(got == sent, $"payload[44] must be echoed ({sent}), got {got}");
+        Hex.True(sent == -4393f, $"sanity: the capture's payload[44] is -4393, got {sent}");
+        Hex.True(body[51] == 0, "payload[51] is struct padding and must be zero");
+    }
+
+    [Test] public static void Handler_13BE_zeroes_only_the_struct_padding()
+    {
+        // Fill every byte of the request with a marker and check exactly which ones the
+        // builder drops. Anything beyond the documented padding list would be a live field
+        // silently blanked on the way to World.
+        var req = (byte[])Cap13BEReq.Clone();
+        for (int i = 8; i < req.Length; i++) req[i] = 0xEE;
+        BitConverter.GetBytes(2u).CopyTo(req, 32);   // keep the playerId readable
+
+        var (_, body) = RunHandler1(DbProxyHandlers.SA_REQUEST_ENTER_DUNGEON, req);
+        var zeroed = new List<int>();
+        for (int i = 8; i < req.Length; i++) if (body[i] != req[i]) zeroed.Add(i);
+        var expected = new[] { 51, 68, 69, 70, 71, 146, 147, 153, 154, 155, 164, 165, 166, 167, 193, 194, 195 };
+        Hex.True(zeroed.SequenceEqual(expected),
+            "only DungeonEnterContext/DungeonOwnerInfo padding may change; changed ["
+            + string.Join(",", zeroed) + "], expected [" + string.Join(",", expected) + "]");
+        foreach (int i in expected) Hex.True(body[i] == 0, $"padding byte {i} must be zero");
+    }
+
+    [Test] public static void Handler_13BE_short_frame_is_refused()
+    {
+        // _Handler_SA_REQUEST_ENTER_DUNGEON drops anything with frame <= 0xD6. Returning a
+        // reply built from a short buffer would be worse than not answering.
+        Hex.True(DbProxyHandlers.BuildAsRequestEnterDungeon(
+            new byte[DbProxyHandlers.RequestEnterDungeonMinPayload - 1]) == null,
+            "a payload shorter than 209 bytes must not produce a 0x13BF");
+        Hex.True(DbProxyHandlers.BuildAsRequestEnterDungeon(
+            new byte[DbProxyHandlers.RequestEnterDungeonMinPayload]) != null,
+            "exactly 209 bytes is the smallest legal 0x13BE");
+    }
+
+    // ---- 0x13C0 -> 0x13C1 ----
+
+    [Test] public static void Handler_13C0_replies_13C1_with_captured_bytes()
+    {
+        var (op, body) = RunHandler1(DbProxyHandlers.SA_RESPONSE_ENTER_DUNGEON, Cap13C0Req);
+        Hex.True(op == 0x13C1, $"reply opcode must be 0x13C1, got 0x{op:X4}");
+        Hex.Eq(body, Cap13C1Rsp, "AS_RESPONSE_ENTER_DUNGEON (cap_newchar.log seq 2464 -> 2465)");
+        Hex.Eq(body, Cap13C0Req, "on this capture the reply is a byte-identical echo");
+    }
+
+    [Test] public static void Handler_13C0_echoes_the_requests_own_PDId()
+    {
+        // Unlike 0x13BE, the response handler writes back the u64 it read at frame+6 rather
+        // than rebuilding a PDId, so the leading 8 bytes are never rewritten.
+        var (_, body) = RunHandler1(DbProxyHandlers.SA_RESPONSE_ENTER_DUNGEON, Cap13C0Req);
+        Hex.True(BitConverter.ToUInt64(body, 0) == BitConverter.ToUInt64(Cap13C0Req, 0),
+            "0x13C1 must echo the request's PDId unchanged");
+    }
+
+    [Test] public static void Handler_13C0_short_frame_is_refused()
+    {
+        Hex.True(DbProxyHandlers.BuildAsResponseEnterDungeon(
+            new byte[DbProxyHandlers.ResponseEnterDungeonMinPayload - 1]) == null,
+            "a payload shorter than 208 bytes must not produce a 0x13C1");
+        Hex.True(DbProxyHandlers.BuildAsResponseEnterDungeon(
+            new byte[DbProxyHandlers.ResponseEnterDungeonMinPayload]) != null,
+            "exactly 208 bytes is the smallest legal 0x13C0");
+    }
+
+    // ---- BuildStarterInventory / OnLoadInventory (0x27A2 -> 0x27A3 + 0x27A4) ----
+
+    /// <summary>data/starter_inventory.bin from the repo, or null with a printed note.</summary>
+    static byte[]? LoadStarterInventoryOrSkip()
+    {
+        var path = FindRepoFile(Path.Combine("data", "starter_inventory.bin"));
+        if (path == null) { Console.WriteLine("        (skipped: data/starter_inventory.bin not found)"); return null; }
+        var bytes = File.ReadAllBytes(path);
+        Hex.True(bytes.Length == DbProxyHandlers.StarterInventorySize,
+            $"starter_inventory.bin must be {DbProxyHandlers.StarterInventorySize} bytes, got {bytes.Length}");
+        return bytes;
+    }
+
+    /// <summary>The six owner-playerId slots: item start + 16, one per 536-byte record.</summary>
+    static readonly int[] StarterInventoryOwnerOffsets = { 29, 565, 1101, 1637, 2173, 2709 };
+
+    [Test] public static void StarterInventory_file_matches_the_captured_0x27A4()
+    {
+        var t = LoadStarterInventoryOrSkip();
+        if (t == null) return;
+        // 13-byte header + 6 x 536-byte items = 3229, and the header's own length field agrees.
+        Hex.True(DbProxyHandlers.StarterInventoryItemStart
+                 + 6 * DbProxyHandlers.StarterInventoryItemSize == t.Length,
+            "13 + 6*536 must be the whole payload");
+        Hex.True(BitConverter.ToUInt32(t, 0) == 19, $"list offset should be 19, got {BitConverter.ToUInt32(t, 0)}");
+        Hex.True(BitConverter.ToUInt32(t, 4) == 3216, $"list length should be 6*536 = 3216, got {BitConverter.ToUInt32(t, 4)}");
+        Hex.True(BitConverter.ToUInt32(t, 8) == 2, "the captured reqId at [8] is 2");
+        foreach (int off in StarterInventoryOwnerOffsets)
+            Hex.True(BitConverter.ToUInt32(t, off) == 2, $"captured owner at [{off}] should be playerId 2");
+        // The offsets the builder walks must be exactly the six above.
+        var walked = new List<int>();
+        for (int off = DbProxyHandlers.StarterInventoryItemStart + DbProxyHandlers.StarterInventoryOwnerOffset;
+             off + 4 <= t.Length; off += DbProxyHandlers.StarterInventoryItemSize) walked.Add(off);
+        Hex.True(walked.SequenceEqual(StarterInventoryOwnerOffsets),
+            "owner slots walked: [" + string.Join(",", walked) + "]");
+    }
+
+    [Test] public static void BuildStarterInventory_patches_reqId_and_owner_and_nothing_else()
+    {
+        var t = LoadStarterInventoryOrSkip();
+        if (t == null) return;
+
+        const uint LiveReqId = 0x0BAD, NewOwner = 42;
+        var r = DbProxyHandlers.BuildStarterInventory(t, LiveReqId, NewOwner);
+
+        Hex.True(r.Length == t.Length, $"length must not change, got {r.Length}");
+        Hex.True(BitConverter.ToUInt32(r, 8) == LiveReqId,
+            $"the live DLM id belongs at [8], got 0x{BitConverter.ToUInt32(r, 8):X}");
+        foreach (int off in StarterInventoryOwnerOffsets)
+            Hex.True(BitConverter.ToUInt32(r, off) == NewOwner, $"owner at [{off}] should be {NewOwner}");
+
+        // Every byte outside those seven u32 slots must be untouched.
+        var patched = new HashSet<int>();
+        foreach (int off in StarterInventoryOwnerOffsets.Append(8))
+            for (int i = off; i < off + 4; i++) patched.Add(i);
+        for (int i = 0; i < t.Length; i++)
+            if (!patched.Contains(i) && r[i] != t[i])
+                throw new Exception($"byte {i} changed ({t[i]:X2} -> {r[i]:X2}) but only [8] and the six owner slots may move");
+
+        Hex.True(!ReferenceEquals(r, t) && t.SequenceEqual(LoadStarterInventoryOrSkip()!),
+            "the template must not be mutated in place — it is a cached static");
+    }
+
+    [Test] public static void OnLoadInventory_sends_pocket_then_inventory()
+    {
+        var t = LoadStarterInventoryOrSkip();
+        if (t == null) return;
+        DbProxyHandlers.SetStarterInventoryForTest(t);
+        try
+        {
+            var frames = RunHandler(DbProxyHandlers.SDB_USER_LOAD_INVENTORY, CapNc27A2Req, 2);
+            Hex.True(frames[0].op == DbProxyHandlers.DBS_USER_LOAD_POCKET_DATA,
+                $"first frame must be 0x27A3, got 0x{frames[0].op:X4}");
+            Hex.True(frames[1].op == DbProxyHandlers.DBS_USER_LOAD_INVENTORY,
+                $"second frame must be 0x27A4, got 0x{frames[1].op:X4}");
+            // The capture's request already carries reqId 2 / playerId 2, so both replies must
+            // come out byte-identical to seq 136 and 137.
+            Hex.Eq(frames[0].body, CapNc27A3Rsp, "DBS_USER_LOAD_POCKET_DATA (cap_newchar.log seq 136)");
+            Hex.Eq(frames[1].body, t, "DBS_USER_LOAD_INVENTORY (cap_newchar.log seq 137)");
+        }
+        finally { DbProxyHandlers.SetStarterInventoryForTest(null); }
+    }
+
+    [Test] public static void OnLoadInventory_patches_the_live_reqId_and_owner()
+    {
+        var t = LoadStarterInventoryOrSkip();
+        if (t == null) return;
+        DbProxyHandlers.SetStarterInventoryForTest(t);
+        try
+        {
+            var req = Hex.B("AD 0B 00 00  2A 00 00 00");   // reqId 0x0BAD, playerId 42
+            var frames = RunHandler(DbProxyHandlers.SDB_USER_LOAD_INVENTORY, req, 2);
+            Hex.True(BitConverter.ToUInt32(frames[0].body, 8) == 0x0BAD, "0x27A3 echoes the live DLM id");
+            Hex.True(BitConverter.ToUInt32(frames[1].body, 8) == 0x0BAD, "0x27A4 echoes the live DLM id");
+            foreach (int off in StarterInventoryOwnerOffsets)
+                Hex.True(BitConverter.ToUInt32(frames[1].body, off) == 42,
+                    $"item owner at [{off}] must be the live playerId 42 — World answers a mismatch "
+                    + "with SA_ENTER_WORLD_FAILED");
+        }
+        finally { DbProxyHandlers.SetStarterInventoryForTest(null); }
+    }
+
+    [Test] public static void OnLoadInventory_leaves_the_captured_player_to_the_replay_table()
+    {
+        // playerId 1 is "dob", whose real 3235-byte inventory is in the replay table. Serving
+        // the starter list there would replace a level-58 character's gear with six newbie items.
+        var t = LoadStarterInventoryOrSkip();
+        if (t == null) return;
+        DbProxyHandlers.SetStarterInventoryForTest(t);
+        try
+        {
+            var req = Hex.B("05 00 00 00  01 00 00 00");   // reqId 5, playerId 1
+            Hex.True(!HandlerAccepts(DbProxyHandlers.SDB_USER_LOAD_INVENTORY, req),
+                "playerId 1 must fall through to the replay table, not get the starter inventory");
+        }
+        finally { DbProxyHandlers.SetStarterInventoryForTest(null); }
     }
 
     /// <summary>

@@ -387,34 +387,87 @@ public sealed class DbProxyHandlers
         return ack;
     }
 
+    // Both dungeon-enter replies are built the same way: the Arbiter copies
+    // DungeonEnterContext (176 B) and DungeonOwnerInfo (24 B) out of the request into a
+    // ZERO-INITIALISED packet buffer, field by field, and the copies skip the structs'
+    // padding. Every skipped byte therefore leaves the buffer's zero on the wire while
+    // every real field is passed through untouched.
+    //
+    // The field lists are FUN_1406d2180 (DungeonEnterContext, 0xB0) and FUN_1406d2430
+    // (DungeonOwnerInfo, 0x18) in ArbiterServer.exe.c. Converting the u32 indices they
+    // write into byte ranges and subtracting the ones they touch leaves these gaps
+    // (context starts at payload 8, owner info at payload 184):
+    //
+    //   context byte 43        -> payload 51        (after a u16 + u8 at 40..42)
+    //   context bytes 60..63   -> payload 68..71    (index 0x0F is never written)
+    //   context bytes 138..139 -> payload 146..147  (after a u16 at 136..137)
+    //   context bytes 145..147 -> payload 153..155  (after a lone u8 at 144)
+    //   context bytes 156..159 -> payload 164..167  (before a u64 at 160)
+    //   owner   bytes 9..11    -> payload 193..195  (after a u8 at 192)
+    //
+    // Verified against cap_newchar.log: for seq 2457 -> 2458 exactly the bytes at 51, 68,
+    // 70, 146 and 147 change (the other gaps were already zero in the request), and
+    // nothing else moves except the leading PDId. NOTE: an older comment here described
+    // this as "three context fields zeroed at 44, 68, 146" and the code cleared payload
+    // 44..47 — that range holds a live coordinate float (-4393.0 in the capture, kept
+    // verbatim by the real Arbiter), so the old builder was not byte-exact. T10.
+    private static readonly int[] DungeonReplyPaddingBytes =
+    {
+        51,
+        68, 69, 70, 71,
+        146, 147,
+        153, 154, 155,
+        164, 165, 166, 167,
+        193, 194, 195,
+    };
+
+    /// <summary>Minimum payload for 0x13BE (frame > 0xD6, _Handler_SA_REQUEST_ENTER_DUNGEON).</summary>
+    public const int RequestEnterDungeonMinPayload = 0xD7 - 6;   // 209
+    /// <summary>Minimum payload for 0x13C0 (frame >= 0xD6, Handler_SA_RESPONSE_ENTER_DUNGEON).</summary>
+    public const int ResponseEnterDungeonMinPayload = 0xD6 - 6;  // 208
+
+    private static void ZeroDungeonReplyPadding(byte[] r)
+    {
+        foreach (int off in DungeonReplyPaddingBytes)
+            if (off < r.Length) r[off] = 0;
+    }
+
     /// <summary>
     /// AS_REQUEST_ENTER_DUNGEON (0x13BF) from SA_REQUEST_ENTER_DUNGEON (0x13BE).
-    /// Request payload: [0] u64 userHandle, [8] DungeonEnterContext (176 B), then DungeonOwnerInfo
-    /// and a u8 flag. Reply = [u32 WorldId][u32 playerId] + everything from [8] on, with the three
-    /// Arbiter-owned context fields zeroed (payload 44 float, 68 u32, 146 float). playerId is the
-    /// u32 at payload 32 (inside the context, after the PDId World put there). Byte-exact to
-    /// cap_newchar.log seq 2457 -> 2458.
+    /// Request payload: [0] u64 userHandle, [8] DungeonEnterContext (176 B), [184]
+    /// DungeonOwnerInfo (24 B), [208] u8 flag. The reply replaces the leading handle with the
+    /// PDId the Arbiter builds itself — [u32 worldId][u32 playerId], worldId = DAT_140e2d020 =
+    /// <see cref="WorldId"/> — and passes the rest through with the padding above zeroed.
+    /// The real Arbiter takes playerId from its own User object (user+0x120); we take it from
+    /// the PDId World embedded in the context at payload 32, which is the same value in the
+    /// capture. Byte-exact to cap_newchar.log seq 2457 -> 2458.
     /// </summary>
     public static byte[]? BuildAsRequestEnterDungeon(byte[] req)
     {
-        if (req.Length < 0xD0) return null;
+        if (req.Length < RequestEnterDungeonMinPayload) return null;
         var r = (byte[])req.Clone();
         uint playerId = BitConverter.ToUInt32(req, 32);
         BitConverter.GetBytes(WorldId).CopyTo(r, 0);
         BitConverter.GetBytes(playerId).CopyTo(r, 4);
-        Array.Clear(r, 44, 4);
-        Array.Clear(r, 68, 4);
-        Array.Clear(r, 146, 4);
+        ZeroDungeonReplyPadding(r);
         return r;
     }
 
     /// <summary>
-    /// AS_RESPONSE_ENTER_DUNGEON (0x13C1) from SA_RESPONSE_ENTER_DUNGEON (0x13C0): the response already
-    /// starts with the PDId and the Arbiter re-emits PDId + context + owner info unchanged, so on the
-    /// wire it is a byte-identical echo (cap_newchar.log seq 2464/2465). Min length 0xD6 per handler.
+    /// AS_RESPONSE_ENTER_DUNGEON (0x13C1) from SA_RESPONSE_ENTER_DUNGEON (0x13C0). Unlike the
+    /// request, this one echoes the request's own PDId (Handler_SA_RESPONSE_ENTER_DUNGEON reads
+    /// the u64 at frame+6 and writes it straight back), so the reply is the request with only
+    /// the struct padding zeroed — a byte-identical echo whenever the padding is already zero,
+    /// which it is in cap_newchar.log seq 2464 -> 2465 because those bytes came from our own
+    /// 0x13BF. Min payload 208 per the handler's length check.
     /// </summary>
     public static byte[]? BuildAsResponseEnterDungeon(byte[] req)
-        => req.Length < 0xD0 ? null : (byte[])req.Clone();
+    {
+        if (req.Length < ResponseEnterDungeonMinPayload) return null;
+        var r = (byte[])req.Clone();
+        ZeroDungeonReplyPadding(r);
+        return r;
+    }
 
     /// <summary>DBS 0x2931: [u32 reqId][u8 ok=1][u8 0] — 6 bytes (lobby_tap.log 02:52:07.112: 82 00 00 00 01 00).</summary>
     public static byte[] Build2931(byte[] request)
