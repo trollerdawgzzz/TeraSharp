@@ -41,7 +41,7 @@ public static class Program
         using var loggerFactory = LoggerFactory.Create(b =>
         {
             b.AddSimpleConsole(o => { o.SingleLine = true; o.TimestampFormat = "HH:mm:ss "; });
-            b.SetMinimumLevel(LogLevel.Trace);
+            b.SetMinimumLevel(LogLevel.Debug);
         });
 
         var log = loggerFactory.CreateLogger("Arbiter");

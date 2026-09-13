@@ -48,6 +48,14 @@ Read this file, then `CLAUDE.md`, then `status/HANDOFF.md` §1 (DLMItems), then 
 
 ## Tooling the human uses
 
+- **Chat (fixed 22:20):** the real Arbiter does NOT forward `C_CHAT` to World; it sends
+  `AS_REQUEST_NORMAL_CHAT` (0x1449) `[u32 msgOff=18][u32 playerId][u32 channel][wstr]` on the control
+  link and World builds `S_CHAT` into the 0x13F7 tunnel. AND the client only renders chat once it has
+  received `S_LOAD_CLIENT_USER_SETTING` **after** `C_LOAD_TOPO_FIN` (real order: `S_USER_BLOCK_LIST`,
+  `S_FRIEND_GROUP_LIST`, `S_FRIEND_LIST`, `S_LOAD_CLIENT_USER_SETTING`; `lobby_proxy.log` 263-268).
+  Sent at character select it is discarded. Both now in `ChatHandlers.OnChat` / `HandlerRegistry`
+  (`C_LOAD_TOPO_FIN` in-world branch). `0x2830 DBS_USER_RESTRICTION` is also sent after the blob now.
+
 - Local: `.\ship.ps1 "msg"` in the repo root = build + tests + commit + publish to
   `D:\TeraSharp-publish` + `D:\TeraSharp-bin.7z`. `npx serve -l 8888` runs from `D:\` to serve
   the 7z. (ship.ps1 may not be committed yet — check.)
