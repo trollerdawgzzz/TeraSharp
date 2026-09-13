@@ -625,12 +625,12 @@ CREATE TABLE IF NOT EXISTS counters (
 --   Account::SaveClientSetting (Arb_part_065.c:9779)  -> spSaveClientSettingForAccount, per account
 -- Both reject a blob of 0 bytes or more than 9000; see CharacterStore.MaxClientSettingBytes.
 CREATE TABLE IF NOT EXISTS client_settings (
-  character_id INTEGER PRIMARY KEY REFERENCES characters(id),
+  character_id INTEGER PRIMARY KEY,
   blob         BLOB NOT NULL,
   updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS account_settings (
-  account_id INTEGER PRIMARY KEY REFERENCES accounts(id),
+  account_id INTEGER PRIMARY KEY,
   blob       BLOB NOT NULL,
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );

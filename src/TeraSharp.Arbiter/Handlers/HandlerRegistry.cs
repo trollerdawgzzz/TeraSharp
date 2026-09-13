@@ -84,6 +84,7 @@ public static class HandlerRegistry
                 SocialHandlers.SendBlockList(s);
                 SocialHandlers.SendFriendGroupList(s);
                 SocialHandlers.SendFriendList(s);
+                ClientSettingsHandlers.SendAccountSetting(s);
                 ClientSettingsHandlers.SendUserSetting(s);
                 return true;
             }
@@ -112,6 +113,8 @@ public static class HandlerRegistry
         Reg("C_REQUEST_CLIENT_CHAT_OPTION_SETTING", 0, ClientSettingsHandlers.OnRequestChatOption);
         Reg("C_REQUEST_CLIENT_UI_SETTING", 0, ClientSettingsHandlers.OnRequestUiSetting);
         Reg("C_SAVE_CLIENT_CHAT_OPTION_SETTING", 0, ClientSettingsHandlers.OnSaveChatOption);
+        Reg("C_SAVE_CLIENT_USER_SETTING", 0, ClientSettingsHandlers.OnSaveUserSetting);
+        Reg("C_SAVE_CLIENT_ACCOUNT_SETTING", 0, ClientSettingsHandlers.OnSaveAccountSetting);
         RegEmptyReply("C_SAVE_CLIENT_UI_SETTING", "S_SAVE_CLIENT_UI_SETTING", new Dictionary<string, object> { ["result"] = (byte)1 });
 
         // --- Inventory window ---
@@ -198,7 +201,6 @@ public static class HandlerRegistry
         // --- Telemetry / world packets: noop standalone, forward in-world ---
         RegNoop("C_SET_VISIBLE_RANGE");
         RegNoop("C_HARDWARE_INFO");
-        RegNoop("C_SAVE_CLIENT_ACCOUNT_SETTING");
         RegNoop("C_CHANGE_USER_LOBBY_SLOT_ID");
         RegNoop("C_RQ_SKILL_POLISHING_LIST");
         RegNoop("C_RQ_SKILL_POLISHING_EXP_INFO");

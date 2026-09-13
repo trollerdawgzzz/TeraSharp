@@ -148,7 +148,20 @@ T17's; three tests needed fixture rows because playerId 1 is reserved for dob's 
    `HandledOnMasterNotOnThisBranch` exemption; `0x272E`: take T17's handler) and in `PatchedWindows()`
    in the tests (T12/T18 both extend it - union).
 
-1. Live-verify the promotion-timestamp fix on a fresh World (see above). Delete old `*_full.dmp`.
+1. **Relog into an instanced zone fails** (04:03, character 'letustry' saved in zone 9827 = the
+   instanced intro area): World sends 0x138C, the client never finishes loading, World times the
+   user out ~60 s later (0x2927 ticks, then 0x13AA..0x1393 with "no session for gameId"). The
+   real Arbiter must set up the dungeon channel for a login into an instance (0x13BE/0x13C0 and/or
+   the 16-byte world-session state at AS_ENTER_WORLD [167] that we zero) - never captured. Options:
+   (a) capture a real-Arbiter relog from inside 9827 (same capture as the "Test" quest one!),
+   (b) short-term: on login, if the saved zone is an instance, spawn at the continent's return
+   position instead (the real Arbiter has AS_SAVE_ETC_DATA_FOR_MOVE_WORLD 0x1499 data for that).
+2. **Exit Game button**: timing is 5 s already (C_EXIT -> leave -> S_EXIT); only the countdown
+   display is missing because `S_PREPARE_EXIT` is sent via `defs.Has(..)` and is not in the
+   registry - send it raw (`[u32 time]`, same shape as S_PREPARE_RETURN_TO_LOBBY).
+3. `no replay for 0x156F` still logged after the T15 merge - check `WorldReplayTable.OneWayFromWorld`
+   kept T15's additions (0x156F, 0x1491, 0x13B6, 0x13C5, 0x13C6, 0x1499, 0x15FA, 0x2927).
+4. Live-verify the promotion-timestamp fix on a fresh World (see above). Delete old `*_full.dmp`.
 2. Merge Cowork T11 (INVENTORY-DESIGN.md) and T12 (identity block in StarterBlob.Build), then
    create a human warrior and confirm it looks right.
 3. Live-test a quest teleport / dungeon enter (zone-change echoes).
