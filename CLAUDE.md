@@ -2,9 +2,9 @@
 
 ## ⚠ READ THIS BLOCK FIRST — WORKSPACE RULES (non-negotiable)
 
-**Cowork works ONLY on its own git branch, never on `master`, never outside the repo.** One Cowork session
-at a time. The human works on `master` and merges your branch when it's green. This is what keeps the two
-streams of work from getting tangled.
+**Cowork works ONLY on its own git branch, never on `master`, never outside the repo.** Two Cowork sessions
+may run at once, each in its OWN worktree (`TeraSharp-cowork` and `TeraSharp-cowork2`) - never two sessions
+in one worktree. The human works on `master` and merges each branch when it's green.
 
 1. Start every session with:
    `cd D:\v100\TERA_SERVER.100\TeraSharp; git status --short; git log --oneline -3`. The tree must be clean.
@@ -68,7 +68,61 @@ Read `status/STATUS.md` after this file. Everything you need is on disk. **Read 
 
 ---
 
-## 0. State of play (updated after session 4 + live testing)
+## 0. State of play (updated 2026-09-14 ~05:30 - after the new-character milestone)
+
+**Milestone: a brand-new character works end-to-end on a fresh WorldServer** - creation, per-class
+starter kit and default skills, quests, inventory, client settings all persist through TeraSharp's SQLite.
+"Everything works like it did on Arbiter" (human, live). 278 tests. Two Cowork sessions run in parallel now,
+each in its own worktree (`TeraSharp-cowork` on `cowork/T8`, `TeraSharp-cowork2` on `cowork/T<n>`); the
+human rebases a worktree on master before a new task if master moved. The current task queue is at the
+bottom of this section; `status/CHAT-HANDOFF.md` has the day-by-day state and the live-debug recipes.
+
+### Hard rules learned the expensive way (2026-09-14)
+- **Never send a `DBS_*` reply World did not ask for.** Every DBS_ carries a DLM id World looks up; an
+  unsolicited one completes whichever item currently holds that id. A pre-emptive `0x2738` with playerId in the
+  id slot crashed a fresh World for every character except playerId 1 (found via minidump stack walk).
+  Pushes (AS_*, no id) are fine; replies are not.
+- **Every per-user W->A request must be answered** (allow-list in `DbProxyHandlers.IsHandledRequest`, or
+  `WorldReplayTable.OneWayFromWorld`, or a replay entry) - the test `Every_per_user_request_opcode_is_answered`
+  enforces it from `status/PERSISTENCE-MAP.md`. `no replay for 0xNNNN` right before silence is the tell.
+- **Captured per-character data must never be served to other characters.** Quests (0x272D), inventory
+  (0x27A4), the world blob, skills - each of these bit us as "every new character got dob's X". The remaining
+  statics (achievements 0x27F9, reputation 0x2890, tutorial tips 0x2873, seren 0x2943, fatigability 0x2909,
+  EP 0x27BA, dungeon history 0x2868) are Cowork T22.
+- **The world blob is per-character state we DO patch at creation** (playerId, name, identity block, skills,
+  position - see `StarterBlob`) and otherwise store verbatim; zone is u32@236 (208 is HP).
+- The real Arbiter's DLM ids are what World looks up; the blob-derived `questDbId` (0x272F payload[25]) is
+  the `quests` row id; item ids come from `counters` (starter kit ids 7.. are deterministic per character).
+- Minidump analysis without WinDbg: parse streams 4/6/3 with PowerShell, scan the faulting thread's stack for
+  addresses inside WorldServer.exe, map `WorldServer+0xNNN` to `FUN_1400NNN` in the decompile (recipe in
+  CHAT-HANDOFF.md). Delete `*_full.dmp` (30 GB each) immediately.
+
+### Status by area
+| Area | Status |
+|---|---|
+| Client crypto/codec/login/char list/select/create/delete | real |
+| Chat, client settings (persisted), social lists | real |
+| World handshake + 0x147D promotion records (live timestamps) + 0x1581 burst | real |
+| Enter-world, blob save/load, restriction, gameId per login | real, live-verified |
+| Per-user DB writes during play (T15), quests (T17), inventory (T20), skills in blob (T18) | real |
+| Relog into an instance (0x138D -> retry at stored return point) | implemented (T21), **live test pending** |
+| Zone change / quest teleport (0x13BE/0x13C0 echoes) | real, live-verified (via T21 capture) |
+| Remaining per-character statics (achievements, reputation, tips, seren, fatigability, EP, dungeon history) | replayed from dob - T22 |
+| Post-handshake ~64-push config burst | not sent explicitly - T23 |
+| Multiple players | blocked on a 2-login capture |
+| Account auth | accept-all |
+
+### Cowork task queue (current)
+- [x] T1-T21 done and merged (see git log).
+- [ ] **T22** - per-character loads from rows (achievements first). Prompt in CHAT-HANDOFF.md.
+- [ ] **T23** - post-handshake config burst as a real step + 0x15ED/0x295D replies.
+- [ ] Exit countdown display: `S_PREPARE_EXIT` not in the def registry (human-owned HandlerRegistry).
+- [ ] Continent fallback table for characters with no stored return point (ENTER-WORLD-FALLBACK.md section 9).
+- [ ] Two-login capture -> multi-player tunnel routing.
+
+---
+
+## 0-old. State of play (updated after session 4 + live testing) - kept for history
 
 **The repo is under git.** Cowork commits only on `cowork/*` branches; the human merges. Start every session
 with `git status` (clean) and `git log --oneline -3`.

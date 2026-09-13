@@ -113,6 +113,16 @@ and look for the next caller.
 
 ## Next steps (in order)
 
+**Update 2026-09-14 ~05:40.** T21 merged + wired (WorldBridge.PlayerForGameId, WorldEntry.ResendEnterWorld,
+Program.cs hooks; AS_ENTER_WORLD [68] is EnterWorldType=1 not level, [52] = stored instance PDId when the
+saved zone is that instance). 278 tests, shipped 71437b1. **Live test pending**: new character -> teleport
+into 9827 -> Exit -> relog; expect `EnterWorld retry for '...': continent 9827 refused, falling back to zone 5`,
+spawn on Island of Dawn, World re-teleports into the instance. (letustry has no stored return point - delete it.)
+Cowork in flight: **T22** (`TeraSharp-cowork`, cowork/T8): per-character loads from rows - achievements,
+reputation, tutorial tips, seren, fatigability, EP, dungeon history; **T23** (`TeraSharp-cowork2`,
+cowork/T23): post-handshake config burst + 0x15ED/0x295D. Prompts are in this chat's history; CLAUDE.md
+section 0 has the queue. Merge order irrelevant; both touch DbProxyHandlers.cs so expect one conflict.
+
 **Update 2026-09-14 ~05:00.** Merged since the milestone: T19 (client settings persist -
 `client_settings`/`account_settings`, `C_SAVE_CLIENT_*` registered, `S_LOAD_CLIENT_ACCOUNT_SETTING`
 sent before the user setting after C_LOAD_TOPO_FIN), T20 (inventory persistence - `items` table
