@@ -1,4 +1,4 @@
-using System.Net;
+﻿using System.Net;
 using Microsoft.Extensions.Logging;
 using TeraSharp.Arbiter.Handlers;
 using TeraSharp.Arbiter.Network;
@@ -41,7 +41,7 @@ public static class Program
         using var loggerFactory = LoggerFactory.Create(b =>
         {
             b.AddSimpleConsole(o => { o.SingleLine = true; o.TimestampFormat = "HH:mm:ss "; });
-            b.SetMinimumLevel(LogLevel.Debug);
+            b.SetMinimumLevel(LogLevel.Trace);
         });
 
         var log = loggerFactory.CreateLogger("Arbiter");
