@@ -1,4 +1,4 @@
-using Microsoft.Extensions.Logging;
+﻿using Microsoft.Extensions.Logging;
 using TeraSharp.Arbiter.Network;
 using TeraSharp.Arbiter.Protocol;
 using TeraSharp.Arbiter.World;
@@ -74,6 +74,13 @@ public static class HandlerRegistry
             {
                 // Arbiter-owned: tell World the player finished loading (0x1439), triggers spawn.
                 Program.World?.NotifyTopoLoaded(s.PlayerId);
+                // Real Arbiter sends these to the client right after C_LOAD_TOPO_FIN (lobby_proxy.log
+                // 263-268), in this order. S_LOAD_CLIENT_USER_SETTING here is what makes the chat
+                // window process S_CHAT; sent at character select it is discarded on zone load.
+                SocialHandlers.SendBlockList(s);
+                SocialHandlers.SendFriendGroupList(s);
+                SocialHandlers.SendFriendList(s);
+                ClientSettingsHandlers.SendUserSetting(s);
                 return true;
             }
             return login.OnLoadTopoFin(s, body);
