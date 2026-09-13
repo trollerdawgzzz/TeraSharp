@@ -633,6 +633,53 @@ CREATE TABLE IF NOT EXISTS quests (
 );
 CREATE INDEX IF NOT EXISTS ix_quests_owner ON quests(owner_id);
 
+-- T22: achievements. `payload` is the whole SDB_UPDATE_USER_ACHIEVEMENT (0x27FA) body World
+-- sends on every zone change and logout - 35 lists plus the 1184-byte Data blob - kept
+-- verbatim, last write wins, and taken apart again when DBS_LOAD_USER_ACHIEVEMENT (0x27F9) is
+-- rebuilt. Storing the message rather than 35 parsed tables is deliberate: the lists are
+-- opaque counter vectors World owns, and a parsed schema would have to be re-derived every
+-- time World's build changes. status/ACHIEVEMENTS.md.
+CREATE TABLE IF NOT EXISTS achievements (
+  owner_id   INTEGER PRIMARY KEY REFERENCES characters(id),
+  payload    BLOB NOT NULL,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- The accomplished list is NOT in the 0x27FA save: it is built one record at a time by
+-- SDB_ACCOMPLISH_USER_ACHIEVEMENT (0x2802), and the real Arbiter keeps the FIRST record for an
+-- achievement and rejects every later one - proven across two capture sessions, where a
+-- re-submitted 5991 came back as an empty 0x2803 and the load still carried the original
+-- timestamp. Hence INSERT OR IGNORE on (owner, achievement).
+CREATE TABLE IF NOT EXISTS achievements_done (
+  owner_id       INTEGER NOT NULL REFERENCES characters(id),
+  achievement_id INTEGER NOT NULL,
+  record         BLOB    NOT NULL,   -- the raw 24-byte record, first write wins
+  created_at     TEXT    NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (owner_id, achievement_id)
+);
+CREATE INDEX IF NOT EXISTS ix_achievements_done_owner ON achievements_done(owner_id);
+
+-- T22: the two other per-character login loads the captures pin completely.
+-- Tutorial tips: SDB_ADD_TUTORIAL_SIMPLE_TIP (0x286E) adds one id at a time and
+-- DBS_LOAD_TUTORIAL_SIMPLE_TIP (0x2873) serves them back in the order they were added.
+CREATE TABLE IF NOT EXISTS tutorial_tips (
+  owner_id   INTEGER NOT NULL REFERENCES characters(id),
+  tip_id     INTEGER NOT NULL,
+  created_at TEXT    NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (owner_id, tip_id)
+);
+CREATE INDEX IF NOT EXISTS ix_tutorial_tips_owner ON tutorial_tips(owner_id);
+
+-- Seren guide: SDB_UPDATE_SEREN_GUIDE_INFO (0x2944) sets one (type, id) pair and
+-- DBS_INIT_SEREN_GUIDE_INFO (0x2943) serves a fixed six-row table back.
+CREATE TABLE IF NOT EXISTS seren_guide (
+  owner_id   INTEGER NOT NULL REFERENCES characters(id),
+  seren_type INTEGER NOT NULL,
+  seren_id   INTEGER NOT NULL,
+  updated_at TEXT    NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (owner_id, seren_type)
+);
+
 -- Monotonic id sequences the DB-proxy layer hands to WorldServer. Not SQLite rowids: the
 -- values leave the process (DBS_ITEM_SINGLE returns them to World, which keys its in-memory
 -- items by them), so they must keep climbing across restarts even with no table behind them.
@@ -1199,6 +1246,157 @@ SELECT last_insert_rowid();";
             cmd.CommandText = "SELECT COUNT(*) FROM quests WHERE owner_id = $o";
             cmd.Parameters.AddWithValue("$o", ownerId);
             return (int)(long)cmd.ExecuteScalar()!;
+        }
+    }
+
+    // ---- Achievements (T22) ----
+
+    /// <summary>
+    /// Store the raw SDB_UPDATE_USER_ACHIEVEMENT (0x27FA) payload for a character, replacing
+    /// whatever was there. World sends the complete set on every zone change and logout, so last
+    /// write wins is the whole story. Returns false for an obviously bad payload (too short to
+    /// hold the 288-byte header), which is left unstored - the caller still acks the DLM item.
+    /// </summary>
+    public bool SaveAchievements(int ownerId, byte[] payload)
+    {
+        ArgumentNullException.ThrowIfNull(payload);
+        if (payload.Length < 288)
+        {
+            _log.LogWarning("SaveAchievements: {Len} B payload for character {Id} is too short to be 0x27FA",
+                payload.Length, ownerId);
+            return false;
+        }
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "INSERT INTO achievements (owner_id, payload, updated_at) "
+                            + "VALUES ($o, $p, datetime('now')) "
+                            + "ON CONFLICT(owner_id) DO UPDATE SET payload = $p, updated_at = datetime('now')";
+            cmd.Parameters.AddWithValue("$o", ownerId);
+            cmd.Parameters.AddWithValue("$p", payload);
+            cmd.ExecuteNonQuery();
+            return true;
+        }
+    }
+
+    /// <summary>The stored 0x27FA payload, or null for a character that has never saved.</summary>
+    public byte[]? GetAchievements(int ownerId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT payload FROM achievements WHERE owner_id = $o";
+            cmd.Parameters.AddWithValue("$o", ownerId);
+            return cmd.ExecuteScalar() as byte[];
+        }
+    }
+
+    /// <summary>
+    /// Record accomplished achievements, keeping the first record for each and ignoring repeats.
+    /// Returns, in request order, only the records that were actually new - that list is exactly
+    /// what DBS_ACCOMPLISH_USER_ACHIEVEMENT (0x2803) sends back.
+    /// </summary>
+    public List<byte[]> AddAccomplishedAchievements(int ownerId, IReadOnlyList<(int Id, byte[] Record)> records)
+    {
+        ArgumentNullException.ThrowIfNull(records);
+        var added = new List<byte[]>();
+        lock (_lock)
+        {
+            foreach (var (id, record) in records)
+            {
+                using var cmd = _db.CreateCommand();
+                cmd.CommandText = "INSERT OR IGNORE INTO achievements_done (owner_id, achievement_id, record) "
+                                + "VALUES ($o, $a, $r)";
+                cmd.Parameters.AddWithValue("$o", ownerId);
+                cmd.Parameters.AddWithValue("$a", id);
+                cmd.Parameters.AddWithValue("$r", record);
+                if (cmd.ExecuteNonQuery() == 1) added.Add(record);
+            }
+        }
+        return added;
+    }
+
+    /// <summary>
+    /// Every accomplished-achievement record for a character, in the order they were earned -
+    /// which is the order the real Arbiter's AccomplishedAchievementList carries them in.
+    /// </summary>
+    public List<byte[]> GetAccomplishedAchievements(int ownerId)
+    {
+        lock (_lock)
+        {
+            var list = new List<byte[]>();
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT record FROM achievements_done WHERE owner_id = $o ORDER BY rowid";
+            cmd.Parameters.AddWithValue("$o", ownerId);
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) list.Add((byte[])r["record"]);
+            return list;
+        }
+    }
+
+    // ---- Tutorial tips and the seren guide (T22) ----
+
+    /// <summary>
+    /// Record a tutorial tip the character has seen. Repeats are ignored, which keeps the load
+    /// order stable: DBS_LOAD_TUTORIAL_SIMPLE_TIP serves the tips in the order they were first
+    /// added (cap_newchar.log adds 1, 2, 35, 39 and the relog capture serves exactly that order).
+    /// Returns true when the tip was new.
+    /// </summary>
+    public bool AddTutorialTip(int ownerId, int tipId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "INSERT OR IGNORE INTO tutorial_tips (owner_id, tip_id) VALUES ($o, $t)";
+            cmd.Parameters.AddWithValue("$o", ownerId);
+            cmd.Parameters.AddWithValue("$t", tipId);
+            return cmd.ExecuteNonQuery() == 1;
+        }
+    }
+
+    /// <summary>The character's tutorial tips, oldest first.</summary>
+    public List<int> GetTutorialTips(int ownerId)
+    {
+        lock (_lock)
+        {
+            var list = new List<int>();
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT tip_id FROM tutorial_tips WHERE owner_id = $o ORDER BY rowid";
+            cmd.Parameters.AddWithValue("$o", ownerId);
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) list.Add(r.GetInt32(0));
+            return list;
+        }
+    }
+
+    /// <summary>One seren-guide slot, last write wins.</summary>
+    public void SetSerenGuide(int ownerId, int serenType, int serenId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "INSERT INTO seren_guide (owner_id, seren_type, seren_id, updated_at) "
+                            + "VALUES ($o, $t, $i, datetime('now')) "
+                            + "ON CONFLICT(owner_id, seren_type) DO UPDATE SET seren_id = $i, updated_at = datetime('now')";
+            cmd.Parameters.AddWithValue("$o", ownerId);
+            cmd.Parameters.AddWithValue("$t", serenType);
+            cmd.Parameters.AddWithValue("$i", serenId);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>Every stored seren-guide slot for a character, as (type, id).</summary>
+    public Dictionary<int, int> GetSerenGuide(int ownerId)
+    {
+        lock (_lock)
+        {
+            var map = new Dictionary<int, int>();
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT seren_type, seren_id FROM seren_guide WHERE owner_id = $o";
+            cmd.Parameters.AddWithValue("$o", ownerId);
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) map[r.GetInt32(0)] = r.GetInt32(1);
+            return map;
         }
     }
 

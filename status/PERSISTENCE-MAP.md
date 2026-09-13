@@ -19,11 +19,11 @@ back in the matching load.
 | 0x273B S_UPDATE_EXP_LEVEL (46 B)                  | 0x273C        | [u32 reqId][u8 ok]                            | 12    | real (T6), writes level/exp to the row |
 | 0x2768 SDB_ITEM_SINGLE (30 / 886 / 4310 B)        | 0x2769        | 21-B header + both atom lists, insert ids filled in | 8 | real (T13) |
 | 0x278E SDB_USER_LEARN_SKILL (896 B)               | 0x278F        | 23-B header + the fee atoms + EMPTY SkillPeriodData list | 1 | **real (T15)** |
-| 0x27FA SDB_UPDATE_USER_ACHIEVEMENT (1478-1526 B)  | 0x27FB        | [u32 reqId][u8 ok], reqId at [280]            | 4     | real |
-| 0x2802 SDB_ACCOMPLISH_USER_ACHIEVEMENT (46 B)     | 0x2803        | 13-B header + the NEWLY accomplished records (43 B) or none (19 B) | 3 | **real (T15)** |
+| 0x27FA SDB_UPDATE_USER_ACHIEVEMENT (1478-1558 B)  | 0x27FB        | [u32 reqId][u8 ok], reqId at [280]            | 4     | **real (T22)**, the whole payload persisted and served back by 0x27F9 |
+| 0x2802 SDB_ACCOMPLISH_USER_ACHIEVEMENT (46 B)     | 0x2803        | 13-B header + the NEWLY accomplished records (43 B) or none (19 B) | 3 | **real (T22)**, persisted first-write-wins; the 19-B form now happens for the right reason |
 | 0x2891 SDB_UPDATE_REPUTATION_INFO (78 B)          | 0x2892        | [u8 ok][u32 reqId] - ok FIRST                 | 1     | **real (T15)** |
-| 0x286E SDB_ADD_TUTORIAL_SIMPLE_TIP (18 B)         | 0x286F        | [u32 reqId][u8 ok]                            | 4     | **real (T15)** |
-| 0x2944 SDB_UPDATE_SEREN_GUIDE_INFO (22 B)         | 0x2945        | [u32 reqId][u32 playerId][u8 ok]              | 2     | **real (T15)** |
+| 0x286E SDB_ADD_TUTORIAL_SIMPLE_TIP (18 B)         | 0x286F        | [u32 reqId][u8 ok]                            | 4     | **real (T22)**, persisted and served back by 0x2873 |
+| 0x2944 SDB_UPDATE_SEREN_GUIDE_INFO (22 B)         | 0x2945        | [u32 reqId][u32 playerId][u8 ok]              | 2     | **real (T22)**, persisted and served back by 0x2943 |
 | 0x293C SDB_UPDATE_USER_DAILY_EVENT_COUNT (58 B)   | 0x293D        | [u32 reqId][u8 ok], reqId at [8]              | 1     | **real (T15)** |
 | 0x293E SDB_UPDATE_GET_EXTRA_REWARD (20 B)         | 0x293F        | [u32 reqId][u8 ok]                            | 1     | **real (T15)** |
 | 0x297B SDB_UPDATE_USER_ACTPOINT (22 B)            | 0x297C        | [u32 reqId][u8 ok]                            | 1     | real (master) |
@@ -36,6 +36,12 @@ back in the matching load.
 | 0x27CB SDB_UPDATE_USER_DATA (blob)                | 0x27CC        | [u32 reqId][u32 1]                            | spawn, zone change, logout | real, persisted (SQLite) |
 | 0x2927 SDB_CANCEL_NPC_ARENA_BET (14 B)            | none          | fire-and-forget - the Arbiter handler has no SendToSession | periodic | **one-way (T15)**, in WorldReplayTable.OneWayFromWorld |
 | 0x138D SA_ENTER_WORLD_FAIL (38 B)                 | 0x148D        | two AS_CACHE_DUNGEON_COOL_TIME_TO_WORLD pushes, then a re-sent 0x138E with the stored return point | relog into an instance | **real (T21)**, status/ENTER-WORLD-FALLBACK.md |
+
+The login LOADS those writes feed are in `status/ACHIEVEMENTS.md`: `0x27F8` -> `0x27F9`,
+`0x2872` -> `0x2873`, `0x2942` -> `0x2943` and `0x2867` -> `0x2868` are rebuilt from rows as of
+T22 and byte-exact for a brand-new character and for one with progress. `0x288F` -> `0x2890`
+(reputation) and `0x2908` -> `0x2909` (fatigability) are still dob's captured bytes: neither
+layout is pinnable from the captures we have, and that file says exactly what would settle each.
 
 Every row above is covered by a test: `Every_per_user_request_opcode_is_answered` parses this
 table and fails the build if an opcode is neither in `DbProxyHandlers.IsHandledRequest` nor in

@@ -5506,6 +5506,346 @@ array items
         Hex.Eq(body[53..133], CapQuest59904, "and 59904 is still the one active record");
     }
 
+
+    // ================================================================================
+    // T22 - the per-character login loads, rebuilt from rows instead of replaying dob's
+    // captured reply to every character.
+    //
+    // Ground truth, both committed as TSIS containers so the tests need no D:\packetlogs:
+    //   data/cap_t22_newchar.bin  cap_newchar.log            - "Test" (playerId 2) FIRST login
+    //   data/cap_t22_relog.bin    arb_world_2026-09-13...log - dob and "Test" WITH progress
+    //
+    // The two 0x27F9 layouts and the 35 -> 38 list map they hinge on: status/ACHIEVEMENTS.md.
+    // ================================================================================
+
+    static Dictionary<uint, byte[]>? LoadT22NewcharOrSkip() => LoadTsisOrSkip("cap_t22_newchar.bin");
+    static Dictionary<uint, byte[]>? LoadT22RelogOrSkip() => LoadTsisOrSkip("cap_t22_relog.bin");
+
+    /// <summary>An in-memory store with characters 1 and 2, and the handler wired to it.</summary>
+    static (TeraSharp.Arbiter.Persistence.CharacterStore store, DbProxyHandlers handlers) T22Store()
+    {
+        var store = StoreWithTwoCharacters();
+        return (store, FreshHandlers(store));
+    }
+
+    // ---- Achievements: 0x27F8 -> 0x27F9, fed by 0x27FA and 0x2802 ----
+
+    [Test] public static void Achievements_save_and_load_layouts_are_the_ones_the_dumper_names()
+    {
+        var newchar = LoadT22NewcharOrSkip(); if (newchar == null) return;
+        var save = newchar[1367];
+        var load = newchar[344];
+
+        // 0x27FA: 35 pairs, then reqId and playerId, then the bodies at 288.
+        Hex.True(DbProxyHandlers.AchievementSaveListCount == 35, "35 save lists");
+        Hex.True(BitConverter.ToUInt32(save, 0) - 6 == DbProxyHandlers.AchievementSaveHeader,
+            $"the first save list starts at payload {DbProxyHandlers.AchievementSaveHeader}");
+        Hex.True(BitConverter.ToUInt32(save, DbProxyHandlers.AchievementSavePlayerIdOffset) == 2,
+            "the save carries the playerId at [284]");
+
+        // 0x27F9: 38 pairs, then reqId and ok, then the bodies at 309.
+        Hex.True(DbProxyHandlers.AchievementLoadListCount == 38, "38 load lists");
+        Hex.True(BitConverter.ToUInt32(load, 0) - 6 == DbProxyHandlers.AchievementLoadHeader,
+            $"the first load list starts at payload {DbProxyHandlers.AchievementLoadHeader}");
+        Hex.True(load[DbProxyHandlers.AchievementLoadOkOffset] == 1, "ok at [308]");
+
+        // List 0 of both is the fixed 1184-byte Data blob.
+        Hex.True(BitConverter.ToUInt32(save, 4) == DbProxyHandlers.AchievementDataSize, "save Data is 1184 B");
+        Hex.True(BitConverter.ToUInt32(load, 4) == DbProxyHandlers.AchievementDataSize, "load Data is 1184 B");
+    }
+
+    [Test] public static void Achievements_save_to_load_list_map_is_a_permutation()
+    {
+        var map = DbProxyHandlers.AchievementSaveToLoadList;
+        Hex.True(map.Length == DbProxyHandlers.AchievementSaveListCount, $"35 entries, got {map.Length}");
+        Hex.True(map.Distinct().Count() == map.Length, "every save list maps to a different load list");
+        Hex.True(map.All(i => i >= 0 && i < DbProxyHandlers.AchievementLoadListCount), "all in range");
+        // The three load lists with no save counterpart: AchievementGrades, BattleFieldRankList
+        // and AccomplishedAchievementList (which 0x2802 feeds instead).
+        var missing = Enumerable.Range(0, DbProxyHandlers.AchievementLoadListCount).Except(map).ToArray();
+        Hex.True(missing.SequenceEqual(new[] { 1, 16, DbProxyHandlers.AchievementAccomplishedListIndex }),
+            "unmapped load lists: " + string.Join(",", missing));
+    }
+
+    [Test] public static void Achievements_fresh_character_reply_matches_cap_newchar_seq_344()
+    {
+        var newchar = LoadT22NewcharOrSkip(); if (newchar == null) return;
+        var expected = newchar[344];
+        var built = DbProxyHandlers.BuildDbs27F9(null, Array.Empty<byte[]>(),
+            BitConverter.ToUInt32(expected, DbProxyHandlers.AchievementLoadReqIdOffset));
+        Hex.Eq(built, expected, "DBS_LOAD_USER_ACHIEVEMENT for a character with no rows (cap_newchar seq 344)");
+    }
+
+    [Test] public static void Achievements_fresh_data_blob_is_zero_apart_from_two_counts()
+    {
+        var d = DbProxyHandlers.FreshAchievementData();
+        Hex.True(d.Length == 1184, $"Data is 1184 B, got {d.Length}");
+        var nonZero = Enumerable.Range(0, d.Length).Where(i => d[i] != 0).ToArray();
+        Hex.True(nonZero.SequenceEqual(new[] { 1052, 1053, 1180, 1181 }),
+            "only the two u16s the capture has are set: " + string.Join(",", nonZero));
+    }
+
+    [Test] public static void Achievements_with_progress_reply_matches_the_relog_capture()
+    {
+        // Rebuild each character's login reply from their own 0x27FA save plus, for Test, the two
+        // accomplished records cap_newchar's 0x2802 writes created. The Data blob is served
+        // straight through, so it is taken from the capture's own save - see the deviation note
+        // on BuildDbs27F9 for the four bytes of it the real Arbiter re-derives.
+        var relog = LoadT22RelogOrSkip(); if (relog == null) return;
+        var newchar = LoadT22NewcharOrSkip(); if (newchar == null) return;
+
+        // dob, seq 397, from his logout save at seq 811. No accomplished achievements.
+        Hex.Eq(DbProxyHandlers.BuildDbs27F9(WithLoadData(relog[811], relog[397]), Array.Empty<byte[]>(),
+                   BitConverter.ToUInt32(relog[397], DbProxyHandlers.AchievementLoadReqIdOffset)),
+            relog[397], "dob's DBS_LOAD_USER_ACHIEVEMENT (relog seq 397)");
+
+        // Test, seq 883, from his save at seq 1137 plus the two records 0x2802 recorded.
+        var done = new[] { AccomplishedRecord(newchar[1369]), AccomplishedRecord(newchar[2722]) };
+        Hex.Eq(DbProxyHandlers.BuildDbs27F9(WithLoadData(relog[1137], relog[883]), done,
+                   BitConverter.ToUInt32(relog[883], DbProxyHandlers.AchievementLoadReqIdOffset)),
+            relog[883], "Test's DBS_LOAD_USER_ACHIEVEMENT (relog seq 883)");
+    }
+
+    /// <summary>
+    /// A 0x27FA save with its Data blob replaced by the one the matching 0x27F9 carried. The
+    /// Arbiter re-derives two u16s of Data on the way out (Data+1052 and Data+1180) that World
+    /// always sends as zero; everything the rebuild actually decides is unaffected.
+    /// </summary>
+    static byte[] WithLoadData(byte[] savePayload, byte[] loadPayload)
+    {
+        var patched = (byte[])savePayload.Clone();
+        int at = (int)BitConverter.ToUInt32(savePayload, 0) - 6;
+        int from = (int)BitConverter.ToUInt32(loadPayload, 0) - 6;
+        Array.Copy(loadPayload, from, patched, at, DbProxyHandlers.AchievementDataSize);
+        return patched;
+    }
+
+    /// <summary>The single 24-byte record carried by a 0x2802 request.</summary>
+    static byte[] AccomplishedRecord(byte[] request)
+    {
+        var recs = DbProxyHandlers.SliceAchievementRecords(request);
+        Hex.True(recs.Count == 1, $"expected one accomplished record, got {recs.Count}");
+        return recs[0];
+    }
+
+    [Test] public static void Achievements_the_lists_survive_a_save_load_round_trip_unchanged()
+    {
+        // Every non-empty list of Test's save has to come out at its mapped index with the same
+        // bytes - that is what the 35 -> 38 name map claims, and it is checked here without
+        // leaning on any single capture's offsets.
+        var relog = LoadT22RelogOrSkip(); if (relog == null) return;
+        var saved = DbProxyHandlers.SplitOffsetLengthLists(relog[1137], DbProxyHandlers.AchievementSaveListCount);
+        var built = DbProxyHandlers.BuildDbs27F9(relog[1137], Array.Empty<byte[]>(), 1);
+        var back = DbProxyHandlers.SplitOffsetLengthLists(built, DbProxyHandlers.AchievementLoadListCount);
+
+        for (int i = 0; i < saved.Length; i++)
+            Hex.Eq(back[DbProxyHandlers.AchievementSaveToLoadList[i]], saved[i],
+                $"save list {i} must come back as load list {DbProxyHandlers.AchievementSaveToLoadList[i]}");
+        foreach (int i in new[] { 1, 16, DbProxyHandlers.AchievementAccomplishedListIndex })
+            Hex.True(back[i].Length == 0, $"load list {i} has no save counterpart and must be empty");
+    }
+
+    [Test] public static void Handler_27F8_rebuilds_from_the_store_and_echoes_the_live_id()
+    {
+        var newchar = LoadT22NewcharOrSkip(); if (newchar == null) return;
+        var (store, handlers) = T22Store();
+        using var _ = store;
+
+        var req = new byte[8];
+        BitConverter.GetBytes(0x0BADu).CopyTo(req, 0);
+        BitConverter.GetBytes(2u).CopyTo(req, 4);
+
+        // Nothing stored -> the brand-new-character reply with our live DLM id.
+        var (op, body) = RunHandler1(DbProxyHandlers.SDB_USER_ACHIEVEMENT, req, store, handlers);
+        Hex.True(op == 0x27F9, $"reply opcode, got 0x{op:X4}");
+        var expected = (byte[])newchar[344].Clone();
+        BitConverter.GetBytes(0x0BADu).CopyTo(expected, DbProxyHandlers.AchievementLoadReqIdOffset);
+        Hex.Eq(body, expected, "no rows -> the captured fresh reply with the live id");
+
+        // Replay the character's own logout save, then load again.
+        RunHandler1(DbProxyHandlers.SDB_SAVE_27FA, newchar[4173], store, handlers);
+        var (_, body2) = RunHandler1(DbProxyHandlers.SDB_USER_ACHIEVEMENT, req, store, handlers);
+        var savedLists = DbProxyHandlers.SplitOffsetLengthLists(newchar[4173], 35);
+        var loaded = DbProxyHandlers.SplitOffsetLengthLists(body2, 38);
+        Hex.Eq(loaded[0], savedLists[0], "the Data blob comes back verbatim");
+        for (int i = 1; i < 35; i++)
+            Hex.Eq(loaded[DbProxyHandlers.AchievementSaveToLoadList[i]], savedLists[i], $"save list {i}");
+    }
+
+    [Test] public static void Handler_27F8_keeps_dob_on_the_captured_reply()
+    {
+        var (store, handlers) = T22Store();
+        using var _ = store;
+        var req = new byte[8];
+        BitConverter.GetBytes(0x0BADu).CopyTo(req, 0);
+        BitConverter.GetBytes((uint)DbProxyHandlers.CapturedQuestPlayerId).CopyTo(req, 4);
+
+        var (op, body) = RunHandler1(DbProxyHandlers.SDB_USER_ACHIEVEMENT, req, store, handlers);
+        Hex.True(op == 0x27F9, "reply opcode");
+        Hex.True(body.Length == DbProxyStaticData.Achievement.Length,
+            $"dob keeps the captured {DbProxyStaticData.Achievement.Length} B reply, got {body.Length}");
+        Hex.True(BitConverter.ToUInt32(body, DbProxyHandlers.AchievementLoadReqIdOffset) == 0x0BAD,
+            "and it still carries the live DLM id");
+    }
+
+    // ---- Accomplished achievements: 0x2802 -> 0x2803, first write wins ----
+
+    [Test] public static void Accomplished_achievements_are_stored_once_and_served_in_order()
+    {
+        var newchar = LoadT22NewcharOrSkip(); if (newchar == null) return;
+        var relog = LoadT22RelogOrSkip(); if (relog == null) return;
+        var (store, handlers) = T22Store();
+        using var _ = store;
+
+        // 5991 is new, the SAME id again with a different timestamp is not, 5992 is new.
+        var (op1, first) = RunHandler1(DbProxyHandlers.SDB_ACCOMPLISH_USER_ACHIEVEMENT, newchar[1369], store, handlers);
+        Hex.True(op1 == 0x2803, $"reply opcode, got 0x{op1:X4}");
+        Hex.True(BitConverter.ToUInt32(first, 4) == DbProxyHandlers.AchievementRecordSize,
+            "the first 5991 comes back as newly accomplished");
+
+        var (_, again) = RunHandler1(DbProxyHandlers.SDB_ACCOMPLISH_USER_ACHIEVEMENT, newchar[2605], store, handlers);
+        Hex.True(BitConverter.ToUInt32(again, 4) == 0,
+            "a repeat of 5991 must come back empty - the real Arbiter's 19-byte form (cap_newchar seq 2606)");
+        Hex.True(again.Length + 6 == 0x13, $"and that is a 19-byte frame, got {again.Length + 6}");
+
+        RunHandler1(DbProxyHandlers.SDB_ACCOMPLISH_USER_ACHIEVEMENT, newchar[2722], store, handlers);
+
+        // The stored records keep the FIRST timestamp, which is what the relog capture served.
+        var stored = store.GetAccomplishedAchievements(2);
+        Hex.True(stored.Count == 2, $"two achievements, got {stored.Count}");
+        var served = DbProxyHandlers.SplitOffsetLengthLists(
+            relog[883], DbProxyHandlers.AchievementLoadListCount)[DbProxyHandlers.AchievementAccomplishedListIndex];
+        Hex.Eq(stored[0].Concat(stored[1]).ToArray(), served,
+            "the stored records are byte-identical to the relog capture's AccomplishedAchievementList");
+    }
+
+    [Test] public static void Accomplished_achievements_reach_the_load_reply()
+    {
+        var newchar = LoadT22NewcharOrSkip(); if (newchar == null) return;
+        var (store, handlers) = T22Store();
+        using var _ = store;
+        RunHandler1(DbProxyHandlers.SDB_ACCOMPLISH_USER_ACHIEVEMENT, newchar[1369], store, handlers);
+
+        var req = new byte[8];
+        BitConverter.GetBytes(0x0BADu).CopyTo(req, 0);
+        BitConverter.GetBytes(2u).CopyTo(req, 4);
+        var (_, body) = RunHandler1(DbProxyHandlers.SDB_USER_ACHIEVEMENT, req, store, handlers);
+        var lists = DbProxyHandlers.SplitOffsetLengthLists(body, DbProxyHandlers.AchievementLoadListCount);
+        Hex.Eq(lists[DbProxyHandlers.AchievementAccomplishedListIndex],
+            DbProxyHandlers.SliceAchievementRecords(newchar[1369])[0],
+            "list 34 carries the accomplished record");
+    }
+
+    // ---- Tutorial tips: 0x2872 -> 0x2873, fed by 0x286E ----
+
+    [Test] public static void TutorialTips_fresh_and_with_progress_match_the_captures()
+    {
+        var newchar = LoadT22NewcharOrSkip(); if (newchar == null) return;
+        var relog = LoadT22RelogOrSkip(); if (relog == null) return;
+
+        Hex.Eq(DbProxyHandlers.BuildDbs2873(Array.Empty<int>(), BitConverter.ToUInt32(newchar[176], 8)),
+            newchar[176], "no tips (cap_newchar seq 176)");
+
+        // The four tips cap_newchar's 0x286E writes add, in write order.
+        var tips = new[] { 719u, 765u, 864u, 911u }
+            .Select(seq => (int)BitConverter.ToUInt32(newchar[seq], DbProxyHandlers.TutorialTipIdOffset)).ToArray();
+        Hex.True(tips.SequenceEqual(new[] { 1, 2, 35, 39 }), "tips: " + string.Join(",", tips));
+        Hex.Eq(DbProxyHandlers.BuildDbs2873(tips, BitConverter.ToUInt32(relog[859], 8)),
+            relog[859], "Test's tips at relog (seq 859)");
+        Hex.Eq(DbProxyHandlers.BuildDbs2873(tips, BitConverter.ToUInt32(relog[373], 8)),
+            relog[373], "dob's tips at relog (seq 373) - the same four");
+    }
+
+    [Test] public static void Handler_2872_rebuilds_the_tips_the_286E_writes_added()
+    {
+        var newchar = LoadT22NewcharOrSkip(); if (newchar == null) return;
+        var relog = LoadT22RelogOrSkip(); if (relog == null) return;
+        var (store, handlers) = T22Store();
+        using var _ = store;
+
+        foreach (uint seq in new uint[] { 719, 765, 864, 911 })
+        {
+            var (op, ack) = RunHandler1(DbProxyHandlers.SDB_ADD_TUTORIAL_SIMPLE_TIP, newchar[seq], store, handlers);
+            Hex.True(op == DbProxyHandlers.DBS_ADD_TUTORIAL_SIMPLE_TIP, $"0x286F ack, got 0x{op:X4}");
+            Hex.True(BitConverter.ToUInt32(ack, 0) == BitConverter.ToUInt32(newchar[seq], 0),
+                "the ack echoes the live DLM id");
+        }
+        // A repeat must not duplicate the tip.
+        RunHandler1(DbProxyHandlers.SDB_ADD_TUTORIAL_SIMPLE_TIP, newchar[864], store, handlers);
+        Hex.True(store.GetTutorialTips(2).SequenceEqual(new[] { 1, 2, 35, 39 }),
+            "tips stay unique and in order: " + string.Join(",", store.GetTutorialTips(2)));
+
+        var req = new byte[8];
+        BitConverter.GetBytes(BitConverter.ToUInt32(relog[859], 8)).CopyTo(req, 0);
+        BitConverter.GetBytes(2u).CopyTo(req, 4);
+        var (rop, body) = RunHandler1(DbProxyHandlers.SDB_TUTORIAL_SIMPLE_TIP, req, store, handlers);
+        Hex.True(rop == DbProxyHandlers.DBS_TUTORIAL_SIMPLE_TIP, $"reply opcode, got 0x{rop:X4}");
+        Hex.Eq(body, relog[859], "the rebuilt reply is the capture, byte for byte");
+    }
+
+    // ---- Seren guide: 0x2942 -> 0x2943, fed by 0x2944 ----
+
+    [Test] public static void SerenGuide_fresh_and_with_progress_match_the_captures()
+    {
+        var newchar = LoadT22NewcharOrSkip(); if (newchar == null) return;
+        var relog = LoadT22RelogOrSkip(); if (relog == null) return;
+
+        Hex.Eq(DbProxyHandlers.BuildDbs2943(new Dictionary<int, int>(),
+                   BitConverter.ToUInt32(newchar[380], 8), BitConverter.ToUInt32(newchar[380], 12)),
+            newchar[380], "nothing stored -> an empty list (cap_newchar seq 380)");
+
+        // Test wrote (type 2, id 1804) then (type 4, id 36); only type 4 is in the served table.
+        var slots = new Dictionary<int, int>();
+        foreach (uint seq in new uint[] { 634, 2713 })
+            slots[(int)BitConverter.ToUInt32(newchar[seq], DbProxyHandlers.SerenGuideTypeOffset)] =
+                (int)BitConverter.ToUInt32(newchar[seq], DbProxyHandlers.SerenGuideIdOffset);
+        Hex.True(slots.Count == 2 && slots[2] == 1804 && slots[4] == 36,
+            "the two 0x2944 writes: " + string.Join(",", slots.Select(kv => $"{kv.Key}={kv.Value}")));
+
+        Hex.Eq(DbProxyHandlers.BuildDbs2943(slots, BitConverter.ToUInt32(relog[920], 8), 2),
+            relog[920], "Test's seren guide at relog (seq 920) - type 4 = 36, type 2 not served");
+    }
+
+    [Test] public static void Handler_2942_rebuilds_the_slots_the_2944_writes_set()
+    {
+        var newchar = LoadT22NewcharOrSkip(); if (newchar == null) return;
+        var relog = LoadT22RelogOrSkip(); if (relog == null) return;
+        var (store, handlers) = T22Store();
+        using var _ = store;
+
+        var req = new byte[8];
+        BitConverter.GetBytes(BitConverter.ToUInt32(newchar[380], 8)).CopyTo(req, 0);
+        BitConverter.GetBytes(2u).CopyTo(req, 4);
+        var (op0, body0) = RunHandler1(DbProxyHandlers.SDB_SEREN_GUIDE, req, store, handlers);
+        Hex.True(op0 == DbProxyHandlers.DBS_SEREN_GUIDE, $"reply opcode, got 0x{op0:X4}");
+        Hex.Eq(body0, newchar[380], "before any write the reply is the fresh capture");
+
+        foreach (uint seq in new uint[] { 634, 2713 })
+            RunHandler1(DbProxyHandlers.SDB_UPDATE_SEREN_GUIDE_INFO, newchar[seq], store, handlers);
+        // Last write wins per slot.
+        RunHandler1(DbProxyHandlers.SDB_UPDATE_SEREN_GUIDE_INFO, newchar[2713], store, handlers);
+
+        BitConverter.GetBytes(BitConverter.ToUInt32(relog[920], 8)).CopyTo(req, 0);
+        var (_, body1) = RunHandler1(DbProxyHandlers.SDB_SEREN_GUIDE, req, store, handlers);
+        Hex.Eq(body1, relog[920], "the rebuilt reply is the capture, byte for byte");
+    }
+
+    // ---- Dungeon history: 0x2867 -> 0x2868 with the LIVE id ----
+
+    [Test] public static void DungeonCoolTime_2868_empty_form_matches_both_captures()
+    {
+        var newchar = LoadT22NewcharOrSkip(); if (newchar == null) return;
+        var relog = LoadT22RelogOrSkip(); if (relog == null) return;
+        foreach (var expected in new[] { newchar[346], relog[399] })
+        {
+            var req = BitConverter.GetBytes(BitConverter.ToUInt32(expected, 25));
+            Hex.Eq(DbProxyHandlers.Build2868_ThreeEmptyLists(req), expected,
+                "DBS_LOAD_DUNGEON_COOL_TIME with no cool times");
+        }
+        Hex.True(DbProxyHandlers.IsHandledRequest(DbProxyHandlers.SDB_LOAD_2867),
+            "0x2867 must be answered by the handler, not the replay table - the reply carries a DLM id");
+    }
+
     /// <summary>Walks up from the test binary looking for a repo-relative file; null if not found.</summary>
     static string? FindRepoFile(string relative)
     {
