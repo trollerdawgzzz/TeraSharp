@@ -89,6 +89,14 @@ public static class HandlerRegistry
         var chat = new ChatHandlers(loggerFactory.CreateLogger<ChatHandlers>());
         Reg("C_CHAT", 4, chat.OnChat);
 
+        // --- Social: friends, blocks, whisper (Arbiter-owned) ---
+        var social = new SocialHandlers(loggerFactory.CreateLogger<SocialHandlers>());
+        Reg("C_ADD_FRIEND", 4, social.OnAddFriend);
+        Reg("C_DELETE_FRIEND", 4, social.OnDeleteFriend);
+        Reg("C_BLOCK_USER", 4, social.OnBlockUser);
+        Reg("C_REMOVE_BLOCKED_USER", 4, social.OnRemoveBlockedUser);
+        Reg("C_WHISPER", 4, social.OnWhisper);
+
         // --- Client settings (Arbiter-owned) ---
         Reg("C_REQUEST_CLIENT_CHAT_OPTION_SETTING", 0, ClientSettingsHandlers.OnRequestChatOption);
         Reg("C_REQUEST_CLIENT_UI_SETTING", 0, ClientSettingsHandlers.OnRequestUiSetting);
