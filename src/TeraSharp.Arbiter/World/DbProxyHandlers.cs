@@ -452,6 +452,7 @@ public sealed class DbProxyHandlers
 
     public const ushort SDB_QUEST_LIST = 0x272C;            // -> 0x272D
     public const ushort SDB_USER_ACHIEVEMENT = 0x27F8;      // -> 0x27F9 (1501B, reqId@304)
+    public const ushort DBS_LOAD_USER_ACHIEVEMENT = 0x27F9; // reply to 0x27F8 (T22 builder)
 
 
     // =====================================================================

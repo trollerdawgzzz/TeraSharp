@@ -592,8 +592,8 @@ CREATE TABLE IF NOT EXISTS characters (
   world_blob BLOB,
   -- T21: the system return point. The real Arbiter keeps this in dbo.spUpdateSysReturnLoc and
   -- restores it when WorldServer answers AS_ENTER_WORLD with SA_ENTER_WORLD_FAIL -- see
-  -- status/ENTER-WORLD-FALLBACK.md. return_zone 0 means "no return point" (the real Arbiter
-  -- tests `0 < User+0x1a8`).
+  -- status/ENTER-WORLD-FALLBACK.md. return_zone 0 means no return point (the real Arbiter
+  -- tests 0 < User+0x1a8).
   return_zone INTEGER NOT NULL DEFAULT 0,
   return_x REAL NOT NULL DEFAULT 0, return_y REAL NOT NULL DEFAULT 0, return_z REAL NOT NULL DEFAULT 0,
   dungeon_id INTEGER NOT NULL DEFAULT 0,
