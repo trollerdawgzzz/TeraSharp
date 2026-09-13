@@ -1,12 +1,32 @@
 # TeraSharp — Handoff for Autonomous Work
 
+## ⚠ READ THIS BLOCK FIRST — WORKSPACE RULES (non-negotiable)
+
+Every past autonomous session lost work by writing to the wrong place. Before editing ANY file:
+
+1. Run `git rev-parse --show-toplevel`. It MUST print `D:/v100/TERA_SERVER.100/TeraSharp` (or the backslash
+   form). If it prints anything else, or errors, STOP — you are in the wrong tree. Do not proceed.
+2. NEVER create or write to `D:\TeraSharp` — that is a stray wrong path a past session made. The only correct
+   root is `D:\v100\TERA_SERVER.100\TeraSharp`.
+3. Your sandbox filesystem is NOT the human's D: drive. "I wrote the file" is not enough — you must PROVE it
+   landed: after every write, run `git status --short` and confirm the file appears in the list. If it does
+   not appear, the write did not reach the real tree — stop and tell the human; do not keep going.
+4. When you finish, run `git status --short` and `git diff --stat` and paste them so the human can review and
+   commit. Do not assume your changes persisted.
+5. If a task's output is small (findings, a proposed patch, analysis), prefer pasting it **directly into the
+   chat** over writing a file — the file write is the step that keeps failing.
+
+These five rules exist because four sessions in a row reported "done" with work that never reached disk, or
+landed in `D:\TeraSharp` (a partial copy missing the project), forcing a painful manual merge. Do not repeat it.
+
+---
+
 TeraSharp is a from-scratch C# (.NET 8) replacement for TERA 100.02's `ArbiterServer.exe`.
 It is **working**: a real client logs in through it, and it bridges to the **real** `WorldServer.exe`,
 which drives gameplay (NPCs, combat, quests). Characters spawn in Velika with real NPCs, walk around,
 and their state persists to SQLite across logins.
 
-Read `STATUS.md` after this file — it's the previous session's report and supersedes anything here that
-conflicts. Everything you need is on disk. **Read the decompile, don't guess from packet timing.**
+Read `status/STATUS.md` after this file. Everything you need is on disk. **Read the decompile, don't guess.**
 
 ---
 
