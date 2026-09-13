@@ -101,6 +101,13 @@ public sealed class DbProxyHandlers
     public const ushort SDB_LOAD_WORLD_EVENT = 0x27B3;           // -> 0x27B4: [u32 reqId][u8 ok] (5B)
     public const ushort SDB_LOAD_FRIEND_INFO = 0x2910;           // -> 0x2911: [u8 ok][u32 reqId] (5B)
 
+    // --- Post-spawn per-user DB items (lobby_tap.log 02:52:07, right after SpawnComplete) ---
+    // Real order: 0x2736 -> 0x2737, 0x27CB x2 -> 0x27CC, 0x2930 -> 0x2931, 0x27B3 -> 0x27B4.
+    // 0x2736 has no replay entry (its captured 0x2737 was attributed to 0x15AE), so it was
+    // never answered with a live id and head-blocked the user from spawn onward.
+    public const ushort SDB_END_START_QUEST_LIST = 0x2736; public const ushort DBS_END_START_QUEST_LIST = 0x2737; // req [u32 reqId]; rsp [reqId][ok=1]
+    public const ushort SDB_LOAD_2930 = 0x2930;              public const ushort DBS_LOAD_2931 = 0x2931;          // req [reqId][u64 gameId][pid]; rsp 82 00 00 00 01 00
+
     // --- Remaining login-time SDB_* (programmatic builders) ---
     public const ushort SDB_LOAD_2867 = 0x2867;            // -> 0x2868: three empty lists + [ok][reqId]
     public const ushort SDB_LOAD_2869 = 0x2869;            // -> 0x286A: empty list + [ok][reqId] + timestamp
@@ -155,6 +162,10 @@ public sealed class DbProxyHandlers
             case SDB_LOAD_FRIEND_INFO:   // 0x2911 = [01][reqId]  (capture: 01 3D 00 00 00)
             case SDB_LOAD_290C:          // 0x290D = [01][reqId]  (capture: 01 3E 00 00 00)
             case SDB_EP_PERK:            // 0x27BA = static, reqId@8 (capture: 05.. 27.. 3F 00 00 00)
+            // Post-spawn steps (lobby_tap.log 02:52:07.09x-.11x).
+            case SDB_END_START_QUEST_LIST: // 0x2737 = [reqId][01]
+            case SDB_LOAD_2930:            // 0x2931 = [reqId][01][00]   (capture: 82 00 00 00 01 00)
+            case SDB_LOAD_WORLD_EVENT:     // 0x27B4 = [reqId][01]       (capture: 83 00 00 00 01)
                 break;               // handled by the real switch below
             default:
                 return false;        // -> replay table
@@ -172,6 +183,10 @@ public sealed class DbProxyHandlers
             case SDB_SAVE_2936: link.SendFrame(DBS_SAVE_2937, BuildDbs2937(payload)); return true;
             case SDB_DAILY_QUEST: link.SendFrame(DBS_DAILY_QUEST, BuildReqIdAck(payload, 16)); return true;
             case SDB_DAILY_QUEST_SEED: link.SendFrame(DBS_DAILY_QUEST_SEED, BuildReqIdAck(payload, 8)); return true;
+
+            // --- Post-spawn (reqId at payload[0] for all three) ---
+            case SDB_END_START_QUEST_LIST: link.SendFrame(DBS_END_START_QUEST_LIST, BuildReqIdAck(payload, 0)); return true;
+            case SDB_LOAD_2930:            link.SendFrame(DBS_LOAD_2931, Build2931(payload)); return true;
 
             // --- Login-time: empty-list Type 1 [off=19][count=0][reqId][ok=1], reqId at payload[0] ---
             case SDB_USER_LOAD_INVENTORY:       link.SendFrame((ushort)(op + 1), BuildEmptyListType1(payload, 0)); return true;
@@ -258,6 +273,16 @@ public sealed class DbProxyHandlers
         BitConverter.GetBytes(reqId).CopyTo(ack, 0);
         ack[4] = 1;
         return ack;
+    }
+
+    /// <summary>DBS 0x2931: [u32 reqId][u8 ok=1][u8 0] — 6 bytes (lobby_tap.log 02:52:07.112: 82 00 00 00 01 00).</summary>
+    public static byte[] Build2931(byte[] request)
+    {
+        uint reqId = request.Length >= 4 ? BitConverter.ToUInt32(request, 0) : 0;
+        var r = new byte[6];
+        BitConverter.GetBytes(reqId).CopyTo(r, 0);
+        r[4] = 1;
+        return r;
     }
 
     /// <summary>DBS_SAVE_2769: [u32 off][u32 0][u32 off][u32 0][u32 reqId][u8 1] — two empty lists.
