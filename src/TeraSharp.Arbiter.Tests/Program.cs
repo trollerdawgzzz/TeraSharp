@@ -5103,6 +5103,407 @@ array items
         Hex.True(ok.Length == 1 && ok[0] == 0xAB, "a 1-byte blob must survive the bounds checks");
     }
 
+    // ================================================================================
+    // T21 - relog into an instanced zone, and completed quests.
+    //
+    // Ground truth: D:\packetlogs\arb_world_2026-09-13T11-33-30-680Z.log, the "Test"
+    // (playerId 2) login at seq 835-2036. That character was saved inside instance 9827;
+    // WorldServer refused the enter, and the real Arbiter fell back to Velika.
+    //   seq 835  A->W 0x138E AS_ENTER_WORLD        continent 9827, ChannelInstanceId 0x0AF00001
+    //   seq 836  W->A 0x138D SA_ENTER_WORLD_FAIL   ticket 1, continent 9827, reason 2
+    //   seq 841  A->W 0x148D AS_CACHE_DUNGEON_COOL_TIME_TO_WORLD   +3.014 s (the 3000 ms timer)
+    //   seq 842  A->W 0x148D  (same record, counters cleared)
+    //   seq 843  A->W 0x138E  continent 5, ChannelInstanceId -1, (16260, 1253, -4410),
+    //                         Ticket 1 -> 2, ContinuousDungeonId 0 -> 9827
+    //   seq 881  A->W 0x272D  list 0 = quest 59904 in progress, list 2 = 59901/2/3 completed
+    // Layouts and the decompile trail: status/ENTER-WORLD-FALLBACK.md.
+    // ================================================================================
+
+    /// <summary>seq 835: AS_ENTER_WORLD for a character saved inside instance 9827.</summary>
+    static readonly byte[] Cap835EnterWorld = Hex.B(@"
+        00 00 00 00  00 00 00 00  AD 00 00 00  10 00 00 00
+        E0 23 11 D9  B2 01 00 00  20 A0 E5 C5  B1 01 00 00
+        02 00 00 00  01 00 00 00  00 00 00 00  E4 92 04 00
+        63 26 00 00  01 00 F0 0A  F8 1E 3C C6  79 3B D6 C6
+        00 98 8A C5  01 00 00 00  5C B6 FF FF  D0 07 00 00
+        01 00 00 00  02 00 F0 0A  00 80 00 00  00 00 00 00
+        00 00 00 00  00 00 00 06  00 00 00 00  00 00 00 00
+        00 00 00 00  00 00 00 00  00 00 00 00  00 00 00 00
+        00 03 00 00  00 14 00 00  00 07 00 00  00 03 00 00
+        00 00 00 00  00 00 00 00  00 00 00 00  00 00 00 00
+        00 00 00 00  00 00 00 00  00 00 00 00  00 00 00 00
+        00 00 00 00  00 00 00");
+
+    /// <summary>seq 836: SA_ENTER_WORLD_FAIL, the whole 32-byte payload.</summary>
+    static readonly byte[] Cap836EnterWorldFail = Hex.B(@"
+        E0 23 11 D9  B2 01 00 00  20 A0 E5 C5  B1 01 00 00
+        01 00 00 00  00 00 00 00  63 26 00 00  02 00 00 00");
+
+    /// <summary>seq 841: the first 0x148D push (cool-time list, counters 1/1).</summary>
+    static readonly byte[] Cap841CoolTime = Hex.B(@"
+        12 00 00 00  34 00 00 00  02 00 00 00  63 26 00 00
+        01 00 F0 0A  B2 07 01 00  01 00 00 00  00 00 00 00
+        00 00 00 00  EA 07 09 00  0C 00 07 00  00 00 00 00
+        00 00 00 00  01 00 00 00  01 00 00 00  00 00 00 00");
+
+    /// <summary>seq 842: the second 0x148D push (clear-count list, counters 0/0).</summary>
+    static readonly byte[] Cap842CoolTime = Hex.B(@"
+        12 00 00 00  34 00 00 00  02 00 00 00  63 26 00 00
+        01 00 F0 0A  B2 07 01 00  01 00 00 00  00 00 00 00
+        00 00 00 00  EA 07 09 00  0C 00 07 00  00 00 00 00
+        00 00 00 00  00 00 00 00  00 00 00 00  00 00 00 00");
+
+    /// <summary>seq 843: the re-sent AS_ENTER_WORLD.</summary>
+    static readonly byte[] Cap843EnterWorldRetry = Hex.B(@"
+        00 00 00 00  00 00 00 00  AD 00 00 00  10 00 00 00
+        E0 23 11 D9  B2 01 00 00  20 A0 E5 C5  B1 01 00 00
+        02 00 00 00  01 00 00 00  00 00 00 00  E4 92 04 00
+        05 00 00 00  FF FF FF FF  00 10 7E 46  00 A0 9C 44
+        00 D0 89 C5  01 00 00 00  5C B6 FF FF  D0 07 00 00
+        02 00 00 00  02 00 F0 0A  00 80 00 00  00 00 00 00
+        00 00 00 00  00 00 00 06  00 00 00 00  00 00 00 00
+        00 00 00 00  00 00 00 00  00 00 00 00  00 00 00 00
+        00 03 00 00  00 14 00 00  00 07 00 00  00 03 00 00
+        00 00 00 00  00 00 00 00  00 00 00 00  00 63 26 00
+        00 00 00 00  00 00 00 00  00 00 00 00  00 00 00 00
+        00 00 00 00  00 00 00");
+
+    /// <summary>seq 885: DBS_LOAD_DUNGEON_COOL_TIME - its list-1 record is the 0x148D blob.</summary>
+    static readonly byte[] Cap885LoadDungeonCoolTime = Hex.B(@"
+        23 00 00 00  34 00 00 00  57 00 00 00  00 00 00 00
+        57 00 00 00  00 00 00 00  01 65 00 00  00 63 26 00
+        00 01 00 F0  0A B2 07 01  00 01 00 00  00 00 00 00
+        00 00 00 00  00 EA 07 09  00 0C 00 07  00 00 00 00
+        00 00 00 00  00 00 00 00  00 00 00 00  00 00 00 00
+        00");
+
+    /// <summary>seq 881: DBS_LOAD_QUEST_LIST for "Test", one active quest and three completed.</summary>
+    static readonly byte[] Cap881QuestList = Hex.B(@"
+        3B 00 00 00  50 00 00 00  8B 00 00 00  00 00 00 00
+        8B 00 00 00  0C 00 00 00  97 00 00 00  00 00 00 00
+        97 00 00 00  00 00 00 00  97 00 00 00  14 00 00 00
+        01 63 00 00  00 05 00 00  00 00 EA 00  00 01 00 00
+        00 01 00 00  00 00 00 00  00 00 00 00  00 00 00 00
+        00 00 00 00  00 00 00 00  00 00 00 00  00 00 00 00
+        00 00 00 00  00 00 00 00  00 00 00 00  00 00 00 00
+        00 00 00 00  00 01 00 53  39 00 00 00  00 00 00 00
+        00 FF FF FF  FF FD E9 00  00 FE E9 00  00 FF E9 00
+        00 00 00 00  00 EA 07 09  00 0C 00 07  00 00 00 00
+        00 00 00 00  00");
+
+    /// <summary>The 2026-09-12 07:00 DateTime both the 0x148D records and the 0x272D trailer carry.</summary>
+    static readonly byte[] CapDailyResetDate = Hex.B(
+        "EA 07 09 00  0C 00 07 00  00 00 00 00  00 00 00 00");
+
+
+    /// <summary>seq 1137: SA_REQUEST_ENTER_DUNGEON for player 2 into 9827, return point (5, 16260, 1253, -4410).</summary>
+    static readonly byte[] Cap1137EnterDungeonReq = Hex.B(@"
+        20 A0 E5 C5  B1 01 00 00  63 26 00 00  00 00 00 00
+        00 00 00 00  00 00 00 00  00 00 00 00  F0 0A 00 00
+        02 00 00 00  00 B0 3E C6  00 30 D9 C6  00 28 89 C5
+        00 00 00 00  00 10 7E 46  00 A0 9C 44  00 D0 89 C5
+        05 00 00 00  00 00 00 00  00 00 00 00  00 00 00 00
+        00 00 0A 79  11 4E 00 00  00 5F BD 8B  65 02 00 00
+        02 00 00 00  00 00 00 00  20 80 A1 D4  66 02 00 00
+        9D B6 C5 C0  F6 7F 00 00  08 D7 5F 4A  B2 00 00 00
+        08 D7 5F 4A  B2 00 00 00  79 D6 5F 4A  B2 00 00 00
+        00 00 00 00  00 00 00 00  00 00 00 00  00 00 00 00
+        00 00 00 00  00 00 00 00  00 00 00 00  00 00 00 00
+        00 00 00 00  00 00 00 00  00 00 00 00  00 00 00 00
+        00 00 00 00  F0 0A 00 00  02 00 00 00  00 00 00 00
+        00");
+
+    /// <summary>seq 1159: SA_RESPONSE_ENTER_DUNGEON - same context plus the allocated instance and the ok byte.</summary>
+    static readonly byte[] Cap1159EnterDungeonRsp = Hex.B(@"
+        F0 0A 00 00  02 00 00 00  63 26 00 00  00 00 00 00
+        00 00 00 00  00 00 00 00  00 00 00 00  F0 0A 00 00
+        02 00 00 00  00 B0 3E C6  00 30 D9 C6  00 28 89 C5
+        00 00 00 00  00 10 7E 46  00 A0 9C 44  00 D0 89 C5
+        05 00 00 00  00 00 00 00  00 00 00 00  00 00 00 00
+        00 00 0A 79  11 4E 00 00  00 5F BD 8B  65 02 00 00
+        02 00 00 00  00 00 00 00  20 80 A1 D4  66 02 00 00
+        9D B6 C5 C0  F6 7F 00 00  08 D7 5F 4A  B2 00 00 00
+        08 D7 5F 4A  B2 00 00 00  79 D6 5F 4A  B2 00 00 00
+        00 00 00 00  01 00 F0 0A  01 00 00 00  00 00 00 00
+        00 00 00 00  00 00 00 00  00 00 00 00  00 00 00 00
+        00 00 00 00  00 00 00 00  00 00 00 00  00 00 00 00
+        00 00 00 00  F0 0A 00 00  02 00 00 00  00 00 00 00");
+
+
+    // ---- Part A: SA_ENTER_WORLD_FAIL (0x138D) ----
+
+    [Test] public static void EnterWorldFail_138D_parses_the_capture()
+    {
+        var f = DbProxyHandlers.ParseEnterWorldFail(Cap836EnterWorldFail)
+            ?? throw new Exception("seq 836 must parse");
+        Hex.True(f.ArbiterClient == BitConverter.ToUInt64(Cap835EnterWorld, 16),
+            "ArbiterClient echoes AS_ENTER_WORLD [16]");
+        Hex.True(f.ArbiterUser == BitConverter.ToUInt64(Cap835EnterWorld, 24),
+            "ArbiterUser echoes AS_ENTER_WORLD [24] - that is how we find the session");
+        Hex.True(f.Ticket == BitConverter.ToUInt32(Cap835EnterWorld, DbProxyHandlers.EnterWorldTicketOffset),
+            $"Ticket echoes AS_ENTER_WORLD [80], got {f.Ticket}");
+        Hex.True(f.LastIndex == 0, $"LastIndex, got {f.LastIndex}");
+        Hex.True(f.ContinuousDungeonId == 9827, $"the refused continent, got {f.ContinuousDungeonId}");
+        Hex.True(f.FailReason == 2, $"FailReason, got {f.FailReason}");
+    }
+
+    [Test] public static void EnterWorldFail_138D_needs_the_full_32_bytes()
+    {
+        Hex.True(DbProxyHandlers.EnterWorldFailMinPayload == 32,
+            "Handler_SA_ENTER_WORLD_FAIL checks frame > 0x25, i.e. a 32-byte payload");
+        Hex.True(DbProxyHandlers.ParseEnterWorldFail(Cap836EnterWorldFail[..31]) == null,
+            "a short frame must not parse");
+        Hex.True(DbProxyHandlers.ParseEnterWorldFail(null!) == null, "null must not parse");
+    }
+
+    [Test] public static void EnterWorldFail_only_reasons_1_to_3_retry()
+    {
+        // User::EnterWorldFail: `if (2 < reason - 1U) { SetLeaveWorldType(3); disconnect; }`.
+        foreach (uint r in new uint[] { 1, 2, 3 })
+            Hex.True(DbProxyHandlers.IsRetryableEnterWorldFailure(r), $"reason {r} retries");
+        foreach (uint r in new uint[] { 0, 4, 5, 0xFFFFFFFF })
+            Hex.True(!DbProxyHandlers.IsRetryableEnterWorldFailure(r), $"reason {r} must NOT retry");
+    }
+
+    [Test] public static void EnterWorld_retry_payload_matches_capture_seq_843()
+    {
+        var retry = DbProxyHandlers.BuildEnterWorldRetryPayload(
+            Cap835EnterWorld, zone: 5, x: 16260f, y: 1253f, z: -4410f,
+            channelInstanceId: 0xFFFFFFFF, ticket: 2, continuousDungeonId: 9827)
+            ?? throw new Exception("the capture payload is 183 bytes and must be accepted");
+        Hex.Eq(retry, Cap843EnterWorldRetry, "AS_ENTER_WORLD retry (capture seq 835 -> seq 843)");
+    }
+
+    [Test] public static void EnterWorld_retry_touches_only_the_five_fallback_fields()
+    {
+        // Anything else moving means we invented a field the real Arbiter leaves alone.
+        var changed = new List<int>();
+        for (int i = 0; i < Cap835EnterWorld.Length; i++)
+            if (Cap835EnterWorld[i] != Cap843EnterWorldRetry[i]) changed.Add(i);
+
+        var expected = new List<int>();
+        void Span(int off, int len) { for (int i = 0; i < len; i++) expected.Add(off + i); }
+        Span(DbProxyHandlers.EnterWorldContinentIdOffset, 4);
+        Span(DbProxyHandlers.EnterWorldChannelInstanceIdOffset, 4);
+        Span(DbProxyHandlers.EnterWorldPositionOffset, 12);
+        Span(DbProxyHandlers.EnterWorldTicketOffset, 4);
+        Span(DbProxyHandlers.EnterWorldContinuousDungeonIdOffset, 4);
+
+        Hex.True(changed.All(expected.Contains),
+            "seq 835 -> 843 changed a byte outside continent/channelInstance/position/ticket/"
+            + "continuousDungeonId: " + string.Join(",", changed.Except(expected)));
+        Hex.True(BitConverter.ToUInt32(Cap843EnterWorldRetry, DbProxyHandlers.EnterWorldTicketOffset)
+                 == BitConverter.ToUInt32(Cap835EnterWorld, DbProxyHandlers.EnterWorldTicketOffset) + 1,
+            "the retry takes the next ticket");
+    }
+
+    [Test] public static void EnterWorld_retry_rejects_a_payload_that_is_not_183_bytes()
+    {
+        Hex.True(DbProxyHandlers.BuildEnterWorldRetryPayload(new byte[182], 5, 0, 0, 0, 0, 0, 0) == null,
+            "182 bytes is not an AS_ENTER_WORLD payload");
+        Hex.True(DbProxyHandlers.BuildEnterWorldRetryPayload(null!, 5, 0, 0, 0, 0, 0, 0) == null, "null");
+    }
+
+    // ---- Part A: AS_CACHE_DUNGEON_COOL_TIME_TO_WORLD (0x148D) ----
+
+    [Test] public static void CacheDungeonCoolTime_148D_matches_capture_seq_841_and_842()
+    {
+        var withCounters = DbProxyHandlers.BuildDungeonCoolTimeRecord(
+            9827, 0x0AF00001, null, CapDailyResetDate, 1, 1, 0);
+        Hex.Eq(DbProxyHandlers.BuildCacheDungeonCoolTime(2, withCounters), Cap841CoolTime,
+            "0x148D push 1 (capture seq 841)");
+
+        var cleared = DbProxyHandlers.BuildDungeonCoolTimeRecord(
+            9827, 0x0AF00001, null, CapDailyResetDate, 0, 0, 0);
+        Hex.Eq(DbProxyHandlers.BuildCacheDungeonCoolTime(2, cleared), Cap842CoolTime,
+            "0x148D push 2 (capture seq 842)");
+    }
+
+    [Test] public static void DungeonCoolTime_record_is_the_same_one_0x2868_carries()
+    {
+        // DBS_LOAD_DUNGEON_COOL_TIME seq 885: 29-byte header (three [offset][length] pairs, ok,
+        // reqId) then one 52-byte record - byte-identical to the 0x148D blob at seq 842.
+        int blobOffset = (int)BitConverter.ToUInt32(Cap885LoadDungeonCoolTime, 0) - 6;
+        int blobLength = (int)BitConverter.ToUInt32(Cap885LoadDungeonCoolTime, 4);
+        Hex.True(blobOffset == 29, $"0x2868's first list starts at payload 29, got {blobOffset}");
+        Hex.True(blobLength == DbProxyHandlers.DungeonCoolTimeRecordSize,
+            $"one {DbProxyHandlers.DungeonCoolTimeRecordSize}-byte record, got {blobLength}");
+        Hex.Eq(Cap885LoadDungeonCoolTime[blobOffset..(blobOffset + blobLength)],
+            Cap842CoolTime[DbProxyHandlers.CacheDungeonCoolTimeHeader..],
+            "the 0x2868 list record and the 0x148D blob are the same DungeonCoolTimeElem");
+    }
+
+    [Test] public static void DungeonCoolTime_never_is_1970_and_the_record_is_52_bytes()
+    {
+        var r = DbProxyHandlers.BuildDungeonCoolTimeRecord(1, 2, null, null, 0, 0, 0);
+        Hex.True(r.Length == 52, $"DungeonCoolTimeElem is 52 bytes, got {r.Length}");
+        Hex.Eq(r[8..24], DbProxyHandlers.DungeonCoolTimeNever, "the default first DateTime is 'never'");
+        Hex.Eq(r[24..40], DbProxyHandlers.DungeonCoolTimeNever, "and so is the second");
+        Hex.True(BitConverter.ToUInt16(DbProxyHandlers.DungeonCoolTimeNever, 0) == 1970,
+            "the 'never' DateTime starts with the year 1970");
+    }
+
+    [Test] public static void CacheDungeonCoolTime_rejects_a_wrong_sized_record()
+    {
+        try { DbProxyHandlers.BuildCacheDungeonCoolTime(1, new byte[51]); }
+        catch (ArgumentException) { return; }
+        throw new Exception("a 51-byte record must be refused, not padded");
+    }
+
+    // ---- Part A: the 0x138D handler ----
+
+    [Test] public static void Handler_138D_pushes_two_148D_and_asks_for_a_retry()
+    {
+        using var store = StoreWithTwoCharacters();
+        store.SaveDungeonReturn(2, dungeonId: 9827, returnZone: 5, x: 16260f, y: 1253f, z: -4410f);
+        store.SaveInstancePdId(2, 0x0AF00001);
+
+        ulong gameId = BitConverter.ToUInt64(Cap836EnterWorldFail, DbProxyHandlers.EnterWorldFailArbiterUserOffset);
+        DbProxyHandlers.EnterWorldFailure? asked = null;
+        var handlers = FreshHandlers(store);
+        handlers.PlayerIdForGameId = g => g == gameId ? 2 : 0;
+        handlers.ResendEnterWorld = f => asked = f;
+
+        var frames = RunHandler(DbProxyHandlers.SA_ENTER_WORLD_FAIL, Cap836EnterWorldFail, 2, store, handlers);
+        foreach (var (op, _) in frames)
+            Hex.True(op == DbProxyHandlers.AS_CACHE_DUNGEON_COOL_TIME_TO_WORLD,
+                $"both pushes are 0x148D, got 0x{op:X4}");
+
+        // We keep no cool-time state, so both go out as "never entered" for the refused instance.
+        var expected = DbProxyHandlers.BuildCacheDungeonCoolTime(2,
+            DbProxyHandlers.BuildDungeonCoolTimeRecord(9827, 0x0AF00001, null, null, 0, 0, 0));
+        Hex.Eq(frames[0].body, expected, "0x148D push 1");
+        Hex.Eq(frames[1].body, expected, "0x148D push 2");
+
+        Hex.True(asked is { } a && a.ContinuousDungeonId == 9827 && a.FailReason == 2,
+            "the retry hook must be called with the parsed failure");
+    }
+
+    [Test] public static void Handler_138D_sends_nothing_when_the_hooks_are_not_wired()
+    {
+        // Unwired is the state on a fresh Program.cs: log it, retry nothing, push nothing.
+        var frames = RunHandler(DbProxyHandlers.SA_ENTER_WORLD_FAIL, Cap836EnterWorldFail, 0, store: null);
+        Hex.True(frames.Count == 0, $"nothing should go out, {frames.Count} frame(s) did");
+    }
+
+    [Test] public static void Handler_138D_does_not_retry_an_unrecoverable_reason()
+    {
+        var payload = (byte[])Cap836EnterWorldFail.Clone();
+        BitConverter.GetBytes(7u).CopyTo(payload, DbProxyHandlers.EnterWorldFailReasonOffset);
+
+        bool asked = false;
+        var handlers = FreshHandlers(null);
+        handlers.PlayerIdForGameId = _ => 2;
+        handlers.ResendEnterWorld = _ => asked = true;
+        var frames = RunHandler(DbProxyHandlers.SA_ENTER_WORLD_FAIL, payload, 0, null, handlers);
+
+        Hex.True(frames.Count == 0, "reason 7 sends nothing");
+        Hex.True(!asked, "and must not ask for a retry - the real Arbiter drops the user instead");
+    }
+
+    // ---- Part A: the return point ----
+
+    [Test] public static void Dungeon_entry_persists_the_return_point_and_the_instance()
+    {
+        using var store = StoreWithTwoCharacters();
+        Hex.True(store.GetDungeonReturn(2) == null, "no return point before any dungeon entry");
+
+        var handlers = FreshHandlers(store);
+        RunHandler1(DbProxyHandlers.SA_REQUEST_ENTER_DUNGEON, Cap1137EnterDungeonReq, store, handlers);
+        var afterRequest = store.GetDungeonReturn(2) ?? throw new Exception("the request carries the return point");
+        Hex.True(afterRequest.DungeonId == 9827, $"dungeon id, got {afterRequest.DungeonId}");
+        Hex.True(afterRequest.Zone == 5, $"return zone, got {afterRequest.Zone}");
+        Hex.True(afterRequest.X == 16260f && afterRequest.Y == 1253f && afterRequest.Z == -4410f,
+            $"return position, got ({afterRequest.X}, {afterRequest.Y}, {afterRequest.Z})");
+        Hex.True(afterRequest.InstancePdId == 0, "the request has no instance handle yet");
+
+        RunHandler1(DbProxyHandlers.SA_RESPONSE_ENTER_DUNGEON, Cap1159EnterDungeonRsp, store, handlers);
+        var afterResponse = store.GetDungeonReturn(2)!;
+        Hex.True(afterResponse.InstancePdId == 0x0AF00001,
+            $"the response carries the allocated instance, got 0x{afterResponse.InstancePdId:X8}");
+        Hex.True(store.GetCharacter(2)!.InstancePdId == 0x0AF00001,
+            "and it lands on the character row, which is where AS_ENTER_WORLD [52] reads it");
+    }
+
+    [Test] public static void Return_point_coordinates_are_truncated_to_int_like_the_real_arbiter()
+    {
+        // UpdateSysReturnLoc takes ints; EnterWorldFail widens them back with (float)(int).
+        // That is why the capture's fallback is exactly (16260, 1253, -4410) and not a fraction.
+        using var store = StoreWithTwoCharacters();
+        store.SaveDungeonReturn(1, 9827, 5, 16260.9f, 1253.4f, -4410.8f);
+        var p = store.GetDungeonReturn(1)!;
+        Hex.True(p.X == 16260f && p.Y == 1253f && p.Z == -4410f,
+            $"coordinates must round-trip as ints, got ({p.X}, {p.Y}, {p.Z})");
+    }
+
+    [Test] public static void Return_point_is_absent_for_zone_zero_and_can_be_cleared()
+    {
+        using var store = StoreWithTwoCharacters();
+        store.SaveDungeonReturn(1, 9827, 5, 1f, 2f, 3f);
+        Hex.True(store.GetDungeonReturn(1) != null, "stored");
+        store.ClearDungeonReturn(1);
+        Hex.True(store.GetDungeonReturn(1) == null,
+            "CleanSysReturnLoc zeroes the continent, and `0 < User+0x1a8` then fails");
+        Hex.True(store.GetCharacter(1)!.InstancePdId == 0, "and the instance handle goes with it");
+    }
+
+    // ---- Part B: completed quests in 0x272D list 2 ----
+
+    [Test] public static void QuestList_272D_matches_capture_seq_881_with_completed_ids()
+    {
+        var active = Cap881QuestList[53..133];
+        var trailer = Cap881QuestList[145..165];
+        var built = DbProxyHandlers.BuildDbs272D(
+            new[] { active }, new[] { 59901, 59902, 59903 }, reqId: 0x63, trailer: trailer);
+        Hex.Eq(built, Cap881QuestList,
+            "DBS_LOAD_QUEST_LIST with completed quests (arb_world_2026-09-13 seq 881)");
+    }
+
+    [Test] public static void QuestList_272D_puts_completed_ids_in_list_2()
+    {
+        var built = DbProxyHandlers.BuildDbs272D(Array.Empty<byte[]>(), new[] { 7, 8 }, 1);
+        Hex.True(BitConverter.ToUInt32(built, 4) == 0, "list 0 empty");
+        Hex.True(BitConverter.ToUInt32(built, 12) == 0, "list 1 empty");
+        Hex.True(BitConverter.ToUInt32(built, 20) == 8, "list 2 holds two ints");
+        Hex.True(BitConverter.ToUInt32(built, 28) == 0 && BitConverter.ToUInt32(built, 36) == 0,
+            "lists 3 and 4 stay empty");
+        Hex.True(BitConverter.ToUInt32(built, 16) == 6 + DbProxyHandlers.QuestListReplyHeader,
+            "list 2 starts right after list 0");
+        Hex.True(BitConverter.ToInt32(built, 53) == 7 && BitConverter.ToInt32(built, 57) == 8,
+            "and the ids are there in order");
+    }
+
+    [Test] public static void QuestList_272D_with_no_completed_quests_is_the_old_reply()
+    {
+        Hex.Eq(DbProxyHandlers.BuildDbs272D(Array.Empty<byte[]>(), Array.Empty<int>(), 18, null),
+            Cap272DEmpty, "the empty reply is unchanged by the list-2 work (cap_newchar seq 342)");
+    }
+
+    [Test] public static void Handler_272C_serves_completed_quest_ids()
+    {
+        using var store = StoreWithTwoCharacters();
+        var records = new[] { CapQuest59901, CapQuest59902, CapQuest59903, CapQuest59904 };
+        foreach (var rec in records)
+            store.UpsertQuest(2,
+                BitConverter.ToInt32(rec, DbProxyHandlers.QuestRecordQuestIdOffset),
+                BitConverter.ToInt32(rec, DbProxyHandlers.QuestRecordStatusOffset),
+                BitConverter.ToInt32(rec, DbProxyHandlers.QuestRecordStepOffset), rec);
+
+        var req = new byte[8];
+        BitConverter.GetBytes(0x63u).CopyTo(req, 0);
+        BitConverter.GetBytes(2u).CopyTo(req, 4);
+        var (op, body) = RunHandler1(DbProxyHandlers.SDB_QUEST_LIST, req, store);
+
+        Hex.True(op == 0x272D, $"reply opcode, got 0x{op:X4}");
+        Hex.True(BitConverter.ToUInt32(body, 20) == 12, "list 2 must carry the three completed ids");
+        int at = 53 + (int)BitConverter.ToUInt32(body, 4);
+        Hex.True(BitConverter.ToInt32(body, at) == 59901
+                 && BitConverter.ToInt32(body, at + 4) == 59902
+                 && BitConverter.ToInt32(body, at + 8) == 59903,
+            "the completed ids, in order");
+        Hex.Eq(body[53..133], CapQuest59904, "and 59904 is still the one active record");
+    }
+
     /// <summary>Walks up from the test binary looking for a repo-relative file; null if not found.</summary>
     static string? FindRepoFile(string relative)
     {

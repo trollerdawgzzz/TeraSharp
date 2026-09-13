@@ -35,6 +35,7 @@ back in the matching load.
 | 0x2736 SDB_END_START_QUEST_LIST (10 B)            | 0x2737        | [u32 reqId][u8 ok]                            | many  | real |
 | 0x27CB SDB_UPDATE_USER_DATA (blob)                | 0x27CC        | [u32 reqId][u32 1]                            | spawn, zone change, logout | real, persisted (SQLite) |
 | 0x2927 SDB_CANCEL_NPC_ARENA_BET (14 B)            | none          | fire-and-forget - the Arbiter handler has no SendToSession | periodic | **one-way (T15)**, in WorldReplayTable.OneWayFromWorld |
+| 0x138D SA_ENTER_WORLD_FAIL (38 B)                 | 0x148D        | two AS_CACHE_DUNGEON_COOL_TIME_TO_WORLD pushes, then a re-sent 0x138E with the stored return point | relog into an instance | **real (T21)**, status/ENTER-WORLD-FALLBACK.md |
 
 Every row above is covered by a test: `Every_per_user_request_opcode_is_answered` parses this
 table and fails the build if an opcode is neither in `DbProxyHandlers.IsHandledRequest` nor in

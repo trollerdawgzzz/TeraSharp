@@ -36,6 +36,22 @@ public sealed class CharacterRecord
     public DateTime LastLogout { get; set; }
     /// <summary>Opaque WorldServer state (15312 bytes). Null for never-entered characters.</summary>
     public byte[]? WorldBlob { get; set; }
+
+    // ---- T21: the dungeon return point (the real Arbiter's SysReturnLoc) ----
+    /// <summary>Continent to return to when a dungeon enter-world fails, 0 = none. User+0x1a8.</summary>
+    public int ReturnZone { get; set; }
+    /// <summary>Return position, stored as the real Arbiter stores it: ints, not floats. User+0x1b0/4/8.</summary>
+    public float ReturnX { get; set; }
+    public float ReturnY { get; set; }
+    public float ReturnZ { get; set; }
+    /// <summary>The instance this character last entered (DungeonEnterContext+0), 0 = none.</summary>
+    public int DungeonId { get; set; }
+    /// <summary>
+    /// ChannelInstanceId of that instance, as WorldServer allocated it in the 0x13C0 response
+    /// (DungeonEnterContext+140, 0x0AF00001 in the capture). Goes in AS_ENTER_WORLD [52] when
+    /// the saved zone IS that instance; 0 = none.
+    /// </summary>
+    public int InstancePdId { get; set; }
 }
 
 public sealed class AccountRecord
@@ -574,6 +590,14 @@ CREATE TABLE IF NOT EXISTS characters (
   position INTEGER NOT NULL DEFAULT 1,
   last_logout TEXT,
   world_blob BLOB,
+  -- T21: the system return point. The real Arbiter keeps this in dbo.spUpdateSysReturnLoc and
+  -- restores it when WorldServer answers AS_ENTER_WORLD with SA_ENTER_WORLD_FAIL -- see
+  -- status/ENTER-WORLD-FALLBACK.md. return_zone 0 means "no return point" (the real Arbiter
+  -- tests `0 < User+0x1a8`).
+  return_zone INTEGER NOT NULL DEFAULT 0,
+  return_x REAL NOT NULL DEFAULT 0, return_y REAL NOT NULL DEFAULT 0, return_z REAL NOT NULL DEFAULT 0,
+  dungeon_id INTEGER NOT NULL DEFAULT 0,
+  instance_pdid INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS ix_characters_account ON characters(account_id);
@@ -638,6 +662,12 @@ CREATE TABLE IF NOT EXISTS account_settings (
         // CREATE TABLE IF NOT EXISTS does nothing to a DB that already has `characters`, so
         // columns added later need their own idempotent step. terasharp.db predates `exp`.
         AddColumnIfMissing("characters", "exp", "INTEGER NOT NULL DEFAULT 0");
+        AddColumnIfMissing("characters", "return_zone", "INTEGER NOT NULL DEFAULT 0");
+        AddColumnIfMissing("characters", "return_x", "REAL NOT NULL DEFAULT 0");
+        AddColumnIfMissing("characters", "return_y", "REAL NOT NULL DEFAULT 0");
+        AddColumnIfMissing("characters", "return_z", "REAL NOT NULL DEFAULT 0");
+        AddColumnIfMissing("characters", "dungeon_id", "INTEGER NOT NULL DEFAULT 0");
+        AddColumnIfMissing("characters", "instance_pdid", "INTEGER NOT NULL DEFAULT 0");
     }
 
     /// <summary>ALTER TABLE ADD COLUMN, but a no-op when the column is already there.</summary>
@@ -976,6 +1006,102 @@ SELECT last_insert_rowid();";
         }
     }
 
+    // ---- Dungeon return point (T21) ----
+    //
+    // The real Arbiter keeps five ints on the User (0x1a8 continent, 0x1ac channelInstanceId,
+    // 0x1b0/4/8 x/y/z as INTS) and writes them through dbo.spUpdateSysReturnLoc, so they survive
+    // a restart. Handler_SA_RESPONSE_ENTER_DUNGEON (ArbiterServer.exe.c, scope tracer
+    // "bool __cdecl Handler_SA_RESPONSE_ENTER_DUNGEON(...)") calls
+    // User::UpdateSysReturnLoc(returnContinent, currentChannelInstanceId, (int)x, (int)y, (int)z)
+    // with the return fields the DungeonEnterContext carries, and User::EnterWorldFail reads them
+    // back when WorldServer refuses the enter. Layout and evidence: status/ENTER-WORLD-FALLBACK.md.
+    //
+    // We keep the same five values plus the dungeon id, on the character row.
+
+    /// <summary>
+    /// Where a character goes when WorldServer refuses to let it into its saved instance.
+    /// DungeonId is DungeonEnterContext+0 (the instance entered), InstancePdId is
+    /// DungeonEnterContext+140 (WorldServer's handle for it), Zone/X/Y/Z are
+    /// DungeonEnterContext+56/44/48/52 (the continent and position to fall back to).
+    /// </summary>
+    public sealed record DungeonReturnPoint(int DungeonId, int InstancePdId, int Zone, float X, float Y, float Z);
+
+    /// <summary>
+    /// Record the return point a dungeon entry carries (SA_REQUEST_ENTER_DUNGEON 0x13BE, and again
+    /// on the 0x13C0 response). The real Arbiter truncates the coordinates to int on the way in and
+    /// widens them back to float on the way out, so we do the same - otherwise a re-sent
+    /// AS_ENTER_WORLD would not be byte-identical to the real one.
+    /// Returns false when the character row is missing.
+    /// </summary>
+    public bool SaveDungeonReturn(int characterId, int dungeonId, int returnZone, float x, float y, float z)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE characters SET dungeon_id = $d, return_zone = $rz, "
+                            + "return_x = $rx, return_y = $ry, return_z = $rzz WHERE id = $id";
+            cmd.Parameters.AddWithValue("$d", dungeonId);
+            cmd.Parameters.AddWithValue("$rz", returnZone);
+            cmd.Parameters.AddWithValue("$rx", (float)(int)x);
+            cmd.Parameters.AddWithValue("$ry", (float)(int)y);
+            cmd.Parameters.AddWithValue("$rzz", (float)(int)z);
+            cmd.Parameters.AddWithValue("$id", characterId);
+            bool ok = cmd.ExecuteNonQuery() == 1;
+            if (!ok) _log.LogWarning("SaveDungeonReturn: character {Id} not found", characterId);
+            else _log.LogInformation(
+                "Character {Id} entered dungeon {Dg}; return point zone {Z} ({X:F0}, {Y:F0}, {Zz:F0})",
+                characterId, dungeonId, returnZone, x, y, z);
+            return ok;
+        }
+    }
+
+    /// <summary>
+    /// The ChannelInstanceId WorldServer allocated for the instance, from the 0x13C0 response.
+    /// It is what AS_ENTER_WORLD [52] must carry on a relog into that instance (capture
+    /// 0x0AF00001); 0 clears it.
+    /// </summary>
+    public bool SaveInstancePdId(int characterId, int pdId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE characters SET instance_pdid = $p WHERE id = $id";
+            cmd.Parameters.AddWithValue("$p", pdId);
+            cmd.Parameters.AddWithValue("$id", characterId);
+            bool ok = cmd.ExecuteNonQuery() == 1;
+            if (!ok) _log.LogWarning("SaveInstancePdId: character {Id} not found", characterId);
+            return ok;
+        }
+    }
+
+    /// <summary>
+    /// User::CleanSysReturnLoc - UpdateSysReturnLoc(0,0,0,0,0). The real Arbiter calls it on a
+    /// dungeon response that is not flagged to set a return point, and on a normal zone change.
+    /// </summary>
+    public bool ClearDungeonReturn(int characterId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE characters SET dungeon_id = 0, instance_pdid = 0, "
+                            + "return_zone = 0, return_x = 0, return_y = 0, return_z = 0 WHERE id = $id";
+            cmd.Parameters.AddWithValue("$id", characterId);
+            return cmd.ExecuteNonQuery() == 1;
+        }
+    }
+
+    /// <summary>
+    /// The stored return point, or null when there is none. Mirrors the real Arbiter's guard in
+    /// User::EnterWorldFail: <c>if (0 &lt; User+0x1a8)</c> - a zone of 0 means "nothing saved",
+    /// and the fallback then comes from the continent table instead.
+    /// </summary>
+    public DungeonReturnPoint? GetDungeonReturn(int characterId)
+    {
+        var c = GetCharacter(characterId);
+        if (c == null || c.ReturnZone <= 0) return null;
+        return new DungeonReturnPoint(c.DungeonId, c.InstancePdId, c.ReturnZone, c.ReturnX, c.ReturnY, c.ReturnZ);
+    }
+
     // ---- Quests (T17) ----
 
     /// <summary>Status value meaning "completed" in the 80-byte record at +8.</summary>
@@ -1185,6 +1311,12 @@ DELETE FROM blocks  WHERE character_id IN (SELECT id FROM characters WHERE id = 
         Position = r.GetInt32(r.GetOrdinal("position")),
         LastLogout = r["last_logout"] is string s ? DateTime.Parse(s) : DateTime.MinValue,
         WorldBlob = r["world_blob"] is byte[] b ? b : null,
+        ReturnZone = r.GetInt32(r.GetOrdinal("return_zone")),
+        ReturnX = (float)r.GetDouble(r.GetOrdinal("return_x")),
+        ReturnY = (float)r.GetDouble(r.GetOrdinal("return_y")),
+        ReturnZ = (float)r.GetDouble(r.GetOrdinal("return_z")),
+        DungeonId = r.GetInt32(r.GetOrdinal("dungeon_id")),
+        InstancePdId = r.GetInt32(r.GetOrdinal("instance_pdid")),
     };
 
     // ---- Friends ----
