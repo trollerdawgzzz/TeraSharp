@@ -1,4 +1,4 @@
-using Microsoft.Extensions.Logging;
+﻿using Microsoft.Extensions.Logging;
 using TeraSharp.Arbiter.Game;
 using TeraSharp.Arbiter.Network;
 using TeraSharp.Arbiter.Persistence;
@@ -46,12 +46,11 @@ public static class WorldEntry
         s.EnterWorld();
 
         // 4. Tell World about the player â€” built from character data, not replayed.
-        var enterPayload = BuildEnterWorldPayload(s.GameId, chr, s.TunnelKey);
+        var record = Program.Store?.GetCharacter((int)chr.Id);
+        var enterPayload = BuildEnterWorldPayload(s.GameId, chr, record?.WorldBlob, s.TunnelKey);
         w.SendFrame(WorldBridge.OpPlayerEnter, enterPayload);
 
         // 5. Send character data (world blob) to World.
-        var store = Program.Store;
-        var record = store?.GetCharacter((int)chr.Id);
         var charDataPayload = BuildCharacterDataPayload((int)chr.Id, record?.WorldBlob);
         w.SendFrame(WorldBridge.OpCharacterData, charDataPayload);
 
@@ -90,6 +89,9 @@ public static class WorldEntry
     ///   param_27 [129]    = 3                 (FUN_1407176f0, server config)
     /// </summary>
     internal static byte[] BuildEnterWorldPayload(ulong gameId, FakeCharacter chr, uint tunnelKey = 5)
+        => BuildEnterWorldPayload(gameId, chr, null, tunnelKey);
+
+    internal static byte[] BuildEnterWorldPayload(ulong gameId, FakeCharacter chr, byte[]? worldBlob, uint tunnelKey = 5)
     {
         var buf = new byte[183];
         var w = new SpanWriter(buf);
@@ -123,13 +125,20 @@ public static class WorldEntry
         // [48..51] Zone (param_8, User+0x19c)
         w.U32((uint)chr.Zone);
 
-        // [52..55] Unknown u32 (param_9, User+0x1a0). Capture=0.
-        w.U32(0);
+        // [52..55] param_9 (User+0x1a0). Real Arbiter sends -1 (lobby_tap.log pkt 127) and World then
+        //          restores position from the blob; 0 (old capture) makes x/y/z authoritative.
+        w.U32(0xFFFFFFFF);
 
         // [56..67] Position float3 (param_10, User+0x18c/190/194)
-        w.Float(chr.X);
-        w.Float(chr.Y);
-        w.Float(chr.Z);
+        // Prefer the blob's last-saved position (offset 220) so this is right even if World honours it.
+        float px = chr.X, py = chr.Y, pz = chr.Z;
+        if (worldBlob != null && worldBlob.Length >= 232)
+        {
+            px = BitConverter.ToSingle(worldBlob, 220);
+            py = BitConverter.ToSingle(worldBlob, 224);
+            pz = BitConverter.ToSingle(worldBlob, 228);
+        }
+        w.Float(px); w.Float(py); w.Float(pz);
 
         // [68..71] Likely character level (param_11, FUN_1403860c0 of User). Capture=1.
         w.U32((uint)chr.Level);
