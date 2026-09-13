@@ -106,7 +106,7 @@ public sealed class WorldBridge
     private readonly object _playersLock = new();
 
     /// <summary>Allocate a unique tunnel key for a new player session.</summary>
-    internal uint AllocateTunnelKey() { lock (_reorderLock) return 5; }  // single-player: always slot 5 (what World's handshake wires). Multi-player revisits this with the 2-login capture.
+    internal uint AllocateTunnelKey() { lock (_reorderLock) return _nextTunnelKey; }  // pinned to 5 for single-player; see field comment  // single-player: always slot 5 (what World's handshake wires). Multi-player revisits this with the 2-login capture.
 
     public void RegisterPlayer(GameSession s)
     {

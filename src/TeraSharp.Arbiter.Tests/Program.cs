@@ -2338,9 +2338,8 @@ array items
         var pkt = Hex.B(CreateUserPkt35);
         Hex.True(pkt.Length == 146, $"packet 35 should be 146 bytes, got {pkt.Length}");
 
-        var req = CharacterHandlers.ParseCreateUser(pkt);
+        var req = CharacterHandlers.ParseCreateUser(pkt)!;
         Hex.True(req != null, "ParseCreateUser returned null for packet 35");
-        req = req!;
 
         Hex.True(req.Name == "Test", $"name: expected 'Test', got '{req.Name}'");
         Hex.True(req.Gender == 1, $"gender: expected 1, got {req.Gender}");
