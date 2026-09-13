@@ -346,11 +346,45 @@ public sealed class DbProxyHandlers
     public const ushort SDB_LOAD_290C = 0x290C;            // -> pushes 0x15B1 + 0x2847 + 0x1440 + 0x143E, then 0x290D
 
     // --- Remaining login-time SDB_* (static data from capture, reqId patched at runtime) ---
+    // --- SDB_LOAD_TUTORIAL_SIMPLE_TIP (0x2872) -> DBS_LOAD_TUTORIAL_SIMPLE_TIP (0x2873), T22 ---
+    // Fed by SDB_ADD_TUTORIAL_SIMPLE_TIP (0x286E), one tip id per write.
+    //   req  [0] u32 reqId  [4] u32 playerId                       (handler needs frame >= 0x0e)
+    //   rsp  [0] u32 listOff=19 [4] u32 listLen [8] u32 reqId [12] u8 ok=1, then 8 B per tip
+    //   tip  [u32 tipId][u32 1]   - the second word is 1 in every record of every capture
+    // cap_newchar.log adds tips 1, 2, 35 and 39 (seq 719/765/864/911); the relog capture serves
+    // exactly those four, in that order, to both characters. Empty list for a fresh character
+    // (cap_newchar seq 176).
     public const ushort SDB_TUTORIAL_SIMPLE_TIP = 0x2872;   // -> 0x2873 (45B, reqId@8)
+    public const ushort DBS_TUTORIAL_SIMPLE_TIP = 0x2873;
+    public const int TutorialTipReplyHeader = 13;
+    public const int TutorialTipRecordSize = 8;
+    /// <summary>0x286E: [0] reqId [4] userDbId [8] tipId.</summary>
+    public const int TutorialTipIdOffset = 8;
     public const ushort SDB_REPUTATION_LIST = 0x288F;       // -> 0x2890 (65B, reqId@9)
     public const ushort SDB_LOAD_293A = 0x293A;             // -> 0x293B (46B, reqId@8)
     public const ushort SDB_FATIGABILITY_LIST = 0x2908;     // -> 0x2909 (45B, reqId@9)
+    // --- SDB_INIT_SEREN_GUIDE_INFO (0x2942) -> DBS_INIT_SEREN_GUIDE_INFO (0x2943), T22 ---
+    // Fed by SDB_UPDATE_SEREN_GUIDE_INFO (0x2944), one (type, id) pair per write.
+    //   req  [0] u32 reqId  [4] u32 playerId
+    //   rsp  [0] u32 listOff=23 [4] u32 listLen [8] u32 reqId [12] u32 playerId [16] u8 ok=1,
+    //        then 8 B per row: [u32 serenType][u32 serenId]
+    // The row set is fixed at <see cref="SerenGuideTypes"/> and a character that has never
+    // written one gets an EMPTY list (cap_newchar seq 380), not six zero rows. Test wrote
+    // (type 2, id 1804) and (type 4, id 36) in cap_newchar; his relog reply carries the six
+    // rows with type 4 = 36 and everything else 0 - type 2 is simply not in the served set.
     public const ushort SDB_SEREN_GUIDE = 0x2942;           // -> 0x2943 (65B, reqId@8)
+    public const ushort DBS_SEREN_GUIDE = 0x2943;
+    public const int SerenGuideReplyHeader = 17;
+    public const int SerenGuideRecordSize = 8;
+    /// <summary>0x2944: [0] reqId [4] userDbId [8] serenType [12] serenId.</summary>
+    public const int SerenGuideTypeOffset = 8;
+    public const int SerenGuideIdOffset = 12;
+    /// <summary>
+    /// The six seren-guide slots every 0x2943 with content carries, in wire order. Observed, not
+    /// derived: both characters in the relog capture get exactly these, and no other type has
+    /// ever appeared in a reply (Test's stored type 2 does not).
+    /// </summary>
+    public static readonly int[] SerenGuideTypes = { 4, 13, 14, 15, 16, 17 };
     public const ushort SDB_EP_PERK = 0x27B9;               // -> 0x27BA (113B, reqId@8)
     // --- Quests (T17). Layouts and the capture evidence: status/QUEST-DESIGN.md ---
     //
@@ -525,6 +559,95 @@ public sealed class DbProxyHandlers
     public const int AchievementReplyHeader = 13;
     /// <summary>One accomplished-achievement record: [u32 achievementId][u32 0][7 x u16 date][u16 pad].</summary>
     public const int AchievementRecordSize = 0x18;
+    /// <summary>The achievement id at record+0. The rest of the record is stored verbatim.</summary>
+    public const int AchievementRecordIdOffset = 0;
+
+    // --- SDB_LOAD_USER_ACHIEVEMENT (0x27F8) -> DBS_LOAD_USER_ACHIEVEMENT (0x27F9),
+    //     fed by SDB_UPDATE_USER_ACHIEVEMENT (0x27FA) and SDB_ACCOMPLISH_USER_ACHIEVEMENT (0x2802).
+    //     Full write-up and the capture evidence: status/ACHIEVEMENTS.md.
+    //
+    // Both messages are [u32 offset][u32 length] tables followed by the bodies, and the list
+    // NAMES come from the Arbiter's own packet dumpers, which is what makes the mapping between
+    // them provable rather than guessed:
+    //
+    //   0x27FA save: 35 pairs (payload 0..279), [280] u32 reqId, [284] u32 playerId, bodies at 288
+    //   0x27F9 load: 38 pairs (payload 0..303), [304] u32 reqId, [308] u8 ok,       bodies at 309
+    //
+    // List 0 of both is `Data`, a fixed 1184-byte blob. The load has three lists the save does
+    // not: 1 AchievementGrades and 16 BattleFieldRankList (empty in every capture) and 34
+    // AccomplishedAchievementList, which comes from 0x2802 instead.
+    public const int AchievementSaveListCount = 35;
+    public const int AchievementSaveReqIdOffset = 280;
+    public const int AchievementSavePlayerIdOffset = 284;
+    public const int AchievementSaveHeader = 288;
+    public const int AchievementLoadListCount = 38;
+    public const int AchievementLoadReqIdOffset = 304;
+    public const int AchievementLoadOkOffset = 308;
+    public const int AchievementLoadHeader = 309;
+    /// <summary>List 0 of both messages: the fixed-size opaque progress blob.</summary>
+    public const int AchievementDataSize = 1184;
+    /// <summary>Load list 34, the one 0x2802 feeds.</summary>
+    public const int AchievementAccomplishedListIndex = 34;
+
+    /// <summary>
+    /// Save list index -> load list index, matched by the names the two packet dumpers print.
+    /// Verified on the wire: the six non-empty lists of relog seq 1137 land byte for byte on the
+    /// six non-empty lists of relog seq 883, including the two that are NOT a simple shift
+    /// (save 23 AcquireCombatItemTypeList -> load 28 AcquireItemCombatTypeCountList, and
+    /// save 31 CityWarRankList -> load 30).
+    /// </summary>
+    public static readonly int[] AchievementSaveToLoadList =
+    {
+        /*  0 Data                                */  0,
+        /*  1 MonsterKillCountList                */  2,
+        /*  2 MonsterKillByMyselfCountList        */  3,
+        /*  3 MonsterKilledMeCountList            */  4,
+        /*  4 PvpDoneCountList                    */  5,
+        /*  5 PvpWinCountList                     */  6,
+        /*  6 ItemLootCountList                   */  7,
+        /*  7 ItemUseCountList                    */  8,
+        /*  8 QuestClearCountByQidList            */  9,
+        /*  9 SkillMonsterKillCountList           */ 10,
+        /* 10 SkillUseCountList                   */ 11,
+        /* 11 AccumulatedReputationPointList      */ 12,
+        /* 12 DailyQuestCompletedCountList        */ 13,
+        /* 13 EventMailReceivedInfoList           */ 14,
+        /* 14 BattleFieldWinCountList             */ 15,
+        /* 15 AbnormalityCounterList              */ 17,
+        /* 16 BattleFieldWinContinuouslyCountList */ 18,
+        /* 17 LootItemInContinentList             */ 19,
+        /* 18 ItemUseInContinentList              */ 20,
+        /* 19 KnockDownMonsterList                */ 21,
+        /* 20 RearAttackMonsterList               */ 22,
+        /* 21 CriticalAttackMonsterList           */ 23,
+        /* 22 HealByItemSkillList                 */ 24,
+        /* 23 AcquireCombatItemTypeList           */ 28,
+        /* 24 SkillUserKillCountList              */ 25,
+        /* 25 BattleFieldTopContribCountList      */ 26,
+        /* 26 RunWorkObjectCountList              */ 27,
+        /* 27 MountSkillUseCountList              */ 29,
+        /* 28 NpcContactList                      */ 36,
+        /* 29 ContentUserKillList                 */ 31,
+        /* 30 ContentUserDeathList                */ 32,
+        /* 31 CityWarRankList                     */ 30,
+        /* 32 LeaderBoardRankList                 */ 33,
+        /* 33 NoDieNpcKillList                    */ 35,
+        /* 34 BattleFieldWinCountByHeroList       */ 37,
+    };
+
+    /// <summary>
+    /// The 1184-byte Data blob the real Arbiter sends for a character that has never saved
+    /// (cap_newchar.log seq 344). It is all zeros except two u16s, so it is built rather than
+    /// carried as a data file. Both values look like Arbiter-side achievement-template counts;
+    /// we send what the capture sent.
+    /// </summary>
+    public static byte[] FreshAchievementData()
+    {
+        var d = new byte[AchievementDataSize];
+        BitConverter.GetBytes((ushort)64228).CopyTo(d, 1052);
+        BitConverter.GetBytes((ushort)622).CopyTo(d, 1180);
+        return d;
+    }
 
     // --- SDB_UPDATE_REPUTATION_INFO (0x2891) -> DBS_UPDATE_REPUTATION_INFO (0x2892) ---
     // cap_newchar.log seq 413 -> 417, 78 B -> 11 B.
@@ -667,6 +790,14 @@ public sealed class DbProxyHandlers
             case SDB_UPDATE_SEREN_GUIDE_INFO:     // 0x2945 = [reqId][playerId][ok]
             case SDB_UPDATE_USER_DAILY_EVENT_COUNT: // 0x293D = [reqId][ok], reqId at payload[8]
             case SDB_UPDATE_GET_EXTRA_REWARD:     // 0x293F = [reqId][ok]
+            // --- T22: the per-character login loads, rebuilt from rows instead of replaying
+            // dob's captured reply to everyone. Each one is byte-exact against BOTH the
+            // brand-new-character reply in cap_newchar.log and the with-progress reply in
+            // arb_world_2026-09-13; playerId 1 still gets the capture. ---
+            case SDB_USER_ACHIEVEMENT:            // 0x27F9 from the stored 0x27FA + 0x2802 records
+            case SDB_TUTORIAL_SIMPLE_TIP:         // 0x2873 from the stored 0x286E tips
+            case SDB_SEREN_GUIDE:                 // 0x2943 from the stored 0x2944 slots
+            case SDB_LOAD_2867:                   // 0x2868 three empty lists with the LIVE reqId
                 return true;
             default:
                 return false;        // -> replay table
@@ -692,7 +823,7 @@ public sealed class DbProxyHandlers
             case SDB_SET_QUEST_INFO: return OnSetQuestInfo(link, payload);
 
             // --- Logout save sequence (reqId echoed from the live request) ---
-            case SDB_SAVE_27FA: link.SendFrame(DBS_SAVE_27FB, BuildReqIdAck(payload, 280)); return true;
+            case SDB_SAVE_27FA: return OnSaveUserAchievement(link, payload);
             case SDB_SAVE_2924: link.SendFrame(DBS_SAVE_2925, BuildReqIdAck(payload, 8)); return true;
             case SDB_SAVE_2768: return OnItemSingle(link, payload);
             case SDB_SAVE_2936: link.SendFrame(DBS_SAVE_2937, BuildDbs2937(payload)); return true;
@@ -703,8 +834,8 @@ public sealed class DbProxyHandlers
             case SDB_USER_LEARN_SKILL:            return OnUserLearnSkill(link, payload);
             case SDB_ACCOMPLISH_USER_ACHIEVEMENT: return OnAccomplishUserAchievement(link, payload);
             case SDB_UPDATE_REPUTATION_INFO:        link.SendFrame(DBS_UPDATE_REPUTATION_INFO, BuildDbs2892(payload)); return true;
-            case SDB_ADD_TUTORIAL_SIMPLE_TIP:       link.SendFrame(DBS_ADD_TUTORIAL_SIMPLE_TIP, BuildReqIdAck(payload, 0)); return true;
-            case SDB_UPDATE_SEREN_GUIDE_INFO:       link.SendFrame(DBS_UPDATE_SEREN_GUIDE_INFO, BuildDbs2945(payload)); return true;
+            case SDB_ADD_TUTORIAL_SIMPLE_TIP:       return OnAddTutorialTip(link, payload);
+            case SDB_UPDATE_SEREN_GUIDE_INFO:       return OnUpdateSerenGuide(link, payload);
             case SDB_UPDATE_USER_DAILY_EVENT_COUNT: link.SendFrame(DBS_UPDATE_USER_DAILY_EVENT_COUNT, BuildReqIdAck(payload, 8)); return true;
             case SDB_UPDATE_GET_EXTRA_REWARD:       link.SendFrame(DBS_UPDATE_GET_EXTRA_REWARD, BuildReqIdAck(payload, 0)); return true;
 
@@ -812,14 +943,14 @@ public sealed class DbProxyHandlers
             }
 
             // --- Remaining login-time: static-data handlers (clone template, patch reqId) ---
-            case SDB_TUTORIAL_SIMPLE_TIP: link.SendFrame(0x2873, BuildFromStaticData(DbProxyStaticData.Tutorial, DbProxyStaticData.TutorialReqIdOffset, payload)); return true;
+            case SDB_TUTORIAL_SIMPLE_TIP: return OnLoadTutorialTips(link, payload);
             case SDB_REPUTATION_LIST:     link.SendFrame(0x2890, BuildFromStaticData(DbProxyStaticData.Reputation, DbProxyStaticData.ReputationReqIdOffset, payload)); return true;
             case SDB_LOAD_293A:           link.SendFrame(0x293B, BuildFromStaticData(DbProxyStaticData.Load293B, DbProxyStaticData.Load293BReqIdOffset, payload)); return true;
             case SDB_FATIGABILITY_LIST:   link.SendFrame(0x2909, BuildFromStaticData(DbProxyStaticData.Fatigability, DbProxyStaticData.FatigabilityReqIdOffset, payload)); return true;
-            case SDB_SEREN_GUIDE:         link.SendFrame(0x2943, BuildFromStaticData(DbProxyStaticData.SerenGuide, DbProxyStaticData.SerenGuideReqIdOffset, payload)); return true;
+            case SDB_SEREN_GUIDE:         return OnLoadSerenGuide(link, payload);
             case SDB_EP_PERK:             link.SendFrame(0x27BA, BuildFromStaticData(DbProxyStaticData.EpPerk, DbProxyStaticData.EpPerkReqIdOffset, payload)); return true;
             case SDB_QUEST_LIST:          return OnLoadQuestList(link, payload);
-            case SDB_USER_ACHIEVEMENT:    link.SendFrame(0x27F9, BuildFromStaticData(DbProxyStaticData.Achievement, DbProxyStaticData.AchievementReqIdOffset, payload)); return true;
+            case SDB_USER_ACHIEVEMENT:    return OnLoadUserAchievement(link, payload);
 
             default:
                 // IsHandledRequest said yes and there is no case for it: the request now falls
@@ -1466,14 +1597,168 @@ public sealed class DbProxyHandlers
         return true;
     }
 
-    /// <summary>SDB_ACCOMPLISH_USER_ACHIEVEMENT (0x2802) -&gt; DBS (0x2803).</summary>
+    /// <summary>
+    /// SDB_ACCOMPLISH_USER_ACHIEVEMENT (0x2802) -&gt; DBS (0x2803). Every record is offered to the
+    /// store, which keeps the first one per achievement; the reply carries only the ones that
+    /// were actually new, which is what makes a re-submitted achievement come back as the
+    /// 19-byte empty form the real Arbiter sent (cap_newchar.log seq 2606).
+    /// </summary>
     private bool OnAccomplishUserAchievement(WorldLink link, byte[] payload)
     {
-        var reply = BuildDbs2803(payload);
-        int n = (int)BitConverter.ToUInt32(reply, 4) / AchievementRecordSize;
-        _log.LogInformation("SDB_ACCOMPLISH_USER_ACHIEVEMENT: echoed {N} record(s) as newly accomplished", n);
-        link.SendFrame(DBS_ACCOMPLISH_USER_ACHIEVEMENT, reply);
+        int playerId = payload.Length >= AchievementRequestHeader
+            ? (int)BitConverter.ToUInt32(payload, 12) : 0;
+
+        var offeredRecords = SliceAchievementRecords(payload);
+        var kept = offeredRecords;                     // no store: every record looks new
+        if (_store is not null && playerId > 0)
+        {
+            var offered = new List<(int Id, byte[] Record)>(offeredRecords.Count);
+            foreach (var rec in offeredRecords)
+                offered.Add(((int)BitConverter.ToUInt32(rec, AchievementRecordIdOffset), rec));
+            kept = _store.AddAccomplishedAchievements(playerId, offered);
+        }
+
+        _log.LogInformation("SDB_ACCOMPLISH_USER_ACHIEVEMENT: player {Pid} offered {O}, {N} newly accomplished",
+            playerId, offeredRecords.Count, kept.Count);
+        link.SendFrame(DBS_ACCOMPLISH_USER_ACHIEVEMENT, BuildDbs2803(payload, null, kept));
         return true;
+    }
+
+    /// <summary>The 24-byte records carried by a 0x2802 request, in order. Empty when malformed.</summary>
+    public static List<byte[]> SliceAchievementRecords(byte[] request)
+    {
+        var recs = new List<byte[]>();
+        if (request is null || request.Length < 8) return recs;
+        int start = (int)BitConverter.ToUInt32(request, 0) - 6;      // frame-relative
+        int len = (int)BitConverter.ToUInt32(request, 4);
+        if (start < AchievementRequestHeader || len <= 0 || len % AchievementRecordSize != 0
+            || start > request.Length || len > request.Length - start) return recs;
+        for (int o = start; o + AchievementRecordSize <= start + len; o += AchievementRecordSize)
+            recs.Add(request[o..(o + AchievementRecordSize)]);
+        return recs;
+    }
+
+    /// <summary>
+    /// SDB_UPDATE_USER_ACHIEVEMENT (0x27FA): store the whole payload verbatim, then ack. The ack
+    /// is sent whether or not the store took it - an unanswered 0x27FA head-blocks the user's DB
+    /// queue for the life of the World process (status/HANDOFF.md section 1).
+    /// </summary>
+    private bool OnSaveUserAchievement(WorldLink link, byte[] payload)
+    {
+        int playerId = payload.Length >= AchievementSavePlayerIdOffset + 4
+            ? (int)BitConverter.ToUInt32(payload, AchievementSavePlayerIdOffset) : 0;
+        if (_store is not null && playerId > 0)
+        {
+            if (_store.SaveAchievements(playerId, payload))
+                _log.LogInformation("SDB_UPDATE_USER_ACHIEVEMENT: stored {Len} B for player {Pid}",
+                    payload.Length, playerId);
+        }
+        link.SendFrame(DBS_SAVE_27FB, BuildReqIdAck(payload, AchievementSaveReqIdOffset));
+        return true;
+    }
+
+    /// <summary>
+    /// SDB_LOAD_USER_ACHIEVEMENT (0x27F8) -&gt; DBS_LOAD_USER_ACHIEVEMENT (0x27F9), rebuilt from the
+    /// stored 0x27FA payload and the accomplished list. A character that has never saved gets the
+    /// brand-new-character reply, byte-identical to cap_newchar.log seq 344.
+    /// </summary>
+    private bool OnLoadUserAchievement(WorldLink link, byte[] payload)
+    {
+        uint reqId = payload.Length >= 4 ? BitConverter.ToUInt32(payload, 0) : 0;
+        int playerId = payload.Length >= 8 ? (int)BitConverter.ToUInt32(payload, 4) : 0;
+
+        if (_store is null || ServesCapturedStatics(playerId))
+        {
+            link.SendFrame(DBS_LOAD_USER_ACHIEVEMENT, BuildFromStaticData(
+                DbProxyStaticData.Achievement, DbProxyStaticData.AchievementReqIdOffset, payload));
+            return true;
+        }
+
+        var saved = playerId <= 0 ? null : _store.GetAchievements(playerId);
+        var done = playerId <= 0 ? new List<byte[]>() : _store.GetAccomplishedAchievements(playerId);
+
+        _log.LogInformation(
+            "SDB_LOAD_USER_ACHIEVEMENT: player {Pid} -> {What}, {N} accomplished achievement(s)",
+            playerId, saved == null ? "brand-new-character reply" : $"{saved.Length} B of stored progress",
+            done.Count);
+        link.SendFrame(DBS_LOAD_USER_ACHIEVEMENT, BuildDbs27F9(saved, done, reqId));
+        return true;
+    }
+
+    /// <summary>
+    /// Split a "[u32 offset][u32 length] x N, then the bodies" payload into its N lists. Offsets
+    /// are frame-relative. A list whose offset or length does not fit the payload comes back
+    /// empty rather than throwing - the reply still has to go out.
+    /// </summary>
+    public static byte[][] SplitOffsetLengthLists(byte[] payload, int listCount)
+    {
+        var lists = new byte[listCount][];
+        for (int i = 0; i < listCount; i++)
+        {
+            lists[i] = Array.Empty<byte>();
+            if (payload is null || (i + 1) * 8 > payload.Length) continue;
+            int off = (int)BitConverter.ToUInt32(payload, i * 8) - 6;
+            int len = (int)BitConverter.ToUInt32(payload, i * 8 + 4);
+            if (len <= 0 || off < 0 || off > payload.Length || len > payload.Length - off) continue;
+            lists[i] = payload[off..(off + len)];
+        }
+        return lists;
+    }
+
+    /// <summary>
+    /// DBS_LOAD_USER_ACHIEVEMENT (0x27F9) from the stored 0x27FA payload plus the accomplished
+    /// records. Every one of the 38 offset slots carries the running body position, empty lists
+    /// included - that is what the real Arbiter's backpatching produces.
+    ///
+    /// <para>Byte-exact against all three captured replies: cap_newchar.log seq 344 (brand-new,
+    /// no save), and arb_world_2026-09-13 seq 397 (dob) and seq 883 (Test) rebuilt from their
+    /// own 0x27FA saves.</para>
+    ///
+    /// <para>DEVIATION: the Data blob is served exactly as World last sent it. The real Arbiter
+    /// fills in two u16s of it that World always sends as zero (Data+1052 and Data+1180 - the
+    /// same value in both, and it tracks the character's achievement progress). We have no way
+    /// to compute them, so a relog sees zeros there. Nothing in any capture shows World reading
+    /// them back. status/ACHIEVEMENTS.md.</para>
+    /// </summary>
+    public static byte[] BuildDbs27F9(byte[]? savePayload, IReadOnlyList<byte[]> accomplished, uint reqId)
+    {
+        ArgumentNullException.ThrowIfNull(accomplished);
+        var lists = new byte[AchievementLoadListCount][];
+        for (int i = 0; i < lists.Length; i++) lists[i] = Array.Empty<byte>();
+        lists[0] = FreshAchievementData();
+
+        if (savePayload != null)
+        {
+            var saved = SplitOffsetLengthLists(savePayload, AchievementSaveListCount);
+            if (saved[0].Length == AchievementDataSize) lists[0] = saved[0];
+            for (int i = 1; i < AchievementSaveListCount; i++)
+                lists[AchievementSaveToLoadList[i]] = saved[i];
+        }
+
+        int accomplishedBytes = 0;
+        foreach (var rec in accomplished) accomplishedBytes += rec.Length;
+        var accList = new byte[accomplishedBytes];
+        int a = 0;
+        foreach (var rec in accomplished) { rec.CopyTo(accList, a); a += rec.Length; }
+        lists[AchievementAccomplishedListIndex] = accList;
+
+        int body = 0;
+        foreach (var l in lists) body += l.Length;
+        var r = new byte[AchievementLoadHeader + body];
+
+        uint at = 6 + (uint)AchievementLoadHeader;                   // 315, frame-relative
+        for (int i = 0; i < lists.Length; i++)
+        {
+            BitConverter.GetBytes(at).CopyTo(r, i * 8);
+            BitConverter.GetBytes((uint)lists[i].Length).CopyTo(r, i * 8 + 4);
+            at += (uint)lists[i].Length;
+        }
+        BitConverter.GetBytes(reqId).CopyTo(r, AchievementLoadReqIdOffset);
+        r[AchievementLoadOkOffset] = 1;
+
+        int p = AchievementLoadHeader;
+        foreach (var l in lists) { l.CopyTo(r, p); p += l.Length; }
+        return r;
     }
 
     /// <summary>
@@ -1556,31 +1841,21 @@ public sealed class DbProxyHandlers
     /// DBS_ACCOMPLISH_USER_ACHIEVEMENT (0x2803): the 13-byte header plus the records the Arbiter
     /// considers NEWLY accomplished.
     ///
-    /// <para><paramref name="isNewlyAccomplished"/> is called once per 24-byte record; null means
-    /// "everything is new", which is what TeraSharp does today because it keeps no achievement
-    /// table. Return false for a record the character already has and the reply collapses to the
-    /// 19-byte form the real Arbiter sent at cap_newchar.log seq 2606 - that is the hook an
-    /// achievement store plugs into.</para>
+    /// <para><paramref name="keptRecords"/> is the set the reply should carry - what the store
+    /// accepted as new (T22). Pass null and every record in the request goes back, which is what
+    /// TeraSharp did before there was an achievement table. <paramref name="isNewlyAccomplished"/>
+    /// is the older per-record predicate, kept for the tests that pin the two captured forms:
+    /// return false for everything and the reply collapses to the 19-byte form the real Arbiter
+    /// sent at cap_newchar.log seq 2606.</para>
     /// </summary>
-    public static byte[] BuildDbs2803(byte[] request, Func<byte[], bool>? isNewlyAccomplished = null)
+    public static byte[] BuildDbs2803(byte[] request, Func<byte[], bool>? isNewlyAccomplished = null,
+                                      IReadOnlyList<byte[]>? keptRecords = null)
     {
         uint reqId = request.Length >= 12 ? BitConverter.ToUInt32(request, 8) : 0;
 
         var kept = new List<byte[]>();
-        if (request.Length >= 8)
-        {
-            int start = (int)BitConverter.ToUInt32(request, 0) - 6;   // frame-relative
-            int len = (int)BitConverter.ToUInt32(request, 4);
-            if (start >= AchievementRequestHeader && len > 0 && len % AchievementRecordSize == 0
-                && len <= request.Length - start)
-            {
-                for (int o = start; o + AchievementRecordSize <= start + len; o += AchievementRecordSize)
-                {
-                    var rec = request[o..(o + AchievementRecordSize)];
-                    if (isNewlyAccomplished == null || isNewlyAccomplished(rec)) kept.Add(rec);
-                }
-            }
-        }
+        foreach (var rec in keptRecords ?? SliceAchievementRecords(request))
+            if (isNewlyAccomplished == null || isNewlyAccomplished(rec)) kept.Add(rec);
 
         int total = kept.Count * AchievementRecordSize;
         var r = new byte[AchievementReplyHeader + total];
@@ -1614,6 +1889,132 @@ public sealed class DbProxyHandlers
     /// DBS_UPDATE_SEREN_GUIDE_INFO (0x2945): [u32 reqId][u32 playerId][u8 ok=1] — 9 bytes.
     /// Both are echoed from the request (payload[0] and payload[4]).
     /// </summary>
+    // ---- Tutorial tips and the seren guide (T22) ----
+
+    /// <summary>
+    /// The captured character (playerId 1, "dob") keeps the recorded static reply for the loads
+    /// T22 rebuilt, exactly as he keeps the captured quest list: his rows do not exist in our DB
+    /// and a rebuilt reply would silently drop everything he has.
+    /// </summary>
+    private bool ServesCapturedStatics(int playerId) => playerId == CapturedQuestPlayerId;
+
+    /// <summary>SDB_ADD_TUTORIAL_SIMPLE_TIP (0x286E): store the tip, then ack.</summary>
+    private bool OnAddTutorialTip(WorldLink link, byte[] payload)
+    {
+        if (_store is not null && payload.Length >= TutorialTipIdOffset + 4)
+        {
+            int playerId = (int)BitConverter.ToUInt32(payload, 4);
+            int tipId = (int)BitConverter.ToUInt32(payload, TutorialTipIdOffset);
+            if (playerId > 0 && _store.AddTutorialTip(playerId, tipId))
+                _log.LogInformation("SDB_ADD_TUTORIAL_SIMPLE_TIP: player {Pid} saw tip {Tip}", playerId, tipId);
+        }
+        link.SendFrame(DBS_ADD_TUTORIAL_SIMPLE_TIP, BuildReqIdAck(payload, 0));
+        return true;
+    }
+
+    /// <summary>SDB_LOAD_TUTORIAL_SIMPLE_TIP (0x2872) -&gt; 0x2873, rebuilt from the stored tips.</summary>
+    private bool OnLoadTutorialTips(WorldLink link, byte[] payload)
+    {
+        uint reqId = payload.Length >= 4 ? BitConverter.ToUInt32(payload, 0) : 0;
+        int playerId = payload.Length >= 8 ? (int)BitConverter.ToUInt32(payload, 4) : 0;
+        if (_store is null || ServesCapturedStatics(playerId))
+        {
+            link.SendFrame(DBS_TUTORIAL_SIMPLE_TIP, BuildFromStaticData(
+                DbProxyStaticData.Tutorial, DbProxyStaticData.TutorialReqIdOffset, payload));
+            return true;
+        }
+        var tips = _store.GetTutorialTips(playerId);
+        _log.LogInformation("SDB_LOAD_TUTORIAL_SIMPLE_TIP: player {Pid} -> {N} tip(s)", playerId, tips.Count);
+        link.SendFrame(DBS_TUTORIAL_SIMPLE_TIP, BuildDbs2873(tips, reqId));
+        return true;
+    }
+
+    /// <summary>
+    /// DBS_LOAD_TUTORIAL_SIMPLE_TIP (0x2873). Byte-exact to cap_newchar.log seq 176 with no tips
+    /// and to arb_world_2026-09-13 seq 859 with the four tips cap_newchar's 0x286E writes add.
+    /// </summary>
+    public static byte[] BuildDbs2873(IReadOnlyList<int> tipIds, uint reqId)
+    {
+        ArgumentNullException.ThrowIfNull(tipIds);
+        int len = tipIds.Count * TutorialTipRecordSize;
+        var r = new byte[TutorialTipReplyHeader + len];
+        BitConverter.GetBytes(6u + TutorialTipReplyHeader).CopyTo(r, 0);   // 19, frame-relative
+        BitConverter.GetBytes((uint)len).CopyTo(r, 4);
+        BitConverter.GetBytes(reqId).CopyTo(r, 8);
+        r[12] = 1;                                                          // ok
+        int p = TutorialTipReplyHeader;
+        foreach (int tip in tipIds)
+        {
+            BitConverter.GetBytes(tip).CopyTo(r, p);
+            BitConverter.GetBytes(1).CopyTo(r, p + 4);
+            p += TutorialTipRecordSize;
+        }
+        return r;
+    }
+
+    /// <summary>SDB_UPDATE_SEREN_GUIDE_INFO (0x2944): store the slot, then ack.</summary>
+    private bool OnUpdateSerenGuide(WorldLink link, byte[] payload)
+    {
+        if (_store is not null && payload.Length >= SerenGuideIdOffset + 4)
+        {
+            int playerId = (int)BitConverter.ToUInt32(payload, 4);
+            int type = (int)BitConverter.ToUInt32(payload, SerenGuideTypeOffset);
+            int id = (int)BitConverter.ToUInt32(payload, SerenGuideIdOffset);
+            if (playerId > 0)
+            {
+                _store.SetSerenGuide(playerId, type, id);
+                _log.LogInformation("SDB_UPDATE_SEREN_GUIDE_INFO: player {Pid} seren type {T} = {I}",
+                    playerId, type, id);
+            }
+        }
+        link.SendFrame(DBS_UPDATE_SEREN_GUIDE_INFO, BuildDbs2945(payload));
+        return true;
+    }
+
+    /// <summary>SDB_INIT_SEREN_GUIDE_INFO (0x2942) -&gt; 0x2943, rebuilt from the stored slots.</summary>
+    private bool OnLoadSerenGuide(WorldLink link, byte[] payload)
+    {
+        uint reqId = payload.Length >= 4 ? BitConverter.ToUInt32(payload, 0) : 0;
+        int playerId = payload.Length >= 8 ? (int)BitConverter.ToUInt32(payload, 4) : 0;
+        if (_store is null || ServesCapturedStatics(playerId))
+        {
+            link.SendFrame(DBS_SEREN_GUIDE, BuildFromStaticData(
+                DbProxyStaticData.SerenGuide, DbProxyStaticData.SerenGuideReqIdOffset, payload));
+            return true;
+        }
+        var slots = _store.GetSerenGuide(playerId);
+        _log.LogInformation("SDB_INIT_SEREN_GUIDE_INFO: player {Pid} -> {N} stored slot(s)", playerId, slots.Count);
+        link.SendFrame(DBS_SEREN_GUIDE, BuildDbs2943(slots, reqId, (uint)playerId));
+        return true;
+    }
+
+    /// <summary>
+    /// DBS_INIT_SEREN_GUIDE_INFO (0x2943). A character with nothing stored gets an empty list -
+    /// byte-exact to cap_newchar.log seq 380 - and any stored slot brings out the full
+    /// <see cref="SerenGuideTypes"/> table, byte-exact to arb_world_2026-09-13 seq 920.
+    /// </summary>
+    public static byte[] BuildDbs2943(IReadOnlyDictionary<int, int> slots, uint reqId, uint playerId)
+    {
+        ArgumentNullException.ThrowIfNull(slots);
+        int rows = slots.Count == 0 ? 0 : SerenGuideTypes.Length;
+        int len = rows * SerenGuideRecordSize;
+        var r = new byte[SerenGuideReplyHeader + len];
+        BitConverter.GetBytes(6u + SerenGuideReplyHeader).CopyTo(r, 0);    // 23, frame-relative
+        BitConverter.GetBytes((uint)len).CopyTo(r, 4);
+        BitConverter.GetBytes(reqId).CopyTo(r, 8);
+        BitConverter.GetBytes(playerId).CopyTo(r, 12);
+        r[16] = 1;                                                          // ok
+        int p = SerenGuideReplyHeader;
+        for (int i = 0; i < rows; i++)
+        {
+            int type = SerenGuideTypes[i];
+            BitConverter.GetBytes(type).CopyTo(r, p);
+            BitConverter.GetBytes(slots.TryGetValue(type, out int id) ? id : 0).CopyTo(r, p + 4);
+            p += SerenGuideRecordSize;
+        }
+        return r;
+    }
+
     public static byte[] BuildDbs2945(byte[] request)
     {
         uint reqId = request.Length >= 4 ? BitConverter.ToUInt32(request, 0) : 0;
