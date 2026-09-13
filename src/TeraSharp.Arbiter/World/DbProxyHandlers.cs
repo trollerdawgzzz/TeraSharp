@@ -50,6 +50,34 @@ public sealed class DbProxyHandlers
     public const ushort SDB_SAVE_2936 = 0x2936; public const ushort DBS_SAVE_2937 = 0x2937; // reqId @0
     public const ushort SDB_DAILY_QUEST = 0x2897; public const ushort DBS_DAILY_QUEST = 0x2898; // reqId @16
 
+    // --- S_UPDATE_EXP_LEVEL (0x273B) -> D_UPDATE_EXP_LEVEL (0x273C) ---
+    // World's only report of level and exp. Everything else about progression lives inside the
+    // opaque world blob, so this is what makes the `level` the lobby shows (S_GET_USER_LIST)
+    // and the `exp` column real instead of frozen at 1/0.
+    //
+    // Handler_S_UPDATE_EXP_LEVEL (ArbiterServer.exe.c FUN_1408f44b0, scope tracer at line
+    // 1564123) requires frame length >= 0x2e (46 B, i.e. a 40-byte payload) and reads, all
+    // FRAME-relative:
+    //   [6]  u32 reqId       -> echoed in the reply
+    //   [10] u32 playerId    -> user lookup; a miss means ok = 0 and no DB write
+    //   [14] i32 level       -> < 1 : User::UpdateUserExpAndRestBonusPoint(exp, restBonus)
+    //                          >= 1: User::UpdateUserLevel(level, exp, restBonus)
+    //   [18] i64 exp         -> spUpdateUserTotalExpA
+    //   [26] i64 restBonusPoint
+    //   [34] i64  > 0 -> FUN_14057fab0()          (unused by us; 0 in every captured frame)
+    //   [42] i32  > 0 -> FUN_140572d20(user, pid) (unused by us; 0 in every captured frame)
+    // Reply writer: FUN_140350eb0(pkt, 0x273c), FUN_14013d0b0 = u32 reqId, FUN_1403513d0 = u8 ok.
+    //
+    // Ground truth (D:\packetlogs\cap_newchar.log, real ArbiterServer, playerId 2, reframed):
+    //   1351 W->A 0x273B 46 B  5D 00 00 00 | 02 00 00 00 | 00 00 00 00 | C7 00 .. (exp 199)
+    //   1352 A->W 0x273C 11 B  5D 00 00 00 01
+    //   2687 W->A 0x273B        8A 00 00 00 | 02 00 00 00 | 02 00 00 00 | 6B 03 .. (level 2, exp 875)
+    //   2688 A->W 0x273C        8A 00 00 00 01
+    // Ten of these in that capture; the level field is non-zero only on the one level-up.
+    public const ushort SDB_UPDATE_EXP_LEVEL = 0x273B; public const ushort DBS_UPDATE_EXP_LEVEL = 0x273C;
+    /// <summary>Handler minimum frame length (0x2e) — a shorter frame is a PDL mismatch.</summary>
+    public const int UpdateExpLevelMinPayload = 0x2e - 6;
+
     // SDB_UPDATE_DAILY_QUEST_SEED (0x2899) -> DBS_UPDATE_DAILY_QUEST_SEED (0x289A).
     // World fires this once per daily quest at enter-world (17x in lobby_tap.log) and each one
     // is a DLMItem serialised on the user's gameId, so an unanswered one head-blocks every
@@ -200,6 +228,7 @@ public sealed class DbProxyHandlers
             case SDB_SAVE_2936:
             case SDB_DAILY_QUEST:
             case SDB_DAILY_QUEST_SEED:
+            case SDB_UPDATE_EXP_LEVEL:   // 0x273C = [reqId][ok]; also writes level/exp to the row
             case SDB_QUEST_LIST:
             // Post-seed-burst steps (lobby_tap.log 02:51:11.15x): 0x2910 -> 0x290C -> 0x27B9.
             // These MUST echo the live DLM id. The replay table attributed 0x290D to the
@@ -231,6 +260,7 @@ public sealed class DbProxyHandlers
             case SDB_USER_ENTERWORLD: return OnUserEnterWorld(link, payload);
             case SDB_UPDATE_USER_DATA: return OnUpdateUserData(link, payload);
             case SDB_USER_LOAD_INVENTORY: return OnLoadInventory(link, payload);
+            case SDB_UPDATE_EXP_LEVEL: return OnUpdateExpLevel(link, payload);
 
             // --- Logout save sequence (reqId echoed from the live request) ---
             case SDB_SAVE_27FA: link.SendFrame(DBS_SAVE_27FB, BuildReqIdAck(payload, 280)); return true;
@@ -819,6 +849,7 @@ public sealed class DbProxyHandlers
 
     // Payload offset = frame offset - 6.
     private static uint U32(byte[] p, int frameOff) => BitConverter.ToUInt32(p, frameOff - 6);
+    private static long I64(byte[] p, int frameOff) => BitConverter.ToInt64(p, frameOff - 6);
 
     /// <summary>
     /// Diagnostic only: the blob is opaque and we never modify it, but position (x,y,z floats)
@@ -1047,5 +1078,51 @@ public sealed class DbProxyHandlers
         BitConverter.GetBytes(1).CopyTo(ack, 4);
         link.SendFrame(DBS_UPDATE_USER_DATA, ack);
         return true;
+    }
+
+    /// <summary>
+    /// S_UPDATE_EXP_LEVEL (0x273B) -> D_UPDATE_EXP_LEVEL (0x273C). Writes level and exp to the
+    /// characters row and acks with the live DLM id. See the constant above for the layout and
+    /// the captured bytes.
+    /// </summary>
+    private bool OnUpdateExpLevel(WorldLink link, byte[] p)
+    {
+        if (p.Length < UpdateExpLevelMinPayload)
+        {
+            // The real handler treats a short frame as a PDL version mismatch. Falling through
+            // to the replay table would answer with the CAPTURED DLM id and head-block the user,
+            // so refuse loudly instead and let the caller log the miss.
+            _log.LogWarning("S_UPDATE_EXP_LEVEL too short ({Len} B payload, need {Need})", p.Length, UpdateExpLevelMinPayload);
+            return false;
+        }
+
+        uint reqId = U32(p, 6);
+        int playerId = (int)U32(p, 10);
+        int level = (int)U32(p, 14);          // 0 on an exp-only update
+        long exp = I64(p, 18);
+        long restBonus = I64(p, 26);
+
+        bool ok = _store.UpdateLevelAndExp(playerId, level >= 1 ? level : null, exp);
+        if (level >= 1)
+            _log.LogInformation("S_UPDATE_EXP_LEVEL: player {Pid} level {Lvl}, exp {Exp} (rest {Rest})", playerId, level, exp, restBonus);
+        else
+            _log.LogDebug("S_UPDATE_EXP_LEVEL: player {Pid} exp {Exp} (rest {Rest})", playerId, exp, restBonus);
+
+        link.SendFrame(DBS_UPDATE_EXP_LEVEL, BuildDbs273C(reqId, ok));
+        return true;
+    }
+
+    /// <summary>
+    /// D_UPDATE_EXP_LEVEL (0x273C): [u32 reqId][u8 ok]. ok is the real Arbiter's own
+    /// "did the user exist and did the update land" flag (cVar5 in FUN_1408f44b0), not a
+    /// constant — World runs OnFail on 0 and OnSuccess on 1, and completes the DLM item either
+    /// way, so an honest 0 is safe and a lie is not.
+    /// </summary>
+    public static byte[] BuildDbs273C(uint reqId, bool ok)
+    {
+        var r = new byte[5];
+        BitConverter.GetBytes(reqId).CopyTo(r, 0);
+        r[4] = (byte)(ok ? 1 : 0);
+        return r;
     }
 }

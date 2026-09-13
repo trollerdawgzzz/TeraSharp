@@ -1689,6 +1689,16 @@ array items
     /// without touching the human-owned WorldBridge.cs.
     /// </summary>
     static List<(ushort op, byte[] body)> RunHandler(ushort op, byte[] requestPayload, int expectedFrames)
+        => RunHandler(op, requestPayload, expectedFrames, store: null);
+
+    /// <summary>
+    /// As <see cref="RunHandler(ushort, byte[], int)"/>, but with a real CharacterStore behind
+    /// the handler. Needed by the handlers that persist (0x273B writes level/exp to the row);
+    /// pass null for the pure protocol handlers, which must never touch the store.
+    /// </summary>
+    static List<(ushort op, byte[] body)> RunHandler(
+        ushort op, byte[] requestPayload, int expectedFrames,
+        TeraSharp.Arbiter.Persistence.CharacterStore? store)
     {
         var log = QuietLog();
         using var listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
@@ -1701,7 +1711,7 @@ array items
 
         var bridge = new WorldBridge(WorldReplayTable.Load("/nonexistent", log), log);
         var link = new WorldLink(1, client, bridge, log);
-        var handlers = new DbProxyHandlers(null!, log);   // these handlers never touch the store
+        var handlers = new DbProxyHandlers(store!, log);  // null store: the handler must never touch it
 
         Hex.True(handlers.TryHandle(bridge, link, op, requestPayload),
             $"0x{op:X4} must be in the TryHandle allow-list (the FIRST switch) — "
@@ -1741,6 +1751,11 @@ array items
     /// <summary>Single-reply convenience wrapper.</summary>
     static (ushort op, byte[] body) RunHandler1(ushort op, byte[] requestPayload)
         => RunHandler(op, requestPayload, 1)[0];
+
+    /// <summary>Single-reply convenience wrapper, with a store behind the handler.</summary>
+    static (ushort op, byte[] body) RunHandler1(
+        ushort op, byte[] requestPayload, TeraSharp.Arbiter.Persistence.CharacterStore store)
+        => RunHandler(op, requestPayload, 1, store)[0];
 
     /// <summary>Clones a captured request and stamps a live DLM id at the given payload offset.</summary>
     static byte[] WithLiveId(byte[] capturedRequest, int reqIdPayloadOffset, uint liveId)
@@ -2574,6 +2589,170 @@ array items
         {
             try { File.Delete(dbPath); } catch { /* best effort */ }
         }
+    }
+
+
+    // =====================================================================
+    // T6 — position + level/exp on the characters row.
+    //
+    // (a) CharacterStore.SaveWorldBlob mirrors zone/x/y/z out of the world blob
+    //     (read-only) onto the row.
+    // (b) S_UPDATE_EXP_LEVEL (0x273B) -> D_UPDATE_EXP_LEVEL (0x273C) is a real
+    //     handler that writes level/exp and echoes the LIVE DLM id.
+    //
+    // Ground truth: D:\packetlogs\cap_newchar.log, real ArbiterServer, new
+    // character "Test" playerId 2, reframed by u32 length. Layout cross-checked
+    // against Handler_S_UPDATE_EXP_LEVEL (ArbiterServer.exe.c FUN_1408f44b0,
+    // scope tracer line 1564123), which requires frame >= 0x2e and reads
+    // [6] reqId, [10] playerId, [14] i32 level, [18] i64 exp, [26] i64 rest.
+    // =====================================================================
+
+    // 1351 W->A 0x273B, 46-byte frame -> 40-byte payload. reqId 0x5D, playerId 2,
+    // level 0 (exp-only update), exp 199. The reply is 1352 A->W: 5D 00 00 00 01.
+    static readonly byte[] Cap273BExpOnly = Hex.B(@"
+        5D 00 00 00  02 00 00 00  00 00 00 00
+        C7 00 00 00  00 00 00 00
+        00 00 00 00  00 00 00 00
+        00 00 00 00  00 00 00 00
+        00 00 00 00");
+    // 2687 W->A 0x273B — the one level-up in the capture. reqId 0x8A, playerId 2,
+    // level 2, exp 875. Reply 2688 A->W: 8A 00 00 00 01.
+    static readonly byte[] Cap273BLevelUp = Hex.B(@"
+        8A 00 00 00  02 00 00 00  02 00 00 00
+        6B 03 00 00  00 00 00 00
+        00 00 00 00  00 00 00 00
+        00 00 00 00  00 00 00 00
+        00 00 00 00");
+
+    /// <summary>In-memory store with two characters, so playerId 2 (the capture's) exists.</summary>
+    static TeraSharp.Arbiter.Persistence.CharacterStore StoreWithTwoCharacters()
+    {
+        var store = new TeraSharp.Arbiter.Persistence.CharacterStore(":memory:", QuietLog());
+        var acct = store.GetOrCreateAccount("t6");
+        for (int i = 1; i <= 2; i++)
+        {
+            int id = store.CreateCharacter(new TeraSharp.Arbiter.Persistence.CharacterRecord
+            {
+                AccountId = acct.Id, Name = "t6_" + i, Gender = 0, Race = 0, Class = 1,
+                Level = 1, TemplateId = 10101, Zone = 5, X = 1f, Y = 2f, Z = 3f,
+                Appearance = new byte[8], Details = new byte[32], Shape = new byte[64],
+                Position = i,
+            });
+            Hex.True(id == i, $"expected character id {i}, got {id} — the capture's playerId 2 must map to a row");
+        }
+        return store;
+    }
+
+    [Test] public static void Handler_273B_replies_273C_with_captured_bytes()
+    {
+        using var store = StoreWithTwoCharacters();
+        var (op, body) = RunHandler1(DbProxyHandlers.SDB_UPDATE_EXP_LEVEL, Cap273BExpOnly, store);
+        Hex.True(op == 0x273C, $"reply opcode must be 0x273C, got 0x{op:X4}");
+        Hex.Eq(body, "5D 00 00 00 01", "D_UPDATE_EXP_LEVEL (cap_newchar.log seq 1351 -> 1352)");
+    }
+
+    [Test] public static void Handler_273B_levelup_frame_replies_captured_bytes()
+    {
+        using var store = StoreWithTwoCharacters();
+        var (op, body) = RunHandler1(DbProxyHandlers.SDB_UPDATE_EXP_LEVEL, Cap273BLevelUp, store);
+        Hex.True(op == 0x273C, "reply opcode");
+        Hex.Eq(body, "8A 00 00 00 01", "D_UPDATE_EXP_LEVEL (cap_newchar.log seq 2687 -> 2688)");
+    }
+
+    [Test] public static void Handler_273B_echoes_live_reqId_not_capture()
+    {
+        using var store = StoreWithTwoCharacters();
+        var (op, body) = RunHandler1(DbProxyHandlers.SDB_UPDATE_EXP_LEVEL,
+            WithLiveId(Cap273BExpOnly, 0, 0x0BAD), store);
+        Hex.True(op == 0x273C, "reply opcode");
+        Hex.True(BitConverter.ToUInt32(body, 0) == 0x0BAD,
+            $"0x273C must echo the LIVE DLM id 0x0BAD, carried 0x{BitConverter.ToUInt32(body, 0):X}");
+        Hex.True(BitConverter.ToUInt32(body, 0) != 0x5D, "must not carry the captured id 0x5D");
+    }
+
+    [Test] public static void Handler_273B_levelup_writes_level_and_exp_to_the_row()
+    {
+        using var store = StoreWithTwoCharacters();
+        RunHandler1(DbProxyHandlers.SDB_UPDATE_EXP_LEVEL, Cap273BLevelUp, store);
+        var c = store.GetCharacter(2)!;
+        Hex.True(c.Level == 2, $"level should be 2 after the level-up frame, got {c.Level}");
+        Hex.True(c.Exp == 875, $"exp should be 875 (0x36B), got {c.Exp}");
+    }
+
+    [Test] public static void Handler_273B_exp_only_frame_leaves_the_level_alone()
+    {
+        // World sends level = 0 whenever only exp moved (the real Arbiter branches to
+        // User::UpdateUserExpAndRestBonusPoint there instead of User::UpdateUserLevel).
+        // Writing that 0 into the row would demote every character on its next kill.
+        using var store = StoreWithTwoCharacters();
+        store.UpdateLevelAndExp(2, level: 7, exp: 100);
+        RunHandler1(DbProxyHandlers.SDB_UPDATE_EXP_LEVEL, Cap273BExpOnly, store);
+        var c = store.GetCharacter(2)!;
+        Hex.True(c.Level == 7, $"an exp-only update must not touch the level, got {c.Level}");
+        Hex.True(c.Exp == 199, $"exp should be 199 (0xC7), got {c.Exp}");
+    }
+
+    [Test] public static void Handler_273B_unknown_player_replies_ok0()
+    {
+        // The real handler's ok byte is its own user lookup (cVar5 in FUN_1408f44b0), not a
+        // constant. World completes the DLM item either way, so an honest 0 is safe.
+        using var store = new TeraSharp.Arbiter.Persistence.CharacterStore(":memory:", QuietLog());
+        var (op, body) = RunHandler1(DbProxyHandlers.SDB_UPDATE_EXP_LEVEL, Cap273BExpOnly, store);
+        Hex.True(op == 0x273C, "reply opcode");
+        Hex.Eq(body, "5D 00 00 00 00", "unknown playerId -> ok = 0, reqId still echoed");
+    }
+
+    [Test] public static void SaveWorldBlob_updates_zone_and_position_on_the_row()
+    {
+        using var store = StoreWithTwoCharacters();
+        var before = store.GetCharacter(1)!;
+        Hex.True(before.Zone == 5 && before.X == 1f, "precondition: the row starts at the created values");
+
+        // A blob shaped like the real one: opaque filler plus the position block T6 reads.
+        // Velika, matching the zone id in the starter-blob notes.
+        var blob = new byte[DbProxyHandlers.WorldBlobSize];
+        for (int i = 0; i < blob.Length; i++) blob[i] = (byte)(i * 7);
+        BitConverter.GetBytes(-449.5f).CopyTo(blob, TeraSharp.Arbiter.Persistence.StarterBlob.XOffset);
+        BitConverter.GetBytes(6239.25f).CopyTo(blob, TeraSharp.Arbiter.Persistence.StarterBlob.YOffset);
+        BitConverter.GetBytes(1956f).CopyTo(blob, TeraSharp.Arbiter.Persistence.StarterBlob.ZOffset);
+        BitConverter.GetBytes(7005).CopyTo(blob, TeraSharp.Arbiter.Persistence.StarterBlob.ZoneOffset);
+        var original = (byte[])blob.Clone();
+
+        store.SaveWorldBlob(1, blob);
+
+        var after = store.GetCharacter(1)!;
+        Hex.True(after.Zone == 7005, $"zone comes from blob[236], expected 7005, got {after.Zone}");
+        Hex.True(after.X == -449.5f && after.Y == 6239.25f && after.Z == 1956f,
+            $"x/y/z come from blob[220/224/228], got ({after.X},{after.Y},{after.Z})");
+
+        // Read-only on the blob, in both directions.
+        Hex.Eq(blob, original, "SaveWorldBlob must not modify the caller's blob");
+        Hex.Eq(after.WorldBlob!, original, "the stored blob must be byte-identical to the one World sent");
+    }
+
+    [Test] public static void SaveWorldBlob_ignores_blob_offset_208_which_is_hp()
+    {
+        // status/HANDOFF.md used to call offset 208 the zone. It is HP: in cap_newchar.log it
+        // goes 100000 -> 1915 as the character takes damage while blob[236] stays 5, so reading
+        // the zone from 208 would teleport everyone to zone 1915 on the next save.
+        using var store = StoreWithTwoCharacters();
+        var blob = new byte[DbProxyHandlers.WorldBlobSize];
+        BitConverter.GetBytes(1915).CopyTo(blob, 208);
+        BitConverter.GetBytes(9827).CopyTo(blob, TeraSharp.Arbiter.Persistence.StarterBlob.ZoneOffset);
+        store.SaveWorldBlob(1, blob);
+        Hex.True(store.GetCharacter(1)!.Zone == 9827, "the zone is blob[236], never blob[208]");
+    }
+
+    [Test] public static void SaveWorldBlob_short_blob_keeps_the_stored_position()
+    {
+        // Never seen on the wire (0x27CB always carries all 15312 bytes), but a truncated blob
+        // must not blank the row's position.
+        using var store = StoreWithTwoCharacters();
+        store.SaveWorldBlob(1, new byte[64]);
+        var c = store.GetCharacter(1)!;
+        Hex.True(c.Zone == 5 && c.X == 1f && c.Y == 2f && c.Z == 3f,
+            $"short blob must leave zone/x/y/z alone, got zone {c.Zone} ({c.X},{c.Y},{c.Z})");
+        Hex.True(c.WorldBlob!.Length == 64, "the blob itself is still stored");
     }
 
     /// <summary>
