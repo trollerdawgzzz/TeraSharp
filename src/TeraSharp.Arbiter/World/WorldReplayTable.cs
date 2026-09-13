@@ -69,15 +69,40 @@ public sealed class WorldReplayTable
         0x13F2, // DSA_DUNGEON_TIMELINE_OPEN_INFO      (periodic heartbeat)
         0x13E5, // BSA_REQUEST_BOUNTY_HUNT_SEASON_INFO (periodic heartbeat)
         0x164D, // SA_WORLD_SERVER_STATUS              (periodic)
-        0x293E, // SDB_UPDATE_GET_EXTRA_REWARD - see the note below
+
+        // --- T15: proven one-way in D:\packetlogs\cap_newchar.log (a real ArbiterServer
+        // playing for five minutes). Each was checked frame by frame: no A->W frame follows
+        // any occurrence, and the Arbiter's handler has no SendToSession at all. ---
+        0x2927, // SDB_CANCEL_NPC_ARENA_BET  - 5 occurrences (the logout-countdown ticks),
+                //   Handler_SDB_CANCEL_NPC_ARENA_BET (Arb_part_063.c:1315) never replies.
+        0x1491, // SA_UPDATE_USER_STATUS     - 12 occurrences
+        0x156F, // SA_UPDATE_MAKRER_END      - 6 occurrences. THIS IS THE DANGEROUS ONE: it
+                //   arrives BETWEEN S_UPDATE_EXP_LEVEL and its reply (cap_newchar.log seq 2994
+                //   is 0x273B then 0x156F then 0x273C). Without this entry 0x156F becomes a
+                //   request whose "response" is 0x273C, and the real 0x273B loses it.
+        0x13B6, // SA_UPDATE_DUNGEON_COOLTIME
+        0x13C5, // SA_ADD_DUNGEON_CHANNEL          (zone change)
+        0x13C6, // SA_REMOVE_DUNGEON_CHANNEL       (zone change)
+        0x1499, // SA_SAVE_ETC_DATA_FOR_MOVE_WORLD (zone change)
+        0x15FA, // one-way push, once per session
     };
 
-    // NOTE: 0x2958 and 0x293E carry SDB_ names, so by the naming convention they would expect a
-    // DBS_ reply. Neither appears as a W->A frame anywhere in arb_world.log or lobby_tap.log, so
-    // listing them here is a no-op on both captures and cannot lose a mapping. They are here
-    // because CLAUDE.md section 3 records them as one-way periodics observed live. If one ever
-    // shows up in a capture as a genuine per-user request, it needs a REAL handler in
-    // DbProxyHandlers (echoing the live DLM id), not a replay entry - remove it from this set then.
+    // NOTE: 0x2958 carries an SDB_ name, so by the naming convention it would expect a DBS_
+    // reply. It does not appear as a W->A frame in arb_world.log, lobby_tap.log or
+    // cap_newchar.log, so listing it here is a no-op on all three captures and cannot lose a
+    // mapping. It is here because CLAUDE.md section 3 records it as a one-way periodic
+    // observed live. If it ever shows up in a capture as a genuine per-user request it needs a
+    // REAL handler in DbProxyHandlers (echoing the live DLM id), not a replay entry - remove it
+    // from this set then.
+    //
+    // 0x293E SDB_UPDATE_GET_EXTRA_REWARD used to be in this set for exactly that reason, and it
+    // was WRONG: cap_newchar.log seq 503 -> 504 shows a real request/reply pair, and the missing
+    // reply wedged a login live on 2026-09-14. It is a real handler as of T15. Absence from one
+    // capture is not evidence that an opcode is one-way; only a decompiled handler with no
+    // SendToSession is.
+    //
+    // 0x162C is NOT here on purpose: cap_newchar.log seq 640 shows the Arbiter answering it with
+    // 0x162D, so it is a genuine request.
 
     public static WorldReplayTable Load(string path, ILogger log)
     {

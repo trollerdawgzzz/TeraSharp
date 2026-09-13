@@ -1700,7 +1700,7 @@ array items
     /// </summary>
     static List<(ushort op, byte[] body)> RunHandler(
         ushort op, byte[] requestPayload, int expectedFrames,
-        TeraSharp.Arbiter.Persistence.CharacterStore? store)
+        TeraSharp.Arbiter.Persistence.CharacterStore? store, DbProxyHandlers? reuse = null)
     {
         var log = QuietLog();
         using var listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
@@ -1713,7 +1713,9 @@ array items
 
         var bridge = new WorldBridge(WorldReplayTable.Load("/nonexistent", log), log);
         var link = new WorldLink(1, client, bridge, log);
-        var handlers = new DbProxyHandlers(store!, log);  // null store: the handler must never touch it
+        // A caller that passes `reuse` gets the SAME handler instance across calls - needed by
+        // anything that checks per-instance state, e.g. the quest row ids 0x272F hands out.
+        var handlers = reuse ?? new DbProxyHandlers(store!, log);  // null store: the handler must never touch it
 
         Hex.True(handlers.TryHandle(bridge, link, op, requestPayload),
             $"0x{op:X4} must be in the TryHandle allow-list (the FIRST switch) — "
@@ -1756,8 +1758,13 @@ array items
 
     /// <summary>Single-reply convenience wrapper, with a store behind the handler.</summary>
     static (ushort op, byte[] body) RunHandler1(
-        ushort op, byte[] requestPayload, TeraSharp.Arbiter.Persistence.CharacterStore store)
-        => RunHandler(op, requestPayload, 1, store)[0];
+        ushort op, byte[] requestPayload, TeraSharp.Arbiter.Persistence.CharacterStore store,
+        DbProxyHandlers? reuse = null)
+        => RunHandler(op, requestPayload, 1, store, reuse)[0];
+
+    /// <summary>A handler instance the caller can hand back to RunHandler to keep its state.</summary>
+    static DbProxyHandlers FreshHandlers(TeraSharp.Arbiter.Persistence.CharacterStore? store)
+        => new DbProxyHandlers(store!, QuietLog());
 
     /// <summary>
     /// TryHandle's verdict without asserting on it, for the cases where declining is the
@@ -2161,13 +2168,23 @@ array items
         ushort[] expected =
         {
             0x1436, 0x15A8, 0x159A, 0x2958, 0x13FA, 0x13CC, 0x1626, 0x1441,
-            0x143F, 0x15B5, 0x13AA, 0x13F2, 0x13E5, 0x164D, 0x293E,
+            0x143F, 0x15B5, 0x13AA, 0x13F2, 0x13E5, 0x164D,
+            // T15, from D:\packetlogs\cap_newchar.log: no A->W frame follows any occurrence.
+            0x2927, 0x1491, 0x156F, 0x13B6, 0x13C5, 0x13C6, 0x1499, 0x15FA,
         };
         foreach (var op in expected)
             Hex.True(WorldReplayTable.OneWayFromWorld.Contains(op),
                 $"0x{op:X4} must be in OneWayFromWorld");
         Hex.True(WorldReplayTable.OneWayFromWorld.Count == expected.Length,
             $"OneWayFromWorld has {WorldReplayTable.OneWayFromWorld.Count} entries, expected {expected.Length}");
+
+        // 0x293E was in this set until T15 and was wrong: cap_newchar.log seq 503 -> 504 is a
+        // real request/reply pair and the missing reply wedged a login. It is a real handler now,
+        // and an opcode may never be in both places - the set makes the replay table drop the
+        // frame, so a real handler is the only thing that can answer it.
+        foreach (var op in WorldReplayTable.OneWayFromWorld)
+            Hex.True(!DbProxyHandlers.IsHandledRequest(op),
+                $"0x{op:X4} is in OneWayFromWorld AND in the TryHandle allow-list - pick one");
         // The tunnel interleaves constantly; sealing on it would break every attribution.
         Hex.True(!WorldReplayTable.OneWayFromWorld.Contains(WorldBridge.OpTunnelToClient),
             "SA_BYPASS_TO_CLIENT (0x13F7) must NOT be in the set");
@@ -2536,6 +2553,14 @@ array items
         foreach (int i in Enumerable.Range(296, 4)) yield return i;              // u32 appearance2
         foreach (int i in Enumerable.Range(312, 32)) yield return i;             // details
         foreach (int i in Enumerable.Range(344, 64)) yield return i;             // shape
+        // T18: the two default-skill regions, 6880..7200 and 7200..11200. Adjacent, so this is
+        // one contiguous run; listed as two for the same reason the code has two constants.
+        foreach (int i in Enumerable.Range(TeraSharp.Arbiter.Persistence.StarterBlob.PassiveSkillsOffset,
+                 TeraSharp.Arbiter.Persistence.StarterBlob.PassiveSkillSlots
+                 * TeraSharp.Arbiter.Persistence.StarterBlob.SkillEntrySize)) yield return i;
+        foreach (int i in Enumerable.Range(TeraSharp.Arbiter.Persistence.StarterBlob.ActiveSkillsOffset,
+                 TeraSharp.Arbiter.Persistence.StarterBlob.ActiveSkillSlots
+                 * TeraSharp.Arbiter.Persistence.StarterBlob.SkillEntrySize)) yield return i;
     }
 
     /// <summary>The identity the client actually sent for "Test", parsed from packet 35.</summary>
@@ -3280,28 +3305,37 @@ array items
     }
 
     /// <summary>data/cap_item_single.bin keyed by capture sequence number, or null with a note.</summary>
-    static Dictionary<uint, byte[]>? LoadItemSingleCaptureOrSkip()
+    static Dictionary<uint, byte[]>? LoadItemSingleCaptureOrSkip() => LoadTsisOrSkip("cap_item_single.bin");
+
+    /// <summary>
+    /// A TSIS container from data/ keyed by capture sequence number, or null (with a printed
+    /// note) when the tests run somewhere the repo root is not above the binary. TSIS is the
+    /// little container T13 introduced so byte-exact tests do not need D:\packetlogs and do not
+    /// carry tens of kilobytes of hex literals: "TSIS", u32 recordCount, then per record
+    /// u32 seq | u16 opcode | u32 payloadLength | payload.
+    /// </summary>
+    static Dictionary<uint, byte[]>? LoadTsisOrSkip(string fileName)
     {
-        var path = FindRepoFile(Path.Combine("data", "cap_item_single.bin"));
-        if (path == null) { Console.WriteLine("        (skipped: data/cap_item_single.bin not found)"); return null; }
+        var path = FindRepoFile(Path.Combine("data", fileName));
+        if (path == null) { Console.WriteLine($"        (skipped: data/{fileName} not found)"); return null; }
 
         var b = File.ReadAllBytes(path);
         Hex.True(b.Length > 8 && b[0] == (byte)'T' && b[1] == (byte)'S' && b[2] == (byte)'I' && b[3] == (byte)'S',
-            "cap_item_single.bin must start with the TSIS magic");
+            $"{fileName} must start with the TSIS magic");
         int count = (int)BitConverter.ToUInt32(b, 4);
         var map = new Dictionary<uint, byte[]>();
         int o = 8;
         for (int i = 0; i < count; i++)
         {
-            Hex.True(o + 10 <= b.Length, $"cap_item_single.bin: truncated header for record {i}");
+            Hex.True(o + 10 <= b.Length, $"{fileName}: truncated header for record {i}");
             uint seq = BitConverter.ToUInt32(b, o);
             int len = (int)BitConverter.ToUInt32(b, o + 6);
             o += 10;
-            Hex.True(o + len <= b.Length, $"cap_item_single.bin: truncated payload for seq {seq}");
+            Hex.True(o + len <= b.Length, $"{fileName}: truncated payload for seq {seq}");
             map[seq] = b[o..(o + len)];
             o += len;
         }
-        Hex.True(o == b.Length, "cap_item_single.bin: trailing bytes after the last record");
+        Hex.True(o == b.Length, $"{fileName}: trailing bytes after the last record");
         return map;
     }
 
@@ -3514,6 +3548,716 @@ array items
     {
         var actual = DbProxyOpcodeNames.Name(op);
         Hex.True(actual == expected, $"0x{op:X4}: expected '{expected}', got '{actual ?? "<null>"}'");
+    }
+
+
+    // =====================================================================
+    // T15 - the per-user DB writes World sends during play.
+    //
+    // Ground truth: data/cap_t15.bin, the request/reply frames lifted out of
+    // D:\packetlogs\cap_newchar.log (real ArbiterServer, new character "Test", playerId 2,
+    // five minutes on the Island of Dawn). See data/cap_t15.md for the record list.
+    //
+    // Every handler gets two tests: the captured bytes reproduced exactly, and a live-reqId
+    // echo that must differ from the captured one. The second one is the important one -
+    // a reply carrying a stale DLM id misses DLMExistManager::Find, the item never completes,
+    // and every later per-user DB message for that user (the blob save, the logout saves,
+    // UserLeaveWorld itself) waits forever (status/HANDOFF.md section 1).
+    // =====================================================================
+
+    /// <summary>data/cap_t15.bin keyed by capture sequence number, or null with a printed note.</summary>
+    static Dictionary<uint, byte[]>? LoadT15CaptureOrSkip() => LoadTsisOrSkip("cap_t15.bin");
+
+    // ---- 0x272E SDB_SET_QUEST_INFO -> 0x272F ----
+
+    [Test] public static void QuestInfo_272F_matches_capture_116B_insert()
+    {
+        var cap = LoadT15CaptureOrSkip();
+        if (cap == null) return;
+        // seq 540: sqlType 22 (INSERT). The Arbiter allocated quest row id 2 and put it at
+        // payload[25]; World reads it there (DBStartQuestContext::SetQuestDbId).
+        var quest = new IdCounter(2);
+        var reply = DbProxyHandlers.BuildDbs272F(cap[540], new IdCounter(999).Next, quest.Next);
+        Hex.Eq(reply, cap[541], "DBS_SET_QUEST_INFO (cap_newchar.log seq 540 -> 541)");
+        Hex.True(quest.Calls == 1, $"sqlType 22 must allocate exactly one quest row id, got {quest.Calls}");
+    }
+
+    [Test] public static void QuestInfo_272F_matches_capture_972B_with_reward_atom()
+    {
+        var cap = LoadT15CaptureOrSkip();
+        if (cap == null) return;
+        // seq 1804: sqlType 23 (update) carrying one op-7 reward atom with item DB id 0. The real
+        // Arbiter filled in 13. seq 1303 is the same size but its atom is op 9, which allocates nothing.
+        var items = new IdCounter(13);
+        Hex.Eq(DbProxyHandlers.BuildDbs272F(cap[1804], items.Next, new IdCounter(999).Next), cap[1807],
+            "DBS_SET_QUEST_INFO (cap_newchar.log seq 1804 -> 1807, op-7 reward atom)");
+        Hex.True(items.Calls == 1, $"the one insert atom must allocate once, got {items.Calls}");
+
+        var none = new IdCounter(999);
+        Hex.Eq(DbProxyHandlers.BuildDbs272F(cap[1303], none.Next, new IdCounter(999).Next), cap[1306],
+            "DBS_SET_QUEST_INFO (cap_newchar.log seq 1303 -> 1306, op-9 atom)");
+        Hex.True(none.Calls == 0, $"an op-9 atom must not allocate an item id, allocated {none.Calls}");
+    }
+
+    [Test] public static void QuestInfo_272F_matches_capture_3540B_four_atoms()
+    {
+        var cap = LoadT15CaptureOrSkip();
+        if (cap == null) return;
+        // seq 2364: four atoms, ops 6, 11, 6, 11, all already carrying item ids - nothing may change.
+        var items = new IdCounter(999);
+        Hex.Eq(DbProxyHandlers.BuildDbs272F(cap[2364], items.Next, new IdCounter(999).Next), cap[2367],
+            "DBS_SET_QUEST_INFO (cap_newchar.log seq 2364 -> 2367, four atoms)");
+        Hex.True(items.Calls == 0, $"atoms that already carry ids must not allocate, allocated {items.Calls}");
+    }
+
+    [Test] public static void QuestInfo_272F_only_sqlType_22_allocates_a_quest_row_id()
+    {
+        var cap = LoadT15CaptureOrSkip();
+        if (cap == null) return;
+        // Every other sqlType gets 0 there, exactly as in the capture: World only reads the field
+        // on the insert branch, and handing it a non-zero id on an update would be a lie.
+        foreach (uint seq in new uint[] { 1303, 1804, 2364 })
+        {
+            var quest = new IdCounter(77);
+            var reply = DbProxyHandlers.BuildDbs272F(cap[seq], new IdCounter(999).Next, quest.Next);
+            Hex.True(BitConverter.ToUInt32(reply, 20) != DbProxyHandlers.QuestSqlInsert,
+                $"seq {seq} should not be an insert");
+            Hex.True(quest.Calls == 0, $"seq {seq}: sqlType != 22 must not allocate, allocated {quest.Calls}");
+            Hex.True(BitConverter.ToUInt32(reply, 25) == 0, $"seq {seq}: quest row id must be 0");
+        }
+    }
+
+    [Test] public static void QuestInfo_272F_header_shape()
+    {
+        var cap = LoadT15CaptureOrSkip();
+        if (cap == null) return;
+        var req = cap[1804];
+        var reply = DbProxyHandlers.BuildDbs272F(req, new IdCounter(13).Next, new IdCounter(99).Next);
+
+        Hex.True(BitConverter.ToUInt32(reply, 0) == 35, "record offset is frame-relative 35 (6 + 29)");
+        Hex.True(BitConverter.ToUInt32(reply, 4) == DbProxyHandlers.QuestInfoRecordSize,
+            "the quest record is always 80 bytes");
+        Hex.True(BitConverter.ToUInt32(reply, 8) == 35 + DbProxyHandlers.QuestInfoRecordSize,
+            "the atom list starts right after the record");
+        Hex.True(BitConverter.ToUInt32(reply, 12) == BitConverter.ToUInt32(req, 12),
+            "the atom list keeps its length");
+        Hex.True(BitConverter.ToUInt32(reply, 16) == BitConverter.ToUInt32(req, 16), "reqId echoed");
+        Hex.True(BitConverter.ToUInt32(reply, 20) == BitConverter.ToUInt32(req, 20), "sqlType echoed");
+        Hex.True(reply[24] == 1, "ok = 1, as on every captured reply");
+        // The reply frame is the request frame minus one: [playerId][2 flags] -> [ok][questDbId].
+        Hex.True(reply.Length == req.Length - 1, $"reply payload should be {req.Length - 1}, got {reply.Length}");
+        // The 80-byte quest record is copied through untouched.
+        int recStart = (int)BitConverter.ToUInt32(req, 0) - 6;
+        Hex.Eq(reply[DbProxyHandlers.QuestInfoReplyHeader..(DbProxyHandlers.QuestInfoReplyHeader + 80)],
+            req[recStart..(recStart + 80)], "the quest record must be echoed verbatim");
+    }
+
+    [Test] public static void Handler_272E_echoes_the_live_reqId_and_climbing_quest_ids()
+    {
+        var cap = LoadT15CaptureOrSkip();
+        if (cap == null) return;
+        using var store = new TeraSharp.Arbiter.Persistence.CharacterStore(":memory:", QuietLog());
+        var handlers = FreshHandlers(store);
+
+        var live = WithLiveId(cap[540], 16, 0x0BAD);     // reqId lives at payload[16]
+        var (op1, body1) = RunHandler1(DbProxyHandlers.SDB_SET_QUEST_INFO, live, store, handlers);
+        Hex.True(op1 == DbProxyHandlers.DBS_SET_QUEST_INFO, $"reply opcode must be 0x272F, got 0x{op1:X4}");
+        uint echoed = BitConverter.ToUInt32(body1, 16);
+        Hex.True(echoed == 0x0BAD, $"0x272F must carry the LIVE DLM id 0x0BAD, carried 0x{echoed:X}");
+        Hex.True(echoed != BitConverter.ToUInt32(cap[540], 16), "must not carry the captured id");
+
+        uint first = BitConverter.ToUInt32(body1, 25);
+        Hex.True(first != 0, "an insert must get a quest row id");
+        var (_, body2) = RunHandler1(DbProxyHandlers.SDB_SET_QUEST_INFO, live, store, handlers);
+        Hex.True(BitConverter.ToUInt32(body2, 25) == first + 1,
+            "the next insert must get a different quest row id - reusing one makes World address the wrong quest");
+    }
+
+    // ---- 0x278E SDB_USER_LEARN_SKILL -> 0x278F ----
+
+    [Test] public static void LearnSkill_278F_matches_capture()
+    {
+        var cap = LoadT15CaptureOrSkip();
+        if (cap == null) return;
+        // seq 2750 -> 2751, 896 B -> 885 B. One atom, op 9 (the training fee), id already set.
+        var items = new IdCounter(999);
+        Hex.Eq(DbProxyHandlers.BuildDbs278F(cap[2750], items.Next), cap[2751],
+            "DBS_USER_LEARN_SKILL (cap_newchar.log seq 2750 -> 2751)");
+        Hex.True(items.Calls == 0, $"an op-9 atom must not allocate an item id, allocated {items.Calls}");
+    }
+
+    [Test] public static void LearnSkill_278F_header_shape()
+    {
+        var cap = LoadT15CaptureOrSkip();
+        if (cap == null) return;
+        var req = cap[2750];
+        var reply = DbProxyHandlers.BuildDbs278F(req, new IdCounter(999).Next);
+        int lenA = (int)BitConverter.ToUInt32(reply, 4);
+
+        Hex.True(BitConverter.ToUInt32(reply, 0) == 29, "atom list offset is frame-relative 29 (6 + 23)");
+        Hex.True(lenA == DbProxyHandlers.ItemAtomSize, $"one 856-byte atom, got {lenA}");
+        Hex.True(BitConverter.ToUInt32(reply, 8) == 29 + lenA, "the skill-period list starts after the atoms");
+        Hex.True(BitConverter.ToUInt32(reply, 12) == 0,
+            "the skill-period list is EMPTY - World reads THIS list, not the atoms");
+        Hex.True(BitConverter.ToUInt32(reply, 16) == BitConverter.ToUInt32(req, 8), "reqId echoed from payload[8]");
+        Hex.True(reply[20] == 1, "ok = 1");
+        Hex.True(reply[21] == 0 && reply[22] == 0, "both trailing flags are 0 in the capture");
+        Hex.True(reply.Length == req.Length - 11, $"reply payload should be {req.Length - 11}, got {reply.Length}");
+    }
+
+    [Test] public static void LearnSkill_278F_allocates_an_id_for_an_insert_atom()
+    {
+        // The capture's atom is op 9 so nothing allocates there. A learn that consumed a NEW item
+        // row would arrive as op 7 with id 0, and handing World back 0 orphans it (T13).
+        var cap = LoadT15CaptureOrSkip();
+        if (cap == null) return;
+        var req = (byte[])cap[2750].Clone();
+        int atomStart = (int)BitConverter.ToUInt32(req, 0) - 6;
+        BitConverter.GetBytes(DbProxyHandlers.TsInsertItem).CopyTo(req, atomStart + DbProxyHandlers.ItemAtomOpOffset);
+        BitConverter.GetBytes(0u).CopyTo(req, atomStart + DbProxyHandlers.ItemAtomDbIdOffset);
+
+        var items = new IdCounter(4242);
+        var reply = DbProxyHandlers.BuildDbs278F(req, items.Next);
+        Hex.True(items.Calls == 1, $"the insert atom must allocate once, got {items.Calls}");
+        Hex.True(BitConverter.ToUInt32(reply, DbProxyHandlers.LearnSkillReplyHeader + DbProxyHandlers.ItemAtomDbIdOffset) == 4242,
+            "the allocated id must land at atom+16");
+    }
+
+    [Test] public static void Handler_278E_echoes_the_live_reqId()
+    {
+        var cap = LoadT15CaptureOrSkip();
+        if (cap == null) return;
+        using var store = new TeraSharp.Arbiter.Persistence.CharacterStore(":memory:", QuietLog());
+        var live = WithLiveId(cap[2750], 8, 0x0BAD);
+        var (op, body) = RunHandler1(DbProxyHandlers.SDB_USER_LEARN_SKILL, live, store);
+        Hex.True(op == DbProxyHandlers.DBS_USER_LEARN_SKILL, $"reply opcode must be 0x278F, got 0x{op:X4}");
+        uint echoed = BitConverter.ToUInt32(body, 16);
+        Hex.True(echoed == 0x0BAD, $"0x278F must carry the LIVE DLM id, carried 0x{echoed:X}");
+        Hex.True(echoed != BitConverter.ToUInt32(cap[2750], 8), "must not carry the captured id 147");
+    }
+
+    // ---- 0x2802 SDB_ACCOMPLISH_USER_ACHIEVEMENT -> 0x2803 ----
+
+    [Test] public static void Achievement_2803_echo_form_matches_capture()
+    {
+        var cap = LoadT15CaptureOrSkip();
+        if (cap == null) return;
+        // seq 1369 -> 1370 (46 B -> 43 B) and 2722 -> 2723: a NEW achievement comes back echoed.
+        Hex.Eq(DbProxyHandlers.BuildDbs2803(cap[1369]), cap[1370],
+            "DBS_ACCOMPLISH_USER_ACHIEVEMENT echo form (cap_newchar.log seq 1369 -> 1370)");
+        Hex.Eq(DbProxyHandlers.BuildDbs2803(cap[2722]), cap[2723],
+            "DBS_ACCOMPLISH_USER_ACHIEVEMENT echo form (cap_newchar.log seq 2722 -> 2723)");
+    }
+
+    [Test] public static void Achievement_2803_short_form_is_a_duplicate_accomplishment()
+    {
+        var cap = LoadT15CaptureOrSkip();
+        if (cap == null) return;
+        // seq 2605 -> 2606 is 46 B -> 19 B. Same request shape as 1369, same achievement id
+        // (5991) - only the timestamp differs. The Arbiter's handler keeps only the records
+        // User::AccomplishAchievement returned true for, so a REPEAT comes back as an empty list.
+        // ok is a hard-coded 1 in the writer either way, so both forms complete the DLM item.
+        uint idA = BitConverter.ToUInt32(cap[1369], DbProxyHandlers.AchievementRequestHeader);
+        uint idB = BitConverter.ToUInt32(cap[2605], DbProxyHandlers.AchievementRequestHeader);
+        Hex.True(idA == idB, $"both frames accomplish the same achievement ({idA} vs {idB})");
+
+        Hex.Eq(DbProxyHandlers.BuildDbs2803(cap[2605], _ => false), cap[2606],
+            "DBS_ACCOMPLISH_USER_ACHIEVEMENT short form (cap_newchar.log seq 2605 -> 2606)");
+        // ...and TeraSharp keeps no achievement table, so today every record looks new to us.
+        Hex.Eq(DbProxyHandlers.BuildDbs2803(cap[2605]),
+            DbProxyHandlers.BuildDbs2803(cap[2605], _ => true),
+            "with no predicate every record is treated as newly accomplished");
+    }
+
+    [Test] public static void Achievement_2803_header_shape()
+    {
+        var cap = LoadT15CaptureOrSkip();
+        if (cap == null) return;
+        var reply = DbProxyHandlers.BuildDbs2803(cap[1369]);
+        Hex.True(BitConverter.ToUInt32(reply, 0) == 19, "record offset is frame-relative 19 (6 + 13)");
+        Hex.True(BitConverter.ToUInt32(reply, 4) == DbProxyHandlers.AchievementRecordSize, "one 24-byte record");
+        Hex.True(BitConverter.ToUInt32(reply, 8) == BitConverter.ToUInt32(cap[1369], 8), "reqId echoed from payload[8]");
+        Hex.True(reply[12] == 1, "ok is a hard-coded 1 in the Arbiter's writer");
+        int recStart = (int)BitConverter.ToUInt32(cap[1369], 0) - 6;
+        Hex.Eq(reply[13..], cap[1369][recStart..(recStart + 24)], "the record is echoed verbatim");
+        // The short form is exactly World's minimum frame length (0x13).
+        Hex.True(DbProxyHandlers.BuildDbs2803(cap[2605], _ => false).Length + 6 == 0x13,
+            "the empty form must still be 19 bytes - World's Handler_DBS_ minimum");
+    }
+
+    [Test] public static void Handler_2802_echoes_the_live_reqId()
+    {
+        var cap = LoadT15CaptureOrSkip();
+        if (cap == null) return;
+        var live = WithLiveId(cap[1369], 8, 0x0BAD);
+        var (op, body) = RunHandler1(DbProxyHandlers.SDB_ACCOMPLISH_USER_ACHIEVEMENT, live);
+        Hex.True(op == DbProxyHandlers.DBS_ACCOMPLISH_USER_ACHIEVEMENT, $"reply opcode must be 0x2803, got 0x{op:X4}");
+        uint echoed = BitConverter.ToUInt32(body, 8);
+        Hex.True(echoed == 0x0BAD, $"0x2803 must carry the LIVE DLM id, carried 0x{echoed:X}");
+        Hex.True(echoed != BitConverter.ToUInt32(cap[1369], 8), "must not carry the captured id 96");
+    }
+
+    // ---- 0x2891 SDB_UPDATE_REPUTATION_INFO -> 0x2892 ----
+
+    [Test] public static void Reputation_2892_matches_capture()
+    {
+        var cap = LoadT15CaptureOrSkip();
+        if (cap == null) return;
+        Hex.Eq(DbProxyHandlers.BuildDbs2892(cap[413]), cap[417],
+            "DBS_UPDATE_REPUTATION_INFO (cap_newchar.log seq 413 -> 417)");
+        Hex.True(cap[417][0] == 1, "the ok byte comes FIRST in this reply, unlike every other one here");
+    }
+
+    [Test] public static void Reputation_2892_ok_follows_the_operation()
+    {
+        var cap = LoadT15CaptureOrSkip();
+        if (cap == null) return;
+        // Handler_SDB_UPDATE_REPUTATION_INFO only reaches a ReputationList call for op 1 (insert)
+        // and ops 2 / 4 (update); anything else leaves ok = 0. ok = 0 still completes the DLM item,
+        // it just selects OnFail, so copying the real value is safe and more faithful than a 1.
+        foreach (uint op in new uint[] { 1, 2, 4 })
+        {
+            var req = (byte[])cap[413].Clone();
+            BitConverter.GetBytes(op).CopyTo(req, 16);
+            Hex.True(DbProxyHandlers.BuildDbs2892(req)[0] == 1, $"op {op} must be ok = 1");
+        }
+        foreach (uint op in new uint[] { 0, 3, 5, 99 })
+        {
+            var req = (byte[])cap[413].Clone();
+            BitConverter.GetBytes(op).CopyTo(req, 16);
+            var r = DbProxyHandlers.BuildDbs2892(req);
+            Hex.True(r[0] == 0, $"op {op} is not implemented by the real Arbiter, so ok = 0");
+            Hex.True(BitConverter.ToUInt32(r, 1) == BitConverter.ToUInt32(req, 8),
+                "the reqId is echoed even when ok = 0 - the item must still complete");
+        }
+    }
+
+    [Test] public static void Handler_2891_echoes_the_live_reqId()
+    {
+        var cap = LoadT15CaptureOrSkip();
+        if (cap == null) return;
+        var live = WithLiveId(cap[413], 8, 0x0BAD);
+        var (op, body) = RunHandler1(DbProxyHandlers.SDB_UPDATE_REPUTATION_INFO, live);
+        Hex.True(op == DbProxyHandlers.DBS_UPDATE_REPUTATION_INFO, $"reply opcode must be 0x2892, got 0x{op:X4}");
+        uint echoed = BitConverter.ToUInt32(body, 1);
+        Hex.True(echoed == 0x0BAD, $"0x2892 must carry the LIVE DLM id at payload[1], carried 0x{echoed:X}");
+        Hex.True(echoed != BitConverter.ToUInt32(cap[413], 8), "must not carry the captured id 43");
+    }
+
+    // ---- the four plain [reqId][ok] acks ----
+
+    [Test] public static void TutorialTip_286F_matches_capture()
+    {
+        var cap = LoadT15CaptureOrSkip();
+        if (cap == null) return;
+        Hex.Eq(DbProxyHandlers.BuildReqIdAck(cap[719], 0), cap[728],
+            "DBS_ADD_TUTORIAL_SIMPLE_TIP (cap_newchar.log seq 719 -> 728)");
+    }
+
+    [Test] public static void DailyEventCount_293D_matches_capture()
+    {
+        var cap = LoadT15CaptureOrSkip();
+        if (cap == null) return;
+        // reqId is at payload[8] here - payload[0] is the record list offset, not an id.
+        Hex.Eq(DbProxyHandlers.BuildReqIdAck(cap[505], 8), cap[507],
+            "DBS_UPDATE_USER_DAILY_EVENT_COUNT (cap_newchar.log seq 505 -> 507)");
+    }
+
+    [Test] public static void ExtraReward_293F_matches_capture()
+    {
+        var cap = LoadT15CaptureOrSkip();
+        if (cap == null) return;
+        Hex.Eq(DbProxyHandlers.BuildReqIdAck(cap[503], 0), cap[504],
+            "DBS_UPDATE_GET_EXTRA_REWARD (cap_newchar.log seq 503 -> 504)");
+    }
+
+    [Test] public static void SerenGuide_2945_matches_capture()
+    {
+        var cap = LoadT15CaptureOrSkip();
+        if (cap == null) return;
+        Hex.Eq(DbProxyHandlers.BuildDbs2945(cap[634]), cap[635],
+            "DBS_UPDATE_SEREN_GUIDE_INFO (cap_newchar.log seq 634 -> 635)");
+        var r = DbProxyHandlers.BuildDbs2945(cap[634]);
+        Hex.True(BitConverter.ToUInt32(r, 4) == BitConverter.ToUInt32(cap[634], 4),
+            "the playerId is echoed back in the middle of this one");
+    }
+
+    [Test] public static void T15_small_acks_echo_the_live_reqId()
+    {
+        var cap = LoadT15CaptureOrSkip();
+        if (cap == null) return;
+        // (request opcode, reply opcode, reqId payload offset in the request, reqId offset in the reply)
+        var cases = new (uint seq, ushort req, ushort rsp, int reqAt, int rspAt)[]
+        {
+            (719, DbProxyHandlers.SDB_ADD_TUTORIAL_SIMPLE_TIP,       DbProxyHandlers.DBS_ADD_TUTORIAL_SIMPLE_TIP,       0, 0),
+            (505, DbProxyHandlers.SDB_UPDATE_USER_DAILY_EVENT_COUNT, DbProxyHandlers.DBS_UPDATE_USER_DAILY_EVENT_COUNT, 8, 0),
+            (503, DbProxyHandlers.SDB_UPDATE_GET_EXTRA_REWARD,       DbProxyHandlers.DBS_UPDATE_GET_EXTRA_REWARD,       0, 0),
+            (634, DbProxyHandlers.SDB_UPDATE_SEREN_GUIDE_INFO,       DbProxyHandlers.DBS_UPDATE_SEREN_GUIDE_INFO,       0, 0),
+        };
+        foreach (var (seq, reqOp, rspOp, reqAt, rspAt) in cases)
+        {
+            uint captured = BitConverter.ToUInt32(cap[seq], reqAt);
+            var (op, body) = RunHandler1(reqOp, WithLiveId(cap[seq], reqAt, 0x0BAD));
+            Hex.True(op == rspOp, $"0x{reqOp:X4} must reply 0x{rspOp:X4}, got 0x{op:X4}");
+            uint echoed = BitConverter.ToUInt32(body, rspAt);
+            Hex.True(echoed == 0x0BAD, $"0x{rspOp:X4} must carry the LIVE DLM id, carried 0x{echoed:X}");
+            Hex.True(echoed != captured, $"0x{rspOp:X4} must not carry the captured id {captured}");
+            Hex.True(body[^1] == 1, $"0x{rspOp:X4} must set the ok byte");
+        }
+    }
+
+    // ---- 0x2927 SDB_CANCEL_NPC_ARENA_BET: no reply, ever ----
+
+    [Test] public static void ArenaBet_2927_is_one_way_and_has_no_handler()
+    {
+        Hex.True(WorldReplayTable.OneWayFromWorld.Contains(DbProxyHandlers.SDB_CANCEL_NPC_ARENA_BET),
+            "0x2927 must be in OneWayFromWorld - Handler_SDB_CANCEL_NPC_ARENA_BET has no SendToSession, "
+            + "so anything the replay table attributes to it is another request's reply");
+        Hex.True(!DbProxyHandlers.IsHandledRequest(DbProxyHandlers.SDB_CANCEL_NPC_ARENA_BET),
+            "0x2927 must NOT be in the TryHandle allow-list - there is no DBS_ opcode to answer with");
+
+        var cap = LoadT15CaptureOrSkip();
+        if (cap == null) return;
+        Hex.True(cap[3466].Length + 6 == 14, "the captured frame is 14 bytes (World's minimum is 0xe)");
+    }
+
+    // =====================================================================
+    // T15 - the build-time gap guard.
+    //
+    // The live rule, learned the hard way twice in one day (0x1463 on a warrior's first login,
+    // 0x297B right after): ANY per-user W->A opcode World sends that we neither handle nor
+    // replay wedges that user for the life of the World process. The symptom is silence, hours
+    // later, in a live session. This test moves that failure to `dotnet run`.
+    // =====================================================================
+
+    /// <summary>
+    /// Opcodes handled on master but not on this branch, so the guard below does not fail on a
+    /// worktree that was cut before that commit. DELETE AN ENTRY once the branch is rebased -
+    /// IsHandledRequest will cover it and the exemption becomes dead weight.
+    /// </summary>
+    static readonly ushort[] HandledOnMasterNotOnThisBranch =
+    {
+        0x297B, // SDB_UPDATE_USER_ACTPOINT -> 0x297C, added on master 2026-09-14 after this
+                // worktree branched. T15 was told not to touch it.
+    };
+
+    [Test]
+    public static void Every_per_user_request_opcode_is_answered()
+    {
+        // The source of truth is the table in status/PERSISTENCE-MAP.md: every row is a per-user
+        // W->A opcode seen in a real capture. An opcode is answered if it is in the TryHandle
+        // allow-list, in OneWayFromWorld (World wants no reply), or has a replay entry.
+        var mapPath = FindRepoFile(Path.Combine("status", "PERSISTENCE-MAP.md"));
+        if (mapPath == null) { Console.WriteLine("        (skipped: status/PERSISTENCE-MAP.md not found)"); return; }
+
+        var opcodes = ParsePersistenceMapRequestOpcodes(File.ReadAllText(mapPath));
+        Hex.True(opcodes.Count >= 18,
+            $"only {opcodes.Count} opcodes parsed out of PERSISTENCE-MAP.md - the table format changed "
+            + "and this guard is no longer guarding anything");
+
+        // The replay table is optional: it is built from D:\packetlogs\arb_world.log at runtime and
+        // that file is not in the repo. Without it the other two arms have to carry the check, which
+        // is the stricter answer anyway.
+        var replay = LoadWorldReplayTableOrNull();
+
+        var gaps = new List<string>();
+        foreach (var (op, name) in opcodes)
+        {
+            if (DbProxyHandlers.IsHandledRequest(op)) continue;
+            if (WorldReplayTable.OneWayFromWorld.Contains(op)) continue;
+            if (replay != null && replay.GetResponses(op).Count > 0) continue;
+            if (Array.IndexOf(HandledOnMasterNotOnThisBranch, op) >= 0) continue;
+            gaps.Add($"0x{op:X4} {name}");
+        }
+
+        Hex.True(gaps.Count == 0,
+            "these per-user opcodes from status/PERSISTENCE-MAP.md have no answer - each one "
+            + "head-blocks the user's DLM queue for the life of the World process "
+            + "(status/HANDOFF.md section 1). Give each a real handler in DbProxyHandlers "
+            + "(allow-list + dispatch case + builder), or add it to WorldReplayTable.OneWayFromWorld "
+            + "if the decompiled Arbiter handler has no SendToSession:\n    " + string.Join("\n    ", gaps));
+    }
+
+    [Test]
+    public static void Persistence_map_guard_would_catch_a_missing_opcode()
+    {
+        // The guard is only worth having if it fails when it should. 0x1463
+        // SA_LEARN_ALL_CREST_ACQUIRABLE is a real per-user request; 0xDEAD is not answered by
+        // anything, which is exactly the shape of the bug this test exists to catch.
+        Hex.True(DbProxyHandlers.IsHandledRequest(0x1463),
+            "0x1463 is answered, so a row for it would pass");
+        Hex.True(!DbProxyHandlers.IsHandledRequest(0xDEAD)
+                 && !WorldReplayTable.OneWayFromWorld.Contains(0xDEAD),
+            "0xDEAD is answered by nothing, so a row for it would fail the guard");
+
+        var parsed = ParsePersistenceMapRequestOpcodes(
+            "| write (W->A) | reply | shape | count | feeds |\n"
+            + "|---|---|---|---|---|\n"
+            + "| 0xDEAD SDB_MADE_UP (10 B) | 0xDEAF | [reqId][ok] | 1 | nothing |\n");
+        Hex.True(parsed.Count == 1 && parsed[0].op == 0xDEAD && parsed[0].name == "SDB_MADE_UP",
+            $"the table parser must find one row, found {parsed.Count}");
+    }
+
+    /// <summary>
+    /// Pulls the request opcode and name out of the first column of every table row in
+    /// status/PERSISTENCE-MAP.md - rows look like
+    /// <c>| 0x272E SDB_SET_QUEST_INFO (116 B) | 0x272F | ... |</c>. Header and separator rows have
+    /// no 0x in the first cell and are skipped.
+    /// </summary>
+    static List<(ushort op, string name)> ParsePersistenceMapRequestOpcodes(string markdown)
+    {
+        var found = new List<(ushort, string)>();
+        var seen = new HashSet<ushort>();
+        foreach (var raw in markdown.Split('\n'))
+        {
+            var line = raw.Trim();
+            if (!line.StartsWith("|")) continue;
+            var cells = line.Split('|', StringSplitOptions.RemoveEmptyEntries);
+            if (cells.Length < 2) continue;
+            var cell = cells[0].Trim();
+            if (!cell.StartsWith("0x", StringComparison.OrdinalIgnoreCase)) continue;
+            // The second cell of a real row names the reply opcode (or "none" for a one-way
+            // write). Requiring it keeps other tables in the file - which also start a cell with
+            // 0x - from being read as request opcodes.
+            var reply = cells[1].Trim();
+            if (!reply.StartsWith("0x", StringComparison.OrdinalIgnoreCase)
+                && !reply.Equals("none", StringComparison.OrdinalIgnoreCase)) continue;
+
+            var bits = cell.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (bits.Length < 1) continue;
+            if (!ushort.TryParse(bits[0].AsSpan(2), System.Globalization.NumberStyles.HexNumber, null, out var op)) continue;
+            if (!seen.Add(op)) continue;
+            found.Add((op, bits.Length > 1 ? bits[1] : "?"));
+        }
+        return found;
+    }
+
+    /// <summary>
+    /// The replay table the running server would build, or null when the tap log is not on this
+    /// machine. Same env var as Program.cs (TERASHARP_LOGS, default D:\packetlogs).
+    /// </summary>
+    static WorldReplayTable? LoadWorldReplayTableOrNull()
+    {
+        var dir = Environment.GetEnvironmentVariable("TERASHARP_LOGS") ?? @"D:\packetlogs";
+        var path = Path.Combine(dir, "arb_world.log");
+        if (!File.Exists(path))
+        {
+            Console.WriteLine($"        (note: {path} not found - checking the allow-list and "
+                + "OneWayFromWorld only)");
+            return null;
+        }
+        return WorldReplayTable.Load(path, QuietLog());
+    }
+
+
+    // =====================================================================
+    // T18 — the default skills a level-1 character starts with.
+    //
+    // Live symptom: a freshly created warrior spawned with his skill icons present but all
+    // locked, while the captured character had usable skills at level 1.
+    //
+    // Cause: the skills live INSIDE the world blob (40 passive slots at 6880, 500 active slots
+    // at 7200, 8 bytes each), the real ArbiterServer writes them there at character creation
+    // from Datasheet\DefaultSkillSet.xml, and data/starter_blob.bin is a Popori-female Glaiver's
+    // blob — so every class we created got the valkyrie's skills and none of its own.
+    // WorldServer copies those two arrays straight into S_SKILL_LIST, so the client saw a
+    // warrior whose every warrior skill was un-learned. Full write-up in status/SKILLS.md.
+    //
+    // Ground truth for the byte-exact tests:
+    //   data/starter_blob.bin            blob 6880/7200 = 17 passive + 7 active ids
+    //   D:\packetlogs\cap_newchar_client.log packet 81 = the same 24 ids as S_SKILL_LIST
+    //   Datasheet\DefaultSkillSet.xml    Popori/Female/Glaiver row = the same 24 ids
+    // =====================================================================
+
+    static readonly int[] GlaiverActive = { 10199, 60199, 140199, 160199, 9020100, 9030100, 60401301 };
+    static readonly int[] GlaiverPassive =
+    {
+        10002, 19500, 19501, 94001, 94002, 94003, 94005, 94006, 94007,
+        94008, 94009, 94010, 94011, 94012, 94013, 94014, 94015,
+    };
+    /// <summary>
+    /// The four Glaiver-only actives. 9020100 and 60401301 are in ALL 99 rows of the sheet -
+    /// every character gets them whatever the class - so they are not evidence of a leak, and
+    /// 9030100 is in 22 rows (it is not Glaiver-specific either).
+    /// </summary>
+    static readonly int[] GlaiverOnlyActive = { 10199, 60199, 140199, 160199 };
+    static readonly int[] HumanWarriorActive = { 10100, 20100, 9020100, 60401301 };
+    static readonly int[] HumanWarriorPassive = { 10001, 19100, 19101, 19102 };
+
+    static int[] ActiveSkills(byte[] blob) => TeraSharp.Arbiter.Persistence.StarterBlob.ReadSkillRegion(
+        blob, TeraSharp.Arbiter.Persistence.StarterBlob.ActiveSkillsOffset,
+        TeraSharp.Arbiter.Persistence.StarterBlob.ActiveSkillSlots);
+
+    static int[] PassiveSkills(byte[] blob) => TeraSharp.Arbiter.Persistence.StarterBlob.ReadSkillRegion(
+        blob, TeraSharp.Arbiter.Persistence.StarterBlob.PassiveSkillsOffset,
+        TeraSharp.Arbiter.Persistence.StarterBlob.PassiveSkillSlots);
+
+    static void EqIds(int[] actual, int[] expected, string what)
+        => Hex.True(actual.SequenceEqual(expected),
+            $"{what}\n   expected: {string.Join(",", expected)}\n   actual:   {string.Join(",", actual)}");
+
+    [Test] public static void DefaultSkills_template_holds_the_captured_valkyrie_list()
+    {
+        // The premise everything else rests on: the ids in data/starter_blob.bin at 6880/7200
+        // are the Popori/Female/Glaiver row of DefaultSkillSet.xml, and they are exactly the 24
+        // entries the real server put in S_SKILL_LIST for that character (packet 81).
+        var template = LoadStarterTemplateOrSkip();
+        if (template == null) return;
+
+        EqIds(ActiveSkills(template), GlaiverActive, "template active skills at 7200");
+        EqIds(PassiveSkills(template), GlaiverPassive, "template passive skills at 6880");
+    }
+
+    [Test] public static void DefaultSkills_regions_are_adjacent_and_inside_the_blob()
+    {
+        // 6880 + 40*8 == 7200, and 7200 + 500*8 == 11200 <= 15312. Both bounds come from the
+        // decompile (Arb_part_080.c:12875 writes at UserData+0x1AE0 / +0x1C20 stepping 8;
+        // WorldServer.exe.c:1663323 reads 40 and 500 entries back) — if either constant is wrong
+        // the regions overlap or run off the end and Build corrupts the blob.
+        Hex.True(TeraSharp.Arbiter.Persistence.StarterBlob.PassiveSkillsOffset
+                 + TeraSharp.Arbiter.Persistence.StarterBlob.PassiveSkillSlots
+                 * TeraSharp.Arbiter.Persistence.StarterBlob.SkillEntrySize
+                 == TeraSharp.Arbiter.Persistence.StarterBlob.ActiveSkillsOffset,
+            "the passive region must end exactly where the active region starts");
+        Hex.True(TeraSharp.Arbiter.Persistence.StarterBlob.ActiveSkillsOffset
+                 + TeraSharp.Arbiter.Persistence.StarterBlob.ActiveSkillSlots
+                 * TeraSharp.Arbiter.Persistence.StarterBlob.SkillEntrySize
+                 <= TeraSharp.Arbiter.Persistence.StarterBlob.Size,
+            "the active region must fit inside the 15312-byte blob");
+    }
+
+    [Test] public static void DefaultSkills_rebuild_reproduces_the_captured_blob_byte_for_byte()
+    {
+        // Build for the captured character's own race/gender/class must give back the template
+        // unchanged — including the two skill regions. That is the strongest form of this test:
+        // the ids go in from the DATASHEET table and the blob the real Arbiter sent comes back
+        // identical, so the table, the offsets and the entry layout are all right at once.
+        var template = LoadStarterTemplateOrSkip();
+        if (template == null) return;
+
+        var blob = (byte[])template.Clone();
+        bool found = TeraSharp.Arbiter.Persistence.StarterBlob.ApplyDefaultSkills(blob, race: 4, gender: 1, cls: 12);
+        Hex.True(found, "the sheet must have a Popori/Female/Glaiver row");
+        Hex.Eq(blob, template, "ApplyDefaultSkills for the captured character must be a no-op");
+    }
+
+    [Test] public static void DefaultSkills_human_warrior_gets_warrior_skills_not_the_valkyrie_s()
+    {
+        var template = LoadStarterTemplateOrSkip();
+        if (template == null) return;
+
+        var blob = TeraSharp.Arbiter.Persistence.StarterBlob.Build(
+            template, playerId: 9, name: "Rurik",
+            identity: new TeraSharp.Arbiter.Persistence.CharacterIdentity { Race = 0, Gender = 0, Class = 0 },
+            zone: 5, x: 16260f, y: 1253f, z: -4410f);
+
+        EqIds(ActiveSkills(blob), HumanWarriorActive, "human male warrior active skills");
+        EqIds(PassiveSkills(blob), HumanWarriorPassive, "human male warrior passive skills");
+        foreach (int id in GlaiverOnlyActive)
+            Hex.True(!ActiveSkills(blob).Contains(id),
+                $"valkyrie skill {id} leaked into a warrior's blob - this is the T18 bug");
+    }
+
+    [Test] public static void DefaultSkills_unknown_combination_clears_both_regions()
+    {
+        // There is no Human/Male/Glaiver row. The real Arbiter's lookup finds nothing and
+        // inserts no skills; leaving the template's arrays would hand that character the
+        // valkyrie's list, which is worse than none.
+        var template = LoadStarterTemplateOrSkip();
+        if (template == null) return;
+
+        var blob = (byte[])template.Clone();
+        bool found = TeraSharp.Arbiter.Persistence.StarterBlob.ApplyDefaultSkills(blob, race: 0, gender: 0, cls: 12);
+        Hex.True(!found, "Human/Male/Glaiver is not a real combination");
+        Hex.True(ActiveSkills(blob).Length == 0, "the active region must be cleared, not left as the template's");
+        Hex.True(PassiveSkills(blob).Length == 0, "the passive region must be cleared");
+
+        int pOff = TeraSharp.Arbiter.Persistence.StarterBlob.PassiveSkillsOffset;
+        int aEnd = TeraSharp.Arbiter.Persistence.StarterBlob.ActiveSkillsOffset
+                 + TeraSharp.Arbiter.Persistence.StarterBlob.ActiveSkillSlots
+                 * TeraSharp.Arbiter.Persistence.StarterBlob.SkillEntrySize;
+        for (int i = pOff; i < aEnd; i++)
+            Hex.True(blob[i] == 0, $"byte {i} inside the skill regions should be 0, got 0x{blob[i]:X2}");
+        Hex.Eq(blob[..pOff], template[..pOff], "nothing before the skill regions may change");
+        Hex.Eq(blob[aEnd..], template[aEnd..], "nothing after the skill regions may change");
+    }
+
+    [Test] public static void DefaultSkills_entry_layout_is_id_then_a_zero_flag_and_padding()
+    {
+        // The Arbiter writes `*(u32*)(p-4) = skillId; *p = 0; p += 8` — so four bytes of id and
+        // four zero bytes. Every used slot in the captured blob looks exactly like that, and so
+        // must every slot we write.
+        var template = LoadStarterTemplateOrSkip();
+        if (template == null) return;
+
+        var blob = TeraSharp.Arbiter.Persistence.StarterBlob.Build(
+            template, playerId: 9, name: "Rurik",
+            identity: new TeraSharp.Arbiter.Persistence.CharacterIdentity { Race = 0, Gender = 0, Class = 0 },
+            zone: 5, x: 0f, y: 0f, z: 0f);
+
+        int size = TeraSharp.Arbiter.Persistence.StarterBlob.SkillEntrySize;
+        foreach (var (off, ids) in new[]
+        {
+            (TeraSharp.Arbiter.Persistence.StarterBlob.ActiveSkillsOffset, HumanWarriorActive),
+            (TeraSharp.Arbiter.Persistence.StarterBlob.PassiveSkillsOffset, HumanWarriorPassive),
+        })
+        {
+            for (int i = 0; i < ids.Length; i++)
+            {
+                Hex.True(BitConverter.ToInt32(blob, off + i * size) == ids[i],
+                    $"slot {i} at {off} should hold {ids[i]}");
+                Hex.Eq(blob[(off + i * size + 4)..(off + (i + 1) * size)], new byte[] { 0, 0, 0, 0 },
+                    $"slot {i} at {off}: the flag byte and its padding must be zero");
+            }
+            // And the slot right after the last id is empty, which is how World stops reading.
+            Hex.True(BitConverter.ToInt32(blob, off + ids.Length * size) == 0,
+                $"the slot after the last id at {off} must be 0 — it terminates the list");
+        }
+    }
+
+    [Test] public static void DefaultSkills_table_covers_the_sheet_and_fits_the_regions()
+    {
+        // 99 rows is the whole of DefaultSkillSet.xml. If a row ever carried more ids than the
+        // blob has slots the extras would be dropped silently, so assert the headroom instead.
+        Hex.True(TeraSharp.Arbiter.Persistence.DefaultSkillSet.Count == 99,
+            $"the sheet has 99 race/gender/class rows, the table has {TeraSharp.Arbiter.Persistence.DefaultSkillSet.Count}");
+
+        int maxActive = 0, maxPassive = 0, rows = 0;
+        for (int race = 0; race <= 5; race++)
+        for (int gender = 0; gender <= 1; gender++)
+        for (int cls = 0; cls <= 12; cls++)
+        {
+            if (!TeraSharp.Arbiter.Persistence.DefaultSkillSet.TryGet(race, gender, cls, out var a, out var p)) continue;
+            rows++;
+            maxActive = Math.Max(maxActive, a.Length);
+            maxPassive = Math.Max(maxPassive, p.Length);
+            foreach (int id in a.Concat(p))
+                Hex.True(id > 0, $"race {race} gender {gender} class {cls} has a non-positive skill id {id}");
+        }
+        Hex.True(rows == 99, $"walking race 0-5 / gender 0-1 / class 0-12 should find all 99 rows, found {rows}");
+        Hex.True(maxActive <= TeraSharp.Arbiter.Persistence.StarterBlob.ActiveSkillSlots,
+            $"a row has {maxActive} active skills, more than the {TeraSharp.Arbiter.Persistence.StarterBlob.ActiveSkillSlots} slots");
+        Hex.True(maxPassive <= TeraSharp.Arbiter.Persistence.StarterBlob.PassiveSkillSlots,
+            $"a row has {maxPassive} passive skills, more than the {TeraSharp.Arbiter.Persistence.StarterBlob.PassiveSkillSlots} slots");
+    }
+
+    [Test] public static void DefaultSkills_every_creatable_class_gets_a_list()
+    {
+        // A combination the character creator offers but the sheet does not cover would spawn a
+        // character with no skills at all. Spot-check one class per race/gender the sheet has.
+        var seen = new List<string>();
+        for (int race = 0; race <= 5; race++)
+        for (int gender = 0; gender <= 1; gender++)
+        {
+            bool any = false;
+            for (int cls = 0; cls <= 12 && !any; cls++)
+                any = TeraSharp.Arbiter.Persistence.DefaultSkillSet.TryGet(race, gender, cls, out _, out _);
+            if (any) seen.Add($"{race}/{gender}");
+        }
+        // Human, High Elf, Aman, Castanic and Popori have both genders; Baraka is male-only.
+        Hex.True(seen.Count == 11,
+            $"expected 11 race/gender combinations with skills, got {seen.Count}: {string.Join(" ", seen)}");
+        Hex.True(!seen.Contains("5/1"), "Baraka is male-only; a female row would mean the table is wrong");
     }
 
     /// <summary>Walks up from the test binary looking for a repo-relative file; null if not found.</summary>

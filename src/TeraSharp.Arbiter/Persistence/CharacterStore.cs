@@ -65,6 +65,191 @@ public sealed class CharacterIdentity
     public byte[] Shape { get; init; } = new byte[StarterBlob.ShapeSize];
 }
 
+
+/// <summary>
+/// The per-race/gender/class default skill lists a brand-new character starts with — T18.
+///
+/// <para><b>Why this exists.</b> A level-1 character's skills are not granted by WorldServer and
+/// they are not in <c>CreateCharData.xml</c> (that sheet only carries the starter items; its
+/// header comment says it is loaded by the Arbiter alone, and it has no skill entries). The real
+/// ArbiterServer writes them into the character's world blob at CREATION, in
+/// <c>AccountManager::ExecCreateDefaultSkills(int, UserData *)</c> (Arb_part_080.c:12875): it
+/// looks the character's (race, class, gender) up in the <c>DefaultSkillInfo</c> datasheet
+/// (<c>DatasheetManager::LoadDefaultSkillInfo</c>, Arb_part_085.c:5992 — the file on disk is
+/// <c>Executable\Datasheet\DefaultSkillSet.xml</c>), runs <c>spInsertSkillLearned</c> /
+/// <c>spInsertPassiveSkill</c> per id, and for every row that inserted writes
+/// <c>[u32 skillId][u8 0]</c> into <c>UserData + 0x1C20</c> (active) and
+/// <c>UserData + 0x1AE0</c> (passive), stepping 8 bytes. UserData IS the 15312-byte blob, so
+/// those are blob offsets 7200 and 6880 — see <see cref="StarterBlob.ActiveSkillsOffset"/>.</para>
+///
+/// <para>WorldServer then reads them straight back out: <c>UserEnterWorldContext::SetRecvData</c>
+/// memcpys our <c>DBS_USER_ENTERWORLD</c> blob to <c>context + 0xA8</c>
+/// (WorldServer.exe.c:1661252), and <c>UpdateRecvedData</c> copies <c>context + 0x1CC8</c> /
+/// <c>+ 0x1B88</c> (= blob 7200 / 6880) into <c>User + 0x8460</c> / <c>User + 0x8320</c>.
+/// <c>User::SendMySkillList</c> (WorldServer.exe.c:2193096) walks exactly those two arrays to
+/// build <c>S_SKILL_LIST</c>. Verified against the capture: the 7 active + 17 passive ids in
+/// <c>data/starter_blob.bin</c> are byte-identical to the 24 entries of the first
+/// <c>S_SKILL_LIST</c> in <c>D:\packetlogs\cap_newchar_client.log</c> (packet 81).</para>
+///
+/// <para><b>The bug this fixes.</b> <c>data/starter_blob.bin</c> is a Popori-female Glaiver's
+/// blob ("Test", race 4 / gender 1 / class 12 = Elin valkyrie), so before T18 every character we
+/// created — warrior included — shipped the VALKYRIE's skill ids. None of a warrior's own skills
+/// were ever in <c>S_SKILL_LIST</c>, so the client drew his whole skill tree as not-yet-learned:
+/// icons present, all locked.</para>
+///
+/// <para>Generated from <c>Executable\Datasheet\DefaultSkillSet.xml</c> (99 rows, the complete
+/// sheet). Race, gender and class are the Arbiter's own numeric ids, decompiled from its
+/// name-&gt;id lookups: race <c>FUN_1400c4e20</c> (Arb_part_006.c:523) = Human 0, HighElf 1,
+/// Aman 2, Castanic 3, Popori 4, Baraka 5; class <c>FUN_140065e00</c> (Arb_part_003.c:2179) =
+/// Warrior 0, Lancer 1, Slayer 2, Berserker 3, Sorcerer 4, Archer 5, Priest 6, Elementalist 7,
+/// Soulless 8, Engineer 9, Fighter 10, Assassin 11, Glaiver 12; gender Male 0, Female 1
+/// (<c>LoadDefaultSkillInfo</c> maps the literal "Female" to 1).</para>
+///
+/// <para>To regenerate after a datasheet change, re-read that XML and re-emit
+/// <see cref="Rows"/>; the format is <c>"race,gender,class|active;ids|passive;ids"</c>.</para>
+/// </summary>
+public static class DefaultSkillSet
+{
+    /// <summary>One row per creatable race/gender/class. Order is irrelevant; the lookup is a dictionary.</summary>
+    internal static readonly string[] Rows =
+    {
+        "0,0,0|10100;20100;9020100;60401301|10001;19100;19101;19102",  // Human Male Warrior
+        "0,0,1|10100;20100;9020100;260100;60401301|10000;19100;19101;19102",  // Human Male Lancer
+        "0,0,2|10100;40100;9020100;60401301|10002;19100;19101;19102",  // Human Male Slayer
+        "0,0,3|10100;20100;290100;9020100;60401301|10000;19100;19101;19102;14070",  // Human Male Berserker
+        "0,0,4|10100;70100;9020100;60401301|10002;19100;19101;19102",  // Human Male Sorcerer
+        "0,0,5|10100;60100;9020100;60401301|10002;19100;19101;19102",  // Human Male Archer
+        "0,0,6|10100;180100;9020100;380100;60401301|10002;19100;19101;19102",  // Human Male Priest
+        "0,0,7|10100;170100;180100;9020100;60401301|10002;19100;19101;19102",  // Human Male Elementalist
+        "0,0,10|10100;20100;400100;9020100;60401301|10002;19100;19101;19102;92001;92002;92003;92004;92005;92006;92007;92008;92009;92010;92011;92012",  // Human Male Fighter
+        "0,1,0|10100;20100;9020100;60401301|10001;19100;19101;19102",  // Human Female Warrior
+        "0,1,1|10100;20100;9020100;260100;60401301|10000;19100;19101;19102",  // Human Female Lancer
+        "0,1,2|10100;40100;9020100;60401301|10002;19100;19101;19102",  // Human Female Slayer
+        "0,1,3|10100;20100;290100;9020100;60401301|10000;19100;19101;19102;14070",  // Human Female Berserker
+        "0,1,4|10100;70100;9020100;60401301|10002;19100;19101;19102",  // Human Female Sorcerer
+        "0,1,5|10100;60100;9020100;60401301|10002;19100;19101;19102",  // Human Female Archer
+        "0,1,6|10100;180100;9020100;380100;60401301|10002;19100;19101;19102",  // Human Female Priest
+        "0,1,7|10100;170100;180100;9020100;60401301|10002;19100;19101;19102",  // Human Female Elementalist
+        "0,1,10|10100;20100;400100;9020100;60401301|10002;19100;19101;19102;92001;92002;92003;92004;92005;92006;92007;92008;92009;92010;92011;92012",  // Human Female Fighter
+        "1,0,0|10100;20100;9020100;60401301|10001;19200;19201",  // Highelf Male Warrior
+        "1,0,1|10100;20100;9020100;260100;60401301|10000;19200;19201",  // Highelf Male Lancer
+        "1,0,2|10100;40100;9020100;60401301|10002;19200;19201",  // Highelf Male Slayer
+        "1,0,3|10100;20100;290100;9020100;60401301|10000;19200;19201;14070",  // Highelf Male Berserker
+        "1,0,4|10100;70100;9020100;60401301|10000;19200;19201;14070",  // Highelf Male Sorcerer
+        "1,0,5|10100;60100;9020100;60401301|10002;19200;19201",  // Highelf Male Archer
+        "1,0,6|10100;180100;9020100;380100;60401301|10002;19200;19201",  // Highelf Male Priest
+        "1,0,7|10100;170100;180100;9020100;60401301|10002;19200;19201",  // Highelf Male Elementalist
+        "1,1,0|10100;20100;9020100;60401301|10001;19200;19201",  // Highelf Female Warrior
+        "1,1,1|10100;20100;9020100;260100;60401301|10000;19200;19201",  // Highelf Female Lancer
+        "1,1,2|10100;40100;9020100;60401301|10002;19200;19201",  // Highelf Female Slayer
+        "1,1,3|10100;20100;290100;9020100;60401301|10000;19200;19201;14070",  // Highelf Female Berserker
+        "1,1,4|10100;70100;9020100;60401301|10002;19200;19201",  // Highelf Female Sorcerer
+        "1,1,5|10100;60100;9020100;60401301|10002;19200;19201",  // Highelf Female Archer
+        "1,1,6|10100;180100;9020100;380100;60401301|10002;19200;19201",  // Highelf Female Priest
+        "1,1,7|10100;170100;180100;9020100;60401301|10002;19200;19201",  // Highelf Female Elementalist
+        "1,1,9|10100;400100;9020100;60401301|10003;19200;19201;91013;91014;91003;91004;91006",  // Highelf Female Engineer
+        "2,0,0|10100;20100;9020100;60401301|10001;19400;19401;19402",  // Aman Male Warrior
+        "2,0,1|10100;20100;9020100;260100;60401301|10000;19400;19401;19402",  // Aman Male Lancer
+        "2,0,2|10100;40100;9020100;60401301|10002;19400;19401;19402",  // Aman Male Slayer
+        "2,0,3|10100;20100;290100;9020100;60401301|10000;19400;19401;19402;14070",  // Aman Male Berserker
+        "2,0,4|10100;70100;9020100;60401301|10002;19400;19401;19402",  // Aman Male Sorcerer
+        "2,0,5|10100;60100;9020100;60401301|10002;19400;19401;19402",  // Aman Male Archer
+        "2,0,6|10100;180100;9020100;380100;60401301|10002;19400;19401;19402",  // Aman Male Priest
+        "2,0,7|10100;170100;180100;9020100;60401301|10002;19400;19401;19402",  // Aman Male Elementalist
+        "2,1,0|10100;20100;9020100;60401301|10001;19400;19401;19402",  // Aman Female Warrior
+        "2,1,1|10100;20100;9020100;260100;60401301|10000;19400;19401;19402",  // Aman Female Lancer
+        "2,1,2|10100;40100;9020100;60401301|10002;19400;19401;19402",  // Aman Female Slayer
+        "2,1,3|10100;20100;290100;9020100;60401301|10000;19400;19401;19402;14070",  // Aman Female Berserker
+        "2,1,4|10100;70100;9020100;60401301|10002;19400;19401;19402",  // Aman Female Sorcerer
+        "2,1,5|10100;60100;9020100;60401301|10002;19400;19401;19402",  // Aman Female Archer
+        "2,1,6|10100;180100;9020100;380100;60401301|10002;19400;19401;19402",  // Aman Female Priest
+        "2,1,7|10100;170100;180100;9020100;60401301|10002;19400;19401;19402",  // Aman Female Elementalist
+        "3,0,0|10100;20100;9020100;60401301|10001;19300;19301;19302",  // Castanic Male Warrior
+        "3,0,1|10100;20100;9020100;260100;60401301|10000;19300;19301;19302",  // Castanic Male Lancer
+        "3,0,2|10100;40100;9020100;60401301|10002;19300;19301;19302",  // Castanic Male Slayer
+        "3,0,3|10100;20100;290100;9020100;60401301|10000;19300;19301;19302;14070",  // Castanic Male Berserker
+        "3,0,4|10100;70100;9020100;60401301|10002;19300;19301;19302",  // Castanic Male Sorcerer
+        "3,0,5|10100;60100;9020100;60401301|10002;19300;19301;19302",  // Castanic Male Archer
+        "3,0,6|10100;180100;9020100;380100;60401301|10002;19300;19301;19302",  // Castanic Male Priest
+        "3,0,7|10100;170100;180100;9020100;60401301|10002;19300;19301;19302",  // Castanic Male Elementalist
+        "3,1,0|10100;20100;9020100;60401301|10001;19300;19301;19302",  // Castanic Female Warrior
+        "3,1,1|10100;20100;9020100;260100;60401301|10000;19300;19301;19302",  // Castanic Female Lancer
+        "3,1,2|10100;40100;9020100;60401301|10002;19300;19301;19302",  // Castanic Female Slayer
+        "3,1,3|10100;20100;290100;9020100;60401301|10000;19300;19301;19302;14070",  // Castanic Female Berserker
+        "3,1,4|10100;70100;9020100;60401301|10002;19300;19301;19302",  // Castanic Female Sorcerer
+        "3,1,5|10100;60100;9020100;60401301|10002;19300;19301;19302",  // Castanic Female Archer
+        "3,1,6|10100;180100;9020100;380100;60401301|10002;19300;19301;19302",  // Castanic Female Priest
+        "3,1,7|10100;170100;180100;9020100;60401301|10002;19300;19301;19302",  // Castanic Female Elementalist
+        "3,1,9|10100;400100;9020100;60401301|10003;19300;19301;19302;91013;91014;91003;91004;91006",  // Castanic Female Engineer
+        "3,1,12|10199;60199;140199;160199;9020100;60401301|10002;19300;19301;19302;94001;94002;94003;94005;94006;94007;94008;94009;94010;94011;94012;94013;94014;94015",  // Castanic Female Glaiver
+        "4,0,0|10100;20100;9020100;9030100;60401301|10001;19500;19501",  // Popori Male Warrior
+        "4,0,1|10100;20100;9020100;9030100;260100;60401301|10000;19500;19501",  // Popori Male Lancer
+        "4,0,2|10100;40100;9020100;9030100;60401301|10002;19500;19501",  // Popori Male Slayer
+        "4,0,3|10100;20100;290100;9020100;9030100;60401301|10000;19500;19501;14070",  // Popori Male Berserker
+        "4,0,4|10100;70100;9020100;9030100;60401301|10002;19500;19501",  // Popori Male Sorcerer
+        "4,0,5|10100;60100;9020100;9030100;60401301|10002;19500;19501",  // Popori Male Archer
+        "4,0,6|10100;180100;9020100;9030100;380100;60401301|10002;19500;19501",  // Popori Male Priest
+        "4,0,7|10100;170100;180100;9020100;9030100;60401301|10002;19500;19501",  // Popori Male Elementalist
+        "4,0,10|10100;20100;400100;9020100;9030100;60401301|10002;19500;19501;92001;92002;92003;92004;92005;92006;92007;92008;92009;92010;92011;92012",  // Popori Male Fighter
+        "4,1,0|10100;20100;9020100;9030100;60401301|10001;19500;19501",  // Popori Female Warrior
+        "4,1,1|10100;20100;9020100;9030100;260100;60401301|10000;19500;19501",  // Popori Female Lancer
+        "4,1,2|10100;40100;9020100;9030100;60401301|10002;19500;19501",  // Popori Female Slayer
+        "4,1,3|10100;20100;290100;9020100;9030100;60401301|10000;19500;19501;14070",  // Popori Female Berserker
+        "4,1,4|10100;70100;9020100;9030100;60401301|10002;19500;19501",  // Popori Female Sorcerer
+        "4,1,5|10100;60100;9020100;9030100;60401301|10002;19500;19501",  // Popori Female Archer
+        "4,1,6|10100;180100;9020100;9030100;380100;60401301|10002;19500;19501",  // Popori Female Priest
+        "4,1,7|10100;170100;180100;9020100;9030100;60401301|10002;19500;19501",  // Popori Female Elementalist
+        "4,1,8|10100;30100;140100;150100;400100;9020100;9030100;111111;60401301|10001;19500;19501;90001",  // Popori Female Soulless
+        "4,1,9|10100;400100;9020100;9030100;60401301|10003;19500;19501;91013;91014;91003;91004;91006",  // Popori Female Engineer
+        "4,1,10|10100;20100;400100;9020100;9030100;60401301|10002;19500;19501;92001;92002;92003;92004;92005;92006;92007;92008;92009;92010;92011;92012",  // Popori Female Fighter
+        "4,1,11|10100;20100;70100;9020100;9030100;60401301|10002;19500;19501;93001;93002;93003;93004;93005;93006;93008",  // Popori Female Assassin
+        "4,1,12|10199;60199;140199;160199;9020100;9030100;60401301|10002;19500;19501;94001;94002;94003;94005;94006;94007;94008;94009;94010;94011;94012;94013;94014;94015",  // Popori Female Glaiver
+        "5,0,0|10100;20100;9020100;60401301|10001;19601;19602",  // Baraka Male Warrior
+        "5,0,1|10100;20100;9020100;260100;60401301|10000;19601;19602",  // Baraka Male Lancer
+        "5,0,2|10100;40100;9020100;60401301|10002;19601;19602",  // Baraka Male Slayer
+        "5,0,3|10100;20100;290100;9020100;60401301|10000;19601;19602;14070",  // Baraka Male Berserker
+        "5,0,4|10100;70100;9020100;60401301|10002;19601;19602",  // Baraka Male Sorcerer
+        "5,0,5|10100;60100;9020100;60401301|10002;19601;19602",  // Baraka Male Archer
+        "5,0,6|10100;180100;9020100;380100;60401301|10002;19601;19602",  // Baraka Male Priest
+        "5,0,7|10100;170100;180100;9020100;60401301|10002;19601;19602",  // Baraka Male Elementalist
+    };
+
+    private static readonly Dictionary<(int race, int gender, int cls), (int[] active, int[] passive)> Table = Parse();
+
+    private static Dictionary<(int, int, int), (int[], int[])> Parse()
+    {
+        var map = new Dictionary<(int, int, int), (int[], int[])>(Rows.Length);
+        foreach (var row in Rows)
+        {
+            var parts = row.Split('|');
+            var key = parts[0].Split(',');
+            map[(int.Parse(key[0]), int.Parse(key[1]), int.Parse(key[2]))] = (Ids(parts[1]), Ids(parts[2]));
+        }
+        return map;
+    }
+
+    private static int[] Ids(string list) =>
+        list.Length == 0 ? Array.Empty<int>()
+                         : list.Split(';').Select(int.Parse).ToArray();
+
+    /// <summary>Number of race/gender/class combinations the sheet covers.</summary>
+    public static int Count => Table.Count;
+
+    /// <summary>
+    /// The default skills for one character, or false when the sheet has no row for that
+    /// combination. The real Arbiter's map lookup simply finds nothing in that case and inserts
+    /// no skills, so the caller must clear the blob's skill regions rather than leave whatever
+    /// the template carried — see <see cref="StarterBlob.ApplyDefaultSkills"/>.
+    /// </summary>
+    public static bool TryGet(int race, int gender, int cls, out int[] active, out int[] passive)
+    {
+        if (Table.TryGetValue((race, gender, cls), out var v)) { active = v.active; passive = v.passive; return true; }
+        active = Array.Empty<int>();
+        passive = Array.Empty<int>();
+        return false;
+    }
+}
+
 /// <summary>
 /// The 15312-byte WorldServer state struct for a freshly created character.
 ///
@@ -141,6 +326,27 @@ public static class StarterBlob
     public const int EnterWorldParamOffset = 304;
     /// <summary>Smallest blob that carries a complete position block (<see cref="ZoneOffset"/> + 4).</summary>
     public const int PositionBlockEnd = ZoneOffset + 4;
+
+    // --- default skills (T18) ---
+    // The two skill arrays inside the blob, both proven from BOTH sides of the wire:
+    //   * the real Arbiter writes them at UserData + 0x1AE0 / + 0x1C20 in
+    //     AccountManager::ExecCreateDefaultSkills (Arb_part_080.c:12875);
+    //   * WorldServer reads them back at blob + 0x1AE0 / + 0x1C20 in
+    //     TutorialUserEnterWorldContext::UpdateRecvedData (WorldServer.exe.c:1663323) -- the blob
+    //     lands at context + 0xA8 (UserEnterWorldContext::SetRecvData, :1661252), and the copies
+    //     are from context + 0x1B88 and context + 0x1CC8 -- into User + 0x8320 / + 0x8460, which
+    //     is exactly what User::SendMySkillList (:2193096) turns into S_SKILL_LIST.
+    // The two regions are adjacent (6880 + 40*8 == 7200) and everything past the last entry is
+    // zero in the captured blob, so clearing a whole region touches nothing else.
+    // See the DefaultSkillSet class above for the whole story.
+    /// <summary>Passive skill slots: 40 x 8 bytes at blob offset 6880 (0x1AE0).</summary>
+    public const int PassiveSkillsOffset = 6880;
+    public const int PassiveSkillSlots = 40;
+    /// <summary>Active skill slots: 500 x 8 bytes at blob offset 7200 (0x1C20).</summary>
+    public const int ActiveSkillsOffset = 7200;
+    public const int ActiveSkillSlots = 500;
+    /// <summary>One slot: [u32 skillId][u8 flag = 0][3 bytes padding], all zero when unused.</summary>
+    public const int SkillEntrySize = 8;
 
     /// <summary>
     /// Read zone and x/y/z out of a world blob. READ-ONLY: the blob is WorldServer's opaque
@@ -241,6 +447,11 @@ public static class StarterBlob
         BitConverter.TryWriteBytes(blob.AsSpan(ZOffset, 4), z);
         BitConverter.TryWriteBytes(blob.AsSpan(ZoneOffset, 4), zone);
 
+        // The class's starting skills. Without this every character keeps the template's, and
+        // the template is an Elin valkyrie: a warrior's own skills never reach S_SKILL_LIST and
+        // the client draws his whole tree as not-yet-learned. See status/SKILLS.md.
+        ApplyDefaultSkills(blob, identity.Race, identity.Gender, identity.Class);
+
         return blob;
     }
 
@@ -255,6 +466,55 @@ public static class StarterBlob
         Array.Clear(blob, offset, size);
         if (src != null && src.Length > 0)
             Array.Copy(src, 0, blob, offset, Math.Min(src.Length, size));
+    }
+
+
+    /// <summary>
+    /// Overwrite the blob's two skill regions with the class's defaults from
+    /// <see cref="DefaultSkillSet"/>. Returns false when the sheet has no row for this
+    /// race/gender/class, in which case BOTH regions are cleared.
+    ///
+    /// <para>Clearing is deliberate: the template is a Popori-female Glaiver's blob, so leaving
+    /// its arrays alone would hand an unknown combination the valkyrie's skills — which is the
+    /// exact bug T18 fixes. The real Arbiter's lookup simply finds no row and inserts nothing, so
+    /// an empty list is what it would have produced too.</para>
+    ///
+    /// <para>The entry layout matches the Arbiter's writer byte for byte:
+    /// <c>*(u32*)(p - 4) = skillId; *p = 0; p += 8</c> — the id, a zero flag byte, and two
+    /// padding bytes that stay zero.</para>
+    /// </summary>
+    public static bool ApplyDefaultSkills(byte[] blob, int race, int gender, int cls)
+    {
+        ArgumentNullException.ThrowIfNull(blob);
+        if (blob.Length < ActiveSkillsOffset + ActiveSkillSlots * SkillEntrySize)
+            throw new ArgumentException($"blob is {blob.Length} bytes, too short to hold the skill regions", nameof(blob));
+
+        bool found = DefaultSkillSet.TryGet(race, gender, cls, out var active, out var passive);
+        WriteSkillRegion(blob, PassiveSkillsOffset, PassiveSkillSlots, passive);
+        WriteSkillRegion(blob, ActiveSkillsOffset, ActiveSkillSlots, active);
+        return found;
+    }
+
+    /// <summary>Zero a skill region, then write one 8-byte entry per id. Ids past the slot count are dropped.</summary>
+    private static void WriteSkillRegion(byte[] blob, int offset, int slots, int[] ids)
+    {
+        Array.Clear(blob, offset, slots * SkillEntrySize);
+        int n = Math.Min(ids.Length, slots);
+        for (int i = 0; i < n; i++)
+            BitConverter.TryWriteBytes(blob.AsSpan(offset + i * SkillEntrySize, 4), ids[i]);
+    }
+
+    /// <summary>Read a skill region back (used by tests and logging); stops at the first empty slot.</summary>
+    public static int[] ReadSkillRegion(byte[] blob, int offset, int slots)
+    {
+        var ids = new List<int>();
+        for (int i = 0; i < slots; i++)
+        {
+            int id = BitConverter.ToInt32(blob, offset + i * SkillEntrySize);
+            if (id == 0) break;
+            ids.Add(id);
+        }
+        return ids.ToArray();
     }
 
     /// <summary>Read back the name written at <see cref="NameOffset"/> (used by tests and logging).</summary>
