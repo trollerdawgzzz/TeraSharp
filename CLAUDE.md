@@ -2,39 +2,33 @@
 
 ## ⚠ READ THIS BLOCK FIRST — WORKSPACE RULES (non-negotiable)
 
-**Cowork is READ-ONLY on the human's machine. Do not create, modify, move or delete any file under `D:\`.**
-The human keeps the tree clean via git and applies your work himself. This replaces every earlier rule
-about "proving writes landed" — there are no writes.
+**Cowork works ONLY on its own git branch, never on `master`, never outside the repo.** One Cowork session
+at a time. The human works on `master` and merges your branch when it's green. This is what keeps the two
+streams of work from getting tangled.
 
-1. You may read anything under `D:\v100\TERA_SERVER.100\` and `D:\packetlogs\`. You may run read-only commands
-   (`git status`, `git log`, `git diff`, `Select-String`, `Get-Content`, `dotnet build`, `dotnet run --project
-   src/TeraSharp.Arbiter.Tests`). Building/testing is fine because it only touches `bin/` and `obj/`.
-2. **Deliver every change as a unified diff pasted in chat**, one code block per file, made against the
-   current `git HEAD` (`git diff` format, `a/` `b/` prefixes, correct hunk headers). The human runs
-   `git apply` and commits. If the change is a new file, paste its full contents with the intended path.
-3. Before writing a diff, read the current file from disk in the same session — the human may have committed
-   since your last read. State the `git log --oneline -1` you based the diff on.
-4. Keep diffs small and single-purpose (one task from the queue = one diff set). Include the test diff with
-   the code diff.
-5. If a task needs a change in a human-owned file (list below), do not diff it — describe the exact change in
-   chat and stop.
-6. Findings, analysis, proposed patches: **in chat**, never as files.
-7. **Every diff starts with a header line** `Based on: <sha> <subject>` (from `git log --oneline -1` at the
-   moment you read the files). The human applies it on a branch with `git apply --3way`; if the base is
-   stale the apply fails and the human will paste the error back — re-read the files and re-issue the diff.
+1. Start every session with:
+   `cd D:\v100\TERA_SERVER.100\TeraSharp; git status --short; git log --oneline -3`. The tree must be clean.
+   If `git status` shows changes you did not make, STOP and tell the human — do not touch them.
+2. Create your branch from current master before the first edit: `git checkout -b cowork/Tn master`
+   (Tn = the task id from the queue below). All edits, all commits, go on that branch. **Never commit to
+   `master`, never merge, never rebase, never `git checkout master -- <file>`, never force anything.**
+3. Write only inside `D:\v100\TERA_SERVER.100\TeraSharp\`. Generated data (opcode tables, extracted bytes)
+   goes in the repo under `data/` or `status/`, not in `D:\packetlogs\` or anywhere else on D:. Never create
+   new top-level folders on D:.
+4. Only the files in the "diffs welcome" list below. Human-owned files: describe the change in chat, do not
+   edit.
+5. Commit on your branch with a message starting with the task id (`T1: ...`). Small, single-purpose commits.
+6. Before you stop: `dotnet build TeraSharp.sln` and `dotnet run --project src\TeraSharp.Arbiter.Tests` must
+   pass; then paste `git log --oneline master..HEAD`, `git diff --stat master..HEAD` and the test output in
+   chat. If anything is unverified, say so.
+7. Read the files you're changing in the same session you change them — master may have moved since the
+   docs were written.
 
-Human side (for reference, so you know how your work lands):
-```
-git checkout -b cowork/Tn master
-git apply --3way --check cowork-Tn.patch
-git apply --3way cowork-Tn.patch
-dotnet build TeraSharp.sln; dotnet run --project src\TeraSharp.Arbiter.Tests
-git commit -am "Tn: ..."; git checkout master; git merge --no-ff cowork/Tn
-```
-The human's own work goes straight to `master`; Cowork work always arrives via a `cowork/*` branch.
+Human side (for reference): `git checkout master; git merge --no-ff cowork/Tn` after review, or
+`git branch -D cowork/Tn` to throw it away. Conflicts are resolved by the human at merge time, never by you.
 
 These rules exist because four sessions in a row reported "done" with work that never reached disk, or
-landed in a stray `D:\TeraSharp` copy and had to be merged by hand. Read-only + diffs-in-chat ends that.
+landed in a stray `D:\TeraSharp` copy and had to be merged by hand. Branch-only + prove-it-with-git ends that.
 
 ### Decompiles on disk (full Ghidra output, both binaries)
 - **ArbiterServer.exe**: `D:\v100\TERA_SERVER.100\Arb_part_000.c` … `Arb_part_095.c` (~60 MB total). The
@@ -67,19 +61,19 @@ Read `status/STATUS.md` after this file. Everything you need is on disk. **Read 
 
 ## 0. State of play (updated after session 4 + live testing)
 
-**The repo is under git.** Cowork is read-only; the human applies diffs and commits. Start every session with
-`git status` (clean) and `git log --oneline -3` so your diffs are against the right base.
+**The repo is under git.** Cowork commits only on `cowork/*` branches; the human merges. Start every session
+with `git status` (clean) and `git log --oneline -3`.
 
 ### FILE OWNERSHIP
-Cowork never edits files (see rules above). This list says which files Cowork may **propose diffs for** and
-which it may only **describe changes to**. The live network path is tested only against the real WorldServer
-+ client, which Cowork cannot run; unit tests pass in isolation while the live path breaks.
+This list says which files Cowork may **edit on its branch** and which it may only **describe changes to**.
+The live network path is tested only against the real WorldServer + client, which Cowork cannot run; unit
+tests pass in isolation while the live path breaks.
 
-- **Diffs welcome (pure logic, unit-testable, no live-behavior risk):**
+- **Editable on a `cowork/*` branch (pure logic, unit-testable, no live-behavior risk):**
   `World/DbProxyHandlers.cs`, `World/DbProxyStaticData.cs`, `World/WorldReplayTable.cs`,
   `Persistence/CharacterStore.cs`, `Handlers/CharacterHandlers.cs`, `Handlers/SocialHandlers.cs`,
   `Handlers/ChatHandlers.cs`, `Protocol/*` (codec), `src/TeraSharp.Arbiter.Tests/`, `status/*.md`.
-- **Describe only, never diff (live path — the human owns these, verified on the server):**
+- **Describe only, never edit (live path — the human owns these, verified on the server):**
   `World/WorldBridge.cs`, `Network/*` (GameSession, TcpServer, PacketDispatcher, Crypto),
   `Handlers/WorldEntry.cs`, `Handlers/HandlerRegistry.cs`, `Handlers/LoginHandlers.cs`, `Program.cs`.
 
@@ -118,8 +112,8 @@ which it may only **describe changes to**. The live network path is tested only 
   stays deferred until a real two-login capture exists.
 
 ### Repo is under git
-Read-only for Cowork. Human workflow per diff: `git apply --check`, `git apply`, build, tests, live test if it
-touches a handler, commit.
+Human workflow per Cowork branch: review `git diff master..cowork/Tn`, build, tests, live test if it touches
+a handler, `git merge --no-ff cowork/Tn` — or `git branch -D cowork/Tn`.
 
 ### Known open items
 - **Respawn position.** After relog the character spawns at the captured default (-449, 6239, 1956), not where
@@ -133,11 +127,11 @@ touches a handler, commit.
 
 ---
 
-## Cowork task queue (safe, self-contained, all inside the "diffs welcome" set)
+## Cowork task queue (safe, self-contained, all inside the editable set)
 
-Pick the first unchecked task. Each one: decompile/capture first, unit test against captured bytes, then
-**paste the diffs in chat** (see workspace rules). Never write to disk. If a task needs a human-owned file,
-describe the exact change in chat instead.
+Pick the first unchecked task. Each one: decompile/capture first, unit test against captured bytes, commits
+on `cowork/Tn`, then paste `git log --oneline master..HEAD` + `git diff --stat master..HEAD` + test output in
+chat. If a task needs a human-owned file, describe the exact change in chat instead of editing it.
 
 - [ ] **T1 — Tests for the DLM-unblock handlers.** In `src/TeraSharp.Arbiter.Tests/Program.cs`, add
   byte-exact tests (captured request -> expected reply, plus a live-reqId-echo assertion) for: `0x2899->0x289A`,
@@ -145,7 +139,7 @@ describe the exact change in chat instead.
   `0x2736->0x2737`, `0x2930->0x2931`, `0x27B3->0x27B4`, `0x1562->0x1563`. Bytes are in `lobby_tap.log`
   (02:51:10–02:52:07) and in the comments next to each constant in `DbProxyHandlers.cs`. Also a test that
   `WorldReplayTable.Load` never produces an entry for request op `0x143F`.
-- [ ] **T2 — Opcode names for `0x27xx–0x29xx`.** Generate `D:\packetlogs\dbproxy_opcodes.txt` (`0xNNNN|NAME`)
+- [ ] **T2 — Opcode names for `0x27xx–0x29xx`.** Generate `data/dbproxy_opcodes.txt` in the repo (`0xNNNN|NAME`)
   from the `case 0xNNNN: return "DBS_/SDB_...";` switch in `WorldServer.exe.c` (~line 247000; use
   `Select-String`, never open the file whole). Then add a tiny `DbProxyOpcodeNames` lookup in
   `World/DbProxyStaticData.cs` (or a new file in `World/`) that `DbProxyHandlers` uses in its log lines.
