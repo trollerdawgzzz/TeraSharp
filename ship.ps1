@@ -22,6 +22,7 @@ Copy-Item D:\v100\TERA_SERVER.100\TeraSharp\data\starter_blob.bin D:\TeraSharp-p
 Copy-Item D:\v100\TERA_SERVER.100\TeraSharp\data\starter_inventory.bin D:\TeraSharp-publish\data\ -Force
 Copy-Item D:\v100\TERA_SERVER.100\TeraSharp\data\promotions_147E.bin D:\TeraSharp-publish\data\ -Force
 Copy-Item D:\v100\TERA_SERVER.100\TeraSharp\data\promotions_147E.bin D:\TeraSharp-publish\data\ -Force
+Copy-Item D:\v100\TERA_SERVER.100\TeraSharp\data\promotions_147E.bin D:\TeraSharp-publish\data\ -Force
 
 Write-Host "== 7z"
 Remove-Item D:\TeraSharp-bin.7z -Force -ErrorAction SilentlyContinue
