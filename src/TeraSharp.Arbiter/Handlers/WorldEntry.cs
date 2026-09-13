@@ -51,8 +51,9 @@ public static class WorldEntry
         w.SendFrame(WorldBridge.OpPlayerEnter, enterPayload);
 
         // 5. Send character data (world blob) to World.
-        var charDataPayload = BuildCharacterDataPayload((int)chr.Id, record?.WorldBlob);
-        w.SendFrame(WorldBridge.OpCharacterData, charDataPayload);
+        // (removed) A pre-emptive 0x2738 with playerId in the DLM-id slot completed the WRONG DLM item on a
+        // fresh World whenever playerId != 1 (crash in DBLoadPromotionContext::ExecuteCommit, 2026-09-14).
+        // World asks with 0x2711 and DbProxyHandlers.OnUserEnterWorld answers with the live id.
 
         // Chat/UI settings are Arbiter-owned and World never sends them. Without the chat-option
         // setting the client's chat window has no channel tabs configured, so S_CHAT arrives but
