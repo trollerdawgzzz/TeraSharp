@@ -667,6 +667,9 @@ public sealed class DbProxyHandlers
             case SDB_UPDATE_SEREN_GUIDE_INFO:     // 0x2945 = [reqId][playerId][ok]
             case SDB_UPDATE_USER_DAILY_EVENT_COUNT: // 0x293D = [reqId][ok], reqId at payload[8]
             case SDB_UPDATE_GET_EXTRA_REWARD:     // 0x293F = [reqId][ok]
+            // --- T23: city-war result. Not a DLM item (no reqId), but the reply echoes two
+            // u32s out of the live request, so a replayed 0x295D would carry captured ones. ---
+            case SDB_RESULT_CITY_WAR:             // 0x15ED + 0x295D, both echoing request+16/+20
                 return true;
             default:
                 return false;        // -> replay table
@@ -707,6 +710,9 @@ public sealed class DbProxyHandlers
             case SDB_UPDATE_SEREN_GUIDE_INFO:       link.SendFrame(DBS_UPDATE_SEREN_GUIDE_INFO, BuildDbs2945(payload)); return true;
             case SDB_UPDATE_USER_DAILY_EVENT_COUNT: link.SendFrame(DBS_UPDATE_USER_DAILY_EVENT_COUNT, BuildReqIdAck(payload, 8)); return true;
             case SDB_UPDATE_GET_EXTRA_REWARD:       link.SendFrame(DBS_UPDATE_GET_EXTRA_REWARD, BuildReqIdAck(payload, 0)); return true;
+
+            // --- T23 ---
+            case SDB_RESULT_CITY_WAR:               return OnResultCityWar(link, payload);
 
             // --- Post-spawn (reqId at payload[0] for all three) ---
             case SDB_END_START_QUEST_LIST: link.SendFrame(DBS_END_START_QUEST_LIST, BuildReqIdAck(payload, 0)); return true;
@@ -2199,12 +2205,225 @@ public sealed class DbProxyHandlers
         return p;
     }
 
-    /// <summary>Called by WorldBridge once the handshake completes. Sends the 0x1581 burst on that link.</summary>
+    // ---- Post-handshake config burst (T23) ----
+    // 63 one-way A->W pushes the real Arbiter sends straight after the handshake, right after the
+    // 0x294F -> 0x2955 + 0x2952 replay and before any player exists
+    // (D:\packetlogs\arb_world_2026-09-13T11-33-30-680Z.log seq 104-126, 11:42:22.403-.408).
+    // Nothing in them carries a reqId or a DLM id, so none of it can head-block a user - which is
+    // why login worked without them - but between them they configure VIP store slots, achievement
+    // seasons, dark rift, GM events, play-guide rewards, five festivals, the in-game shop
+    // catalogue and the continent channel counts. status/RELOG-CAPTURE-NOTES.md section 4 has the
+    // full opcode table; data/handshake_burst.md is the per-frame index.
+    //
+    // The bytes live in data/handshake_burst.bin (TSIS container, same shape as cap_t15.bin)
+    // rather than in a literal here: 63 frames, 1082 frame bytes, 50 distinct opcodes.
+    //
+    // Four captures were diffed frame by frame - arb_world.log (2026-09-12 06:36), lobby_tap.log
+    // (09-13 02:51), cap_newchar.log (09-13 05:49) and the 09-13 11:42 relog. The burst is
+    // byte-identical in all four EXCEPT for exactly two u64s:
+    //   0x15BD AS_SYNC_DATE_TIME              payload+0 = unix seconds at send time. World echoes
+    //                                                     the value straight back as 0x15BC.
+    //   0x14D1 AS_SET_DARK_RIFT_DAILY_COMPLETED payload+8 = the most recent daily reset.
+    // Everything else is replayed verbatim, including 0x15DE AS_DUNGEON_PHASE_LAST_RESET_TIME,
+    // whose u64 reads 2026-09-12T03:57:29Z in ALL FOUR captures - on both sides of a daily reset,
+    // a day apart - so it is a stored value the Arbiter keeps in SQL, not a clock.
+    public const ushort AS_SYNC_DATE_TIME = 0x15BD;
+    public const ushort SA_SYNC_DATE_TIME = 0x15BC;                 // World's echo; one-way back
+    public const ushort AS_DUNGEON_PHASE_LAST_RESET_TIME = 0x15DE;
+    public const ushort AS_SET_DARK_RIFT_DAILY_COMPLETED = 0x14D1;
+    public const ushort AS_INIT_TIMELINE_CHANGES = 0x1582;
+    public const int SyncDateTimeOffset = 0;        // 0x15BD payload+0, u64 unix seconds
+    public const int DarkRiftResetTimeOffset = 8;   // 0x14D1 payload+8, u64 unix seconds
+    public const int HandshakeBurstFrameCount = 63;
+    public const string HandshakeBurstFile = "handshake_burst.bin";
+
+    /// <summary>
+    /// The daily-reset instant the real Arbiter stamps into 0x14D1 - and into the SECOND u64 of
+    /// the handshake's 0x1595 AS_EVENT_MATCHING_INFO, which carries the same value in every
+    /// capture (the first u64 there is a constant 2026-09-09T14:50:00Z in all four).
+    /// Observed: 2026-09-11T15:00:00Z in the 09-12 06:36 capture, 2026-09-12T15:00:00Z in all
+    /// three 09-13 captures (02:51, 05:49, 11:42) - i.e. the most recent 15:00:00 UTC at or
+    /// before now. 15:00 UTC is also midnight in UTC+9, which is what a KR-configured box calls
+    /// local midnight; no capture was taken between 15:00 and 24:00 UTC, so the two readings
+    /// cannot be told apart yet. That is why the hour is a parameter and not a local-midnight
+    /// calculation - change DailyResetHourUtc, not the arithmetic, if a later capture settles it.
+    /// </summary>
+    public const int DailyResetHourUtc = 15;
+
+    public static ulong DailyResetUnixSeconds(DateTimeOffset now, int resetHourUtc = DailyResetHourUtc)
+    {
+        var midnight = new DateTimeOffset(now.UtcDateTime.Date, TimeSpan.Zero);
+        var boundary = midnight.AddHours(resetHourUtc);
+        if (boundary > now) boundary = boundary.AddDays(-1);
+        return (ulong)boundary.ToUnixTimeSeconds();
+    }
+
+    /// <summary>One record of data/handshake_burst.bin: captured sequence number, opcode, payload.</summary>
+    public readonly record struct BurstFrame(uint Seq, ushort Op, byte[] Payload);
+
+    private static IReadOnlyList<BurstFrame>? _handshakeBurst;
+    private static byte[]? _handshakeBurstBytes;
+
+    /// <summary>Test seam. Pass null to force the next call to read from disk again.</summary>
+    internal static void SetHandshakeBurstForTest(IReadOnlyList<BurstFrame>? burst)
+    {
+        _handshakeBurst = burst;
+        if (burst == null) _handshakeBurstBytes = null;
+    }
+
+    /// <summary>
+    /// Parse the TSIS container: "TSIS", u32 recordCount, then per record
+    /// u32 seq | u16 opcode | u32 payloadLength | payload (little-endian throughout).
+    /// Returns null for anything that is not a well-formed container, so a truncated or missing
+    /// file degrades to "burst not sent" with a warning instead of taking the handshake down.
+    /// </summary>
+    public static IReadOnlyList<BurstFrame>? ParseBurst(byte[]? bytes)
+    {
+        if (bytes == null || bytes.Length < 8) return null;
+        if (bytes[0] != (byte)'T' || bytes[1] != (byte)'S' || bytes[2] != (byte)'I' || bytes[3] != (byte)'S') return null;
+        uint count = BitConverter.ToUInt32(bytes, 4);
+        if (count > 4096) return null;
+        var list = new List<BurstFrame>((int)count);
+        int o = 8;
+        for (uint i = 0; i < count; i++)
+        {
+            if (o + 10 > bytes.Length) return null;
+            uint seq = BitConverter.ToUInt32(bytes, o);
+            ushort op = BitConverter.ToUInt16(bytes, o + 4);
+            uint len = BitConverter.ToUInt32(bytes, o + 6);
+            o += 10;
+            if (len > (uint)(bytes.Length - o)) return null;
+            var payload = new byte[len];
+            Buffer.BlockCopy(bytes, o, payload, 0, (int)len);
+            o += (int)len;
+            list.Add(new BurstFrame(seq, op, payload));
+        }
+        return o == bytes.Length ? list : null;
+    }
+
+    public static IReadOnlyList<BurstFrame>? LoadHandshakeBurst()
+        => _handshakeBurst ??= ParseBurst(LoadDataFile(HandshakeBurstFile, ref _handshakeBurstBytes, 0));
+
+    /// <summary>
+    /// One burst frame as it should go out now: the captured payload with the live u64 replaced.
+    /// Every other opcode comes back verbatim. Always a fresh array - the cached payload from the
+    /// TSIS file is never handed to a caller.
+    /// </summary>
+    public static byte[] PatchBurstFrame(ushort op, byte[] payload, DateTimeOffset now, ulong dailyReset)
+    {
+        var p = (byte[])payload.Clone();
+        switch (op)
+        {
+            case AS_SYNC_DATE_TIME:
+                if (p.Length >= SyncDateTimeOffset + 8)
+                    BitConverter.GetBytes((ulong)now.ToUnixTimeSeconds()).CopyTo(p, SyncDateTimeOffset);
+                break;
+            case AS_SET_DARK_RIFT_DAILY_COMPLETED:
+                if (p.Length >= DarkRiftResetTimeOffset + 8)
+                    BitConverter.GetBytes(dailyReset).CopyTo(p, DarkRiftResetTimeOffset);
+                break;
+        }
+        return p;
+    }
+
+    /// <summary>The whole burst in captured order, stamped for <paramref name="now"/>.</summary>
+    public static List<(ushort op, byte[] payload)> BuildHandshakeBurst(IReadOnlyList<BurstFrame> burst, DateTimeOffset now)
+    {
+        ulong reset = DailyResetUnixSeconds(now);
+        var frames = new List<(ushort, byte[])>(burst.Count);
+        foreach (var f in burst) frames.Add((f.Op, PatchBurstFrame(f.Op, f.Payload, now, reset)));
+        return frames;
+    }
+
+    /// <summary>
+    /// Called by WorldBridge once the handshake completes (on the link that carried 0x294F,
+    /// exactly once per World process). Sends the captured config burst first, then the 0x1581
+    /// dungeon-open pushes - the order in lobby_tap.log, the capture the live-verified login came
+    /// from, and the order that puts AS_INITIALIZE_DUNGEON_ID / AS_DUNGEON_DISABLED_LIST before
+    /// the per-dungeon opens. (cap_newchar.log has them the other way round only because that
+    /// Arbiter stalled ~11 s on a DB query before its burst went out; the burst's own internal
+    /// order is identical in all four captures.)
+    /// </summary>
     public void OnWorldReady(WorldLink link)
     {
+        var burst = LoadHandshakeBurst();
+        if (burst == null)
+        {
+            _log.LogWarning("Post-handshake: data/{File} missing or malformed - the {N}-push config burst was NOT sent",
+                HandshakeBurstFile, HandshakeBurstFrameCount);
+        }
+        else
+        {
+            var now = DateTimeOffset.UtcNow;
+            ulong reset = DailyResetUnixSeconds(now);
+            foreach (var (op, payload) in BuildHandshakeBurst(burst, now))
+                link.SendFrame(op, payload);
+            _log.LogInformation("Post-handshake: sent {N} config pushes (0x15BD = {Now:u}, 0x14D1 daily reset = {Reset:u})",
+                burst.Count, now.UtcDateTime, DateTimeOffset.FromUnixTimeSeconds((long)reset).UtcDateTime);
+        }
+
         foreach (var id in PostHandshakeDungeonIds)
             link.SendFrame(AS_DUNGEON_OPEN_1581, Build1581(id));
         _log.LogInformation("Post-handshake: sent {N} x 0x1581 dungeon-open pushes", PostHandshakeDungeonIds.Length);
+    }
+
+    // ---- SDB_RESULT_CITY_WAR (0x295C) -> 0x15ED + DBS_RESULT_CITY_WAR (0x295D), T23 ----
+    // World sends 0x295C once per city-war result, 42-byte frame, shortly after the handshake
+    // (cap_newchar.log seq 115, 05:48:54.119; the real Arbiter answered 9 s later at seq 128/129
+    // because the handler does a DB round trip first). It is absent from arb_world.log, so the
+    // replay table has no entry for it and today it produces a bare "no replay for 0x295C".
+    //
+    // Handler_SDB_RESULT_CITY_WAR (Arb_part_064.c:2367, min frame 0x2a) calls CityWarEnd
+    // (FUN_14064f030, Arb_part_054.c:10714), which broadcasts 0x15ED through FUN_140641300, and
+    // then writes its own reply:
+    //   SendToSession<PKT_DBS_RESULT_CITY_WAR_WRITE,int,int>  ->  0x295D  [u32][u32]
+    // with both ints read from the REQUEST frame at +0x16 and +0x1a, i.e. payload+16 and
+    // payload+20. Capture: the request carries 1 and 1 there and the reply is
+    //   01 00 00 00 01 00 00 00.
+    // 0x15ED is PKT_AS_UPDATE_ADMIN_CITY_WAR_INTEREST_ONLY_WRITE<int&,bool&> = [u32 cityWarId]
+    // [u8 interestOnly], and FUN_14064f030 passes (cityWarId, false) - cityWarId being that same
+    // payload+16. Capture: 01 00 00 00 00. Neither frame carries a reqId or a DLM id, so neither
+    // can head-block; they are made real because the capture shows the Arbiter sending them and
+    // because a replayed 0x295D would carry the captured ints.
+    //
+    // NOT a pair: 0x15F9 SA_REWARD_CITYWAR_KILL_DEATH_COUNT arrives in the same millisecond
+    // (cap_newchar.log seq 116) and looks like a request, but
+    // Handler_SA_REWARD_CITYWAR_KILL_DEATH_COUNT (Arb_part_062.c:13831) contains no
+    // SendToSession at all - it only awards CPOINT and messages the players. It is one-way and
+    // belongs in WorldReplayTable.OneWayFromWorld; see the T23 section of
+    // status/RELOG-CAPTURE-NOTES.md for the exact one-line change.
+    public const ushort SDB_RESULT_CITY_WAR = 0x295C;
+    public const ushort DBS_RESULT_CITY_WAR = 0x295D;
+    public const ushort AS_UPDATE_ADMIN_CITY_WAR_INTEREST_ONLY = 0x15ED;
+    public const ushort SA_REWARD_CITYWAR_KILL_DEATH_COUNT = 0x15F9; // one-way; no reply exists
+    public const int CityWarIdOffset = 16;      // request payload+16 (frame+0x16)
+    public const int CityWarResultOffset = 20;  // request payload+20 (frame+0x1a)
+
+    /// <summary>0x15ED: [u32 cityWarId][u8 interestOnly=0] - 5 bytes.</summary>
+    public static byte[] Build15ED(byte[] request)
+    {
+        var r = new byte[5];
+        if (request.Length >= CityWarIdOffset + 4) Array.Copy(request, CityWarIdOffset, r, 0, 4);
+        return r;
+    }
+
+    /// <summary>0x295D: [u32 request+16][u32 request+20] - 8 bytes.</summary>
+    public static byte[] BuildDbs295D(byte[] request)
+    {
+        var r = new byte[8];
+        if (request.Length >= CityWarIdOffset + 4) Array.Copy(request, CityWarIdOffset, r, 0, 4);
+        if (request.Length >= CityWarResultOffset + 4) Array.Copy(request, CityWarResultOffset, r, 4, 4);
+        return r;
+    }
+
+    private bool OnResultCityWar(WorldLink link, byte[] payload)
+    {
+        if (payload.Length < CityWarResultOffset + 4) return false;   // -> replay table
+        link.SendFrame(AS_UPDATE_ADMIN_CITY_WAR_INTEREST_ONLY, Build15ED(payload));
+        link.SendFrame(DBS_RESULT_CITY_WAR, BuildDbs295D(payload));
+        _log.LogInformation("SDB_RESULT_CITY_WAR: city war {Id} result {Res} - sent 0x15ED + 0x295D",
+            BitConverter.ToUInt32(payload, CityWarIdOffset), BitConverter.ToUInt32(payload, CityWarResultOffset));
+        return true;
     }
 
     // ---- SDB_USER_LOAD_INVENTORY (0x27A2) -> DBS_USER_LOAD_POCKET_DATA (0x27A3) + DBS_USER_LOAD_INVENTORY (0x27A4) ----
