@@ -2173,6 +2173,8 @@ array items
             0x143F, 0x15B5, 0x13AA, 0x13F2, 0x13E5, 0x164D,
             // T15, from D:\packetlogs\cap_newchar.log: no A->W frame follows any occurrence.
             0x2927, 0x1491, 0x156F, 0x13B6, 0x13C5, 0x13C6, 0x1499, 0x15FA,
+            // T23: Handler_SA_REWARD_CITYWAR_KILL_DEATH_COUNT has no SendToSession.
+            0x15F9,
         };
         foreach (var op in expected)
             Hex.True(WorldReplayTable.OneWayFromWorld.Contains(op),
@@ -5844,6 +5846,8 @@ array items
         }
         Hex.True(DbProxyHandlers.IsHandledRequest(DbProxyHandlers.SDB_LOAD_2867),
             "0x2867 must be answered by the handler, not the replay table - the reply carries a DLM id");
+    }
+
     // ================= T23: the post-handshake config burst + the city-war reply =================
 
     // The two live instants, straight out of the captures:

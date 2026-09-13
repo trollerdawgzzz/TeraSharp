@@ -76,6 +76,9 @@ public sealed class WorldReplayTable
         0x2927, // SDB_CANCEL_NPC_ARENA_BET  - 5 occurrences (the logout-countdown ticks),
                 //   Handler_SDB_CANCEL_NPC_ARENA_BET (Arb_part_063.c:1315) never replies.
         0x1491, // SA_UPDATE_USER_STATUS     - 12 occurrences
+        0x15F9, // SA_REWARD_CITYWAR_KILL_DEATH_COUNT - Handler_SA_REWARD_CITYWAR_KILL_DEATH_COUNT
+                //   (Arb_part_062.c:13831) has no SendToSession; the 0x15ED that follows it in
+                //   the captures belongs to 0x295C SDB_RESULT_CITY_WAR (T23).
         0x156F, // SA_UPDATE_MAKRER_END      - 6 occurrences. THIS IS THE DANGEROUS ONE: it
                 //   arrives BETWEEN S_UPDATE_EXP_LEVEL and its reply (cap_newchar.log seq 2994
                 //   is 0x273B then 0x156F then 0x273C). Without this entry 0x156F becomes a
