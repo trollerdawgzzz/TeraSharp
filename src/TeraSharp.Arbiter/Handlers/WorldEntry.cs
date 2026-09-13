@@ -145,7 +145,8 @@ public static class WorldEntry
 
         // [72..75] Likely maxHP base (param_12, User+0x1e0, from DB col 76 /
         //          HeroWorldDataSheet+0x34). Capture=20446.
-        w.U32(20446);
+        // Real Arbiter copies this from the blob (u32 @304): dob 0x5AC4, fresh char 0xFFFFF334 (cap_newchar pkt 130).
+        w.U32(worldBlob != null && worldBlob.Length >= 308 ? BitConverter.ToUInt32(worldBlob, 304) : 20446u);
 
         // [76..79] Client-reported session parameter (param_13, WorldSession+0x744).
         //          Default is 2048; capture shows 2000. World re-derives from blob.
