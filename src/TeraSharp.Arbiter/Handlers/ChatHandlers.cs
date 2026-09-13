@@ -1,16 +1,55 @@
+using System.Collections.Concurrent;
 using Microsoft.Extensions.Logging;
 using TeraSharp.Arbiter.Network;
 
 namespace TeraSharp.Arbiter.Handlers;
 
 /// <summary>
-/// Chat: C_CHAT -> S_CHAT. Echoes the message back to the sender (and later,
-/// broadcasts to others). Messages starting with "!" are server commands.
+/// Known TERA chat channel IDs (from decompiled client/Arbiter).
+/// The Arbiter owns all chat routing; World never sees C_CHAT.
+/// </summary>
+public enum ChatChannel : uint
+{
+    Say       = 0,   // proximity (nearby players)
+    Party     = 1,   // party members only
+    Guild     = 2,   // guild members only
+    Area      = 3,   // zone-wide broadcast
+    Trade     = 4,   // global trade channel
+    Team      = 5,   // battleground team
+    Grp       = 6,   // group
+    Raid      = 11,  // raid party
+    Megaphone = 12,  // global shout (costs megaphone item)
+    Emote     = 21,  // emote (proximity)
+    Global    = 22,  // global channel
+    Private   = 25,  // custom private channel
+    Lfg       = 27,  // looking-for-group (global)
+    System    = 213, // system/global-raid
+}
+
+/// <summary>
+/// Chat: C_CHAT -> S_CHAT. Routes messages by channel:
+///   - Global channels (Area, Trade, Megaphone, Global, LFG): broadcast to all sessions.
+///   - Membership channels (Party, Guild, Raid): echo to sender only (no membership tracking yet).
+///   - Proximity channels (Say, Emote): broadcast to all sessions (no spatial query yet).
+///   - Messages starting with "!" are server commands (sender only).
 /// </summary>
 public sealed class ChatHandlers
 {
     private readonly ILogger _log;
     public ChatHandlers(ILogger log) => _log = log;
+
+    /// <summary>Channels that broadcast to every connected session.</summary>
+    internal static bool IsBroadcastChannel(uint channel) => channel switch
+    {
+        (uint)ChatChannel.Say       => true,  // proximity → broadcast (no spatial yet)
+        (uint)ChatChannel.Area      => true,  // zone-wide
+        (uint)ChatChannel.Trade     => true,  // global
+        (uint)ChatChannel.Megaphone => true,  // global shout
+        (uint)ChatChannel.Global    => true,  // global
+        (uint)ChatChannel.Emote     => true,  // proximity → broadcast (no spatial yet)
+        (uint)ChatChannel.Lfg       => true,  // global
+        _ => false,
+    };
 
     public bool OnChat(GameSession s, ReadOnlyMemory<byte> body)
     {
@@ -32,9 +71,53 @@ public sealed class ChatHandlers
             return true;
         }
 
-        // Echo back to sender (single-player for now; broadcast later)
-        SendChat(s, channel, s.GameId, name, message);
+        if (IsBroadcastChannel(channel))
+        {
+            BroadcastChat(s, channel, message);
+        }
+        else
+        {
+            // Party/Guild/Raid/Private: echo to sender (no membership tracking yet)
+            SendChat(s, channel, s.GameId, name, message);
+        }
         return true;
+    }
+
+    /// <summary>
+    /// Broadcast a chat message to all connected sessions, respecting block lists.
+    /// The sender always receives their own message.
+    /// </summary>
+    internal static void BroadcastChat(GameSession sender, uint channel, string message)
+    {
+        var chr = sender.SelectedCharacter;
+        if (chr == null) return;
+        string senderName = chr.Name;
+        ulong senderGameId = sender.GameId;
+        var store = Program.Store;
+
+        // Send to sender first (always)
+        SendChat(sender, channel, senderGameId, senderName, message);
+
+        // Broadcast to all other sessions
+        foreach (var kvp in SocialHandlers.Sessions)
+        {
+            var target = kvp.Value;
+            if (target == sender) continue;
+
+            var targetChr = target.SelectedCharacter;
+            if (targetChr == null) continue;
+
+            // Check block list bidirectionally
+            if (store != null)
+            {
+                var senderBlocks = store.GetBlocks((int)chr.Id);
+                if (senderBlocks.Contains((int)targetChr.Id)) continue;
+                var targetBlocks = store.GetBlocks((int)targetChr.Id);
+                if (targetBlocks.Contains((int)chr.Id)) continue;
+            }
+
+            SendChat(target, channel, senderGameId, senderName, message);
+        }
     }
 
     private void HandleCommand(GameSession s, string cmd)
@@ -102,7 +185,7 @@ public sealed class ChatHandlers
         SendChat(s, 0, 0, "[System]", $"<FONT>{text}</FONT>");
     }
 
-    private static string StripFont(string msg)
+    internal static string StripFont(string msg)
     {
         // Remove <FONT ...> and </FONT> tags the client wraps messages in.
         var sb = new System.Text.StringBuilder();

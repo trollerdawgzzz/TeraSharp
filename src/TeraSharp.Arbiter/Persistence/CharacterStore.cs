@@ -86,6 +86,21 @@ CREATE TABLE IF NOT EXISTS characters (
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS ix_characters_account ON characters(account_id);
+
+CREATE TABLE IF NOT EXISTS friends (
+  character_id INTEGER NOT NULL REFERENCES characters(id),
+  friend_id INTEGER NOT NULL REFERENCES characters(id),
+  type INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (character_id, friend_id)
+);
+
+CREATE TABLE IF NOT EXISTS blocks (
+  character_id INTEGER NOT NULL REFERENCES characters(id),
+  blocked_id INTEGER NOT NULL REFERENCES characters(id),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (character_id, blocked_id)
+);
 ");
     }
 
@@ -272,6 +287,88 @@ SELECT last_insert_rowid();";
         LastLogout = r["last_logout"] is string s ? DateTime.Parse(s) : DateTime.MinValue,
         WorldBlob = r["world_blob"] is byte[] b ? b : null,
     };
+
+    // ---- Friends ----
+
+    /// <summary>Get all friends for a character (type: 0=mutual, 1=outgoing request, 2=incoming request).</summary>
+    public List<(int FriendId, int Type)> GetFriends(int characterId)
+    {
+        lock (_lock)
+        {
+            var list = new List<(int, int)>();
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT friend_id, type FROM friends WHERE character_id = $cid";
+            cmd.Parameters.AddWithValue("$cid", characterId);
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) list.Add((r.GetInt32(0), r.GetInt32(1)));
+            return list;
+        }
+    }
+
+    public bool AddFriend(int characterId, int friendId, int type = 0)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "INSERT OR IGNORE INTO friends(character_id, friend_id, type) VALUES($c,$f,$t)";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            cmd.Parameters.AddWithValue("$f", friendId);
+            cmd.Parameters.AddWithValue("$t", type);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    public bool RemoveFriend(int characterId, int friendId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "DELETE FROM friends WHERE character_id = $c AND friend_id = $f";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            cmd.Parameters.AddWithValue("$f", friendId);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    // ---- Blocks ----
+
+    public List<int> GetBlocks(int characterId)
+    {
+        lock (_lock)
+        {
+            var list = new List<int>();
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT blocked_id FROM blocks WHERE character_id = $cid";
+            cmd.Parameters.AddWithValue("$cid", characterId);
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) list.Add(r.GetInt32(0));
+            return list;
+        }
+    }
+
+    public bool AddBlock(int characterId, int blockedId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "INSERT OR IGNORE INTO blocks(character_id, blocked_id) VALUES($c,$b)";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            cmd.Parameters.AddWithValue("$b", blockedId);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    public bool RemoveBlock(int characterId, int blockedId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "DELETE FROM blocks WHERE character_id = $c AND blocked_id = $b";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            cmd.Parameters.AddWithValue("$b", blockedId);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
 
     public void Dispose() => _db.Dispose();
 }

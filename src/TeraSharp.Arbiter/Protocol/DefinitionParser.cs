@@ -95,6 +95,18 @@ public static class DefinitionParser
         return def;
     }
 
+    /// <summary>Parse a def from inline text (for packets without .def files).</summary>
+    internal static PacketDef ParseText(string name, string defText, int version = 1)
+    {
+        var lines = defText.Split('\n');
+        var def = new PacketDef { Name = name, Version = version, Fields = new List<FieldDef>() };
+        var roots = ParseNodes(lines, def);
+        int refCounter = 0;
+        var fields = BuildRecord(roots, def, ref refCounter);
+        def.Fields.AddRange(fields);
+        return def;
+    }
+
     // Parse into a nested Node tree, preserving "ref" lines as IsRef nodes.
     private static List<Node> ParseNodes(string[] lines, PacketDef def)
     {

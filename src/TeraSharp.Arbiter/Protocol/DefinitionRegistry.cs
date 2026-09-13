@@ -101,4 +101,16 @@ public sealed class DefinitionRegistry
         Register(def);
         _log.LogInformation("Registered inline def for {Name} ({Count} fields)", packetName, fields.Length);
     }
+
+    /// <summary>
+    /// Register a packet definition from inline def text (supports arrays, strings, refs).
+    /// Only registers if no def already exists for this packet name.
+    /// </summary>
+    internal void RegisterFromDef(string name, string defText)
+    {
+        if (_latest.ContainsKey(name)) return;
+        var def = DefinitionParser.ParseText(name, defText);
+        Register(def);
+        _log.LogInformation("Registered def-text for {Name} ({Count} fields)", name, def.Fields.Count);
+    }
 }
