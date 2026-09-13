@@ -113,6 +113,12 @@ and look for the next caller.
 
 ## Next steps (in order)
 
+**MILESTONE 2026-09-14 ~03:30: a brand-new character works end-to-end on a fresh World — creation,
+per-class kit, default skills, quests — "everything works like it did on Arbiter" (human).**
+Merged: T14/T15/T16/T17/T18 (248 tests). Merge notes: T15's 0x272E handler was dropped for
+T17's; three tests needed fixture rows because playerId 1 is reserved for dob's captures and
+`quests` has an FK on `characters`.
+
 0. **Where things stand at end of 2026-09-14 (~02:30):** live-verified today: fresh-World first login of a
    new character (testtwo, zone 5), elinwarrior spawned after the 0x1463 crest handler. Shipped but
    NOT live-verified: 0x297B/0x297C ack, T13 (0x2769 echo + item id counter), T11/T12 (starter blob
