@@ -217,6 +217,7 @@ public sealed class DbProxyHandlers
             case SA_REQUEST_ENTER_DUNGEON:          // 0x13BF (zone change step 1)
             case SA_RESPONSE_ENTER_DUNGEON:         // 0x13C1 (zone change step 2)
             case SDB_LOAD_2869:          // 0x15E0 push + 0x286A, both carrying the live reset time
+            case AS_PROMOTION_LIST_REQ:  // 0x147D -> 0x1484 + 24 x 0x147E (timestamps = now) + 0x1480
                 break;               // handled by the real switch below
             default:
                 return false;        // -> replay table
@@ -231,6 +232,7 @@ public sealed class DbProxyHandlers
             case SDB_USER_ENTERWORLD: return OnUserEnterWorld(link, payload);
             case SDB_UPDATE_USER_DATA: return OnUpdateUserData(link, payload);
             case SDB_USER_LOAD_INVENTORY: return OnLoadInventory(link, payload);
+            case AS_PROMOTION_LIST_REQ: return OnPromotionListRequest(link);
 
             // --- Logout save sequence (reqId echoed from the live request) ---
             case SDB_SAVE_27FA: link.SendFrame(DBS_SAVE_27FB, BuildReqIdAck(payload, 280)); return true;
@@ -863,6 +865,89 @@ public sealed class DbProxyHandlers
     }
 
     public const ushort DBS_USER_RESTRICTION = 0x2830;
+
+    // ---- Handshake: 0x147D -> 0x1484 + 24 x 0x147E + 0x1480 (promotion definitions) ----
+    // World's PromotionController keeps the promotion datasheet it receives here. Each 0x147E record
+    // (1368-byte payload) carries two 16-byte timestamps at [16] and [32]: u16 year, month, day, hour,
+    // minute, second + u32 nanoseconds, stamped "now" by the real Arbiter (arb_world.log: 2026-09-12
+    // 04:47:51; cap_newchar.log: 2026-09-13 05:47:09). Replaying yesterday's records left World with
+    // stale promotion entries, and the first level-1 character to qualify for a newbie promotion
+    // crashed World in PromotionController::NewPromotion -> vector<PromotionConditionDataHead> copy
+    // (WorldServer+0x128F4B0, minidump 2026-09-14 01:03:25). Level-58 dob never triggers it, which
+    // is why the crash only hit new characters on a fresh World.
+    // Bytes 568..700 of each record are raw Arbiter heap pointers memcpy'd into the struct; harmless.
+    // data/promotions_147E.bin = the 24 records from cap_newchar.log concatenated.
+    public const ushort AS_PROMOTION_LIST_REQ = 0x147D;
+    public const ushort AS_PROMOTION_LIST_BEGIN = 0x1484;
+    public const ushort AS_PROMOTION_RECORD = 0x147E;
+    public const ushort AS_PROMOTION_LIST_END = 0x1480;
+    public const int PromotionRecordSize = 1368;
+    private static byte[]? _promotions;
+
+    private bool OnPromotionListRequest(WorldLink link)
+    {
+        var data = LoadDataFile("promotions_147E.bin", ref _promotions, 0);
+        if (data == null || data.Length % PromotionRecordSize != 0)
+        {
+            _log.LogWarning("0x147D: promotions_147E.bin missing or malformed - falling back to replay (stale timestamps)");
+            return false;
+        }
+        link.SendFrame(AS_PROMOTION_LIST_BEGIN, new byte[4]);
+        var now = DateTime.UtcNow;
+        int n = 0;
+        for (int off = 0; off + PromotionRecordSize <= data.Length; off += PromotionRecordSize)
+        {
+            var rec = new byte[PromotionRecordSize];
+            Array.Copy(data, off, rec, 0, PromotionRecordSize);
+            WriteArbTimestamp(rec, 16, now);
+            WriteArbTimestamp(rec, 32, now);
+            link.SendFrame(AS_PROMOTION_RECORD, rec);
+            n++;
+        }
+        link.SendFrame(AS_PROMOTION_LIST_END, Array.Empty<byte>());
+        _log.LogInformation("0x147D: sent {N} x 0x147E promotion records stamped {Now:u}", n, now);
+        return true;
+    }
+
+    /// <summary>[u16 year][u16 month][u16 day][u16 hour][u16 minute][u16 second][u32 nanoseconds] (16 B).</summary>
+    public static void WriteArbTimestamp(byte[] b, int off, DateTime t)
+    {
+        BitConverter.GetBytes((ushort)t.Year).CopyTo(b, off);
+        BitConverter.GetBytes((ushort)t.Month).CopyTo(b, off + 2);
+        BitConverter.GetBytes((ushort)t.Day).CopyTo(b, off + 4);
+        BitConverter.GetBytes((ushort)t.Hour).CopyTo(b, off + 6);
+        BitConverter.GetBytes((ushort)t.Minute).CopyTo(b, off + 8);
+        BitConverter.GetBytes((ushort)t.Second).CopyTo(b, off + 10);
+        BitConverter.GetBytes((uint)(t.Ticks % TimeSpan.TicksPerSecond * 100)).CopyTo(b, off + 12);
+    }
+
+    /// <summary>Locate a data file the same way StarterBlob does (env TERASHARP_STARTER_BLOB's folder, walk-up from the binary, TERASHARP_DATA).</summary>
+    private static byte[]? LoadDataFile(string name, ref byte[]? cache, int expectedSize)
+    {
+        if (cache != null) return cache;
+        foreach (var candidate in DataFileCandidates(name))
+        {
+            if (candidate == null || !File.Exists(candidate)) continue;
+            var bytes = File.ReadAllBytes(candidate);
+            if (expectedSize > 0 && bytes.Length != expectedSize) continue;
+            return cache = bytes;
+        }
+        return null;
+    }
+
+    private static IEnumerable<string?> DataFileCandidates(string name)
+    {
+        var blob = Environment.GetEnvironmentVariable("TERASHARP_STARTER_BLOB");
+        if (!string.IsNullOrEmpty(blob)) yield return Path.Combine(Path.GetDirectoryName(blob) ?? ".", name);
+        string? dir = AppContext.BaseDirectory;
+        for (int i = 0; i < 8 && !string.IsNullOrEmpty(dir); i++)
+        {
+            yield return Path.Combine(dir, "data", name);
+            dir = Path.GetDirectoryName(dir.TrimEnd(Path.DirectorySeparatorChar));
+        }
+        var root = Environment.GetEnvironmentVariable("TERASHARP_DATA") ?? @"D:\v100\TERA_SERVER.100";
+        yield return Path.Combine(root, "TeraSharp", "data", name);
+    }
 
     // ---- Post-handshake burst (cap_newchar.log seq 112-113, lobby_tap.log 107-113) ----
     // 1 s after the handshake completes (0x2955/0x2952), before any player, the real Arbiter sends

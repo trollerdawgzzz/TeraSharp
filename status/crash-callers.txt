@@ -1,0 +1,20 @@
+
+LineNumber Line                                                         
+---------- ----                                                         
+   3390593 longlong * FUN_14128f410(longlong *param_1,longlong *param_2)
+   3411470   uVar2 = FUN_14128f410(local_40,param_1 + 0xb8);            
+   3411531   uVar2 = FUN_14128f410(local_40,param_1 + 0xa8);            
+   3464220   uVar4 = FUN_14128f410(local_38,param_3);                   
+   3486175   uVar2 = FUN_14128f410(local_38,param_3);                   
+   3531130         uVar8 = FUN_14128f410(local_80,&local_a8);           
+   3531137         uVar11 = FUN_14128f410(local_68,uVar8);              
+
+
+
+3390593  
+3411470  DBCreatePromotionConditionContext::ExecuteCommit
+3411531  DBLoadPromotionConditionContext::ExecuteCommit
+3464220  
+3486175  
+3531130  PromotionController::IsAccomplishPromotion
+3531137  PromotionController::IsAccomplishPromotion
