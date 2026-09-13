@@ -361,6 +361,7 @@ public sealed class WorldBridge
                 {
                     IsReady = true;
                     Interlocked.Exchange(ref _gameIdSeq, 0);
+                    DbProxy?.OnWorldReady(link);   // real Arbiter: ~100 x 0x1581 dungeon-open pushes, 1 s after READY
                     _log.LogInformation("WorldServer handshake complete - READY for players");
                 }
                 return;

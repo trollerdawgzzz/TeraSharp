@@ -864,6 +864,47 @@ public sealed class DbProxyHandlers
 
     public const ushort DBS_USER_RESTRICTION = 0x2830;
 
+    // ---- Post-handshake burst (cap_newchar.log seq 112-113, lobby_tap.log 107-113) ----
+    // 1 s after the handshake completes (0x2955/0x2952), before any player, the real Arbiter sends
+    // ~100 x 0x1581 [u32 dungeonId][u32 1][u32 0][u8 0]. World's DungeonManager logs "<id> open"
+    // for each. Without it a FIRST enter-world into a fresh World process (zone 5 character, i.e.
+    // any new character) is silently dropped after DBS_USER_ENTERWORLD and World later crashes;
+    // after one successful login (dob, zone 7005) later enters proceed. Before T5 these pushes were
+    // replayed by accident (attributed to 0x15A8); T5 correctly sealed 0x15A8 and they vanished.
+    // Opcode name unverified (0x1581 is not in world_opcodes.txt as of 2026-09-14).
+    public const ushort AS_DUNGEON_OPEN_1581 = 0x1581;
+    public static readonly uint[] PostHandshakeDungeonIds =
+    {
+        0x834, 0x835, 0x836, 0x837, 0x839,
+        0x9C5, 0x9C6, 0x9C7, 0x9C8, 0x9E2,
+        0xBB9, 0xBBA, 0xBBB, 0xBBC, 0xBBD, 0xBBE, 0xBBF, 0xBC0, 0xBC1, 0xBC2, 0xBC3, 0xBC4,
+        0xBC8, 0xBCC, 0xBD0, 0xBD1, 0xBD4, 0xBD5, 0xBD7, 0xBD8, 0xBD9, 0xBDB, 0xBDD,
+        0xC20, 0xC84,
+        0x2327, 0x2329, 0x232A, 0x232B, 0x232D, 0x232F, 0x2330, 0x2332, 0x2333, 0x2334, 0x2335,
+        0x2336, 0x2339, 0x233A, 0x233B, 0x233C, 0x233D, 0x233E, 0x233F, 0x2344, 0x2347, 0x2348,
+        0x2349, 0x234C, 0x234D, 0x234E, 0x234F, 0x2350, 0x2351, 0x2352, 0x2356, 0x235B, 0x235C,
+        0x2365, 0x2366, 0x2367, 0x2368, 0x2369, 0x236D, 0x2372, 0x2382, 0x2383, 0x2384,
+        0x251F, 0x2521, 0x2522, 0x2523, 0x2524, 0x2525, 0x25D1,
+        0x2643, 0x264C, 0x2656, 0x265A, 0x265D, 0x265E, 0x265F, 0x2662, 0x2663, 0x2664, 0x2665,
+        0x2666, 0x2669,
+    };
+
+    public static byte[] Build1581(uint dungeonId)
+    {
+        var p = new byte[13];
+        BitConverter.GetBytes(dungeonId).CopyTo(p, 0);
+        BitConverter.GetBytes(1u).CopyTo(p, 4);
+        return p;
+    }
+
+    /// <summary>Called by WorldBridge once the handshake completes. Sends the 0x1581 burst on that link.</summary>
+    public void OnWorldReady(WorldLink link)
+    {
+        foreach (var id in PostHandshakeDungeonIds)
+            link.SendFrame(AS_DUNGEON_OPEN_1581, Build1581(id));
+        _log.LogInformation("Post-handshake: sent {N} x 0x1581 dungeon-open pushes", PostHandshakeDungeonIds.Length);
+    }
+
     // ---- SDB_USER_LOAD_INVENTORY (0x27A2) -> DBS_USER_LOAD_POCKET_DATA (0x27A3) + DBS_USER_LOAD_INVENTORY (0x27A4) ----
     // The inventory reply is data-bearing and OWNED: every item carries the owner's playerId. The
     // replay table serves dob's captured list (owner 1, level-58 gear) to everyone, and World
