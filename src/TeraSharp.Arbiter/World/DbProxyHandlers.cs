@@ -248,6 +248,165 @@ public sealed class DbProxyHandlers
     public const ushort SDB_QUEST_LIST = 0x272C;            // -> 0x272D (1377B, reqId@49)
     public const ushort SDB_USER_ACHIEVEMENT = 0x27F8;      // -> 0x27F9 (1501B, reqId@304)
 
+
+    // =====================================================================
+    // T15 - the per-user DB writes World sends DURING PLAY.
+    //
+    // Every one of these is a DLMItem serialised on the user's gameId: one unanswered or
+    // mis-answered reply head-blocks that user's whole DB queue - the periodic blob save, the
+    // logout saves and UserLeaveWorld itself - for the life of the World process
+    // (status/HANDOFF.md section 1). Before T15 they were all "no replay for 0xNNNN".
+    //
+    // Ground truth: D:\packetlogs\cap_newchar.log (real ArbiterServer, new character "Test",
+    // playerId 2, Island of Dawn, 05:49-05:53). The frames used by the tests are extracted into
+    // data/cap_t15.bin (TSIS container, see data/cap_t15.md) so the tests do not need D:\packetlogs.
+    // All offsets in the comments below are PAYLOAD-relative (the decompile's frame offset - 6).
+    // =====================================================================
+
+    // --- SDB_SET_QUEST_INFO (0x272E) -> DBS_SET_QUEST_INFO (0x272F) ---
+    // ~30 per session: every quest accept, objective tick and completion. Three sizes in the
+    // capture (116 / 972 / 3540 B frames) - the 80-byte quest record is always there, the tail
+    // is a list of 856-byte ItemTransactionAtoms (quest reward items).
+    //
+    // Handler_SDB_SET_QUEST_INFO (Arb_part_064.c:3916, tracer at 3916) needs frame >= 0x24 and
+    // reads, payload-relative:
+    //   [0]  u32 recordOffset (frame-relative, 36)   [4]  u32 recordLength (80)
+    //   [8]  u32 atomListOffset (frame-relative)     [12] u32 atomListLength (n * 856)
+    //   [16] u32 reqId        (the DLM id)           [20] u32 sqlType
+    //   [24] u32 playerId     [28] u8 flag  [29] u8 flag   -> 30-byte header
+    // The reply writer is FUN_1406f4910 (Arb_part_060.c:11576): opcode 0x272f, four backpatch
+    // slots, u32 reqId, u32 sqlType, u8 ok, u32 questDbId - a 29-byte header - then the 80-byte
+    // record and the atoms. So the reply frame is the request frame MINUS ONE: the request's
+    // u32 playerId + 2 flag bytes (6 bytes) are replaced by the u8 ok + u32 questDbId (5 bytes).
+    //
+    // World's Handler_DBS_SET_QUEST_INFO (WorldServer.exe.c:3022389) needs frame >= 0x23,
+    // switches on the SAME sqlType, finds the DLM item by payload[16], takes ok from payload[24]
+    // - and on sqlType 22 ONLY it calls DBStartQuestContext::SetQuestDbId(payload[25])
+    // (FUN_140e7aa60, WorldServer.exe.c:2636646). That is the row id the Arbiter's INSERT
+    // allocated; in the capture it is 2, 3, 4, 5 for the four sqlType-22 writes and 0 for every
+    // other type. We keep no quest table yet, so DbProxyHandlers hands out its own monotonic
+    // ids - they only have to be distinct within the process (see NextQuestDbId).
+    //
+    // The atoms follow the T13 rule exactly: an op-7 (insert) atom that arrives with item DB id 0
+    // gets one allocated; everything else is echoed verbatim. Verified in the capture at
+    // seq 1804 (atom op 7, id 0 -> 13) and 2364 (four atoms, ops 6/11/6/11, ids untouched).
+    public const ushort SDB_SET_QUEST_INFO = 0x272E; public const ushort DBS_SET_QUEST_INFO = 0x272F;
+    /// <summary>0x272E header: two [offset][length] pairs, reqId, sqlType, playerId, 2 flag bytes.</summary>
+    public const int QuestInfoRequestHeader = 30;
+    /// <summary>0x272F header: the same two pairs, reqId, sqlType, ok, questDbId.</summary>
+    public const int QuestInfoReplyHeader = 29;
+    /// <summary>The quest record is a fixed 80-byte struct; the Arbiter always writes 0x50 bytes.</summary>
+    public const int QuestInfoRecordSize = 0x50;
+    /// <summary>
+    /// sqlType 22 = INSERT: the only one where World reads the allocated quest row id back
+    /// (DBStartQuestContext::SetQuestDbId). 23/24 are updates, 25-27 are deletes/cleanups.
+    /// </summary>
+    public const uint QuestSqlInsert = 22;
+
+    // --- SDB_USER_LEARN_SKILL (0x278E) -> DBS_USER_LEARN_SKILL (0x278F) ---
+    // cap_newchar.log seq 2750 -> 2751, 896 B -> 885 B. Sent when the character learns a skill
+    // at a trainer; the request carries the skill id and ONE ItemTransactionAtom (the fee).
+    //
+    // Handler_SDB_USER_LEARN_SKILL (Arb_part_078.c:3384) needs frame >= 0x28 and reads:
+    //   [0]  u32 atomListOffset (frame-relative, 40)  [4]  u32 atomListLength (856)
+    //   [8]  u32 reqId   [12] u32 playerId   [16] u32 skillId
+    //   [20] u8 learnAll flag   [21] u32 ...  [26] i32 ...  [30] i32 ...  -> 34-byte header
+    // Reply writer FUN_1408e8230 (Arb_part_077.c:15265): opcode 0x278f, four backpatch slots,
+    // u32 reqId, u8 ok, u8 hasSkillPeriodList, u8 wasAlreadyLearned - a 23-byte header - then
+    // the atom list and a SkillPeriodData list (0x18 each, EMPTY in the capture).
+    //
+    // World's Handler_DBS_USER_LEARN_SKILL (WorldServer.exe.c:3027296) needs frame >= 0x1d,
+    // finds the item by payload[16], takes ok from payload[20], and reads the SECOND list
+    // (payload[8]/[12]) as the skill-period list - it never looks at the atoms. It stores
+    // payload[21] and payload[22] on the context. Both are 0 in the capture (no skill-period
+    // rows, and the learn was new), which is what we always send.
+    //
+    // So the echo rule is the same shape as T13's 0x2769: header + the request's atom list with
+    // insert ids filled in, and an empty second list. The capture's one atom is op 9 with id 0,
+    // which the T13 rule leaves alone - reply bytes are the request's atom verbatim.
+    public const ushort SDB_USER_LEARN_SKILL = 0x278E; public const ushort DBS_USER_LEARN_SKILL = 0x278F;
+    /// <summary>0x278E header: [offset][length] atom list, reqId, playerId, skillId, flags.</summary>
+    public const int LearnSkillRequestHeader = 34;
+    /// <summary>0x278F header: two [offset][length] pairs, reqId, ok, 2 flag bytes.</summary>
+    public const int LearnSkillReplyHeader = 23;
+
+    // --- SDB_ACCOMPLISH_USER_ACHIEVEMENT (0x2802) -> DBS_ACCOMPLISH_USER_ACHIEVEMENT (0x2803) ---
+    // Two forms in the capture, and they are the SAME code path:
+    //   seq 1369 -> 1370   46 B -> 43 B   achievement 5991, echoed back
+    //   seq 2605 -> 2606   46 B -> 19 B   achievement 5991 AGAIN, empty list
+    //   seq 2722 -> 2723   46 B -> 43 B   achievement 5992, echoed back
+    // Handler_SDB_ACCOMPLISH_USER_ACHIEVEMENT (Arb_part_062.c:18927) needs frame >= 0x16 and
+    // reads [0] u32 listOffset [4] u32 listLength [8] u32 reqId [12] u32 playerId, then
+    // listLength/0x18 records of 24 bytes. For each record it calls User::AccomplishAchievement
+    // and keeps ONLY the ones that returned true - the reply list is the achievements that were
+    // NEWLY accomplished, which is why a repeat of 5991 comes back empty. ok is a hard-coded 1
+    // in the writer either way, so both forms complete the DLM item.
+    // World's Handler_DBS_ACCOMPLISH_USER_ACHIEVEMENT (WorldServer.exe.c:3008986) needs
+    // frame >= 0x13 (the 19-byte short form is exactly the minimum), finds the item by
+    // payload[8] and takes ok from payload[12].
+    // We keep no achievement table, so every record looks new to us and we always echo. The
+    // short form is reachable through the isNewlyAccomplished predicate, which is where an
+    // achievement store would plug in.
+    public const ushort SDB_ACCOMPLISH_USER_ACHIEVEMENT = 0x2802; public const ushort DBS_ACCOMPLISH_USER_ACHIEVEMENT = 0x2803;
+    /// <summary>0x2802 header: [offset][length] record list, reqId, playerId.</summary>
+    public const int AchievementRequestHeader = 16;
+    /// <summary>0x2803 header: [offset][length], reqId, ok.</summary>
+    public const int AchievementReplyHeader = 13;
+    /// <summary>One accomplished-achievement record: [u32 achievementId][u32 0][7 x u16 date][u16 pad].</summary>
+    public const int AchievementRecordSize = 0x18;
+
+    // --- SDB_UPDATE_REPUTATION_INFO (0x2891) -> DBS_UPDATE_REPUTATION_INFO (0x2892) ---
+    // cap_newchar.log seq 413 -> 417, 78 B -> 11 B.
+    // Handler_SDB_UPDATE_REPUTATION_INFO (Arb_part_064.c:13105) needs frame >= 0x1a and reads
+    //   [0] u32 recordOffset  [4] u32 recordLength (52)  [8] u32 reqId  [12] u32 playerId
+    //   [16] u32 op
+    // op 1 -> ReputationList::Insert, op 2 or 4 -> ReputationList::Update; any other op leaves
+    // ok = 0. The writer emits u8 ok FIRST, then u32 reqId - the ONLY reply in this batch with
+    // that ordering (capture: 01 2B 00 00 00).
+    public const ushort SDB_UPDATE_REPUTATION_INFO = 0x2891; public const ushort DBS_UPDATE_REPUTATION_INFO = 0x2892;
+
+    // --- SDB_ADD_TUTORIAL_SIMPLE_TIP (0x286E) -> DBS_ADD_TUTORIAL_SIMPLE_TIP (0x286F) ---
+    // cap_newchar.log seq 719/765/864/911, 18 B -> 11 B each.
+    // Handler_SDB_ADD_TUTORIAL_SIMPLE_TIP (Arb_part_063.c:36) needs frame >= 0x12 and reads
+    //   [0] u32 reqId  [4] u32 playerId  [8] u32 tipId
+    // Reply: [u32 reqId][u8 ok] (capture: 51 00 00 00 01).
+    public const ushort SDB_ADD_TUTORIAL_SIMPLE_TIP = 0x286E; public const ushort DBS_ADD_TUTORIAL_SIMPLE_TIP = 0x286F;
+
+    // --- SDB_UPDATE_SEREN_GUIDE_INFO (0x2944) -> DBS_UPDATE_SEREN_GUIDE_INFO (0x2945) ---
+    // cap_newchar.log seq 634 -> 635 and 2713 -> 2716, 22 B -> 15 B.
+    // Handler_SDB_UPDATE_SEREN_GUIDE_INFO (Arb_part_064.c:13189) needs frame >= 0x16 and reads
+    //   [0] u32 reqId  [4] u32 playerId  [8] u32 guideId  [12] u32 value
+    // Reply: [u32 reqId][u32 playerId][u8 ok] (capture: 4B 00 00 00 02 00 00 00 01).
+    // NOTE: the real Arbiter sends NOTHING when its update fails - which would head-block the
+    // user. We always answer; ok = 1 matches every captured reply.
+    public const ushort SDB_UPDATE_SEREN_GUIDE_INFO = 0x2944; public const ushort DBS_UPDATE_SEREN_GUIDE_INFO = 0x2945;
+
+    // --- SDB_UPDATE_USER_DAILY_EVENT_COUNT (0x293C) -> DBS (0x293D) ---
+    // cap_newchar.log seq 505 -> 507, 58 B -> 11 B.
+    // Handler_SDB_UPDATE_USER_DAILY_EVENT_COUNT (Arb_part_064.c:14404) needs frame >= 0x26 and
+    // reads [0] u32 recordOffset [4] u32 recordLength (20) [8] u32 reqId [12] u32 playerId
+    //       [16] i64 flag  [24] u64 timestamp.  Reply: [u32 reqId][u8 ok] - reqId at payload[8].
+    public const ushort SDB_UPDATE_USER_DAILY_EVENT_COUNT = 0x293C; public const ushort DBS_UPDATE_USER_DAILY_EVENT_COUNT = 0x293D;
+
+    // --- SDB_UPDATE_GET_EXTRA_REWARD (0x293E) -> DBS_UPDATE_GET_EXTRA_REWARD (0x293F) ---
+    // cap_newchar.log seq 503 -> 504, 20 B -> 11 B. This one was in
+    // WorldReplayTable.OneWayFromWorld until T15 - CLAUDE.md section 3 had it filed as a
+    // periodic push because it never appeared in arb_world.log. It IS a per-user DLM request
+    // and it wedged a login on 2026-09-14; the set now only holds opcodes proven one-way.
+    // Handler_SDB_UPDATE_GET_EXTRA_REWARD (Arb_part_064.c:11963) needs frame >= 0x14 and reads
+    //   [0] u32 reqId  [4] u32 playerId  [8] u8 kind  [9] u32 value  [13] u8 flag
+    // Reply: [u32 reqId][u8 ok] (capture: 3F 00 00 00 01).
+    public const ushort SDB_UPDATE_GET_EXTRA_REWARD = 0x293E; public const ushort DBS_UPDATE_GET_EXTRA_REWARD = 0x293F;
+
+    // --- SDB_CANCEL_NPC_ARENA_BET (0x2927): FIRE AND FORGET, NEVER REPLY ---
+    // Handler_SDB_CANCEL_NPC_ARENA_BET (Arb_part_063.c:1315) needs frame >= 0xe, calls
+    // NpcArenaManager::Cancel and returns - there is no SendToSession at all, and no DBS_ opcode
+    // exists for it. All five occurrences in cap_newchar.log (seq 3466, 4116, 4138, 4151, 4198,
+    // the logout-countdown ticks) are followed by no A->W frame. It lives in
+    // WorldReplayTable.OneWayFromWorld so the replay table cannot hand the NEXT request's reply
+    // to it; there is deliberately no handler here.
+    public const ushort SDB_CANCEL_NPC_ARENA_BET = 0x2927;
+
     private readonly CharacterStore _store;
     private readonly ILogger _log;
 
@@ -257,13 +416,23 @@ public sealed class DbProxyHandlers
         _log = log;
     }
 
-    /// <summary>Returns true if handled (caller should not fall back to replay).</summary>
-    public bool TryHandle(WorldBridge bridge, WorldLink link, ushort op, byte[] payload)
+    /// <summary>
+    /// THE ALLOW-LIST. True when <see cref="TryHandle"/> answers this opcode itself; false sends
+    /// it to the replay table, which replies with the CAPTURED DLM id and wedges the user if the
+    /// reply carries a live one (status/HANDOFF.md section 1).
+    ///
+    /// <para>Only intercept messages that need live per-session data. Every login-time SDB_* that
+    /// is served byte-exact by the replay table stays off this list; the synthetic builders below
+    /// desynced World once (0x27A2 returns a 3235-byte item list, not an empty list) and are kept
+    /// only for their unit tests.</para>
+    ///
+    /// <para>This is a method rather than the inline switch it used to be so the T15 coverage test
+    /// can ask it directly - see Every_per_user_request_opcode_is_answered in the test project.
+    /// Adding an opcode here WITHOUT adding a case to the dispatch switch in TryHandle makes it
+    /// fall through to the replay table; TryHandle logs an error if that ever happens.</para>
+    /// </summary>
+    public static bool IsHandledRequest(ushort op)
     {
-        // Only intercept messages that need live per-session data (character blob + logout
-        // saves). Every login-time SDB_* is served byte-exact by the replay table; the
-        // synthetic builders below desynced World (0x27A2 returns a 3235-byte item list,
-        // not an empty list) so they are bypassed here and kept only for their unit tests.
         switch (op)
         {
             case SDB_USER_ENTERWORLD:
@@ -294,10 +463,26 @@ public sealed class DbProxyHandlers
             case SA_RESPONSE_ENTER_DUNGEON:         // 0x13C1 (zone change step 2)
             case SDB_LOAD_2869:          // 0x15E0 push + 0x286A, both carrying the live reset time
             case AS_PROMOTION_LIST_REQ:  // 0x147D -> 0x1484 + 24 x 0x147E (timestamps = now) + 0x1480
-                break;               // handled by the real switch below
+            // --- T15: the per-user writes World sends during play. Each one is a DLM item; a
+            // missing reply head-blocks the user's queue for the life of the World process. ---
+            case SDB_SET_QUEST_INFO:              // 0x272F = echo + ok + allocated quest row id
+            case SDB_USER_LEARN_SKILL:            // 0x278F = echo of the fee atoms + empty skill-period list
+            case SDB_ACCOMPLISH_USER_ACHIEVEMENT: // 0x2803 = the newly-accomplished records echoed
+            case SDB_UPDATE_REPUTATION_INFO:      // 0x2892 = [ok][reqId]  (ok-first, the odd one out)
+            case SDB_ADD_TUTORIAL_SIMPLE_TIP:     // 0x286F = [reqId][ok]
+            case SDB_UPDATE_SEREN_GUIDE_INFO:     // 0x2945 = [reqId][playerId][ok]
+            case SDB_UPDATE_USER_DAILY_EVENT_COUNT: // 0x293D = [reqId][ok], reqId at payload[8]
+            case SDB_UPDATE_GET_EXTRA_REWARD:     // 0x293F = [reqId][ok]
+                return true;
             default:
                 return false;        // -> replay table
         }
+    }
+
+    /// <summary>Returns true if handled (caller should not fall back to replay).</summary>
+    public bool TryHandle(WorldBridge bridge, WorldLink link, ushort op, byte[] payload)
+    {
+        if (!IsHandledRequest(op)) return false;
 
         // Name the opcode in the log so a real handler is distinguishable from a replay at a
         // glance (DbProxyOpcodeNames is generated from WorldServer.exe.c; logging only).
@@ -318,6 +503,16 @@ public sealed class DbProxyHandlers
             case SDB_SAVE_2936: link.SendFrame(DBS_SAVE_2937, BuildDbs2937(payload)); return true;
             case SDB_DAILY_QUEST: link.SendFrame(DBS_DAILY_QUEST, BuildReqIdAck(payload, 16)); return true;
             case SDB_DAILY_QUEST_SEED: link.SendFrame(DBS_DAILY_QUEST_SEED, BuildReqIdAck(payload, 8)); return true;
+
+            // --- T15: per-user writes during play (all echo the LIVE reqId) ---
+            case SDB_SET_QUEST_INFO:              return OnSetQuestInfo(link, payload);
+            case SDB_USER_LEARN_SKILL:            return OnUserLearnSkill(link, payload);
+            case SDB_ACCOMPLISH_USER_ACHIEVEMENT: return OnAccomplishUserAchievement(link, payload);
+            case SDB_UPDATE_REPUTATION_INFO:        link.SendFrame(DBS_UPDATE_REPUTATION_INFO, BuildDbs2892(payload)); return true;
+            case SDB_ADD_TUTORIAL_SIMPLE_TIP:       link.SendFrame(DBS_ADD_TUTORIAL_SIMPLE_TIP, BuildReqIdAck(payload, 0)); return true;
+            case SDB_UPDATE_SEREN_GUIDE_INFO:       link.SendFrame(DBS_UPDATE_SEREN_GUIDE_INFO, BuildDbs2945(payload)); return true;
+            case SDB_UPDATE_USER_DAILY_EVENT_COUNT: link.SendFrame(DBS_UPDATE_USER_DAILY_EVENT_COUNT, BuildReqIdAck(payload, 8)); return true;
+            case SDB_UPDATE_GET_EXTRA_REWARD:       link.SendFrame(DBS_UPDATE_GET_EXTRA_REWARD, BuildReqIdAck(payload, 0)); return true;
 
             // --- Post-spawn (reqId at payload[0] for all three) ---
             case SDB_END_START_QUEST_LIST: link.SendFrame(DBS_END_START_QUEST_LIST, BuildReqIdAck(payload, 0)); return true;
@@ -427,7 +622,14 @@ public sealed class DbProxyHandlers
             case SDB_QUEST_LIST:          link.SendFrame(0x272D, BuildFromStaticData(DbProxyStaticData.QuestListEmpty, DbProxyStaticData.QuestListEmptyReqIdOffset, payload)); return true;
             case SDB_USER_ACHIEVEMENT:    link.SendFrame(0x27F9, BuildFromStaticData(DbProxyStaticData.Achievement, DbProxyStaticData.AchievementReqIdOffset, payload)); return true;
 
-            default: return false;
+            default:
+                // IsHandledRequest said yes and there is no case for it: the request now falls
+                // through to the replay table, which answers with the CAPTURED DLM id. That is
+                // a wedge (status/HANDOFF.md section 1), so say so rather than failing quietly.
+                _log.LogError("DbProxy: {Op} is allow-listed but has no handler - falling through "
+                    + "to the replay table, which will answer with a stale DLM id and head-block this user",
+                    DbProxyOpcodeNames.Describe(op));
+                return false;
         }
     }
 
@@ -642,8 +844,14 @@ public sealed class DbProxyHandlers
         return r;
     }
 
-    /// <summary>Copy one atom list out of the request, allocating ids for the inserts in it.</summary>
-    private static byte[] CloneAtomList(byte[] request, int headerOffset, Func<int> allocateItemId)
+    /// <summary>
+    /// Copy one ItemTransactionAtom list out of a request, allocating item DB ids for the
+    /// inserts in it. Shared by 0x2768 (T13), 0x272E and 0x278E (T15) - all three carry the
+    /// same 856-byte atoms behind an [offset][length] pair, they just have different headers,
+    /// hence <paramref name="minStart"/>: an offset pointing inside the header is malformed.
+    /// </summary>
+    private static byte[] CloneAtomList(byte[] request, int headerOffset, Func<int> allocateItemId,
+                                        int minStart = ItemSingleRequestHeader)
     {
         if (headerOffset + 8 > request.Length) return Array.Empty<byte>();
         int frameOffset = (int)BitConverter.ToUInt32(request, headerOffset);
@@ -651,7 +859,9 @@ public sealed class DbProxyHandlers
         if (length <= 0) return Array.Empty<byte>();
 
         int start = frameOffset - 6;                            // offsets in the frame count the header
-        if (start < ItemSingleRequestHeader || length % ItemAtomSize != 0 || start + length > request.Length)
+        // `length > request.Length - start` rather than `start + length > request.Length`: a
+        // garbage offset can be big enough that the sum overflows int and passes the check.
+        if (start < minStart || length % ItemAtomSize != 0 || length > request.Length - start)
             return Array.Empty<byte>();
 
         var atoms = new byte[length];
@@ -665,6 +875,221 @@ public sealed class DbProxyHandlers
             BitConverter.GetBytes(allocateItemId()).CopyTo(atoms, o + ItemAtomDbIdOffset);
         }
         return atoms;
+    }
+
+
+    // =====================================================================
+    // T15 builders. Every one is verified byte-for-byte against data/cap_t15.bin in the tests.
+    // =====================================================================
+
+    /// <summary>
+    /// Quest row ids for 0x272F. The real Arbiter returns the identity of the row its INSERT
+    /// created; World stores it (DBStartQuestContext::SetQuestDbId) and uses it to address the
+    /// row later. We keep no quest table yet - status/PERSISTENCE-MAP.md step 1 - so this is a
+    /// process-wide counter. It only has to be distinct within the World process: nothing
+    /// persists, so a restart that begins again at 1 collides with nothing. When quests become
+    /// real this moves into CharacterStore next to the item-id sequence.
+    /// </summary>
+    private int _nextQuestDbId;
+    private int NextQuestDbId() => Interlocked.Increment(ref _nextQuestDbId);
+
+    /// <summary>SDB_SET_QUEST_INFO (0x272E) -&gt; DBS_SET_QUEST_INFO (0x272F).</summary>
+    private bool OnSetQuestInfo(WorldLink link, byte[] payload)
+    {
+        uint sqlType = payload.Length >= 24 ? BitConverter.ToUInt32(payload, 20) : 0;
+        int declaredAtoms = DeclaredAtomCount(payload, 8);
+        int questDbId = 0;
+        var reply = BuildDbs272F(payload, _store.NextItemId,
+            () => { questDbId = NextQuestDbId(); return questDbId; });
+
+        int echoedAtoms = (int)BitConverter.ToUInt32(reply, 12) / ItemAtomSize;
+        if (echoedAtoms != declaredAtoms)
+            _log.LogWarning("SDB_SET_QUEST_INFO: could not echo the reward atoms (declared {D}, echoed {E}, "
+                + "payload {Len} B) - World will lose the items the quest just granted",
+                declaredAtoms, echoedAtoms, payload.Length);
+
+        _log.LogInformation("SDB_SET_QUEST_INFO: sqlType {Sql}, {N} reward atom(s){Quest}",
+            sqlType, declaredAtoms, questDbId != 0 ? $", quest row id {questDbId}" : "");
+        link.SendFrame(DBS_SET_QUEST_INFO, reply);
+        return true;
+    }
+
+    /// <summary>SDB_USER_LEARN_SKILL (0x278E) -&gt; DBS_USER_LEARN_SKILL (0x278F).</summary>
+    private bool OnUserLearnSkill(WorldLink link, byte[] payload)
+    {
+        uint skillId = payload.Length >= 20 ? BitConverter.ToUInt32(payload, 16) : 0;
+        uint playerId = payload.Length >= 16 ? BitConverter.ToUInt32(payload, 12) : 0;
+        int declaredAtoms = DeclaredAtomCount(payload, 0);
+        var reply = BuildDbs278F(payload, _store.NextItemId);
+
+        int echoedAtoms = (int)BitConverter.ToUInt32(reply, 4) / ItemAtomSize;
+        if (echoedAtoms != declaredAtoms)
+            _log.LogWarning("SDB_USER_LEARN_SKILL: could not echo the fee atoms (declared {D}, echoed {E}, "
+                + "payload {Len} B)", declaredAtoms, echoedAtoms, payload.Length);
+
+        _log.LogInformation("SDB_USER_LEARN_SKILL: player {Pid} learned skill {Skill} ({N} atom(s))",
+            playerId, skillId, declaredAtoms);
+        link.SendFrame(DBS_USER_LEARN_SKILL, reply);
+        return true;
+    }
+
+    /// <summary>SDB_ACCOMPLISH_USER_ACHIEVEMENT (0x2802) -&gt; DBS (0x2803).</summary>
+    private bool OnAccomplishUserAchievement(WorldLink link, byte[] payload)
+    {
+        var reply = BuildDbs2803(payload);
+        int n = (int)BitConverter.ToUInt32(reply, 4) / AchievementRecordSize;
+        _log.LogInformation("SDB_ACCOMPLISH_USER_ACHIEVEMENT: echoed {N} record(s) as newly accomplished", n);
+        link.SendFrame(DBS_ACCOMPLISH_USER_ACHIEVEMENT, reply);
+        return true;
+    }
+
+    /// <summary>
+    /// DBS_SET_QUEST_INFO (0x272F): the 29-byte header, the 80-byte quest record copied straight
+    /// back, and the reward atom list with an item DB id filled into every op-7 atom that arrived
+    /// with 0 (the T13 rule - see <see cref="BuildDbs2769"/>).
+    ///
+    /// <para><paramref name="allocateQuestDbId"/> is called ONLY for sqlType
+    /// <see cref="QuestSqlInsert"/>; every other type gets 0, exactly as in the capture. That is
+    /// the row id World reads back at payload[25] and hands to DBStartQuestContext::SetQuestDbId.</para>
+    ///
+    /// <para>The record length in the reply is always <see cref="QuestInfoRecordSize"/> because the
+    /// Arbiter parses the request into a fixed 80-byte struct and writes all 80 bytes back. A
+    /// request whose record is short, missing or out of bounds therefore gets zeros for the
+    /// remainder rather than no reply - not replying head-blocks the user forever.</para>
+    /// </summary>
+    public static byte[] BuildDbs272F(byte[] request, Func<int> allocateItemId, Func<int> allocateQuestDbId)
+    {
+        ArgumentNullException.ThrowIfNull(allocateItemId);
+        ArgumentNullException.ThrowIfNull(allocateQuestDbId);
+
+        uint reqId   = request.Length >= 20 ? BitConverter.ToUInt32(request, 16) : 0;
+        uint sqlType = request.Length >= 24 ? BitConverter.ToUInt32(request, 20) : 0;
+
+        var record = new byte[QuestInfoRecordSize];
+        if (request.Length >= 8)
+        {
+            int start = (int)BitConverter.ToUInt32(request, 0) - 6;   // frame-relative
+            int len = Math.Min((int)BitConverter.ToUInt32(request, 4), QuestInfoRecordSize);
+            // `len <= request.Length - start` rather than `start + len <= request.Length`: a
+            // garbage offset can be big enough that the sum overflows and passes the check.
+            if (start >= QuestInfoRequestHeader && len > 0 && len <= request.Length - start)
+                Array.Copy(request, start, record, 0, len);
+        }
+
+        byte[] atoms = CloneAtomList(request, 8, allocateItemId, QuestInfoRequestHeader);
+        uint questDbId = sqlType == QuestSqlInsert ? (uint)allocateQuestDbId() : 0;
+
+        var r = new byte[QuestInfoReplyHeader + QuestInfoRecordSize + atoms.Length];
+        uint offRecord = 6 + QuestInfoReplyHeader;                    // 35, frame-relative
+        BitConverter.GetBytes(offRecord).CopyTo(r, 0);
+        BitConverter.GetBytes((uint)QuestInfoRecordSize).CopyTo(r, 4);
+        BitConverter.GetBytes(offRecord + (uint)QuestInfoRecordSize).CopyTo(r, 8);
+        BitConverter.GetBytes((uint)atoms.Length).CopyTo(r, 12);
+        BitConverter.GetBytes(reqId).CopyTo(r, 16);
+        BitConverter.GetBytes(sqlType).CopyTo(r, 20);
+        r[24] = 1;                                                    // ok - 1 on every captured reply
+        BitConverter.GetBytes(questDbId).CopyTo(r, 25);
+        record.CopyTo(r, QuestInfoReplyHeader);
+        atoms.CopyTo(r, QuestInfoReplyHeader + QuestInfoRecordSize);
+        return r;
+    }
+
+    /// <summary>
+    /// DBS_USER_LEARN_SKILL (0x278F): the 23-byte header, the request's atom list echoed back with
+    /// insert ids filled in, and an EMPTY SkillPeriodData list. World reads the second list, not
+    /// the atoms, so the empty list is what tells it "no timed skills" - which is what the real
+    /// Arbiter sent in the capture.
+    /// </summary>
+    public static byte[] BuildDbs278F(byte[] request, Func<int> allocateItemId)
+    {
+        ArgumentNullException.ThrowIfNull(allocateItemId);
+        uint reqId = request.Length >= 12 ? BitConverter.ToUInt32(request, 8) : 0;
+        byte[] atoms = CloneAtomList(request, 0, allocateItemId, LearnSkillRequestHeader);
+
+        var r = new byte[LearnSkillReplyHeader + atoms.Length];
+        uint offAtoms = 6 + LearnSkillReplyHeader;                    // 29, frame-relative
+        BitConverter.GetBytes(offAtoms).CopyTo(r, 0);
+        BitConverter.GetBytes((uint)atoms.Length).CopyTo(r, 4);
+        BitConverter.GetBytes(offAtoms + (uint)atoms.Length).CopyTo(r, 8);
+        // r[12..15] = 0  - the SkillPeriodData list is empty
+        BitConverter.GetBytes(reqId).CopyTo(r, 16);
+        r[20] = 1;   // ok
+        // r[21] = 0  - hasSkillPeriodList; r[22] = 0 - wasAlreadyLearned. Both 0 in the capture.
+        atoms.CopyTo(r, LearnSkillReplyHeader);
+        return r;
+    }
+
+    /// <summary>
+    /// DBS_ACCOMPLISH_USER_ACHIEVEMENT (0x2803): the 13-byte header plus the records the Arbiter
+    /// considers NEWLY accomplished.
+    ///
+    /// <para><paramref name="isNewlyAccomplished"/> is called once per 24-byte record; null means
+    /// "everything is new", which is what TeraSharp does today because it keeps no achievement
+    /// table. Return false for a record the character already has and the reply collapses to the
+    /// 19-byte form the real Arbiter sent at cap_newchar.log seq 2606 - that is the hook an
+    /// achievement store plugs into.</para>
+    /// </summary>
+    public static byte[] BuildDbs2803(byte[] request, Func<byte[], bool>? isNewlyAccomplished = null)
+    {
+        uint reqId = request.Length >= 12 ? BitConverter.ToUInt32(request, 8) : 0;
+
+        var kept = new List<byte[]>();
+        if (request.Length >= 8)
+        {
+            int start = (int)BitConverter.ToUInt32(request, 0) - 6;   // frame-relative
+            int len = (int)BitConverter.ToUInt32(request, 4);
+            if (start >= AchievementRequestHeader && len > 0 && len % AchievementRecordSize == 0
+                && len <= request.Length - start)
+            {
+                for (int o = start; o + AchievementRecordSize <= start + len; o += AchievementRecordSize)
+                {
+                    var rec = request[o..(o + AchievementRecordSize)];
+                    if (isNewlyAccomplished == null || isNewlyAccomplished(rec)) kept.Add(rec);
+                }
+            }
+        }
+
+        int total = kept.Count * AchievementRecordSize;
+        var r = new byte[AchievementReplyHeader + total];
+        BitConverter.GetBytes(6u + (uint)AchievementReplyHeader).CopyTo(r, 0);   // 19, frame-relative
+        BitConverter.GetBytes((uint)total).CopyTo(r, 4);
+        BitConverter.GetBytes(reqId).CopyTo(r, 8);
+        r[12] = 1;                                                   // ok - hard-coded 1 in the writer
+        int p = AchievementReplyHeader;
+        foreach (var rec in kept) { rec.CopyTo(r, p); p += AchievementRecordSize; }
+        return r;
+    }
+
+    /// <summary>
+    /// DBS_UPDATE_REPUTATION_INFO (0x2892): [u8 ok][u32 reqId] — 5 bytes. The ok byte comes FIRST
+    /// here; 0x2891 is the only request in this batch with that ordering.
+    /// The real Arbiter leaves ok = 0 for an op it does not implement (only 1 = insert and
+    /// 2 / 4 = update reach a ReputationList call), and ok = 0 still completes the DLM item -
+    /// it just selects OnFail. Copy that rather than hardcoding 1.
+    /// </summary>
+    public static byte[] BuildDbs2892(byte[] request)
+    {
+        uint reqId = request.Length >= 12 ? BitConverter.ToUInt32(request, 8) : 0;
+        uint op = request.Length >= 20 ? BitConverter.ToUInt32(request, 16) : 0;
+        var r = new byte[5];
+        r[0] = (byte)(op is 1u or 2u or 4u ? 1 : 0);
+        BitConverter.GetBytes(reqId).CopyTo(r, 1);
+        return r;
+    }
+
+    /// <summary>
+    /// DBS_UPDATE_SEREN_GUIDE_INFO (0x2945): [u32 reqId][u32 playerId][u8 ok=1] — 9 bytes.
+    /// Both are echoed from the request (payload[0] and payload[4]).
+    /// </summary>
+    public static byte[] BuildDbs2945(byte[] request)
+    {
+        uint reqId = request.Length >= 4 ? BitConverter.ToUInt32(request, 0) : 0;
+        uint playerId = request.Length >= 8 ? BitConverter.ToUInt32(request, 4) : 0;
+        var r = new byte[9];
+        BitConverter.GetBytes(reqId).CopyTo(r, 0);
+        BitConverter.GetBytes(playerId).CopyTo(r, 4);
+        r[8] = 1;
+        return r;
     }
 
     /// <summary>DBS_SAVE_2937: [u32 reqId][u32 0x300][u32 0] (13 bytes), reqId at request offset 0.</summary>
