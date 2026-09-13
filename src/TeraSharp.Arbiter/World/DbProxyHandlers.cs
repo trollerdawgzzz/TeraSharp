@@ -167,6 +167,12 @@ public sealed class DbProxyHandlers
     //              the same 16-B shape (User::LearnAllCrest output). We learn everything requested.
     public const ushort SA_LEARN_ALL_CREST_ACQUIRABLE = 0x1463; public const ushort AS_LEARN_ALL_CREST_ACQUIRABLE = 0x1464;
 
+    // SDB_UPDATE_USER_ACTPOINT (0x297B) -> DBS_UPDATE_USER_ACTPOINT (0x297C). Per-user DLM, sent after
+    // the first enter-world steps (cap_newchar.log seq 537/538: req 22 B [u32 reqId][u32 pid][u32][u32],
+    // rsp 11 B [reqId][ok=1]). Unanswered it head-blocked everything behind it (skill learns) for the
+    // first warrior login, 2026-09-14 02:16.
+    public const ushort SDB_UPDATE_USER_ACTPOINT = 0x297B; public const ushort DBS_UPDATE_USER_ACTPOINT = 0x297C;
+
     // --- Zone change / dungeon / quest-teleport handshake (cap_newchar.log 05:52:35) ---
     // World: SA_REQUEST_ENTER_DUNGEON (0x13BE, 215 B) -> we: AS_REQUEST_ENTER_DUNGEON (0x13BF, 215 B)
     // World: SA_RESPONSE_ENTER_DUNGEON (0x13C0, 214 B) -> we: AS_RESPONSE_ENTER_DUNGEON (0x13C1, 214 B)
@@ -290,6 +296,7 @@ public sealed class DbProxyHandlers
             case SDB_LOAD_WORLD_EVENT:     // 0x27B4 = [reqId][01]       (capture: 83 00 00 00 01)
             case SA_CLEAR_BATTLE_FIELD_ENTER_COUNT: // 0x1563 = [01][reqId@8]  (decompile Arb_part_062.c:4769)
             case SA_LEARN_ALL_CREST_ACQUIRABLE:     // 0x1464 = learned-crest list (all of them)
+            case SDB_UPDATE_USER_ACTPOINT:          // 0x297C = [reqId][01]
             case SA_REQUEST_ENTER_DUNGEON:          // 0x13BF (zone change step 1)
             case SA_RESPONSE_ENTER_DUNGEON:         // 0x13C1 (zone change step 2)
             case SDB_LOAD_2869:          // 0x15E0 push + 0x286A, both carrying the live reset time
@@ -323,6 +330,7 @@ public sealed class DbProxyHandlers
             case SDB_END_START_QUEST_LIST: link.SendFrame(DBS_END_START_QUEST_LIST, BuildReqIdAck(payload, 0)); return true;
             case SDB_LOAD_2930:            link.SendFrame(DBS_LOAD_2931, Build2931(payload)); return true;
             case SA_CLEAR_BATTLE_FIELD_ENTER_COUNT: link.SendFrame(AS_CLEAR_BATTLE_FIELD_ENTER_COUNT, BuildOkReqId(payload, 8)); return true;
+            case SDB_UPDATE_USER_ACTPOINT: link.SendFrame(DBS_UPDATE_USER_ACTPOINT, BuildReqIdAck(payload, 0)); return true;
             case SA_LEARN_ALL_CREST_ACQUIRABLE:
             {
                 var r = BuildLearnAllCrest(payload);
