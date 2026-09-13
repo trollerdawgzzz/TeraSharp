@@ -252,9 +252,26 @@ public sealed class CharacterHandlers
             Position = position,
             // playerId is only known after the INSERT; when it is 0 here the caller patches
             // the blob again with the real row id (see OnCreateUser).
-            WorldBlob = StarterBlob.Build(blobTemplate, playerId, req.Name, zone, x, y, z),
+            WorldBlob = StarterBlob.Build(blobTemplate, playerId, req.Name, IdentityOf(req), zone, x, y, z),
         };
     }
+
+    /// <summary>
+    /// The identity block the world blob needs, straight from the create request. The three
+    /// byte blocks are passed through by reference-copy semantics: ParseCreateUser and the .def
+    /// path both allocate them at their struct sizes, and StarterBlob.Build copies them into the
+    /// blob rather than keeping the arrays.
+    /// </summary>
+    internal static CharacterIdentity IdentityOf(CreateUserRequest req) => new()
+    {
+        Race = req.Race,
+        Gender = req.Gender,
+        Class = req.Class,
+        Appearance = req.Appearance,
+        Appearance2 = req.Appearance2,
+        Details = req.Details,
+        Shape = req.Shape,
+    };
 
     // ---- Helpers ----
 
@@ -405,14 +422,14 @@ public sealed class CharacterHandlers
         }
 
         var (zone, x, y, z) = StartPositionFor(req.Race, req.Class);
-        record.WorldBlob = StarterBlob.Build(template, id, req.Name, zone, x, y, z);
+        record.WorldBlob = StarterBlob.Build(template, id, req.Name, IdentityOf(req), zone, x, y, z);
         store.SaveWorldBlob(id, record.WorldBlob);
 
         s.Account.Characters.Add(FakeCharacter.FromRecord(record));
 
         _log.LogInformation(
             "C_CREATE_USER from {Id}: created '{Name}' id={CId} template={T} race={R} gender={G} class={C} " +
-            "slot={P} start=zone {Z} ({X},{Y},{Zz})",
+            "slot={P} start=zone {Z} ({X},{Y},{Zz}) (identity patched into the blob)",
             s.Id, req.Name, id, record.TemplateId, req.Race, req.Gender, req.Class, position, zone, x, y, z);
 
         SendCreateResult(s, true);

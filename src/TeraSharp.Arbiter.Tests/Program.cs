@@ -2427,13 +2427,16 @@ array items
     [Test] public static void StarterBlob_rebuilds_the_captured_blob_exactly()
     {
         // The template IS the blob the real server sent for "Test" (playerId 2, zone 5,
-        // 16260/1253/-4410). Patching those same values back in must be a no-op — which proves
-        // both that the offsets are right and that Build touches nothing else.
+        // 16260/1253/-4410), and the identity below is parsed from the C_CREATE_USER the client
+        // sent for that same character. Patching those values back in must be a no-op — which
+        // proves the offsets are right (independently: the values come from the client packet,
+        // not from the blob) and that Build touches nothing else.
         var template = LoadStarterTemplateOrSkip();
         if (template == null) return;
 
         var rebuilt = TeraSharp.Arbiter.Persistence.StarterBlob.Build(
-            template, playerId: 2, name: "Test", zone: 5, x: 16260f, y: 1253f, z: -4410f);
+            template, playerId: 2, name: "Test", identity: Pkt35Identity(),
+            zone: 5, x: 16260f, y: 1253f, z: -4410f);
 
         Hex.True(rebuilt.Length == 15312, $"blob must be 15312 bytes, got {rebuilt.Length}");
         for (int i = 0; i < rebuilt.Length; i++)
@@ -2451,14 +2454,20 @@ array items
         const int zone = 9827;
         const float x = -12142f, y = -27790f, z = -4393f;   // the Velika position from packet 2553
 
-        var blob = TeraSharp.Arbiter.Persistence.StarterBlob.Build(template, playerId, name, zone, x, y, z);
+        var identity = new TeraSharp.Arbiter.Persistence.CharacterIdentity
+        {
+            Race = 2, Gender = 0, Class = 3,
+            Appearance = Hex.B("11 22 33 44 55 66 77 88"),
+            Appearance2 = 0xDEAD,
+            Details = Enumerable.Range(1, 32).Select(v => (byte)v).ToArray(),
+            Shape = Enumerable.Range(1, 64).Select(v => (byte)(0x80 + v)).ToArray(),
+        };
+
+        var blob = TeraSharp.Arbiter.Persistence.StarterBlob.Build(
+            template, playerId, name, identity, zone, x, y, z);
 
         // Every byte outside the patched windows must be identical to the capture.
-        var patched = new HashSet<int>();
-        for (int i = 112; i < 116; i++) patched.Add(i);                 // u32 playerId
-        for (int i = 116; i < 116 + 17 * 2; i++) patched.Add(i);        // wstr name (zeroed region)
-        for (int i = 220; i < 232; i++) patched.Add(i);                 // x, y, z floats
-        for (int i = 236; i < 240; i++) patched.Add(i);                 // u32 zone
+        var patched = new HashSet<int>(PatchedWindows());
 
         for (int i = 0; i < blob.Length; i++)
         {
@@ -2475,15 +2484,191 @@ array items
         Hex.True(BitConverter.ToSingle(blob, 228) == z, "z at 228");
         Hex.True(BitConverter.ToInt32(blob, 236) == zone, "zone at 236");
 
+        Hex.True(BitConverter.ToInt32(blob, 192) == 2, "race at 192");
+        Hex.True(BitConverter.ToInt32(blob, 196) == 0, "gender at 196");
+        Hex.True(BitConverter.ToInt32(blob, 200) == 3, "class at 200");
+        Hex.Eq(blob[288..296], "11 22 33 44 55 66 77 88", "appearance at 288");
+        Hex.True(BitConverter.ToUInt32(blob, 296) == 0xDEAD, "appearance2 at 296");
+        Hex.Eq(blob[312..344], identity.Details, "details at 312");
+        Hex.Eq(blob[344..408], identity.Shape, "shape at 344");
+
+        // 304 sits inside the identity block but is not ours: WorldEntry copies it into
+        // AS_ENTER_WORLD payload[72].
+        Hex.Eq(blob[304..308], template[304..308], "the u32 at 304 must survive untouched");
+
         // The old name must be gone, not merely overwritten up to its own length.
         Hex.True(!TeraSharp.Arbiter.Persistence.StarterBlob.ReadName(blob).Contains("Test"),
             "the template name 'Test' leaked into the new blob");
     }
 
+    // =====================================================================
+    // T12 — the identity block in the world blob.
+    //
+    // data/starter_blob.bin is the blob the real ArbiterServer sent for "Test", an Elin (race 4)
+    // female (gender 1) valkyrie (class 12). Build used to leave those bytes alone, so every
+    // character created through TeraSharp spawned wearing that body whatever the player picked.
+    //
+    // The seven identity fields in the template are byte-for-byte the values C_CREATE_USER
+    // carried for that character (cap_newchar_client.log packet 35 -> data/starter_blob.bin):
+    //   192 race 4 | 196 gender 1 | 200 class 12 | 288 appearance 65 01 07 04 0E 0E 04 00
+    //   296 appearance2 100 | 312 details 32 B | 344 shape 64 B
+    // which is what makes StarterBlob_rebuilds_the_captured_blob_exactly a real proof of the
+    // offsets rather than a tautology: the values go in from the client packet and the blob has
+    // to come back unchanged.
+    //
+    // 304 is deliberately NOT in the list — WorldEntry copies that u32 into AS_ENTER_WORLD
+    // payload[72] (0xFFFFF334 in the capture).
+    // =====================================================================
+
+    /// <summary>Every byte StarterBlob.Build is allowed to change.</summary>
+    static IEnumerable<int> PatchedWindows()
+    {
+        foreach (int i in Enumerable.Range(112, 4)) yield return i;              // u32 playerId
+        foreach (int i in Enumerable.Range(116, 17 * 2)) yield return i;         // wstr name (zeroed region)
+        foreach (int i in Enumerable.Range(192, 4)) yield return i;              // u32 race
+        foreach (int i in Enumerable.Range(196, 4)) yield return i;              // u32 gender
+        foreach (int i in Enumerable.Range(200, 4)) yield return i;              // u32 class
+        foreach (int i in Enumerable.Range(220, 12)) yield return i;             // x, y, z floats
+        foreach (int i in Enumerable.Range(236, 4)) yield return i;              // u32 zone
+        foreach (int i in Enumerable.Range(288, 8)) yield return i;              // appearance
+        foreach (int i in Enumerable.Range(296, 4)) yield return i;              // u32 appearance2
+        foreach (int i in Enumerable.Range(312, 32)) yield return i;             // details
+        foreach (int i in Enumerable.Range(344, 64)) yield return i;             // shape
+    }
+
+    /// <summary>The identity the client actually sent for "Test", parsed from packet 35.</summary>
+    static TeraSharp.Arbiter.Persistence.CharacterIdentity Pkt35Identity()
+        => CharacterHandlers.IdentityOf(CharacterHandlers.ParseCreateUser(Hex.B(CreateUserPkt35))!);
+
+    [Test] public static void StarterBlob_template_identity_matches_create_packet_35()
+    {
+        // The premise the two tests below rest on, asserted directly.
+        var template = LoadStarterTemplateOrSkip();
+        if (template == null) return;
+        var id = Pkt35Identity();
+
+        Hex.True(BitConverter.ToInt32(template, 192) == id.Race && id.Race == 4,
+            $"blob[192] should be the packet's race 4, got {BitConverter.ToInt32(template, 192)}/{id.Race}");
+        Hex.True(BitConverter.ToInt32(template, 196) == id.Gender && id.Gender == 1,
+            $"blob[196] should be the packet's gender 1, got {BitConverter.ToInt32(template, 196)}/{id.Gender}");
+        Hex.True(BitConverter.ToInt32(template, 200) == id.Class && id.Class == 12,
+            $"blob[200] should be the packet's class 12, got {BitConverter.ToInt32(template, 200)}/{id.Class}");
+        Hex.Eq(template[288..296], id.Appearance, "blob[288] == packet appearance");
+        Hex.Eq(template[288..296], "65 01 07 04 0E 0E 04 00", "blob[288] literal");
+        Hex.True(BitConverter.ToUInt32(template, 296) == id.Appearance2 && id.Appearance2 == 100,
+            $"blob[296] should be the packet's appearance2 100, got {BitConverter.ToUInt32(template, 296)}");
+        Hex.Eq(template[312..344], id.Details, "blob[312] == packet details");
+        Hex.Eq(template[344..408], id.Shape, "blob[344] == packet shape");
+    }
+
+    [Test] public static void StarterBlob_human_warrior_replaces_the_elin_identity()
+    {
+        // The bug this task fixes, stated as a test: a human (race 0) male (gender 0) warrior
+        // (class 0) must not carry any of the template's Elin valkyrie identity.
+        var template = LoadStarterTemplateOrSkip();
+        if (template == null) return;
+
+        var identity = new TeraSharp.Arbiter.Persistence.CharacterIdentity
+        {
+            Race = 0, Gender = 0, Class = 0,
+            Appearance = new byte[8],
+            Appearance2 = 0,
+            Details = new byte[32],
+            Shape = new byte[64],
+        };
+        const int playerId = 3, zone = 5;
+        const float x = 16260f, y = 1253f, z = -4410f;
+
+        var blob = TeraSharp.Arbiter.Persistence.StarterBlob.Build(
+            template, playerId, "Rurik", identity, zone, x, y, z);
+
+        Hex.True(BitConverter.ToInt32(blob, 192) == 0, $"race must be 0, got {BitConverter.ToInt32(blob, 192)} (4 = Elin)");
+        Hex.True(BitConverter.ToInt32(blob, 196) == 0, $"gender must be 0, got {BitConverter.ToInt32(blob, 196)}");
+        Hex.True(BitConverter.ToInt32(blob, 200) == 0, $"class must be 0, got {BitConverter.ToInt32(blob, 200)} (12 = valkyrie)");
+        Hex.Eq(blob[288..296], new byte[8], "the template's appearance must be gone");
+        Hex.True(BitConverter.ToUInt32(blob, 296) == 0, "appearance2 must be 0, not the template's 100");
+        Hex.Eq(blob[312..344], new byte[32], "the template's detail sliders must be gone");
+        Hex.Eq(blob[344..408], new byte[64], "the template's shape sliders must be gone");
+
+        // Byte-exact: enumerate every offset that differs from the template and check the set.
+        // x/y/z/zone are the template's own values here, so they do not appear.
+        var changed = Enumerable.Range(0, blob.Length).Where(i => blob[i] != template[i]).ToList();
+        var allowed = new HashSet<int>(PatchedWindows());
+        var unexpected = changed.Where(i => !allowed.Contains(i)).ToList();
+        Hex.True(unexpected.Count == 0,
+            "bytes changed outside the identity/playerId/name/zone/pos windows: ["
+            + string.Join(",", unexpected.Take(24)) + "]");
+
+        // And the fields that must have moved, actually did.
+        foreach (var (from, to, what) in new[] { (192, 204, "race/gender/class"), (288, 300, "appearance+appearance2"),
+                                                 (312, 408, "details+shape"), (112, 116, "playerId") })
+            Hex.True(changed.Any(i => i >= from && i < to), $"{what} did not change at all");
+
+        Hex.Eq(blob[304..308], template[304..308],
+            "the u32 at 304 is AS_ENTER_WORLD payload[72], not part of the identity block");
+        Hex.True(BitConverter.ToUInt32(blob, 304) == 0xFFFFF334,
+            $"304 should still be the capture's 0xFFFFF334, got 0x{BitConverter.ToUInt32(blob, 304):X8}");
+        Hex.True(TeraSharp.Arbiter.Persistence.StarterBlob.ReadName(blob) == "Rurik",
+            "name still lands at 116");
+    }
+
+    [Test] public static void StarterBlob_short_identity_blocks_are_zero_filled()
+    {
+        // A malformed C_CREATE_USER must not leave the template's Elin sliders showing through
+        // the part of the window it did not fill, and must not throw mid-creation.
+        var template = LoadStarterTemplateOrSkip();
+        if (template == null) return;
+
+        var blob = TeraSharp.Arbiter.Persistence.StarterBlob.Build(
+            template, 4, "Stub",
+            new TeraSharp.Arbiter.Persistence.CharacterIdentity
+            {
+                Appearance = new byte[] { 0xAA, 0xBB }, Details = new byte[] { 0xCC }, Shape = Array.Empty<byte>(),
+            },
+            5, 0f, 0f, 0f);
+
+        Hex.Eq(blob[288..296], "AA BB 00 00 00 00 00 00", "appearance: given bytes then zeros");
+        Hex.True(blob[312] == 0xCC && blob[313..344].All(v => v == 0), "details: given byte then zeros");
+        Hex.True(blob[344..408].All(v => v == 0), "shape: all zeros, none of the template's");
+    }
+
+    [Test] public static void CreateUser_blob_carries_the_requested_identity()
+    {
+        // End to end through BuildRecord, which is what OnCreateUser calls.
+        var template = LoadStarterTemplateOrSkip();
+        if (template == null) return;
+
+        var req = new CreateUserRequest
+        {
+            Race = 1, Gender = 0, Class = 5, Name = "Halvar",
+            Appearance = Hex.B("01 02 03 04 05 06 07 08"),
+            Appearance2 = 7,
+            Details = new byte[32], Shape = new byte[64],
+        };
+        var rec = CharacterHandlers.BuildRecord(req, accountId: 1, position: 1, template, playerId: 9);
+        var blob = rec.WorldBlob!;
+
+        Hex.True(BitConverter.ToInt32(blob, 192) == 1, "race reached the blob");
+        Hex.True(BitConverter.ToInt32(blob, 196) == 0, "gender reached the blob");
+        Hex.True(BitConverter.ToInt32(blob, 200) == 5, "class reached the blob");
+        Hex.Eq(blob[288..296], "01 02 03 04 05 06 07 08", "appearance reached the blob");
+        Hex.True(BitConverter.ToUInt32(blob, 296) == 7, "appearance2 reached the blob");
+        Hex.True(BitConverter.ToInt32(blob, 112) == 9, "playerId reached the blob");
+        // The row and the blob must agree, or the lobby shows one character and the world spawns another.
+        Hex.True(rec.Race == BitConverter.ToInt32(blob, 192)
+              && rec.Gender == BitConverter.ToInt32(blob, 196)
+              && rec.Class == BitConverter.ToInt32(blob, 200),
+            "the characters row and the blob must carry the same race/gender/class");
+    }
+
     [Test] public static void StarterBlob_rejects_a_wrong_sized_template()
     {
         bool threw = false;
-        try { TeraSharp.Arbiter.Persistence.StarterBlob.Build(new byte[100], 1, "Ab", 5, 0, 0, 0); }
+        try
+        {
+            TeraSharp.Arbiter.Persistence.StarterBlob.Build(
+                new byte[100], 1, "Ab", new TeraSharp.Arbiter.Persistence.CharacterIdentity(), 5, 0, 0, 0);
+        }
         catch (ArgumentException) { threw = true; }
         Hex.True(threw, "a template that is not 15312 bytes must be rejected");
     }
@@ -2544,8 +2729,8 @@ array items
                 var req = CharacterHandlers.ParseCreateUser(Hex.B(CreateUserPkt35))!;
                 var first = CharacterHandlers.BuildRecord(req, acct.Id, position: 1, template, playerId: 0);
                 int id1 = store.CreateCharacter(first);
-                store.SaveWorldBlob(id1,
-                    TeraSharp.Arbiter.Persistence.StarterBlob.Build(template, id1, req.Name, 5, 16260f, 1253f, -4410f));
+                store.SaveWorldBlob(id1, TeraSharp.Arbiter.Persistence.StarterBlob.Build(
+                    template, id1, req.Name, CharacterHandlers.IdentityOf(req), 5, 16260f, 1253f, -4410f));
 
                 Hex.True(store.CountCharacters(acct.Id) == 1, "one character after create");
                 Hex.True(store.NameExists("Test"), "NameExists must see the new name");
@@ -2563,16 +2748,15 @@ array items
                 Hex.True(duplicateRefused, "duplicate character name must be rejected");
 
                 // A second, differently named character.
-                var second = CharacterHandlers.BuildRecord(
-                    new CreateUserRequest
-                    {
-                        Gender = 0, Race = 0, Class = 1, Name = "Bramwell",
-                        Appearance = new byte[8], Details = new byte[32], Shape = new byte[64],
-                    },
-                    acct.Id, position: 2, template, playerId: 0);
+                var secondReq = new CreateUserRequest
+                {
+                    Gender = 0, Race = 0, Class = 1, Name = "Bramwell",
+                    Appearance = new byte[8], Details = new byte[32], Shape = new byte[64],
+                };
+                var second = CharacterHandlers.BuildRecord(secondReq, acct.Id, position: 2, template, playerId: 0);
                 int id2 = store.CreateCharacter(second);
-                store.SaveWorldBlob(id2,
-                    TeraSharp.Arbiter.Persistence.StarterBlob.Build(template, id2, "Bramwell", 5, 16260f, 1253f, -4410f));
+                store.SaveWorldBlob(id2, TeraSharp.Arbiter.Persistence.StarterBlob.Build(
+                    template, id2, "Bramwell", CharacterHandlers.IdentityOf(secondReq), 5, 16260f, 1253f, -4410f));
 
                 // ... and the list the select screen is built from (S_GET_USER_LIST).
                 var list = store.GetCharacters(acct.Id);

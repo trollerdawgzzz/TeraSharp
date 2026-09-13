@@ -45,6 +45,27 @@ public sealed class AccountRecord
 }
 
 /// <summary>
+/// The appearance/identity block C_CREATE_USER carries, in the shape the world blob wants it.
+/// Race, gender and class decide the model WorldServer spawns; the three byte blocks are the
+/// character-creator sliders. Kept here rather than taking
+/// <c>Handlers.CreateUserRequest</c> directly so Persistence does not depend on Handlers.
+/// </summary>
+public sealed class CharacterIdentity
+{
+    public int Race { get; init; }
+    public int Gender { get; init; }
+    public int Class { get; init; }
+    /// <summary>8-byte "customize" block (blob offset 288).</summary>
+    public byte[] Appearance { get; init; } = new byte[StarterBlob.AppearanceSize];
+    /// <summary>The second appearance word (blob offset 296); 100 in the capture.</summary>
+    public uint Appearance2 { get; init; }
+    /// <summary>32-byte creator detail sliders (blob offset 312).</summary>
+    public byte[] Details { get; init; } = new byte[StarterBlob.DetailsSize];
+    /// <summary>64-byte creator shape sliders (blob offset 344).</summary>
+    public byte[] Shape { get; init; } = new byte[StarterBlob.ShapeSize];
+}
+
+/// <summary>
 /// The 15312-byte WorldServer state struct for a freshly created character.
 ///
 /// Ground truth: <c>data/starter_blob.bin</c> — the blob the real ArbiterServer sent in
@@ -60,6 +81,8 @@ public sealed class AccountRecord
 /// <code>
 ///   112  u32   playerId                       (2 in the template)
 ///   116  wstr  name, UTF-16LE, null-terminated ("Test"; zero up to 116+2*17)
+///   192  u32   race                           (4)
+///   196  u32   gender                         (1)
 ///   200  u32   class                          (12)
 ///   208  u32   hp        100000 in the template, 1915 after the first save — runtime, left alone
 ///   216  u32   mp        100000 in the template
@@ -67,7 +90,18 @@ public sealed class AccountRecord
 ///   224  f32   y                              (1253)
 ///   228  f32   z                              (-4410)
 ///   236  u32   zone                           (5; 9827 after the character walked into Velika)
+///   288  8 B   appearance                     (65 01 07 04 0E 0E 04 00)
+///   296  u32   appearance2                    (100)
+///   304  u32   NOT ours                       (0xFFFFF334; AS_ENTER_WORLD copies it to [72])
+///   312  32 B  details                        (creator sliders)
+///   344  64 B  shape                          (creator sliders)
 /// </code>
+///
+/// The seven identity fields (192/196/200/288/296/312/344) are exactly the values
+/// C_CREATE_USER carried for "Test" — verified field by field against
+/// <c>cap_newchar_client.log</c> packet 35, so a blob built from that packet's request must
+/// come back byte-identical to this template. Leaving them at the template's values is what
+/// made every new character spawn as an Elin valkyrie regardless of what the player picked.
 ///
 /// NOTE: <c>status/HANDOFF.md</c> and the T6/T8 task notes say the zone is "u32 at 208".
 /// It is not — 208 is hp. The zone is the u32 at 236. Verified three ways in
@@ -90,6 +124,21 @@ public static class StarterBlob
     public const int YOffset = 224;
     public const int ZOffset = 228;
     public const int ZoneOffset = 236;
+
+    // --- identity block (T12) ---
+    public const int RaceOffset = 192;
+    public const int GenderOffset = 196;
+    public const int ClassOffset = 200;
+    public const int AppearanceOffset = 288;   public const int AppearanceSize = 8;
+    public const int Appearance2Offset = 296;
+    public const int DetailsOffset = 312;      public const int DetailsSize = 32;
+    public const int ShapeOffset = 344;        public const int ShapeSize = 64;
+    /// <summary>
+    /// Between <see cref="Appearance2Offset"/> and <see cref="DetailsOffset"/> and NOT ours:
+    /// <c>WorldEntry</c> copies this u32 into <c>AS_ENTER_WORLD</c> payload[72]. Listed as a
+    /// constant only so the tests can assert we leave it alone.
+    /// </summary>
+    public const int EnterWorldParamOffset = 304;
     /// <summary>Smallest blob that carries a complete position block (<see cref="ZoneOffset"/> + 4).</summary>
     public const int PositionBlockEnd = ZoneOffset + 4;
 
@@ -152,12 +201,16 @@ public static class StarterBlob
     }
 
     /// <summary>
-    /// Copy the template and patch in the per-character fields. Pure — every other byte of
-    /// the 15312 is left exactly as the real ArbiterServer sent it.
+    /// Copy the template and patch in the per-character fields: identity (race/gender/class and
+    /// the three creator blocks), playerId, name, and the start position. Pure — every other
+    /// byte of the 15312 is left exactly as the real ArbiterServer sent it, including the u32 at
+    /// <see cref="EnterWorldParamOffset"/>.
     /// </summary>
-    public static byte[] Build(byte[] template, int playerId, string name, int zone, float x, float y, float z)
+    public static byte[] Build(byte[] template, int playerId, string name, CharacterIdentity identity,
+                               int zone, float x, float y, float z)
     {
         ArgumentNullException.ThrowIfNull(template);
+        ArgumentNullException.ThrowIfNull(identity);
         if (template.Length != Size)
             throw new ArgumentException($"template must be {Size} bytes, got {template.Length}", nameof(template));
         name ??= "";
@@ -173,12 +226,35 @@ public static class StarterBlob
         for (int i = 0; i < name.Length; i++)
             BitConverter.TryWriteBytes(blob.AsSpan(NameOffset + i * 2, 2), (ushort)name[i]);
 
+        // Identity. Without this every character wears the template's body: the capture is an
+        // Elin (race 4) female (gender 1) valkyrie (class 12), so a human warrior spawned as one.
+        BitConverter.TryWriteBytes(blob.AsSpan(RaceOffset, 4), identity.Race);
+        BitConverter.TryWriteBytes(blob.AsSpan(GenderOffset, 4), identity.Gender);
+        BitConverter.TryWriteBytes(blob.AsSpan(ClassOffset, 4), identity.Class);
+        BitConverter.TryWriteBytes(blob.AsSpan(Appearance2Offset, 4), identity.Appearance2);
+        PatchBlock(blob, AppearanceOffset, AppearanceSize, identity.Appearance);
+        PatchBlock(blob, DetailsOffset, DetailsSize, identity.Details);
+        PatchBlock(blob, ShapeOffset, ShapeSize, identity.Shape);
+
         BitConverter.TryWriteBytes(blob.AsSpan(XOffset, 4), x);
         BitConverter.TryWriteBytes(blob.AsSpan(YOffset, 4), y);
         BitConverter.TryWriteBytes(blob.AsSpan(ZOffset, 4), z);
         BitConverter.TryWriteBytes(blob.AsSpan(ZoneOffset, 4), zone);
 
         return blob;
+    }
+
+    /// <summary>
+    /// Overwrite a fixed-size window with <paramref name="src"/>, zero-filling the remainder.
+    /// The parser already pads every block to its struct size, so a short source only happens on
+    /// a malformed request; zero-filling keeps the template's Elin sliders from showing through
+    /// the gap, and never throws in the middle of character creation.
+    /// </summary>
+    private static void PatchBlock(byte[] blob, int offset, int size, byte[]? src)
+    {
+        Array.Clear(blob, offset, size);
+        if (src != null && src.Length > 0)
+            Array.Copy(src, 0, blob, offset, Math.Min(src.Length, size));
     }
 
     /// <summary>Read back the name written at <see cref="NameOffset"/> (used by tests and logging).</summary>
