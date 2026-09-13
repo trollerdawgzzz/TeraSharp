@@ -35,30 +35,45 @@ tests). Therefore:
 ### Live-verified truths (supersede everything below; do not "fix" these)
 - **Login works end-to-end** against the real WorldServer: character spawns in Velika with real NPCs, and the
   world blob persists across logins (SQLite). Verified live.
+- **The WorldServer decompile is now on disk** at `D:\v100\TERA_SERVER.100\world_decompiled\WorldServer.exe.c`
+  (ONE 125 MB file). NEVER open it whole (`cat`/Get-Content -Raw will hang). Use targeted line reads with a
+  StreamReader or `Select-String -SimpleMatch <name>` to get line numbers, then read a small window. This is
+  the authority for anything World does (enter, leave, spawn, DB-proxy expectations) — `Arb_part_*.c` is the
+  Arbiter only.
+- **Logout / Switch-Characters is FIXED (root cause found in the World decompile).** World's
+  `Handler_AS_LEAVE_WORLD` looks up the user by (worldId, playerId); if the user is already gone it logs
+  `Critical Error LeaveWorld planet[..] user[..] type[..] reason[..]` and the process dies. We were sending
+  `AS_LEAVE_WORLD` **twice**: once from the button (`CompleteLeaveToWorld`) and again when the socket closed
+  (`LeaveWorld`/`Close`). The first leave despawned the player; the second hit World after despawn -> crash.
+  Fix: a single `_leaveFinished` gate (`Interlocked.CompareExchange`) shared by the button path
+  (`OnWorldLeaveConfirmed`) and the disconnect path (`LeaveWorld`) so `AS_LEAVE_WORLD` is sent exactly once.
+- **`AS_LEAVE_WORLD` (0x1392) is (type=1, reason=8) for lobby AND exit AND disconnect.** The capture's working
+  leave frame is `1A 00 00 00 92 13 | gameId(8) | 01 00 00 00 | 08 00 00 00 | 01 00 00 00` = type 1, reason 8,
+  playerId 1. The decompile's OnLeaveWorldTick shows a (3,0) lobby branch, but that path is for a different
+  state; the packet World actually accepts on the wire is (1,8). `LeaveValues` returns (1,8) for every mode.
+  The 3 lobby unit tests that still expect (3,0) must be updated to (1,8).
 - **The ~40 login-time `SDB_*` are served by the replay table**, NOT by synthetic builders. A session replaced
   them with hand-built "empty list" replies; that DESYNCED World (`SDB_USER_LOAD_INVENTORY` 0x27A2 returns a
   3235-byte item list, not an empty list) and hung login. `DbProxyHandlers.TryHandle` now intercepts ONLY:
   enter-world (0x2711), update-user-data (0x27CB), and the logout saves (0x27FA/0x2924/0x2768/0x2936/0x2897);
-  everything else falls through to replay. **Do not route login-time SDB_* back through DbProxy.** The synthetic
-  builders remain in the file only for their unit tests.
-- **Lobby-return / exit leave values are (type=1, reason=8)** — the same as disconnect. The decompile suggested
-  (3,0) for lobby, but (3,0) makes World ack with 0x13AA and never run the save; (1,8) drives the full
-  save + `SA_LEAVE_WORLD`. WorldServer confirms `LeaveWorldStart ... LeaveWorldType[1] LogoutReason[8]`. The
-  `LeaveValues` table and its test still say lobby=(3,0) and must be updated to (1,8) — that mismatch is a
-  known open item (see below).
+  everything else falls through to replay. **Do not route login-time SDB_* back through DbProxy.**
 - **Single-player tunnel fast path is in `WorldBridge.HandleFrame`:** with exactly one registered session the
   tunnel ignores the routing key and uses one shared reorder queue (the broadcast behavior that worked for
   login and logout). The per-key routing a session added stalled the logout despawn burst. Multi-player routing
   stays deferred until a real two-login capture exists.
 
-### Known open items (human will handle the live ones)
-- `LeaveValues(LeaveMode.Lobby)` should return (1,8), not (3,0); update the value and the
-  `LeaveWorld_Lobby_uses_type3_reason0` test to match (rename to reflect (1,8)). This is a pure-logic change —
-  Cowork may make it.
-- The test project was renamed to `Program.cs.bak` at one point to unblock a server-only build, then restored.
-  Ensure `src/TeraSharp.Arbiter.Tests/Program.cs` is the live one and the solution builds with it.
-- Live logout end-to-end (save + `0x1393`→`0x1433` + spawn-where-you-logged-out) is being verified by the
-  human right now; treat its result as authoritative over any test.
+### Repo is under git — use it every session
+`git init` done; commits exist. **Start each session with `git status` (should be clean) and `git log --oneline -3`.**
+Work only in `D:\v100\TERA_SERVER.100\TeraSharp`. When you finish, the human reviews `git diff` and commits
+(good) or `git checkout -- <file>` (bad). This is the safety net after three sessions where cloud-workspace
+edits failed to reach D:. Prove your writes landed with `git status` before claiming a task done.
+
+### Known open items
+- Update the 3 failing lobby `LeaveValues` tests to expect (1,8) (pure test change — Cowork may do it).
+- Live logout end-to-end (single leave -> save -> `0x1393`->`0x1433` -> spawn-where-you-logged-out, and NO
+  `Critical Error` in the WorldServer console) is being verified by the human now; its result is authoritative.
+- Log level is currently `Trace` in Program.cs for tunnel debugging — turn back to `Debug` once logout is
+  confirmed (that's a Program.cs change, human-owned).
 
 ---
 

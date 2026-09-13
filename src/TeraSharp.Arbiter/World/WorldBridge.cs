@@ -41,7 +41,7 @@ internal sealed class TunnelReorderBuffer
 /// sessions and round-robins tunnel packets across them; each 0x13F7 frame
 /// carries a sequence number (payload[30..31] >> 3) so we can reorder.
 ///
-///   Frame: [u32 totalLength][u16 opcode][payload]   ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â plaintext.
+///   Frame: [u32 totalLength][u16 opcode][payload]   ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â plaintext.
 ///
 /// Tunnel routing: each player gets a unique tunnel key (allocated by
 /// <see cref="AllocateTunnelKey"/>). The key is sent to World in AS_ENTER_WORLD
@@ -106,7 +106,7 @@ public sealed class WorldBridge
     private readonly object _playersLock = new();
 
     /// <summary>Allocate a unique tunnel key for a new player session.</summary>
-    internal uint AllocateTunnelKey() { lock (_reorderLock) return _nextTunnelKey++; }
+    internal uint AllocateTunnelKey() { lock (_reorderLock) return 5; }  // single-player: always slot 5 (what World's handshake wires). Multi-player revisits this with the 2-login capture.
 
     public void RegisterPlayer(GameSession s)
     {
@@ -169,7 +169,7 @@ public sealed class WorldBridge
     /// Deliver a reordered client packet to the session that owns the given tunnel key.
     /// Falls back to broadcasting to all registered sessions when the key is unknown
     /// (e.g. World sends a packet before we've registered the player, or uses a key
-    /// we don't recognise yet ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â the two-login capture will clarify).
+    /// we don't recognise yet ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â the two-login capture will clarify).
     /// </summary>
     internal void RouteToClient(uint key, byte[] packet)
     {
@@ -184,7 +184,7 @@ public sealed class WorldBridge
             deliver(packet);
             return;
         }
-        // Broadcast fallback: unknown key ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ send to all registered sessions.
+        // Broadcast fallback: unknown key ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ send to all registered sessions.
         List<Action<byte[]>> all;
         lock (_reorderLock)
             all = _tunnels.Values
@@ -192,7 +192,7 @@ public sealed class WorldBridge
                 .Select(t => t.Deliver!)
                 .ToList();
         if (all.Count > 0)
-            _log.LogDebug("Tunnel key {Key} unknown ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â broadcasting to {N} session(s)", key, all.Count);
+            _log.LogDebug("Tunnel key {Key} unknown ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â broadcasting to {N} session(s)", key, all.Count);
         foreach (var d in all) d(packet);
     }
 
@@ -324,7 +324,7 @@ public sealed class WorldBridge
                 if (deliver != null)
                     foreach (var (k, p) in deliver) RouteToClient(k, p);
                 else
-                    RouteToClient(key, clientPkt); // unknown key ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â broadcast immediately
+                    RouteToClient(key, clientPkt); // unknown key ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â broadcast immediately
                 return;
             }
 
@@ -340,7 +340,7 @@ public sealed class WorldBridge
                 if (responses.Count == 0) { _log.LogDebug("  no replay for 0x{Op:X4}", op); }
                 foreach (var (rop, rbody) in responses)
                 {
-                    // DBS_UPDATE_USER_DATA (0x27CC) must never come from replay ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â it carries
+                    // DBS_UPDATE_USER_DATA (0x27CC) must never come from replay ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â it carries
                     // a reqId that only makes sense for the live request. DbProxy handles it.
                     if (rop == DbProxyHandlers.DBS_UPDATE_USER_DATA)
                     {
@@ -458,10 +458,13 @@ public sealed class WorldBridge
     /// <summary>AS_ARBITER_USER_DELETE (0x1433) payload: [u64 gameId][u64 gameId] (FUN_140832f20).</summary>
     public static byte[] BuildArbiterUserDeletePayload(ulong gameId)
     {
-        var masked = gameId & 0x7FFFFFFFFFFFFFFFUL;
+        // World looks up the user by this gameId (Handler_AS_ARBITER_USER_DELETE reads it at
+        // frame+6). It must match the gameId form World stored at enter (AS_ENTER_WORLD [24],
+        // which we send UNMASKED). Masking the high bit here made the lookup miss -> no delete
+        // -> character stuck -> relog hangs. Send it unmasked to match enter.
         var p = new byte[16];
-        BitConverter.GetBytes(masked).CopyTo(p, 0);
-        BitConverter.GetBytes(masked).CopyTo(p, 8);
+        BitConverter.GetBytes(gameId).CopyTo(p, 0);
+        BitConverter.GetBytes(gameId).CopyTo(p, 8);
         return p;
     }
 

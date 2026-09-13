@@ -99,20 +99,31 @@ public sealed class GameSession : IDisposable
         {
             if (!t.IsCanceled)
             {
-                _log.LogWarning("Session {Id}: SA_LEAVE_WORLD not received in 5s - releasing client", Id);
-                OnWorldLeaveConfirmed();
+                _log.LogWarning("Session {Id}: SA_LEAVE_WORLD not received in 5s - forcing delete", Id);
+                OnWorldLeaveConfirmed(worldConfirmed: false);
             }
         }, TaskScheduler.Default);
     }
 
     /// <summary>World confirmed the leave (SA_LEAVE_WORLD). Tear down the tunnel and release
     /// the client back to character select / exit. Idempotent.</summary>
-    public void OnWorldLeaveConfirmed()
+    public void OnWorldLeaveConfirmed(bool worldConfirmed = true)
     {
         if (Interlocked.Exchange(ref _leaveFinished, 1) == 1) return;
         _leaveFallback?.Cancel();
         var w = Program.World;
-        if (w != null) w.UnregisterPlayer(GameId, TunnelKey);
+        if (w != null)
+        {
+            // If World never sent SA_LEAVE_WORLD (fallback path), it despawned the player but
+            // never deleted the user from its map -> next login for this character hangs. Force
+            // the delete so World releases the character. Harmless if World already deleted it.
+            if (!worldConfirmed)
+            {
+                w.SendFrame(WorldBridge.OpArbiterUserDelete, WorldBridge.BuildArbiterUserDeletePayload(GameId));
+                _log.LogWarning("Session {Id}: forcing AS_ARBITER_USER_DELETE (World never sent SA_LEAVE_WORLD)", Id);
+            }
+            w.UnregisterPlayer(GameId, TunnelKey);
+        }
         InWorld = false;
         FinishLeaveToClient();
     }
