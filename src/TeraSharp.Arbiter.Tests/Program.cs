@@ -2007,4 +2007,328 @@ array items
         }
         finally { File.Delete(path); }
     }
+
+    // ================================================================================
+    // T3 - DBS_USER_RESTRICTION (0x2830), sent right after DBS_USER_ENTERWORLD
+    //
+    // Ground truth: D:\packetlogs\lobby_tap.log packet 131, A->W, 02:51:10.552Z, 22-byte frame:
+    //   16 00 00 00  30 28 | 16 00 00 00  00 00 00 00  01 00 f0 0a 00 80 00 00
+    //                        listOff=22    count=0      gameId 0x80000AF00001
+    // listOff = 22 = the whole frame length, i.e. an empty list parked at the end. The handler
+    // lives in DbProxyHandlers.OnUserEnterWorld; this pins the bytes it sends.
+    // ================================================================================
+
+    [Test]
+    public static void BuildDbsUserRestriction_matches_capture_packet_131()
+    {
+        Hex.Eq(DbProxyHandlers.BuildDbsUserRestriction(0x80000AF00001UL),
+            "16 00 00 00  00 00 00 00  01 00 F0 0A 00 80 00 00",
+            "0x2830 payload, lobby_tap.log packet 131");
+    }
+
+    [Test]
+    public static void BuildDbsUserRestriction_carries_the_live_gameId()
+    {
+        // The gameId is 0x80000AF00000 | characterId, unmasked - the same value AS_ENTER_WORLD
+        // carries. A captured gameId here would point World at the wrong user, so it must track
+        // the character the reply is for.
+        var p = DbProxyHandlers.BuildDbsUserRestriction(0x80000AF00007UL);
+        Hex.True(BitConverter.ToUInt64(p, 8) == 0x80000AF00007UL,
+            $"gameId at payload[8], got 0x{BitConverter.ToUInt64(p, 8):X}");
+        Hex.True(BitConverter.ToUInt32(p, 0) == 22, "listOff must be 22 (frame length, empty list)");
+        Hex.True(BitConverter.ToUInt32(p, 4) == 0, "list count must be 0");
+        Hex.True(p.Length == 16, $"payload must be 16 B (22-byte frame), got {p.Length}");
+    }
+
+    // ================================================================================
+    // T4 - 0x2869 also pushes AS_REQUEST_DUNGEON_PHASE_USER_RESET (0x15E0)
+    //
+    // Ground truth: D:\packetlogs\lobby_tap.log 02:51:10.705-.709, packets 172/173/174 -
+    // one W->A request answered by TWO A->W frames, the push first:
+    //   172 W->A 0x2869  15 00 00 00  01 00 00 00
+    //   173 A->W 0x15E0  01 00 00 00  00 00 00 00  9e 0f a6 6a 00 00 00 00
+    //   174 A->W 0x286A  1b 00 00 00  00 00 00 00  01  15 00 00 00  9e 0f a6 6a 00 00 00 00
+    // 0x6AA60F9E = 1789267870 = 2026-09-13T02:51:10Z: plain unix seconds, equal to the capture
+    // wall clock, and IDENTICAL in both frames because Handler_SDB_LOAD_DUNGEON_PHASE_LEVEL
+    // (FUN_14074df40 -> FUN_1407168f0 -> CheckAndResetDungeonPhaseUser FUN_14070d430) writes the
+    // reset time, sends 0x15E0 with it, and then reads it straight back for the 0x286A trailer.
+    // ================================================================================
+
+    static readonly byte[] Cap2869Req = Hex.B("15 00 00 00  01 00 00 00");
+    const ulong CapResetTime = 0x6AA60F9EUL;
+
+    [Test]
+    public static void Handler_2869_pushes_15E0_before_286A()
+    {
+        var frames = RunHandler(DbProxyHandlers.SDB_LOAD_2869, Cap2869Req, 2);
+        Hex.True(frames.Count == 2, $"expected 2 frames (0x15E0 then 0x286A), got {frames.Count}");
+        Hex.True(frames[0].op == DbProxyHandlers.AS_REQUEST_DUNGEON_PHASE_USER_RESET,
+            $"first frame must be the 0x15E0 push, got 0x{frames[0].op:X4}");
+        Hex.True(frames[1].op == DbProxyHandlers.DBS_LOAD_DUNGEON_PHASE_LEVEL,
+            $"second frame must be 0x286A, got 0x{frames[1].op:X4}");
+        Hex.True(frames[0].body.Length == 16, $"0x15E0 payload must be 16 B, got {frames[0].body.Length}");
+        Hex.True(frames[1].body.Length == 21, $"0x286A payload must be 21 B, got {frames[1].body.Length}");
+
+        // playerId comes from request payload[4]; continentId is 0 (the (DateTime) overload).
+        Hex.Eq(frames[0].body.Take(8).ToArray(), "01 00 00 00  00 00 00 00",
+            "0x15E0 = [u32 playerId][u32 continentId=0]");
+        Hex.Eq(frames[1].body.Take(13).ToArray(), "1B 00 00 00  00 00 00 00  01  15 00 00 00",
+            "0x286A = [u32 listOff=27][u32 count=0][u8 ok=1][u32 reqId]");
+
+        // The whole point: one reset time, written into both frames.
+        ulong pushTime = BitConverter.ToUInt64(frames[0].body, 8);
+        ulong replyTime = BitConverter.ToUInt64(frames[1].body, 13);
+        Hex.True(pushTime == replyTime,
+            $"0x15E0 and 0x286A must carry the SAME reset time, got {pushTime} and {replyTime}");
+        Hex.True(pushTime != 0, "the reset time must be live, not the 0 the old builder wrote");
+        ulong now = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        Hex.True(pushTime > CapResetTime - 86400 && pushTime <= now + 5,
+            $"reset time {pushTime} is not plausible unix seconds (capture used {CapResetTime})");
+    }
+
+    [Test]
+    public static void Build15E0_matches_capture_packet_173()
+    {
+        Hex.Eq(DbProxyHandlers.Build15E0(1, CapResetTime),
+            "01 00 00 00  00 00 00 00  9E 0F A6 6A 00 00 00 00",
+            "0x15E0 payload, lobby_tap.log packet 173");
+    }
+
+    [Test]
+    public static void Build286A_matches_capture_packet_174()
+    {
+        Hex.Eq(DbProxyHandlers.Build286A_EmptyListTimestamp(Cap2869Req, CapResetTime),
+            "1B 00 00 00  00 00 00 00  01  15 00 00 00  9E 0F A6 6A 00 00 00 00",
+            "0x286A payload, lobby_tap.log packet 174");
+    }
+
+    [Test]
+    public static void Handler_2869_echoes_live_reqId_not_capture()
+    {
+        var frames = RunHandler(DbProxyHandlers.SDB_LOAD_2869, WithLiveId(Cap2869Req, 0, 0x0BAD), 2);
+        uint echoed = BitConverter.ToUInt32(frames[1].body, 9);
+        Hex.True(echoed == 0x0BAD, $"0x286A must echo the LIVE DLM id, carried 0x{echoed:X}");
+        Hex.True(echoed != 0x15, "must not carry the captured id 0x15");
+    }
+
+    // ================================================================================
+    // T5 - WorldReplayTable.OneWayFromWorld: opcodes that must never become request entries
+    //
+    // A replayed DBS_* attributed to the wrong request goes out with the CAPTURED DLM id,
+    // DLMExistManager::Find misses, the item never completes, and every later per-user DB
+    // message for that user waits forever (status/HANDOFF.md section 1).
+    // ================================================================================
+
+    [Test]
+    public static void Replay_one_way_set_is_the_documented_list()
+    {
+        ushort[] expected =
+        {
+            0x1436, 0x15A8, 0x159A, 0x2958, 0x13FA, 0x13CC, 0x1626, 0x1441,
+            0x143F, 0x15B5, 0x13AA, 0x13F2, 0x13E5, 0x164D, 0x293E,
+        };
+        foreach (var op in expected)
+            Hex.True(WorldReplayTable.OneWayFromWorld.Contains(op),
+                $"0x{op:X4} must be in OneWayFromWorld");
+        Hex.True(WorldReplayTable.OneWayFromWorld.Count == expected.Length,
+            $"OneWayFromWorld has {WorldReplayTable.OneWayFromWorld.Count} entries, expected {expected.Length}");
+        // The tunnel interleaves constantly; sealing on it would break every attribution.
+        Hex.True(!WorldReplayTable.OneWayFromWorld.Contains(WorldBridge.OpTunnelToClient),
+            "SA_BYPASS_TO_CLIENT (0x13F7) must NOT be in the set");
+    }
+
+    [Test]
+    public static void Replay_one_way_opcodes_never_become_request_entries()
+    {
+        // Every one-way opcode, each immediately followed by an Arbiter frame that carries a DLM
+        // id. None of them may end up with an entry, with or without a live request supplied.
+        var frames = new List<(bool, byte[])>();
+        foreach (var op in WorldReplayTable.OneWayFromWorld)
+        {
+            frames.Add((true, Frame(op, Hex.B("01 00 00 00  00 00 00 00"))));
+            frames.Add((false, Frame(0x290D, Hex.B("01 3E 00 00 00"))));
+        }
+        var path = WriteTapLog(frames.ToArray());
+        try
+        {
+            var table = WorldReplayTable.Load(path, QuietLog());
+            foreach (var op in WorldReplayTable.OneWayFromWorld)
+            {
+                Hex.True(table.GetResponses(op).Count == 0,
+                    $"0x{op:X4} must never become a request entry");
+                Hex.True(table.GetResponses(op, Hex.B("01 00 00 00")).Count == 0,
+                    $"0x{op:X4} must have no entry with a live request either");
+            }
+        }
+        finally { File.Delete(path); }
+    }
+
+    [Test]
+    public static void Replay_one_way_opcode_seals_the_pending_request()
+    {
+        // 0x15A8 (a periodic broadcast) arriving between a real request and a later Arbiter frame
+        // must SEAL the request, or that frame is attributed backwards to it. In arb_world.log
+        // this is how 0x27B3 inherited 0x15FB, 0x1449 and 0x14FF AS_USER_REQUEST_EXIT.
+        var path = WriteTapLog(
+            (true,  Cap27A2Req),
+            (true,  Frame(0x15A8, Hex.B("00 00 00 00"))),
+            (false, Frame(0x290D, Hex.B("01 3E 00 00 00"))));
+        try
+        {
+            var table = WorldReplayTable.Load(path, QuietLog());
+            Hex.True(table.GetResponses(0x15A8).Count == 0, "0x15A8 has no entry of its own");
+            Hex.True(table.GetResponses(0x27A2).Count == 0,
+                "the pending 0x27A2 was sealed by the 0x15A8, so the following frame must not be "
+                + "attributed to it");
+        }
+        finally { File.Delete(path); }
+    }
+
+    [Test]
+    public static void Replay_heartbeats_seal_but_the_tunnel_does_not()
+    {
+        // 0x13F2 / 0x13E5 are periodic heartbeats and now seal. SA_BYPASS_TO_CLIENT does not:
+        // it interleaves with everything, and a genuine reply after one must still be mapped.
+        var sealedPath = WriteTapLog(
+            (true,  Cap27A2Req),
+            (true,  Frame(0x13F2, Hex.B("00 00 00 00"))),
+            (false, Cap27A3Rsp));
+        try
+        {
+            var table = WorldReplayTable.Load(sealedPath, QuietLog());
+            Hex.True(table.GetResponses(0x27A2).Count == 0, "a heartbeat seals the pending request");
+        }
+        finally { File.Delete(sealedPath); }
+
+        var tunnelPath = WriteTapLog(
+            (true,  Cap27A2Req),
+            (true,  Frame(WorldBridge.OpTunnelToClient, new byte[32])),
+            (false, Cap27A3Rsp));
+        try
+        {
+            var table = WorldReplayTable.Load(tunnelPath, QuietLog());
+            Hex.True(table.GetResponses(0x27A2).Count == 1,
+                "the tunnel must not seal - the 0x27A3 reply after it is still the reply to 0x27A2");
+        }
+        finally { File.Delete(tunnelPath); }
+    }
+
+    /// <summary>Wraps a payload in the [u32 len][u16 op] Arbiter&lt;-&gt;World frame header.</summary>
+    static byte[] Frame(ushort op, byte[] payload)
+    {
+        var f = new byte[6 + payload.Length];
+        BitConverter.GetBytes(f.Length).CopyTo(f, 0);
+        BitConverter.GetBytes(op).CopyTo(f, 4);
+        payload.CopyTo(f, 6);
+        return f;
+    }
+
+    // ================================================================================
+    // T2 - DbProxyOpcodeNames: opcode -> name table for 0x2700-0x29FF
+    // Generated from the opcode->name switch in FUN_140146f50, WorldServer.exe.c
+    // lines 244861-253069. Pure logging data; nothing on the wire depends on it.
+    // ================================================================================
+
+    [Test]
+    public static void OpcodeNames_table_covers_the_whole_dbproxy_range()
+    {
+        Hex.True(DbProxyOpcodeNames.Count == 712,
+            $"expected 712 entries extracted from WorldServer.exe.c, got {DbProxyOpcodeNames.Count}");
+        // Nothing outside 0x2700-0x29FF may be in this table - AS_/SA_ opcodes below 0x2700 are
+        // named by D:\packetlogs\world_opcodes.txt instead.
+        Hex.True(DbProxyOpcodeNames.Name(0x1392) == null, "0x1392 AS_LEAVE_WORLD is out of range");
+        Hex.True(DbProxyOpcodeNames.Name(0x26FF) == null, "0x26FF is below the range");
+        Hex.True(DbProxyOpcodeNames.Name(0x2A00) == null, "0x2A00 is above the range");
+    }
+
+    [Test]
+    public static void OpcodeNames_match_the_decompile_for_known_opcodes()
+    {
+        // Spot checks straight out of the case table. The first four are the ones the notes
+        // and CLAUDE.md already name, so they pin the extraction to known-good ground truth.
+        AssertName(0x2711, "SDB_USER_ENTERWORLD");
+        AssertName(0x2738, "DBS_USER_ENTERWORLD");
+        AssertName(0x27CB, "SDB_UPDATE_USER_DATA");
+        AssertName(0x27CC, "DBS_UPDATE_USER_DATA");
+        AssertName(0x2830, "DBS_USER_RESTRICTION");
+        AssertName(0x2897, "SDB_UPDATE_DAILY_QUEST_COMPLETE_COUNT");
+        AssertName(0x2898, "DBS_UPDATE_DAILY_QUEST_COMPLETE_COUNT");
+        AssertName(0x2899, "SDB_UPDATE_DAILY_QUEST_SEED");
+        AssertName(0x289A, "DBS_UPDATE_DAILY_QUEST_SEED");
+        AssertName(0x2869, "SDB_LOAD_DUNGEON_PHASE_LEVEL");
+        AssertName(0x286A, "DBS_LOAD_DUNGEON_PHASE_LEVEL");
+        // Not an SDB_/DBS_ pair: the DB-proxy path pushes this one during the 0x290C step,
+        // which is why the table keeps non-DB names in range.
+        AssertName(0x2847, "AS_LOAD_POCKET_NAME_INFO");
+    }
+
+    [Test]
+    public static void OpcodeNames_cover_every_opcode_DbProxyHandlers_handles_in_range()
+    {
+        // Every request opcode in the TryHandle allow-list that falls in 0x2700-0x29FF, plus the
+        // reply opcode it sends. A miss here means the table was regenerated from the wrong
+        // window of the decompile.
+        ushort[] ops =
+        {
+            0x2711, 0x2738, 0x27CB, 0x27CC, 0x272C, 0x272D,
+            0x27FA, 0x27FB, 0x2924, 0x2925, 0x2768, 0x2769, 0x2936, 0x2937,
+            0x2897, 0x2898, 0x2899, 0x289A,
+            0x2910, 0x2911, 0x290C, 0x290D, 0x27B9, 0x27BA,
+            0x2736, 0x2737, 0x2930, 0x2931, 0x27B3, 0x27B4,
+        };
+        foreach (var op in ops)
+            Hex.True(DbProxyOpcodeNames.Name(op) != null, $"no name for handled opcode 0x{op:X4}");
+    }
+
+    [Test]
+    public static void OpcodeNames_Describe_formats_known_and_unknown()
+    {
+        Hex.True(DbProxyOpcodeNames.Describe(0x2711) == "0x2711 SDB_USER_ENTERWORLD",
+            $"got '{DbProxyOpcodeNames.Describe(0x2711)}'");
+        Hex.True(DbProxyOpcodeNames.Describe(0x1392) == "0x1392",
+            $"unknown opcodes describe as bare hex, got '{DbProxyOpcodeNames.Describe(0x1392)}'");
+    }
+
+    [Test]
+    public static void OpcodeNames_agree_with_data_dbproxy_opcodes_txt()
+    {
+        // The committed data/dbproxy_opcodes.txt and the compiled table are generated from the
+        // same extraction; this keeps them from drifting. Skipped (with a note) when the test
+        // runs somewhere the repo root is not above the binary, e.g. from a publish folder.
+        var path = FindRepoFile(Path.Combine("data", "dbproxy_opcodes.txt"));
+        if (path == null) { Console.WriteLine("        (skipped: data/dbproxy_opcodes.txt not found)"); return; }
+
+        int n = 0;
+        foreach (var raw in File.ReadAllLines(path))
+        {
+            var line = raw.Trim();
+            if (line.Length == 0 || line.StartsWith("#")) continue;
+            int bar = line.IndexOf('|');
+            Hex.True(bar > 0, $"malformed line '{line}'");
+            ushort op = Convert.ToUInt16(line[..bar], 16);
+            string name = line[(bar + 1)..];
+            Hex.True(DbProxyOpcodeNames.Name(op) == name,
+                $"0x{op:X4}: file says '{name}', table says '{DbProxyOpcodeNames.Name(op)}'");
+            n++;
+        }
+        Hex.True(n == DbProxyOpcodeNames.Count, $"file has {n} entries, table has {DbProxyOpcodeNames.Count}");
+    }
+
+    static void AssertName(ushort op, string expected)
+    {
+        var actual = DbProxyOpcodeNames.Name(op);
+        Hex.True(actual == expected, $"0x{op:X4}: expected '{expected}', got '{actual ?? "<null>"}'");
+    }
+
+    /// <summary>Walks up from the test binary looking for a repo-relative file; null if not found.</summary>
+    static string? FindRepoFile(string relative)
+    {
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        for (int i = 0; i < 8 && dir != null; i++, dir = dir.Parent)
+        {
+            var candidate = Path.Combine(dir.FullName, relative);
+            if (File.Exists(candidate)) return candidate;
+        }
+        return null;
+    }
 }

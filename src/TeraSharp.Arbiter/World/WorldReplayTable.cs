@@ -32,6 +32,53 @@ public sealed class WorldReplayTable
     public byte[]? PlayerEnterBody { get; private set; }
     public byte[]? CharacterDataBody { get; private set; }
 
+    /// <summary>
+    /// World opcodes that are one-way pushes or answers to Arbiter-initiated messages, never
+    /// requests. A frame in this set must NEVER become a request entry, and must SEAL whatever
+    /// request is pending, so a later Arbiter frame cannot be attributed backwards across it.
+    ///
+    /// Why this matters: a replayed DBS_* attributed to the wrong request goes out carrying the
+    /// CAPTURED DLM id. DLMExistManager::Find then misses, the item never calls CompleteMyself,
+    /// and every later per-user DB message for that user - including UserLeaveWorld, the only
+    /// thing that emits SA_LEAVE_WORLD - waits forever (status/HANDOFF.md section 1).
+    /// That is exactly what 0x143F -> 0x290D did.
+    ///
+    /// Measured against D:\packetlogs\arb_world.log (the file the table is loaded from): this set
+    /// removes 8 request entries that had ZERO responses - 0x13AA 0x13CC 0x13FA 0x1436 0x15A8
+    /// 0x15B5 0x1626 0x164D, pure "no replay for" noise - and strips three frames that the
+    /// heartbeats had let 0x27B3 inherit (0x15FB, 0x1449 and, worst, 0x14FF AS_USER_REQUEST_EXIT).
+    /// No legitimate request -> response mapping is lost.
+    ///
+    /// Names from D:\packetlogs\world_opcodes.txt and the opcode switch in WorldServer.exe.c.
+    /// SA_BYPASS_TO_CLIENT (0x13F7) is deliberately NOT here: it is the tunnel, it interleaves
+    /// constantly, and sealing on it would break every attribution.
+    /// </summary>
+    public static readonly IReadOnlySet<ushort> OneWayFromWorld = new HashSet<ushort>
+    {
+        0x1436, // SA_BROADCAST_SYSTEM_MESSAGE_TO_WHOLE_WORLD
+        0x15A8, // SA_BROADCAST_FLOATING_CASTLE_NAMEPLATE
+        0x159A, // SA_UPDATE_EVENT_MATCHING_ADD_REWARD_RESETTIME
+        0x2958, // SDB_CHANGE_CITY_WAR_STATE   - see the note below
+        0x13FA, // SA_DUMMY_PACKET
+        0x13CC, // SA_EQUIP_ITEM_LEVEL
+        0x1626, // SA_SEND_USE_OPTIONAL_ITEM
+        0x1441, // SA_UPDATE_FIELD_POINT_RECEIVED_INDEX
+        0x143F, // SA_UPDATE_FIELD_POINT       - World's answer to our 0x143E push
+        0x15B5, // SA_REQUEST_SEND_SKILL_SCRIPT_LIST
+        0x13AA, // SA_DEL_FROM_INTER_PARTY_MATCH_POOL
+        0x13F2, // DSA_DUNGEON_TIMELINE_OPEN_INFO      (periodic heartbeat)
+        0x13E5, // BSA_REQUEST_BOUNTY_HUNT_SEASON_INFO (periodic heartbeat)
+        0x164D, // SA_WORLD_SERVER_STATUS              (periodic)
+        0x293E, // SDB_UPDATE_GET_EXTRA_REWARD - see the note below
+    };
+
+    // NOTE: 0x2958 and 0x293E carry SDB_ names, so by the naming convention they would expect a
+    // DBS_ reply. Neither appears as a W->A frame anywhere in arb_world.log or lobby_tap.log, so
+    // listing them here is a no-op on both captures and cannot lose a mapping. They are here
+    // because CLAUDE.md section 3 records them as one-way periodics observed live. If one ever
+    // shows up in a capture as a genuine per-user request, it needs a REAL handler in
+    // DbProxyHandlers (echoing the live DLM id), not a replay entry - remove it from this set then.
+
     public static WorldReplayTable Load(string path, ILogger log)
     {
         var table = new WorldReplayTable();
@@ -78,12 +125,12 @@ public sealed class WorldReplayTable
         {
             if (fromWorld)
             {
-                if (op is WorldBridge.OpTunnelToClient or WorldBridge.OpHeartbeat14 or WorldBridge.OpHeartbeat6) continue;
-                // World replies to Arbiter-initiated pushes, never requests. In arb_world.log the
-                // Arbiter's 0x290D (DBS reply to 0x290C, carrying a DLM id) happened to follow
-                // 0x143F, so it was attributed here and replayed with the captured id, which
-                // head-blocked the 0x290C DLMItem. Seal whatever is pending and never map these.
-                if (op is 0x143F /* SA_UPDATE_FIELD_POINT */)
+                // The tunnel interleaves constantly and must be skipped WITHOUT sealing.
+                if (op == WorldBridge.OpTunnelToClient) continue;
+                // One-way pushes and answers to Arbiter-initiated messages are never requests.
+                // Seal whatever is pending so a later Arbiter frame cannot be attributed
+                // backwards across them, and never give them an entry of their own.
+                if (OneWayFromWorld.Contains(op))
                 {
                     if (pending != null) sealedOps.Add(pendingOp);
                     pending = null;
