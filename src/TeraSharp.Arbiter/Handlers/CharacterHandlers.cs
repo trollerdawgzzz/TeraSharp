@@ -87,7 +87,23 @@ public sealed class CharacterHandlers
     /// table when one is extracted; the shape of the method is already per-class.</para>
     /// </summary>
     internal static (int Zone, float X, float Y, float Z) StartPositionFor(int race, int cls)
-        => (5, 16260f, 1253f, -4410f);
+    {
+        // Experiment knob (2026-09-14): TERASHARP_START_OVERRIDE="zone,x,y,z", e.g. "7005,2679.8,9148,1870"
+        // (dob's Velika position). Used to isolate "first enter into a fresh World fails for zone-5
+        // characters". Remove once a per-class start table exists.
+        var ov = Environment.GetEnvironmentVariable("TERASHARP_START_OVERRIDE");
+        if (!string.IsNullOrWhiteSpace(ov))
+        {
+            var p = ov.Split(',');
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+            if (p.Length == 4 && int.TryParse(p[0], out var oz)
+                && float.TryParse(p[1], System.Globalization.NumberStyles.Float, inv, out var ox)
+                && float.TryParse(p[2], System.Globalization.NumberStyles.Float, inv, out var oy)
+                && float.TryParse(p[3], System.Globalization.NumberStyles.Float, inv, out var ozz))
+                return (oz, ox, oy, ozz);
+        }
+        return (5, 16260f, 1253f, -4410f);
+    }
 
     // ---- Name validation ----
 
