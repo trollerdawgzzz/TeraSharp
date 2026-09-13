@@ -71,21 +71,18 @@ public sealed class ChatHandlers
             return true;
         }
 
-        // IN-WORLD: the real Arbiter forwards C_CHAT to WorldServer, which broadcasts and
-        // sends S_CHAT back through the tunnel (0x13F7). Verified in the Arbiter<->World tap:
-        // S_CHAT arrives wrapped in 0x13F7, never as a direct Arbiter packet. A direct S_CHAT
-        // injection does NOT render in-world (the client reads chat from the tunnel stream;
-        // that's why !test/S_SYSTEM_MESSAGE showed but chat didn't). So forward to World.
+        // IN-WORLD: the real Arbiter does NOT forward C_CHAT (World has no handler for it and logs
+        // "handler has not been implemented yet!!!"). It sends AS_REQUEST_NORMAL_CHAT (0x1449) on the
+        // control link; World then builds S_CHAT itself and delivers it through the 0x13F7 tunnel to
+        // everyone in range, sender included. lobby_tap.log pkt 761:
+        //   52 00 00 00 49 14 | 12 00 00 00 | 01 00 00 00 | 00 00 00 00 | wstr "<FONT>...</FONT>\0"
+        //   frame: [6]u32 msgOff=18 [10]u32 playerId [14]u32 channel [18] UTF-16LE message + 00 00
         if (s.InWorld)
         {
-            if (s.Opcodes.TryGetCode("C_CHAT", out ushort cop))
-            {
-                var pkt = new byte[body.Length + 4];
-                pkt[0] = (byte)pkt.Length; pkt[1] = (byte)(pkt.Length >> 8);
-                pkt[2] = (byte)cop; pkt[3] = (byte)(cop >> 8);
-                body.Span.CopyTo(pkt.AsSpan(4));
-                s.ForwardToWorld(pkt);
-            }
+            var w = Program.World;
+            var chr = s.SelectedCharacter;
+            if (w != null && chr != null)
+                w.SendFrame(AS_REQUEST_NORMAL_CHAT, BuildRequestNormalChat((uint)chr.Id, channel, message));
             return true;
         }
 
@@ -97,8 +94,24 @@ public sealed class ChatHandlers
         return true;
     }
 
+    public const ushort AS_REQUEST_NORMAL_CHAT = 0x1449;
+
     /// <summary>
-    /// Broadcast a chat message to all connected sessions, respecting block lists.
+    /// AS_REQUEST_NORMAL_CHAT (0x1449) payload: [u32 msgOff=18][u32 playerId][u32 channel][wstr msg].
+    /// msgOff is frame-relative (6-byte header + 12 bytes of fields). Byte-exact to lobby_tap.log pkt 761.
+    /// </summary>
+    public static byte[] BuildRequestNormalChat(uint playerId, uint channel, string message)
+    {
+        var text = System.Text.Encoding.Unicode.GetBytes(message + "\0");
+        var p = new byte[12 + text.Length];
+        BitConverter.GetBytes(18u).CopyTo(p, 0);
+        BitConverter.GetBytes(playerId).CopyTo(p, 4);
+        BitConverter.GetBytes(channel).CopyTo(p, 8);
+        text.CopyTo(p, 12);
+        return p;
+    }
+
+    /// <summary>
     /// The sender always receives their own message.
     /// </summary>
     internal static void BroadcastChat(GameSession sender, uint channel, string message)
