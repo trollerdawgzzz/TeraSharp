@@ -17,6 +17,9 @@ public sealed class CharacterRecord
     public int Race { get; set; }
     public int Class { get; set; }
     public int Level { get; set; } = 1;
+    /// <summary>Total exp, from SDB_UPDATE_EXP_LEVEL (0x273B). Not shown in the lobby; kept so
+    /// the row is a complete answer for anything that later needs it.</summary>
+    public long Exp { get; set; }
     public int TemplateId { get; set; }
     public int Zone { get; set; }
     public float X { get; set; }
@@ -87,6 +90,24 @@ public static class StarterBlob
     public const int YOffset = 224;
     public const int ZOffset = 228;
     public const int ZoneOffset = 236;
+    /// <summary>Smallest blob that carries a complete position block (<see cref="ZoneOffset"/> + 4).</summary>
+    public const int PositionBlockEnd = ZoneOffset + 4;
+
+    /// <summary>
+    /// Read zone and x/y/z out of a world blob. READ-ONLY: the blob is WorldServer's opaque
+    /// struct and is never modified here. False when the buffer is too short to hold the
+    /// position block, in which case the outputs are meaningless and must be ignored.
+    /// </summary>
+    public static bool TryReadPosition(byte[] blob, out int zone, out float x, out float y, out float z)
+    {
+        zone = 0; x = y = z = 0f;
+        if (blob == null || blob.Length < PositionBlockEnd) return false;
+        x = BitConverter.ToSingle(blob, XOffset);
+        y = BitConverter.ToSingle(blob, YOffset);
+        z = BitConverter.ToSingle(blob, ZOffset);
+        zone = BitConverter.ToInt32(blob, ZoneOffset);
+        return true;
+    }
 
     private static byte[]? _cached;
 
@@ -207,6 +228,7 @@ CREATE TABLE IF NOT EXISTS characters (
   name TEXT NOT NULL UNIQUE COLLATE NOCASE,
   gender INTEGER NOT NULL, race INTEGER NOT NULL, class INTEGER NOT NULL,
   level INTEGER NOT NULL DEFAULT 1,
+  exp INTEGER NOT NULL DEFAULT 0,
   template_id INTEGER NOT NULL,
   zone INTEGER NOT NULL DEFAULT 7005,
   x REAL NOT NULL DEFAULT -449, y REAL NOT NULL DEFAULT 6239, z REAL NOT NULL DEFAULT 1956,
@@ -235,6 +257,22 @@ CREATE TABLE IF NOT EXISTS blocks (
   PRIMARY KEY (character_id, blocked_id)
 );
 ");
+        // CREATE TABLE IF NOT EXISTS does nothing to a DB that already has `characters`, so
+        // columns added later need their own idempotent step. terasharp.db predates `exp`.
+        AddColumnIfMissing("characters", "exp", "INTEGER NOT NULL DEFAULT 0");
+    }
+
+    /// <summary>ALTER TABLE ADD COLUMN, but a no-op when the column is already there.</summary>
+    private void AddColumnIfMissing(string table, string column, string decl)
+    {
+        using (var probe = _db.CreateCommand())
+        {
+            probe.CommandText = $"SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = $c";
+            probe.Parameters.AddWithValue("$c", column);
+            if ((long)probe.ExecuteScalar()! > 0) return;
+        }
+        Exec($"ALTER TABLE {table} ADD COLUMN {column} {decl}");
+        _log.LogInformation("Migrated {Table}: added column {Column}", table, column);
     }
 
     private void Exec(string sql)
@@ -380,18 +418,74 @@ SELECT last_insert_rowid();";
         }
     }
 
-    /// <summary>Store the WorldServer state struct after SDB_UPDATE_USER_DATA.</summary>
+    /// <summary>
+    /// Store the WorldServer state struct after SDB_UPDATE_USER_DATA, and mirror the position
+    /// out of it onto the row (T6).
+    ///
+    /// The blob is opaque and is <b>read only</b> here — nothing is written back into it. The
+    /// row copy exists because the character-select screen and any future real
+    /// <c>AS_ENTER_WORLD</c> builder need zone/x/y/z as columns, and World only ever hands us
+    /// those numbers inside the blob:
+    ///   x/y/z = f32 at <see cref="StarterBlob.XOffset"/>/224/228, zone = u32 at
+    ///   <see cref="StarterBlob.ZoneOffset"/>. Offset 208 is HP, not zone (verified in
+    ///   cap_newchar.log: 236 is 5 on the starting island and 9827 in Velika, while 208 tracks
+    ///   damage).
+    /// A short buffer (never seen on the wire; 0x27CB always carries the full 15312 bytes)
+    /// still updates the blob, it just leaves the position columns alone.
+    /// </summary>
     public void SaveWorldBlob(int characterId, byte[] blob)
     {
         lock (_lock)
         {
+            bool hasPos = StarterBlob.TryReadPosition(blob, out int zone, out float x, out float y, out float z);
+
             using var cmd = _db.CreateCommand();
-            cmd.CommandText = "UPDATE characters SET world_blob = $b, last_logout = datetime('now') WHERE id = $id";
+            cmd.CommandText = hasPos
+                ? "UPDATE characters SET world_blob = $b, zone = $zone, x = $x, y = $y, z = $z, last_logout = datetime('now') WHERE id = $id"
+                : "UPDATE characters SET world_blob = $b, last_logout = datetime('now') WHERE id = $id";
             cmd.Parameters.AddWithValue("$b", blob);
             cmd.Parameters.AddWithValue("$id", characterId);
+            if (hasPos)
+            {
+                cmd.Parameters.AddWithValue("$zone", zone);
+                cmd.Parameters.AddWithValue("$x", x);
+                cmd.Parameters.AddWithValue("$y", y);
+                cmd.Parameters.AddWithValue("$z", z);
+            }
             int n = cmd.ExecuteNonQuery();
-            if (n == 1) _log.LogInformation("Saved world blob ({Len} bytes) for character {Id}", blob.Length, characterId);
-            else _log.LogWarning("SaveWorldBlob: character {Id} not found", characterId);
+            if (n != 1) { _log.LogWarning("SaveWorldBlob: character {Id} not found", characterId); return; }
+
+            if (hasPos)
+                _log.LogInformation("Saved world blob ({Len} bytes) for character {Id}; zone {Zone} ({X:F1}, {Y:F1}, {Z:F1})",
+                    blob.Length, characterId, zone, x, y, z);
+            else
+                _log.LogInformation("Saved world blob ({Len} bytes) for character {Id} (too short for a position)",
+                    blob.Length, characterId);
+        }
+    }
+
+    /// <summary>
+    /// Level/exp from SDB_UPDATE_EXP_LEVEL (0x273B). World sends a level only when it changed
+    /// (the field is 0 on an exp-only update, matching the real Arbiter's
+    /// <c>User::UpdateUserExpAndRestBonusPoint</c> vs <c>User::UpdateUserLevel</c> split), so
+    /// <paramref name="level"/> is null on those and the stored level is left alone.
+    /// Returns true when a row was updated — that is the ok byte the 0x273C reply carries.
+    /// </summary>
+    public bool UpdateLevelAndExp(int characterId, int? level, long exp)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = level.HasValue
+                ? "UPDATE characters SET level = $l, exp = $e WHERE id = $id"
+                : "UPDATE characters SET exp = $e WHERE id = $id";
+            if (level.HasValue) cmd.Parameters.AddWithValue("$l", level.Value);
+            cmd.Parameters.AddWithValue("$e", exp);
+            cmd.Parameters.AddWithValue("$id", characterId);
+            bool ok = cmd.ExecuteNonQuery() == 1;
+            if (!ok) _log.LogWarning("UpdateLevelAndExp: character {Id} not found", characterId);
+            else if (level.HasValue) _log.LogInformation("Character {Id} reached level {L} (exp {E})", characterId, level.Value, exp);
+            return ok;
         }
     }
 
@@ -461,6 +555,7 @@ DELETE FROM blocks  WHERE character_id IN (SELECT id FROM characters WHERE id = 
         Race = r.GetInt32(r.GetOrdinal("race")),
         Class = r.GetInt32(r.GetOrdinal("class")),
         Level = r.GetInt32(r.GetOrdinal("level")),
+        Exp = r.GetInt64(r.GetOrdinal("exp")),
         TemplateId = r.GetInt32(r.GetOrdinal("template_id")),
         Zone = r.GetInt32(r.GetOrdinal("zone")),
         X = (float)r.GetDouble(r.GetOrdinal("x")),
