@@ -923,6 +923,7 @@ public sealed class DbProxyHandlers
         if (p.Length < 18) { _log.LogWarning("SDB_USER_ENTERWORLD too short ({Len})", p.Length); return false; }
         uint replyId = U32(p, 10);
         int playerId = (int)U32(p, 14);
+        _log.LogInformation("SDB_USER_ENTERWORLD raw: {Hex} (replyId {R}, playerId {P})", Convert.ToHexString(p), replyId, playerId);
 
         var chr = _store.GetCharacter(playerId);
         bool found = chr?.WorldBlob != null && chr.WorldBlob.Length == WorldBlobSize;
