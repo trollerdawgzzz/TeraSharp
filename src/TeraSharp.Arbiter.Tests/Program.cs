@@ -2314,6 +2314,282 @@ array items
         Hex.True(n == DbProxyOpcodeNames.Count, $"file has {n} entries, table has {DbProxyOpcodeNames.Count}");
     }
 
+    // ================================================================================
+    // T8 — character creation
+    //
+    // Ground truth:
+    //   D:\packetlogs\cap_newchar_client.log packets 30-38  (client <-> real ArbiterServer)
+    //   D:\packetlogs\cap_newchar.log packet 133, 05:49:03  (the starter blob, DBS_USER_ENTERWORLD)
+    //   data/starter_blob.bin                               (that blob, extracted)
+    // ================================================================================
+
+    /// <summary>cap_newchar_client.log packet 35: C_CREATE_USER, 146 bytes, creating "Test".</summary>
+    const string CreateUserPkt35 =
+        "92 00 03 8F 28 00 32 00 20 00 52 00 40 00 01 00 00 00 04 00 00 00 0C 00 " +
+        "00 00 65 01 07 04 0E 0E 04 00 00 64 00 00 00 00 54 00 65 00 73 00 74 00 " +
+        "00 00 00 0A 08 0C 00 00 00 00 1A 15 1D 00 0B 15 05 00 10 00 0C 0D 00 00 " +
+        "00 0F 10 17 10 12 19 10 0E 09 01 13 10 13 13 10 13 13 13 0F 0F 0F 0F 0F " +
+        "0F 0F 10 13 0A 00 05 0B 10 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 " +
+        "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 " +
+        "00 00";
+
+    [Test] public static void CreateUser_parses_capture_packet_35()
+    {
+        var pkt = Hex.B(CreateUserPkt35);
+        Hex.True(pkt.Length == 146, $"packet 35 should be 146 bytes, got {pkt.Length}");
+
+        var req = CharacterHandlers.ParseCreateUser(pkt);
+        Hex.True(req != null, "ParseCreateUser returned null for packet 35");
+        req = req!;
+
+        Hex.True(req.Name == "Test", $"name: expected 'Test', got '{req.Name}'");
+        Hex.True(req.Gender == 1, $"gender: expected 1, got {req.Gender}");
+        Hex.True(req.Race == 4, $"race: expected 4, got {req.Race}");
+        Hex.True(req.Class == 12, $"class: expected 12, got {req.Class}");
+        Hex.True(!req.IsSecondCharacter, "isSecondCharacter should be false");
+        Hex.True(req.Appearance2 == 100, $"appearance2: expected 100, got {req.Appearance2}");
+        Hex.True(!req.IsRandomName, "isRandomName should be false");
+
+        Hex.Eq(req.Appearance, "65 01 07 04 0E 0E 04 00", "appearance (customize, 8 B)");
+        Hex.Eq(req.Details,
+            "00 0A 08 0C 00 00 00 00 1A 15 1D 00 0B 15 05 00 " +
+            "10 00 0C 0D 00 00 00 0F 10 17 10 12 19 10 0E 09", "details (32 B)");
+        Hex.Eq(req.Shape,
+            "01 13 10 13 13 10 13 13 13 0F 0F 0F 0F 0F 0F 0F 10 13 0A 00 05 0B 10 00 " +
+            "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 " +
+            "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00", "shape (64 B)");
+    }
+
+    [Test] public static void CreateUser_short_packet_is_rejected()
+    {
+        // Handler_C_CREATE_USER (Arb_part_079.c:9510) treats anything under 0x28 bytes as a
+        // PDL version mismatch.
+        Hex.True(CharacterHandlers.ParseCreateUser(new byte[0x27]) == null, "0x27 bytes must not parse");
+        Hex.True(CharacterHandlers.ParseCreateUser(new byte[0x28]) != null, "0x28 bytes is the minimum");
+    }
+
+    [Test] public static void CreateUser_record_matches_capture_user_list()
+    {
+        // cap_newchar_client.log packet 38 (S_GET_USER_LIST after creation) shows the new
+        // character as: id 2, gender 1, race 4, class 12, level 1, name "Test", appearance
+        // 65 01 07 04 0E 0E 04 00, details/shape exactly as the client sent them in packet 35.
+        var template = LoadStarterTemplateOrSkip();
+        if (template == null) return;
+
+        var req = CharacterHandlers.ParseCreateUser(Hex.B(CreateUserPkt35))!;
+        var rec = CharacterHandlers.BuildRecord(req, accountId: 1, position: 2, template, playerId: 2);
+
+        Hex.True(rec.Name == "Test", $"name: got '{rec.Name}'");
+        Hex.True(rec.Gender == 1 && rec.Race == 4 && rec.Class == 12,
+            $"gender/race/class: got {rec.Gender}/{rec.Race}/{rec.Class}");
+        Hex.True(rec.Level == 1, $"new characters start at level 1, got {rec.Level}");
+        // 10101 + race*200 + gender*100 + class = 10101 + 800 + 100 + 12; "dob" uses the same value.
+        Hex.True(rec.TemplateId == 11013, $"templateId: expected 11013, got {rec.TemplateId}");
+        Hex.True(rec.Position == 2, $"second character takes lobby slot 2, got {rec.Position}");
+        Hex.Eq(rec.Appearance, "65 01 07 04 0E 0E 04 00", "record appearance");
+        Hex.Eq(rec.Details, req.Details, "record details == packet details");
+        Hex.Eq(rec.Shape, req.Shape, "record shape == packet shape");
+    }
+
+    [Test] public static void StarterBlob_rebuilds_the_captured_blob_exactly()
+    {
+        // The template IS the blob the real server sent for "Test" (playerId 2, zone 5,
+        // 16260/1253/-4410). Patching those same values back in must be a no-op — which proves
+        // both that the offsets are right and that Build touches nothing else.
+        var template = LoadStarterTemplateOrSkip();
+        if (template == null) return;
+
+        var rebuilt = TeraSharp.Arbiter.Persistence.StarterBlob.Build(
+            template, playerId: 2, name: "Test", zone: 5, x: 16260f, y: 1253f, z: -4410f);
+
+        Hex.True(rebuilt.Length == 15312, $"blob must be 15312 bytes, got {rebuilt.Length}");
+        for (int i = 0; i < rebuilt.Length; i++)
+            Hex.True(rebuilt[i] == template[i],
+                $"byte {i} changed: template 0x{template[i]:X2} -> 0x{rebuilt[i]:X2}");
+    }
+
+    [Test] public static void StarterBlob_patches_only_the_per_character_fields()
+    {
+        var template = LoadStarterTemplateOrSkip();
+        if (template == null) return;
+
+        const int playerId = 7;
+        const string name = "Zephyra";
+        const int zone = 9827;
+        const float x = -12142f, y = -27790f, z = -4393f;   // the Velika position from packet 2553
+
+        var blob = TeraSharp.Arbiter.Persistence.StarterBlob.Build(template, playerId, name, zone, x, y, z);
+
+        // Every byte outside the patched windows must be identical to the capture.
+        var patched = new HashSet<int>();
+        for (int i = 112; i < 116; i++) patched.Add(i);                 // u32 playerId
+        for (int i = 116; i < 116 + 17 * 2; i++) patched.Add(i);        // wstr name (zeroed region)
+        for (int i = 220; i < 232; i++) patched.Add(i);                 // x, y, z floats
+        for (int i = 236; i < 240; i++) patched.Add(i);                 // u32 zone
+
+        for (int i = 0; i < blob.Length; i++)
+        {
+            if (patched.Contains(i)) continue;
+            Hex.True(blob[i] == template[i],
+                $"byte {i} outside the patched fields changed: 0x{template[i]:X2} -> 0x{blob[i]:X2}");
+        }
+
+        Hex.True(BitConverter.ToInt32(blob, 112) == playerId, "playerId at 112");
+        Hex.True(TeraSharp.Arbiter.Persistence.StarterBlob.ReadName(blob) == name,
+            $"name at 116: got '{TeraSharp.Arbiter.Persistence.StarterBlob.ReadName(blob)}'");
+        Hex.True(BitConverter.ToSingle(blob, 220) == x, "x at 220");
+        Hex.True(BitConverter.ToSingle(blob, 224) == y, "y at 224");
+        Hex.True(BitConverter.ToSingle(blob, 228) == z, "z at 228");
+        Hex.True(BitConverter.ToInt32(blob, 236) == zone, "zone at 236");
+
+        // The old name must be gone, not merely overwritten up to its own length.
+        Hex.True(!TeraSharp.Arbiter.Persistence.StarterBlob.ReadName(blob).Contains("Test"),
+            "the template name 'Test' leaked into the new blob");
+    }
+
+    [Test] public static void StarterBlob_rejects_a_wrong_sized_template()
+    {
+        bool threw = false;
+        try { TeraSharp.Arbiter.Persistence.StarterBlob.Build(new byte[100], 1, "Ab", 5, 0, 0, 0); }
+        catch (ArgumentException) { threw = true; }
+        Hex.True(threw, "a template that is not 15312 bytes must be rejected");
+    }
+
+    [Test] public static void CreateUser_name_validation()
+    {
+        void Case(string? name, NameCheck expected)
+        {
+            var got = CharacterHandlers.ValidateName(name);
+            Hex.True(got == expected, $"ValidateName('{name}'): expected {expected}, got {got}");
+        }
+
+        Case("Test", NameCheck.Ok);
+        Case("Ab", NameCheck.Ok);
+        Case("Zephyra", NameCheck.Ok);
+        Case("Ithilien", NameCheck.Ok);
+        Case("Abcdefghijklmnop", NameCheck.Ok);          // exactly 16
+
+        Case(null, NameCheck.Empty);
+        Case("", NameCheck.Empty);
+        Case("A", NameCheck.TooShort);
+        Case("Abcdefghijklmnopq", NameCheck.TooLong);     // 17
+        Case(new string('A', 0x24), NameCheck.TooLong);   // the Arbiter's own limit
+        Case("Test1", NameCheck.IllegalCharacter);
+        Case("Two Words", NameCheck.IllegalCharacter);
+        Case("Test!", NameCheck.IllegalCharacter);
+        Case("Te-st", NameCheck.IllegalCharacter);
+        Case(" Test", NameCheck.IllegalCharacter);
+    }
+
+    [Test] public static void CreateUser_start_position_is_the_captured_one_for_every_class()
+    {
+        // Documented limitation: no per-class start table has been extracted yet, so every
+        // class gets the one position we have ground truth for (cap_newchar.log packet 133).
+        for (int cls = 0; cls <= 12; cls++)
+        {
+            var p = CharacterHandlers.StartPositionFor(race: 4, cls: cls);
+            Hex.True(p.Zone == 5 && p.X == 16260f && p.Y == 1253f && p.Z == -4410f,
+                $"class {cls}: got zone {p.Zone} ({p.X},{p.Y},{p.Z})");
+        }
+    }
+
+    [Test] public static void CharacterStore_create_then_list_round_trip()
+    {
+        var template = LoadStarterTemplateOrSkip();
+        if (template == null) return;
+
+        var dbPath = Path.Combine(Path.GetTempPath(), $"terasharp_t8_{Guid.NewGuid():N}.db");
+        try
+        {
+            var log = Microsoft.Extensions.Logging.LoggerFactory.Create(b => { }).CreateLogger("test");
+            using (var store = new TeraSharp.Arbiter.Persistence.CharacterStore(dbPath, log))
+            {
+                var acct = store.GetOrCreateAccount("t8");
+                Hex.True(store.CountCharacters(acct.Id) == 0, "new account starts empty");
+                Hex.True(store.NextPosition(acct.Id) == 1, "first character takes slot 1");
+
+                var req = CharacterHandlers.ParseCreateUser(Hex.B(CreateUserPkt35))!;
+                var first = CharacterHandlers.BuildRecord(req, acct.Id, position: 1, template, playerId: 0);
+                int id1 = store.CreateCharacter(first);
+                store.SaveWorldBlob(id1,
+                    TeraSharp.Arbiter.Persistence.StarterBlob.Build(template, id1, req.Name, 5, 16260f, 1253f, -4410f));
+
+                Hex.True(store.CountCharacters(acct.Id) == 1, "one character after create");
+                Hex.True(store.NameExists("Test"), "NameExists must see the new name");
+                Hex.True(store.NameExists("tEsT"), "the name index is case-insensitive");
+                Hex.True(store.NextPosition(acct.Id) == 2, "second character takes slot 2");
+
+                // A duplicate name must be refused by the UNIQUE index, not silently inserted.
+                bool duplicateRefused = false;
+                try
+                {
+                    store.CreateCharacter(CharacterHandlers.BuildRecord(
+                        req, acct.Id, position: 2, template, playerId: 0));
+                }
+                catch (Exception) { duplicateRefused = true; }
+                Hex.True(duplicateRefused, "duplicate character name must be rejected");
+
+                // A second, differently named character.
+                var second = CharacterHandlers.BuildRecord(
+                    new CreateUserRequest
+                    {
+                        Gender = 0, Race = 0, Class = 1, Name = "Bramwell",
+                        Appearance = new byte[8], Details = new byte[32], Shape = new byte[64],
+                    },
+                    acct.Id, position: 2, template, playerId: 0);
+                int id2 = store.CreateCharacter(second);
+                store.SaveWorldBlob(id2,
+                    TeraSharp.Arbiter.Persistence.StarterBlob.Build(template, id2, "Bramwell", 5, 16260f, 1253f, -4410f));
+
+                // ... and the list the select screen is built from (S_GET_USER_LIST).
+                var list = store.GetCharacters(acct.Id);
+                Hex.True(list.Count == 2, $"expected 2 characters, got {list.Count}");
+                Hex.True(list[0].Name == "Test" && list[1].Name == "Bramwell",
+                    $"ordered by lobby slot, got '{list[0].Name}','{list[1].Name}'");
+                Hex.True(list[0].Position == 1 && list[1].Position == 2, "distinct lobby slots");
+                Hex.True(list[0].TemplateId == 11013, $"templateId round-trip, got {list[0].TemplateId}");
+                Hex.True(list[0].Level == 1, "level round-trip");
+                Hex.True(list[0].Zone == 5 && list[0].X == 16260f && list[0].Y == 1253f && list[0].Z == -4410f,
+                    "start position round-trip");
+                Hex.Eq(list[0].Appearance, "65 01 07 04 0E 0E 04 00", "appearance round-trip");
+
+                // The stored blob is the starter blob with this row's playerId and name in it.
+                var blob = list[0].WorldBlob;
+                Hex.True(blob != null && blob.Length == 15312,
+                    $"stored world blob must be 15312 bytes, got {blob?.Length.ToString() ?? "<null>"}");
+                Hex.True(BitConverter.ToInt32(blob!, 112) == id1,
+                    $"blob playerId should be {id1}, got {BitConverter.ToInt32(blob!, 112)}");
+                Hex.True(TeraSharp.Arbiter.Persistence.StarterBlob.ReadName(blob!) == "Test",
+                    "blob name should be 'Test'");
+                Hex.True(BitConverter.ToInt32(list[1].WorldBlob!, 112) == id2, "second blob carries its own id");
+
+                // Delete: wrong account must not be able to remove it.
+                Hex.True(!store.DeleteCharacter(id1, acct.Id + 999), "delete from a foreign account must fail");
+                Hex.True(store.CountCharacters(acct.Id) == 2, "nothing deleted by the foreign delete");
+                Hex.True(store.DeleteCharacter(id1, acct.Id), "owner delete should succeed");
+                Hex.True(store.CountCharacters(acct.Id) == 1, "one left after delete");
+                Hex.True(!store.NameExists("Test"), "the name is free again after delete");
+            }
+        }
+        finally
+        {
+            try { File.Delete(dbPath); } catch { /* best effort */ }
+        }
+    }
+
+    /// <summary>
+    /// data/starter_blob.bin from the repo, or null (with a printed note) when the tests run
+    /// somewhere the repo root is not above the binary — same convention as the opcode test.
+    /// </summary>
+    static byte[]? LoadStarterTemplateOrSkip()
+    {
+        var path = FindRepoFile(Path.Combine("data", "starter_blob.bin"));
+        if (path == null) { Console.WriteLine("        (skipped: data/starter_blob.bin not found)"); return null; }
+        var bytes = File.ReadAllBytes(path);
+        Hex.True(bytes.Length == 15312, $"starter_blob.bin must be 15312 bytes, got {bytes.Length}");
+        return bytes;
+    }
+
     static void AssertName(ushort op, string expected)
     {
         var actual = DbProxyOpcodeNames.Name(op);
