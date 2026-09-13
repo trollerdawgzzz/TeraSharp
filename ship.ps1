@@ -17,6 +17,8 @@ if ($LASTEXITCODE) { git commit -m $Message } else { Write-Host "nothing to comm
 Write-Host "== publish"
 dotnet publish src\TeraSharp.Arbiter\TeraSharp.Arbiter.csproj -c Release -r win-x64 --self-contained -o D:\TeraSharp-publish 2>&1 | Select-String "error|TeraSharp-publish"
 if ($LASTEXITCODE) { throw "publish failed" }
+New-Item -ItemType Directory D:\TeraSharp-publish\data -Force | Out-Null
+Copy-Item D:\v100\TERA_SERVER.100\TeraSharp\data\starter_blob.bin D:\TeraSharp-publish\data\ -Force
 
 Write-Host "== 7z"
 Remove-Item D:\TeraSharp-bin.7z -Force -ErrorAction SilentlyContinue
