@@ -153,7 +153,16 @@ T17's; three tests needed fixture rows because playerId 1 is reserved for dob's 
    user out ~60 s later (0x2927 ticks, then 0x13AA..0x1393 with "no session for gameId"). The
    real Arbiter must set up the dungeon channel for a login into an instance (0x13BE/0x13C0 and/or
    the 16-byte world-session state at AS_ENTER_WORLD [167] that we zero) - never captured. Options:
-   (a) capture a real-Arbiter relog from inside 9827 (same capture as the "Test" quest one!),
+   (a) capture a real-Arbiter relog from inside 9827 (same capture as the "Test" quest one!).
+   HOW: on netcup stop TeraSharp; `DeploymentConfig.xml` `<ArbiterServer port="7812">`; `node
+   C:\TERA_SERVER.100\arbiter-world-tap.js` (listens 7812 -> 7802, logs to
+   C:\TERA_SERVER.100\arb_world_<stamp>.log); start the real ArbiterServer from
+   C:\TERA_SERVER.100\Executable (it needs MS SQL Server listening on 1433 - on 2026-09-14 04:30
+   both instances `MSSQLSERVER` and `MSSQL$SQL2022` were STOPPED and the Arbiter died instantly
+   with no console log; check `Get-NetTCPConnection -LocalPort 1433 -State Listen` first); restart
+   World; client proxy; log in "Test" (the real Arbiter's playerId 2, saved in 9827); spawn, walk,
+   Logout, Exit. Copy tap log + proxy log to D:\packetlogs\cap_relog9827[_client].log. Revert the
+   port to 7802 and `C:\deploy.ps1`.
    (b) short-term: on login, if the saved zone is an instance, spawn at the continent's return
    position instead (the real Arbiter has AS_SAVE_ETC_DATA_FOR_MOVE_WORLD 0x1499 data for that).
 2. **Exit Game button**: timing is 5 s already (C_EXIT -> leave -> S_EXIT); only the countdown
