@@ -940,11 +940,13 @@ public sealed class DbProxyHandlers
         // frame that differs between two logins in the real capture, and chat/whisper bans live
         // in the restriction record World initialises from it. gameId form: 0x80000AF00000|id,
         // unmasked, as sent in AS_ENTER_WORLD [24] and captured (01 00 F0 0A 00 80 00 00).
-        if (found)
+        if (found && Environment.GetEnvironmentVariable("TERASHARP_NO_RESTRICTION") != "1")
         {
             ulong gameId = GameIdByPlayer.TryGetValue(playerId, out var g) ? g : 0x80000AF00000UL | (ulong)(uint)playerId;
             link.SendFrame(DBS_USER_RESTRICTION, BuildDbsUserRestriction(gameId));
         }
+        else if (found)
+            _log.LogWarning("TERASHARP_NO_RESTRICTION=1: skipping DBS_USER_RESTRICTION (experiment)");
         return true;
     }
 

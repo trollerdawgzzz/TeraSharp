@@ -1,0 +1,20 @@
+
+LineNumber Line                                                                                                
+---------- ----                                                                                                
+   3017662                 "bool __cdecl Handler_DBS_LOAD_PROMOTION_LIST(void *,const unsigned char *,int)",0);
+   3017669                   "bool __cdecl Handler_DBS_LOAD_PROMOTION_LIST(void *,const unsigned char *,int)",0
+   3391731   *param_1 = DBLoadPromotionContext::vftable;                                                       
+   3391737                 "__cdecl DBLoadPromotionContext::DBLoadPromotionContext(class TPointer<class User...
+   3399228   *param_1 = DBLoadPromotionContext::vftable;                                                       
+   3399229   FUN_140011960(local_28,"__cdecl DBLoadPromotionContext::~DBLoadPromotionContext(void)",param_1);  
+   3400617   *param_1 = DBLoadPromotionContext::vftable;                                                       
+   3400618   FUN_140011960(local_28,"__cdecl DBLoadPromotionContext::~DBLoadPromotionContext(void)",param_1);  
+   3402616   FUN_140011960(local_38,"void __cdecl DBLoadPromotionContext::BeginTransaction(void)",param_1);    
+   3411551   FUN_140011960(local_28,"void __cdecl DBLoadPromotionContext::ExecuteCommit(void)",param_1);       
+   3434041   FUN_140011960(local_28,"void __cdecl DBLoadPromotionContext::OnFail(void)",param_1);              
+   3434644   FUN_140011960(local_20,"void __cdecl DBLoadPromotionContext::OnSuccess(void)",param_1);           
+   3445054                 "void __cdecl DBLoadPromotionContext::SetRecvData(const unsigned char *,int)",      
+   3448938   FUN_140011960(local_28,"bool __cdecl DBLoadPromotionContext::Validate(void)",param_1);            
+
+
+
