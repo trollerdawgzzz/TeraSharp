@@ -239,7 +239,15 @@ public sealed class GmCommandHandlers
 
     /// <summary>The Arbiter-&gt;World relay for a command the World owns. No symbolic name exists
     /// for it: 0x2829 is absent from the opcode-&gt;name table in Arb_part_003.c.</summary>
-    public const ushort AS_BYPASS_COMMAND = 0x2829;
+    /// <summary>
+    /// <c>AS_ADMIN_COMMAND</c> - the name World's own opcode table gives 0x2829
+    /// (WorldServer.exe.c:246833). T32 called it AS_BYPASS_COMMAND, after the Arbiter-side
+    /// handler class that builds it; the wire name is this one.
+    /// </summary>
+    public const ushort AS_ADMIN_COMMAND = 0x2829;
+
+    /// <summary>T32's name for <see cref="AS_ADMIN_COMMAND"/>. Kept so older call sites compile.</summary>
+    public const ushort AS_BYPASS_COMMAND = AS_ADMIN_COMMAND;
 
     /// <summary>AS_ADMIN - the broadcast form (no user), one wide string. Not used here.</summary>
     public const ushort AS_ADMIN = 0x1473;
@@ -249,9 +257,17 @@ public sealed class GmCommandHandlers
     public const int CommandTypeAdmin = 1, CommandTypeOp = 0;
 
     /// <summary>
-    /// The bypass mode the forward carries: the type-4 bucket sends 1, the type-1 bucket 0
-    /// (ArbiterBypassCommandHandler is constructed twice, and its ctor argument lands at
-    /// this+0x24 - Arb_part_033.c:13685/13691). World commands live in the type-4 bucket.
+    /// What goes in the forward's third field. The Arbiter's dumper calls that field
+    /// <c>CommandType</c> (FUN_14017bdf0, Arb_part_011.c:5334), and the writer fills it from the
+    /// HANDLER's own constant, not from the client packet: <c>lVar18 = param_1[0x24]</c>, where
+    /// param_1 is the ArbiterBypassCommandHandler (Arb_part_067.c:6898). The handler is
+    /// constructed twice, with 1 and 0 (Arb_part_033.c:13685/13691), and World commands live in
+    /// the bucket that carries 1.
+    ///
+    /// <para>So this is deliberately NOT the client's C_ADMIN/C_OP_COMMAND type - see
+    /// <see cref="CommandTypeAdmin"/> - and <c>ForwardToWorld</c> ignoring its own
+    /// <c>commandType</c> argument is correct, not an oversight. Verified against the dumper and
+    /// against World's Handler_AS_ADMIN_COMMAND in T46.</para>
     /// </summary>
     public const int BypassModeWorld = 1;
 
@@ -380,6 +396,20 @@ public sealed class GmCommandHandlers
     /// So, payload (frame minus its 6-byte header): [0] u32 offset = 18, [4] u32 userId,
     /// [8] u32 mode, [12] the command line as UTF-16LE with a terminator.
     /// The offset is frame-relative, like every other offset on the Arbiter-World protocol.
+    ///
+    /// <para><b>T46 verified this three ways</b> and it is byte-exact:</para>
+    /// <list type="number">
+    /// <item>The Arbiter's own PDL dumper for AS_ADMIN_COMMAND (FUN_14017bdf0,
+    /// Arb_part_011.c:5334) names the fields and their FRAME offsets: <c>Command</c> ref at 6,
+    /// <c>UserDbId</c> at 10, <c>CommandType</c> at 0x0E, string at 0x12 - i.e. payload 0, 4, 8,
+    /// 12. Its guard is <c>0x11 &lt; len</c>, so the minimum frame is 18.</item>
+    /// <item>The second writer (Arb_part_040.c:8820, the <c>clear_recipe_world</c> path) emits
+    /// exactly this order with <c>UserDbId</c> from <c>User+0x120</c> and CommandType 1.</item>
+    /// <item>World's <c>Handler_AS_ADMIN_COMMAND</c> (WorldServer.exe.c:2977905) guards on
+    /// <c>len &lt; 0x12</c>, looks the user up by the u32 at frame 10, bounds-checks the string
+    /// ref at frame 6 against the frame length, reads CommandType at frame 0x0E and dispatches.
+    /// It performs <b>no admin-level check of its own</b>.</item>
+    /// </list>
     /// </summary>
     public static byte[] BuildWorldForward(int userId, int mode, string line)
     {

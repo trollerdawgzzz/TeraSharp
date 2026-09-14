@@ -233,6 +233,32 @@ Three of these correct comments in `Handlers/WorldEntry.cs`:
 * **[72] is `Direction`**, not "maxHP base" — `WorldEntry` already sources it from world blob
   offset 304, which is right; only the name is wrong.
 
+## 5a. `[111] AdminLevel` — where World gets the number it logs (T46)
+
+WorldServer prints `SpawnComplete [...] AdminLevel[0]` for an account whose Arbiter-side level is
+5. The field in the table above is the one it means, and the chain is complete on both sides.
+
+**Arbiter → wire.** `User+0x3b98` is the Arbiter's admin level: it is what
+`ArbiterQACommandHandler::SetAdminLevel` writes (`Arb_part_030.c:9743`), what every `/@` gate tests
+with `level < 1`, and what `Arb_part_029.c:3915` compares against 5. The `AS_ENTER_WORLD` caller
+reads it into a local (`Arb_part_028.c:15470` and `:15522`) and hands it to the writer
+`FUN_140360710` (`Arb_part_027.c:12906`) as **param_22**, the 22nd value it serialises — which
+lands at frame `0x75`, payload **111**. The Arbiter's own dumper agrees: `AdminLevel` at frame
+`0x75` (`Arb_part_011.c:10446`).
+
+**Wire → World.** `FUN_140496c80` (`WorldServer.exe.c:847717`) is World's generated field-binding
+table; at `:847798` it binds the name `adminLevel` to offset **`0xA474`** on its `User`. That
+offset is what both log sites print — `SpawnComplete ... AdminLevel[%d]` at `:935500` and
+`=== AdminLevel[%d], Status[%d], ...` at `:866788`.
+
+**The part that matters for `/@`:** `0xA474` appears **four times in the whole World binary** — set
+to 0 in the constructor (`:803532`), bound in that table, and read by those two log lines. World
+never compares it against anything. So the wrong value is a wrong log line and a wrong GM-info
+dump; it is **not** what refuses a command. World's `Handler_AS_ADMIN_COMMAND` does no
+admin check either (see `status/GM-DESIGN.md` §7). The gates that do exist are the Arbiter's own
+`User+0x3b98` (already working — `query_point` answers) and the client's, which keys off
+`S_LOGIN_ARBITER.status` (§6 of GM-DESIGN, still unwired).
+
 ## 6. `[52]` on a first-time enter: 0, -1, or the PDId
 
 Three observed values, all `User+0x1a0` at login time:
@@ -366,6 +392,56 @@ Wire the two hooks wherever `DbProxyHandlers` is constructed:
 
 Until they are wired the handler still runs: it logs the failure in full and says, at error
 level, that no retry will go out.
+
+### 8d. `Handlers/WorldEntry.cs` — AdminLevel (T46)
+
+Three edits. `DbProxyHandlers.EnterWorldAdminLevelOffset` (= 111) already exists, and
+`GmCommandHandlers.LevelOf` already resolves the allow-list-or-stored level; both are
+Cowork-editable and landed with T46.
+
+```csharp
+-    internal static byte[] BuildEnterWorldPayload(ulong gameId, FakeCharacter chr, uint tunnelKey = 5)
+-        => BuildEnterWorldPayload(gameId, chr, null, tunnelKey);
++    internal static byte[] BuildEnterWorldPayload(ulong gameId, FakeCharacter chr, uint tunnelKey = 5,
++                                                  int adminLevel = 0)
++        => BuildEnterWorldPayload(gameId, chr, null, tunnelKey, adminLevel);
+
+-    internal static byte[] BuildEnterWorldPayload(ulong gameId, FakeCharacter chr, byte[]? worldBlob, uint tunnelKey = 5)
++    internal static byte[] BuildEnterWorldPayload(ulong gameId, FakeCharacter chr, byte[]? worldBlob,
++                                                  uint tunnelKey = 5, int adminLevel = 0)
+```
+
+```csharp
+-        // [111..114] From User+0x3b98 (param_22). Capture=0.
+-        w.U32(0);
++        // [111..114] AdminLevel (param_22, from User+0x3b98). World binds this to its own
++        //            User+0xA474 and prints it as "AdminLevel[%d]" in the SpawnComplete line.
++        //            status/ENTER-WORLD-FALLBACK.md 5a.
++        w.U32((uint)adminLevel);
+```
+
+and both call sites in this file — `EnterWorld` and `ResendEnterWorld` — pass it:
+
+```csharp
+-        var enterPayload = BuildEnterWorldPayload(s.GameId, chr, record?.WorldBlob, s.TunnelKey);
++        var enterPayload = BuildEnterWorldPayload(s.GameId, chr, record?.WorldBlob, s.TunnelKey,
++                                                  GmCommandHandlers.LevelOf(s, Program.Store));
+```
+
+```csharp
+-        var first = BuildEnterWorldPayload(s.GameId, chr, record?.WorldBlob, s.TunnelKey);
++        var first = BuildEnterWorldPayload(s.GameId, chr, record?.WorldBlob, s.TunnelKey,
++                                           GmCommandHandlers.LevelOf(s, Program.Store));
+```
+
+`GmCommandHandlers` is in the same namespace, so no `using` changes. The optional parameter keeps
+the dozen existing `BuildEnterWorldPayload(GameId, chr)` test call sites compiling.
+`BuildEnterWorldRetryPayload` clones and patches only zone/instance/position/ticket/dungeon, so the
+level carries into the retry frame by itself — `T46_the_enter_world_retry_carries_admin_level_through`
+pins that.
+
+When the diff lands, flip `T46_world_entry_still_sends_admin_level_zero` to assert the account's
+level instead; it exists to document the bug, not to defend it.
 
 ## 9. Still open
 
