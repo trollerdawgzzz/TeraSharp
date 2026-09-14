@@ -127,6 +127,54 @@ public readonly record struct DispatchResult(
         $"{WorldFailed} world failed{(RejectionSent ? ", rejection relayed" : "")}";
 }
 
+
+/// <summary>
+/// The ordinary client action: a packet for one recipient. PartyManager and GuildHandlers each
+/// predate this and keep their own record (ClientAction / GuildClientAction) because their tests
+/// read the typed lists; anything written after T41 should use this one rather than add a third.
+/// </summary>
+public readonly record struct ClientPacket(
+    Recipient To, string PacketName, IReadOnlyDictionary<string, object>? Fields,
+    byte[]? RawPacket, byte[]? RawBody) : IArbiterClientAction
+{
+    /// <summary>A def-driven packet for a character db id.</summary>
+    public static ClientPacket ToPlayer(int playerId, string name, IReadOnlyDictionary<string, object> fields)
+        => new(Recipient.Player(playerId), name, fields, null, null);
+
+    /// <summary>A def-driven packet for a tunnel ticket.</summary>
+    public static ClientPacket ToTicket(uint ticket, string name, IReadOnlyDictionary<string, object> fields)
+        => new(Recipient.Ticket(ticket), name, fields, null, null);
+
+    /// <summary>A finished packet, header included - one World built.</summary>
+    public static ClientPacket Framed(Recipient to, byte[] packet) => new(to, "(raw)", null, packet, null);
+
+    /// <summary>A body the dispatcher frames by packet name.</summary>
+    public static ClientPacket Body(Recipient to, string name, byte[] body) => new(to, name, null, null, body);
+}
+
+/// <summary>
+/// A ready-made <see cref="IArbiterActions"/> for subsystems that do not need their own. Keeps
+/// one ordered list and nothing else; <see cref="PartyActions"/> and <see cref="GuildActions"/>
+/// are the two that came first and carry extra typed lists their tests read.
+/// </summary>
+public class ArbiterActions : IArbiterActions
+{
+    private readonly List<IArbiterAction> _ordered = new();
+
+    public Recipient Origin { get; set; } = Recipient.None;
+    public IReadOnlyList<IArbiterAction> Ordered => _ordered;
+    public string? Rejected { get; set; }
+    public bool IsEmpty => _ordered.Count == 0;
+
+    public ArbiterActions Reject(string why) { Rejected = why; return this; }
+    public void Client(IArbiterClientAction a) => _ordered.Add(a);
+    public void World(ushort opcode, byte[] payload) => _ordered.Add(new WorldAction(opcode, payload));
+
+    /// <summary>Shorthand for the common case: a def-driven packet to a character db id.</summary>
+    public void ToPlayer(int playerId, string packetName, IReadOnlyDictionary<string, object> fields)
+        => Client(ClientPacket.ToPlayer(playerId, packetName, fields));
+}
+
 public sealed class ActionDispatcher
 {
     private readonly Func<uint, IClientSink?> _byTicket;

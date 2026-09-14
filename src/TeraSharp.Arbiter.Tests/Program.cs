@@ -11483,4 +11483,644 @@ some prose with `backticks` that is not a table row
         }
         return null;
     }
+
+    // =======================================================================================
+    // T43 - whisper and private chat channels (status/CHAT-DESIGN.md).
+    //
+    // The layouts are pinned the same way T36/T39 pinned the guild ones: NamedDefs must produce
+    // exactly the bytes the shipped .def would, and CorrectedDefs must land on the offsets the
+    // Arbiter's own PDL dumper proves. The behaviour tests then walk the three scenarios the
+    // brief names - whisper, join/leave, and channel chat to three members - and read the
+    // ORDERED list, because emission order is the thing ActionDispatcher preserves.
+    //
+    // The trap these tests exist to pin: C_CHAT's Type 0x0B..0x12 and C_LEAVE_PRIVATE_CHANNEL's
+    // Index are the sender's own SLOT 0..7, never a channel id. Chat_chat_type_is_a_slot_not_a_
+    // channel_id fails loudly if that is ever "simplified".
+    // =======================================================================================
+
+    /// <summary>An in-memory store with `count` characters named c1..cN, ids 1..count.</summary>
+    static TeraSharp.Arbiter.Persistence.CharacterStore ChatStore(int count = 4)
+    {
+        var store = new TeraSharp.Arbiter.Persistence.CharacterStore(":memory:", QuietLog());
+        var acct = store.GetOrCreateAccount("t43");
+        for (int i = 1; i <= count; i++)
+        {
+            int id = store.CreateCharacter(new TeraSharp.Arbiter.Persistence.CharacterRecord
+            {
+                AccountId = acct.Id, Name = "c" + i, Gender = i % 2, Race = 1, Class = 2,
+                Level = 60, TemplateId = 10101, Zone = 5, X = 1f, Y = 2f, Z = 3f,
+                Appearance = new byte[8], Details = new byte[32], Shape = new byte[64],
+                Position = i,
+            });
+            Hex.True(id == i, $"expected character id {i}, got {id}");
+        }
+        return store;
+    }
+
+    /// <summary>A manager with characters 1..online registered; the rest exist but are offline.</summary>
+    static ChatManager NewChatManager(TeraSharp.Arbiter.Persistence.CharacterStore store, int online = 3)
+    {
+        var cm = new ChatManager(store, QuietLog());
+        for (int i = 1; i <= online; i++)
+            cm.Register(new ChatPlayer(i, "c" + i, 0x0400000000000000UL | (ulong)i, 60, 2, false));
+        return cm;
+    }
+
+    /// <summary>(recipient, packet) for every client action, in emission order.</summary>
+    static List<(int To, string Packet)> ChatSeq(ArbiterActions a)
+    {
+        var seq = new List<(int, string)>();
+        foreach (var item in a.Ordered)
+            if (item is IArbiterClientAction c) seq.Add((unchecked((int)c.To.Id), c.PacketName));
+        return seq;
+    }
+
+    /// <summary>The n-th client action's fields.</summary>
+    static IReadOnlyDictionary<string, object> ChatFields(ArbiterActions a, int n)
+    {
+        int i = 0;
+        foreach (var item in a.Ordered)
+            if (item is IArbiterClientAction c && i++ == n) return c.Fields!;
+        throw new Exception($"no client action #{n} (there are {i})");
+    }
+
+    static int ChatCount(ArbiterActions a, string packet)
+    {
+        int n = 0;
+        foreach (var item in a.Ordered)
+            if (item is IArbiterClientAction c && c.PacketName == packet) n++;
+        return n;
+    }
+
+    /// <summary>Writes a NUL-terminated UTF-16LE string at `at` and returns the next index.</summary>
+    static int PutW(byte[] b, int at, string s)
+    {
+        for (int i = 0; i < s.Length; i++) { b[at++] = (byte)s[i]; b[at++] = (byte)(s[i] >> 8); }
+        b[at++] = 0; b[at++] = 0;
+        return at;
+    }
+
+    /// <summary>C_WHISPER (0xE8E5): [u16 toOff][u16 talkOff], fixed 0x08.</summary>
+    static byte[] CWhisperBody(string to, string talk)
+    {
+        var b = new byte[4 + (to.Length + 1) * 2 + (talk.Length + 1) * 2];
+        BitConverter.GetBytes((ushort)(4 + 4)).CopyTo(b, 0);
+        BitConverter.GetBytes((ushort)(4 + 4 + (to.Length + 1) * 2)).CopyTo(b, 2);
+        PutW(b, PutW(b, 4, to), talk);
+        return b;
+    }
+
+    /// <summary>C_CHAT (0xEB77): [u16 talkOff][i32 type], fixed 0x0A.</summary>
+    static byte[] CChatBody(string talk, int type)
+    {
+        var b = new byte[6 + (talk.Length + 1) * 2];
+        BitConverter.GetBytes((ushort)(6 + 4)).CopyTo(b, 0);
+        BitConverter.GetBytes(type).CopyTo(b, 2);
+        PutW(b, 6, talk);
+        return b;
+    }
+
+    /// <summary>C_JOIN_PRIVATE_CHANNEL (0x7E16): [u16 nameOff][u16 password], fixed 0x08.</summary>
+    static byte[] CJoinBody(string name, ushort password)
+    {
+        var b = new byte[4 + (name.Length + 1) * 2];
+        BitConverter.GetBytes((ushort)(4 + 4)).CopyTo(b, 0);
+        BitConverter.GetBytes(password).CopyTo(b, 2);
+        PutW(b, 4, name);
+        return b;
+    }
+
+    /// <summary>C_LEAVE_PRIVATE_CHANNEL (0x561E): [i16 slot], fixed 0x06.</summary>
+    static byte[] CLeaveBody(int slot) => BitConverter.GetBytes((short)slot);
+
+    /// <summary>C_KICK_CHANNEL_MEMBER (0xA531): [u16 nameOff][i16 slot], fixed 0x08 - the
+    /// CORRECTED order, which is what the handler reads and what the .def gets backwards.</summary>
+    static byte[] CKickBody(string userName, int slot)
+    {
+        var b = new byte[4 + (userName.Length + 1) * 2];
+        BitConverter.GetBytes((ushort)(4 + 4)).CopyTo(b, 0);
+        BitConverter.GetBytes((short)slot).CopyTo(b, 2);
+        PutW(b, 4, userName);
+        return b;
+    }
+
+    /// <summary>C_CHANGE_CHANNEL_PASSWORD (0x96E4): [i16 slot][i16 current][i16 new].</summary>
+    static byte[] CChpwBody(int slot, ushort current, ushort next)
+    {
+        var b = new byte[6];
+        BitConverter.GetBytes((short)slot).CopyTo(b, 0);
+        BitConverter.GetBytes(current).CopyTo(b, 2);
+        BitConverter.GetBytes(next).CopyTo(b, 4);
+        return b;
+    }
+
+    /// <summary>C_REQUEST_PRIVATE_CHANNEL_INFO (0x73BD): [i32 channelId].</summary>
+    static byte[] CInfoBody(int channelId) => BitConverter.GetBytes(channelId);
+
+    /// <summary>C_CREATE_PRIVATE_CHANNEL (0xB868): [u16 count][u16 off][u16 nameOff][u16 password]
+    /// then {[u16 self][u16 next][i32 userDbId]} elements.</summary>
+    static byte[] CCreateBody(string name, ushort password, params int[] invited)
+    {
+        int nameAt = 8, arrayAt = nameAt + (name.Length + 1) * 2;
+        var b = new byte[arrayAt + invited.Length * 8];
+        BitConverter.GetBytes((ushort)invited.Length).CopyTo(b, 0);
+        BitConverter.GetBytes((ushort)(invited.Length == 0 ? 0 : arrayAt + 4)).CopyTo(b, 2);
+        BitConverter.GetBytes((ushort)(nameAt + 4)).CopyTo(b, 4);
+        BitConverter.GetBytes(password).CopyTo(b, 6);
+        PutW(b, nameAt, name);
+        for (int i = 0; i < invited.Length; i++)
+        {
+            int at = arrayAt + i * 8;
+            BitConverter.GetBytes((ushort)(at + 4)).CopyTo(b, at);
+            BitConverter.GetBytes((ushort)(i == invited.Length - 1 ? 0 : at + 12)).CopyTo(b, at + 2);
+            BitConverter.GetBytes(invited[i]).CopyTo(b, at + 4);
+        }
+        return b;
+    }
+
+    // ---------------------------------- layouts ----------------------------------
+
+    [Test] public static void Chat_named_defs_are_byte_identical_to_the_shipped_ones()
+    {
+        var defs = LoadDefinitionsOrSkip();
+        if (defs == null) return;
+
+        // our field name -> the shipped file's, and one set of values written through both.
+        var cases = new (string Packet, Dictionary<string, object> Ours, Dictionary<string, object> Shipped)[]
+        {
+            ("S_WHISPER",
+             new() { ["fromName"] = "c1", ["to"] = "c2", ["talk"] = "hi there",
+                     ["fromGameId"] = 0x0400000000000001UL, ["isWorldEventTarget"] = false,
+                     ["isAdmin"] = true, ["isExistingUser"] = false },
+             new() { ["name"] = "c1", ["recipient"] = "c2", ["message"] = "hi there",
+                     ["gameId"] = 0x0400000000000001UL, ["isWorldEventTarget"] = false,
+                     ["gm"] = true, ["founder"] = false }),
+
+            ("S_PRIVATE_CHAT",
+             new() { ["fromName"] = "c1", ["talk"] = "hello", ["channelId"] = 7,
+                     ["fromGameId"] = 0x0400000000000001UL },
+             new() { ["authorName"] = "c1", ["message"] = "hello", ["channel"] = 7,
+                     ["authorID"] = 0x0400000000000001UL }),
+
+            ("S_PRIVATE_CHANNEL_NOTICE",
+             new() { ["value"] = "c2", ["channelId"] = 3, ["sysMsgId"] = 0xDFF },
+             new() { ["name"] = "c2", ["channelId"] = 3, ["event"] = 0xDFF }),
+
+            ("S_REQUEST_PRIVATE_CHANNEL_INFO",
+             new() { ["isMaster"] = true, ["password"] = (ushort)4242,
+                     ["memberList"] = new List<Dictionary<string, object>>
+                        { new() { ["charName"] = "c1" }, new() { ["charName"] = "c2" } },
+                     ["friendList"] = new List<Dictionary<string, object>>
+                        { new() { ["charName"] = "c3", ["userDbId"] = 3, ["userClass"] = 2,
+                                  ["level"] = 60, ["groupId"] = 0 } } },
+             new() { ["owner"] = true, ["password"] = (ushort)4242,
+                     ["members"] = new List<Dictionary<string, object>>
+                        { new() { ["name"] = "c1" }, new() { ["name"] = "c2" } },
+                     ["friends"] = new List<Dictionary<string, object>>
+                        { new() { ["name"] = "c3", ["playerId"] = 3, ["class"] = 2,
+                                  ["level"] = 60, ["group"] = 0 } } }),
+        };
+
+        foreach (var (packet, ours, shipped) in cases)
+        {
+            var mine = new DefinitionWriter().Write(ChatManager.ResolveDef(null, packet)!, ours);
+            var theirs = new DefinitionWriter().Write(defs.Get(packet)!, shipped);
+            Hex.Eq(mine, theirs, $"{packet}: NamedDefs must be a rename, not a change");
+        }
+    }
+
+    [Test] public static void Chat_corrected_defs_land_on_the_decompiled_offsets()
+    {
+        // C_KICK_CHANNEL_MEMBER: the shipped .def declares `string index` then `string userName`,
+        // i.e. two refs. The handler reads a NAME ref at packet 0x04 and a RAW i16 slot at 0x06.
+        var kick = ChatManager.ResolveDef(null, "C_KICK_CHANNEL_MEMBER")!;
+        var kickTrace = new List<string>();
+        var kickBytes = new DefinitionWriter { Trace = kickTrace }
+            .Write(kick, new Dictionary<string, object> { ["userName"] = "c2", ["index"] = 3 });
+        Hex.True(kickTrace.Contains("index@6"),
+            "C_KICK_CHANNEL_MEMBER.index is a raw i16 at packet 0x06, not a second ref: "
+            + string.Join(", ", kickTrace));
+        Hex.True(BitConverter.ToUInt16(kickBytes, 0) == 0x08,
+            $"userName ref at 0x04 points past the 0x08 fixed part, got 0x{BitConverter.ToUInt16(kickBytes, 0):X2}");
+        Hex.True(BitConverter.ToInt16(kickBytes, 2) == 3, "and the slot is the raw value 3");
+
+        // S_JOIN_PRIVATE_CHANNEL: the shipped `array unk` has no element type, so the writer
+        // emits headers and no payload. The real element is one i32 UserDbId -> stride 8.
+        var join = ChatManager.ResolveDef(null, "S_JOIN_PRIVATE_CHANNEL")!;
+        var members = new List<Dictionary<string, object>>
+            { new() { ["userDbId"] = 1 }, new() { ["userDbId"] = 2 }, new() { ["userDbId"] = 3 } };
+        var jt = new List<string>();
+        var jb = new DefinitionWriter { Trace = jt }.Write(join, new Dictionary<string, object>
+            { ["index"] = 0, ["channelId"] = 9, ["name"] = "raid", ["userList"] = members });
+
+        Hex.True(jt.Contains("index@10") && jt.Contains("channelId@14"),
+            "S_JOIN_PRIVATE_CHANNEL: index at packet 0x0A, channelId at 0x0E: " + string.Join(", ", jt));
+        Hex.True(BitConverter.ToUInt16(jb, 0) == 3, "userList count is 3");
+        int arrayAt = BitConverter.ToUInt16(jb, 2);
+        Hex.True(arrayAt == 0x12, $"userList starts at the 0x12 fixed part, got 0x{arrayAt:X2}");
+        // elements are [u16 self][u16 next][i32 id]; the second's `self` proves the stride.
+        Hex.True(BitConverter.ToUInt16(jb, arrayAt - 4 + 2) == arrayAt + 8,
+            "element stride is 8 - [u16 self][u16 next][i32 userDbId]");
+        Hex.True(BitConverter.ToInt32(jb, arrayAt - 4 + 4) == 1, "first member is character 1");
+    }
+
+    [Test] public static void Chat_min_client_lengths_match_the_handler_guards()
+    {
+        var want = new (ushort Op, int Len)[]
+        {
+            (ChatPackets.C_WHISPER, 0x08), (ChatPackets.C_CHAT, 0x0A),
+            (ChatPackets.C_CREATE_PRIVATE_CHANNEL, 0x0C), (ChatPackets.C_EDIT_PRIVATE_CHANNEL, 0x0C),
+            (ChatPackets.C_JOIN_PRIVATE_CHANNEL, 0x08), (ChatPackets.C_LEAVE_PRIVATE_CHANNEL, 0x06),
+            (ChatPackets.C_KICK_CHANNEL_MEMBER, 0x08), (ChatPackets.C_CHANGE_CHANNEL_PASSWORD, 0x0A),
+            (ChatPackets.C_REQUEST_PRIVATE_CHANNEL_INFO, 0x08),
+        };
+        foreach (var (op, len) in want)
+            Hex.True(ChatPackets.MinClientLength(op) == len,
+                $"0x{op:X4} min length 0x{ChatPackets.MinClientLength(op):X2}, want 0x{len:X2}");
+        Hex.True(ChatPackets.MinClientLength(0x1234) == 0, "an unknown opcode has no guard");
+    }
+
+    // ---------------------------------- whisper ----------------------------------
+
+    [Test] public static void Chat_whisper_reaches_the_receiver_then_echoes_to_the_sender()
+    {
+        using var store = ChatStore();
+        var cm = NewChatManager(store);
+
+        var a = cm.OnClientPacket(1, ChatPackets.C_WHISPER, CWhisperBody("c2", "hi there"));
+        Hex.True(a.Rejected == null, $"whisper rejected: {a.Rejected}");
+        var seq = ChatSeq(a);
+        Hex.True(seq.Count == 2 && seq[0] == (2, "S_WHISPER") && seq[1] == (1, "S_WHISPER"),
+            "S_WHISPER goes to the receiver first, then back to the sender: "
+            + string.Join(", ", seq.Select(x => $"{x.To}:{x.Packet}")));
+
+        var f = ChatFields(a, 0);
+        Hex.True((string)f["fromName"] == "c1", "both copies carry the SENDER as From");
+        Hex.True((string)f["to"] == "c2", "and the receiver as To");
+        Hex.True((string)f["talk"] == "hi there", "the text survives the round trip");
+        Hex.True(ReferenceEquals(f, ChatFields(a, 1)), "one dictionary serves both sends");
+    }
+
+    [Test] public static void Chat_whisper_rejects_self_offline_unknown_and_blocked()
+    {
+        using var store = ChatStore();
+        var cm = NewChatManager(store);   // c4 exists but never registered -> offline
+
+        void Smt(int sender, string target, string expect, string what)
+        {
+            var a = cm.OnClientPacket(sender, ChatPackets.C_WHISPER, CWhisperBody(target, "x"));
+            Hex.True(a.Rejected != null, what + ": should carry a reason");
+            var seq = ChatSeq(a);
+            Hex.True(seq.Count == 1 && seq[0] == (sender, "S_SYSTEM_MESSAGE"),
+                what + ": exactly one system message back to the sender");
+            Hex.True((string)ChatFields(a, 0)["message"] == expect,
+                what + $": want {expect}, got {ChatFields(a, 0)["message"]}");
+        }
+
+        Smt(1, "c1", "@111", "whispering yourself");           // 0x6F
+        Smt(1, "c4", "@831", "whispering an offline player");  // 0x33F
+        Smt(1, "nobody", "@831", "whispering a name with no character");
+
+        store.AddBlock(2, 1);
+        Smt(1, "c2", "@1338\vUserName\vc2", "the target has blocked the sender");   // 0x53A
+        store.RemoveBlock(2, 1);
+        store.AddBlock(1, 2);
+        Smt(1, "c2", "@1463\vUserName\vc2", "the sender has blocked the target");   // 0x5B7
+    }
+
+    // ---------------------------------- join / leave ----------------------------------
+
+    [Test] public static void Chat_create_emits_the_created_notice_then_the_join()
+    {
+        using var store = ChatStore();
+        var cm = NewChatManager(store);
+
+        var a = cm.OnClientPacket(1, ChatPackets.C_CREATE_PRIVATE_CHANNEL, CCreateBody("raidchat", 4242));
+        Hex.True(a.Rejected == null, $"create rejected: {a.Rejected}");
+        var seq = ChatSeq(a);
+        Hex.True(seq.Count == 3
+            && seq[0] == (1, "S_PRIVATE_CHANNEL_NOTICE")
+            && seq[1] == (1, "S_JOIN_PRIVATE_CHANNEL")
+            && seq[2] == (1, "S_PRIVATE_CHANNEL_NOTICE"),
+            "create: notice(0xDFE), the creator's channel window, notice(0xDFF): "
+            + string.Join(", ", seq.Select(x => $"{x.To}:{x.Packet}")));
+
+        Hex.True((int)ChatFields(a, 0)["sysMsgId"] == ChatManager.NoticeCreated, "first notice is 0xDFE");
+        Hex.True((int)ChatFields(a, 2)["sysMsgId"] == ChatManager.NoticeJoined, "second notice is 0xDFF");
+        Hex.True((int)ChatFields(a, 1)["index"] == 0, "the creator lands in slot 0");
+        Hex.True((int)ChatFields(a, 1)["channelId"] == 1, "the first channel id is 1, not 0");
+
+        // there is no S_CREATE_PRIVATE_CHANNEL on the wire in this build
+        Hex.True(ChatCount(a, "S_CREATE_PRIVATE_CHANNEL") == 0,
+            "S_CREATE_PRIVATE_CHANNEL has no construction site in the binary - do not invent one");
+
+        // name is taken now
+        var again = cm.OnClientPacket(2, ChatPackets.C_CREATE_PRIVATE_CHANNEL, CCreateBody("raidchat", 1111));
+        Hex.True((string)ChatFields(again, 0)["message"] == "@960", "a duplicate name is SMT 960 (0x3C0)");
+        // and a password outside 1000..9999 is refused
+        var bad = cm.OnClientPacket(2, ChatPackets.C_CREATE_PRIVATE_CHANNEL, CCreateBody("other", 12));
+        Hex.True((string)ChatFields(bad, 0)["message"] == "@962", "a non-four-digit password is SMT 962");
+    }
+
+    [Test] public static void Chat_join_tells_the_joiner_then_every_member()
+    {
+        using var store = ChatStore();
+        var cm = NewChatManager(store);
+        cm.OnClientPacket(1, ChatPackets.C_CREATE_PRIVATE_CHANNEL, CCreateBody("raidchat", 4242));
+
+        var a = cm.OnClientPacket(2, ChatPackets.C_JOIN_PRIVATE_CHANNEL, CJoinBody("raidchat", 4242));
+        var seq = ChatSeq(a);
+        Hex.True(seq.Count == 3
+            && seq[0] == (2, "S_JOIN_PRIVATE_CHANNEL")
+            && seq[1] == (1, "S_PRIVATE_CHANNEL_NOTICE")
+            && seq[2] == (2, "S_PRIVATE_CHANNEL_NOTICE"),
+            "join: the joiner's window first, then a notice to every member in insertion order: "
+            + string.Join(", ", seq.Select(x => $"{x.To}:{x.Packet}")));
+
+        var b = cm.OnClientPacket(3, ChatPackets.C_JOIN_PRIVATE_CHANNEL, CJoinBody("raidchat", 4242));
+        Hex.True(ChatCount(b, "S_PRIVATE_CHANNEL_NOTICE") == 3, "three members, three notices");
+        var list = (List<Dictionary<string, object>>)ChatFields(b, 0)["userList"];
+        Hex.True(list.Count == 3 && (int)list[0]["userDbId"] == 1 && (int)list[2]["userDbId"] == 3,
+            "the member list is every member in join order");
+        Hex.True((int)ChatFields(b, 0)["index"] == 0,
+            "slots are PER USER - c3's first channel is c3's slot 0, whatever c1 and c2 hold");
+
+        // failures
+        var wrong = cm.OnClientPacket(4, ChatPackets.C_JOIN_PRIVATE_CHANNEL, CJoinBody("raidchat", 1111));
+        Hex.True((string)ChatFields(wrong, 0)["message"] == "@966", "a wrong password is SMT 966");
+        var missing = cm.OnClientPacket(4, ChatPackets.C_JOIN_PRIVATE_CHANNEL, CJoinBody("nope", 4242));
+        Hex.True((string)ChatFields(missing, 0)["message"] == "@963", "an unknown channel is SMT 963");
+        var dup = cm.OnClientPacket(3, ChatPackets.C_JOIN_PRIVATE_CHANNEL, CJoinBody("raidchat", 4242));
+        Hex.True(dup.IsEmpty && dup.Rejected != null, "joining twice emits nothing");
+    }
+
+    [Test] public static void Chat_leave_tells_the_leaver_then_the_remaining_members()
+    {
+        using var store = ChatStore();
+        var cm = NewChatManager(store);
+        cm.OnClientPacket(1, ChatPackets.C_CREATE_PRIVATE_CHANNEL, CCreateBody("raidchat", 4242));
+        cm.OnClientPacket(2, ChatPackets.C_JOIN_PRIVATE_CHANNEL, CJoinBody("raidchat", 4242));
+        cm.OnClientPacket(3, ChatPackets.C_JOIN_PRIVATE_CHANNEL, CJoinBody("raidchat", 4242));
+
+        var a = cm.OnClientPacket(2, ChatPackets.C_LEAVE_PRIVATE_CHANNEL, CLeaveBody(0));
+        var seq = ChatSeq(a);
+        Hex.True(seq.Count == 3
+            && seq[0] == (2, "S_LEAVE_PRIVATE_CHANNEL")
+            && seq[1] == (1, "S_PRIVATE_CHANNEL_NOTICE")
+            && seq[2] == (3, "S_PRIVATE_CHANNEL_NOTICE"),
+            "leave: the leaver, then the REMAINING members - never the leaver twice: "
+            + string.Join(", ", seq.Select(x => $"{x.To}:{x.Packet}")));
+        Hex.True((int)ChatFields(a, 0)["channelId"] == 1, "S_LEAVE carries the real channel id");
+        Hex.True((int)ChatFields(a, 1)["sysMsgId"] == ChatManager.NoticeLeft, "the notice is 0xE00");
+        Hex.True(cm.SlotsOf(2)[0] == -1, "and the slot is free again");
+
+        var stale = cm.OnClientPacket(2, ChatPackets.C_LEAVE_PRIVATE_CHANNEL, CLeaveBody(0));
+        Hex.True((string)ChatFields(stale, 0)["message"] == "@977", "an unjoined slot is SMT 977 (0x3D1)");
+        var oob = cm.OnClientPacket(2, ChatPackets.C_LEAVE_PRIVATE_CHANNEL, CLeaveBody(99));
+        Hex.True((string)ChatFields(oob, 0)["message"] == "@977", "so is a slot outside 0..7");
+    }
+
+    [Test] public static void Chat_master_leaving_promotes_the_oldest_member()
+    {
+        using var store = ChatStore();
+        var cm = NewChatManager(store);
+        cm.OnClientPacket(1, ChatPackets.C_CREATE_PRIVATE_CHANNEL, CCreateBody("raidchat", 4242));
+        cm.OnClientPacket(2, ChatPackets.C_JOIN_PRIVATE_CHANNEL, CJoinBody("raidchat", 4242));
+        cm.OnClientPacket(3, ChatPackets.C_JOIN_PRIVATE_CHANNEL, CJoinBody("raidchat", 4242));
+
+        var a = cm.OnClientPacket(1, ChatPackets.C_LEAVE_PRIVATE_CHANNEL, CLeaveBody(0));
+        var seq = ChatSeq(a);
+        Hex.True(seq[0] == (1, "S_LEAVE_PRIVATE_CHANNEL"), "the master still gets S_LEAVE first");
+        Hex.True((int)ChatFields(a, 1)["sysMsgId"] == ChatManager.NoticeNewMaster,
+            "then the promotion notice 0xE01");
+        Hex.True((string)ChatFields(a, 1)["value"] == "c2", "naming the oldest remaining member");
+        Hex.True((int)ChatFields(a, 3)["sysMsgId"] == ChatManager.NoticeLeft, "and only then 0xE00 left");
+        Hex.True(cm.Channel(1)!.MasterDbId == 2, "c2 owns the channel now");
+    }
+
+    // ---------------------------------- channel chat ----------------------------------
+
+    [Test] public static void Chat_channel_chat_reaches_three_members_with_the_real_id()
+    {
+        using var store = ChatStore();
+        var cm = NewChatManager(store);
+        cm.OnClientPacket(1, ChatPackets.C_CREATE_PRIVATE_CHANNEL, CCreateBody("raidchat", 4242));
+        cm.OnClientPacket(2, ChatPackets.C_JOIN_PRIVATE_CHANNEL, CJoinBody("raidchat", 4242));
+        cm.OnClientPacket(3, ChatPackets.C_JOIN_PRIVATE_CHANNEL, CJoinBody("raidchat", 4242));
+
+        var a = cm.OnClientPacket(2, ChatPackets.C_CHAT,
+            CChatBody("<FONT>hello all</FONT>", ChatManager.ChatTypePrivateFirst));
+        Hex.True(a.Rejected == null, $"channel chat rejected: {a.Rejected}");
+        var seq = ChatSeq(a);
+        Hex.True(seq.Count == 3
+            && seq[0] == (1, "S_PRIVATE_CHAT")
+            && seq[1] == (2, "S_PRIVATE_CHAT")
+            && seq[2] == (3, "S_PRIVATE_CHAT"),
+            "every member gets S_PRIVATE_CHAT, the sender included: "
+            + string.Join(", ", seq.Select(x => $"{x.To}:{x.Packet}")));
+
+        var f = ChatFields(a, 0);
+        Hex.True((int)f["channelId"] == 1,
+            "S_PRIVATE_CHAT carries the REAL channel id even though the client sent a slot");
+        Hex.True((string)f["fromName"] == "c2" && (string)f["talk"] == "<FONT>hello all</FONT>",
+            "author and text are the sender's");
+        Hex.True(ReferenceEquals(f, ChatFields(a, 2)), "one dictionary for all three sends");
+    }
+
+    [Test] public static void Chat_chat_type_is_a_slot_not_a_channel_id()
+    {
+        using var store = ChatStore();
+        var cm = NewChatManager(store, online: 1);
+
+        // eight channels for one character; ChatType 0x0B+i must select the i-th SLOT.
+        for (int i = 0; i < ChatManager.MaxChannelsPerUser; i++)
+        {
+            var made = cm.OnClientPacket(1, ChatPackets.C_CREATE_PRIVATE_CHANNEL,
+                CCreateBody("ch" + i, (ushort)(1000 + i)));
+            Hex.True(made.Rejected == null, $"channel ch{i} rejected: {made.Rejected}");
+        }
+        for (int i = 0; i < ChatManager.MaxChannelsPerUser; i++)
+        {
+            var a = cm.OnClientPacket(1, ChatPackets.C_CHAT,
+                CChatBody("m" + i, ChatManager.ChatTypePrivateFirst + i));
+            Hex.True((int)ChatFields(a, 0)["channelId"] == i + 1,
+                $"ChatType 0x{ChatManager.ChatTypePrivateFirst + i:X2} is slot {i}, i.e. channel {i + 1}");
+        }
+
+        // a ninth channel is refused
+        var ninth = cm.OnClientPacket(1, ChatPackets.C_CREATE_PRIVATE_CHANNEL, CCreateBody("ch8", 1008));
+        Hex.True((string)ChatFields(ninth, 0)["message"] == "@967", "a ninth channel is SMT 967 (0x3C7)");
+
+        // an unjoined slot, and a type that is not a private channel at all
+        var cm2 = NewChatManager(ChatStore(), online: 1);
+        var unjoined = cm2.OnClientPacket(1, ChatPackets.C_CHAT, CChatBody("x", ChatManager.ChatTypePrivateFirst));
+        Hex.True((string)ChatFields(unjoined, 0)["message"] == "@977", "an unjoined slot is SMT 977");
+        var say = cm2.OnClientPacket(1, ChatPackets.C_CHAT, CChatBody("x", 0));
+        Hex.True(say.IsEmpty && say.Rejected != null,
+            "ChatType 0 (say) is not this class's job - it must emit nothing and say why");
+        var over = cm2.OnClientPacket(1, ChatPackets.C_CHAT, CChatBody("x", ChatManager.ChatTypeMax + 1));
+        Hex.True(over.IsEmpty && over.Rejected != null, "and 0xDC or above is out of the ChatType space");
+    }
+
+    // ---------------------------------- kick, password, info ----------------------------------
+
+    [Test] public static void Chat_kick_removes_the_victim_and_tells_them_why()
+    {
+        using var store = ChatStore();
+        var cm = NewChatManager(store);
+        cm.OnClientPacket(1, ChatPackets.C_CREATE_PRIVATE_CHANNEL, CCreateBody("raidchat", 4242));
+        cm.OnClientPacket(2, ChatPackets.C_JOIN_PRIVATE_CHANNEL, CJoinBody("raidchat", 4242));
+
+        var a = cm.OnClientPacket(1, ChatPackets.C_KICK_CHANNEL_MEMBER, CKickBody("c2", 0));
+        var seq = ChatSeq(a);
+        Hex.True(seq.Count == 3
+            && seq[0] == (2, "S_LEAVE_PRIVATE_CHANNEL")
+            && seq[1] == (1, "S_PRIVATE_CHANNEL_NOTICE")
+            && seq[2] == (2, "S_SYSTEM_MESSAGE"),
+            "kick: the victim leaves, the channel is told, the victim is told why: "
+            + string.Join(", ", seq.Select(x => $"{x.To}:{x.Packet}")));
+        Hex.True((string)ChatFields(a, 2)["message"] == "@971\v_ChannelName\vraidchat",
+            "SMT 971 (0x3CB) carries the channel name");
+        Hex.True(!cm.Channel(1)!.Has(2), "and c2 really is out");
+
+        var self = cm.OnClientPacket(1, ChatPackets.C_KICK_CHANNEL_MEMBER, CKickBody("c1", 0));
+        Hex.True((string)ChatFields(self, 0)["message"] == "@278", "kicking yourself is SMT 278 (0x116)");
+        var notMember = cm.OnClientPacket(1, ChatPackets.C_KICK_CHANNEL_MEMBER, CKickBody("c3", 0));
+        Hex.True((string)ChatFields(notMember, 0)["message"] == "@965", "a non-member is SMT 965 (0x3C5)");
+
+        cm.OnClientPacket(2, ChatPackets.C_JOIN_PRIVATE_CHANNEL, CJoinBody("raidchat", 4242));
+        var notMaster = cm.OnClientPacket(2, ChatPackets.C_KICK_CHANNEL_MEMBER, CKickBody("c1", 0));
+        Hex.True((string)ChatFields(notMaster, 0)["message"] == "@968", "only the master may kick (SMT 968)");
+    }
+
+    [Test] public static void Chat_password_change_is_master_only_and_four_digits()
+    {
+        using var store = ChatStore();
+        var cm = NewChatManager(store);
+        cm.OnClientPacket(1, ChatPackets.C_CREATE_PRIVATE_CHANNEL, CCreateBody("raidchat", 4242));
+        cm.OnClientPacket(2, ChatPackets.C_JOIN_PRIVATE_CHANNEL, CJoinBody("raidchat", 4242));
+
+        var ok = cm.OnClientPacket(1, ChatPackets.C_CHANGE_CHANNEL_PASSWORD, CChpwBody(0, 4242, 7777));
+        Hex.True((string)ChatFields(ok, 0)["message"] == "@979\v_ChannelName\vraidchat",
+            "a successful change is SMT 979 (0x3D3) with the channel name");
+        Hex.True(cm.Channel(1)!.Password == 7777, "and the password actually changed");
+
+        var stale = cm.OnClientPacket(1, ChatPackets.C_CHANGE_CHANNEL_PASSWORD, CChpwBody(0, 4242, 1234));
+        Hex.True((string)ChatFields(stale, 0)["message"] == "@966", "a stale current password is SMT 966");
+        var short_ = cm.OnClientPacket(1, ChatPackets.C_CHANGE_CHANNEL_PASSWORD, CChpwBody(0, 7777, 12));
+        Hex.True((string)ChatFields(short_, 0)["message"] == "@962", "and a two-digit one is SMT 962");
+        var notMaster = cm.OnClientPacket(2, ChatPackets.C_CHANGE_CHANNEL_PASSWORD, CChpwBody(0, 7777, 1234));
+        Hex.True((string)ChatFields(notMaster, 0)["message"] == "@968", "only the master may change it");
+        var noop = cm.OnClientPacket(1, ChatPackets.C_CHANGE_CHANNEL_PASSWORD, CChpwBody(0, 7777, 7777));
+        Hex.True(noop.IsEmpty, "old == new emits nothing at all");
+    }
+
+    [Test] public static void Chat_channel_info_answers_the_create_dialog_defaults_for_minus_one()
+    {
+        using var store = ChatStore();
+        var cm = NewChatManager(store);
+        cm.OnClientPacket(1, ChatPackets.C_CREATE_PRIVATE_CHANNEL, CCreateBody("raidchat", 4242));
+        cm.OnClientPacket(2, ChatPackets.C_JOIN_PRIVATE_CHANNEL, CJoinBody("raidchat", 4242));
+
+        var a = cm.OnClientPacket(1, ChatPackets.C_REQUEST_PRIVATE_CHANNEL_INFO, CInfoBody(1));
+        var seq = ChatSeq(a);
+        Hex.True(seq.Count == 1 && seq[0] == (1, "S_REQUEST_PRIVATE_CHANNEL_INFO"),
+            "the reply is S_REQUEST_PRIVATE_CHANNEL_INFO - there is no S_PRIVATE_CHANNEL_INFO in this build");
+        var f = ChatFields(a, 0);
+        Hex.True((bool)f["isMaster"], "c1 is the master");
+        Hex.True((ushort)f["password"] == 4242, "the current password comes back");
+        var members = (List<Dictionary<string, object>>)f["memberList"];
+        Hex.True(members.Count == 2 && (string)members[0]["charName"] == "c1", "both members, in join order");
+
+        var other = cm.OnClientPacket(2, ChatPackets.C_REQUEST_PRIVATE_CHANNEL_INFO, CInfoBody(1));
+        Hex.True(!(bool)ChatFields(other, 0)["isMaster"], "c2 is not");
+
+        var create = cm.OnClientPacket(3, ChatPackets.C_REQUEST_PRIVATE_CHANNEL_INFO, CInfoBody(-1));
+        var d = ChatFields(create, 0);
+        Hex.True(!(bool)d["isMaster"] && (ushort)d["password"] == ChatManager.MinPassword
+            && ((List<Dictionary<string, object>>)d["memberList"]).Count == 0,
+            "channelId -1 answers the create-dialog defaults: not the master, password 1000, no members");
+    }
+
+    // ---------------------------------- lifetime ----------------------------------
+
+    [Test] public static void Chat_logout_leaves_every_channel_and_empties_are_swept()
+    {
+        using var store = ChatStore();
+        var cm = NewChatManager(store);
+        cm.OnClientPacket(1, ChatPackets.C_CREATE_PRIVATE_CHANNEL, CCreateBody("one", 1111));
+        cm.OnClientPacket(1, ChatPackets.C_CREATE_PRIVATE_CHANNEL, CCreateBody("two", 2222));
+        cm.OnClientPacket(2, ChatPackets.C_JOIN_PRIVATE_CHANNEL, CJoinBody("one", 1111));
+
+        var a = cm.Unregister(1);
+        Hex.True(ChatCount(a, "S_LEAVE_PRIVATE_CHANNEL") == 2, "logging out leaves both channels");
+        Hex.True(!cm.IsOnline(1), "and drops the registration");
+        Hex.True(cm.Channel(1)!.Count == 1 && cm.Channel(1)!.Has(2), "c2 is still in 'one'");
+        Hex.True(cm.Channel(2)!.Count == 0, "'two' is empty");
+        Hex.True(cm.Channel(2)!.EmptySinceMs != 0, "and stamped rather than deleted");
+
+        long stamp = cm.Channel(2)!.EmptySinceMs;
+        Hex.True(cm.SweepEmptyChannels(stamp + ChatManager.EmptyChannelTimeoutMs - 1) == 0,
+            "not swept a millisecond early");
+        Hex.True(cm.SweepEmptyChannels(stamp + ChatManager.EmptyChannelTimeoutMs) == 1,
+            "swept at ten minutes");
+        Hex.True(cm.Channel(2) == null && cm.ChannelByName("two") == null,
+            "the channel and its name are both gone");
+        Hex.True(cm.Channel(1) != null, "the occupied one is untouched");
+    }
+
+    // ---------------------------------- the codec ----------------------------------
+
+    [Test] public static void Chat_every_emitted_packet_encodes_through_the_codec()
+    {
+        var defs = LoadDefinitionsOrSkip();
+        if (defs == null) return;
+
+        using var store = ChatStore();
+        var cm = NewChatManager(store);
+        var all = new List<ArbiterActions>
+        {
+            cm.OnClientPacket(1, ChatPackets.C_WHISPER, CWhisperBody("c2", "hi there")),
+            cm.OnClientPacket(1, ChatPackets.C_WHISPER, CWhisperBody("c4", "offline")),
+            cm.OnClientPacket(1, ChatPackets.C_CREATE_PRIVATE_CHANNEL, CCreateBody("raidchat", 4242, 2, 3)),
+            cm.OnClientPacket(2, ChatPackets.C_JOIN_PRIVATE_CHANNEL, CJoinBody("raidchat", 4242)),
+            cm.OnClientPacket(3, ChatPackets.C_JOIN_PRIVATE_CHANNEL, CJoinBody("raidchat", 4242)),
+            cm.OnClientPacket(2, ChatPackets.C_CHAT, CChatBody("<FONT>hi</FONT>", ChatManager.ChatTypePrivateFirst)),
+            cm.OnClientPacket(1, ChatPackets.C_REQUEST_PRIVATE_CHANNEL_INFO, CInfoBody(1)),
+            cm.OnClientPacket(1, ChatPackets.C_CHANGE_CHANNEL_PASSWORD, CChpwBody(0, 4242, 7777)),
+            cm.OnClientPacket(1, ChatPackets.C_KICK_CHANNEL_MEMBER, CKickBody("c3", 0)),
+            cm.OnClientPacket(2, ChatPackets.C_LEAVE_PRIVATE_CHANNEL, CLeaveBody(0)),
+        };
+        all.Add(cm.Unregister(1));
+
+        int encoded = 0;
+        var seen = new HashSet<string>();
+        foreach (var actions in all)
+            foreach (var item in actions.Ordered)
+            {
+                if (item is not IArbiterClientAction c) continue;
+                if (c.Fields == null) continue;
+                var def = ChatManager.ResolveDef(defs, c.PacketName);
+                Hex.True(def != null, $"no def for {c.PacketName} - the wiring would log and drop it");
+                var bytes = new DefinitionWriter().Write(def!, c.Fields);
+                Hex.True(new DefinitionReader(bytes).Read(def!) != null, $"{c.PacketName} did not read back");
+                seen.Add(c.PacketName);
+                encoded++;
+
+                if (c.PacketName == "S_JOIN_PRIVATE_CHANNEL")
+                    Hex.True(BitConverter.ToUInt16(bytes, 2) == 0x12,
+                        "S_JOIN_PRIVATE_CHANNEL's userList starts at the 0x12 fixed part - "
+                        + "ResolveDef must prefer CorrectedDefs over the shipped .def");
+            }
+
+        foreach (var name in new[]
+        {
+            "S_WHISPER", "S_PRIVATE_CHAT", "S_JOIN_PRIVATE_CHANNEL", "S_LEAVE_PRIVATE_CHANNEL",
+            "S_PRIVATE_CHANNEL_NOTICE", "S_REQUEST_PRIVATE_CHANNEL_INFO", "S_SYSTEM_MESSAGE",
+        })
+            Hex.True(seen.Contains(name), $"the scenario never emitted {name}");
+
+        Hex.True(encoded >= 25, $"only {encoded} packets encoded - the scenario got shorter");
+        Console.WriteLine($"        ({encoded} chat packets encoded, {seen.Count} distinct)");
+    }
 }
