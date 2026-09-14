@@ -827,8 +827,10 @@ public sealed class SocialHandlers
 
         int me = (int)chr.Id;
         UpdateGroup(store, me, id, name);
+        // T50: `array<uint32> friends` - the elements arrive as uint, so Convert.ToInt32 threw
+        // on any playerId past int.MaxValue. A bad id simply matches no friend row.
         foreach (var raw in List(f, "friends"))
-            store.SetFriendGroup(me, Convert.ToInt32(raw), id);
+            store.SetFriendGroup(me, DefField.I32(raw), id);
         _log.LogInformation("C_ADD_FRIEND_GROUP: {Name} group {Id}", chr.Name, id);
         return true;
     }
@@ -851,10 +853,12 @@ public sealed class SocialHandlers
 
         int me = (int)chr.Id;
         UpdateGroup(store, me, id, name);
+        // T50: both element fields are `uint32`, and the indexer threw KeyNotFoundException for
+        // an element the reader could not fill. DefField does neither.
         foreach (var raw in List(f, "friends"))
         {
             if (raw is not IReadOnlyDictionary<string, object> e) continue;
-            store.SetFriendGroup(me, Convert.ToInt32(e["playerId"]), Convert.ToInt32(e["id"]));
+            store.SetFriendGroup(me, DefField.I32(e, "playerId"), DefField.I32(e, "id"));
         }
         _log.LogInformation("C_EDIT_FRIEND_GROUP: {Name} group {Id}", chr.Name, id);
         return true;
@@ -1087,14 +1091,22 @@ public sealed class SocialHandlers
         return true;
     }
 
-    // ---- Field helpers: a def field that is absent must never throw in a handler ----
+    // ---- Field helpers: a def field that is absent or hostile must never throw in a handler ----
+    //
+    // T50: these forward to DefField, which reinterprets rather than range-checks. The old I32
+    // used Convert.ToInt32, and every id field the friend-group packets carry is `uint32` in the
+    // .def - so the reader hands back a uint and any id past int.MaxValue threw OverflowException
+    // out of the handler. It never surfaced in the fuzz only because Program.Store is null there
+    // and each of these handlers returns before the conversion; in a live session it is reachable
+    // from C_ADD_FRIEND_GROUP, C_EDIT_FRIEND_GROUP, C_DELETE_FRIEND_GROUP and
+    // C_EDIT_BLOCKED_USER_MEMO. status/SECURITY-AUDIT.md section 1.
 
     private static string Str(IReadOnlyDictionary<string, object> f, string name)
-        => f.TryGetValue(name, out var v) ? v?.ToString() ?? "" : "";
+        => DefField.Str(f, name);
 
     private static int I32(IReadOnlyDictionary<string, object> f, string name)
-        => f.TryGetValue(name, out var v) && v != null ? Convert.ToInt32(v) : 0;
+        => DefField.I32(f, name);
 
     private static List<object> List(IReadOnlyDictionary<string, object> f, string name)
-        => f.TryGetValue(name, out var v) && v is List<object> l ? l : new List<object>();
+        => DefField.List(f, name);
 }

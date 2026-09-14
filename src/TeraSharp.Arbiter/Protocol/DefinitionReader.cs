@@ -27,13 +27,33 @@ public sealed class DefinitionReader
 {
     private const int Header = 4;
 
+    /// <summary>
+    /// Total array elements one packet may produce, across every array in it. T48.
+    ///
+    /// <para><b>Why this exists.</b> An array header is <c>[u16 count][u16 offset]</c>, so a
+    /// four-byte body can declare 65535 elements, and each element is a full
+    /// <see cref="ReadRecord"/> - a Dictionary allocation, plus a string scan per string field.
+    /// Worse, elements are chained by a <c>next</c> offset the packet also supplies, and nothing
+    /// stopped that chain pointing at itself. <c>C_CHECK_VERSION</c> is an array packet, it is
+    /// the FIRST handler registered, and it is reachable BEFORE authentication: the 16-byte body
+    /// <c>FF FF 08 00 08 00 08 00 01 00 00 00 01 00 00 00</c> declared 65535 elements whose
+    /// <c>next</c> pointed at themselves and cost ~13 MB of allocation per packet - an 850,000x
+    /// amplification, pre-auth, repeatable as fast as a socket can write.</para>
+    ///
+    /// <para>4096 is far above anything the real protocol sends to us (the largest client array
+    /// we answer is a 24-entry private-channel invite list) and far below anything that hurts.</para>
+    /// </summary>
+    public const int MaxElementsPerPacket = 4096;
+
     private readonly byte[] _body;
+    private int _elementBudget = MaxElementsPerPacket;
 
     public DefinitionReader(ReadOnlySpan<byte> body) => _body = body.ToArray();
 
     public Dictionary<string, object> Read(PacketDef def)
     {
         int pos = 0;
+        _elementBudget = MaxElementsPerPacket;
         return ReadRecord(def.Fields, ref pos);
     }
 
@@ -114,14 +134,41 @@ public sealed class DefinitionReader
         return result;
     }
 
+    /// <summary>
+    /// Walk an array's element chain. Three things here are defensive and all three matter (T48,
+    /// status/SECURITY-AUDIT.md):
+    /// <list type="number">
+    /// <item><b>The list is never pre-sized from the count.</b> <c>new List&lt;object&gt;(count)</c>
+    /// allocated 512 KB for a four-byte body that declared 65535 and then went nowhere.</item>
+    /// <item><b>Every element offset must be new.</b> The chain is packet-supplied; without this
+    /// an element whose <c>next</c> points at itself is walked <c>count</c> times.</item>
+    /// <item><b>A shared per-packet budget.</b> Nesting multiplies: an array of records that each
+    /// contain an array would otherwise be count^depth, and neither of the first two rules bounds
+    /// the product on its own.</item>
+    /// </list>
+    /// Hitting any limit truncates the array and stops - it does not throw, because a short read
+    /// is what every other malformed-packet path here does and the handler above copes with an
+    /// empty list.
+    /// </summary>
     private List<object> ReadArray(FieldDef arrayField, int count, int firstOffset)
     {
-        var list = new List<object>(count > 0 ? count : 0);
+        var list = new List<object>();
         if (count <= 0) return list;
 
+        // An element is at least its own here+next header, so the body itself caps the count.
+        int maxByBody = _body.Length / 4;
+        if (count > maxByBody) count = maxByBody;
+
+        HashSet<int>? seen = null;
         int elemBody = ToBody(firstOffset);
         for (int i = 0; i < count && elemBody >= 0; i++)
         {
+            if (_elementBudget <= 0) break;
+            _elementBudget--;
+
+            seen ??= new HashSet<int>();
+            if (!seen.Add(elemBody)) break;          // the chain looped back
+
             int pos = elemBody;
             ushort here = ReadU16(ref pos);
             ushort next = ReadU16(ref pos);
@@ -230,4 +277,115 @@ public sealed class DefinitionReader
         Array.Copy(_body, offset, b, 0, count);
         return b;
     }
+}
+
+/// <summary>
+/// Narrowing helpers for values that came out of <see cref="DefinitionReader"/>.
+///
+/// <para>T50. The reader hands back the CLR type the .def declares: a <c>uint32</c> field arrives
+/// as <see cref="uint"/>, a <c>uint64</c> as <see cref="ulong"/>, and roughly half of all
+/// four-byte values on the wire are 0x80000000 or higher. <c>Convert.ToInt32</c> throws
+/// <see cref="OverflowException"/> on every one of those - not because the packet is malformed
+/// but because the id is large - and that single line was 125 of the 126 client-fuzz errors
+/// (the C_DELETE_USER id read; status/FUZZ-FINDINGS.txt).</para>
+///
+/// <para>These reinterpret the bits instead of refusing them, which is what the real Arbiter
+/// does: Handler_C_DELETE_USER copies the DWORD straight into a signed slot and compares it
+/// against the account's character ids, so 0xFFFFFFFF simply matches nothing. Every method here
+/// is total - no input of any type throws.</para>
+/// </summary>
+public static class DefField
+{
+    /// <summary>The field as an <see cref="int"/>, reinterpreting the bits rather than throwing.</summary>
+    public static int I32(object? v) => v switch
+    {
+        null => 0,
+        int i => i,
+        uint u => unchecked((int)u),
+        short sh => sh,
+        ushort us => us,
+        sbyte sb => sb,
+        byte by => by,
+        long l => unchecked((int)l),
+        ulong ul => unchecked((int)ul),
+        bool bo => bo ? 1 : 0,
+        float f => ClampI32(f),
+        double d => ClampI32(d),
+        string s => int.TryParse(s, out int p) ? p : 0,
+        _ => 0,
+    };
+
+    /// <summary>The field as a <see cref="uint"/>. Same bits as <see cref="I32(object)"/>.</summary>
+    public static uint U32(object? v) => unchecked((uint)I32(v));
+
+    /// <summary>The field as a <see cref="long"/>, reinterpreting the bits rather than throwing.</summary>
+    public static long I64(object? v) => v switch
+    {
+        null => 0L,
+        long l => l,
+        ulong ul => unchecked((long)ul),
+        int i => i,
+        uint u => u,
+        short sh => sh,
+        ushort us => us,
+        sbyte sb => sb,
+        byte by => by,
+        bool bo => bo ? 1L : 0L,
+        float f => ClampI64(f),
+        double d => ClampI64(d),
+        string s => long.TryParse(s, out long p) ? p : 0L,
+        _ => 0L,
+    };
+
+    /// <summary>The field as a <see cref="ulong"/>. Same bits as <see cref="I64(object)"/>.</summary>
+    public static ulong U64(object? v) => unchecked((ulong)I64(v));
+
+    /// <summary>The field as a bool. Anything non-zero is true; nothing throws.</summary>
+    public static bool Bool(object? v) => v switch
+    {
+        null => false,
+        bool b => b,
+        string s => s.Length > 0 && !s.Equals("0", StringComparison.Ordinal)
+                                 && !s.Equals("false", StringComparison.OrdinalIgnoreCase),
+        _ => I64(v) != 0,
+    };
+
+    /// <summary>The field as a string. Never null.</summary>
+    public static string Str(object? v) => v?.ToString() ?? string.Empty;
+
+    /// <summary>Look one field up in a decoded packet without throwing on a missing name.</summary>
+    public static int I32(IReadOnlyDictionary<string, object>? f, string name)
+        => f != null && f.TryGetValue(name, out object? v) ? I32(v) : 0;
+
+    /// <summary>Look one field up as a <see cref="uint"/>; absent means 0.</summary>
+    public static uint U32(IReadOnlyDictionary<string, object>? f, string name)
+        => f != null && f.TryGetValue(name, out object? v) ? U32(v) : 0u;
+
+    /// <summary>Look one field up as a <see cref="long"/>; absent means 0.</summary>
+    public static long I64(IReadOnlyDictionary<string, object>? f, string name)
+        => f != null && f.TryGetValue(name, out object? v) ? I64(v) : 0L;
+
+    /// <summary>Look one field up as a bool; absent means false.</summary>
+    public static bool Bool(IReadOnlyDictionary<string, object>? f, string name)
+        => f != null && f.TryGetValue(name, out object? v) && Bool(v);
+
+    /// <summary>Look one field up as a string; absent means empty.</summary>
+    public static string Str(IReadOnlyDictionary<string, object>? f, string name)
+        => f != null && f.TryGetValue(name, out object? v) ? Str(v) : string.Empty;
+
+    /// <summary>The element list of an array field, or an empty list when it is absent.</summary>
+    public static List<object> List(IReadOnlyDictionary<string, object>? f, string name)
+        => f != null && f.TryGetValue(name, out object? v) && v is List<object> l ? l : new List<object>();
+
+    private static int ClampI32(double d)
+        => double.IsNaN(d) ? 0
+         : d <= int.MinValue ? int.MinValue
+         : d >= int.MaxValue ? int.MaxValue
+         : (int)d;
+
+    private static long ClampI64(double d)
+        => double.IsNaN(d) ? 0L
+         : d <= long.MinValue ? long.MinValue
+         : d >= long.MaxValue ? long.MaxValue
+         : (long)d;
 }

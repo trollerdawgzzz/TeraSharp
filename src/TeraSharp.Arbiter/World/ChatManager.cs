@@ -706,12 +706,22 @@ public static class ChatPackets
         string name = ReadWString(body, 4);
         ushort password = BitConverter.ToUInt16(body, 6);
 
-        var invited = new List<int>(count);
+        // T48: `count` is a u16 off the wire, so it can say 65535 for an 8-byte body. Never
+        // pre-size from it (that alone was a 256 KB allocation per packet) and never let the
+        // element chain revisit an offset - `next` is packet-supplied and may point at itself.
+        // The cap is the body's own size: an element is 8 bytes, so there cannot be more of them
+        // than the body holds. status/SECURITY-AUDIT.md.
+        var invited = new List<int>();
+        int maxByBody = body.Length / 8;
+        if (count > maxByBody) count = maxByBody;
+        HashSet<int>? seen = null;
         int at = offset - 4;
         for (int i = 0; i < count; i++)
         {
             // element: [u16 self][u16 next][i32 UserDbId]
             if (at < 0 || at + 8 > body.Length) return null;
+            seen ??= new HashSet<int>();
+            if (!seen.Add(at)) break;
             invited.Add(BitConverter.ToInt32(body, at + 4));
             int next = BitConverter.ToUInt16(body, at + 2);
             if (next == 0) break;

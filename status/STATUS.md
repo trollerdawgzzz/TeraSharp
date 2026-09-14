@@ -8,7 +8,7 @@ Read order for anyone new: `CLAUDE.md` (workspace rules at the top) -> `status/H
 (every per-user W->A opcode and how it is answered) -> this file.
 
 Build: `dotnet build TeraSharp.sln` — 0 warnings, 0 errors.
-Tests: `dotnet run --project src\TeraSharp.Arbiter.Tests` — **573**.
+Tests: `dotnet run --project src\TeraSharp.Arbiter.Tests` — **576**.
 Deploy check: `TeraSharp.Arbiter.exe --selftest` — one PASS/FAIL line per data dependency (T37).
 
 ---
@@ -19,6 +19,7 @@ Deploy check: `TeraSharp.Arbiter.exe --selftest` — one PASS/FAIL line per data
 |---|---|
 | Client crypto / codec / login / char list / select / create / delete | real |
 | Chat, client settings (persisted) | real |
+| Packet-handling security: bounds, pagination, allocate-by-count, plus a fuzz suite | audited (T48), fuzz run and its 3 findings fixed (T50), 2 human-owned open |
 | Whisper + private chat channels - layouts, the channel object, `ChatManager` | implemented (T43), RAM-only, **not wired** |
 | The 18 client packets World rejects - tooltips, exploration, client log, the small acks | implemented (T45), **not wired** |
 | Mail: the six `SDB_*_PARCEL` W<->A pairs, empty inbox byte-exact | real (T45) |
@@ -38,7 +39,6 @@ Deploy check: `TeraSharp.Arbiter.exe --selftest` — one PASS/FAIL line per data
 | Warehouse — 8 W->A requests answered from `items`/`warehouses` rows, `0x2754` sealed | real (T42) |
 | Mail — the 3 Arbiter-owned client packets + `parcels` table; World's 6 `SDB_*_PARCEL` are not answered | half real (T42) |
 | Parties — `PartyManager` (T35) wired through `World/PartyWiring.cs`, roster shared with chat | implemented (T49), needs the 2 human-owned lines |
-| Guilds — 17 Arbiter-owned `C_` packets wired through `World/GuildWiring.cs`; roster shared with chat; `0x27CF` boot load answered from the `guilds` table | implemented (T51), needs the 1 human-owned line |
 
 ## Where the truth lives
 
@@ -69,6 +69,8 @@ Deploy check: `TeraSharp.Arbiter.exe --selftest` — one PASS/FAIL line per data
 | Guild rows, the Arbiter-side guild handlers, and the wiring they still need | `status/GUILD-DESIGN.md` section 10 |
 | How a subsystem's action list becomes sends (parties, guilds, chat, and whatever is next) | `World/ActionDispatcher.cs`, and the wiring section of each design doc |
 | Why World logs "handler has not been implemented yet!!!", and who owns each of those packets | `status/CLIENT-REJECTS.md` |
+| Whether a packet field is bounds-checked, and what the fuzz suite covers | `status/SECURITY-AUDIT.md` |
+| Where `S_LOGIN_ARBITER.status` and `AdminLevel` come from, and why they are unrelated | `status/GM-ADMINLEVEL-TRACE.md` |
 | Why a fresh mailbox showed 12 blank rows, and the 35-byte empty `DBS_LIST_PARCEL` | `status/CLIENT-REJECTS.md` section 4 |
 | Whisper, private channels, the slot-not-an-id trap, and the chat .def corrections | `status/CHAT-DESIGN.md` |
 | The `SocialHandlers.OnWhisper` -> `ChatManager` swap, and what it changes for blocked users | `status/CHAT-DESIGN.md` section 7.2 |
@@ -106,6 +108,17 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
 ## Open
 
 - Live test of the relog-into-instance fallback (T21).
+- **T48 security audit**: two fixes are in human-owned files and NOT applied -
+  `World/WorldBridge.cs` needs the tunnel length check (a negative `clientLen` slips the bound and
+  a large one overflows it) and a per-frame try/catch (today one throwing `SDB_` handler closes
+  the World link and drops every player). Diffs in `status/SECURITY-AUDIT.md` section 5.
+- `Program.Store` has a private setter, so the T48 client fuzz runs against a null store and only
+  covers the shallow half of each handler. `internal set` would fix it
+  (`status/SECURITY-AUDIT.md` section 5.4).
+- `Network/PacketReader.cs` is dead code and its `ReadOffsetString` uses a body-relative offset
+  where the protocol is packet-relative - delete it or fix it before anyone wires it up.
+- `AS_ENTER_WORLD[111]` (AdminLevel) is never populated, so World treats every GM as an ordinary
+  player whatever `S_LOGIN_ARBITER.status` said (`status/GM-ADMINLEVEL-TRACE.md`).
 - **The `RegNoop` / `RegEmptyReply` in-world forward** (`HandlerRegistry`) sends Arbiter-owned
   packets to World, which drops them. Six packets are affected; the fix and the
   `PacketDispatcher` deny-list are in `status/CLIENT-REJECTS.md` section 7 (human-owned files).
@@ -134,16 +147,6 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
 - Two-login capture -> multi-player tunnel routing, `S_CHANGE_FRIEND_STATE` on login/logout and
   the `AS_*` block-list pushes (`status/MULTIPLAYER-DESIGN.md`).
 - Friend/blocked memos skip the Arbiter's banned-word + NetModerator stage (we have neither).
-- T51 needs ONE line in a human-owned file: a `foreach` over `GuildWiring.ClientOpcodes` in
-  `HandlerRegistry.RegisterAll` (the 17 guild `C_` opcodes, body length =
-  `GuildPackets.MinClientLength` MINUS 4). Exact text: `status/GUILD-DESIGN.md` §11.5. Nothing
-  in `WorldBridge`, `WorldEntry` or `GameSession` - the roster rides the chat path and the boot
-  load is a `DbProxyHandlers` allow-list entry, which T51 added directly.
-- Guilds: the whole `SA_` direction is still unanswered - all twelve of `GUILD-DESIGN.md` §4.2,
-  including `SA_LEAVE_GUILD` (0x13FE) and `SA_DESTROY_GUILD` (0x13FC). A player can leave a guild
-  in the client and World will believe it while our rows do not. That is the task that needs a
-  `WorldBridge.HandleFrame` line (T49's party one is the model). `C_INVITE_USER_TO_GUILD` and
-  `C_CHANGE_GUILDNAME` are also still unregistered - both need a handler, not wiring (§11.6).
 - T49 needs two lines in human-owned files: one `foreach` over `PartyWiring.ClientOpcodes`
   in `HandlerRegistry.RegisterAll` (the seven `C_` party opcodes, body length = the decompile's
   frame guard MINUS 4) and `if (PartyWiring.TryHandleWorldFrame(op, payload)) return;` as the
@@ -175,6 +178,25 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   `ServerConfig.xml`, which we do not read.
 - `status/*.txt` (15 decompile scratch files) should be deleted; Cowork has no delete tool
   in this session, so the human runs the `git rm` in the T24 report.
-- CLOSED by T51: the replayed `DBS_INIT_GUILD_DATA` (0x27ED) padding leak. `0x27CF` is in the
-  `DbProxyHandlers` allow-list now, so `TryHandle` answers it from the `guilds` table before
-  `WorldBridge` reaches the replay table at all (`status/GUILD-DESIGN.md` §11.4).
+- The replayed `DBS_INIT_GUILD_DATA` (0x27ED) leaks two bytes of the real Arbiter's
+  uninitialised stack padding (`0xB379` at GuildData+0x024A). Harmless - World never reads
+  them - but `GuildPackets.BuildEmptyDbsInitGuildData()` builds the same frame with zeros, so
+  the replay entry could be swapped for it (`status/GUILD-DESIGN.md` sections 2.1 and 9).
+
+- T50 ran the T48 fuzz suite for real. 147 failure lines were **three** findings, all fixed:
+  `Convert.ToInt32` on a `uint32` def field (125 of the 126 client errors, all C_DELETE_USER),
+  `off + 16` wrapping in `BuildLearnAllCrest` (2 of the 21 DB failures), and SQLite foreign keys
+  actually being enforced so a per-character INSERT with an unknown owner threw (19 of the 21).
+  `status/SECURITY-AUDIT.md` section 9.
+- The DB-proxy fuzz used to stop at its 21st failure, which meant it stopped inside `0x27FA` and
+  **never fuzzed the 23 allow-listed opcodes above it**. The cap is gone and the report is now one
+  line per distinct `(opcode, exception)` pair; those 23 are hand-audited in section 9.4 but the
+  next run is the first that exercises them.
+- `C_CHECK_ALIVE` is registered by `HandlerRegistry` but is not in opcode map 376012, so
+  `RegisterAll` logs an Error for it at every startup. One line in a human-owned file: drop the
+  registration, or let `Reg` log at Warning for a name the map does not have.
+- **Foreign keys are on.** `Microsoft.Data.Sqlite` sets `PRAGMA foreign_keys = 1` unless told
+  otherwise, so the REFERENCES clauses in `CharacterStore` are enforced — the comment above the
+  guild tables saying they are documentation only is wrong. Every per-character INSERT now checks
+  the owner. The matching question for the human is DELETE: `DeleteCharacter` for a character that
+  has quests, achievements, friends or a guild row can fail the same way.

@@ -1573,16 +1573,34 @@ public sealed class DbProxyHandlers
     public static byte[]? BuildLearnAllCrest(byte[] req)
     {
         if (req.Length < 20) return null;
-        uint count = BitConverter.ToUInt32(req, 0);
-        int listOff = (int)BitConverter.ToUInt32(req, 4);
         uint reqId = BitConverter.ToUInt32(req, 16);
         var entries = new List<(int id, int val)>();
-        int off = listOff - 6;
+
+        // T50. Three things here, all of them found by the fuzz or by the walk that follows it:
+        //
+        //   1. The offsets are LONG arithmetic. `off + 16` used to be int, so a listOff of
+        //      int.MaxValue (and int.MinValue, which wraps to the same place) made the sum
+        //      negative, the `<= req.Length` bound passed, and BitConverter.ToInt32 threw
+        //      ArgumentOutOfRangeException. Out of a DB-proxy handler that is not a dropped
+        //      packet: WorldLink.ReceiveLoop has no per-frame catch, so it closes the World link
+        //      and disconnects every player. Two of the 21 DB-proxy failures were this line
+        //      (status/FUZZ-FINDINGS.txt).
+        //   2. The chain is packet-supplied, so an element whose `next` points at itself - or
+        //      back up the chain - would be walked to the guard every time. The visited set ends
+        //      it at the repeat instead.
+        //   3. The offsets are frame-relative and unsigned on the wire, so they are read as uint
+        //      and widened; the old `(int)` cast turned a large offset into a negative one, which
+        //      happened to be safe but for the wrong reason.
+        long off = (long)BitConverter.ToUInt32(req, 4) - 6;
+        HashSet<long>? seen = null;
         int guard = 0;
         while (off > 0 && off + 16 <= req.Length && guard++ < 512)
         {
-            entries.Add((BitConverter.ToInt32(req, off + 8), BitConverter.ToInt32(req, off + 12)));
-            int next = (int)BitConverter.ToUInt32(req, off + 4);
+            seen ??= new HashSet<long>();
+            if (!seen.Add(off)) break;
+            int at = (int)off;
+            entries.Add((BitConverter.ToInt32(req, at + 8), BitConverter.ToInt32(req, at + 12)));
+            long next = BitConverter.ToUInt32(req, at + 4);
             if (next == 0) break;
             off = next - 6;
         }

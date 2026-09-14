@@ -3,6 +3,7 @@ using Microsoft.Extensions.Logging;
 using TeraSharp.Arbiter.Game;
 using TeraSharp.Arbiter.Network;
 using TeraSharp.Arbiter.Persistence;
+using TeraSharp.Arbiter.Protocol;
 
 namespace TeraSharp.Arbiter.Handlers;
 
@@ -225,16 +226,20 @@ public sealed class CharacterHandlers
     }
 
     /// <summary>Build the request from the .def codec output (the normal in-session path).</summary>
+    // T50: every read here goes through DefField, which reinterprets rather than range-checks.
+    // Convert.ToInt32 on the uint a `uint32` def field produces throws OverflowException for any
+    // value past int.MaxValue, and Convert.ToUInt32 throws for any negative int - neither is a
+    // malformed packet, and an exception out of a handler is logged at Error by PacketDispatcher.
     private static CreateUserRequest FromFields(IReadOnlyDictionary<string, object> f) => new()
     {
-        Gender = f.TryGetValue("gender", out var gv) ? Convert.ToInt32(gv) : 0,
-        Race = f.TryGetValue("race", out var rv) ? Convert.ToInt32(rv) : 0,
-        Class = f.TryGetValue("class", out var cv) ? Convert.ToInt32(cv) : 0,
+        Gender = DefField.I32(f, "gender"),
+        Race = DefField.I32(f, "race"),
+        Class = DefField.I32(f, "class"),
         Appearance = f.TryGetValue("appearance", out var av) ? av as byte[] ?? new byte[8] : new byte[8],
-        IsSecondCharacter = f.TryGetValue("isSecondCharacter", out var sv) && Convert.ToBoolean(sv),
-        Appearance2 = f.TryGetValue("appearance2", out var a2) ? Convert.ToUInt32(a2) : 0u,
-        IsRandomName = f.TryGetValue("isRandomName", out var rn) && Convert.ToBoolean(rn),
-        Name = f.TryGetValue("name", out var nv) ? nv?.ToString() ?? "" : "",
+        IsSecondCharacter = DefField.Bool(f, "isSecondCharacter"),
+        Appearance2 = DefField.U32(f, "appearance2"),
+        IsRandomName = DefField.Bool(f, "isRandomName"),
+        Name = DefField.Str(f, "name"),
         Details = f.TryGetValue("details", out var dv) ? dv as byte[] ?? new byte[32] : new byte[32],
         Shape = f.TryGetValue("shape", out var shv) ? shv as byte[] ?? new byte[64] : new byte[64],
     };
@@ -457,10 +462,15 @@ public sealed class CharacterHandlers
     /// </summary>
     public bool OnDeleteUser(GameSession s, ReadOnlyMemory<byte> body)
     {
+        // T50: C_DELETE_USER.1 is `uint32 id`, so the reader hands back a uint and roughly half
+        // of all four-byte values are past int.MaxValue. Convert.ToInt32 threw OverflowException
+        // on every one of them - 125 of the 126 client-fuzz errors were this line alone
+        // (status/FUZZ-FINDINGS.txt). The real handler reinterprets the DWORD into a signed slot
+        // and compares it against the account's characters, where 0xFFFFFFFF matches nothing.
         int charId = 0;
         var f = s.ReadByDef("C_DELETE_USER", body);
         if (f != null && f.TryGetValue("id", out var idv))
-            charId = Convert.ToInt32(idv);
+            charId = DefField.I32(idv);
         else if (body.Length >= 4)
             charId = BitConverter.ToInt32(body.Span);
 
