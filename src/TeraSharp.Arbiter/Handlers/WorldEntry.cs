@@ -44,6 +44,7 @@ public static class WorldEntry
         // 3. Switch to tunnel mode BEFORE telling World, so nothing is missed.
         //    RegisterPlayer (inside EnterWorld) creates a fresh reorder buffer.
         s.EnterWorld();
+        SocialHandlers.RegisterChat(s);   // T47: whisper/private channels need the live roster
 
         // 4. Tell World about the player â€” built from character data, not replayed.
         var record = Program.Store?.GetCharacter((int)chr.Id);

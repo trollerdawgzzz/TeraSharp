@@ -124,6 +124,7 @@ public sealed class GameSession : IDisposable
             }
             w.UnregisterPlayer(GameId, TunnelKey);
         }
+        Handlers.SocialHandlers.UnregisterChat(this);   // T47: leave private channels, go offline for whisper
         InWorld = false;
         FinishLeaveToClient();
     }
@@ -163,6 +164,7 @@ public sealed class GameSession : IDisposable
             w.UnregisterPlayer(GameId, TunnelKey);
             w.NotifyPlayerLeave(GameId, PlayerId, LeaveMode.Disconnect);
         }
+        Handlers.SocialHandlers.UnregisterChat(this);   // T47
     }
 
     public void ForwardToWorld(byte[] packet)

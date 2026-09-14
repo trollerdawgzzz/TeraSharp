@@ -2140,6 +2140,9 @@ array items
             0x15F9,
             // T42: SDB_MOVE_WAREHOUSE_ITEM is a ten-line stub in the real Arbiter that sends nothing.
             0x2754,
+            // T47: the through-Arbiter contract family (two-party trades the Arbiter brokers) -
+            // no DlmId, fan-out rather than reply.
+            0x2809, 0x280C, 0x280D, 0x280E,
         };
         foreach (var op in expected)
             Hex.True(WorldReplayTable.OneWayFromWorld.Contains(op),
@@ -11617,7 +11620,7 @@ some prose with `backticks` that is not a table row
         var offSeq = ChatSeq(offline);
         Hex.True(offSeq.Count == 1 && offSeq[0] == (1, "S_SYSTEM_MESSAGE"),
                  "one S_SYSTEM_MESSAGE back to the sender");
-        Hex.True((int)ChatFields(offline, 0)["sysMsgId"] == ChatManager.MsgWhisperNoSuchUser,
+        Hex.True(((string)ChatFields(offline, 0)["message"]).StartsWith("@" + ChatManager.MsgWhisperNoSuchUser),
                  "SMT 831 - 'Whisper ... offline', which is what the live test saw");
 
         // Register the target and the same whisper is delivered. That is the whole of T47 part 1.
@@ -11644,7 +11647,7 @@ some prose with `backticks` that is not a table row
                  "the actions it returns are attributed to the leaver");
 
         var after = cm.OnClientPacket(1, ChatPackets.C_WHISPER, CWhisperBody("c2", "hi"));
-        Hex.True((int)ChatFields(after, 0)["sysMsgId"] == ChatManager.MsgWhisperNoSuchUser,
+        Hex.True(((string)ChatFields(after, 0)["message"]).StartsWith("@" + ChatManager.MsgWhisperNoSuchUser),
                  "whispering them now says not-found, as it should");
     }
 
