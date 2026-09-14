@@ -2645,6 +2645,34 @@ DELETE FROM guild_members     WHERE user_db_id = $id;";
     public bool UpdateGuildPromotion(int guildId, string promotion)
         => SetGuildText(guildId, "promotion", Clamp(promotion, MaxGuildPromotion));
 
+    /// <summary>
+    /// spChangeGuildName(int guildDbId, nvarchar newName) - T52. Unlike the other three text
+    /// setters the name is UNIQUE, so this checks first and answers false when it is taken; the
+    /// real Arbiter gets the same answer out of SDB_ASK_CHANGE_GUILD_NAME. Returns false for an
+    /// empty name, a name already in use by ANOTHER guild, or a guild id that does not exist.
+    /// Renaming a guild to the name it already has succeeds and changes nothing.
+    /// </summary>
+    public bool RenameGuild(int guildId, string newName)
+    {
+        string name = Clamp(newName ?? string.Empty, MaxGuildName);
+        if (name.Length == 0) return false;
+        lock (_lock)
+        {
+            using (var probe = _db.CreateCommand())
+            {
+                probe.CommandText = "SELECT guild_id FROM guilds WHERE name = $n";
+                probe.Parameters.AddWithValue("$n", name);
+                var taken = probe.ExecuteScalar();
+                if (taken != null && taken != DBNull.Value && Convert.ToInt32(taken) != guildId) return false;
+            }
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE guilds SET name = $n WHERE guild_id = $g";
+            cmd.Parameters.AddWithValue("$n", name);
+            cmd.Parameters.AddWithValue("$g", guildId);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
     private bool SetGuildText(int guildId, string column, string value)
     {
         lock (_lock)

@@ -1204,3 +1204,124 @@ Nothing else. In particular there is **no** `WorldBridge` line: the guild boot l
    checklist is what would fix that.
 5. Guild wars, quests, towers, the warehouse, perks, the wanted board, contribution decay and the
    level/exp curve are all still unmodelled (§10, "What is NOT modelled").
+
+
+---
+
+## 12. T52 — the `SA_` direction, and the last two `C_` handlers
+
+T51 wired the Arbiter's own half. T52 opens the other direction: World now has a way to tell us
+a guild changed, and the two client packets §10 parked "for routing" are answered.
+
+### 12.1 The gate — one `WorldBridge` line
+
+```csharp
+            default:
+                if (PartyWiring.TryHandleWorldFrame(op, payload)) return;   // T49
+                if (GuildWiring.TryHandleWorldFrame(op, payload)) return;   // T52
+```
+
+first thing in `HandleFrame`'s `default:` arm, beside T49's, **before** `DbProxy.TryHandle`.
+That is the whole human-owned diff for T52.
+
+`GuildWiring.HandlesWorldFrame` is a membership test over `GuildWiring.WorldOpcodes`, **not**
+`GuildPackets.MinFrameLength(op) != 0` the way the party gate is. The reason is that two of the
+twelve — `SA_INC_GUILD_ACCOUNT_LIMIT` (0x1414) and `SA_PUSH_GUILD_BUFF` (0x145C) — have no
+dumper we could find, so `MinFrameLength` answers 0 for them; they still have to be consumed,
+because the alternative is the replay table handing World somebody else's reply. None of the
+twelve appears in `DbProxyHandlers` or `WorldReplayTable.OneWayFromWorld`, and none collides with
+the party gate (test `T52_the_guild_world_frame_gate_is_exactly_the_twelve`).
+
+### 12.2 What is answered
+
+**`SA_LEAVE_GUILD` (0x13FE)** and **`SA_BANISH_GUILD_MEMBER` (0x1400)** — one worker in the
+binary too, `GuildUtil::UserLeaveFromGuild` (`FUN_1408165f0`, `Arb_part_070.c:16414`), with one
+enum apart. It sends **no client packet at all**:
+
+| to | what |
+|---|---|
+| the leaver | system message **0x126**, key `GuildName` |
+| everyone still in the guild | **0x2F8** (voluntary) or **0x2F9** (banished), key `UserName` |
+| every World session | `AS_LEAVE_GUILD` **0x13FF** = `[i32 GuildDbId][i32 MemberDbId]` |
+
+Note the capitalisation: the leave path spells its keys `GuildName` / `UserName`, the invite path
+(12.2 below) spells them `guildName` / `userName`. Both are the binary's.
+
+Two endings beyond "one fewer member", both on this exact path:
+`GuildManager::MemberLeave_DestroyGuildWithLock` destroys a guild that falls to zero (we send
+`AS_DESTROY_GUILD` 0x13FD after it), and a departing master is replaced.
+
+One deviation: the real handler identifies the leaver by the `User` object at frame +0x0A and
+reads only `GuildDbId` out of the packet (`*(u32 *)(packet + 0x12)`). We have no `User` handles,
+so we use `MemberDbId` at +0x16 — which the frame carries and the dumper names — and verify it
+really is a member of that guild before touching a row.
+
+**`C_INVITE_USER_TO_GUILD` (0xEF92)**, `Handler_C_INVITE_USER_TO_GUILD` (`FUN_1404e1890`) then
+`GuildJoinManager::AddInviteUserToGuildInfo` (`FUN_140825d20`), guards in the binary's order:
+caller in a guild (else 0xE2B) → invite authority (else 0xE2C) → resolve the target by name when
+`userDbId` is 0, by id otherwise (else 0xE2B) → target not already in a guild (else **0xE36**
+`userName`) → `fromWantedList` implies actually on the board (else 0xE2E) → not already invited
+(`AlreadyInvitedGuild`) → `spAddInviteUserToGuild`, **0xE2F** `userName` to the inviter and
+**0xE30** `guildName` to the target. There is no `S_` packet for an invite at all, which is why
+`C_REJECT_INVITE_USER_TO_GUILD` takes a guild id rather than an invite id.
+
+Two deviations, both deliberate. The real handler resolves the target through `UserManager`, so
+an **offline** character is "no such user"; we resolve through the characters table and address
+the 0xE30 to their db id, letting the dispatcher drop it when they are offline — the same thing
+every other cross-session guild push does, and the invite row persists so their invite list shows
+it at next login. And there is no wanted board in this build, so `fromWantedList` is refused with
+0xE2E rather than quietly treated as a plain invite.
+
+**`C_CHANGE_GUILDNAME` (0xFC1C)** — `FUN_1404dc6a0` (`Arb_part_040.c:19716`) has exactly one
+guard before it hands off, and it is not the invite authority:
+
+```c
+  FUN_140386990(user,&local_30);                                  /* User::GetGuild */
+  if ((local_30 != 0) && (*(int *)(local_30 + 0xd8) == *(int *)(lVar2 + 0x120))) {
+```
+
+`Guild+0xD8` is `GuildData+0x50` = `ChiefDbId`, `User+0x120` is `UserDbId`: **only the guild
+master may rename.** What follows in the real one is `InputRestrictionHelper::CheckGuildName`
+(banned words, NetModerator) and an `SDB_ASK_CHANGE_GUILD_NAME` round trip — and the only thing
+that round trip decides is uniqueness, which the SQL `UNIQUE` index answers one hop earlier. So
+§10's "needs the round trip" was wrong: `CharacterStore.RenameGuild` returns false when the name
+is taken, the reply is `S_CHANGE_GUILDNAME` (`string guildName, bool usable` — the shipped .def
+drops the flag, §5.5), and World is told with `AS_UPDATE_GUILD_NAME` (0x1490). We have no
+moderator, so the banned-word stage is simply absent.
+
+With these two, **all nineteen** Arbiter-side guild `C_` packets of §5.1 are answered and
+registered; `GuildWiring.ClientOpcodes` is 17 → 19 and the registry loop of §11.5 is unchanged.
+
+### 12.3 What is gated but not answered
+
+Ten of the twelve. Each returns a rejection whose `Origin` is `Recipient.None`, so it reaches the
+log and never a chat window — `T52_the_unmodelled_guild_frames_are_consumed_not_answered` is the
+test that keeps it that way.
+
+| opcode | name | what it would need |
+|---|---|---|
+| 0x13FB | `SA_LOAD_GUILD` | re-push one guild's mirror; the frames already exist (§11.4) |
+| 0x13FC | `SA_DESTROY_GUILD` | `DeleteGuild` + the fan-out; trivial once someone can destroy one |
+| 0x1402 | `SA_CHANGE_GUILD_CHIEF` | `ChangeGuildChief` + `S_CHANGE_GUILD_CHIEF`; the leave path already does both |
+| 0x1404 | `SA_SET_GUILDGROUP_AUTHORITY` | `SetGuildGroupAuthority` + `S_UPDATE_GUILD_GROUP` |
+| 0x1406 | `SA_CREATE_GUILD_GROUP` | `CreateGuildGroup` + `S_ADD_GUILD_GROUP`; needs the id allocator |
+| 0x1408 | `SA_REMOVE_GUILD_GROUP` | `DeleteGuildGroup` + `S_REMOVE_GUILD_GROUP` |
+| 0x140B | `SA_CHANGE_GUILDGROUP` | `SetGuildMemberGroup` + `S_UPDATE_GUILD_MEMBER` |
+| 0x140F | `SA_UPDATE_GUILD_MEMBER` | `UpdateGuildMemberLocation`; the roster path (§11.3) already writes these fields |
+| 0x1414 | `SA_INC_GUILD_ACCOUNT_LIMIT` | **layout unknown** — no dumper found |
+| 0x145C | `SA_PUSH_GUILD_BUFF` | **layout unknown**; guild buffs are not modelled at all |
+
+The first eight are a handler each and no new research — their parsers are already in
+`GuildPackets` and their store methods already exist. They were left out of T52 on purpose: none
+of them can be reached until a guild exists live, and a handler nobody has ever run is worth less
+than one that is honest about not existing.
+
+### 12.4 Ours, not the decompile's
+
+**Master promotion on leave.** When the master leaves we promote the longest-serving remaining
+member and emit the `S_CHANGE_GUILD_CHIEF` / `AS_CHANGE_GUILD_CHIEF` pair World's
+`SA_CHANGE_GUILD_CHIEF` would have produced. The real Arbiter certainly re-picks one — a guild
+with no chief is not a state the client can render — but the choice of successor was not traced.
+The same caveat `PARTY-DESIGN.md` §10 carries for party managers.
+
+Everything else in 12.2 is quoted to a function in `Arb_part_*.c`.

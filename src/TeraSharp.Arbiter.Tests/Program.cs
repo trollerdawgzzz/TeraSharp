@@ -10423,11 +10423,13 @@ some prose with `backticks` that is not a table row
             Hex.True(a.Rejected!.Contains("not an Arbiter-side"), $"0x{op:X4}: {a.Rejected}");
         }
 
-        // and the two Arbiter-side ones T39 leaves for the routing layer say so distinctly
+        // T52 made C_INVITE_USER_TO_GUILD and C_CHANGE_GUILDNAME real handlers; an empty body is
+        // now a short-body refusal, not "needs routing".
         foreach (var op in new[] { GuildPackets.C_INVITE_USER_TO_GUILD, GuildPackets.C_CHANGE_GUILDNAME })
         {
+            Hex.True(GuildHandlers.Handles(op), $"0x{op:X4} is handled since T52");
             var a = g.OnClientPacket(1, op, Array.Empty<byte>());
-            Hex.True(a.Rejected != null && a.Rejected.Contains("needs routing"), $"0x{op:X4}: {a.Rejected}");
+            Hex.True(a.Rejected != null, $"0x{op:X4}: an empty body is refused");
         }
     }
 
@@ -13214,8 +13216,8 @@ some prose with `backticks` that is not a table row
     /// </summary>
     [Test] public static void T51_guild_registrations_use_the_body_length_not_the_frame_length()
     {
-        Hex.True(GuildWiring.ClientOpcodes.Length == 17,
-            $"seventeen Arbiter-answered guild opcodes, got {GuildWiring.ClientOpcodes.Length}");
+        Hex.True(GuildWiring.ClientOpcodes.Length == 19,
+            $"nineteen Arbiter-answered guild opcodes after T52, got {GuildWiring.ClientOpcodes.Length}");
         Hex.True(GuildWiring.ClientHeaderSize == 4, "the client header is [u16 len][u16 opcode]");
 
         foreach (var (name, op) in GuildWiring.ClientOpcodes)
@@ -13251,12 +13253,14 @@ some prose with `backticks` that is not a table row
         Hex.True(GuildWiring.MinBodyLength(GuildPackets.C_ACCEPT_GUILD_APPLY) == 5,
             "C_ACCEPT_GUILD_APPLY: [u8 accept][u32 userDbId], unaligned");
 
-        // Not registered: two Arbiter-side packets that still need routing work...
-        Hex.True(!GuildWiring.IsRegistered(GuildPackets.C_INVITE_USER_TO_GUILD),
-            "C_INVITE_USER_TO_GUILD needs the wanted-board manager - still open");
-        Hex.True(!GuildWiring.IsRegistered(GuildPackets.C_CHANGE_GUILDNAME),
-            "C_CHANGE_GUILDNAME needs the SDB_ASK_CHANGE_GUILD_NAME round trip - still open");
-        // ...and the ten that belong to WorldServer. Answering one double-answers the client.
+        // T52 registered the last two Arbiter-side packets, so every one of section 5.1 is ours.
+        Hex.True(GuildWiring.IsRegistered(GuildPackets.C_INVITE_USER_TO_GUILD)
+                 && GuildWiring.MinBodyLength(GuildPackets.C_INVITE_USER_TO_GUILD) == 0x0B - 4,
+            "C_INVITE_USER_TO_GUILD: [u16 nameOff][u32 userDbId][u8 fromWantedList] = 7 bytes of body");
+        Hex.True(GuildWiring.IsRegistered(GuildPackets.C_CHANGE_GUILDNAME)
+                 && GuildWiring.MinBodyLength(GuildPackets.C_CHANGE_GUILDNAME) == 0x06 - 4,
+            "C_CHANGE_GUILDNAME: [u16 off] + wstring = 2 bytes of body");
+        // The ten that belong to WorldServer. Answering one double-answers the client.
         foreach (ushort op in new ushort[] { 0x7C83, 0xE303, 0xC4CC, 0x8C0F, 0xBC8A,
                                              0x8148, 0x73F1, 0xE885, 0xA6EF, 0x99CC })
         {
@@ -13396,7 +13400,7 @@ some prose with `backticks` that is not a table row
             "GuildWiring registers these but GuildHandlers has no case, so every one would answer "
             + "the player with a rejection: " + string.Join(", ", extra.Select(o => $"0x{o:X4}")));
 
-        Hex.True(answered.Count == 17, $"seventeen answered opcodes, saw {answered.Count}");
+        Hex.True(answered.Count == 19, $"nineteen answered opcodes after T52, saw {answered.Count}");
     }
 
     /// <summary>
@@ -14271,5 +14275,727 @@ some prose with `backticks` that is not a table row
         Hex.True(store.GetCharacter(1) != null, "the store still answers afterwards");
         Hex.True(store.GetAchievements(1) != null, "character 1 still has its achievements");
         Hex.True(store.GetAchievements(9999) == null, "and 9999 never got any");
+    }
+
+    // =======================================================================================
+    // T52 - the guild SA_ direction, and the last two C_ handlers.
+    // Research: status/GUILD-DESIGN.md section 12.
+    //
+    // No capture contains a guild SA_ frame (no guild has ever existed on the tap), so the
+    // payloads here are built from GUILD-DESIGN.md section 4.2's layouts, which came from the
+    // decompiled handler guards - the same footing the party SA_ tests stand on.
+    // =======================================================================================
+
+    /// <summary>SA_LEAVE_GUILD / SA_BANISH_GUILD_MEMBER: `u32 nameOff@06, i64 ArbiterUser@0A,
+    /// i32 GuildDbId@12, i32 MemberDbId@16`, frame 0x1A. Payload index = frame - 6.</summary>
+    static byte[] SaLeaveGuildPayload(int guildDbId, int memberDbId, string memberName = "")
+    {
+        var name = new List<byte>();
+        foreach (char ch in memberName) { name.Add((byte)ch); name.Add((byte)(ch >> 8)); }
+        name.Add(0); name.Add(0);
+        var p = new byte[20 + name.Count];
+        BitConverter.GetBytes(memberName.Length == 0 ? 0 : 0x1A).CopyTo(p, 0);   // frame-relative
+        BitConverter.GetBytes(0x8000_0AF0_0001L).CopyTo(p, 4);                   // ArbiterUser
+        BitConverter.GetBytes(guildDbId).CopyTo(p, 12);
+        BitConverter.GetBytes(memberDbId).CopyTo(p, 16);
+        name.CopyTo(p, 20);
+        return p;
+    }
+
+    /// <summary>
+    /// A store with `chars` characters (default: as many as there are members), of which 1..`members`
+    /// are in guild "Ere" with character 1 as chief. Returns (store, handlers, guildId).
+    /// </summary>
+    static (TeraSharp.Arbiter.Persistence.CharacterStore store, GuildHandlers guilds, int guildId)
+        T52Guild(int members = 3, int chars = 0)
+    {
+        var store = GuildStore(Math.Max(chars, members));
+        var guilds = NewGuildHandlers(store);
+        var a = new GuildActions();
+        int guildId = guilds.CreateGuild(a, 1, "Ere", "Master", "Member");
+        Hex.True(guildId > 0, $"CreateGuild returned {guildId}");
+        for (int id = 2; id <= members; id++)
+        {
+            guilds.OnClientPacket(id, GuildPackets.C_APPLY_GUILD, CApplyGuildBody("Ere", "hi"));
+            guilds.OnClientPacket(1, GuildPackets.C_ACCEPT_GUILD_APPLY, CAcceptGuildApplyBody(true, id));
+            Hex.True(store.GetGuildIdOf(id) == guildId, $"character {id} joined");
+        }
+        return (store, guilds, guildId);
+    }
+
+    /// <summary>C_INVITE_USER_TO_GUILD (0xEF92): `[u16 nameOff][u32 userDbId][u8 fromWantedList]`,
+    /// min total 0x0B. The name is only consulted when userDbId is 0.</summary>
+    static byte[] CInviteBody(string name, int userDbId, bool fromWantedList)
+    {
+        var b = new byte[7 + (name.Length + 1) * 2];
+        BitConverter.GetBytes((ushort)(7 + 4)).CopyTo(b, 0);
+        BitConverter.GetBytes(userDbId).CopyTo(b, 2);
+        b[6] = (byte)(fromWantedList ? 1 : 0);
+        for (int i = 0; i < name.Length; i++) { b[7 + i * 2] = (byte)name[i]; b[8 + i * 2] = (byte)(name[i] >> 8); }
+        return b;
+    }
+
+    /// <summary>
+    /// The gate the one WorldBridge line uses. It has to be true for every W-&gt;A guild opcode
+    /// and false for everything else. Unlike the party gate it is a membership test rather than
+    /// `MinFrameLength(op) != 0`, because two of the twelve have no known layout and so answer 0 -
+    /// and those two still must not reach the replay table, which would hand World somebody
+    /// else's reply.
+    /// </summary>
+    [Test] public static void T52_the_guild_world_frame_gate_is_exactly_the_twelve()
+    {
+        ushort[] guild =
+        {
+            0x13FB, 0x13FC, 0x13FE, 0x1400, 0x1402, 0x1404,
+            0x1406, 0x1408, 0x140B, 0x140F, 0x1414, 0x145C,
+        };
+        Hex.True(GuildWiring.WorldOpcodes.Length == 12, $"twelve, got {GuildWiring.WorldOpcodes.Length}");
+        Hex.True(string.Join(",", GuildWiring.WorldOpcodes.Select(o => $"0x{o:X4}"))
+                 == string.Join(",", guild.Select(o => $"0x{o:X4}")),
+            "in opcode order: " + string.Join(",", GuildWiring.WorldOpcodes.Select(o => $"0x{o:X4}")));
+
+        foreach (ushort op in guild)
+        {
+            Hex.True(GuildWiring.HandlesWorldFrame(op), $"0x{op:X4} must reach GuildWiring");
+            Hex.True(!WorldReplayTable.OneWayFromWorld.Contains(op),
+                $"0x{op:X4} is not sealed one-way - nothing is being taken away");
+            Hex.True(!DbProxyHandlers.IsHandledRequest(op), $"0x{op:X4} is not a DB-proxy request");
+        }
+
+        // ten have a layout, two do not - and the gate covers both kinds
+        int known = guild.Count(o => GuildPackets.MinFrameLength(o) != 0);
+        Hex.True(known == 10, $"ten guild SA_ frames have a pinned layout, saw {known}");
+        Hex.True(GuildPackets.MinFrameLength(0x1414) == 0 && GuildPackets.MinFrameLength(0x145C) == 0,
+            "SA_INC_GUILD_ACCOUNT_LIMIT and SA_PUSH_GUILD_BUFF have no dumper we found");
+        Hex.True(GuildWiring.HandlesWorldFrame(0x1414) && GuildWiring.HandlesWorldFrame(0x145C),
+            "and are gated anyway, so the replay table never sees them");
+
+        // neighbours, the party gate, and a sample of the rest of the default: arm
+        foreach (ushort op in new ushort[] { 0x13FA, 0x13FD, 0x13FF, 0x1401, 0x1403, 0x140A,
+                                             0x1410, 0x13F8, 0x1395, 0x27CF, 0x2809 })
+            Hex.True(!GuildWiring.HandlesWorldFrame(op), $"0x{op:X4} must NOT be gated to guilds");
+        // the AS_ direction is ours to SEND, never to receive
+        Hex.True(!GuildWiring.HandlesWorldFrame(GuildPackets.AS_LEAVE_GUILD)
+                 && !GuildWiring.HandlesWorldFrame(GuildPackets.AS_DESTROY_GUILD),
+            "AS_ opcodes are Arbiter -> World");
+        // and the two gates never overlap
+        foreach (ushort op in GuildWiring.WorldOpcodes)
+            Hex.True(!PartyWiring.HandlesWorldFrame(op), $"0x{op:X4} is not also a party frame");
+    }
+
+    /// <summary>
+    /// SA_LEAVE_GUILD (0x13FE). GuildUtil::UserLeaveFromGuild sends <b>no client packet at
+    /// all</b>: system message 0x126 to the leaver with GuildName, 0x2F8 to everyone still in the
+    /// guild with UserName, and AS_LEAVE_GUILD to World. The row goes, and the character's
+    /// guild_leave_time is stamped so C_REQUEST_COOLTIME_TO_JOIN_GUILD can answer.
+    /// </summary>
+    [Test] public static void T52_leaving_a_guild_removes_the_row_and_tells_everyone()
+    {
+        var (store, _, guildId) = T52Guild(3);
+        using var _s = store;
+        var h = new DispatchHarness().Build(resolveDef: n => GuildHandlers.ResolveDef(null, n));
+        var chief = h.Player(1);
+        var stays = h.Player(2);
+        var leaver = h.Player(3);
+
+        var actions = GuildWiring.OnWorldFrame(store, GuildPackets.SA_LEAVE_GUILD,
+            SaLeaveGuildPayload(guildId, 3, "g3"));
+        Hex.True(actions.Rejected == null, $"rejected: {actions.Rejected}");
+        var r = h.Dispatcher.Dispatch(actions, "guild-world");
+
+        Hex.True(store.GetGuildIdOf(3) == 0, "the member row is gone");
+        Hex.True(store.GetGuildMembers(guildId).Count == 2, "two left");
+        Hex.True(store.GetGuildLeaveTime(3) > 0,
+            "guild_leave_time is stamped - Guild::CanRejoinGuild reads it later");
+
+        Hex.True(string.Join(",", leaver.Log) == "def:S_SYSTEM_MESSAGE", string.Join(",", leaver.Log));
+        Hex.True(string.Join(",", chief.Log) == "def:S_SYSTEM_MESSAGE", string.Join(",", chief.Log));
+        Hex.True(string.Join(",", stays.Log) == "def:S_SYSTEM_MESSAGE", string.Join(",", stays.Log));
+        Hex.True(string.Join(",", h.WorldLog.Select(w => $"0x{w.Op:X4}")) == "0x13FF",
+            "AS_LEAVE_GUILD and nothing else: " + string.Join(",", h.WorldLog.Select(w => $"0x{w.Op:X4}")));
+        Hex.True(BitConverter.ToInt32(h.WorldLog[0].Payload, 0) == guildId
+                 && BitConverter.ToInt32(h.WorldLog[0].Payload, 4) == 3,
+            "AS_LEAVE_GUILD is [i32 GuildDbId][i32 MemberDbId]");
+        Hex.True(r.ClientsSent == 3 && r.WorldSent == 1, $"{r}");
+
+        // the guild history records it
+        var log = store.GetGuildLog(guildId, 1);
+        Hex.True(log.Any(e => e.ActionType == GuildHandlers.GuildLogLeave && e.ActorName == "g3"),
+            "a 0x0C leave row was written");
+
+        // a member of a DIFFERENT guild, or none, is refused rather than silently removed
+        Hex.True(GuildWiring.OnWorldFrame(store, GuildPackets.SA_LEAVE_GUILD,
+            SaLeaveGuildPayload(guildId, 3)).Rejected != null, "3 is no longer a member");
+        Hex.True(GuildWiring.OnWorldFrame(store, GuildPackets.SA_LEAVE_GUILD,
+            SaLeaveGuildPayload(guildId + 99, 2)).Rejected != null, "2 is not in that guild");
+        Hex.True(GuildWiring.OnWorldFrame(store, GuildPackets.SA_LEAVE_GUILD, new byte[8]).Rejected != null,
+            "a frame shorter than 0x1A is refused, not read past");
+        Hex.True(GuildWiring.OnWorldFrame(null, GuildPackets.SA_LEAVE_GUILD,
+            SaLeaveGuildPayload(guildId, 2)).Rejected != null, "and with no store open");
+    }
+
+    /// <summary>
+    /// The two endings the leave path has beyond "one fewer member": the master leaving promotes
+    /// a successor, and the last member leaving destroys the guild
+    /// (GuildManager::MemberLeave_DestroyGuildWithLock is on this exact path).
+    /// </summary>
+    [Test] public static void T52_the_master_leaving_promotes_and_the_last_one_out_destroys()
+    {
+        var (store, _, guildId) = T52Guild(3);
+        using var _s = store;
+        var h = new DispatchHarness().Build(resolveDef: n => GuildHandlers.ResolveDef(null, n));
+        var chief = h.Player(1); var a2 = h.Player(2); var a3 = h.Player(3);
+
+        // the master leaves
+        h.Dispatcher.Dispatch(GuildWiring.OnWorldFrame(store, GuildPackets.SA_LEAVE_GUILD,
+            SaLeaveGuildPayload(guildId, 1)), "guild-world");
+        var g = store.GetGuild(guildId);
+        Hex.True(g != null && g.ChiefDbId != 1 && store.GetGuildIdOf(g.ChiefDbId) == guildId,
+            $"a remaining member was promoted, got chief {g?.ChiefDbId}");
+        Hex.True(a2.Log.Contains("def:S_CHANGE_GUILD_CHIEF") && a3.Log.Contains("def:S_CHANGE_GUILD_CHIEF"),
+            "both survivors are told who the new master is: " + string.Join(",", a2.Log));
+        Hex.True(chief.Log.Count == 1 && chief.Log[0] == "def:S_SYSTEM_MESSAGE",
+            "the one who left gets 0x126 and nothing else");
+        Hex.True(string.Join(",", h.WorldLog.Select(w => $"0x{w.Op:X4}")) == "0x13FF,0x1403",
+            "AS_LEAVE_GUILD then AS_CHANGE_GUILD_CHIEF: "
+            + string.Join(",", h.WorldLog.Select(w => $"0x{w.Op:X4}")));
+
+        // then everybody else, until the guild is empty
+        ClearSinks(h, chief, a2, a3);
+        foreach (var m in store.GetGuildMembers(guildId).Select(m => m.UserDbId).ToArray())
+            h.Dispatcher.Dispatch(GuildWiring.OnWorldFrame(store, GuildPackets.SA_LEAVE_GUILD,
+                SaLeaveGuildPayload(guildId, m)), "guild-world");
+
+        Hex.True(store.GetGuild(guildId) == null, "the guild is destroyed when the last member goes");
+        Hex.True(store.GetGuildMembers(guildId).Count == 0, "and it has no members");
+        Hex.True(h.WorldLog.Any(w => w.Op == GuildPackets.AS_DESTROY_GUILD),
+            "World is told with AS_DESTROY_GUILD (0x13FD): "
+            + string.Join(",", h.WorldLog.Select(w => $"0x{w.Op:X4}")));
+    }
+
+    /// <summary>SA_BANISH_GUILD_MEMBER (0x1400) is the same worker with one enum different: the
+    /// guild hears 0x2F9 instead of 0x2F8. Everything else - the row, the log, AS_LEAVE_GUILD -
+    /// is identical, because there is no spBanishGuildMember (GUILD-DESIGN section 3.1).</summary>
+    [Test] public static void T52_banish_is_the_same_path_with_a_different_system_message()
+    {
+        var (store, _, guildId) = T52Guild(3);
+        using var _s = store;
+        Hex.True(GuildWiring.SmtMemberLeft == 0x2F8 && GuildWiring.SmtMemberBanished == 0x2F9
+                 && GuildWiring.SmtYouLeftTheGuild == 0x126,
+            "the three message ids GuildUtil::UserLeaveFromGuild sends");
+
+        var actions = GuildWiring.OnWorldFrame(store, GuildPackets.SA_BANISH_GUILD_MEMBER,
+            SaLeaveGuildPayload(guildId, 3, "g3"));
+        Hex.True(actions.Rejected == null, $"rejected: {actions.Rejected}");
+        Hex.True(store.GetGuildIdOf(3) == 0, "banished too");
+
+        var messages = actions.Ordered.OfType<IArbiterClientAction>()
+            .Select(c => (string)c.Fields!["message"]).ToList();
+        Hex.True(messages.Count == 3, $"three system messages, got {messages.Count}");
+        Hex.True(messages[0] == SocialHandlers.Smt(0x126, "GuildName", "Ere"),
+            $"the banished member is told which guild: {messages[0]}");
+        Hex.True(messages.Skip(1).All(m => m == SocialHandlers.Smt(0x2F9, "UserName", "g3")),
+            $"and the rest hear 0x2F9, not 0x2F8: {string.Join(" | ", messages.Skip(1))}");
+
+        // the voluntary path, same shape, 0x2F8
+        var (store2, _, guild2) = T52Guild(3);
+        using var _s2 = store2;
+        var left = GuildWiring.OnWorldFrame(store2, GuildPackets.SA_LEAVE_GUILD,
+            SaLeaveGuildPayload(guild2, 3, "g3")).Ordered.OfType<IArbiterClientAction>()
+            .Select(c => (string)c.Fields!["message"]).Skip(1).ToList();
+        Hex.True(left.All(m => m == SocialHandlers.Smt(0x2F8, "UserName", "g3")),
+            $"voluntary is 0x2F8: {string.Join(" | ", left)}");
+    }
+
+    /// <summary>
+    /// The other ten gated opcodes are consumed and logged, not answered. That is on purpose:
+    /// consuming keeps the replay table out of it, and an OnWorldFrame action set carries
+    /// Origin = None, so the rejection reaches the log and not somebody's chat window.
+    /// </summary>
+    [Test] public static void T52_the_unmodelled_guild_frames_are_consumed_not_answered()
+    {
+        var (store, _, _) = T52Guild(members: 2);
+        using var _s = store;
+        var h = new DispatchHarness().Build();
+        var someone = h.Player(1);
+
+        foreach (ushort op in GuildWiring.WorldOpcodes)
+        {
+            if (op == GuildPackets.SA_LEAVE_GUILD || op == GuildPackets.SA_BANISH_GUILD_MEMBER) continue;
+            var a = GuildWiring.OnWorldFrame(store, op, new byte[32]);
+            Hex.True(a.Origin.Kind == RecipientKind.None, $"0x{op:X4}: a World frame has no origin");
+            Hex.True(a.Rejected != null && a.IsEmpty, $"0x{op:X4} is not answered yet");
+            var r = h.Dispatcher.Dispatch(a, "guild-world");
+            Hex.True(!r.RejectionSent, $"0x{op:X4}: the rejection stays in the log");
+        }
+        Hex.True(someone.Log.Count == 0, "and nobody's chat window was touched");
+    }
+
+    /// <summary>
+    /// C_INVITE_USER_TO_GUILD (0xEF92), in the binary's own order of guards. The reply is two
+    /// system messages - 0xE2F to the inviter and 0xE30 to the target - plus a guild_invites row;
+    /// there is no S_ packet for it, which is why C_REJECT_INVITE_USER_TO_GUILD takes a guild id.
+    /// </summary>
+    [Test] public static void T52_invite_writes_the_row_and_tells_both_sides()
+    {
+        var (store, guilds, guildId) = T52Guild(members: 2, chars: 3);
+        using var _s = store;
+        var h = new DispatchHarness().Build(resolveDef: n => GuildHandlers.ResolveDef(null, n));
+        var chief = h.Player(1);
+        var target = h.Player(3);
+
+        // by name
+        var a = guilds.OnClientPacket(1, GuildPackets.C_INVITE_USER_TO_GUILD, CInviteBody("g3", 0, false));
+        Hex.True(a.Rejected == null, $"rejected: {a.Rejected}");
+        h.Dispatcher.Dispatch(a, "guild");
+        Hex.True(store.GetGuildInvites(3).Any(i => i.GuildId == guildId && i.InvitorDbId == 1),
+            "spAddInviteUserToGuild wrote the row");
+        Hex.True(string.Join(",", chief.Log) == "def:S_SYSTEM_MESSAGE"
+                 && string.Join(",", target.Log) == "def:S_SYSTEM_MESSAGE",
+            $"both sides: {string.Join(",", chief.Log)} // {string.Join(",", target.Log)}");
+
+        var msgs = a.ToClients.Select(c => (string)c.Fields!["message"]).ToList();
+        Hex.True(msgs[0] == SocialHandlers.Smt(GuildHandlers.MsgInviteSent, "userName", "g3"),
+            $"0xE2F to the inviter, key spelled lowercase: {msgs[0]}");
+        Hex.True(msgs[1] == SocialHandlers.Smt(GuildHandlers.MsgInviteReceived, "guildName", "Ere"),
+            $"0xE30 to the target: {msgs[1]}");
+
+        // a second invite from the same guild is refused - GuildJoinManager::AlreadyInvitedGuild
+        Hex.True(guilds.OnClientPacket(1, GuildPackets.C_INVITE_USER_TO_GUILD,
+            CInviteBody("g3", 0, false)).Rejected != null, "no duplicate invites");
+        // by db id works the same way, and 0 means "use the name"
+        Hex.True(store.GetGuildInvites(3).Count == 1, "still one row");
+
+        // every guard, in the binary's order
+        Hex.True(guilds.OnClientPacket(3, GuildPackets.C_INVITE_USER_TO_GUILD,
+            CInviteBody("g2", 0, false)).Rejected != null, "the caller must be in a guild (0xE2B)");
+        Hex.True(guilds.OnClientPacket(2, GuildPackets.C_INVITE_USER_TO_GUILD,
+            CInviteBody("g3", 0, false)).Rejected != null, "and hold the invite authority (0xE2C)");
+        Hex.True(guilds.OnClientPacket(1, GuildPackets.C_INVITE_USER_TO_GUILD,
+            CInviteBody("nobody", 0, false)).Rejected != null, "no such user (0xE2B)");
+        Hex.True(guilds.OnClientPacket(1, GuildPackets.C_INVITE_USER_TO_GUILD,
+            CInviteBody("g1", 0, false)).Rejected != null, "cannot invite yourself");
+        Hex.True(guilds.OnClientPacket(1, GuildPackets.C_INVITE_USER_TO_GUILD,
+            CInviteBody("g3", 0, true)).Rejected != null, "no wanted board in this build (0xE2E)");
+
+        // a target who is already in a guild is a system message, not a rejection
+        var already = guilds.OnClientPacket(1, GuildPackets.C_INVITE_USER_TO_GUILD, CInviteBody("g2", 0, false));
+        Hex.True(already.Rejected == null && already.ToClients.Count == 1,
+            "0xE36 is content, not a refusal");
+        Hex.True((string)already.ToClients[0].Fields!["message"]
+                 == SocialHandlers.Smt(GuildHandlers.MsgAlreadyInAGuild, "userName", "g2"),
+            (string)already.ToClients[0].Fields!["message"]);
+    }
+
+    /// <summary>
+    /// C_CHANGE_GUILDNAME (0xFC1C). The handler's one guard is
+    /// <c>*(int *)(guild + 0xd8) == *(int *)(user + 0x120)</c> - Guild+0xD8 is GuildData+0x50,
+    /// the ChiefDbId - so only the master may rename. The reply is S_CHANGE_GUILDNAME, whose
+    /// shipped .def drops the `usable` flag the whole name-check family carries (section 5.5).
+    /// </summary>
+    [Test] public static void T52_only_the_master_may_rename_and_a_taken_name_is_refused()
+    {
+        var (store, guilds, guildId) = T52Guild(members: 2, chars: 3);
+        using var _s = store;
+
+        // a member is refused outright - the real handler answers nothing at all
+        Hex.True(guilds.OnClientPacket(2, GuildPackets.C_CHANGE_GUILDNAME, CStringBody("Nope")).Rejected != null,
+            "only the guild master may rename");
+        Hex.True(store.GetGuild(guildId)!.Name == "Ere", "and nothing changed");
+
+        // the master renames
+        var ok = guilds.OnClientPacket(1, GuildPackets.C_CHANGE_GUILDNAME, CStringBody("Erenor"));
+        Hex.True(ok.Rejected == null && ok.ToClients.Count == 1, $"rejected: {ok.Rejected}");
+        Hex.True(ok.ToClients[0].PacketName == "S_CHANGE_GUILDNAME", ok.ToClients[0].PacketName);
+        Hex.True((string)ok.ToClients[0].Fields!["guildName"] == "Erenor"
+                 && (bool)ok.ToClients[0].Fields!["usable"],
+            "the reply carries the name and the flag the shipped .def forgot");
+        Hex.True(store.GetGuild(guildId)!.Name == "Erenor", "the row was renamed");
+        Hex.True(string.Join(",", ok.ToWorld.Select(w => $"0x{w.Opcode:X4}")) == "0x1490",
+            "AS_UPDATE_GUILD_NAME: " + string.Join(",", ok.ToWorld.Select(w => $"0x{w.Opcode:X4}")));
+
+        // a name another guild already has comes back usable = false, and nothing is written
+        var other = NewGuildHandlers(store);
+        var setup = new GuildActions();
+        int g2 = other.CreateGuild(setup, 3, "Taken");   // character 3 is in no guild yet
+        Hex.True(g2 > 0, "a second guild exists");
+        var clash = guilds.OnClientPacket(1, GuildPackets.C_CHANGE_GUILDNAME, CStringBody("Taken"));
+        Hex.True(!(bool)clash.ToClients[0].Fields!["usable"], "usable = false");
+        Hex.True(clash.ToWorld.Count == 0, "and World is not told about a rename that did not happen");
+        Hex.True(store.GetGuild(guildId)!.Name == "Erenor", "the row is untouched");
+
+        // renaming to the name you already have is a no-op that succeeds
+        var same = guilds.OnClientPacket(1, GuildPackets.C_CHANGE_GUILDNAME, CStringBody("Erenor"));
+        Hex.True((bool)same.ToClients[0].Fields!["usable"], "a guild may keep its own name");
+        Hex.True(!store.RenameGuild(guildId, ""), "an empty name is refused");
+        Hex.True(!store.RenameGuild(guildId + 999, "Ghost"), "and so is a guild id that does not exist");
+    }
+
+    // =======================================================================================
+    // T53 - the trade broker codec. Research: status/BROKER-DESIGN.md.
+    //
+    // No capture contains a broker frame, so every layout is golden against the packet's own PDL
+    // dumper - the same footing the party (T28) and guild (T36) codecs stand on. What these
+    // tests pin is the two things a dumper gives you for free and a hand-copy loses: that the
+    // guard lands on the end of the last field, and that the shipped .def agrees.
+    // =======================================================================================
+
+    /// <summary>
+    /// The split that decides the whole design: the Arbiter answers 16 of the 21
+    /// C_TRADE_BROKER_* packets and never sees the other five, which are exactly the five that
+    /// move an item. Registering one of World's would double-answer the client; leaving one of
+    /// ours unregistered sends it to World, which cannot answer it.
+    /// </summary>
+    [Test] public static void T53_the_broker_client_packets_split_16_arbiter_5_world()
+    {
+        (ushort Op, int Frame)[] ours =
+        {
+            (0xABCA, 0x04), (0x961B, 0x04), (0x9FA3, 0x0C), (0xDB7F, 0x10), (0xEAFB, 0x04),
+            (0x76B4, 0x6C), (0xE53F, 0x08), (0x983A, 0x09), (0x6F34, 0x10), (0xB981, 0x04),
+            (0xB33F, 0x0C), (0x92E5, 0x04), (0xA788, 0x10), (0x8DC7, 0x75), (0x8CFB, 0x08),
+            (0x8863, 0x09),
+        };
+        Hex.True(ours.Length == 16, "sixteen Arbiter-answered broker packets");
+
+        foreach (var (op, frame) in ours)
+        {
+            Hex.True(BrokerPackets.ArbiterHandlesClientPacket(op), $"0x{op:X4} is ours");
+            Hex.True(BrokerPackets.MinClientLength(op) == frame,
+                $"0x{op:X4}: frame guard 0x{BrokerPackets.MinClientLength(op):X2}, want 0x{frame:X2}");
+            Hex.True(BrokerPackets.MinBodyLength(op) == (frame <= 4 ? 0 : frame - 4),
+                $"0x{op:X4}: the body minimum is the frame guard minus the 4-byte header, got "
+                + $"{BrokerPackets.MinBodyLength(op)}");
+            Hex.True(!BrokerPackets.WorldHandlesClientPacket(op), $"0x{op:X4} is not also World's");
+        }
+
+        // the five World owns - dumpers but no Handler_C_* anywhere in ArbiterServer.exe
+        ushort[] worlds = { 0x7E74, 0xB8BA, 0x7516, 0x5C10, 0xF66D };
+        foreach (ushort op in worlds)
+        {
+            Hex.True(BrokerPackets.WorldHandlesClientPacket(op), $"0x{op:X4} is World's");
+            Hex.True(!BrokerPackets.ArbiterHandlesClientPacket(op)
+                     && BrokerPackets.MinClientLength(op) == 0 && BrokerPackets.MinBodyLength(op) == 0,
+                $"0x{op:X4} must answer 0 in both length tables, or someone will register it");
+        }
+
+        // and each of the five becomes the SDB_ of the same name
+        Hex.True(BrokerPackets.SDB_TRADE_BROKER_REGISTER_ITEM == 0x2817
+                 && BrokerPackets.SDB_TRADE_BROKER_UNREGISTER_ITEM == 0x2819
+                 && BrokerPackets.SDB_TRADE_BROKER_CALC_SOLD_ITEM == 0x281B
+                 && BrokerPackets.SDB_TRADE_BROKER_CALC_BOUGHT_ITEM == 0x281D
+                 && BrokerPackets.SDB_TRADE_BROKER_BUY_IT_NOW == 0x281F,
+            "the C_ name and the SDB_ name are the same word");
+    }
+
+    /// <summary>
+    /// The finding that matters: five of the seven SDB_ broker requests carry a DlmId, so each is
+    /// a per-user DLMItem. Nothing answers them and no capture contains one, so the replay table
+    /// cannot cover either - opening the broker on a live TeraSharp head-blocks that character's
+    /// DB queue for the life of the World process, exactly as opening the mailbox did before T45.
+    /// </summary>
+    [Test] public static void T53_five_broker_requests_are_unanswered_DLM_items()
+    {
+        ushort[] withDlm = { 0x2817, 0x2819, 0x281B, 0x281D, 0x281F };
+        ushort[] withoutDlm = { 0x2821, 0x2824 };
+
+        foreach (ushort op in withDlm)
+        {
+            Hex.True(BrokerPackets.CarriesDlmId(op), $"0x{op:X4} carries a DlmId");
+            Hex.True(!DbProxyHandlers.IsHandledRequest(op),
+                $"0x{op:X4} is still unanswered - if this fails, T53's headline is stale and "
+                + "status/BROKER-DESIGN.md section 8 needs updating");
+            Hex.True(!WorldReplayTable.OneWayFromWorld.Contains(op),
+                $"0x{op:X4} is not sealed one-way either - World really is waiting for a reply");
+            Hex.True(BrokerPackets.ReplyFor(op) == (ushort)(op + 1),
+                $"0x{op:X4}'s reply is the next opcode");
+        }
+        foreach (ushort op in withoutDlm)
+            Hex.True(!BrokerPackets.CarriesDlmId(op),
+                $"0x{op:X4} carries no DlmId, so an unanswered one cannot head-block anyone");
+
+        // CANCEL_DEAL is the one pair that is not request+1
+        Hex.True(BrokerPackets.ReplyFor(0x2824) == 0x282C, "SDB 0x2824 -> DBS 0x282C, not 0x2825");
+        Hex.True(BrokerPackets.ReplyFor(0xDEAD) == 0, "and anything else has no reply");
+        // DBS_TRADE_BROKER_ACCEPT_DEAL is a push, so nothing maps to it
+        Hex.True(BrokerPackets.DBS_TRADE_BROKER_ACCEPT_DEAL == 0x2823, "0x2823 has no SDB_ partner");
+    }
+
+    /// <summary>
+    /// Every inter-server broker frame's guard, from its dumper. A short frame kills the link on
+    /// the real Arbiter (PDL version mismatch), so these have to be exact; our parsers answer
+    /// null instead, which is the safe analogue.
+    /// </summary>
+    [Test] public static void T53_broker_frame_guards_match_the_dumpers()
+    {
+        (ushort Op, int Frame)[] frames =
+        {
+            (0x2817, 0x16), (0x2819, 0x1E), (0x281B, 0x22), (0x281D, 0x22), (0x281F, 0x27),
+            (0x2821, 0x12), (0x2824, 0x0E),
+            (0x2818, 0x13), (0x281A, 0x1F), (0x281C, 0x1F), (0x281E, 0x1F), (0x2820, 0x1F),
+            (0x2822, 0x4C), (0x2823, 0x1E), (0x282C, 0x0A),
+            (0x1457, 0x0E), (0x1459, 0x13), (0x1458, 0x0A), (0x145A, 0x12), (0x145B, 0x0A),
+            (0x286D, 0x0B),
+        };
+        foreach (var (op, frame) in frames)
+            Hex.True(BrokerPackets.MinFrameLength(op) == frame,
+                $"0x{op:X4}: 0x{BrokerPackets.MinFrameLength(op):X2}, want 0x{frame:X2}");
+        Hex.True(frames.Length == 21, "seven SDB_, eight DBS_, six AS_/SA_");
+        Hex.True(BrokerPackets.MinFrameLength(0xDEAD) == 0, "and 0 for anything else");
+
+        // none of the broker opcodes collides with a gate we already have
+        foreach (var (op, _) in frames)
+        {
+            Hex.True(!PartyWiring.HandlesWorldFrame(op), $"0x{op:X4} is not a party frame");
+            Hex.True(!GuildWiring.HandlesWorldFrame(op), $"0x{op:X4} is not a guild frame");
+        }
+    }
+
+    /// <summary>
+    /// The three SDB_ requests a handler would answer first, parsed at the documented offsets,
+    /// and the reply builders that go with them. The BUY_IT_NOW case is the one the shipped .def
+    /// gets wrong - TotalPriceWithTax sits past where the .def stops.
+    /// </summary>
+    [Test] public static void T53_the_SDB_broker_requests_parse_at_the_documented_offsets()
+    {
+        // SDB_TRADE_BROKER_REGISTER_ITEM, frame 0x16: i32 DlmId@0E, i32 OwnerDbId@12
+        var reg = new byte[0x16 - 6];
+        BitConverter.GetBytes(0x3Cu).CopyTo(reg, 0x0E - 6);
+        BitConverter.GetBytes(77).CopyTo(reg, 0x12 - 6);
+        var r = BrokerPackets.ParseSdbRegisterItem(reg);
+        Hex.True(r != null && r.Value.dlmId == 0x3C && r.Value.ownerDbId == 77, $"{r}");
+        Hex.True(BrokerPackets.ParseSdbRegisterItem(new byte[4]) == null, "a short frame is refused");
+
+        // SDB_TRADE_BROKER_BUY_IT_NOW, frame 0x27 - the .def stops at InstantBuy@1E and misses
+        // the i64 at 0x1F entirely (BROKER-DESIGN.md section 5).
+        var buy = new byte[0x27 - 6];
+        BitConverter.GetBytes(0x41u).CopyTo(buy, 0x0E - 6);
+        BitConverter.GetBytes(88).CopyTo(buy, 0x12 - 6);
+        BitConverter.GetBytes(2).CopyTo(buy, 0x16 - 6);
+        BitConverter.GetBytes(9001).CopyTo(buy, 0x1A - 6);
+        buy[0x1E - 6] = 1;
+        BitConverter.GetBytes(1_234_567_890_123L).CopyTo(buy, 0x1F - 6);
+        var b = BrokerPackets.ParseSdbBuyItNow(buy);
+        Hex.True(b != null, "parsed");
+        Hex.True(b!.Value.dlmId == 0x41 && b.Value.ownerDbId == 88 && b.Value.step == 2
+                 && b.Value.tradeId == 9001 && b.Value.instantBuy
+                 && b.Value.totalPriceWithTax == 1_234_567_890_123L,
+            $"every field, including the one the .def forgot: {b}");
+        Hex.True(buy.Length == 0x21, "the frame is 0x27 = 6-byte header + 0x21 of payload");
+
+        // the two with no DlmId
+        var start = new byte[0x12 - 6];
+        BitConverter.GetBytes(11).CopyTo(start, 0);
+        BitConverter.GetBytes(22).CopyTo(start, 4);
+        BitConverter.GetBytes(33).CopyTo(start, 8);
+        var sd = BrokerPackets.ParseSdbStartDeal(start);
+        Hex.True(sd != null && sd.Value.buyerDbId == 11 && sd.Value.sellerDbId == 22 && sd.Value.tradeId == 33, $"{sd}");
+
+        var cancel = new byte[0x0E - 6];
+        BitConverter.GetBytes(44).CopyTo(cancel, 0);
+        BitConverter.GetBytes(55).CopyTo(cancel, 4);
+        var cd = BrokerPackets.ParseSdbCancelDeal(cancel);
+        Hex.True(cd != null && cd.Value.userDbId == 44 && cd.Value.tradeId == 55, $"{cd}");
+
+        // CALC_SOLD and CALC_BOUGHT are one layout behind two opcodes
+        var calc = new byte[0x22 - 6];
+        BitConverter.GetBytes(0x50u).CopyTo(calc, 0x16 - 6);
+        BitConverter.GetBytes(66).CopyTo(calc, 0x1A - 6);
+        BitConverter.GetBytes(3).CopyTo(calc, 0x1E - 6);
+        foreach (ushort op in new ushort[] { 0x281B, 0x281D })
+        {
+            var c = BrokerPackets.ParseSdbCalcItem(op, calc);
+            Hex.True(c != null && c.Value.dlmId == 0x50 && c.Value.ownerDbId == 66 && c.Value.step == 3,
+                $"0x{op:X4}: {c}");
+        }
+        Hex.True(BrokerPackets.ParseSdbCalcItem(0x2817, calc) == null,
+            "and it refuses an opcode that is not one of the two");
+
+        // the replies, at the sizes the dumpers give
+        var ack = BrokerPackets.BuildDbsRegisterItem(0x3C, success: false);
+        Hex.True(ack.Length == 0x13 - 6, $"DBS_REGISTER_ITEM payload {ack.Length}, want {0x13 - 6}");
+        Hex.True(BitConverter.ToUInt32(ack, 0x0E - 6) == 0x3C && ack[0x12 - 6] == 0, "DlmId echoed, Success 0");
+
+        var step = BrokerPackets.BuildDbsStepAck(0x41, step: 2, success: true);
+        Hex.True(step.Length == 0x1F - 6, $"the 0x1F shape {step.Length}");
+        Hex.True(BitConverter.ToUInt32(step, 0x16 - 6) == 0x41
+                 && BitConverter.ToInt32(step, 0x1A - 6) == 2 && step[0x1E - 6] == 1,
+            "DlmId, the Step echoed back, Success");
+
+        var accept = BrokerPackets.BuildDbsAcceptDeal(1, 2, 3, 4, 5_000_000L);
+        Hex.True(accept.Length == 0x1E - 6 && BitConverter.ToInt64(accept, 16) == 5_000_000L,
+            $"DBS_ACCEPT_DEAL is 0x1E and ends with AgreedPrice: {accept.Length}");
+    }
+
+    /// <summary>
+    /// The search filter, 0x6C bytes of it. The point of this test is the last assertion: the
+    /// handler's guard lands exactly on the end of <c>Wearable</c>, which is what says the field
+    /// list is complete rather than merely plausible.
+    /// </summary>
+    [Test] public static void T53_the_history_search_filter_fills_its_guard_exactly()
+    {
+        Hex.True(BrokerPackets.HistorySearchSize == 0x6C, "fixed part 0x6C");
+        Hex.True(BrokerPackets.WaitingSearchSize == 0x75,
+            "the waiting filter is nine bytes longer - it adds CanBargainItemsOnly and reorders");
+
+        var body = new byte[BrokerPackets.HistorySearchSize - 4];
+        void I(int packetOff, int v) => BitConverter.GetBytes(v).CopyTo(body, packetOff - 4);
+        void L(int packetOff, long v) => BitConverter.GetBytes(v).CopyTo(body, packetOff - 4);
+        I(0x0C, 65); I(0x10, 70); I(0x14, 4); I(0x18, 1);
+        body[0x1C - 4] = 1; body[0x1D - 4] = 0;
+        I(0x1E, 100); I(0x22, 450);
+        I(0x26, 7); L(0x2A, 12345L); I(0x32, 2);
+        I(0x36, 1); I(0x3A, 9); I(0x3E, 0); I(0x42, 12);
+        L(0x46, 1_000L); L(0x4E, 9_999_999L);
+        body[0x56 - 4] = 1; body[0x57 - 4] = 1;
+        L(0x58, 5L); L(0x60, 50L);
+        body[0x68 - 4] = 1; body[0x69 - 4] = 1; body[0x6A - 4] = 0; body[0x6B - 4] = 1;
+
+        var f = BrokerPackets.ParseCHistorySearch(body);
+        Hex.True(f != null, "parsed");
+        var v = f!.Value;
+        Hex.True(v.MinLevel == 65 && v.MaxLevel == 70 && v.Grade == 4 && v.UnidentifiedItem == 1,
+            $"the four leading i32: {v.MinLevel},{v.MaxLevel},{v.Grade},{v.UnidentifiedItem}");
+        Hex.True(v.Masterpiece && !v.Enchantable, "the two unaligned bools at 0x1C/0x1D");
+        Hex.True(v.MinItemLevel == 100 && v.MaxItemLevel == 450, "item level band");
+        Hex.True(v.OptionValue == 12345L && v.OptionSearchCompareType == 2, "the i64 at 0x2A is unaligned");
+        Hex.True(v.MinPrice == 1_000L && v.MaxPrice == 9_999_999L, "price band");
+        Hex.True(v.MinTCatPrice == 5L && v.MaxTCatPrice == 50L, "and the T-cat band");
+        Hex.True(v.ExactMatch && v.EquipmentSet && v.UseDetailSearch && v.Awakened
+                 && !v.Unbindable && v.Wearable, "the six trailing bools");
+        Hex.True(v.Keyword == "" && v.Category == "" && v.ItemTemplateIdList == ""
+                 && v.SecondaryKeyword == "",
+            "an offset of 0 reads as empty, which is what the real handler falls back on");
+
+        // one byte short and it is refused rather than read past
+        Hex.True(BrokerPackets.ParseCHistorySearch(body[..^1]) == null,
+            "0x6B of body is one short of the guard");
+        Hex.True(BrokerPackets.ParseCHistorySearch(null!) == null, "and null is not a crash");
+    }
+
+    /// <summary>The small fixed-layout client packets, and the two i64 that are UNALIGNED
+    /// because the protocol packs a TradeId in front of them.</summary>
+    [Test] public static void T53_the_small_broker_client_packets_parse()
+    {
+        var confirm = new byte[8];
+        BitConverter.GetBytes(101).CopyTo(confirm, 0);
+        BitConverter.GetBytes(2).CopyTo(confirm, 4);
+        var c = BrokerPackets.ParseCDealConfirm(confirm);
+        Hex.True(c != null && c.Value.tradeId == 101 && c.Value.dealStatus == 2, $"{c}");
+
+        var reject = new byte[8];
+        BitConverter.GetBytes(7).CopyTo(reject, 0);
+        BitConverter.GetBytes(102).CopyTo(reject, 4);
+        var rj = BrokerPackets.ParseCRejectSuggest(reject);
+        Hex.True(rj != null && rj.Value.buyerDbId == 7 && rj.Value.tradeId == 102, $"{rj}");
+
+        var price = new byte[12];
+        BitConverter.GetBytes(103).CopyTo(price, 0);
+        BitConverter.GetBytes(7_777_777_777L).CopyTo(price, 4);      // unaligned i64
+        var pu = BrokerPackets.ParseCDealPriceUpdate(price);
+        Hex.True(pu != null && pu.Value.tradeId == 103 && pu.Value.price == 7_777_777_777L, $"{pu}");
+        var sg = BrokerPackets.ParseCSuggestDeal(price);
+        Hex.True(sg != null && sg.Value.tradeId == 103 && sg.Value.suggestPrice == 7_777_777_777L,
+            "SUGGEST_DEAL is the same shape");
+
+        var input = new byte[12];
+        BitConverter.GetBytes(0x1122334455667788L).CopyTo(input, 0);
+        BitConverter.GetBytes(88888).CopyTo(input, 8);
+        var ip = BrokerPackets.ParseCInputPrice(input);
+        Hex.True(ip != null && ip.Value.itemDbId == 0x1122334455667788L && ip.Value.itemTemplateId == 88888, $"{ip}");
+
+        Hex.True(BrokerPackets.ParseCListPage(BitConverter.GetBytes(3)) == 3, "PageNo");
+        var sort = new byte[5];
+        BitConverter.GetBytes(2).CopyTo(sort, 0); sort[4] = 1;
+        var st = BrokerPackets.ParseCListSort(sort);
+        Hex.True(st != null && st.Value.criteria == 2 && st.Value.ascending, $"{st}");
+
+        // every parser refuses a body one byte short of its guard
+        Hex.True(BrokerPackets.ParseCDealConfirm(new byte[7]) == null
+                 && BrokerPackets.ParseCRejectSuggest(new byte[7]) == null
+                 && BrokerPackets.ParseCDealPriceUpdate(new byte[11]) == null
+                 && BrokerPackets.ParseCSuggestDeal(new byte[11]) == null
+                 && BrokerPackets.ParseCInputPrice(new byte[11]) == null
+                 && BrokerPackets.ParseCListPage(new byte[3]) == null
+                 && BrokerPackets.ParseCListSort(new byte[4]) == null,
+            "a short body is null, never a read past the end");
+    }
+
+    /// <summary>
+    /// The four shipped .def files that do not match the binary, and the contract that lets a
+    /// future wiring chain the corrections with the guild and chat ones. The BUY_IT_NOW
+    /// correction is the one with teeth: the .def is 8 bytes short of the price the buyer paid.
+    /// </summary>
+    [Test] public static void T53_the_four_wrong_broker_defs_are_corrected()
+    {
+        Hex.True(BrokerPackets.CorrectedDefs.Count == 4, "four, no more - two others only LOOK wrong");
+        foreach (var name in new[] { "SDB_TRADE_BROKER_BUY_IT_NOW", "S_TRADE_BROKER_DEAL_SUGGESTED",
+                                     "S_TRADE_BROKER_DEAL_INFO_UPDATE", "S_TRADE_BROKER_SOLD_ITEM_LIST" })
+            Hex.True(BrokerPackets.CorrectedDefs.ContainsKey(name), name);
+
+        // the corrections parse, and carry the fields the .def dropped
+        var buy = BrokerPackets.ResolveDef(null, "SDB_TRADE_BROKER_BUY_IT_NOW");
+        Hex.True(buy != null && buy.Fields.Any(f => f.Name == "totalPriceWithTax"),
+            "the i64 the .def stops before");
+        var sold = BrokerPackets.ResolveDef(null, "S_TRADE_BROKER_SOLD_ITEM_LIST");
+        Hex.True(sold != null && sold.Fields.Count == 2,
+            "two i64 - the guard is 0x18 = header + both");
+        var sug = BrokerPackets.ResolveDef(null, "S_TRADE_BROKER_DEAL_SUGGESTED");
+        Hex.True(sug != null && sug.Fields[0].Name == "userName@hdr" && sug.Fields[0].IsHeaderFor == FieldKind.String,
+            "the binary writes the name's ref slot FIRST (the parser emits it as the userName@hdr header)");
+        Hex.True(sug!.Fields.Any(f => f.Name == "itemEnchantCount"), "and the .def drops this one");
+        var upd = BrokerPackets.ResolveDef(null, "S_TRADE_BROKER_DEAL_INFO_UPDATE");
+        Hex.True(upd != null && upd.Fields.Count == 3,
+            "three fields - the .def has an extra int32 and is 4 bytes too long");
+
+        // an uncorrected packet falls through, and a null registry returns the corrections only
+        Hex.True(BrokerPackets.ResolveDef(null, "S_TRADE_BROKER_CALC_NOTIFY") == null,
+            "the same contract as GuildHandlers.ResolveDef / ChatManager.ResolveDef");
+
+        // ...and it really does chain with the other two
+        Hex.True((BrokerPackets.ResolveDef(null, "S_ADD_GUILD_MEMBER")
+                  ?? GuildHandlers.ResolveDef(null, "S_ADD_GUILD_MEMBER")) != null,
+            "broker ?? guild resolves a guild packet");
+    }
+
+    /// <summary>
+    /// The broker opcodes, cross-checked the way T36 cross-checked the guild ones: the client ids
+    /// the Arbiter writes into its packets have to match data.json maps."376012". Here the check
+    /// is against the def folder's presence and the in-code constants agreeing with the table in
+    /// status/BROKER-DESIGN.md, since data.json is not in the repo.
+    /// </summary>
+    [Test] public static void T53_no_two_broker_opcodes_collide()
+    {
+        var all = typeof(BrokerPackets).GetFields(BindingFlags.Public | BindingFlags.Static)
+            .Where(f => f.IsLiteral && f.FieldType == typeof(ushort))
+            .Select(f => (f.Name, Op: (ushort)f.GetRawConstantValue()!))
+            .ToList();
+        Hex.True(all.Count == 57,
+            $"21 C_ + 15 S_ + 7 SDB_ + 8 DBS_ + 4 AS_ + 2 SA_ = 57 broker opcodes, got {all.Count}");
+        Hex.True(all.Count(f => f.Name.StartsWith("C_")) == 21
+                 && all.Count(f => f.Name.StartsWith("S_")) == 15
+                 && all.Count(f => f.Name.StartsWith("SDB_")) == 7
+                 && all.Count(f => f.Name.StartsWith("DBS_")) == 8
+                 && all.Count(f => f.Name.StartsWith("AS_")) == 4
+                 && all.Count(f => f.Name.StartsWith("SA_")) == 2,
+            "the family breakdown - DBS_ has one more than SDB_ because ACCEPT_DEAL is a push");
+
+        var byOp = new Dictionary<ushort, string>();
+        foreach (var (name, op) in all)
+        {
+            Hex.True(!byOp.ContainsKey(op),
+                $"0x{op:X4} is declared twice: {name} and {(byOp.TryGetValue(op, out var w) ? w : "")}"
+                + " - a copy/paste in a 42-constant block is otherwise invisible");
+            byOp[op] = name;
+        }
+
+        // the four families are in their own numeric ranges, which is a cheap sanity check
+        Hex.True(BrokerPackets.SDB_TRADE_BROKER_REGISTER_ITEM >> 8 == 0x28
+                 && BrokerPackets.DBS_TRADE_BROKER_CANCEL_DEAL >> 8 == 0x28,
+            "the DB-proxy pairs live in 0x28xx");
+        Hex.True(BrokerPackets.SA_TRADE_BROKER_OPEN >> 8 == 0x14
+                 && BrokerPackets.AS_TRADE_BROKER_DEAL_CLOSE >> 8 == 0x14,
+            "the inter-server ones in 0x14xx, except AS_TRADE_BROKER_ITEM_SOLD");
+        Hex.True(BrokerPackets.AS_TRADE_BROKER_ITEM_SOLD == 0x286D,
+            "which sits in the DB-proxy range despite being an AS_");
     }
 }

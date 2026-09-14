@@ -265,3 +265,28 @@ every World boot re-sent two bytes of the real Arbiter's uninitialised stack fro
 
 The four one-way `AS_`/`SA_` guild frames are not in this table because none of them is a
 DB-proxy request: they are in `GUILD-DESIGN.md` §4.1 and §4.2.
+
+
+## Trade broker — T53 research, nothing answered yet
+
+Deliberately **not** a table in this file. The coverage guard
+(`Every_per_user_request_opcode_is_answered`) reads the tables above and fails for any row that
+has neither a handler nor a one-way seal — and these five have neither, on purpose, because T53
+was research and a codec. Adding them as rows would break the build to say what this paragraph
+already says.
+
+Five of the seven `SDB_TRADE_BROKER_*` requests carry a **DlmId**, so each is a per-user DLMItem
+and an unanswered one head-blocks that character's DB queue for the life of the World process
+(`status/HANDOFF.md` §1):
+
+    0x2817 SDB_TRADE_BROKER_REGISTER_ITEM     -> 0x2818, frame 0x16
+    0x2819 SDB_TRADE_BROKER_UNREGISTER_ITEM   -> 0x281A, frame 0x1E
+    0x281B SDB_TRADE_BROKER_CALC_SOLD_ITEM    -> 0x281C, frame 0x22
+    0x281D SDB_TRADE_BROKER_CALC_BOUGHT_ITEM  -> 0x281E, frame 0x22
+    0x281F SDB_TRADE_BROKER_BUY_IT_NOW        -> 0x2820, frame 0x27
+
+`SDB_TRADE_BROKER_START_DEAL` (0x2821) and `_CANCEL_DEAL` (0x2824) carry no DlmId and are safe to
+leave alone. **Opening the broker on a live TeraSharp today wedges the character** — the same
+failure the mailbox had before T45, and for the same reason: no handler, and no capture for the
+replay table to fall back on. Layouts, reply builders and the `Step` caveat are in
+`status/BROKER-DESIGN.md` §3; §8 says what to do first.
