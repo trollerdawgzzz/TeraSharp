@@ -435,3 +435,29 @@ a gameId must be a real handler.
 - The client's "TERA / Battle Arena" picker after server select is the 100.02 client, not fixable server-side.
 - Don't "fix" things the decompile contradicts. Two earlier assumptions (0x1460 unnecessary; gameId derivable)
   were wrong and cost time. When the notes and the decompile disagree, the decompile wins — and update the notes.
+
+---
+
+## 7. Token budget (2026-09-15 — a week's quota went mostly to Cowork verification volume)
+
+Applies to every Cowork task. Do the work, not the theatre.
+
+1. **Read only what the task needs.** Grep the decompile for the handler/writer by name and read that function
+   and its callees; never sweep `Arb_part_*.c` / `WorldServer.exe.c` for context. Never re-read a file already
+   read in the same task; never read the whole test file — grep for the test name.
+2. **Verify once, cheaply.** One Python check per layout/frame. Do NOT transliterate whole handlers or state
+   machines, reconstruct .NET Random, re-derive goldens independently and diff them, or simulate build guards.
+   Brace-balance the edited files and stop.
+3. **Reports: 15 lines max.** Files touched (one line each), test names, the human-owned lines to apply, at most
+   three findings. No narrative, no restating the brief, no "not acted on" lists unless something blocks.
+4. **Docs:** extend the existing design doc with a short section; no new 500-line documents unless the task is
+   research-only. Tables over prose. No decompile quotes longer than 5 lines.
+5. **Tests:** one byte-exact test per frame/layout, one round-trip per store feature, one refusal path. Not one
+   per branch. Reuse existing helpers.
+6. **Scope:** implement X only. Do not audit Y, rename Z, or reorganise docs. One line noting it, then stop.
+7. **Ask before expanding:** if the task needs more than ~2x the obvious work (a second capture, a second
+   subsystem), report in 3 lines and wait.
+8. Never rewrite STATUS.md / CLAUDE.md sections wholesale — append one row/line.
+
+For the human: batch two or three tasks per merge session, keep prompts to essentials, prefer one live session
+over speculative tasks.
