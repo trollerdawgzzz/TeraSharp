@@ -2140,9 +2140,10 @@ array items
             0x15F9,
             // T42: SDB_MOVE_WAREHOUSE_ITEM is a ten-line stub in the real Arbiter that sends nothing.
             0x2754,
-            // T47: the through-Arbiter contract family (two-party trades the Arbiter brokers) -
-            // no DlmId, fan-out rather than reply.
-            0x2809, 0x280C, 0x280D, 0x280E,
+            // T47 sealed the through-Arbiter contract family here (0x2809, 0x280C, 0x280D,
+            // 0x280E). T60 UNSEALED all four: they are gated to ContractBroker off
+            // WorldBridge's default arm instead, and a SEALED opcode never reaches a gate.
+            // See T60_the_contract_opcodes_are_gated_not_sealed.
         };
         foreach (var op in expected)
             Hex.True(WorldReplayTable.OneWayFromWorld.Contains(op),
@@ -11730,21 +11731,24 @@ some prose with `backticks` that is not a table row
 
     // ---- the Arbiter Contract opcodes ----
 
-    [Test] public static void T47_contract_family_is_sealed_one_way()
+    [Test] public static void T47_contract_family_carries_no_dlm_id()
     {
         // 0x2809 SDB_FETCH_THROUGH_ARBITER_CONTRACT and 0x280E SDB_SEND_END_THROUGH_ARBITER_CONTRACT
         // are the two seen live (58-66 B, only with two players in view). None of the family
-        // carries a DlmId, so an unanswered one cannot head-block the DB queue - but without an
-        // entry here the replay table would hand them somebody else's reply.
-        foreach (ushort op in new ushort[] { 0x2809, 0x280C, 0x280D, 0x280E })
-            Hex.True(WorldReplayTable.OneWayFromWorld.Contains(op),
-                     $"0x{op:X4} must be sealed one-way");
-
-        // And they must NOT be answered: the Arbiter's own handlers send nothing back over the
-        // World link (0x280E's 0x280F is a fan-out to the OTHER participants, not a reply).
+        // carries a DlmId - the dumpers name ContractorDbId / ContractType / ContractId and
+        // nothing else - so an unanswered one cannot head-block the user's DB queue the way a
+        // missing DBS_ reply does. That is still true, and it is why T60 could answer them
+        // gradually without risking a wedged World.
         foreach (ushort op in new ushort[] { 0x2809, 0x280C, 0x280D, 0x280E })
             Hex.True(!DbProxyHandlers.IsHandledRequest(op),
-                     $"0x{op:X4} must not be in the allow-list - we have no contract system to answer with");
+                     $"0x{op:X4} must not be in the DB-proxy allow-list - it is not a DLM request, "
+                     + "and ContractBroker owns it now");
+
+        // T60 lifted the seal T47 put on them; the assertion that replaced it lives in
+        // T60_the_contract_opcodes_are_gated_not_sealed.
+        foreach (ushort op in new ushort[] { 0x2809, 0x280C, 0x280D, 0x280E })
+            Hex.True(ContractBroker.HandlesWorldFrame(op),
+                     $"0x{op:X4} is answered by ContractBroker, not sealed");
     }
 
     /// <summary>Walks up from the test binary looking for a repo-relative file; null if not found.</summary>
@@ -12839,11 +12843,13 @@ some prose with `backticks` that is not a table row
 
     [Test] public static void Arbiter_owned_set_covers_every_opcode_world_rejected()
     {
-        // The eighteen decimal opcodes the live World console printed.
+        // The eighteen decimal opcodes the live World console printed, plus the nineteenth
+        // (58817 C_ADD_TRADE_BAG) that the trade window produced on 2026-09-15 - T60.
         var observed = new ushort[]
         {
             30152, 43407, 61398, 23377, 28262, 64109, 33506, 57252, 46956,
             39349, 60155, 27265, 54263, 60477, 33239, 34411, 53135, 22631,
+            58817,
         };
         Hex.True(ArbiterClientHandlers.ArbiterOwned.Count == observed.Length,
             $"{ArbiterClientHandlers.ArbiterOwned.Count} in the set, {observed.Length} observed");
@@ -15779,6 +15785,456 @@ some prose with `backticks` that is not a table row
         foreach (ushort op in GuildWiring.WorldOpcodes)
             Hex.True(GuildWiring.OnWorldFrame(null, op, new byte[32]).Rejected != null,
                 $"0x{op:X4} with no store");
+    }
+
+    // =======================================================================================
+    // T60 - the contract broker (status/CONTRACT-DESIGN.md).
+    //
+    // Live 2026-09-15: a party invite between two in-world players sent
+    // SDB_FETCH_THROUGH_ARBITER_CONTRACT (0x2809) and later SDB_SEND_END (0x280E), both sealed
+    // one-way by T47, so the invite reached nobody and PartyManager never saw a packet. The seal
+    // is lifted and ContractBroker answers instead.
+    //
+    // No capture holds a decoded contract frame - the two live ones were recorded as lengths -
+    // so every layout below is golden against the DECOMPILED WRITERS, the same way PARTY-DESIGN
+    // section 5.1 pinned the party frames. If a capture ever contradicts one of these, the
+    // capture wins and the citation in CONTRACT-DESIGN.md section 3 says which writer to re-read.
+    // =======================================================================================
+
+    /// <summary>
+    /// Every A-&gt;W frame and client packet the broker builds, byte for byte.
+    ///
+    /// <para>The one that is easy to get wrong is the refusal: <c>FetchWork::ResponseFailure</c>
+    /// (FUN_1409cde70) backpatches the AskList OFFSET slot to the frame length whether or not the
+    /// list is empty, so an empty AskList is <c>offset 34, count 0</c> - NOT eight zero bytes.
+    /// World reads the offset before it reads the count.</para>
+    /// </summary>
+    [Test] public static void T60_contract_frames_match_the_arbiters_writers()
+    {
+        // 0x280A DBS_FETCH - the verdict. Success: one opponent in the AskList.
+        Hex.Eq(ContractBroker.BuildDbsFetch(1, ContractBroker.TypePartyInvite, 0x1234, 1,
+                   ContractBroker.ErrorNone, new[] { 2 }),
+            "22 00 00 00  04 00 00 00  01 00 00 00  04 00 00 00  34 12 00 00  01 00 00 00  "
+            + "00 00 00 00  02 00 00 00",
+            "0x280A success: [askList ref][contractor][type][contractId][index][errorNo][2]");
+
+        // ...and the refusal, which is the shape the live invite will now get when the target
+        // logged out between the click and the frame.
+        Hex.Eq(ContractBroker.BuildDbsFetch(1, ContractBroker.TypePartyInvite, 0x1234, 0,
+                   ContractBroker.ErrorTargetNotInWorld),
+            "22 00 00 00  00 00 00 00  01 00 00 00  04 00 00 00  34 12 00 00  00 00 00 00  "
+            + "02 00 00 00",
+            "0x280A refusal: offset 34 and count 0, not eight zeroes");
+
+        // 0x280B DBS_ASK - one per opponent, and both names are OFFSET-ONLY refs (four bytes,
+        // no count slot: FUN_140351030 writes a wstr, FUN_14016be20 dumps it from a pointer).
+        Hex.Eq(ContractBroker.BuildDbsAsk(1, 1, ContractBroker.TypePartyInvite, 0x1234, 2, "dob", "Test"),
+            "22 00 00 00  2A 00 00 00  01 00 00 00  01 00 00 00  04 00 00 00  34 12 00 00  "
+            + "02 00 00 00  64 00 6F 00 62 00 00 00  54 00 65 00 73 00 74 00 00 00",
+            "0x280B: contractor name at frame 34, opponent name right after it at 42");
+
+        // 0x280F DBS_SEND_END and 0x2810 DBS_REPLY - no refs at all
+        Hex.Eq(ContractBroker.BuildDbsSendEnd(1, ContractBroker.TypePartyInvite, 0x1234, 2),
+            "01 00 00 00  04 00 00 00  34 12 00 00  02 00 00 00",
+            "0x280F: [contractor][type][contractId][thatUser]");
+        Hex.Eq(ContractBroker.BuildDbsReply(1, 2, ContractBroker.TypePartyInvite, 0x1234, 1),
+            "01 00 00 00  02 00 00 00  04 00 00 00  34 12 00 00  01 00 00 00",
+            "0x2810: [requestor][requestee][type][contractId][reply]");
+
+        // the two client packets, which have no .def - the layouts come from the PDL dumpers
+        Hex.Eq(ContractBroker.BuildSBegin("dob", ContractBroker.TypePartyInvite, 0x1234, 1),
+            "1E 00  3F 7E  16 00  1E 00  00 00  04 00 00 00  34 12 00 00  01 00 00 00  "
+            + "64 00 6F 00 62 00 00 00",
+            "S_BEGIN_THROUGH_ARBITER_CONTRACT (0x7E3F), 22-byte fixed part");
+        Hex.Eq(ContractBroker.BuildSEnd("dob", ContractBroker.TypePartyInvite, 0x1234),
+            "16 00  D7 C7  0E 00  04 00 00 00  34 12 00 00  64 00 6F 00 62 00 00 00",
+            "S_END_THROUGH_ARBITER_CONTRACT (0xC7D7), 14-byte fixed part");
+
+        // the sizes the guards compare against, so a later edit cannot quietly move one
+        Hex.True(ContractBroker.FetchFrameSize == 0x22 && ContractBroker.AskFrameSize == 0x1B
+                 && ContractBroker.SendBeginFrameSize == 0x26
+                 && ContractBroker.SendEndReplyFrameSize == 0x16
+                 && ContractBroker.ReplyFrameSize == 0x1A,
+            "the five W->A frame sizes");
+        Hex.True(ContractBroker.ReplyPacketSize == 0x1E
+                 && ContractBroker.ReplyMinBodyLength == 0x1E - 4,
+            "C_REPLY's guard is the TOTAL length 0x1E; the dispatcher compares the body");
+    }
+
+    /// <summary>
+    /// The four W-&gt;A requests, read at the frame offsets the decompiled handlers read. Every
+    /// parser takes the PAYLOAD, so payload index = frame offset - 6 - the same convention
+    /// DbProxyStaticData and ParcelDbHandlers use.
+    /// </summary>
+    [Test] public static void T60_contract_requests_parse_at_the_frame_offsets()
+    {
+        // A 0x2809 as World builds it: Param is a wstring block at frame 34, the FetchDataList
+        // is one u32 right after it at frame 44.
+        var fetch = Hex.B(
+            "22 00 00 00  0A 00 00 00  2C 00 00 00  04 00 00 00  01 00 00 00  04 00 00 00  "
+            + "34 12 00 00  54 00 65 00 73 00 74 00 00 00  02 00 00 00");
+        var r = ContractBroker.ParseFetch(fetch);
+        Hex.True(r != null, "a 42-byte payload (48-byte frame) parses");
+        Hex.True(r!.Value.ContractorDbId == 1 && r.Value.ContractType == ContractBroker.TypePartyInvite
+                 && r.Value.ContractId == 0x1234,
+            $"contractor {r.Value.ContractorDbId}, type {r.Value.ContractType}, id {r.Value.ContractId}");
+
+        // Both readings of the target, which is the one guess in the file: a db id in the list,
+        // or a name in Param. CAPTURE-PLAN.md A.2.1 is the step that settles which one is real.
+        var hint = ContractBroker.ReadTargetHint(r.Value);
+        Hex.True(hint.DbIds.Count == 1 && hint.DbIds[0] == 2, "the FetchDataList reading finds db id 2");
+        Hex.True(hint.Name == "Test", $"and the Param reading finds the name, got '{hint.Name}'");
+
+        // 0x280C SDB_ASK - no refs, and the last byte is the bool
+        var ask = ContractBroker.ParseAsk(Hex.B(
+            "01 00 00 00  01 00 00 00  04 00 00 00  34 12 00 00  02 00 00 00  01"));
+        Hex.True(ask != null && ask.Value.ContractIndex == 1 && ask.Value.OpponentDbId == 2
+                 && ask.Value.CanContract, "0x280C: index 1, opponent 2, CanContract true");
+
+        // 0x280D SDB_SEND_BEGIN carries a ContractIndex the END frame does not
+        var begin = ContractBroker.ParseSendBegin(Hex.B(
+            "26 00 00 00  00 00 00 00  26 00 00 00  04 00 00 00  01 00 00 00  04 00 00 00  "
+            + "34 12 00 00  07 00 00 00  02 00 00 00"));
+        Hex.True(begin != null && begin.Value.ContractIndex == 7,
+            "0x280D reads ContractIndex at frame 0x22");
+        Hex.True(ContractBroker.ReadIdList(begin!.Value.AskUserList).Count == 1
+                 && ContractBroker.ReadIdList(begin.Value.AskUserList)[0] == 2,
+            "and the AskUserList holds the one opponent");
+
+        // 0x280E SDB_SEND_END is the 0x2809 layout again, with no index - the parser must say 0
+        var end = ContractBroker.ParseSendEnd(fetch);
+        Hex.True(end != null && end.Value.ContractIndex == 0,
+            "0x280E carries no ContractIndex, so the parser reports 0 rather than reading past");
+        Hex.True(end!.Value.ContractorDbId == 1 && end.Value.ContractId == 0x1234,
+            "and the rest lines up with 0x2809");
+    }
+
+    /// <summary>
+    /// Every contract parser refuses a short frame and a hostile ref instead of throwing - the
+    /// T50 rule, applied to four new W-&gt;A opcodes. A World frame is attacker-adjacent the
+    /// moment a client can make World emit one.
+    /// </summary>
+    [Test] public static void T60_short_and_hostile_contract_payloads_are_rejected()
+    {
+        Hex.True(ContractBroker.ParseFetch(null!) == null, "null payload");
+        Hex.True(ContractBroker.ParseFetch(new byte[27]) == null, "27 B is one short of the guard");
+        Hex.True(ContractBroker.ParseFetch(new byte[28]) != null, "28 B (a 34-byte frame) is the minimum");
+        Hex.True(ContractBroker.ParseAsk(new byte[20]) == null && ContractBroker.ParseAsk(new byte[21]) != null,
+            "0x280C wants 21 B of payload");
+        Hex.True(ContractBroker.ParseSendBegin(new byte[31]) == null
+                 && ContractBroker.ParseSendBegin(new byte[32]) != null, "0x280D wants 32 B");
+        Hex.True(ContractBroker.ParseSendEnd(new byte[27]) == null
+                 && ContractBroker.ParseSendEnd(new byte[28]) != null, "0x280E wants 28 B");
+
+        // a ref that points past the end, a count that would overflow the addition, and an
+        // offset inside the 6-byte header - all empty, none of them an exception
+        var p = new byte[28];
+        BitConverter.GetBytes(0x22u).CopyTo(p, 0); BitConverter.GetBytes(0xFFFFFFFFu).CopyTo(p, 4);
+        Hex.True(ContractBroker.Ref(p, 0).Length == 0, "count 0xFFFFFFFF reads nothing");
+        BitConverter.GetBytes(0xFFFFFFFFu).CopyTo(p, 0); BitConverter.GetBytes(4u).CopyTo(p, 4);
+        Hex.True(ContractBroker.Ref(p, 0).Length == 0, "offset 0xFFFFFFFF reads nothing");
+        BitConverter.GetBytes(0u).CopyTo(p, 0); BitConverter.GetBytes(4u).CopyTo(p, 4);
+        Hex.True(ContractBroker.Ref(p, 0).Length == 0, "an offset inside the header reads nothing");
+        Hex.True(ContractBroker.Ref(p, 24).Length == 0, "a ref slot that runs off the end reads nothing");
+        Hex.True(ContractBroker.ReadIdList(Array.Empty<byte>()).Count == 0
+                 && ContractBroker.ReadIdList(new byte[7]).Count == 1,
+            "a trailing partial u32 is dropped, not read");
+
+        // and the target guess on a request whose blocks are both empty
+        var empty = ContractBroker.ParseFetch(new byte[28])!.Value;
+        var hint = ContractBroker.ReadTargetHint(empty);
+        Hex.True(hint.DbIds.Count == 0 && hint.Name.Length == 0, "no ids, no name, no throw");
+        Hex.True(ContractBroker.ResolveTarget(empty, out var how) == null && how == "nothing",
+            $"and with no WorldBridge there is nobody to resolve to: {how}");
+    }
+
+    /// <summary>
+    /// The seal T47 put on the family is gone, and a gate replaced it. This is the assertion
+    /// T47_contract_family_is_sealed_one_way used to make in the opposite direction: a sealed
+    /// opcode never reaches TryHandleWorldFrame, so the two cannot both be true.
+    /// </summary>
+    [Test] public static void T60_the_contract_opcodes_are_gated_not_sealed()
+    {
+        ushort[] family = { 0x2809, 0x280C, 0x280D, 0x280E };
+        foreach (ushort op in family)
+        {
+            Hex.True(ContractBroker.HandlesWorldFrame(op), $"0x{op:X4} must reach the broker");
+            Hex.True(!WorldReplayTable.OneWayFromWorld.Contains(op),
+                $"0x{op:X4} must NOT be sealed - a sealed opcode never reaches the gate");
+            Hex.True(!DbProxyHandlers.IsHandledRequest(op),
+                $"0x{op:X4} is not a DB-proxy request either - the gate owns it");
+            Hex.True(!PartyWiring.HandlesWorldFrame(op) && !GuildWiring.HandlesWorldFrame(op),
+                $"0x{op:X4} belongs to exactly one gate");
+        }
+
+        // the A->W half of the family is ours to SEND and must never be gated as an arrival
+        foreach (ushort op in new ushort[] { 0x280A, 0x280B, 0x280F, 0x2810 })
+            Hex.True(!ContractBroker.HandlesWorldFrame(op),
+                $"0x{op:X4} is Arbiter -> World, not a frame we receive");
+
+        // neighbours, and a sample of what else crosses WorldBridge's default: arm
+        foreach (ushort op in new ushort[] { 0x2808, 0x2811, 0x13F7, 0x1395, 0x27CF, 0x1436 })
+            Hex.True(!ContractBroker.HandlesWorldFrame(op), $"0x{op:X4} must NOT be gated to contracts");
+
+        // with no WorldBridge the handlers stop at the null check, so the gate can be driven
+        // here for what it is: a claim on four opcodes, and nothing else.
+        foreach (ushort op in family)
+            Hex.True(ContractBroker.TryHandleWorldFrame(op, new byte[64]),
+                $"0x{op:X4} is claimed and dealt with");
+        foreach (ushort op in family)
+            Hex.True(ContractBroker.TryHandleWorldFrame(op, Array.Empty<byte>()),
+                $"0x{op:X4} is claimed even when the payload is too short to parse - it is dropped, "
+                + "not handed back to the replay table");
+        Hex.True(!ContractBroker.TryHandleWorldFrame(0x1395, new byte[64]),
+            "SA_JOIN_PARTY is left alone for PartyWiring");
+    }
+
+    /// <summary>
+    /// Offline target: the real Arbiter's by-name lookup misses, <c>ErrorNo</c> keeps its initial
+    /// value and <c>ResponseFailure</c> sends an empty AskList. No 0x280B goes out, so the target
+    /// hears nothing and the initiator's World gets a refusal it can show.
+    /// </summary>
+    [Test] public static void T60_an_offline_target_is_refused_the_way_the_real_arbiter_refuses()
+    {
+        Hex.True(ContractBroker.ErrorTargetNotInWorld == 2 && ContractBroker.ErrorNone == 0,
+            "ErrorNo 0 is success, 2 is the refusal");
+
+        var refusal = ContractBroker.BuildDbsFetch(1, ContractBroker.TypePartyInvite, 0x1234, 0,
+            ContractBroker.ErrorTargetNotInWorld);
+        Hex.True(refusal.Length == ContractBroker.FetchFrameSize - 6,
+            $"a refusal is the fixed 28-byte payload, got {refusal.Length}");
+        Hex.True(BitConverter.ToUInt32(refusal, 0) == ContractBroker.FetchFrameSize
+                 && BitConverter.ToUInt32(refusal, 4) == 0,
+            "offset is still the frame length; only the COUNT is zero");
+        Hex.True(BitConverter.ToInt32(refusal, 20) == 0,
+            "and the ContractIndex is 0 - no contract was created, so there is nothing to quote back");
+        Hex.True(BitConverter.ToInt32(refusal, 24) == ContractBroker.ErrorTargetNotInWorld,
+            "ErrorNo 2");
+
+        // the success form differs in exactly the three fields that matter
+        var ok = ContractBroker.BuildDbsFetch(1, ContractBroker.TypePartyInvite, 0x1234, 9,
+            ContractBroker.ErrorNone, new[] { 2 });
+        Hex.True(BitConverter.ToUInt32(ok, 4) == 4 && BitConverter.ToInt32(ok, 20) == 9
+                 && BitConverter.ToInt32(ok, 24) == ContractBroker.ErrorNone,
+            "count 4, index 9, ErrorNo 0");
+        Hex.True(ok.Length == refusal.Length + 4, "and exactly one u32 longer");
+    }
+
+    /// <summary>
+    /// Guild creation (type 10) and the trade broker deal (type 0x23) are refused ON PURPOSE.
+    /// <c>CreateGuildFetchWork</c> runs the guild-name restriction check before anything else and
+    /// <c>TradeBrokerOpenDealFetchWork</c> needs the broker's own deal state; we have neither, and
+    /// a made-up verdict would tell World a contract was brokered that never was.
+    /// </summary>
+    [Test] public static void T60_guild_and_trade_broker_contracts_are_not_brokered()
+    {
+        Hex.True(ContractBroker.IsBrokeredType(ContractBroker.TypePartyInvite)
+                 && ContractBroker.IsBrokeredType(ContractBroker.TypePartyApply),
+            "the two party types are brokered");
+        Hex.True(!ContractBroker.IsBrokeredType(ContractBroker.TypeCreateGuild)
+                 && !ContractBroker.IsBrokeredType(ContractBroker.TypeTradeBrokerOpenDeal),
+            "guild creation and the trade broker deal are not");
+        Hex.True(!ContractBroker.IsBrokeredType(0) && !ContractBroker.IsBrokeredType(99),
+            "and an unknown type is refused rather than guessed at");
+
+        Hex.True(ContractBroker.TypePartyInvite == 4 && ContractBroker.TypePartyApply == 5
+                 && ContractBroker.TypeCreateGuild == 10 && ContractBroker.TypeTradeBrokerOpenDeal == 0x23,
+            "the four ContractType ids the 0x2809 handler switches on");
+        Hex.True(ContractBroker.DescribeType(4) == "party invite"
+                 && ContractBroker.DescribeType(10) == "guild creation"
+                 && ContractBroker.DescribeType(77) == "type 77",
+            "the log line names the type it knows and prints the number it does not");
+    }
+
+    /// <summary>
+    /// The whole point of T60: a party invite that used to die at the seal now travels
+    /// initiator -&gt; Arbiter -&gt; target -&gt; accept -&gt; party.
+    ///
+    /// <para><b>The SA_JOIN_PARTY at the end is synthesised on purpose.</b> The real Arbiter does
+    /// not create the party either - it brokers the contract, the client accepts, and WORLD
+    /// creates the party and tells the Arbiter with SA_JOIN_PARTY (0x1395), which is where
+    /// PartyManager takes over (status/PARTY-DESIGN.md section 6.1). That separation is exactly
+    /// why PartyManager saw nothing while the contract opcodes were sealed. This test drives the
+    /// broker's half for real and then feeds the frame World would send, so the two halves are
+    /// joined where the live server joins them.</para>
+    /// </summary>
+    [Test] public static void T60_invite_accept_forms_a_party_through_PartyManager()
+    {
+        ContractBroker.Reset();
+
+        var pm = NewPartyManager();
+        pm.Register(P(10, 1, "dob"));            // ticket 10, character 1 - the inviter
+        pm.Register(P(11, 2, "Test"));           // ticket 11, character 2 - the invitee
+        var h = new DispatchHarness().Build();
+        var inviter = h.Ticket(10);
+        var invitee = h.Ticket(11);
+
+        // ---- 1. World asks the Arbiter to broker: SDB_FETCH_THROUGH_ARBITER_CONTRACT ----
+        var request = ContractBroker.ParseFetch(Hex.B(
+            "22 00 00 00  0A 00 00 00  2C 00 00 00  04 00 00 00  01 00 00 00  04 00 00 00  "
+            + "34 12 00 00  54 00 65 00 73 00 74 00 00 00  02 00 00 00"))!.Value;
+        Hex.True(request.ContractType == ContractBroker.TypePartyInvite
+                 && ContractBroker.IsBrokeredType(request.ContractType),
+            "a party invite, and a type we broker");
+        var target = ContractBroker.ReadTargetHint(request);
+        Hex.True(target.DbIds.Contains(2) || target.Name == "Test",
+            "the invitee is found by db id or by name");
+
+        // ---- 2. the verdict to the initiator, and the ask to the opponent ----
+        int index = ContractBroker.NextContractIndex();
+        var verdict = ContractBroker.BuildDbsFetch(request.ContractorDbId, request.ContractType,
+            request.ContractId, index, ContractBroker.ErrorNone, new[] { 2 });
+        Hex.True(BitConverter.ToInt32(verdict, 24) == ContractBroker.ErrorNone
+                 && BitConverter.ToInt32(verdict, 20) == index,
+            "0x280A carries ErrorNo 0 and the index both Worlds will quote back");
+        var askFrame = ContractBroker.BuildDbsAsk(index, request.ContractorDbId, request.ContractType,
+            request.ContractId, 2, "dob", "Test");
+        Hex.True(ContractBroker.DecodeWString(askFrame.AsSpan(28)) == "dob",
+            "0x280B names the contractor first");
+        Hex.True(BitConverter.ToInt32(askFrame, 24) == 2, "and the opponent it is about");
+
+        // the opponent's World answers with 0x280C - a DIFFERENT frame, not the 0x280B echoed
+        var canContract = ContractBroker.ParseAsk(
+            BitConverter.GetBytes(index)
+                .Concat(BitConverter.GetBytes(1)).Concat(BitConverter.GetBytes(4))
+                .Concat(BitConverter.GetBytes(0x1234)).Concat(BitConverter.GetBytes(2))
+                .Concat(new byte[] { 1 }).ToArray())!.Value;
+        Hex.True(canContract.CanContract && canContract.ContractIndex == index,
+            "0x280C says yes for this contract");
+
+        // ---- 3. the invitee's client accepts: C_REPLY_THROUGH_ARBITER_CONTRACT ----
+        var reply = ContractBroker.ParseClientReply(Hex.B(
+            "26 00  7C 5B  00 00 00 00  00 00 00 00  1E 00  04 00 00 00  34 12 00 00  "
+            + "01 00 00 00  01 00 00 00  64 00 6F 00 62 00 00 00"))!.Value;
+        Hex.True(reply.ContractRequestorName == "dob" && reply.Reply == 1
+                 && reply.ContractIndex == index && reply.ContractType == ContractBroker.TypePartyInvite,
+            $"the accept names the requestor and the contract: '{reply.ContractRequestorName}' "
+            + $"reply {reply.Reply} index {reply.ContractIndex}");
+
+        // the replier's World is told the contract is over for them; the requestor's gets the answer
+        Hex.Eq(ContractBroker.BuildDbsSendEnd(1, reply.ContractType, reply.ContractId, 2),
+            "01 00 00 00  04 00 00 00  34 12 00 00  02 00 00 00",
+            "0x280F to the replier's World");
+        Hex.Eq(ContractBroker.BuildDbsReply(1, 2, reply.ContractType, reply.ContractId, reply.Reply),
+            "01 00 00 00  02 00 00 00  04 00 00 00  34 12 00 00  01 00 00 00",
+            "0x2810 to the requestor's World - requestor first, replier second");
+
+        // ---- 4. World creates the party and tells us. THIS is where PartyManager starts. ----
+        var r = PartyWiring.DispatchWorldFrame(pm, h.Dispatcher,
+            PartyPackets.SA_JOIN_PARTY, SaJoinPartyPayload(1, 2));
+        var party = pm.FindByMember(1);
+        Hex.True(party != null && party.Count == 2, "the party exists and holds both");
+        Hex.True(party!.IsManager(1), "the inviter is the manager");
+        Hex.True(pm.FindByMember(2) != null && pm.FindByMember(2)!.Id == party.Id,
+            "and the invitee is in the same party");
+        Hex.True(string.Join(",", inviter.Log) == "def:S_PARTY_MEMBER_LIST", string.Join(",", inviter.Log));
+        Hex.True(string.Join(",", invitee.Log) == "def:S_PARTY_MEMBER_LIST", string.Join(",", invitee.Log));
+        Hex.True(r.WorldSent == 1 && h.WorldLog.Count == 1
+                 && h.WorldLog[0].Op == PartyPackets.AS_DO_CREATE_PARTY,
+            $"and World gets the member list back as AS_DO_CREATE_PARTY: {r}");
+
+        ContractBroker.Reset();
+    }
+
+    /// <summary>
+    /// C_REPLY_THROUGH_ARBITER_CONTRACT is read by ABSOLUTE OFFSET, not through its .def.
+    /// <c>C_REPLY_THROUGH_ARBITER_CONTRACT.1.def</c> declares uint32/uint64/uint32/string, which
+    /// is 22 bytes and puts every field in the wrong place; the handler's own reads and its
+    /// 30-byte GET_CLIENT_BUFFER_BUFSIZE_MISMATCH guard say otherwise. Same class of trap as the
+    /// patch-101 S_FRIEND_LIST def and the ten wrong guild defs.
+    /// </summary>
+    [Test] public static void T60_c_reply_is_read_by_absolute_offset()
+    {
+        var packet = Hex.B(
+            "26 00  7C 5B  DE AD BE EF  DE AD BE EF  1E 00  04 00 00 00  34 12 00 00  "
+            + "07 00 00 00  01 00 00 00  64 00 6F 00 62 00 00 00");
+        var r = ContractBroker.ParseClientReply(packet);
+        Hex.True(r != null, "a 38-byte packet parses");
+        Hex.True(r!.Value.ContractType == 4 && r.Value.ContractId == 0x1234
+                 && r.Value.ContractIndex == 7 && r.Value.Reply == 1
+                 && r.Value.ContractRequestorName == "dob",
+            $"type {r.Value.ContractType}, id {r.Value.ContractId}, index {r.Value.ContractIndex}, "
+            + $"reply {r.Value.Reply}, name '{r.Value.ContractRequestorName}'");
+
+        // the eight bytes at [0x04..0x0B] are read by neither the handler nor the dumper, so
+        // filling them with garbage must change nothing - that is the proof the .def is wrong
+        Hex.True(packet[4] == 0xDE && packet[8] == 0xDE,
+            "and the unread eight bytes really were garbage");
+
+        // the guard: one byte short of 0x1E is not a packet
+        Hex.True(ContractBroker.ParseClientReply(new byte[0x1D]) == null, "29 B is refused");
+        Hex.True(ContractBroker.ParseClientReply(new byte[0x1E]) != null,
+            "30 B is the minimum - the name offset is then 0, which the codec reads as absent");
+        Hex.True(ContractBroker.ParseClientReply(new byte[0x1E])!.Value.ContractRequestorName == "",
+            "a 0 name offset is an absent string, not an exception");
+        Hex.True(ContractBroker.ReadWString(packet, 0x3000) == "",
+            "and an offset past the end is empty too");
+    }
+
+    /// <summary>
+    /// C_ADD_TRADE_BAG (58817 / 0xE5C1) - the nineteenth opcode World rejected with "handler has
+    /// not been implemented yet", found live on 2026-09-15 when an item was added to a trade
+    /// window. World was right to reject it: the client sends it to the ARBITER, which forwards
+    /// it as AS_ADD_TRADE_BAG (0x1637). World has no C_ handler for it and never did.
+    /// </summary>
+    [Test] public static void T60_add_trade_bag_is_arbiter_owned_and_forwards_as_1637()
+    {
+        Hex.True(ArbiterClientHandlers.C_ADD_TRADE_BAG == 58817
+                 && ArbiterClientHandlers.AS_ADD_TRADE_BAG == 0x1637,
+            "0xE5C1 in, 0x1637 out");
+        Hex.True(ArbiterClientHandlers.ArbiterOwned.Contains(ArbiterClientHandlers.C_ADD_TRADE_BAG),
+            "and it is ours, not World's");
+        Hex.True(ArbiterClientHandlers.AddTradeBagPacketSize == 0x34
+                 && ArbiterClientHandlers.AddTradeBagBodySize == 0x30,
+            "the handler's guard is `param_3 < 0x34`, which is 52 total and 48 of body - and 52 is "
+            + "exactly the length World printed");
+
+        // read at the offsets the dumper gives, which start at 0x0C - NOT at 0x04 where the
+        // shipped C_ADD_TRADE_BAG.1.def starts. The eight bytes between are read by neither.
+        var packet = Hex.B(
+            "34 00  C1 E5  DE AD BE EF  DE AD BE EF  "
+            + "44 44 33 33 22 22 11 11  88 88 77 77 66 66 55 55  "
+            + "34 12 00 00  00 00 00 00  07 00 00 00  03 00 00 00  00 00 00 00 00 00 00 00");
+        var req = ArbiterClientHandlers.ParseAddTradeBag(packet);
+        Hex.True(req != null, "a 52-byte packet parses");
+        Hex.True(req!.Value.TradeRequestor == 0x1111222233334444L
+                 && req.Value.TradeRequestee == 0x5555666677778888L
+                 && req.Value.ContractId == 0x1234 && req.Value.TabIndex == 0
+                 && req.Value.InvenPos == 7 && req.Value.MoveAmount == 3 && req.Value.Money == 0,
+            "contract 0x1234, pocket 0 slot 7, three of them, no money");
+        Hex.True(ArbiterClientHandlers.ParseAddTradeBag(new byte[0x33]) == null, "51 B is refused");
+
+        // the forwarded frame. The leading u64 is NOT copied from the packet: the Arbiter builds
+        // it from its own planet id and the SENDER's character db id.
+        Hex.Eq(ArbiterClientHandlers.BuildAsAddTradeBag(ContractBroker.PlanetId, 1, req.Value),
+            "F0 0A 00 00  01 00 00 00  44 44 33 33 22 22 11 11  88 88 77 77 66 66 55 55  "
+            + "34 12 00 00  00 00 00 00  07 00 00 00  03 00 00 00  00 00 00 00 00 00 00 00",
+            "AS_ADD_TRADE_BAG (0x1637): [planetId][senderDbId] then the packet's own fields");
+        Hex.True(ArbiterClientHandlers.BuildAsAddTradeBag(ContractBroker.PlanetId, 1, req.Value).Length
+                 == ArbiterClientHandlers.AddTradeBagFrameSize - 6,
+            "48 bytes of payload, a 54-byte frame");
+        Hex.True(ContractBroker.PlanetId == 2800 && PartyManager.PlanetId == ContractBroker.PlanetId,
+            "one planet id for the whole process");
+    }
+
+    /// <summary>
+    /// The contract index is the Arbiter's own handle and both Worlds quote it back, so it has to
+    /// be unique while a contract is live and it must never be 0 (0 is what a refusal carries).
+    /// </summary>
+    [Test] public static void T60_the_contract_index_is_a_handle_not_a_guess()
+    {
+        ContractBroker.Reset();
+        Hex.True(ContractBroker.LiveCount == 0, "Reset empties the table");
+        int a = ContractBroker.NextContractIndex();
+        int b = ContractBroker.NextContractIndex();
+        Hex.True(a == 1 && b == 2, $"counts from 1, got {a} then {b}");
+        Hex.True(ContractBroker.Find(a) == null,
+            "an index that was handed out but never brokered resolves to nothing");
+        Hex.True(!ContractBroker.Forget(a), "and forgetting it is a no-op, not a throw");
+        Hex.True(ContractBroker.MaxLiveContracts == 4096,
+            "the table is capped - it is fed straight off the World link");
+        ContractBroker.Reset();
+        Hex.True(ContractBroker.NextContractIndex() == 1, "Reset restarts the counter for the next test");
     }
 
 }

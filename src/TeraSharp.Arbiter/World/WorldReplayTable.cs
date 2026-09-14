@@ -89,34 +89,31 @@ public sealed class WorldReplayTable
         0x13C6, // SA_REMOVE_DUNGEON_CHANNEL       (zone change)
         0x1499, // SA_SAVE_ETC_DATA_FOR_MOVE_WORLD (zone change)
 
-        // --- T47: the "Arbiter Contract" family. These are the two-party interactions the
-        // Arbiter brokers - the ContractType field selects which - so they only appear once two
-        // players can see each other, which is why nothing saw them before the two-client test.
+        // --- T47 sealed the four "Arbiter Contract" requests here. T60 UNSEALED them: the
+        // seal was based on a wrong reading and it is what made a party invite between two
+        // in-world players do nothing at all on 2026-09-15.
         //
-        // None of the four carries a DlmId (the dumpers name ContractorDbId / ContractType /
-        // ContractId and nothing else), so an unanswered one canNOT head-block the per-user DB
-        // queue the way a missing DBS_ reply does. What they would do without an entry here is
-        // worse in a subtler way: the replay table would pair them with whatever A->W frame
-        // happened to follow and send a captured reply.
+        // What T47 got wrong: it said 0x2809 "sends NOTHING at all - no World frame, no client
+        // packet". The HANDLER sends nothing - it dispatches on ContractType into one of four
+        // FetchWork objects (4 ContractPartyFetchWork, 5 ContractPartyApplyFetchWork,
+        // 10 CreateGuildFetchWork, 0x23 TradeBrokerOpenDealFetchWork) and THOSE send:
+        // FetchWork::ResponseFailure (FUN_1409cde70) and ::ResponseSuccess both emit
+        // DBS_FETCH_THROUGH_ARBITER_CONTRACT 0x280A, and the success path additionally fans
+        // DBS_ASK 0x280B out to every opponent. T47 stopped at the handler.
         //
-        // Why one-way, handler by handler:
-        //   0x2809 SDB_FETCH_THROUGH_ARBITER_CONTRACT  (Arb_part_063.c:7017, guard frame >= 0x22)
-        //       dispatches on ContractType (4, 5, 10, 0x23) into four managers and sends NOTHING
-        //       at all - no World frame, no client packet.
-        //   0x280C SDB_ASK_THROUGH_ARBITER_CONTRACT    (Arb_part_063.c:810)  - 38 lines, sends nothing.
-        //   0x280D SDB_SEND_BEGIN_THROUGH_ARBITER_CONTRACT (Arb_part_064.c:2732) - sends only the
-        //       CLIENT packet S_BEGIN_THROUGH_ARBITER_CONTRACT; no World frame.
-        //   0x280E SDB_SEND_END_THROUGH_ARBITER_CONTRACT   (Arb_part_064.c:2983) - the one that
-        //       does emit 0x280F, but NOT as a reply: it walks the AskUserList, and for each other
-        //       participant that is in world it pushes DBS_SEND_END_THROUGH_ARBITER_CONTRACT to
-        //       THAT user's World session with [ContractorDbId][ContractType][ContractId][thatUser].
-        //       A fan-out, not an answer. Faithfully reproducing it needs the contract/trade
-        //       system we do not have, and inventing one would tell World a contract completed
-        //       that we never brokered.
-        0x2809, // SDB_FETCH_THROUGH_ARBITER_CONTRACT       - observed live, 58-66 B
-        0x280C, // SDB_ASK_THROUGH_ARBITER_CONTRACT         - same family, not yet observed
-        0x280D, // SDB_SEND_BEGIN_THROUGH_ARBITER_CONTRACT  - same family, not yet observed
-        0x280E, // SDB_SEND_END_THROUGH_ARBITER_CONTRACT    - observed live, 58-66 B
+        // The four are now answered by World/ContractBroker.cs, gated out of WorldBridge's
+        // default arm the way PartyWiring and GuildWiring are, so they must not be sealed here:
+        // a sealed opcode never reaches TryHandleWorldFrame.
+        //
+        //   0x2809 SDB_FETCH_THROUGH_ARBITER_CONTRACT      -> ContractBroker.OnFetch
+        //   0x280C SDB_ASK_THROUGH_ARBITER_CONTRACT        -> ContractBroker.OnAsk
+        //   0x280D SDB_SEND_BEGIN_THROUGH_ARBITER_CONTRACT -> ContractBroker.OnSendBegin
+        //   0x280E SDB_SEND_END_THROUGH_ARBITER_CONTRACT   -> ContractBroker.OnSendEnd
+        //
+        // None of them carries a DlmId, so the replay table could never have head-blocked a user
+        // over one - what the seal bought was stopping the table pairing them with whatever A->W
+        // frame happened to follow. The gate does that now, and does it earlier.
+        // status/CONTRACT-DESIGN.md.
 
         // --- T42: SDB_MOVE_WAREHOUSE_ITEM. Not "one-way" because we chose not to answer it -
         // the REAL Arbiter does not answer it. Handler_SDB_MOVE_WAREHOUSE_ITEM (FUN_1405b53c0,
