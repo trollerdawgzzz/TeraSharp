@@ -280,6 +280,37 @@ public sealed class DbProxyHandlers
     // from those two points, not from a decompiled writer - so they are handled as opaque
     // blobs here and DungeonCoolTimeNever is the literal "never" bytes.
     public const ushort AS_CACHE_DUNGEON_COOL_TIME_TO_WORLD = 0x148D;
+
+    // --- T25: the write side of the dungeon cool time. All four are one-way (World -> us, no
+    // reply): none of their Arbiter handlers has a SendToSession. They are in the allow-list so
+    // TryHandle can persist them, AND still in WorldReplayTable.OneWayFromWorld, which is a
+    // different job - that set is used while BUILDING the replay table from the tap log, to stop
+    // a one-way frame being paired with the next A->W frame as if it were its reply.
+    //
+    //   0x13B6 SA_UPDATE_DUNGEON_COOLTIME
+    //     [0] u32 listOff=22  [4] u32 listLen=52  [8] u64 ArbiterUser  [16] CoolTimeElem (52 B)
+    //     Handler: memcpy the element, DungeonInfoManager::UpdateCoolTime. cap_newchar seq 2907.
+    //   0x13B7 SA_UPDATE_DUNGEON_CLEAR_COUNT
+    //     [0] u64 ArbiterUser  [8] u32 ContinentId  [12] u32 ClearCount
+    //     Handler: DungeonInfoManager::UpdateDungeonClearCount -> dbo.spUpdateDungeonClearCount.
+    //   0x13B8 SA_UPDATE_DUNGEON_UI_HISTORY
+    //     [0] u64 ArbiterUser  + a vector<int> DungeonIdList. Never seen on the wire.
+    //   0x13BD SA_DELETE_DUNGEON_COOLTIME
+    //     [0] u64 ArbiterUser  [8] u32 ContinentId
+    public const ushort SA_UPDATE_DUNGEON_COOLTIME = 0x13B6;
+    public const ushort SA_UPDATE_DUNGEON_CLEAR_COUNT = 0x13B7;
+    public const ushort SA_UPDATE_DUNGEON_UI_HISTORY = 0x13B8;
+    public const ushort SA_DELETE_DUNGEON_COOLTIME = 0x13BD;
+    /// <summary>0x13B6: the element starts at payload 16 (frame 22).</summary>
+    public const int DungeonCoolTimeUpdateHeader = 16;
+    /// <summary>0x13B7/0x13BD: the continent id, right after the u64 ArbiterUser.</summary>
+    public const int DungeonContinentIdOffset = 8;
+    /// <summary>0x13B7: the clear count.</summary>
+    public const int DungeonClearCountOffset = 12;
+    /// <summary>DungeonCoolTimeElem+0.</summary>
+    public const int DungeonCoolTimeDungeonIdOffset = 0;
+    /// <summary>DBS_LOAD_DUNGEON_COOL_TIME (0x2868): three [offset][length] pairs, ok, reqId.</summary>
+    public const int DungeonCoolTimeReplyHeader = 29;
     public const int CacheDungeonCoolTimeHeader = 12;
     public const int DungeonCoolTimeRecordSize = 52;
     public const int DungeonCoolTimeDateSize = 16;
@@ -303,6 +334,9 @@ public sealed class DbProxyHandlers
     public const ushort SDB_LOAD_QUEST_PROGRESS = 0x2902;       // -> 0x2903: [u32 reqId][u32 pid][u32 0][u32 0][u8 0]
     public const ushort SDB_LOAD_ACHIEVE_LIST = 0x2981;          // -> 0x2982: [u64 0][u32 reqId][u8 ok]
     public const ushort SDB_LOAD_WORLD_EVENT = 0x27B3;           // -> 0x27B4: [u32 reqId][u8 ok] (5B)
+    // MISNAMED, kept as an alias because the live path and several tests use it: 0x2910 is
+    // SDB_UPDATE_FATIGABILITY_POINT, not a friend-info load. WorldServer's own opcode table says
+    // so, and the payload is a fatigue delta. Prefer SDB_FATIGABILITY_UPDATE in new code. T26.
     public const ushort SDB_LOAD_FRIEND_INFO = 0x2910;           // -> 0x2911: [u8 ok][u32 reqId] (5B)
 
     // --- Post-spawn per-user DB items (lobby_tap.log 02:52:07, right after SpawnComplete) ---
@@ -659,6 +693,52 @@ public sealed class DbProxyHandlers
     // ok = 0. The writer emits u8 ok FIRST, then u32 reqId - the ONLY reply in this batch with
     // that ordering (capture: 01 2B 00 00 00).
     public const ushort SDB_UPDATE_REPUTATION_INFO = 0x2891; public const ushort DBS_UPDATE_REPUTATION_INFO = 0x2892;
+    public const ushort DBS_REPUTATION_LIST = 0x2890;
+    /// <summary>0x2891: [0] recordOff [4] recordLen [8] reqId [12] ownerDbId [16] op, record at 20.</summary>
+    public const int ReputationUpdateHeader = 20;
+    public const int ReputationUpdateOpOffset = 16;
+    /// <summary>0x2890: [0] listOff=19 [4] listLen [8] u8 Success [9] u32 DlmId.</summary>
+    public const int ReputationReplyHeader = 13;
+    /// <summary>ReputationData is 0x34 bytes; the id at +4 is the std::map key.</summary>
+    public const int ReputationRecordSize = 0x34;
+    public const int ReputationRecordIdOffset = 4;
+    /// <summary>ReputationData+0: the owner, stamped by the Arbiter's DB loader, not by World.</summary>
+    public const int ReputationRecordOwnerOffset = 0;
+    /// <summary>ReputationData+32: see <see cref="ReputationLoaderResidue"/>.</summary>
+    public const int ReputationRecordResidueOffset = 32;
+    /// <summary>
+    /// The value the real Arbiter leaves in ReputationData+32 on every load. It is NOT a field:
+    /// ReputationDataManager::CacheReputationData binds eight output columns of
+    /// <c>dbo.spLoadAllUserReputation</c> into its row buffer and the slot that ends up at +32
+    /// (<c>(u32)local_80</c>) is never one of them, so what lands there is whatever the buffer
+    /// held. Both captured replies carry 0x000107B2 because both came from the same code path
+    /// on the first row; a second row would carry 0, since the loop zeroes the buffer between
+    /// rows. We send the captured value for the same reason T13 clones the item record's
+    /// uninitialised tail rather than synthesising it: it is what the real server sends, and
+    /// World demonstrably does not read it.
+    /// </summary>
+    public const uint ReputationLoaderResidue = 0x000107B2;
+    /// <summary>op 1 inserts; op 2 and 4 update. Anything else leaves ok = 0 and stores nothing.</summary>
+    public static bool IsReputationWriteOp(uint op) => op == 1 || op == 2 || op == 4;
+
+    // --- SDB_LOAD_FATIGABILITY_LIST (0x2908) -> DBS_LOAD_FATIGABILITY_LIST (0x2909),
+    //     fed by SDB_UPDATE_FATIGABILITY_POINT (0x2910). T26.
+    //
+    //   0x2910 req [0] u32 DlmId [4] u32 UserDbId [8] u32 kind=1 [12] u32 DELTA [16] u8
+    //          rsp 0x2911 [0] u8 ok=1 [1] u32 DlmId          (ok FIRST, like 0x2892)
+    //   0x2909 rsp [0] u32 listOff=23 [4] u32 listLen=28 [8] u8 Success=1 [9] u32 DlmId
+    //              [13] u32 AddtionalFatiguePoint, then ONE 28-byte element:
+    //              [0] u32 kind=1  [4] u32 curPoint  [8] 16-B TIMESTAMP  [24] u32 (unexplained)
+    //   World copies the 28 bytes into FatigabilityInfo verbatim (stride 0x1c in
+    //   DBLoadFatigabilityContext::ExecuteCommit), so the element is opaque to it too.
+    public const ushort SDB_FATIGABILITY_UPDATE = 0x2910;
+    public const ushort DBS_FATIGABILITY_UPDATE = 0x2911;
+    public const ushort DBS_FATIGABILITY_LIST = 0x2909;
+    public const int FatigabilityReplyHeader = 17;
+    public const int FatigabilityRecordSize = 28;
+    public const int FatigabilityKind = 1;
+    public const int FatigabilityUpdateKindOffset = 8;
+    public const int FatigabilityUpdateDeltaOffset = 12;
 
     // --- SDB_ADD_TUTORIAL_SIMPLE_TIP (0x286E) -> DBS_ADD_TUTORIAL_SIMPLE_TIP (0x286F) ---
     // cap_newchar.log seq 719/765/864/911, 18 B -> 11 B each.
@@ -733,6 +813,59 @@ public sealed class DbProxyHandlers
     public Action<EnterWorldFailure>? ResendEnterWorld { get; set; }
 
     /// <summary>
+    /// The dispatch cases in <see cref="TryHandle"/> that are deliberately NOT in
+    /// <see cref="IsHandledRequest"/>. Every one is a login-time load the replay table already
+    /// serves byte-exact from the capture; the builder here exists for its unit test and for the
+    /// day the reply has to become per-character. Because <c>TryHandle</c> returns early on
+    /// anything the allow-list rejects, these cases never run.
+    ///
+    /// <para>This list is what makes that intentional rather than accidental:
+    /// <c>Dispatch_switch_and_the_allow_list_agree</c> fails the build for any case that is in
+    /// neither the allow-list nor here. Four per-character loads (0x27F8, 0x2872, 0x2942,
+    /// 0x2867) sat in this state for months, quietly replaying dob's bytes to every character,
+    /// until T22 - that is the bug this guard exists to catch.</para>
+    ///
+    /// <para>The list shrinks as loads become per-character: T22 took four out of it, T25 took
+    /// 0x2867, and T26 took the last two known-wrong ones (0x288F reputations and 0x2908
+    /// fatigability - status/REPUTATION-FATIGABILITY.md). What is left is either genuinely
+    /// static or has no evidence of per-character content yet.</para>
+    /// </summary>
+    public static readonly ushort[] DispatchOnlyForTests =
+    {
+        SA_PET_LOAD,                                // 0x1415
+        SA_LOAD_BATTLE_FIELD_COOL_TIME,             // 0x1521
+        SA_LOAD_SERVANT_AUTO_POTION_DATA,           // 0x152F
+        SA_LOAD_SERVANT_AUTO_FEED_DATA,             // 0x1533
+        SA_LOAD_SERVANT_STORAGE_DATA,               // 0x1537
+        SA_LOAD_SERVANT_DATA,                       // 0x1539
+        SA_LOAD_SERVANT_ADVENTURE_DATA,             // 0x153B
+        SA_LOAD_EXTRAPOINT_DATA,                    // 0x1554
+        SA_LOAD_BATTLE_FIELD_ENTER_COUNT,           // 0x155D
+        SDB_LOAD_ITEM_RECIPE,                       // 0x2760
+        SDB_LOAD_SKILL_PROF,                        // 0x2764
+        SDB_LOAD_TELEPORT_TO_POS_LIST,              // 0x27A7
+        SDB_LOAD_USER_RESTRICTION,                  // 0x2833
+        SDB_LOAD_BATTLE_FIELD_LIST,                 // 0x2895
+        SDB_LOAD_REFER_A_FRIEND,                    // 0x28B0
+        SDB_LOAD_28B7,                              // 0x28B7
+        SDB_LOAD_ACCOUNT_BENEFIT,                   // 0x28BB
+        SDB_LOAD_SERVANT_PERIOD,                    // 0x28C5
+        SDB_LOAD_SKILLPERIOD,                       // 0x28C9
+        SDB_LOAD_LEARNED_SOCIAL,                    // 0x28CF
+        SDB_LOAD_TOKEN_EXCHANGE,                    // 0x28FE
+        SDB_LOAD_2900,                              // 0x2900
+        SDB_LOAD_QUEST_PROGRESS,                    // 0x2902
+        SDB_LOAD_PROMOTION_LIST,                    // 0x2912
+        SDB_LOAD_PROMOTION_COND_LIST,               // 0x2916
+        SDB_LOAD_PASSIVITY_COOLTIME,                // 0x2922
+        SDB_LOAD_293A,                              // 0x293A
+        SDB_LOAD_ADDITIONAL_REWARD,                 // 0x2967
+        SDB_LOAD_2975,                              // 0x2975
+        SDB_LOAD_ACHIEVE_LIST,                      // 0x2981
+        SDB_LOAD_2986,                              // 0x2986
+    };
+
+    /// <summary>
     /// THE ALLOW-LIST. True when <see cref="TryHandle"/> answers this opcode itself; false sends
     /// it to the replay table, which replies with the CAPTURED DLM id and wedges the user if the
     /// reply carries a live one (status/HANDOFF.md section 1).
@@ -798,7 +931,15 @@ public sealed class DbProxyHandlers
             case SDB_USER_ACHIEVEMENT:            // 0x27F9 from the stored 0x27FA + 0x2802 records
             case SDB_TUTORIAL_SIMPLE_TIP:         // 0x2873 from the stored 0x286E tips
             case SDB_SEREN_GUIDE:                 // 0x2943 from the stored 0x2944 slots
-            case SDB_LOAD_2867:                   // 0x2868 three empty lists with the LIVE reqId
+            case SDB_LOAD_2867:                   // 0x2868, now rebuilt from dungeon_cooldowns
+            // --- T25: one-way dungeon writes. They send nothing back; they are here so
+            // TryHandle sees them at all and can persist them. ---
+            case SA_UPDATE_DUNGEON_COOLTIME:      // 0x13B6
+            case SA_UPDATE_DUNGEON_CLEAR_COUNT:   // 0x13B7
+            case SA_DELETE_DUNGEON_COOLTIME:      // 0x13BD
+            // --- T26: the last two per-character login loads, rebuilt from rows. ---
+            case SDB_REPUTATION_LIST:             // 0x2890 from the stored 0x2891 records
+            case SDB_FATIGABILITY_LIST:           // 0x2909 from the account's fatigue row
             // --- T23: city-war result. Not a DLM item (no reqId), but the reply echoes two
             // u32s out of the live request, so a replayed 0x295D would carry captured ones. ---
             case SDB_RESULT_CITY_WAR:             // 0x15ED + 0x295D, both echoing request+16/+20
@@ -837,7 +978,7 @@ public sealed class DbProxyHandlers
             // --- T15: per-user writes during play (all echo the LIVE reqId) ---
             case SDB_USER_LEARN_SKILL:            return OnUserLearnSkill(link, payload);
             case SDB_ACCOMPLISH_USER_ACHIEVEMENT: return OnAccomplishUserAchievement(link, payload);
-            case SDB_UPDATE_REPUTATION_INFO:        link.SendFrame(DBS_UPDATE_REPUTATION_INFO, BuildDbs2892(payload)); return true;
+            case SDB_UPDATE_REPUTATION_INFO:        return OnUpdateReputation(link, payload);
             case SDB_ADD_TUTORIAL_SIMPLE_TIP:       return OnAddTutorialTip(link, payload);
             case SDB_UPDATE_SEREN_GUIDE_INFO:       return OnUpdateSerenGuide(link, payload);
             case SDB_UPDATE_USER_DAILY_EVENT_COUNT: link.SendFrame(DBS_UPDATE_USER_DAILY_EVENT_COUNT, BuildReqIdAck(payload, 8)); return true;
@@ -915,10 +1056,13 @@ public sealed class DbProxyHandlers
             case SDB_LOAD_QUEST_PROGRESS: link.SendFrame(0x2903, BuildQuestProgress(payload)); return true;
             case SDB_LOAD_ACHIEVE_LIST:   link.SendFrame(0x2982, BuildAchieveList(payload)); return true;
             case SDB_LOAD_WORLD_EVENT:    link.SendFrame(0x27B4, BuildReqIdAck(payload, 0)); return true;
-            case SDB_LOAD_FRIEND_INFO:    link.SendFrame(0x2911, BuildOkReqId(payload, 0)); return true;
+            case SDB_LOAD_FRIEND_INFO:    return OnUpdateFatigability(link, payload);
 
             // --- Remaining login-time: programmatic builders ---
-            case SDB_LOAD_2867: link.SendFrame(0x2868, Build2868_ThreeEmptyLists(payload)); return true;
+            case SDB_LOAD_2867: return OnLoadDungeonCoolTime(link, payload);
+            case SA_UPDATE_DUNGEON_COOLTIME:    return OnUpdateDungeonCoolTime(payload);
+            case SA_UPDATE_DUNGEON_CLEAR_COUNT: return OnUpdateDungeonClearCount(payload);
+            case SA_DELETE_DUNGEON_COOLTIME:    return OnDeleteDungeonCoolTime(payload);
             case SDB_LOAD_2869:
             {
                 // The real Arbiter pushes 0x15E0 first, then answers 0x286A, and both carry the
@@ -951,9 +1095,9 @@ public sealed class DbProxyHandlers
 
             // --- Remaining login-time: static-data handlers (clone template, patch reqId) ---
             case SDB_TUTORIAL_SIMPLE_TIP: return OnLoadTutorialTips(link, payload);
-            case SDB_REPUTATION_LIST:     link.SendFrame(0x2890, BuildFromStaticData(DbProxyStaticData.Reputation, DbProxyStaticData.ReputationReqIdOffset, payload)); return true;
+            case SDB_REPUTATION_LIST:     return OnLoadReputationList(link, payload);
             case SDB_LOAD_293A:           link.SendFrame(0x293B, BuildFromStaticData(DbProxyStaticData.Load293B, DbProxyStaticData.Load293BReqIdOffset, payload)); return true;
-            case SDB_FATIGABILITY_LIST:   link.SendFrame(0x2909, BuildFromStaticData(DbProxyStaticData.Fatigability, DbProxyStaticData.FatigabilityReqIdOffset, payload)); return true;
+            case SDB_FATIGABILITY_LIST:   return OnLoadFatigability(link, payload);
             case SDB_SEREN_GUIDE:         return OnLoadSerenGuide(link, payload);
             case SDB_EP_PERK:             link.SendFrame(0x27BA, BuildFromStaticData(DbProxyStaticData.EpPerk, DbProxyStaticData.EpPerkReqIdOffset, payload)); return true;
             case SDB_QUEST_LIST:          return OnLoadQuestList(link, payload);
@@ -1153,15 +1297,29 @@ public sealed class DbProxyHandlers
     /// (capture seq 841/842). Both carry one 52-byte DungeonCoolTimeElem for the refused
     /// instance; in the capture they differ only in the two counters at +40/+44 (1,1 then 0,0),
     /// which is the cool-time list followed by the clear-count list.
-    /// <para>We keep no dungeon cool-time state, so both go out as "never entered": the
-    /// timestamps are <see cref="DungeonCoolTimeNever"/> and the counters are 0. That is a
-    /// deliberate deviation - it can only ever let a player back in, never lock one out.</para>
+    /// <para>Since T25 the element comes from <c>dungeon_cooldowns</c>. With no row for the
+    /// dungeon both pushes are "never entered" - timestamps <see cref="DungeonCoolTimeNever"/>
+    /// and counters 0 - which can only ever let a player back in, never lock one out.</para>
+    ///
+    /// <para>The capture's first push carries counters (1, 1) while the DB load two hundred
+    /// frames later carries (0, 0) for the same dungeon: the push is the real Arbiter's LIVE
+    /// in-memory element with the attempt already counted, not the stored row. We push the
+    /// stored row twice instead, and that difference is the one thing here that is not
+    /// byte-exact against the capture.</para>
     /// </summary>
     private List<byte[]> BuildCacheDungeonCoolTimePushes(int playerId, int dungeonId)
     {
-        var chr = _store is null ? null : _store.GetCharacter(playerId);
-        uint pdId = (uint)(chr?.InstancePdId ?? 0);
-        var record = BuildDungeonCoolTimeRecord(dungeonId, pdId, null, null, 0, 0, 0);
+        var stored = _store is null ? null : _store.GetDungeonCoolTime(playerId, dungeonId);
+        byte[] record;
+        if (stored != null && stored.Length == DungeonCoolTimeRecordSize)
+        {
+            record = stored;
+        }
+        else
+        {
+            var chr = _store is null ? null : _store.GetCharacter(playerId);
+            record = BuildDungeonCoolTimeRecord(dungeonId, (uint)(chr?.InstancePdId ?? 0), null, null, 0, 0, 0);
+        }
         return new List<byte[]>
         {
             BuildCacheDungeonCoolTime(playerId, record),
@@ -1875,6 +2033,189 @@ public sealed class DbProxyHandlers
         return r;
     }
 
+    // ================================================================================
+    // T26 - reputations and fatigability, the last two per-character login loads.
+    // Full write-up: status/REPUTATION-FATIGABILITY.md.
+    // ================================================================================
+
+    /// <summary>
+    /// SDB_UPDATE_REPUTATION_INFO (0x2891): store the 52-byte ReputationData, then ack.
+    /// The real Arbiter keeps the struct verbatim in a std::map keyed on record+4
+    /// (ReputationDataManager::AddNewReputationInfo / ::UpdateReputationInfo) and
+    /// ::GetAllReputationData copies it straight back out, so storing the bytes is what it does.
+    /// </summary>
+    private bool OnUpdateReputation(WorldLink link, byte[] payload)
+    {
+        var record = SliceReputationRecord(payload);
+        uint op = payload.Length >= ReputationUpdateOpOffset + 4
+            ? BitConverter.ToUInt32(payload, ReputationUpdateOpOffset) : 0;
+        int playerId = payload.Length >= 16 ? (int)BitConverter.ToUInt32(payload, 12) : 0;
+
+        if (_store is not null && playerId > 0 && record != null && IsReputationWriteOp(op))
+        {
+            int reputationId = (int)BitConverter.ToUInt32(record, ReputationRecordIdOffset);
+            _store.UpsertReputation(playerId, reputationId, record);
+            _log.LogInformation("SDB_UPDATE_REPUTATION_INFO: player {Pid} reputation {Rep} (op {Op})",
+                playerId, reputationId, op);
+        }
+        link.SendFrame(DBS_UPDATE_REPUTATION_INFO, BuildDbs2892(payload));
+        return true;
+    }
+
+    /// <summary>The 52-byte ReputationData a 0x2891 request carries, or null when malformed.</summary>
+    public static byte[]? SliceReputationRecord(byte[] request)
+    {
+        if (request is null || request.Length < ReputationUpdateHeader) return null;
+        int off = (int)BitConverter.ToUInt32(request, 0) - 6;
+        int len = (int)BitConverter.ToUInt32(request, 4);
+        if (len != ReputationRecordSize || off < ReputationUpdateHeader
+            || off > request.Length || len > request.Length - off) return null;
+        return request[off..(off + len)];
+    }
+
+    /// <summary>SDB_LOAD_REPUTATION_LIST (0x288F) -&gt; 0x2890, rebuilt from the stored records.</summary>
+    private bool OnLoadReputationList(WorldLink link, byte[] payload)
+    {
+        uint reqId = payload.Length >= 4 ? BitConverter.ToUInt32(payload, 0) : 0;
+        int playerId = payload.Length >= 8 ? (int)BitConverter.ToUInt32(payload, 4) : 0;
+        if (_store is null || ServesCapturedStatics(playerId))
+        {
+            link.SendFrame(DBS_REPUTATION_LIST, BuildFromStaticData(
+                DbProxyStaticData.Reputation, DbProxyStaticData.ReputationReqIdOffset, payload));
+            return true;
+        }
+        var rows = playerId <= 0 ? new List<byte[]>() : _store.GetReputations(playerId);
+        if (rows.Count > 0)
+            _log.LogInformation("SDB_LOAD_REPUTATION_LIST: player {Pid} -> {N} reputation(s)", playerId, rows.Count);
+        link.SendFrame(DBS_REPUTATION_LIST, BuildDbs2890(rows, reqId, playerId));
+        return true;
+    }
+
+    /// <summary>
+    /// DBS_LOAD_REPUTATION_LIST (0x2890): [0] u32 listOff=19 [4] u32 listLen [8] u8 Success=1
+    /// [9] u32 DlmId, then 52 bytes per reputation, ordered by reputation id.
+    /// <para>Success is the Arbiter's "I found the User object", not a data flag, so it is 1
+    /// whenever we answer at all.</para>
+    ///
+    /// <para>Two bytes of each record are put back the way the Arbiter's DB loader puts them,
+    /// not the way World sent them: <see cref="ReputationRecordOwnerOffset"/> gets
+    /// <paramref name="ownerDbId"/> - which is what makes dob's and Test's otherwise identical
+    /// records differ in the capture - and <see cref="ReputationRecordResidueOffset"/> gets
+    /// <see cref="ReputationLoaderResidue"/>.</para>
+    ///
+    /// <para>Byte-exact against all three captured replies: cap_newchar.log seq 336 (no rows),
+    /// and arb_world_2026-09-13 seq 389 (dob) and seq 875 (Test) rebuilt from the one 0x2891
+    /// write in cap_newchar.log.</para>
+    /// </summary>
+    public static byte[] BuildDbs2890(IReadOnlyList<byte[]> records, uint reqId, int ownerDbId)
+    {
+        ArgumentNullException.ThrowIfNull(records);
+        int len = 0;
+        foreach (var rec in records)
+        {
+            if (rec.Length != ReputationRecordSize)
+                throw new ArgumentException(
+                    $"ReputationData must be {ReputationRecordSize} bytes, got {rec.Length}", nameof(records));
+            len += rec.Length;
+        }
+        var r = new byte[ReputationReplyHeader + len];
+        BitConverter.GetBytes(6u + ReputationReplyHeader).CopyTo(r, 0);   // 19, frame-relative
+        BitConverter.GetBytes((uint)len).CopyTo(r, 4);
+        r[8] = 1;                                                          // Success
+        BitConverter.GetBytes(reqId).CopyTo(r, 9);
+        int p = ReputationReplyHeader;
+        foreach (var rec in records)
+        {
+            rec.CopyTo(r, p);
+            BitConverter.GetBytes(ownerDbId).CopyTo(r, p + ReputationRecordOwnerOffset);
+            BitConverter.GetBytes(ReputationLoaderResidue).CopyTo(r, p + ReputationRecordResidueOffset);
+            p += rec.Length;
+        }
+        return r;
+    }
+
+    /// <summary>
+    /// SDB_UPDATE_FATIGABILITY_POINT (0x2910, the const is still called SDB_LOAD_FRIEND_INFO):
+    /// add the delta to the ACCOUNT's running total, stamp the time, then ack.
+    /// </summary>
+    private bool OnUpdateFatigability(WorldLink link, byte[] payload)
+    {
+        if (_store is not null && payload.Length >= FatigabilityUpdateDeltaOffset + 4)
+        {
+            int playerId = (int)BitConverter.ToUInt32(payload, 4);
+            int delta = (int)BitConverter.ToUInt32(payload, FatigabilityUpdateDeltaOffset);
+            var chr = playerId > 0 ? _store.GetCharacter(playerId) : null;
+            if (chr != null)
+            {
+                var row = _store.AddFatigabilityPoints(chr.AccountId, delta, EncodeDbDateTime(DateTime.UtcNow));
+                _log.LogInformation(
+                    "SDB_UPDATE_FATIGABILITY_POINT: account {Acc} +{D} fatigue -> {Total}",
+                    chr.AccountId, delta, row.CurPoint);
+            }
+        }
+        link.SendFrame(DBS_FATIGABILITY_UPDATE, BuildOkReqId(payload, 0));
+        return true;
+    }
+
+    /// <summary>SDB_LOAD_FATIGABILITY_LIST (0x2908) -&gt; 0x2909, from the account's row.</summary>
+    private bool OnLoadFatigability(WorldLink link, byte[] payload)
+    {
+        uint reqId = payload.Length >= 4 ? BitConverter.ToUInt32(payload, 0) : 0;
+        int playerId = payload.Length >= 8 ? (int)BitConverter.ToUInt32(payload, 4) : 0;
+        var chr = _store is null || playerId <= 0 ? null : _store.GetCharacter(playerId);
+        if (chr == null)
+        {
+            link.SendFrame(DBS_FATIGABILITY_LIST, BuildDbs2909(0, null, reqId));
+            return true;
+        }
+        var row = _store!.GetFatigability(chr.AccountId);
+        _log.LogInformation("SDB_LOAD_FATIGABILITY_LIST: account {Acc} -> {P} fatigue point(s)",
+            chr.AccountId, row.CurPoint);
+        link.SendFrame(DBS_FATIGABILITY_LIST, BuildDbs2909(row.CurPoint, row.Timestamp, reqId));
+        return true;
+    }
+
+    /// <summary>
+    /// DBS_LOAD_FATIGABILITY_LIST (0x2909). Always exactly one 28-byte element, which is what
+    /// every captured reply carries: [u32 kind=1][u32 curPoint][16-B TIMESTAMP][u32].
+    ///
+    /// <para>The trailing u32 is sent as 0: nothing in five captured replies explains it
+    /// (630, 443, 426, 1626, 88 with no relation to the point, the timestamp or the elapsed
+    /// time), and World copies the element into FatigabilityInfo without reading it.</para>
+    /// </summary>
+    public static byte[] BuildDbs2909(int curPoint, byte[]? timestamp, uint reqId)
+    {
+        var r = new byte[FatigabilityReplyHeader + FatigabilityRecordSize];
+        BitConverter.GetBytes(6u + FatigabilityReplyHeader).CopyTo(r, 0);       // 23, frame-relative
+        BitConverter.GetBytes((uint)FatigabilityRecordSize).CopyTo(r, 4);
+        r[8] = 1;                                                               // Success
+        BitConverter.GetBytes(reqId).CopyTo(r, 9);
+        // [13] AddtionalFatiguePoint: 0 in every captured reply.
+        int p = FatigabilityReplyHeader;
+        BitConverter.GetBytes(FatigabilityKind).CopyTo(r, p);
+        BitConverter.GetBytes(curPoint).CopyTo(r, p + 4);
+        (timestamp is { Length: 16 } t ? t : DungeonCoolTimeNever).CopyTo(r, p + 8);
+        return r;
+    }
+
+    /// <summary>
+    /// The Arbiter's 16-byte wire DateTime - an ODBC <c>tagTIMESTAMP_STRUCT</c>:
+    /// u16 year, month, day, hour, minute, second, then a u32 fraction. Proven by the
+    /// accomplished-achievement records (2026-09-13 05:51:45 in a capture that starts 05:49:03)
+    /// and by the fatigue timestamps tracking each 0x2910 write.
+    /// </summary>
+    public static byte[] EncodeDbDateTime(DateTime when)
+    {
+        var b = new byte[16];
+        BitConverter.GetBytes((ushort)when.Year).CopyTo(b, 0);
+        BitConverter.GetBytes((ushort)when.Month).CopyTo(b, 2);
+        BitConverter.GetBytes((ushort)when.Day).CopyTo(b, 4);
+        BitConverter.GetBytes((ushort)when.Hour).CopyTo(b, 6);
+        BitConverter.GetBytes((ushort)when.Minute).CopyTo(b, 8);
+        BitConverter.GetBytes((ushort)when.Second).CopyTo(b, 10);
+        return b;                                                  // the fraction stays 0
+    }
+
     /// <summary>
     /// DBS_UPDATE_REPUTATION_INFO (0x2892): [u8 ok][u32 reqId] — 5 bytes. The ok byte comes FIRST
     /// here; 0x2891 is the only request in this batch with that ordering.
@@ -2081,7 +2422,7 @@ public sealed class DbProxyHandlers
         return r;
     }
 
-    /// <summary>[u8 ok=1][u32 reqId] — 5 bytes. Used by 0x2910→0x2911 (SDB_LOAD_FRIEND_INFO).</summary>
+    /// <summary>[u8 ok=1][u32 reqId] — 5 bytes. Used by 0x2910→0x2911 (SDB_UPDATE_FATIGABILITY_POINT).</summary>
     public static byte[] BuildOkReqId(byte[] request, int reqIdPayloadOffset)
     {
         uint reqId = reqIdPayloadOffset + 4 <= request.Length
@@ -2263,18 +2604,141 @@ public sealed class DbProxyHandlers
     /// 0x2868: three empty lists + [u8 ok=1][u32 reqId] — 29 bytes.
     /// Three [u32 off=35][u32 count=0] headers (35 = 6+29), then ok + reqId.
     /// </summary>
-    public static byte[] Build2868_ThreeEmptyLists(byte[] request)
+    // ---- Dungeon cool times (T25) ----
+
+    /// <summary>
+    /// The character behind an <c>ArbiterUser</c> handle (our gameId), or 0. The dungeon writes
+    /// carry no playerId at all, so without <see cref="PlayerIdForGameId"/> wired there is
+    /// nothing to key a row on and the write is dropped with a warning.
+    /// </summary>
+    private int PlayerForDungeonWrite(byte[] payload, string what)
     {
-        uint reqId = request.Length >= 4 ? BitConverter.ToUInt32(request, 0) : 0;
-        var r = new byte[29];
-        const uint off = 35; // 6 + 29
-        BitConverter.GetBytes(off).CopyTo(r, 0);
-        BitConverter.GetBytes(off).CopyTo(r, 8);
-        BitConverter.GetBytes(off).CopyTo(r, 16);
-        r[24] = 1; // ok
+        if (_store is null || payload.Length < 8) return 0;
+        ulong gameId = BitConverter.ToUInt64(payload, 0);
+        int playerId = PlayerIdForGameId?.Invoke(gameId) ?? 0;
+        if (playerId <= 0)
+            _log.LogWarning("{What}: no live session owns gameId 0x{G:X} - not stored", what, gameId);
+        return playerId;
+    }
+
+    /// <summary>
+    /// SA_UPDATE_DUNGEON_COOLTIME (0x13B6). One-way: World expects no reply, and returning true
+    /// only keeps the replay table out of it. The ArbiterUser handle is at payload 8 here, not 0,
+    /// because the two list backpatch slots come first.
+    /// </summary>
+    private bool OnUpdateDungeonCoolTime(byte[] payload)
+    {
+        if (payload.Length < DungeonCoolTimeUpdateHeader) return true;
+        int off = (int)BitConverter.ToUInt32(payload, 0) - 6;
+        int len = (int)BitConverter.ToUInt32(payload, 4);
+        if (len != DungeonCoolTimeRecordSize || off < DungeonCoolTimeUpdateHeader
+            || off > payload.Length || len > payload.Length - off)
+        {
+            _log.LogWarning("SA_UPDATE_DUNGEON_COOLTIME: element at {Off} len {Len} does not fit a {N} B payload",
+                off, len, payload.Length);
+            return true;
+        }
+
+        ulong gameId = BitConverter.ToUInt64(payload, 8);
+        int playerId = _store is null ? 0 : PlayerIdForGameId?.Invoke(gameId) ?? 0;
+        if (playerId <= 0)
+        {
+            if (_store is not null)
+                _log.LogWarning("SA_UPDATE_DUNGEON_COOLTIME: no live session owns gameId 0x{G:X} - not stored", gameId);
+            return true;
+        }
+
+        var record = payload[off..(off + len)];
+        int dungeonId = (int)BitConverter.ToUInt32(record, DungeonCoolTimeDungeonIdOffset);
+        _store!.UpsertDungeonCoolTime(playerId, dungeonId, record);
+        _log.LogInformation("SA_UPDATE_DUNGEON_COOLTIME: player {Pid} dungeon {Dg} cool time stored",
+            playerId, dungeonId);
+        return true;
+    }
+
+    /// <summary>SA_UPDATE_DUNGEON_CLEAR_COUNT (0x13B7). One-way.</summary>
+    private bool OnUpdateDungeonClearCount(byte[] payload)
+    {
+        if (payload.Length < DungeonClearCountOffset + 4) return true;
+        int playerId = PlayerForDungeonWrite(payload, "SA_UPDATE_DUNGEON_CLEAR_COUNT");
+        if (playerId <= 0) return true;
+        int dungeonId = (int)BitConverter.ToUInt32(payload, DungeonContinentIdOffset);
+        int count = (int)BitConverter.ToUInt32(payload, DungeonClearCountOffset);
+        _store!.SetDungeonClearCount(playerId, dungeonId, count);
+        _log.LogInformation("SA_UPDATE_DUNGEON_CLEAR_COUNT: player {Pid} dungeon {Dg} cleared {N} time(s)",
+            playerId, dungeonId, count);
+        return true;
+    }
+
+    /// <summary>SA_DELETE_DUNGEON_COOLTIME (0x13BD). One-way.</summary>
+    private bool OnDeleteDungeonCoolTime(byte[] payload)
+    {
+        if (payload.Length < DungeonContinentIdOffset + 4) return true;
+        int playerId = PlayerForDungeonWrite(payload, "SA_DELETE_DUNGEON_COOLTIME");
+        if (playerId <= 0) return true;
+        int dungeonId = (int)BitConverter.ToUInt32(payload, DungeonContinentIdOffset);
+        _store!.ClearDungeonCoolTime(playerId, dungeonId);
+        _log.LogInformation("SA_DELETE_DUNGEON_COOLTIME: player {Pid} dungeon {Dg} cool time cleared",
+            playerId, dungeonId);
+        return true;
+    }
+
+    /// <summary>SDB_LOAD_DUNGEON_COOL_TIME (0x2867) -&gt; 0x2868, rebuilt from the stored rows.</summary>
+    private bool OnLoadDungeonCoolTime(WorldLink link, byte[] payload)
+    {
+        uint reqId = payload.Length >= 4 ? BitConverter.ToUInt32(payload, 0) : 0;
+        int playerId = payload.Length >= 8 ? (int)BitConverter.ToUInt32(payload, 4) : 0;
+        // No dob exemption here, unlike the other login loads: his captured 0x2868 IS the empty
+        // form, so the rebuild and the capture agree byte for byte with no rows, and once he has
+        // rows serving them is strictly better.
+        var rows = _store is null || playerId <= 0
+            ? new List<byte[]>() : _store.GetDungeonCoolTimes(playerId);
+        if (rows.Count > 0)
+            _log.LogInformation("SDB_LOAD_DUNGEON_COOL_TIME: player {Pid} -> {N} cool time(s)", playerId, rows.Count);
+        link.SendFrame(0x2868, BuildDbs2868(rows, reqId));
+        return true;
+    }
+
+    /// <summary>
+    /// DBS_LOAD_DUNGEON_COOL_TIME (0x2868): three [offset][length] pairs, [24] u8 ok,
+    /// [25] u32 DlmId, then the bodies. List 0 is <c>CoolTimeList</c> (52-byte elements),
+    /// list 1 <c>ClearCountList</c> and list 2 <c>UiHistoryList</c>.
+    ///
+    /// <para>Lists 1 and 2 are empty in every captured reply, so their element layouts have
+    /// never been observed and nothing is served in them - the clear counts SA_UPDATE_DUNGEON_
+    /// CLEAR_COUNT gives us are stored but not sent back. status/DUNGEON-COOLTIME.md.</para>
+    ///
+    /// <para>Byte-exact with no rows against cap_newchar.log seq 346 and
+    /// arb_world_2026-09-13 seq 399, and with one row against seq 885.</para>
+    /// </summary>
+    public static byte[] BuildDbs2868(IReadOnlyList<byte[]> coolTimes, uint reqId)
+    {
+        ArgumentNullException.ThrowIfNull(coolTimes);
+        int len = 0;
+        foreach (var rec in coolTimes)
+        {
+            if (rec.Length != DungeonCoolTimeRecordSize)
+                throw new ArgumentException(
+                    $"cool-time element must be {DungeonCoolTimeRecordSize} bytes, got {rec.Length}", nameof(coolTimes));
+            len += rec.Length;
+        }
+
+        var r = new byte[DungeonCoolTimeReplyHeader + len];
+        uint start = 6 + (uint)DungeonCoolTimeReplyHeader;      // 35, frame-relative
+        uint after = start + (uint)len;
+        BitConverter.GetBytes(start).CopyTo(r, 0);
+        BitConverter.GetBytes((uint)len).CopyTo(r, 4);
+        BitConverter.GetBytes(after).CopyTo(r, 8);              // ClearCountList: empty
+        BitConverter.GetBytes(after).CopyTo(r, 16);             // UiHistoryList: empty
+        r[24] = 1;                                              // ok
         BitConverter.GetBytes(reqId).CopyTo(r, 25);
+        int p = DungeonCoolTimeReplyHeader;
+        foreach (var rec in coolTimes) { rec.CopyTo(r, p); p += rec.Length; }
         return r;
     }
+
+    public static byte[] Build2868_ThreeEmptyLists(byte[] request)
+        => BuildDbs2868(Array.Empty<byte[]>(), request.Length >= 4 ? BitConverter.ToUInt32(request, 0) : 0);
 
     /// <summary>
     /// 0x286A: [u32 off=27][u32 0][u8 ok=1][u32 reqId][u64 timestamp=0] — 21 bytes.
@@ -2461,7 +2925,6 @@ public sealed class DbProxyHandlers
         if (p.Length < 18) { _log.LogWarning("SDB_USER_ENTERWORLD too short ({Len})", p.Length); return false; }
         uint replyId = U32(p, 10);
         int playerId = (int)U32(p, 14);
-        _log.LogInformation("SDB_USER_ENTERWORLD raw: {Hex} (replyId {R}, playerId {P})", Convert.ToHexString(p), replyId, playerId);
 
         var chr = _store.GetCharacter(playerId);
         bool found = chr?.WorldBlob != null && chr.WorldBlob.Length == WorldBlobSize;
@@ -2469,7 +2932,9 @@ public sealed class DbProxyHandlers
             _log.LogWarning("SDB_USER_ENTERWORLD: player {Id} has no world blob (found={F}, len={L}) - replying not-found",
                 playerId, chr != null, chr?.WorldBlob?.Length ?? 0);
         else
-            _log.LogInformation("DBS_USER_ENTERWORLD: sent world blob for '{Name}' (id {Id}) from DB, pos {Pos}, sha256 {Sha}",
+            // Debug, not Information: the sha256 is here to prove a save/restore round trip when
+            // one is being investigated, and it costs a hash of 15 KB on every enter-world.
+            _log.LogDebug("DBS_USER_ENTERWORLD: sent world blob for '{Name}' (id {Id}) from DB, pos {Pos}, sha256 {Sha}",
                 chr!.Name, playerId, BlobPos(chr.WorldBlob!), Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(chr.WorldBlob!))[..16]);
 
         link.SendFrame(DBS_USER_ENTERWORLD, BuildDbsUserEnterWorld(replyId, found ? chr!.WorldBlob : null));
@@ -2479,13 +2944,11 @@ public sealed class DbProxyHandlers
         // frame that differs between two logins in the real capture, and chat/whisper bans live
         // in the restriction record World initialises from it. gameId form: 0x80000AF00000|id,
         // unmasked, as sent in AS_ENTER_WORLD [24] and captured (01 00 F0 0A 00 80 00 00).
-        if (found && Environment.GetEnvironmentVariable("TERASHARP_NO_RESTRICTION") != "1")
+        if (found)
         {
             ulong gameId = GameIdByPlayer.TryGetValue(playerId, out var g) ? g : 0x80000AF00000UL | (ulong)(uint)playerId;
             link.SendFrame(DBS_USER_RESTRICTION, BuildDbsUserRestriction(gameId));
         }
-        else if (found)
-            _log.LogWarning("TERASHARP_NO_RESTRICTION=1: skipping DBS_USER_RESTRICTION (experiment)");
         return true;
     }
 

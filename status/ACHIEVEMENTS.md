@@ -178,58 +178,23 @@ record layout is known, the counters are not.
 All three captured replies — fresh, dob, Test — are **byte-identical apart from the DlmId at [8]**.
 The replay path already patches that. There is nothing per-character in this message; leave it.
 
-## 6. What could NOT be pinned
+## 6. What could NOT be pinned — SUPERSEDED by T26
 
-### 6.1 Reputation `0x2890`
+This section said reputation `0x2890` and fatigability `0x2909` could not be pinned. That was
+true of the captures and false of the binary: **both are pinned and both are now rebuilt from
+rows** — `status/REPUTATION-FATIGABILITY.md`. Two claims made here were wrong and are worth
+naming, because both were mis-reads rather than missing evidence:
 
-The load record and the write record are both 52 bytes and share 11 of their 13 words, but they are
-**different structs**:
+* "record+0 is 1 for both dob and Test, so it is not the owner." A byte-level diff of the two
+  captured replies shows they differ at **exactly one offset, +0**: dob 1, Test 2. It is the
+  OwnerDbId, stamped by the Arbiter's DB loader. record+32 is an unbound row-buffer slot —
+  residue, not a field.
+* "There is no write opcode for fatigability in either capture." There are five: `0x2910`, which
+  the C# had under the wrong name (`SDB_LOAD_FRIEND_INFO`). It carries a **delta**, and the total
+  belongs to the **account**, which is why the three replies looked contradictory.
 
-```
-0x2891 write body  02000000 62020000 06000000 00000000 00000000 18790000 3F420F00 00000000 04030500 00000000 00000000 00000000 00000000
-0x2890 load  body  01000000 62020000 06000000 00000000 00000000 18790000 3F420F00 00000000 B2070100 00000000 00000000 00000000 00000000
-                   ^^^^^^^^                                                       ^^^^^^^^
-```
-
-`Handler_SDB_LOAD_REPUTATION_LIST` copies all 52 bytes of the stored `ReputationData` with no gaps,
-so the load record *is* the stored record — which means
-`Handler_SDB_UPDATE_REPUTATION_INFO` transforms the incoming one. It memcpys the record into a
-temp and hands it to `FUN_1404857c0` (UpdateType 1) or `FUN_1404a6480` (UpdateType 2 or 5) on
-`User+0x60c0`; the field mapping lives inside those.
-
-Two fields cannot be resolved from what we have:
-
-* **record+0** — 2 (the OwnerDbId) in the write, 1 in the load. It is 1 for **both** dob and Test,
-  so it is not the owner.
-* **record+32** — `04 03 05 00` in the write, `B2 07 01 00` in the load. The load value is the
-  first four bytes of the 1970-01-01 "never" DateTime; the write value is not a DateTime at all.
-
-There is exactly **one** `0x2891` write in the captures (cap_newchar seq 413) and no later load of
-the same character in the same DB state, so there is no second data point to fit against. And
-dob's and Test's load records are byte-identical, so the captures cannot even show that the reply
-is per-character.
-
-**What would settle it:** one capture of a character earning a *second, different* reputation, or a
-login immediately after a `0x2891` write in the same session.
-
-### 6.2 Fatigability `0x2909`
-
-```
-[0] u32 listOff=23  [4] u32 listLen=28  [8] u8 Success=1  [9] u32 DlmId
-[13] u32 AddtionalFatiguePoint=0
-[17..44] Fatigability: [u32 1][u32 points][16-byte DateTime][u32 ?]
-```
-
-There is **no write opcode for it in either capture**, and the three replies disagree in ways
-nothing explains: a brand-new character already gets `points 2520, 2026-09-13 02:52:52, 630` — a
-timestamp three hours before cap_newchar even starts. dob gets `2655, 05:53:38, 1626` and Test
-`2940, 11:45:51, 88`. The trailing u32 is not monotonic, and the DateTime is the login time for
-Test but not for dob.
-
-Nothing observable depends on it (World has never been seen reacting), so the static stays.
-
-**What would settle it:** a capture containing whatever writes fatigue points — most likely an
-`SDB_UPDATE_FATIGABILITY_*`, which has never appeared.
+The lesson for the next stuck layout: when the captures run out, the Arbiter's own loader and the
+packet dumpers still have the answer.
 
 ## 7. What TeraSharp does now
 

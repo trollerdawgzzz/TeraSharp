@@ -108,24 +108,7 @@ public sealed class CharacterHandlers
     /// for either, and the blob offsets for them are unidentified.</para>
     /// </summary>
     internal static (int Zone, float X, float Y, float Z) StartPositionFor(int race, int cls)
-    {
-        // Experiment knob (2026-09-14): TERASHARP_START_OVERRIDE="zone,x,y,z", e.g. "7005,2679.8,9148,1870"
-        // (dob's Velika position). Used to isolate "first enter into a fresh World fails for zone-5
-        // characters". Wins over the datasheet so it can still be used to bisect a live problem.
-        var ov = Environment.GetEnvironmentVariable("TERASHARP_START_OVERRIDE");
-        if (!string.IsNullOrWhiteSpace(ov))
-        {
-            var p = ov.Split(',');
-            var inv = System.Globalization.CultureInfo.InvariantCulture;
-            if (p.Length == 4 && int.TryParse(p[0], out var oz)
-                && float.TryParse(p[1], System.Globalization.NumberStyles.Float, inv, out var ox)
-                && float.TryParse(p[2], System.Globalization.NumberStyles.Float, inv, out var oy)
-                && float.TryParse(p[3], System.Globalization.NumberStyles.Float, inv, out var ozz))
-                return (oz, ox, oy, ozz);
-        }
-
-        return cls == SoullessClassId ? SoullessStart : DefaultStart;
-    }
+        => cls == SoullessClassId ? SoullessStart : DefaultStart;
 
     /// <summary>Class id 8 — the one class with its own <c>&lt;InitPos&gt;</c>.</summary>
     internal const int SoullessClassId = 8;

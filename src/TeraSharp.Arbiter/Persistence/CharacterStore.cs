@@ -659,6 +659,46 @@ CREATE TABLE IF NOT EXISTS achievements_done (
 );
 CREATE INDEX IF NOT EXISTS ix_achievements_done_owner ON achievements_done(owner_id);
 
+-- T25: dungeon cool times. `record` is the raw 52-byte DungeonCoolTimeElem World sends in
+-- SA_UPDATE_DUNGEON_COOLTIME (0x13B6), kept verbatim and handed straight back in
+-- DBS_LOAD_DUNGEON_COOL_TIME (0x2868) list 0 and in the AS_CACHE_DUNGEON_COOL_TIME_TO_WORLD
+-- (0x148D) pushes. `clear_count` is the separate scalar SA_UPDATE_DUNGEON_CLEAR_COUNT (0x13B7)
+-- carries; it is stored but not yet served, because no capture has ever shown a non-empty
+-- ClearCountList and its element layout is therefore unverified. status/DUNGEON-COOLTIME.md.
+CREATE TABLE IF NOT EXISTS dungeon_cooldowns (
+  owner_id    INTEGER NOT NULL REFERENCES characters(id),
+  dungeon_id  INTEGER NOT NULL,
+  record      BLOB,
+  clear_count INTEGER NOT NULL DEFAULT 0,
+  updated_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (owner_id, dungeon_id)
+);
+CREATE INDEX IF NOT EXISTS ix_dungeon_cooldowns_owner ON dungeon_cooldowns(owner_id);
+
+-- T26: reputations. `record` is the raw 52-byte ReputationData World sends in
+-- SDB_UPDATE_REPUTATION_INFO (0x2891); the real Arbiter's ReputationDataManager stores that
+-- struct verbatim in a std::map keyed on record+4 and GetAllReputationData copies it straight
+-- back out, so keeping the bytes is exactly what it does. status/REPUTATION-FATIGABILITY.md.
+CREATE TABLE IF NOT EXISTS reputations (
+  owner_id      INTEGER NOT NULL REFERENCES characters(id),
+  reputation_id INTEGER NOT NULL,
+  record        BLOB    NOT NULL,
+  updated_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (owner_id, reputation_id)
+);
+CREATE INDEX IF NOT EXISTS ix_reputations_owner ON reputations(owner_id);
+
+-- T26: fatigability. PER ACCOUNT, not per character: dob and "Test" share account 1 and the
+-- point they are served is the same running total, proven three times across the captures
+-- (2505 + 15 = 2520; 2520 + 135 + 0 = 2655; 2655 + 270 + 15 = 2940 - the second and third chains
+-- cross both characters). SDB_UPDATE_FATIGABILITY_POINT (0x2910) carries a DELTA, not a total.
+CREATE TABLE IF NOT EXISTS fatigability (
+  account_id INTEGER PRIMARY KEY REFERENCES accounts(id),
+  cur_point  INTEGER NOT NULL DEFAULT 0,
+  updated_at BLOB,            -- the raw 16-byte TIMESTAMP of the last update, null = never
+  tail       INTEGER NOT NULL DEFAULT 0
+);
+
 -- T22: the two other per-character login loads the captures pin completely.
 -- Tutorial tips: SDB_ADD_TUTORIAL_SIMPLE_TIP (0x286E) adds one id at a time and
 -- DBS_LOAD_TUTORIAL_SIMPLE_TIP (0x2873) serves them back in the order they were added.
@@ -1397,6 +1437,181 @@ SELECT last_insert_rowid();";
             using var r = cmd.ExecuteReader();
             while (r.Read()) map[r.GetInt32(0)] = r.GetInt32(1);
             return map;
+        }
+    }
+
+    // ---- Dungeon cool times (T25) ----
+
+    /// <summary>
+    /// Store the 52-byte DungeonCoolTimeElem for one dungeon, last write wins. World sends the
+    /// whole element on every change (SA_UPDATE_DUNGEON_COOLTIME), so there is nothing to merge.
+    /// </summary>
+    public void UpsertDungeonCoolTime(int ownerId, int dungeonId, byte[] record)
+    {
+        ArgumentNullException.ThrowIfNull(record);
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "INSERT INTO dungeon_cooldowns (owner_id, dungeon_id, record, updated_at) "
+                            + "VALUES ($o, $d, $r, datetime('now')) "
+                            + "ON CONFLICT(owner_id, dungeon_id) DO UPDATE SET record = $r, updated_at = datetime('now')";
+            cmd.Parameters.AddWithValue("$o", ownerId);
+            cmd.Parameters.AddWithValue("$d", dungeonId);
+            cmd.Parameters.AddWithValue("$r", record);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>
+    /// SA_UPDATE_DUNGEON_CLEAR_COUNT (0x13B7): <c>dbo.spUpdateDungeonClearCount(userDbId,
+    /// continentId, clearCount)</c>. Stored on the same row; a dungeon can have a clear count
+    /// without ever having had a cool time, hence the nullable record column.
+    /// </summary>
+    public void SetDungeonClearCount(int ownerId, int dungeonId, int clearCount)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "INSERT INTO dungeon_cooldowns (owner_id, dungeon_id, clear_count, updated_at) "
+                            + "VALUES ($o, $d, $c, datetime('now')) "
+                            + "ON CONFLICT(owner_id, dungeon_id) DO UPDATE SET clear_count = $c, updated_at = datetime('now')";
+            cmd.Parameters.AddWithValue("$o", ownerId);
+            cmd.Parameters.AddWithValue("$d", dungeonId);
+            cmd.Parameters.AddWithValue("$c", clearCount);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>
+    /// Every stored cool-time element for a character, ordered by dungeon id so the reply is
+    /// reproducible. Rows that only ever carried a clear count have no element and are skipped.
+    /// </summary>
+    public List<byte[]> GetDungeonCoolTimes(int ownerId)
+    {
+        lock (_lock)
+        {
+            var list = new List<byte[]>();
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT record FROM dungeon_cooldowns WHERE owner_id = $o AND record IS NOT NULL "
+                            + "ORDER BY dungeon_id";
+            cmd.Parameters.AddWithValue("$o", ownerId);
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) list.Add((byte[])r["record"]);
+            return list;
+        }
+    }
+
+    /// <summary>The stored element for one dungeon, or null.</summary>
+    public byte[]? GetDungeonCoolTime(int ownerId, int dungeonId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT record FROM dungeon_cooldowns WHERE owner_id = $o AND dungeon_id = $d";
+            cmd.Parameters.AddWithValue("$o", ownerId);
+            cmd.Parameters.AddWithValue("$d", dungeonId);
+            return cmd.ExecuteScalar() as byte[];
+        }
+    }
+
+    /// <summary>
+    /// SA_DELETE_DUNGEON_COOLTIME (0x13BD): drop the cool time but keep the clear count, which
+    /// is what DungeonInfoManager::DeleteCoolTime does - the two live in different containers.
+    /// </summary>
+    public bool ClearDungeonCoolTime(int ownerId, int dungeonId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE dungeon_cooldowns SET record = NULL, updated_at = datetime('now') "
+                            + "WHERE owner_id = $o AND dungeon_id = $d";
+            cmd.Parameters.AddWithValue("$o", ownerId);
+            cmd.Parameters.AddWithValue("$d", dungeonId);
+            return cmd.ExecuteNonQuery() == 1;
+        }
+    }
+
+    // ---- Reputations (T26) ----
+
+    /// <summary>
+    /// Store one 52-byte ReputationData, keyed on the reputation id at record+4. Insert and
+    /// update are the same operation for us: the real Arbiter's two paths
+    /// (ReputationDataManager::AddNewReputationInfo and ::UpdateReputationInfo) both end with
+    /// the incoming struct in the map, so last write wins.
+    /// </summary>
+    public void UpsertReputation(int ownerId, int reputationId, byte[] record)
+    {
+        ArgumentNullException.ThrowIfNull(record);
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "INSERT INTO reputations (owner_id, reputation_id, record, updated_at) "
+                            + "VALUES ($o, $r, $b, datetime('now')) "
+                            + "ON CONFLICT(owner_id, reputation_id) DO UPDATE SET record = $b, updated_at = datetime('now')";
+            cmd.Parameters.AddWithValue("$o", ownerId);
+            cmd.Parameters.AddWithValue("$r", reputationId);
+            cmd.Parameters.AddWithValue("$b", record);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>
+    /// A character's reputations, ordered by reputation id - the order
+    /// ReputationDataManager::GetAllReputationData produces, because it walks a std::map keyed
+    /// on that id.
+    /// </summary>
+    public List<byte[]> GetReputations(int ownerId)
+    {
+        lock (_lock)
+        {
+            var list = new List<byte[]>();
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT record FROM reputations WHERE owner_id = $o ORDER BY reputation_id";
+            cmd.Parameters.AddWithValue("$o", ownerId);
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) list.Add((byte[])r["record"]);
+            return list;
+        }
+    }
+
+    // ---- Fatigability (T26) ----
+
+    /// <summary>One account's fatigue state. <paramref name="Timestamp"/> is the raw 16-byte
+    /// TIMESTAMP of the last update, or null when there has never been one.</summary>
+    public sealed record FatigabilityRow(int CurPoint, byte[]? Timestamp, int Tail);
+
+    /// <summary>
+    /// Add a fatigue delta to an account and stamp the update time. Returns the new total.
+    /// The delta really is a delta - three capture chains prove it, including two that cross
+    /// from one character to another on the same account.
+    /// </summary>
+    public FatigabilityRow AddFatigabilityPoints(long accountId, int delta, byte[] timestamp)
+    {
+        ArgumentNullException.ThrowIfNull(timestamp);
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "INSERT INTO fatigability (account_id, cur_point, updated_at) VALUES ($a, $d, $t) "
+                            + "ON CONFLICT(account_id) DO UPDATE SET cur_point = cur_point + $d, updated_at = $t";
+            cmd.Parameters.AddWithValue("$a", accountId);
+            cmd.Parameters.AddWithValue("$d", delta);
+            cmd.Parameters.AddWithValue("$t", timestamp);
+            cmd.ExecuteNonQuery();
+        }
+        return GetFatigability(accountId);
+    }
+
+    /// <summary>An account's fatigue state; zeros and no timestamp when it has never been set.</summary>
+    public FatigabilityRow GetFatigability(long accountId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT cur_point, updated_at, tail FROM fatigability WHERE account_id = $a";
+            cmd.Parameters.AddWithValue("$a", accountId);
+            using var r = cmd.ExecuteReader();
+            if (!r.Read()) return new FatigabilityRow(0, null, 0);
+            return new FatigabilityRow(r.GetInt32(0), r["updated_at"] as byte[], r.GetInt32(2));
         }
     }
 

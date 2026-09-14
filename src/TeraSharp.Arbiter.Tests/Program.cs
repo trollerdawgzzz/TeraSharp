@@ -2775,24 +2775,6 @@ array items
         }
     }
 
-    [Test] public static void StartPosition_override_still_wins()
-    {
-        // The bisect knob has to beat the datasheet or it is useless for isolating a live
-        // problem with the zone-5 start.
-        var saved = Environment.GetEnvironmentVariable("TERASHARP_START_OVERRIDE");
-        Environment.SetEnvironmentVariable("TERASHARP_START_OVERRIDE", "7005,2679.8,9148,1870");
-        try
-        {
-            foreach (int cls in new[] { 0, CharacterHandlers.SoullessClassId })
-            {
-                var p = CharacterHandlers.StartPositionFor(race: 4, cls: cls);
-                Hex.True(p.Zone == 7005 && p.X == 2679.8f && p.Y == 9148f && p.Z == 1870f,
-                    $"class {cls}: the override must win, got zone {p.Zone} ({p.X},{p.Y},{p.Z})");
-            }
-        }
-        finally { Environment.SetEnvironmentVariable("TERASHARP_START_OVERRIDE", saved); }
-    }
-
     [Test] public static void StartPosition_reaches_the_blob_and_the_row()
     {
         // BuildRecord writes the start position to both the characters row and blob 220/236,
@@ -6078,6 +6060,521 @@ array items
             "a short 0x295C must fall through to the replay table");
         Hex.True(HandlerAccepts(DbProxyHandlers.SDB_RESULT_CITY_WAR, CapCityWarRequest),
             "the captured 0x295C must be handled");
+    }
+
+
+    // ================================================================================
+    // T25 - dungeon cool-time persistence.
+    //
+    // The write side is four one-way SA_ messages, not an SDB_ pair. Only the first has ever
+    // appeared on the wire: cap_newchar.log seq 2907, SA_UPDATE_DUNGEON_COOLTIME for dungeon
+    // 9827. Layouts and the decompile trail: status/DUNGEON-COOLTIME.md.
+    // ================================================================================
+
+    /// <summary>cap_newchar.log seq 2907: SA_UPDATE_DUNGEON_COOLTIME, the only one in any capture.</summary>
+    static readonly byte[] Cap2907UpdateDungeonCoolTime = Hex.B(@"
+        16 00 00 00  34 00 00 00  20 A0 FB 4C  6F 02 00 00
+        63 26 00 00  01 00 F0 0A  EA 07 09 00  0D 00 05 00
+        34 00 38 00  00 00 00 00  EA 07 09 00  0C 00 07 00
+        00 00 00 00  00 00 00 00  01 00 00 00  01 00 00 00
+        00 00 00 00");
+
+    [Test] public static void DungeonCoolTime_update_layout_matches_the_capture()
+    {
+        var p = Cap2907UpdateDungeonCoolTime;
+        Hex.True(p.Length == 68, $"seq 2907 payload is 68 B, got {p.Length}");
+        Hex.True(BitConverter.ToUInt32(p, 0) - 6 == DbProxyHandlers.DungeonCoolTimeUpdateHeader,
+            "the element starts right after the 16-byte header");
+        Hex.True(BitConverter.ToUInt32(p, 4) == DbProxyHandlers.DungeonCoolTimeRecordSize,
+            "one 52-byte DungeonCoolTimeElem");
+
+        var rec = p[DbProxyHandlers.DungeonCoolTimeUpdateHeader..];
+        Hex.True(BitConverter.ToUInt32(rec, DbProxyHandlers.DungeonCoolTimeDungeonIdOffset) == 9827,
+            "dungeon 9827");
+        Hex.Eq(rec[8..24], Hex.B("EA 07 09 00  0D 00 05 00  34 00 38 00  00 00 00 00"),
+            "the first DateTime is when the player entered: 2026-09-13 05:52:56");
+        Hex.Eq(rec[24..40], Hex.B("EA 07 09 00  0C 00 07 00  00 00 00 00  00 00 00 00"),
+            "the second is the 2026-09-12 07:00 daily-reset stamp the 0x272D trailer also carries");
+        Hex.True(BitConverter.ToUInt32(rec, 40) == 1 && BitConverter.ToUInt32(rec, 44) == 1,
+            "both counters are 1 after the entry");
+    }
+
+    [Test] public static void DungeonCoolTime_2868_empty_and_one_record_match_the_captures()
+    {
+        var newchar = LoadT22NewcharOrSkip(); if (newchar == null) return;
+        var relog = LoadT22RelogOrSkip(); if (relog == null) return;
+
+        // No rows -> the three-empty-list form, both captures.
+        foreach (var expected in new[] { newchar[346], relog[399] })
+            Hex.Eq(DbProxyHandlers.BuildDbs2868(Array.Empty<byte[]>(), BitConverter.ToUInt32(expected, 25)),
+                expected, "DBS_LOAD_DUNGEON_COOL_TIME with no cool times");
+
+        // One row -> Test's reply at relog seq 885, byte for byte.
+        var served = relog[885];
+        var record = served[DbProxyHandlers.DungeonCoolTimeReplyHeader..];
+        Hex.True(record.Length == DbProxyHandlers.DungeonCoolTimeRecordSize, "one element");
+        Hex.Eq(DbProxyHandlers.BuildDbs2868(new[] { record }, BitConverter.ToUInt32(served, 25)),
+            served, "DBS_LOAD_DUNGEON_COOL_TIME with one cool time (relog seq 885)");
+    }
+
+    [Test] public static void DungeonCoolTime_2868_keeps_lists_1_and_2_empty()
+    {
+        var rec = DbProxyHandlers.BuildDungeonCoolTimeRecord(9827, 1, null, null, 0, 0, 0);
+        var r = DbProxyHandlers.BuildDbs2868(new[] { rec, rec }, 7);
+        Hex.True(BitConverter.ToUInt32(r, 4) == 104, "list 0 holds both elements");
+        Hex.True(BitConverter.ToUInt32(r, 12) == 0 && BitConverter.ToUInt32(r, 20) == 0,
+            "ClearCountList and UiHistoryList stay empty - their element layouts are unobserved");
+        Hex.True(BitConverter.ToUInt32(r, 8) == BitConverter.ToUInt32(r, 16)
+                 && BitConverter.ToUInt32(r, 8) == 6 + DbProxyHandlers.DungeonCoolTimeReplyHeader + 104,
+            "and both point past the end of list 0");
+        Hex.True(r[24] == 1 && BitConverter.ToUInt32(r, 25) == 7, "ok and the live DLM id");
+    }
+
+    [Test] public static void DungeonCoolTime_rejects_a_wrong_sized_element()
+    {
+        try { DbProxyHandlers.BuildDbs2868(new[] { new byte[51] }, 1); }
+        catch (ArgumentException) { return; }
+        throw new Exception("a 51-byte element must be refused, not padded");
+    }
+
+    /// <summary>A store with characters 1 and 2, and a handler that can resolve gameId -> playerId.</summary>
+    static (TeraSharp.Arbiter.Persistence.CharacterStore store, DbProxyHandlers handlers, ulong gameId) T25Store()
+    {
+        var store = StoreWithTwoCharacters();
+        var handlers = FreshHandlers(store);
+        // Any handle resolves to character 2: the 0x13B6 capture and the 0x138D capture come from
+        // different sessions and carry different ArbiterUser values.
+        handlers.PlayerIdForGameId = _ => 2;
+        return (store, handlers, BitConverter.ToUInt64(Cap2907UpdateDungeonCoolTime, 8));
+    }
+
+    [Test] public static void Handler_13B6_stores_the_element_and_sends_nothing()
+    {
+        var (store, handlers, _) = T25Store();
+        using var _s = store;
+
+        // One-way: World expects no reply, and returning true only keeps the replay table out.
+        var frames = RunHandler(DbProxyHandlers.SA_UPDATE_DUNGEON_COOLTIME, Cap2907UpdateDungeonCoolTime,
+            0, store, handlers);
+        Hex.True(frames.Count == 0, $"0x13B6 is one-way, {frames.Count} frame(s) went out");
+
+        var stored = store.GetDungeonCoolTime(2, 9827);
+        Hex.Eq(stored!, Cap2907UpdateDungeonCoolTime[DbProxyHandlers.DungeonCoolTimeUpdateHeader..],
+            "the element is stored verbatim");
+    }
+
+    [Test] public static void Handler_13B6_needs_a_session_to_key_the_row_on()
+    {
+        // The write carries no playerId - only the ArbiterUser handle. With no resolver there is
+        // nothing to store it against, and dropping it is better than guessing.
+        using var store = StoreWithTwoCharacters();
+        var handlers = FreshHandlers(store);          // PlayerIdForGameId left unwired
+        RunHandler(DbProxyHandlers.SA_UPDATE_DUNGEON_COOLTIME, Cap2907UpdateDungeonCoolTime, 0, store, handlers);
+        Hex.True(store.GetDungeonCoolTime(2, 9827) == null, "nothing may be stored without a session");
+    }
+
+    [Test] public static void Handler_2867_serves_the_stored_cool_times()
+    {
+        var newchar = LoadT22NewcharOrSkip(); if (newchar == null) return;
+        var relog = LoadT22RelogOrSkip(); if (relog == null) return;
+        var (store, handlers, _) = T25Store();
+        using var _s = store;
+
+        var req = new byte[8];
+        BitConverter.GetBytes(BitConverter.ToUInt32(newchar[346], 25)).CopyTo(req, 0);
+        BitConverter.GetBytes(2u).CopyTo(req, 4);
+
+        // Nothing stored -> the captured empty reply with our live id.
+        var (op, empty) = RunHandler1(DbProxyHandlers.SDB_LOAD_2867, req, store, handlers);
+        Hex.True(op == 0x2868, $"reply opcode, got 0x{op:X4}");
+        Hex.Eq(empty, newchar[346], "no cool times -> cap_newchar seq 346");
+
+        // Replay the capture's write, then load again. The reply has the same shape as the
+        // capture's one-record reply; the element differs because the daily reset between the
+        // two captures zeroed it (status/DUNGEON-COOLTIME.md).
+        RunHandler(DbProxyHandlers.SA_UPDATE_DUNGEON_COOLTIME, Cap2907UpdateDungeonCoolTime, 0, store, handlers);
+        BitConverter.GetBytes(BitConverter.ToUInt32(relog[885], 25)).CopyTo(req, 0);
+        var (_, full) = RunHandler1(DbProxyHandlers.SDB_LOAD_2867, req, store, handlers);
+
+        Hex.True(full.Length == relog[885].Length, $"same length as seq 885, got {full.Length}");
+        Hex.Eq(full[..DbProxyHandlers.DungeonCoolTimeReplyHeader],
+            relog[885][..DbProxyHandlers.DungeonCoolTimeReplyHeader],
+            "the header is byte-identical to the capture's one-record reply");
+        Hex.Eq(full[DbProxyHandlers.DungeonCoolTimeReplyHeader..],
+            Cap2907UpdateDungeonCoolTime[DbProxyHandlers.DungeonCoolTimeUpdateHeader..],
+            "and the element is the one World wrote");
+    }
+
+    [Test] public static void Handler_13BD_clears_the_cool_time_but_keeps_the_clear_count()
+    {
+        var (store, handlers, gameId) = T25Store();
+        using var _s = store;
+        RunHandler(DbProxyHandlers.SA_UPDATE_DUNGEON_COOLTIME, Cap2907UpdateDungeonCoolTime, 0, store, handlers);
+
+        var clearCount = new byte[16];
+        BitConverter.GetBytes(gameId).CopyTo(clearCount, 0);
+        BitConverter.GetBytes(9827).CopyTo(clearCount, DbProxyHandlers.DungeonContinentIdOffset);
+        BitConverter.GetBytes(3).CopyTo(clearCount, DbProxyHandlers.DungeonClearCountOffset);
+        RunHandler(DbProxyHandlers.SA_UPDATE_DUNGEON_CLEAR_COUNT, clearCount, 0, store, handlers);
+
+        var del = new byte[12];
+        BitConverter.GetBytes(gameId).CopyTo(del, 0);
+        BitConverter.GetBytes(9827).CopyTo(del, DbProxyHandlers.DungeonContinentIdOffset);
+        RunHandler(DbProxyHandlers.SA_DELETE_DUNGEON_COOLTIME, del, 0, store, handlers);
+
+        Hex.True(store.GetDungeonCoolTime(2, 9827) == null, "the cool time is gone");
+        Hex.True(store.GetDungeonCoolTimes(2).Count == 0, "and it drops out of the load");
+        // The clear count is a separate container in DungeonInfoManager and survives the delete;
+        // it is stored but not served, because no capture shows a ClearCountElem.
+    }
+
+    [Test] public static void Handler_138D_pushes_the_stored_cool_time()
+    {
+        // T21 pushed a synthesized "never entered" element; since T25 it is the stored row.
+        var (store, handlers, _) = T25Store();
+        using var _s = store;
+        RunHandler(DbProxyHandlers.SA_UPDATE_DUNGEON_COOLTIME, Cap2907UpdateDungeonCoolTime, 0, store, handlers);
+
+        DbProxyHandlers.EnterWorldFailure? asked = null;
+        handlers.ResendEnterWorld = f => asked = f;
+        var frames = RunHandler(DbProxyHandlers.SA_ENTER_WORLD_FAIL, Cap836EnterWorldFail, 2, store, handlers);
+
+        var expected = DbProxyHandlers.BuildCacheDungeonCoolTime(2,
+            Cap2907UpdateDungeonCoolTime[DbProxyHandlers.DungeonCoolTimeUpdateHeader..]);
+        Hex.Eq(frames[0].body, expected, "0x148D push 1 carries the stored element");
+        Hex.Eq(frames[1].body, expected, "0x148D push 2 carries the stored element");
+        Hex.True(asked != null, "and the retry hook still fires");
+    }
+
+    // ================================================================================
+    // T24 - the dispatch switch and the allow-list have to agree.
+    //
+    // TryHandle opens with `if (!IsHandledRequest(op)) return false;`, so a dispatch case whose
+    // opcode is not in the allow-list never runs. Four per-character login loads sat like that
+    // for months, quietly replaying dob's captured bytes to every character, and nothing failed.
+    // ================================================================================
+
+    /// <summary>Every `case IDENT:` label inside one method of DbProxyHandlers.cs, as opcodes.</summary>
+    static List<(string Name, ushort Op)> CaseLabelsIn(string source, string methodSignature)
+    {
+        int at = source.IndexOf(methodSignature, StringComparison.Ordinal);
+        Hex.True(at >= 0, $"DbProxyHandlers.cs no longer contains '{methodSignature}' - fix this test");
+        int open = source.IndexOf('{', at);
+        int depth = 0, end = open;
+        for (; end < source.Length; end++)
+        {
+            if (source[end] == '{') depth++;
+            else if (source[end] == '}' && --depth == 0) break;
+        }
+        var body = source[open..end];
+
+        var found = new List<(string, ushort)>();
+        foreach (System.Text.RegularExpressions.Match m in
+                 System.Text.RegularExpressions.Regex.Matches(body, @"\bcase\s+([A-Za-z_][A-Za-z0-9_]*)\s*:"))
+        {
+            string name = m.Groups[1].Value;
+            var f = typeof(DbProxyHandlers).GetField(name,
+                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+            Hex.True(f != null && f.FieldType == typeof(ushort),
+                $"case label '{name}' is not a public const ushort on DbProxyHandlers");
+            found.Add((name, (ushort)f!.GetValue(null)!));
+        }
+        return found;
+    }
+
+    [Test]
+    public static void Dispatch_switch_and_the_allow_list_agree()
+    {
+        var path = FindRepoFile(Path.Combine("src", "TeraSharp.Arbiter", "World", "DbProxyHandlers.cs"));
+        if (path == null) { Console.WriteLine("        (skipped: DbProxyHandlers.cs not found)"); return; }
+        var source = File.ReadAllText(path);
+
+        var allowList = CaseLabelsIn(source, "public static bool IsHandledRequest(ushort op)");
+        var dispatch = CaseLabelsIn(source, "public bool TryHandle(WorldBridge bridge, WorldLink link, ushort op, byte[] payload)");
+        Hex.True(allowList.Count >= 30 && dispatch.Count >= 30,
+            $"parsed {allowList.Count} allow-list and {dispatch.Count} dispatch cases - the parser broke, "
+            + "not the code");
+
+        var allowed = allowList.Select(c => c.Op).ToHashSet();
+        var dispatched = dispatch.Select(c => c.Op).ToHashSet();
+        var testOnly = DbProxyHandlers.DispatchOnlyForTests.ToHashSet();
+
+        // 1. An allow-list entry with no dispatch case falls through to TryHandle's `default`,
+        //    which logs an error and hands the request to the replay table - with the CAPTURED
+        //    DLM id, which wedges the user.
+        var noCase = allowList.Where(c => !dispatched.Contains(c.Op)).ToArray();
+        Hex.True(noCase.Length == 0,
+            "these opcodes are in IsHandledRequest but have no case in TryHandle's switch, so they "
+            + "fall through to the replay table and go out with the captured DLM id:\n    "
+            + string.Join("\n    ", noCase.Select(c => $"0x{c.Op:X4} {c.Name}")));
+
+        // 2. A dispatch case with no allow-list entry never runs. That is allowed only when the
+        //    opcode is declared in DispatchOnlyForTests.
+        var dead = dispatch.Where(c => !allowed.Contains(c.Op) && !testOnly.Contains(c.Op)).ToArray();
+        Hex.True(dead.Length == 0,
+            "these opcodes have a case in TryHandle's switch but are in neither IsHandledRequest "
+            + "nor DispatchOnlyForTests, so the case is dead code and the replay table is "
+            + "answering them:\n    "
+            + string.Join("\n    ", dead.Select(c => $"0x{c.Op:X4} {c.Name}")));
+
+        // 3. DispatchOnlyForTests must stay honest in both directions.
+        var claimedButLive = DbProxyHandlers.DispatchOnlyForTests.Where(allowed.Contains).ToArray();
+        Hex.True(claimedButLive.Length == 0,
+            "DispatchOnlyForTests claims these are unreachable, but they ARE in the allow-list: "
+            + string.Join(", ", claimedButLive.Select(o => $"0x{o:X4}")));
+        var claimedButAbsent = DbProxyHandlers.DispatchOnlyForTests.Where(o => !dispatched.Contains(o)).ToArray();
+        Hex.True(claimedButAbsent.Length == 0,
+            "DispatchOnlyForTests names opcodes with no dispatch case at all - delete them: "
+            + string.Join(", ", claimedButAbsent.Select(o => $"0x{o:X4}")));
+    }
+
+    [Test]
+    public static void Dispatch_guard_would_catch_a_dead_case()
+    {
+        // The guard is only worth having if it fails when it should: a case label that is in
+        // neither set has to be reported. This is the T22 shape, run against a fake source.
+        const string fake = @"
+public static bool IsHandledRequest(ushort op)
+{
+    switch (op)
+    {
+        case SDB_USER_ENTERWORLD:
+            return true;
+        default:
+            return false;
+    }
+}
+public bool TryHandle(WorldBridge bridge, WorldLink link, ushort op, byte[] payload)
+{
+    switch (op)
+    {
+        case SDB_USER_ENTERWORLD: return true;
+        case SDB_QUEST_LIST: return true;
+    }
+}";
+        var allowed = CaseLabelsIn(fake, "public static bool IsHandledRequest(ushort op)").Select(c => c.Op).ToHashSet();
+        var dispatched = CaseLabelsIn(fake, "public bool TryHandle(WorldBridge bridge, WorldLink link, ushort op, byte[] payload)");
+        var dead = dispatched.Where(c => !allowed.Contains(c.Op)).Select(c => c.Name).ToArray();
+        Hex.True(dead.SequenceEqual(new[] { "SDB_QUEST_LIST" }),
+            "the parser must spot the dead case: " + string.Join(",", dead));
+    }
+
+
+    // ================================================================================
+    // T26 - reputations and fatigability, the last two per-character login loads.
+    //
+    // Both were left on dob's captured bytes by T22 because the captures alone could not pin
+    // them. The decompile did: status/REPUTATION-FATIGABILITY.md.
+    //
+    // data/cap_t26.bin (TSIS): cap_newchar.log seq 336 (0x2890 empty), 413 (the only 0x2891),
+    // 376 (0x2909), 511 and 2068 (0x2910 writes); arb_world_2026-09-13 seq 389 and 875 (0x2890
+    // for dob and Test), 430 and 916 (0x2909), 549 and 748 (0x2910 writes).
+    // ================================================================================
+
+    static Dictionary<uint, byte[]>? LoadT26OrSkip() => LoadTsisOrSkip("cap_t26.bin");
+
+    [Test] public static void Reputation_record_is_52_bytes_keyed_on_the_id_at_plus_4()
+    {
+        var cap = LoadT26OrSkip(); if (cap == null) return;
+        var write = cap[413];
+        Hex.True(BitConverter.ToUInt32(write, 0) - 6 == DbProxyHandlers.ReputationUpdateHeader,
+            "the record starts right after the 20-byte header");
+        Hex.True(BitConverter.ToUInt32(write, 4) == DbProxyHandlers.ReputationRecordSize, "52 bytes");
+        Hex.True(BitConverter.ToUInt32(write, DbProxyHandlers.ReputationUpdateOpOffset) == 1, "op 1 = insert");
+
+        var rec = DbProxyHandlers.SliceReputationRecord(write)!;
+        Hex.True(rec.Length == 52, $"sliced 52 bytes, got {rec.Length}");
+        Hex.True(BitConverter.ToUInt32(rec, DbProxyHandlers.ReputationRecordIdOffset) == 610, "reputation 610");
+        Hex.True(BitConverter.ToUInt32(rec, DbProxyHandlers.ReputationRecordOwnerOffset) == 2,
+            "record+0 is the OwnerDbId World sent - Test is playerId 2");
+
+        foreach (uint op in new uint[] { 1, 2, 4 })
+            Hex.True(DbProxyHandlers.IsReputationWriteOp(op), $"op {op} stores");
+        foreach (uint op in new uint[] { 0, 3, 5, 99 })
+            Hex.True(!DbProxyHandlers.IsReputationWriteOp(op), $"op {op} must not store");
+    }
+
+    [Test] public static void Reputation_2890_matches_all_three_captured_replies()
+    {
+        var cap = LoadT26OrSkip(); if (cap == null) return;
+        var rec = DbProxyHandlers.SliceReputationRecord(cap[413])!;
+
+        Hex.Eq(DbProxyHandlers.BuildDbs2890(Array.Empty<byte[]>(), BitConverter.ToUInt32(cap[336], 9), 2),
+            cap[336], "no reputations (cap_newchar seq 336)");
+
+        // The SAME stored record produces dob's and Test's replies - they differ only in the
+        // owner the loader stamps at record+0.
+        Hex.Eq(DbProxyHandlers.BuildDbs2890(new[] { rec }, BitConverter.ToUInt32(cap[389], 9), 1),
+            cap[389], "dob's reputation list (relog seq 389)");
+        Hex.Eq(DbProxyHandlers.BuildDbs2890(new[] { rec }, BitConverter.ToUInt32(cap[875], 9), 2),
+            cap[875], "Test's reputation list (relog seq 875)");
+
+        // Those two replies are identical apart from record+0.
+        var a = cap[389][DbProxyHandlers.ReputationReplyHeader..];
+        var b = cap[875][DbProxyHandlers.ReputationReplyHeader..];
+        var differ = Enumerable.Range(0, a.Length).Where(i => a[i] != b[i]).ToArray();
+        Hex.True(differ.SequenceEqual(new[] { 0 }),
+            "dob and Test differ only at record+0: " + string.Join(",", differ));
+    }
+
+    [Test] public static void Reputation_load_restamps_the_two_fields_the_DB_loader_owns()
+    {
+        var cap = LoadT26OrSkip(); if (cap == null) return;
+        var rec = DbProxyHandlers.SliceReputationRecord(cap[413])!;
+        var built = DbProxyHandlers.BuildDbs2890(new[] { rec }, 1, 7);
+        var served = built[DbProxyHandlers.ReputationReplyHeader..];
+
+        Hex.True(BitConverter.ToUInt32(served, DbProxyHandlers.ReputationRecordOwnerOffset) == 7,
+            "record+0 is stamped with the owner, not echoed from the write");
+        Hex.True(BitConverter.ToUInt32(served, DbProxyHandlers.ReputationRecordResidueOffset)
+                 == DbProxyHandlers.ReputationLoaderResidue,
+            "record+32 carries the loader residue, not the write's value");
+        Hex.True(BitConverter.ToUInt32(rec, DbProxyHandlers.ReputationRecordResidueOffset)
+                 != DbProxyHandlers.ReputationLoaderResidue,
+            "and the write really did carry something else there");
+
+        // Everything else survives untouched.
+        foreach (int off in new[] { 4, 8, 12, 16, 20, 24, 28, 36, 40, 44, 48 })
+            Hex.True(BitConverter.ToUInt32(served, off) == BitConverter.ToUInt32(rec, off),
+                $"record+{off} must pass through");
+    }
+
+    [Test] public static void Handler_288F_rebuilds_from_the_store()
+    {
+        var cap = LoadT26OrSkip(); if (cap == null) return;
+        using var store = StoreWithTwoCharacters();
+        var handlers = FreshHandlers(store);
+
+        var req = new byte[8];
+        BitConverter.GetBytes(BitConverter.ToUInt32(cap[336], 9)).CopyTo(req, 0);
+        BitConverter.GetBytes(2u).CopyTo(req, 4);
+
+        var (op, empty) = RunHandler1(DbProxyHandlers.SDB_REPUTATION_LIST, req, store, handlers);
+        Hex.True(op == DbProxyHandlers.DBS_REPUTATION_LIST, $"reply opcode, got 0x{op:X4}");
+        Hex.Eq(empty, cap[336], "no rows -> cap_newchar seq 336");
+
+        // Replay the capture's write, then load: Test's relog reply, byte for byte.
+        var (wop, ack) = RunHandler1(DbProxyHandlers.SDB_UPDATE_REPUTATION_INFO, cap[413], store, handlers);
+        Hex.True(wop == DbProxyHandlers.DBS_UPDATE_REPUTATION_INFO, "0x2892 ack");
+        Hex.True(ack[0] == 1 && BitConverter.ToUInt32(ack, 1) == BitConverter.ToUInt32(cap[413], 8),
+            "ok first, then the live DLM id");
+
+        BitConverter.GetBytes(BitConverter.ToUInt32(cap[875], 9)).CopyTo(req, 0);
+        var (_, full) = RunHandler1(DbProxyHandlers.SDB_REPUTATION_LIST, req, store, handlers);
+        Hex.Eq(full, cap[875], "Test's reputation list, rebuilt from his own write");
+    }
+
+    [Test] public static void Handler_2891_ignores_an_op_it_does_not_implement()
+    {
+        var cap = LoadT26OrSkip(); if (cap == null) return;
+        using var store = StoreWithTwoCharacters();
+        var handlers = FreshHandlers(store);
+
+        var bad = (byte[])cap[413].Clone();
+        BitConverter.GetBytes(3u).CopyTo(bad, DbProxyHandlers.ReputationUpdateOpOffset);
+        RunHandler1(DbProxyHandlers.SDB_UPDATE_REPUTATION_INFO, bad, store, handlers);
+        Hex.True(store.GetReputations(2).Count == 0,
+            "op 3 reaches neither Insert nor Update in the real Arbiter, so nothing is stored");
+    }
+
+    // ---- Fatigability ----
+
+    [Test] public static void Fatigability_element_layout_matches_every_captured_reply()
+    {
+        var cap = LoadT26OrSkip(); if (cap == null) return;
+        foreach (uint seq in new uint[] { 376, 430, 916 })
+        {
+            var p = cap[seq];
+            Hex.True(p.Length == DbProxyHandlers.FatigabilityReplyHeader + DbProxyHandlers.FatigabilityRecordSize,
+                $"seq {seq}: 17-byte header + one 28-byte element, got {p.Length}");
+            Hex.True(BitConverter.ToUInt32(p, 0) - 6 == DbProxyHandlers.FatigabilityReplyHeader, "list offset");
+            Hex.True(BitConverter.ToUInt32(p, 4) == DbProxyHandlers.FatigabilityRecordSize, "one element");
+            Hex.True(p[8] == 1, "Success");
+            Hex.True(BitConverter.ToUInt32(p, 13) == 0, "AddtionalFatiguePoint is 0 in every capture");
+            Hex.True(BitConverter.ToUInt32(p, DbProxyHandlers.FatigabilityReplyHeader) == DbProxyHandlers.FatigabilityKind,
+                "the element kind is 1 in every capture");
+        }
+    }
+
+    [Test] public static void Fatigability_2909_matches_the_captures_apart_from_the_unexplained_tail()
+    {
+        // The trailing u32 of the element (630, 1626, 88 in the three replies) has no relation to
+        // the point, the timestamp or the elapsed time, and World copies the element without
+        // reading it. We send 0; everything else reproduces byte for byte.
+        var cap = LoadT26OrSkip(); if (cap == null) return;
+        const int tailOffset = 17 + 24;
+        foreach (uint seq in new uint[] { 376, 430, 916 })
+        {
+            var p = cap[seq];
+            int point = (int)BitConverter.ToUInt32(p, DbProxyHandlers.FatigabilityReplyHeader + 4);
+            var ts = p[(DbProxyHandlers.FatigabilityReplyHeader + 8)..(DbProxyHandlers.FatigabilityReplyHeader + 24)];
+            var built = DbProxyHandlers.BuildDbs2909(point, ts, BitConverter.ToUInt32(p, 9));
+
+            var expected = (byte[])p.Clone();
+            BitConverter.GetBytes(0u).CopyTo(expected, tailOffset);
+            Hex.Eq(built, expected, $"DBS_LOAD_FATIGABILITY_LIST seq {seq} (tail zeroed on both sides)");
+            Hex.True(BitConverter.ToUInt32(p, tailOffset) != 0, $"seq {seq} really did carry a non-zero tail");
+        }
+    }
+
+    [Test] public static void Fatigability_point_is_a_running_total_per_ACCOUNT()
+    {
+        // Three chains prove the 0x2910 payload is a delta, and two of them cross characters:
+        //   lobby_tap  2505 + 15        = 2520
+        //   cap_newchar 2520 + 135 + 0  = 2655  (Test writes, dob reads at the next capture)
+        //   relog      2655 + 270 + 15  = 2940  (dob writes, Test reads)
+        var cap = LoadT26OrSkip(); if (cap == null) return;
+        using var store = StoreWithTwoCharacters();
+        var handlers = FreshHandlers(store);
+
+        int Delta(uint seq) => (int)BitConverter.ToUInt32(cap[seq], DbProxyHandlers.FatigabilityUpdateDeltaOffset);
+        Hex.True(Delta(511) == 135 && Delta(2068) == 0 && Delta(549) == 270 && Delta(748) == 15,
+            $"the four captured deltas: {Delta(511)}, {Delta(2068)}, {Delta(549)}, {Delta(748)}");
+
+        // Character 2 writes, character 1 reads: same account, same total.
+        foreach (uint seq in new uint[] { 511, 2068 })
+        {
+            var w = (byte[])cap[seq].Clone();
+            BitConverter.GetBytes(2u).CopyTo(w, 4);
+            var (op, ack) = RunHandler1(DbProxyHandlers.SDB_LOAD_FRIEND_INFO, w, store, handlers);
+            Hex.True(op == DbProxyHandlers.DBS_FATIGABILITY_UPDATE, $"0x2911 ack, got 0x{op:X4}");
+            Hex.True(ack[0] == 1 && BitConverter.ToUInt32(ack, 1) == BitConverter.ToUInt32(w, 0),
+                "ok first, then the live DLM id");
+        }
+
+        var req = new byte[8];
+        BitConverter.GetBytes(0x0BADu).CopyTo(req, 0);
+        BitConverter.GetBytes(1u).CopyTo(req, 4);          // the OTHER character on the account
+        var (_, reply) = RunHandler1(DbProxyHandlers.SDB_FATIGABILITY_LIST, req, store, handlers);
+        Hex.True(BitConverter.ToUInt32(reply, DbProxyHandlers.FatigabilityReplyHeader + 4) == 135,
+            "the total follows the account, not the character");
+        Hex.True(BitConverter.ToUInt32(reply, 9) == 0x0BAD, "and the reply carries the live DLM id");
+    }
+
+    [Test] public static void Fatigability_fresh_account_gets_zero_and_the_never_timestamp()
+    {
+        using var store = StoreWithTwoCharacters();
+        var handlers = FreshHandlers(store);
+        var req = new byte[8];
+        BitConverter.GetBytes(7u).CopyTo(req, 0);
+        BitConverter.GetBytes(2u).CopyTo(req, 4);
+        var (_, reply) = RunHandler1(DbProxyHandlers.SDB_FATIGABILITY_LIST, req, store, handlers);
+
+        int at = DbProxyHandlers.FatigabilityReplyHeader;
+        Hex.True(BitConverter.ToUInt32(reply, at) == 1, "kind 1");
+        Hex.True(BitConverter.ToUInt32(reply, at + 4) == 0, "no fatigue");
+        Hex.Eq(reply[(at + 8)..(at + 24)], DbProxyHandlers.DungeonCoolTimeNever,
+            "and the 1970-01-01 'never' timestamp");
+    }
+
+    [Test] public static void DbDateTime_round_trips_the_capture_format()
+    {
+        // Proven by the accomplished-achievement records and the fatigue timestamps:
+        // u16 year, month, day, hour, minute, second, then a u32 fraction.
+        var b = DbProxyHandlers.EncodeDbDateTime(new DateTime(2026, 9, 13, 5, 51, 45, DateTimeKind.Utc));
+        Hex.Eq(b, Hex.B("EA 07 09 00  0D 00 05 00  33 00 2D 00  00 00 00 00"),
+            "2026-09-13 05:51:45 encodes exactly as the capture has it");
+        Hex.True(b.Length == 16, "16 bytes");
     }
 
     /// <summary>Walks up from the test binary looking for a repo-relative file; null if not found.</summary>

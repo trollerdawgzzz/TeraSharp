@@ -1,139 +1,92 @@
-# TeraSharp — Status (2026-09-13)
+# TeraSharp — Status
 
-Read `status/HANDOFF.md` first if you are new — especially section 1 (DLMItems). Workspace rules
-are at the top of `CLAUDE.md`.
+Mirrors `CLAUDE.md` section 0. When the two disagree, **CLAUDE.md wins** and this file is stale.
+Day-by-day state, live-debug recipes and the deploy loop are in `status/CHAT-HANDOFF.md`.
 
-Build: `dotnet build TeraSharp.sln` -> 0 warnings, 0 errors.
-Tests: `dotnet run --project src/TeraSharp.Arbiter.Tests` -> **149** (134 before the T2/T3/T4/T5
-branches, +15 from them). Re-run to confirm the count after merging.
+Read order for anyone new: `CLAUDE.md` (workspace rules at the top) -> `status/HANDOFF.md` §1
+(DLMItems — the single failure mode behind every relog hang) -> `status/PERSISTENCE-MAP.md`
+(every per-user W->A opcode and how it is answered) -> this file.
 
----
-
-## 0. State of play — logout/relog is FIXED
-
-**Live-verified 2026-09-13, 21:13 and 21:46 runs.** Logout button -> countdown -> char select ->
-select again -> spawn where you logged out. The full chain runs:
-
-```
-0x13AA -> 0x27FA -> 0x2924 -> 0x2768 -> 0x2936 -> 0x27CB (blob saved) -> 0x1393 -> 0x1433
-```
-
-No `forcing delete`, no World crash, relog spawns at the logout position.
-
-**The root cause of every "hangs on relog / Critical Error LeaveWorld" was one thing:** a per-user
-WorldServer **DLMItem head-block** (`status/HANDOFF.md` section 1). World serialises every per-user
-DB message; one `DBS_*` reply that carries a stale or captured DLM id — or never arrives — silently
-blocks every later item for that user, including `UserLeaveWorld`, which is the only thing that
-emits `SA_LEAVE_WORLD`. The 5 s fallback then fakes the lobby return and the next `C_SELECT_USER`
-stalls at `0x1626` because World still holds the character.
-
-It was never a logout bug, never a leave-reason bug, and never a missing trigger. **Any new
-`no replay for 0xNNNN` on a per-user opcode is the next wedge waiting to happen.**
-
-### Two facts that used to be wrong in these notes
-
-- `AS_LEAVE_WORLD` (0x1392) = `[u64 gameId][u32 leaveWorldType][u32 logoutReason][u32 playerId]`.
-  Lobby return is **(3,0)**, disconnect is (1,0) — both from `lobby_tap.log`; the older
-  `arb_world.log` disconnect used (1,8). The type/reason are only read once `UserLeaveWorld`
-  reaches the head of the DLM queue, so they were never the blocker.
-- Respawn position is **done**. `WorldEntry.BuildEnterWorldPayload` now sends `param_9 = 0xFFFFFFFF`
-  (payload[52]) and takes x/y/z from blob offset 220 when a blob exists, so World restores from the
-  blob. Live-verified: logout save == relog enter-world == first save after respawn.
+Build: `dotnet build TeraSharp.sln` — 0 warnings, 0 errors.
+Tests: `dotnet run --project src\TeraSharp.Arbiter.Tests` — **324**.
 
 ---
 
-## 1. What is REAL (not replayed)
+## Status by area
 
-All in `World/DbProxyHandlers.cs`, all echoing the **live** DLM id from the request, each verified
-against `D:\packetlogs\lobby_tap.log` bytes or the decompiled writer. The `TryHandle` allow-list
-(the FIRST switch) is the source of truth for this list — anything not in it falls through to the
-replay table.
+| Area | Status |
+|---|---|
+| Client crypto / codec / login / char list / select / create / delete | real |
+| Chat, client settings (persisted), social lists | real |
+| World handshake, 0x147D promotion records (live timestamps), 0x1581 burst, post-handshake config burst | real |
+| Enter-world, blob save/load, restriction, gameId per login | real, live-verified |
+| Per-user DB writes during play (T15), quests (T17), inventory (T20), skills in blob (T18) | real |
+| Zone change / quest teleport (0x13BE/0x13C0 echoes) | real, live-verified |
+| Relog into an instance (0x138D -> retry at the stored return point) | implemented (T21), **live test pending** |
+| Achievements, tutorial tips, seren guide, dungeon history — rebuilt from rows | real (T22) |
+| Reputation (0x2890), fatigability (0x2909) — rebuilt from rows | real (T26), pinned from the decompile |
+| Dungeon cool times (0x13B6 write, 0x2868 load, 0x148D pushes) | real (T25) |
+| Multiple players | blocked on a two-login capture |
+| Account auth | accept-all |
 
-| Opcode | Name | Reply | Note |
-|---|---|---|---|
-| 0x2711 | `SDB_USER_ENTERWORLD` | 0x2738 + **0x2830** | world blob from SQLite; `DBS_USER_RESTRICTION` follows it (T3) |
-| 0x27CB | `SDB_UPDATE_USER_DATA` | 0x27CC | the periodic + logout blob save |
-| 0x272C | `SDB_LOAD_QUEST_LIST` | 0x272D | **empty** 159 B form, so World takes the seed branch |
-| 0x2899 | `SDB_UPDATE_DAILY_QUEST_SEED` | 0x289A | fires 17x at enter-world; absent from `arb_world.log` |
-| 0x2897 | `SDB_UPDATE_DAILY_QUEST_COMPLETE_COUNT` | 0x2898 | |
-| 0x2910 | `SDB_UPDATE_FATIGABILITY_POINT` | 0x2911 | |
-| 0x290C | `SDB_INIT_LOSS_LOGINTIME_REVISION_SECOND` | 0x290D | also pushes 0x15B1, 0x2847, 0x1440, 0x143E |
-| 0x27B9 | `SDB_USER_LOAD_EP_PERK` | 0x27BA | |
-| 0x2869 | `SDB_LOAD_DUNGEON_PHASE_LEVEL` | **0x15E0** + 0x286A | T4 — both carry the same live reset time |
-| 0x2736 | `SDB_END_START_QUEST_LIST` | 0x2737 | post-spawn |
-| 0x2930 | `SDB_UPDATE_HOLD_CHARACTER_STATUS` | 0x2931 | post-spawn |
-| 0x27B3 | `SDB_UPDATE_DAILY_LIMIT_EP_EXP` | 0x27B4 | post-spawn |
-| 0x1562 | `SA_CLEAR_BATTLE_FIELD_ENTER_COUNT` | 0x1563 | daily reset, can fire mid-session |
-| 0x27FA | `SDB_UPDATE_USER_ACHIEVEMENT` | 0x27FB | logout save |
-| 0x2924 | `SDB_UPDATE_PASSIVITY_COOLTIME` | 0x2925 | logout save |
-| 0x2768 | `SDB_ITEM_SINGLE` | 0x2769 | logout save |
-| 0x2936 | `SDB_CHECK_DAILY_ATTENDANCE` | 0x2937 | logout save |
+## Where the truth lives
 
-Names are from the opcode switch in `WorldServer.exe.c` (see `data/dbproxy_opcodes.txt`, T2). Several
-C# constants in `DbProxyHandlers` still carry older guessed names (`SDB_LOAD_FRIEND_INFO` for 0x2910,
-`SDB_LOAD_WORLD_EVENT` for 0x27B3, `SDB_LOAD_2930`, `SDB_LOAD_290C`) — the table above is correct.
+| Question | File |
+|---|---|
+| Why a relog hangs | `status/HANDOFF.md` §1 |
+| Is opcode 0xNNNN answered, and how | `status/PERSISTENCE-MAP.md` (a test parses this table) |
+| Quest list / quest writes | `status/QUEST-DESIGN.md` |
+| Inventory and the 536-byte item record | `status/INVENTORY-DESIGN.md` |
+| Level-1 skills, and where they live in the blob | `status/SKILLS.md` |
+| Client option blobs | `status/CLIENT-SETTINGS.md` |
+| Enter-world failure and the fallback retry | `status/ENTER-WORLD-FALLBACK.md` |
+| The per-character login loads, and the two that resisted | `status/ACHIEVEMENTS.md` |
+| Reputation and fatigability, and why the captures alone could not pin them | `status/REPUTATION-FATIGABILITY.md` |
+| Dungeon cool times and entry counts | `status/DUNGEON-COOLTIME.md` |
+| Everything else in the 2026-09-13 relog capture | `status/RELOG-CAPTURE-NOTES.md` |
 
-`World/WorldReplayTable.cs` also now refuses to make a request entry out of any one-way World
-opcode (`OneWayFromWorld`, T5), which kills the `no replay for` noise and the mis-attribution that
-caused the 0x143F -> 0x290D wedge.
+## The three rules that cost the most to learn
 
-### Still replayed, and fine
+1. **Never send a `DBS_*` reply World did not ask for.** Every `DBS_` carries a DLM id World looks
+   up; an unsolicited one completes whichever item currently holds that id.
+2. **Every per-user W->A request must be answered** — allow-listed in
+   `DbProxyHandlers.IsHandledRequest`, or in `WorldReplayTable.OneWayFromWorld`, or with a replay
+   entry. `no replay for 0xNNNN` right before silence is the tell.
+3. **Captured per-character data must never be served to another character.** Quests, inventory,
+   the world blob, skills and the T22 loads each bit us as "every new character got dob's X".
+   playerId 1 (dob) is the one character that still gets the captures, on purpose —
+   `DbProxyHandlers.ServesCapturedStatics` is the single place that decides it.
 
-- **World startup handshake** — static config, never varies.
-- **Client settings blobs** — client defaults.
-- **~30 login-time `SDB_*` whose reply carries no live id.** Convert one to a real handler only if
-  it wedges. **Do not** replace a data-bearing replayed reply with a synthetic empty one:
-  `SDB_USER_LOAD_INVENTORY` (0x27A2) returns a 3235-byte item list, and a past session desynced
-  World by emptying it.
-- `AS_ENTER_WORLD` (0x138E) is built for real by `WorldEntry`, but from a captured template with
-  gameId, tunnelKey and position patched in.
+Two guards enforce this and both fail the build:
+`Every_per_user_request_opcode_is_answered` (from PERSISTENCE-MAP.md) and
+`Dispatch_switch_and_the_allow_list_agree` (T24 — a dispatch case that is in neither
+`IsHandledRequest` nor `DispatchOnlyForTests` is dead code, which is how four per-character loads
+went on replaying dob's bytes until T22).
 
----
+## Scope — who may edit what
 
-## 2. Human TODO (human-owned files — Cowork cannot touch these)
+From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and cannot run git.
 
-1. **`Network/GameSession.cs`: raise the `SA_LEAVE_WORLD` fallback from 5 s to 15 s and log loudly.**
-   The real countdown between the final `0x14FF` and `0x1392` is ~10 s and the save chain takes
-   ~80 ms once it runs, so 5 s will mask real failures as "forcing delete".
-2. **`Handlers/WorldEntry.cs`: gameId and tunnelKey should increment per login.** A byte-diff of the
-   two `AS_ENTER_WORLD` frames in `lobby_tap.log` (both 183-byte payloads) shows the real Arbiter
-   varies exactly these between login #1 and the relog:
-   `payload[80]` tunnelKey `0 -> 1` (we pin 5); `payload[84..91]` gameId `...0001 -> ...0002`
-   (we reuse `...0001`). Both look like per-session counters.
-3. **`Program.cs`: log level back from `Trace` to `Debug`.**
-4. Optional, one line: `World/WorldBridge.cs` line ~337 logs `W->A #{Id} 0x{Op:X4}`. Swapping the
-   opcode for `DbProxyOpcodeNames.Describe(op)` names every DB-proxy opcode in the log.
+- **Cowork may edit:** `World/DbProxyHandlers.cs`, `World/DbProxyStaticData.cs`,
+  `World/WorldReplayTable.cs`, `Persistence/CharacterStore.cs`, `Handlers/CharacterHandlers.cs`,
+  `Handlers/SocialHandlers.cs`, `Handlers/ChatHandlers.cs`, `Protocol/*`,
+  `src/TeraSharp.Arbiter.Tests/`, `status/*.md`, `data/*`.
+- **Human-owned — describe the change, never edit:** `World/WorldBridge.cs`, `Network/*`,
+  `Handlers/WorldEntry.cs`, `Handlers/HandlerRegistry.cs`, `Handlers/LoginHandlers.cs`,
+  `Program.cs`.
 
-Done and no longer open: (3a) the replay id echo now passes the live payload; (3b) `LeaveValues`
-lobby returns (3,0); (3c) `DBS_USER_RESTRICTION` (0x2830) is sent after `DBS_USER_ENTERWORLD`.
+## Open
 
----
-
-## 3. Also true, lower priority
-
-- `BuildDbs2937` hardcodes `ok = 0`. That byte-matches the logout capture but not the login one
-  (`2f 00 00 00 01 03 ...` = ok 1), so World runs `DBCheckDailyAttendance::OnFail` every login.
-  Harmless today; make it explicit when someone models daily attendance.
-- `0x147D` is answered with `0x1484`, not the `0x147E x23 + 0x1480` the older notes describe.
-- The real Arbiter sends `0x15E0` only when a dungeon-phase reset actually fires. We keep no phase
-  state, so we send it on every `0x2869` — harmless (World just restamps the reset time) but not
-  byte-identical on a second login the same day.
-- Multi-player tunnel routing is single-player fast-path only (`WorldBridge.HandleFrame` ignores the
-  routing key when exactly one session is registered). Needs a real two-login capture.
-- Character creation (T8), real account auth via `tera-api`, guild/party/friends/mail: not started.
-
----
-
-## 4. Testing and tooling
-
-- **Always restart WorldServer before a live test.** A wedged DLM queue from the previous run makes
-  a correct fix look broken.
-- Log lines to grep after a run: `no replay for 0x` (a per-user opcode here is a future wedge),
-  `forcing delete` (the leave never completed), `blob pos`, `0x1393`.
-- `arbiter-world-tap.js` taps Arbiter<->World (plaintext); `tera-server-proxy` (or a decrypted dump
-  inside `GameSession`) taps client<->server. All 4548 client `.def` files are on disk, so any
-  client packet decodes by name. See `status/HANDOFF.md` section 5.
-- Both captures are TCP chunks — reframe by u32 length; a chunk can hold several frames and a frame
-  can span chunks. `lobby_tap.log` (login + working logout + relog + second leave) is newer and much
-  more complete than `arb_world.log` — but note the **replay table is loaded from `arb_world.log`**,
-  so an opcode present only in `lobby_tap.log` has no replay entry at all.
+- Live test of the relog-into-instance fallback (T21).
+- The trailing u32 of the fatigability element (630 / 1626 / 88 in the captures) is sent as 0;
+  nothing explains it and World never reads it (`status/REPUTATION-FATIGABILITY.md` §2.3).
+- Continent fallback table for a character with no stored return point
+  (`status/ENTER-WORLD-FALLBACK.md` §9).
+- `DBS_LOAD_DUNGEON_COOL_TIME` lists 1 and 2 (clear counts, UI history): stored but not served,
+  layouts unobserved (`status/DUNGEON-COOLTIME.md` §3).
+- `C_DUNGEON_COOL_TIME_LIST` reply: needs a client capture and a registry entry
+  (`status/DUNGEON-COOLTIME.md` §5).
+- Exit countdown: `S_PREPARE_EXIT` is not in the def registry (human-owned).
+- Two-login capture -> multi-player tunnel routing.
+- `status/*.txt` (15 decompile scratch files) should be deleted; Cowork has no delete tool
+  in this session, so the human runs the `git rm` in the T24 report.
