@@ -4923,20 +4923,24 @@ array items
     [Test]
     public static void ClientSettings_default_body_is_the_captured_one_and_frames_byte_exact()
     {
-        // The default TeraSharp has always served IS the capture: framing it must give back
-        // lobby_proxy.log packet 268 to the byte.
+        // The captured blob (lobby_proxy.log packet 268) is kept as a reference; framing it must
+        // give back that packet to the byte. The live DEFAULT for a never-saved character is now
+        // the empty form (parity with the real Arbiter, live-motivated 2026-09-14).
         var cap = LoadClientSettingsCaptureOrSkip();
         if (cap == null) return;
 
         var frame = ClientFrame(ClientSettingsHandlers.OpSLoadClientUserSetting,
-                          ClientSettingsHandlers.DefaultUserSettingBody());
+                          ClientSettingsHandlers.CapturedUserSettingBody());
         Hex.Eq(frame, cap[100268], "the captured default must frame to the captured S_LOAD packet");
 
         // ...and it must be a copy, or a caller could scribble on the shared template.
-        var a = ClientSettingsHandlers.DefaultUserSettingBody();
+        var a = ClientSettingsHandlers.CapturedUserSettingBody();
         a[4] ^= 0xFF;
-        Hex.Eq(ClientSettingsHandlers.DefaultUserSettingBody(), FrameBody(cap[100268]),
-            "DefaultUserSettingBody must hand out a fresh copy each time");
+        Hex.Eq(ClientSettingsHandlers.CapturedUserSettingBody(), FrameBody(cap[100268]),
+            "CapturedUserSettingBody must hand out a fresh copy each time");
+
+        Hex.Eq(ClientSettingsHandlers.DefaultUserSettingBody(), ClientSettingsHandlers.EmptySettingBody(),
+            "a never-saved character gets the empty form, as the real Arbiter sends");
     }
 
     [Test]

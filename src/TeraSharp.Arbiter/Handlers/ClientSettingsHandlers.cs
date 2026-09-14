@@ -166,18 +166,19 @@ public static class ClientSettingsHandlers
     }
 
     /// <summary>
-    /// The captured default: the body TeraSharp has always sent for S_LOAD_CLIENT_USER_SETTING,
-    /// served to any character that has never saved. It is one real character's settings
-    /// (lobby_proxy.log packet 268 = the blob "Test" itself saved at cap packet 350 — the two are
-    /// byte-identical, so it is simply what a client saves once it has drawn its default UI).
+    /// What S_LOAD_CLIENT_USER_SETTING carries for a character that has never saved: the EMPTY
+    /// form, exactly like the real Arbiter (cap_newchar_client.log packet 309). The client then
+    /// builds its own class-appropriate defaults - hotbar, tooltips, window layout.
     ///
-    /// <para>NOTE: the real Arbiter would send <see cref="EmptySettingBody"/> here instead — see
-    /// the block comment above. We keep the captured default because HandlerRegistry's in-world
-    /// branch relies on this packet to get the chat window processing S_CHAT, and that is
-    /// live-verified behaviour nobody wants to disturb on a hunch. Switching to parity is one
-    /// line: return EmptySettingBody(). status/CLIENT-SETTINGS.md has the argument.</para>
+    /// <para>Until 2026-09-14 this returned <see cref="CapturedUserSettingBody"/> (one real
+    /// character's saved UI, a valkyrie's). Live result: a new warrior spawned with the
+    /// valkyrie's hotbar (empty for him) and item tooltips off. The chat window does NOT depend on
+    /// the blob's content, only on the packet arriving after C_LOAD_TOPO_FIN, which is unchanged.</para>
     /// </summary>
-    public static byte[] DefaultUserSettingBody() => (byte[])UserSetting.Clone();
+    public static byte[] DefaultUserSettingBody() => EmptySettingBody();
+
+    /// <summary>The old captured default (lobby_proxy.log packet 268), kept for tests and reference only.</summary>
+    public static byte[] CapturedUserSettingBody() => (byte[])UserSetting.Clone();
 
     /// <summary>
     /// The default for S_LOAD_CLIENT_ACCOUNT_SETTING: EMPTY. Unlike the user one there is no
