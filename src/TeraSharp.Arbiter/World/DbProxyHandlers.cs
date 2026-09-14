@@ -943,6 +943,9 @@ public sealed class DbProxyHandlers
             // --- T23: city-war result. Not a DLM item (no reqId), but the reply echoes two
             // u32s out of the live request, so a replayed 0x295D would carry captured ones. ---
             case SDB_RESULT_CITY_WAR:             // 0x15ED + 0x295D, both echoing request+16/+20
+            // --- T33: World's dungeon-timeline broadcast. Not a DLM item and usually empty;
+            // the non-empty form is echoed back one 0x1581 per record. ---
+            case DSA_DUNGEON_TIMELINE_OPEN_INFO:  // 0x13F2 -> N x 0x1581
                 return true;
             default:
                 return false;        // -> replay table
@@ -986,6 +989,9 @@ public sealed class DbProxyHandlers
 
             // --- T23 ---
             case SDB_RESULT_CITY_WAR:               return OnResultCityWar(link, payload);
+
+            // --- T33 ---
+            case DSA_DUNGEON_TIMELINE_OPEN_INFO:    return OnDungeonTimelineOpenInfo(link, payload);
 
             // --- Post-spawn (reqId at payload[0] for all three) ---
             case SDB_END_START_QUEST_LIST: link.SendFrame(DBS_END_START_QUEST_LIST, BuildReqIdAck(payload, 0)); return true;
@@ -3037,14 +3043,42 @@ public sealed class DbProxyHandlers
         yield return Path.Combine(root, "TeraSharp", "data", name);
     }
 
-    // ---- Post-handshake burst (cap_newchar.log seq 112-113, lobby_tap.log 107-113) ----
-    // 1 s after the handshake completes (0x2955/0x2952), before any player, the real Arbiter sends
-    // ~100 x 0x1581 [u32 dungeonId][u32 1][u32 0][u8 0]. World's DungeonManager logs "<id> open"
-    // for each. Without it a FIRST enter-world into a fresh World process (zone 5 character, i.e.
-    // any new character) is silently dropped after DBS_USER_ENTERWORLD and World later crashes;
-    // after one successful login (dob, zone 7005) later enters proceed. Before T5 these pushes were
-    // replayed by accident (attributed to 0x15A8); T5 correctly sealed 0x15A8 and they vanished.
-    // Opcode name unverified (0x1581 is not in world_opcodes.txt as of 2026-09-14).
+    // ---- AS_DUNGEON_TIMELINE_ON_OFF (0x1581) and where the 98 ids really come from ----
+    //
+    // 1 s after the handshake completes (0x2955/0x2952), before any player, the real Arbiter
+    // sends 98 x 0x1581. Without them a FIRST enter-world into a fresh World process (zone 5
+    // character, i.e. any new character) is silently dropped after DBS_USER_ENTERWORLD and World
+    // later crashes; after one successful login (dob, zone 7005) later enters proceed. Before T5
+    // these pushes were replayed by accident (attributed to 0x15A8); T5 correctly sealed 0x15A8
+    // and they vanished.
+    //
+    // T29/T33 corrected two things about them.
+    //
+    // (1) THE PAYLOAD SHAPE. Writer FUN_1407ace90 (Arb_part_066.c:17289) is
+    //         FUN_140350eb0(pkt, 0x1581); FUN_14013d0b0(u32); FUN_1403513d0(u8); FUN_140351270(u64);
+    //     and the dumper (Arb_part_011.c:10058) names the fields DungeonId @frame+6, IsOn
+    //     @frame+10, NextChange @frame+0x0B. So the 13-byte payload is
+    //         [u32 DungeonId][u8 IsOn][u64 NextChange]
+    //     not the [u32 id][u32 1][u32 0][u8 0] this used to write. The bytes are identical while
+    //     IsOn = 1 and NextChange = 0 (the whole of both captures), which is why nothing ever
+    //     caught it - but a non-zero NextChange would have gone out as garbage.
+    //
+    // (2) THE LIST IS NOT OURS TO CHOOSE. The real Arbiter does not decide these 98 ids: it
+    //     ECHOES them, one 0x1581 per record, out of the DSA_DUNGEON_TIMELINE_OPEN_INFO (0x13F2)
+    //     frame World sends moments earlier. lobby_tap.log [122] -> [123..124] and
+    //     cap_newchar.log [111] -> [112..113]: same 98 ids, same order, every record CurrOpen=1.
+    //     Handler_DSA_DUNGEON_TIMELINE_OPEN_INFO (Arb_part_062.c:332) is a pure fan-out into
+    //     DungeonManager::SetDungeonTimelineOpen (FUN_140786fd0, Arb_part_065.c:13433).
+    //     status/HANDSHAKE-DATA.md section 0 has the evidence.
+    //
+    // PostHandshakeDungeonIds is therefore a FALLBACK, not the mechanism. It still goes out from
+    // OnWorldReady because it is live-verified to unblock that first enter-world, and because
+    // 0x1581 is an idempotent state push - World is told "dungeon X is on until T", so the echo
+    // that follows simply restates it with World's own values. Set
+    // SendPostHandshakeDungeonBurst = false once a live run shows "echoed N dungeon-timeline
+    // states" in the log; after that the echo is the only source and the ids are World's, not a
+    // 2026-09-13 capture's. status/HANDSHAKE-DATA.md section 2 also shows the list is exactly
+    // reproducible from the datasheets (HandshakeData.LoadDungeonTimelineIds).
     public const ushort AS_DUNGEON_OPEN_1581 = 0x1581;
     public static readonly uint[] PostHandshakeDungeonIds =
     {
@@ -3062,12 +3096,107 @@ public sealed class DbProxyHandlers
         0x2666, 0x2669,
     };
 
-    public static byte[] Build1581(uint dungeonId)
+    /// <summary>
+    /// AS_DUNGEON_TIMELINE_ON_OFF (0x1581): [u32 DungeonId][u8 IsOn][u64 NextChange] - 13 bytes.
+    /// Writer FUN_1407ace90 (Arb_part_066.c:17289); field names from the dumper at
+    /// Arb_part_011.c:10058. The defaults reproduce the captured bytes exactly
+    /// (34 08 00 00 01 00 00 00 00 00 00 00 00 for dungeon 0x834).
+    /// </summary>
+    public static byte[] Build1581(uint dungeonId, bool isOn = true, ulong nextChange = 0)
     {
         var p = new byte[13];
         BitConverter.GetBytes(dungeonId).CopyTo(p, 0);
-        BitConverter.GetBytes(1u).CopyTo(p, 4);
+        p[4] = (byte)(isOn ? 1 : 0);
+        BitConverter.GetBytes(nextChange).CopyTo(p, 5);
         return p;
+    }
+
+    // ---- DSA_DUNGEON_TIMELINE_OPEN_INFO (0x13F2) -> N x AS_DUNGEON_TIMELINE_ON_OFF (0x1581) ----
+    //
+    // Layout, from the dumper at Arb_part_016.c:2781 (L"OpenInfo", L"DungeonId", L"CurrOpen",
+    // L"NextChange", L"SendSystemMessage") and the handler's own bounds check
+    // `(longlong)iVar2 + 0x16U <= (ulonglong)(longlong)*piVar9`:
+    //
+    //   payload [0] u32 count   [4] u32 listOffset (FRAME-relative, 14)
+    //   then count x 0x16-byte nodes:
+    //     [+0] u32 self  [+4] u32 next  [+8] u32 DungeonId  [+12] u8 CurrOpen
+    //     [+13] i64 NextChange  [+21] u8 SendSystemMessage
+    //
+    // Almost every 0x13F2 is the EMPTY form - an 8-byte payload, count 0 - which is why the
+    // whole opcode has been treated as a heartbeat (WorldBridge.OpHeartbeat14). Across the four
+    // captures: 909 empty frames and exactly two non-empty ones, both carrying 98 records.
+    // 0x13F2 stays in WorldReplayTable.OneWayFromWorld - it must never become a request entry -
+    // and is handled here instead.
+    public const ushort DSA_DUNGEON_TIMELINE_OPEN_INFO = 0x13F2;
+    public const int TimelineNodeSize = 0x16;
+    public const int TimelineNodeDungeonId = 8;
+    public const int TimelineNodeCurrOpen = 12;
+    public const int TimelineNodeNextChange = 13;
+    /// <summary>Sanity cap on the record count; the real list is the ~200 DungeonData sheets.</summary>
+    public const int MaxTimelineNodes = 4096;
+
+    /// <summary>
+    /// True once World has sent a non-empty 0x13F2 on this process and we echoed it. Purely
+    /// diagnostic: it is what tells the human the echo path is live and the fallback burst can
+    /// be switched off. The echo always arrives AFTER OnWorldReady in every capture, so it can
+    /// never suppress a burst that has already gone out.
+    /// </summary>
+    public bool TimelineEchoed { get; private set; }
+
+    /// <summary>
+    /// Set false to stop OnWorldReady sending the captured 98-id fallback and rely on the echo
+    /// alone - which is what the real Arbiter does. Left true until a live run confirms the echo
+    /// fires, because the fallback is the live-verified fix for a first enter-world into a fresh
+    /// World process.
+    /// </summary>
+    public static bool SendPostHandshakeDungeonBurst = true;
+
+    /// <summary>Every (dungeonId, isOn, nextChange) in a 0x13F2 list, or null if malformed.
+    /// An empty list parses to an empty array - that is the heartbeat form, not an error.</summary>
+    public static List<(uint dungeonId, bool isOn, ulong nextChange)>? ParseTimelineOpenInfo(byte[] payload)
+    {
+        if (payload == null || payload.Length < 8) return null;
+        int count = (int)BitConverter.ToUInt32(payload, 0);
+        int start = (int)BitConverter.ToUInt32(payload, 4) - 6;      // frame-relative -> payload
+        var outp = new List<(uint, bool, ulong)>(Math.Max(0, Math.Min(count, 256)));
+        if (count == 0) return outp;
+        if (count < 0 || count > MaxTimelineNodes || start < 0 ||
+            (long)start + (long)count * TimelineNodeSize > payload.Length) return null;
+        for (int i = 0; i < count; i++)
+        {
+            int o = start + i * TimelineNodeSize;
+            outp.Add((BitConverter.ToUInt32(payload, o + TimelineNodeDungeonId),
+                      payload[o + TimelineNodeCurrOpen] != 0,
+                      BitConverter.ToUInt64(payload, o + TimelineNodeNextChange)));
+        }
+        return outp;
+    }
+
+    /// <summary>The 0x1581 frames a 0x13F2 payload should produce, in order.</summary>
+    public static List<byte[]>? BuildTimelineEcho(byte[] payload)
+    {
+        var nodes = ParseTimelineOpenInfo(payload);
+        if (nodes == null) return null;
+        var frames = new List<byte[]>(nodes.Count);
+        foreach (var (id, isOn, next) in nodes) frames.Add(Build1581(id, isOn, next));
+        return frames;
+    }
+
+    private bool OnDungeonTimelineOpenInfo(WorldLink link, byte[] payload)
+    {
+        var frames = BuildTimelineEcho(payload);
+        if (frames == null)
+        {
+            _log.LogWarning("0x13F2: malformed open-info list ({Len}-byte payload) - not echoed", payload.Length);
+            return true;                       // handled: never fall through to the replay table
+        }
+        if (frames.Count == 0) return true;    // the heartbeat form
+        foreach (var f in frames) link.SendFrame(AS_DUNGEON_OPEN_1581, f);
+        TimelineEchoed = true;
+        _log.LogInformation(
+            "0x13F2: echoed {N} dungeon-timeline states back as 0x1581 (fallback burst {Burst})",
+            frames.Count, SendPostHandshakeDungeonBurst ? "also sent - see HANDSHAKE-DATA.md section 6a" : "disabled");
+        return true;
     }
 
     // ---- Post-handshake config burst (T23) ----
@@ -3227,9 +3356,17 @@ public sealed class DbProxyHandlers
                 burst.Count, now.UtcDateTime, DateTimeOffset.FromUnixTimeSeconds((long)reset).UtcDateTime);
         }
 
+        // The FALLBACK, not the mechanism - the real Arbiter only ever echoes World's 0x13F2.
+        // See the comment on PostHandshakeDungeonIds and status/HANDSHAKE-DATA.md section 0.
+        if (!SendPostHandshakeDungeonBurst)
+        {
+            _log.LogInformation("Post-handshake: 0x1581 fallback burst disabled - waiting for World's 0x13F2 echo");
+            return;
+        }
         foreach (var id in PostHandshakeDungeonIds)
             link.SendFrame(AS_DUNGEON_OPEN_1581, Build1581(id));
-        _log.LogInformation("Post-handshake: sent {N} x 0x1581 dungeon-open pushes", PostHandshakeDungeonIds.Length);
+        _log.LogInformation("Post-handshake: sent {N} x 0x1581 dungeon-open pushes (fallback; World's 0x13F2 echo supersedes them)",
+            PostHandshakeDungeonIds.Length);
     }
 
     // ---- SDB_RESULT_CITY_WAR (0x295C) -> 0x15ED + DBS_RESULT_CITY_WAR (0x295D), T23 ----
