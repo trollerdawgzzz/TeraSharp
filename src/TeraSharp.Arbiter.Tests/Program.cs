@@ -2141,6 +2141,8 @@ array items
             0x2927, 0x1491, 0x156F, 0x13C5, 0x13C6, 0x1499, 0x15FA,   // 0x13B6 became a handler in T25
             // T23: Handler_SA_REWARD_CITYWAR_KILL_DEATH_COUNT has no SendToSession.
             0x15F9,
+            // T42: SDB_MOVE_WAREHOUSE_ITEM is a ten-line stub in the real Arbiter that sends nothing.
+            0x2754,
         };
         foreach (var op in expected)
             Hex.True(WorldReplayTable.OneWayFromWorld.Contains(op),
@@ -11432,7 +11434,7 @@ some prose with `backticks` that is not a table row
         {
             using var store = new TeraSharp.Arbiter.Persistence.CharacterStore(
                 Path.Combine(dir, "del.db"), QuietLog());
-            int account = store.GetOrCreateAccount("t44");
+            var account = store.GetOrCreateAccount("t44");
             store.UpsertItem(11, 42, BagItems.Pocket, 0, 6550, 20);
             store.UpsertItem(1001, 42, WarehouseHandlers.InvenCharacterWarehouse, 0, 6560, 1);
 
@@ -11441,7 +11443,7 @@ some prose with `backticks` that is not a table row
             Hex.True(store.GetItems(42, WarehouseHandlers.InvenCharacterWarehouse).Count == 0,
                      "and so does the character bank - item ids never repeat, so an orphan would "
                      + "surface under whoever gets that id next");
-            Hex.True(account > 0, "the account itself is untouched");
+            Hex.True(account.Id > 0, "the account itself is untouched");
         }
         finally { Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools(); Directory.Delete(dir, true); }
     }
