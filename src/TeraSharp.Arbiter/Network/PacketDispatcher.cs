@@ -39,6 +39,15 @@ public sealed class PacketDispatcher
 
         if (!_handlers.TryGetValue(opcode, out var reg))
         {
+            // T45: never forward a packet we know the Arbiter owns. World has no handler for any of
+            // them and prints "handler has not been implemented yet!!!", which reads as a World bug
+            // and hides ours. status/CLIENT-REJECTS.md.
+            if (Handlers.ArbiterClientHandlers.ArbiterOwned.Contains(opcode))
+            {
+                _log.LogError("{Opcode} (0x{Opcode:X4}) is Arbiter-owned and has no handler - dropped, NOT forwarded",
+                    opcode, opcode);
+                return;
+            }
             if (session.InWorld)
             {
                 session.ForwardToWorld(packet.ToArray());

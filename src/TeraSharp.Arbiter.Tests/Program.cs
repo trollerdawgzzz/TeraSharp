@@ -8777,7 +8777,7 @@ array    friends
         Hex.Eq(WriteByDef(reg, "S_FRIEND_GROUP_LIST", SocialHandlers.BuildFriendGroupListFields(store, 1)),
             "00 00 00 00", "no groups yet");
 
-        SocialHandlers.ProvideSampleGroup(store, 1);
+        SocialHandlers.ProvideSampleGroup(store, 1, TeraSharp.Arbiter.Auth.LoginLanguage.Twn);   // the capture is a TW server's strings (T45)
         Hex.Eq(WriteByDef(reg, "S_FRIEND_GROUP_LIST", SocialHandlers.BuildFriendGroupListFields(store, 1)),
             Cap305FriendGroups, "S_FRIEND_GROUP_LIST after the sample group (capture frame 305)");
     }
@@ -8786,7 +8786,7 @@ array    friends
     {
         using var store = StoreWithTwoAccounts();
         var reg = CreateT30Defs();
-        SocialHandlers.ProvideSampleGroup(store, 1);       // also seeds the profile message
+        SocialHandlers.ProvideSampleGroup(store, 1, TeraSharp.Arbiter.Auth.LoginLanguage.Twn);       // also seeds the profile message (TW strings = the capture)
         Hex.Eq(WriteByDef(reg, "S_FRIEND_LIST", SocialHandlers.BuildFriendListFields(store, 1)),
             Cap306FriendList, "S_FRIEND_LIST for a brand-new character (capture frame 306)");
     }
@@ -8803,9 +8803,9 @@ array    friends
     {
         // The two strings come from StrFriendDataSheet (ids 100 and 200), so they are only
         // knowable from the capture - and they are what makes frames 305/306 reproduce.
-        Hex.Eq(System.Text.Encoding.Unicode.GetBytes(SocialHandlers.SampleGroupName),
+        Hex.Eq(System.Text.Encoding.Unicode.GetBytes(SocialHandlers.SampleGroupNameTw),
             "7D 59 CB 53", "the sample group name is the capture's two code units");
-        Hex.Eq(System.Text.Encoding.Unicode.GetBytes(SocialHandlers.DefaultProfileMessage),
+        Hex.Eq(System.Text.Encoding.Unicode.GetBytes(SocialHandlers.DefaultProfileMessageTw),
             "CA 4E 29 59 5F 4E 2F 66 09 61 EB 5F 84 76 00 4E 29 59 21 00",
             "the default profile message is the capture's ten code units");
     }
@@ -12634,7 +12634,7 @@ some prose with `backticks` that is not a table row
     [Test] public static void Visit_new_section_reply_is_the_shipped_def()
     {
         var p = ArbiterClientHandlers.BuildVisitNewSection(true, 7005, 1, 3);
-        Hex.Eq(p, "11 00 23 5A  01  7D 1B 00 00  01 00 00 00  03 00 00 00",
+        Hex.Eq(p, "11 00 23 5A  01  5D 1B 00 00  01 00 00 00  03 00 00 00",
             "S_VISIT_NEW_SECTION: [bool isFirstVisit][u32 mapId][u32 guardId][u32 sectionId]");
         Hex.True(ArbiterClientHandlers.BuildVisitNewSection(false, 0, 0, 0)[4] == 0,
             "isFirstVisit is false on a revisit");

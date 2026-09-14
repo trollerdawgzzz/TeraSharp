@@ -74,9 +74,12 @@ public static class HandlerRegistry
             {
                 // Arbiter-owned: tell World the player finished loading (0x1439), triggers spawn.
                 // Real Arbiter sends AS_UPDATE_VISITED_SECTION_LIST (0x1439) before 0x1390/0x138F on every
-                // C_LOAD_TOPO_FIN (first spawn AND after a zone change): [u32 off=18][u32 bytes][u32 pid][entries].
-                // Empty list until visited sections are tracked (cap_newchar.log seq 638).
-                Program.World?.SendFrame(WorldBridge.OpUpdateVisitedSection, new byte[] { 18,0,0,0, 0,0,0,0, (byte)s.PlayerId, (byte)(s.PlayerId>>8), (byte)(s.PlayerId>>16), (byte)(s.PlayerId>>24) });
+                // C_LOAD_TOPO_FIN (first spawn AND after a zone change). T45: built from the visited_sections
+                // rows - the hard-coded empty list told World "nothing explored" on every relog.
+                Program.World?.SendFrame(WorldBridge.OpUpdateVisitedSection,
+                    ArbiterClientHandlers.BuildUpdateVisitedSectionList(s.PlayerId,
+                        Program.Store?.GetVisitedSections((int)s.SelectedCharacter!.Id)
+                            ?? Array.Empty<TeraSharp.Arbiter.Persistence.CharacterStore.VisitedSection>()));
                 Program.World?.NotifyTopoLoaded(s.PlayerId);
                 // Real Arbiter sends these to the client right after C_LOAD_TOPO_FIN (lobby_proxy.log
                 // 263-268), in this order. S_LOAD_CLIENT_USER_SETTING here is what makes the chat
@@ -136,7 +139,27 @@ public static class HandlerRegistry
         Reg("C_SAVE_CLIENT_CHAT_OPTION_SETTING", 0, ClientSettingsHandlers.OnSaveChatOption);
         Reg("C_SAVE_CLIENT_USER_SETTING", 0, ClientSettingsHandlers.OnSaveUserSetting);
         Reg("C_SAVE_CLIENT_ACCOUNT_SETTING", 0, ClientSettingsHandlers.OnSaveAccountSetting);
-        RegEmptyReply("C_SAVE_CLIENT_UI_SETTING", "S_SAVE_CLIENT_UI_SETTING", new Dictionary<string, object> { ["result"] = (byte)1 });
+
+        // --- T45: Arbiter-owned client packets World was rejecting (status/CLIENT-REJECTS.md).
+        //     Note the "- 4": PacketDispatcher compares BODY length; the *PacketSize constants are totals. ---
+        var misc = loggerFactory.CreateLogger("ArbiterClient");
+        Reg("C_SHOW_ITEM_TOOLTIP_EX", ArbiterClientHandlers.TooltipRequestBodySize,
+            (s, b) => ArbiterClientHandlers.OnShowItemTooltipEx(s, b, misc));
+        Reg("C_VISIT_NEW_SECTION", ArbiterClientHandlers.VisitPacketSize - 4,
+            (s, b) => ArbiterClientHandlers.OnVisitNewSection(s, b, misc));
+        Reg("C_CLIENT_LOG", 0, (s, b) => ArbiterClientHandlers.OnClientLog(s, b, misc));
+        Reg("C_SERVER_TIME", 0, (s, b) => ArbiterClientHandlers.OnServerTime(s, b, misc));
+        Reg("C_SAVE_CLIENT_UI_SETTING", 0, (s, b) => ArbiterClientHandlers.OnSaveClientUiSetting(s, b, misc));
+        Reg("C_TRADE_BROKER_HIGHEST_ITEM_LEVEL", 0,
+            (s, b) => ArbiterClientHandlers.OnTradeBrokerHighestItemLevel(s, b, misc));
+        foreach (var name in new[]
+        {
+            "C_REQUEST_PARTY_MATCH_INFO", "C_REQUEST_MY_PARTY_MATCH_INFO", "C_PARTY_MATCH_WINDOW_CLOSED",
+            "C_REQUEST_GUILD_LIST", "C_DUNGEON_COOL_TIME_LIST", "C_VIEW_BATTLE_FIELD_RESULT",
+            "C_REQUEST_CANDIDATE_LIST", "C_SHOW_AWESOMIUMWEB_SHOP", "C_RESET_ALL_DUNGEON",
+            "C_UPDATE_CONTENTS_PLAYTIME", "C_EVENT_GUIDE",
+        })
+            Reg(name, 0, (s, b) => ArbiterClientHandlers.OnAcceptSilently(s, b, misc));
 
         // --- Inventory window ---
         Reg("C_SHOW_ITEMLIST", 0, (s, body) =>
@@ -157,16 +180,7 @@ public static class HandlerRegistry
             ["unk1"] = (byte)1, ["unk2"] = -1, ["maxSlots"] = 3, ["unk3"] = 0, ["adventures"] = new List<object>(),
         });
 
-        // --- Server time ---
-        Reg("C_SERVER_TIME", 0, (s, body) =>
-        {
-            if (s.InWorld) { opcodes.TryGetCode("C_SERVER_TIME", out ushort op); Forward(s, op, body); return true; }
-            s.SendByDef("S_SERVER_TIME", new Dictionary<string, object>
-            {
-                ["serverTime"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-            });
-            return true;
-        });
+        // --- Server time: T45 ArbiterClientHandlers.OnServerTime (registered above) ---
 
         Reg("C_CHECK_ALIVE", 0, (s, body) => true);
 
@@ -220,22 +234,20 @@ public static class HandlerRegistry
         });
 
         // --- Telemetry / world packets: noop standalone, forward in-world ---
+        // (T45 moved C_TRADE_BROKER_HIGHEST_ITEM_LEVEL, C_UPDATE_CONTENTS_PLAYTIME, C_EVENT_GUIDE and
+        //  C_VISIT_NEW_SECTION to real Arbiter-side handlers above - they must NOT be forwarded.)
         RegNoop("C_SET_VISIBLE_RANGE");
         RegNoop("C_HARDWARE_INFO");
         RegNoop("C_CHANGE_USER_LOBBY_SLOT_ID");
         RegNoop("C_RQ_SKILL_POLISHING_LIST");
         RegNoop("C_RQ_SKILL_POLISHING_EXP_INFO");
-        RegNoop("C_TRADE_BROKER_HIGHEST_ITEM_LEVEL");
         RegNoop("C_REQUEST_INGAMESTORE_PRODUCT_LIST");
         RegNoop("C_REQUEST_GUILD_PERK_LIST");
         RegNoop("C_SET_SERVANT_SEQUENCE");
-        RegNoop("C_UPDATE_CONTENTS_PLAYTIME");
         RegNoop("C_PLAYER_LOCATION");
         RegNoop("C_PLAYER_FLYING_LOCATION");
         RegNoop("C_AVAILABLE_EVENT_MATCHING_LIST");
-        RegNoop("C_EVENT_GUIDE");
         RegNoop("C_GUARD_PK_POLICY");
-        RegNoop("C_VISIT_NEW_SECTION");
         RegNoop("C_SIMPLE_TIP_REPEAT_CHECK");
     }
 }

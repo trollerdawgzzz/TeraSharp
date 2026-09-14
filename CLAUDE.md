@@ -81,6 +81,11 @@ Cowork-editable files also include: `Auth/*`, `Handlers/GmCommands.cs`, `Protoco
 `World/PartyManager.cs`, `World/StarterInventory.cs`, `World/DbProxyStaticData.cs` (added 2026-09-14).
 
 ### Hard rules learned the expensive way (2026-09-14)
+- **Input hardening (from the real Arbiter's two known remote crashes, D:\arbiter_handoff_fixes.md):**
+  every packet-derived index is bounds-checked as UNSIGNED on both sides (the real C_CHECK_VERSION
+  crashed pre-auth on a negative module index); every paginated list checks `page*size < count`, not
+  just `>= 0` (the real C_VIEW_GUILD_WAR crashed on page 0 of an empty history) - applies to guild war
+  history, rankings, broker, parcels. And never hold a lock across blocking I/O.
 - **Commit in the worktree BEFORE merging, and verify the branch moved** (`git log --oneline -1` in the
   worktree must show the new commit). T20 (inventory persistence) was merged with nothing committed and
   the worktree was then removed - the work was lost and only noticed a day later. Never `git worktree
