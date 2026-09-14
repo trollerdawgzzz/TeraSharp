@@ -171,3 +171,50 @@ Arbiter decompile and has not been tested live. If the client still refuses the 
 other value to try.
 
 `TERASHARP_GM_ACCOUNTS=1` (or whatever account name you log in with) is what turns any of this on.
+
+---
+
+## 7. The forwarded frame, verified (T46)
+
+Before trying `/@teleport` and the rest of the 416 World commands, the frame `GmCommandHandlers.
+BuildWorldForward` builds was checked against the decompile. **It is byte-exact**; only two names
+were wrong.
+
+**0x2829 is `AS_ADMIN_COMMAND`**, not `AS_BYPASS_COMMAND` — that is the name in World's own opcode
+table (`WorldServer.exe.c:246833`). T32 named it after the Arbiter-side handler class that builds
+it. `GmCommandHandlers.AS_BYPASS_COMMAND` is kept as an alias.
+
+**Layout**, from the Arbiter's PDL dumper `FUN_14017bdf0` (`Arb_part_011.c:5334`), which names the
+fields and their frame offsets, with a `0x11 < len` guard:
+
+| frame | payload | type | name |
+|---|---|---|---|
+| 6 | 0 | u32 | `Command` — string offset, frame-relative, backpatched to 18 |
+| 10 | 4 | u32 | `UserDbId` — from `User+0x120` |
+| 0x0E | 8 | u32 | **`CommandType`** |
+| 0x12 | 12 | wchar[] | the command line, UTF-16LE, NUL-terminated |
+
+The third field is `CommandType`, not a "bypass mode", but T32's **value** is right and for the
+right reason: the writer fills it from the *handler object's* own constant
+(`lVar18 = param_1[0x24]`, `Arb_part_067.c:6898`), not from the client packet.
+`ArbiterBypassCommandHandler` is constructed twice, with 1 and 0
+(`Arb_part_033.c:13685`/`:13691`), and World commands live in the bucket that carries **1**. So
+`ForwardToWorld` ignoring its own `commandType` argument is correct, not an oversight.
+
+Cross-checked against the second writer (`Arb_part_040.c:8820`, the `clear_recipe_world` path),
+which emits the same four fields in the same order.
+
+**World's side.** `Handler_AS_ADMIN_COMMAND` (`WorldServer.exe.c:2977905`):
+
+1. drops the frame — and logs `Arbiter <-> World PDL Version Mismatch! Bye :(` — when the frame is
+   under `0x12`. Our shortest possible frame is 20 bytes (an empty line), so this can never fire;
+   `T46_admin_command_always_clears_the_world_handler_guard` pins it.
+2. looks the user up by the u32 at frame 10. **No user, no command, silently** — so the `UserDbId`
+   has to be the character id World knows, which is what `ForwardToWorld` sends.
+3. bounds-checks the string ref at frame 6 against the frame length.
+4. reads `CommandType` at frame `0x0E` and dispatches.
+
+It performs **no admin-level check of its own**, and World never tests the `AdminLevel` it stores
+from AS_ENTER_WORLD either (`status/ENTER-WORLD-FALLBACK.md` §5a). So nothing on the World side
+gates `/@`; what still has to be right for a live test is the client offering the `/@` channel at
+all — §6, `S_LOGIN_ARBITER.status`.

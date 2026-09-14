@@ -8,7 +8,7 @@ Read order for anyone new: `CLAUDE.md` (workspace rules at the top) -> `status/H
 (every per-user W->A opcode and how it is answered) -> this file.
 
 Build: `dotnet build TeraSharp.sln` — 0 warnings, 0 errors.
-Tests: `dotnet run --project src\TeraSharp.Arbiter.Tests` — **517**.
+Tests: `dotnet run --project src\TeraSharp.Arbiter.Tests` — **538**.
 Deploy check: `TeraSharp.Arbiter.exe --selftest` — one PASS/FAIL line per data dependency (T37).
 
 ---
@@ -116,7 +116,12 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   the `AS_*` block-list pushes (`status/MULTIPLAYER-DESIGN.md`).
 - Friend/blocked memos skip the Arbiter's banned-word + NetModerator stage (we have neither).
 - GM: the client only offers `/@` for a QA login (`S_LOGIN_ARBITER.status` 31/33) - LoginHandlers
-  still sends 0, so the one-line diff in `status/GM-DESIGN.md` §6 is untested live.
+  still sends 0, so the one-line diff in `status/GM-DESIGN.md` §6 is untested live. That is now
+  the ONLY thing between us and trying the 416 World commands: the 0x2829 frame is verified
+  byte-exact and World's handler does no admin check (`status/GM-DESIGN.md` §7).
+- World logs `AdminLevel[0]` for a GM because `WorldEntry` hard-codes AS_ENTER_WORLD payload
+  111. Three-line diff in `status/ENTER-WORLD-FALLBACK.md` §8d (WorldEntry is human-owned).
+  Cosmetic - World stores the level but never tests it (§5a).
 - Mail: World's six `SDB_*_PARCEL` requests are still unanswered, so the first mailbox a live
   player opens gives `no replay for 0x2777` and head-blocks that character
   (`status/MAIL-WAREHOUSE.md` §7). The client half and the `parcels` table are done (T42).

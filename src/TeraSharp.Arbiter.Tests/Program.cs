@@ -11469,6 +11469,116 @@ some prose with `backticks` that is not a table row
         finally { Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools(); Directory.Delete(dir, true); }
     }
 
+    // ======================================================================
+    // T46 — the AdminLevel World logs, and the forwarded /@ command frame.
+    //
+    // World was logging "SpawnComplete [...] AdminLevel[0]" for an account
+    // whose Arbiter-side level is 5. The field is AS_ENTER_WORLD payload 111,
+    // which WorldEntry hard-codes to 0. The chain, both halves from the
+    // decompile:
+    //   Arbiter  User+0x3b98 -> FUN_140360710 param_22 -> frame 0x75 = payload 111
+    //   World    FUN_140496c80 binds "adminLevel" -> User+0xA474 -> the log
+    // ======================================================================
+
+    [Test] public static void T46_admin_level_is_payload_111_inside_the_fixed_header()
+    {
+        // 0x75 - 6 = 111. The neighbours pin it: AccountRestrictionLevel is the u32 before
+        // (frame 0x71 = payload 107) and TutorialUser the u8 after (frame 0x79 = payload 115).
+        Hex.True(DbProxyHandlers.EnterWorldAdminLevelOffset == 111,
+                 $"AdminLevel is at payload 111, got {DbProxyHandlers.EnterWorldAdminLevelOffset}");
+        Hex.True(DbProxyHandlers.EnterWorldAdminLevelOffset + 4 == 115,
+                 "and it is a u32, so TutorialUser starts at 115");
+
+        // It must be in the fixed part of the frame, not in the trailing EtcData blob: the
+        // Arbiter's writer ends its fixed fields at frame 0xAD and the handler's guard is
+        // `0xac < len`, so payload 0..166 is fixed and 167..182 is EtcData.
+        Hex.True(DbProxyHandlers.EnterWorldAdminLevelOffset < 167,
+                 "AdminLevel is a fixed field, not part of EtcData");
+        Hex.True(DbProxyHandlers.EnterWorldPayloadSize == 183, "the payload is still 183 bytes");
+
+        // The other offsets in the same table, as a regression fence on the whole layout.
+        Hex.True(DbProxyHandlers.EnterWorldContinentIdOffset == 48
+                 && DbProxyHandlers.EnterWorldChannelInstanceIdOffset == 52
+                 && DbProxyHandlers.EnterWorldPositionOffset == 56
+                 && DbProxyHandlers.EnterWorldTicketOffset == 80
+                 && DbProxyHandlers.EnterWorldContinuousDungeonIdOffset == 157,
+                 "the rest of the AS_ENTER_WORLD field map is unchanged");
+    }
+
+    [Test] public static void T46_world_entry_still_sends_admin_level_zero()
+    {
+        // Documents the bug rather than hiding it: until WorldEntry is changed (human-owned,
+        // status/ENTER-WORLD-FALLBACK.md 8d) every login tells World the player is level 0.
+        // When the diff lands, flip this to assert the account's level instead.
+        var chr = new TeraSharp.Arbiter.Game.FakeCharacter();
+        var p = WorldEntry.BuildEnterWorldPayload(GameId, chr);
+        Hex.True(p.Length == DbProxyHandlers.EnterWorldPayloadSize, "183 bytes");
+        Hex.True(BitConverter.ToUInt32(p, DbProxyHandlers.EnterWorldAdminLevelOffset) == 0,
+                 "WorldEntry hard-codes AdminLevel 0 - this is what World logs");
+    }
+
+    [Test] public static void T46_the_enter_world_retry_carries_admin_level_through()
+    {
+        // The retry path clones and patches only zone/instance/position/ticket/dungeon, so
+        // whatever AdminLevel the first frame carried has to survive. If it did not, a character
+        // who relogs into an instance would silently drop to level 0 on the second attempt.
+        var chr = new TeraSharp.Arbiter.Game.FakeCharacter();
+        var first = WorldEntry.BuildEnterWorldPayload(GameId, chr);
+        BitConverter.GetBytes(5u).CopyTo(first, DbProxyHandlers.EnterWorldAdminLevelOffset);
+
+        var retry = DbProxyHandlers.BuildEnterWorldRetryPayload(
+            first, zone: 5, x: 1, y: 2, z: 3, channelInstanceId: 0xFFFFFFFF, ticket: 7,
+            continuousDungeonId: 9827);
+        Hex.True(retry != null, "the retry builder accepted a 183-byte payload");
+        Hex.True(BitConverter.ToUInt32(retry!, DbProxyHandlers.EnterWorldAdminLevelOffset) == 5,
+                 "AdminLevel survives the retry");
+        Hex.True(BitConverter.ToUInt32(retry!, DbProxyHandlers.EnterWorldContinuousDungeonIdOffset) == 9827,
+                 "and the retry still does its own job");
+    }
+
+    // ---- the forwarded /@ command frame (0x2829) ----
+
+    [Test] public static void T46_admin_command_opcode_and_layout()
+    {
+        Hex.True(GmCommandHandlers.AS_ADMIN_COMMAND == 0x2829, "0x2829");
+        Hex.True(GmCommandHandlers.AS_BYPASS_COMMAND == GmCommandHandlers.AS_ADMIN_COMMAND,
+                 "T32's name still resolves to the same opcode");
+
+        // Byte for byte against the Arbiter's writer (Arb_part_040.c:8820 / Arb_part_067.c:6898):
+        //   [0]  u32 Command string offset, FRAME-relative, backpatched to the running length = 18
+        //   [4]  u32 UserDbId          (User+0x120)
+        //   [8]  u32 CommandType       (the handler bucket's own constant: 1 for World commands)
+        //   [12] the line as UTF-16LE, with a u16 0 terminator
+        var p = GmCommandHandlers.BuildWorldForward(2, GmCommandHandlers.BypassModeWorld, "teleport 1 2 3");
+        Hex.Eq(p, "12 00 00 00 02 00 00 00 01 00 00 00 74 00 65 00 6C 00 65 00 70 00 6F 00 72 00 74 00 "
+                + "20 00 31 00 20 00 32 00 20 00 33 00 00 00",
+               "AS_ADMIN_COMMAND payload, as ArbiterBypassCommandHandler::HandleCommand writes it");
+
+        Hex.True(BitConverter.ToUInt32(p, 0) == 18,
+                 "the string offset is frame-relative and constant: 6 + the 12-byte fixed part");
+        Hex.True(BitConverter.ToUInt32(p, 4) == 2, "UserDbId");
+        Hex.True(BitConverter.ToUInt32(p, 8) == 1, "CommandType");
+        Hex.True(System.Text.Encoding.Unicode.GetString(p, 12, p.Length - 14) == "teleport 1 2 3",
+                 "and the line round-trips");
+        Hex.True(p[^2] == 0 && p[^1] == 0, "terminated");
+    }
+
+    [Test] public static void T46_admin_command_always_clears_the_world_handler_guard()
+    {
+        // World's Handler_AS_ADMIN_COMMAND (WorldServer.exe.c:2977905) drops the frame - and logs
+        // "Arbiter <-> World PDL Version Mismatch! Bye :(" - when the FRAME is under 0x12.
+        // The shortest thing we can send is an empty line, so check that one too.
+        foreach (var line in new[] { "", "a", "teleport 1 2 3" })
+        {
+            var p = GmCommandHandlers.BuildWorldForward(1, GmCommandHandlers.BypassModeWorld, line);
+            int frame = p.Length + 6;
+            Hex.True(frame >= 0x12, $"frame for '{line}' is {frame}, World needs at least 18");
+            // The string ref must point inside the frame, because World bounds-checks it.
+            uint off = BitConverter.ToUInt32(p, 0);
+            Hex.True(off >= 6 && off < frame, $"the string offset {off} is inside the frame");
+        }
+    }
+
     /// <summary>Walks up from the test binary looking for a repo-relative file; null if not found.</summary>
     static string? FindRepoFile(string relative)
     {

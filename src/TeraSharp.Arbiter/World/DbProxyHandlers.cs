@@ -264,6 +264,20 @@ public sealed class DbProxyHandlers
     public const int EnterWorldChannelInstanceIdOffset = 52;
     public const int EnterWorldPositionOffset = 56;
     public const int EnterWorldTicketOffset = 80;
+    /// <summary>
+    /// T46. The GM level World reads out of AS_ENTER_WORLD. The Arbiter takes it from
+    /// <c>User+0x3b98</c> (the field <c>set_admin_level</c> writes and every <c>/@</c> gate tests
+    /// with <c>level &lt; 1</c>), passes it as param_22 to the 0x138E writer FUN_140360710
+    /// (Arb_part_027.c:12906), and it lands at frame 0x75 = payload 111.
+    ///
+    /// <para>World's side of the chain: its generated field-binding table FUN_140496c80
+    /// (WorldServer.exe.c:847798) binds the name <c>adminLevel</c> to <c>User+0xA474</c>, and that
+    /// is the value in <c>SpawnComplete [%s] %s(%d) AdminLevel[%d]</c> (:935500) and in
+    /// <c>=== AdminLevel[%d], Status[%d], ...</c> (:866788). <b>Those two logs are the only reads
+    /// in the whole binary</b> - World stores the level and prints it but never gates on it, so a
+    /// wrong value here is a wrong log line, not a refused command.</para>
+    /// </summary>
+    public const int EnterWorldAdminLevelOffset = 111;
     public const int EnterWorldContinuousDungeonIdOffset = 157;
 
     // AS_CACHE_DUNGEON_COOL_TIME_TO_WORLD (0x148D). Writer:
