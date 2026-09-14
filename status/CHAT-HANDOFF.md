@@ -118,6 +118,22 @@ and look for the next caller.
 
 ## Next steps (in order)
 
+**Checkpoint 2026-09-15 late - 605 tests, T52-T56 merged.** Since the last checkpoint: guild SA_
+direction (leave/banish) + C_INVITE_USER_TO_GUILD/C_CHANGE_GUILDNAME real, GuildWiring gate in
+HandleFrame; broker research (BROKER-DESIGN.md) + the five SDB_TRADE_BROKER_* DLM answers (opening the
+broker no longer wedges) + 15 C_TRADE_BROKER_* accept/empty replies; TunnelFrames length-overflow fix;
+SelfTest requires the guild + visited_sections tables; docs refreshed from git (LIVE-CHECKLIST,
+STATUS, CLAUDE section 0, PERSISTENCE-MAP now covers all 59 allow-listed opcodes, CAPTURE-PLAN);
+capture tooling under tools/ (arbiter-world-tap.js labels World links - copy it to netcup before the
+next capture; reframe-tap.ps1 / reframe-client.ps1 / packet-logger.js). In flight: T57 (eight guild
+SA_ handlers, session 2), T58 (selftest completeness + scratch cleanup, session 1). Live session in
+progress: GM /@makemoney reported not working - first check `C_ADMIN ... -> ForwardToWorld` in
+arbiter.log and `AdminLevel[5]` in the World console; TERASHARP_GM_ACCOUNTS (not the tera-api
+privilege) is what TeraSharp reads. Live script: LIVE-CHECKLIST.md sections 0-11 with
+accountonetest + warriortwo for the two-client steps and warrior for the quest-after-relog check
+(fallback puts it in its own 9827 instance, so it cannot see the others). GM money/items:
+/@makemoney <amount>, /@makeitem <templateId> <amount>.
+
 **Checkpoint 2026-09-15 - 583 tests, T45-T51 merged.** New on master since the multiplayer milestone:
 whisper via ChatManager (roster registered in WorldEntry/GameSession), World GM commands forwarded
 (anything not Arbiter-owned -> AS_ADMIN_COMMAND 0x2829), AdminLevel in AS_ENTER_WORLD[111] +

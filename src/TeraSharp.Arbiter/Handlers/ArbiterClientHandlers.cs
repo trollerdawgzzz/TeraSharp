@@ -215,10 +215,10 @@ public static class ArbiterClientHandlers
         var store = Program.Store;
         if (chr == null || store == null) return true;
 
-        // The owner the request names, when it names one that is not us, is a different
-        // character's item - a linked item in chat. We only have our own rows, so anything else
-        // goes unanswered exactly as the real Arbiter's `lVar5 == 0` branch does.
-        long owner = req.Value.ItemOwnerDbId != 0 ? req.Value.ItemOwnerDbId : (long)chr.Id;
+        // The client names the owner as 0 or -1 for its own items (live: -1 on 100.02); anything
+        // else is a linked item belonging to someone else - we only have our own rows, so that goes
+        // unanswered exactly as the real Arbiter's `lVar5 == 0` branch does.
+        long owner = req.Value.ItemOwnerDbId > 0 ? req.Value.ItemOwnerDbId : (long)chr.Id;
         var match = FindItem(store, owner, req.Value.ItemDbId);
         if (match == null)
         {
