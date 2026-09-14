@@ -113,6 +113,16 @@ and look for the next caller.
 
 ## Next steps (in order)
 
+**2026-09-15 checkpoint: 448 tests, T36-T38 merged.** Since the last checkpoint: TunnelFrames
+(multi-recipient 0x13F7 parser, 0x13F6 builder with WorldClient addressing, TicketAllocator -
+call-site swap for WorldBridge in the T38 report / MULTIPLAYER-DESIGN section 6, NOT applied yet),
+GUILD-DESIGN.md + GuildPackets codec (17 Arbiter-handled guild packets vs 10 World-handled; the
+replayed 0x27ED leaks two Arbiter stack bytes - BuildEmptyDbsInitGuildData is the clean form),
+SelfTest (`TeraSharp.Arbiter.exe --selftest`), LIVE-CHECKLIST.md (12 steps). Cowork queue: T39
+guild persistence (Arbiter half), T40 mail/warehouse research. Human-owned, waiting for a live
+session: the WorldBridge tunnel call-site swap (T38) + TicketAllocator wiring, then the two-client
+capture; PartyManager wiring (PARTY-DESIGN section 10) after that.
+
 **State at 2026-09-14 end (411 tests, everything through T35 merged; T36 guilds and T37 live checklist in flight).**
 
 What works (live-verified): login -> lobby -> create character (any class, own kit, own skills, own

@@ -81,6 +81,10 @@ Cowork-editable files also include: `Auth/*`, `Handlers/GmCommands.cs`, `Protoco
 `World/PartyManager.cs`, `World/StarterInventory.cs`, `World/DbProxyStaticData.cs` (added 2026-09-14).
 
 ### Hard rules learned the expensive way (2026-09-14)
+- **Cowork must never copy a file from master into its worktree by hand** ("I took master's test file as
+  the base"). The worktree base is whatever `git rebase master` gives it; a hand-copied snapshot is
+  silently stale and the merge deletes everything added since (T39 lost 60 tests this way). If the worktree
+  is behind, STOP and ask the human to rebase.
 - **No `"` inside C# verbatim strings** (`@"..."`, e.g. the SQL DDL in CharacterStore) - a lone double quote
   terminates the string and the build fails with 300+ errors. Use single quotes or no quotes in SQL comments.
   Cowork cannot build, so this has broken three merges in a row.
