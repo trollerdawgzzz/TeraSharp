@@ -11522,7 +11522,7 @@ some prose with `backticks` that is not a table row
     {
         var cm = new ChatManager(store, QuietLog());
         for (int i = 1; i <= online; i++)
-            cm.Register(new ChatPlayer(i, "c" + i, 0x0400000000000000UL | (ulong)i, 60, 2, false));
+            cm.Register(new ChatPlayer(i, "c" + i, 0x0400000000000000UL | (uint)i, 60, 2, false));
         return cm;
     }
 
