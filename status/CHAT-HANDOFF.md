@@ -113,6 +113,33 @@ and look for the next caller.
 
 ## Next steps (in order)
 
+**State at 2026-09-14 end (411 tests, everything through T35 merged; T36 guilds and T37 live checklist in flight).**
+
+What works (live-verified): login -> lobby -> create character (any class, own kit, own skills, own
+look) -> Island of Dawn on a fresh World -> quests, loot, level -> logout/exit (5 s) -> relog with
+quests/level/position intact; chat; character delete.
+
+What is implemented and unit-tested but NOT live-verified (all since T19): client settings
+persistence (keybinds); inventory rows (loot survives relog); achievements, tutorial tips, seren
+guide, reputation, per-account fatigability, dungeon cool-times served from rows; completed quests
+in 0x272D list 2; the 63-push handshake burst with live timestamps + city-war replies; 0x13F2 ->
+0x1581 echo (fallback burst still on); relog into a dead instance (0x138D -> retry at stored return
+point; needs a character that entered the instance AFTER T21); friends/groups/memos/blocks (v100
+defs - the shipped S_FRIEND_LIST def was patch-101); GM commands via C_ADMIN/C_OP_COMMAND with
+`TERASHARP_GM_ACCOUNTS=<account>` (S_LOGIN_ARBITER.status=31 unlocks /@ in the client - untested);
+auth provider (`TERASHARP_AUTH=true` -> tera-api /authApi/GameAuthenticationLogin, default
+accept-all).
+
+Designed, codec written, NOT wired: multiplayer routing (MULTIPLAYER-DESIGN.md section 6 diffs to
+WorldBridge/GameSession; six Routing_* tests PENDING), PartyManager (PARTY-DESIGN.md section 10
+wiring; needs routing first). Not started: guilds (T36 research), mail, broker, warehouse, admin
+beyond the six GM commands, multi-World.
+
+First live session: deploy -> restart World -> new character -> play 10 min incl. the 9827 teleport
+-> change a keybind -> Exit -> relog: check position/quests/inventory/keybind, then `0x13F2:
+echoed` in the log (then flip SendPostHandshakeDungeonBurst=false), then /@ commands with
+TERASHARP_GM_ACCOUNTS set. Then the routing diffs + two-client capture.
+
 **Update 2026-09-14 late.** Merged T24-T34 (361 tests). Master now also has: dungeon cool-times,
 reputation + per-account fatigability, MULTIPLAYER-DESIGN.md (routing = Ticket index into a session
 table; SA_BYPASS_TO_CLIENT is N x 16-byte recipients, packet at payload[8]-6 - our parser is wrong

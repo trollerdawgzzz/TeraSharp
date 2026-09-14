@@ -35,7 +35,7 @@ public static class Program
     public static WorldBridge? World { get; private set; }
     public static CharacterStore? Store { get; private set; }
 
-    public static async Task Main()
+    public static async Task Main(string[] args)
     {
         using var loggerFactory = LoggerFactory.Create(b =>
         {
@@ -44,6 +44,7 @@ public static class Program
         });
 
         var log = loggerFactory.CreateLogger("Arbiter");
+        bool selfTest = args.Any(a => a is "--selftest" or "/selftest");
         Auth = AuthProviders.FromEnvironment(log);
         log.LogInformation("TeraSharp Arbiter starting (protocol {Proto}, patch {Patch})", ProtocolVersion, MajorPatchVersion);
         log.LogInformation("Data root: {Root}, logs: {Logs}, db: {Db}", DataRoot, PacketLogsPath, DbPath);
@@ -72,6 +73,17 @@ public static class Program
         var worldReplay = WorldReplayTable.Load(WorldReplayPath, loggerFactory.CreateLogger<WorldReplayTable>());
         // Persistence
         Store = new CharacterStore(DbPath, loggerFactory.CreateLogger<CharacterStore>());
+        if (selfTest)
+        {
+            // --selftest (T37, status/LIVE-CHECKLIST.md): verify every file/folder/schema dependency and
+            // exit non-zero on a required failure, so a bad deploy is caught before the first login.
+            // ship.ps1 publishes data\ next to the exe.
+            var results = SelfTest.RunAll(log, DataRoot, PacketLogsPath, DbPath,
+                Path.Combine(AppContext.BaseDirectory, "data"), ProtocolVersionKey);
+            int failed = SelfTest.Report(results, log);
+            Store.Dispose();
+            Environment.Exit(failed == 0 ? 0 : 1);
+        }
         SeedFromCapture(Store, worldReplay, log);
 
         World = new WorldBridge(worldReplay, loggerFactory.CreateLogger<WorldBridge>())
