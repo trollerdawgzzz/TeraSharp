@@ -8623,6 +8623,187 @@ some prose with `backticks` that is not a table row
             "listed -> the GM level (the env-backed overload is exercised live, not here)");
     }
 
+    // ================================================================================
+    // T37 - the startup dependency check behind `TeraSharp.Arbiter.exe --selftest`.
+    // Companion to status/LIVE-CHECKLIST.md: these tests prove the checker reports what it
+    // claims, and - the important one - that its required table/column list really is what
+    // CharacterStore creates, so a stale terasharp.db cannot pass.
+    // ================================================================================
+
+    static string T37TempDir()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "terasharp-t37-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        return dir;
+    }
+
+    [Test] public static void T37_fixed_size_check_reports_the_size_it_found()
+    {
+        string dir = T37TempDir();
+        try
+        {
+            string good = Path.Combine(dir, "starter_blob.bin");
+            File.WriteAllBytes(good, new byte[DbProxyHandlers.WorldBlobSize]);
+            var pass = SelfTest.CheckFixedSize("starter blob", good, DbProxyHandlers.WorldBlobSize);
+            Hex.True(pass.Pass, "a 15312-byte blob passes");
+            Hex.True(pass.Detail.Contains(good), "and the detail names the resolved path");
+
+            string truncated = Path.Combine(dir, "short.bin");
+            File.WriteAllBytes(truncated, new byte[100]);
+            var fail = SelfTest.CheckFixedSize("starter blob", truncated, DbProxyHandlers.WorldBlobSize);
+            Hex.True(!fail.Pass, "a truncated file fails");
+            Hex.True(fail.Detail.Contains("100") && fail.Detail.Contains("15312"),
+                "and says both the size it found and the size it wanted: " + fail.Detail);
+
+            var missing = SelfTest.CheckFixedSize("starter blob", Path.Combine(dir, "nope.bin"), 1);
+            Hex.True(!missing.Pass && missing.Detail.Contains("not found"), "a missing file fails");
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    [Test] public static void T37_record_file_check_counts_records()
+    {
+        string dir = T37TempDir();
+        try
+        {
+            string promos = Path.Combine(dir, "promotions_147E.bin");
+            File.WriteAllBytes(promos, new byte[DbProxyHandlers.PromotionRecordSize * 3]);
+            var ok = SelfTest.CheckRecordFile("promotion records", promos, DbProxyHandlers.PromotionRecordSize);
+            Hex.True(ok.Pass && ok.Detail.Contains("3 record"), "three whole records: " + ok.Detail);
+
+            File.WriteAllBytes(promos, new byte[DbProxyHandlers.PromotionRecordSize + 7]);
+            var ragged = SelfTest.CheckRecordFile("promotion records", promos, DbProxyHandlers.PromotionRecordSize);
+            Hex.True(!ragged.Pass, "a partial record fails - that is what a truncated copy looks like");
+
+            File.WriteAllBytes(promos, Array.Empty<byte>());
+            Hex.True(!SelfTest.CheckRecordFile("promotion records", promos, 1368).Pass, "an empty file fails");
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    [Test] public static void T37_folder_check_wants_the_file_inside_it()
+    {
+        string dir = T37TempDir();
+        try
+        {
+            var empty = SelfTest.CheckFolder("Datasheet folder", dir, "DefaultSkillSet.xml", required: false);
+            Hex.True(!empty.Pass && !empty.Required, "the marker file is missing, but it is not required");
+            File.WriteAllText(Path.Combine(dir, "DefaultSkillSet.xml"), "<x/>");
+            Hex.True(SelfTest.CheckFolder("Datasheet folder", dir, "DefaultSkillSet.xml").Pass, "now it passes");
+            Hex.True(!SelfTest.CheckFolder("Datasheet folder", Path.Combine(dir, "gone")).Pass, "no folder");
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    [Test] public static void T37_report_counts_only_required_failures()
+    {
+        var log = QuietLog();
+        Hex.True(SelfTest.Report(new[]
+        {
+            new SelfTestResult("a", true, "fine"),
+            new SelfTestResult("b", true, "fine"),
+        }, log) == 0, "all green");
+
+        Hex.True(SelfTest.Report(new[]
+        {
+            new SelfTestResult("a", true, "fine"),
+            new SelfTestResult("b", false, "gone", Required: false),
+        }, log) == 0, "an optional miss is a warning, not a failed deploy");
+
+        Hex.True(SelfTest.Report(new[]
+        {
+            new SelfTestResult("a", false, "gone"),
+            new SelfTestResult("b", false, "gone", Required: false),
+            new SelfTestResult("c", false, "gone"),
+        }, log) == 2, "two required failures");
+
+        Hex.True(SelfTest.Format(new SelfTestResult("x", true, "d")).StartsWith("[PASS]"), "PASS tag");
+        Hex.True(SelfTest.Format(new SelfTestResult("x", false, "d")).StartsWith("[FAIL]"), "FAIL tag");
+        Hex.True(SelfTest.Format(new SelfTestResult("x", false, "d", Required: false)).StartsWith("[WARN]"),
+            "an optional failure is a WARN");
+    }
+
+    [Test] public static void T37_database_check_accepts_a_store_built_now()
+    {
+        // The point of this test: SelfTest.RequiredTables / RequiredColumns must be exactly what
+        // CharacterStore creates. Build a real DB with the real migrations, then check it.
+        string dir = T37TempDir();
+        try
+        {
+            string db = Path.Combine(dir, "terasharp.db");
+            using (var store = new TeraSharp.Arbiter.Persistence.CharacterStore(db, QuietLog()))
+            {
+                store.GetOrCreateAccount("selftest");
+            }
+            var result = SelfTest.CheckDatabase(db);
+            Hex.True(result.Pass,
+                "a freshly migrated DB has every required table and column: " + result.Detail);
+            Hex.True(result.Detail.Contains("user_version"), "and reports the schema version");
+        }
+        finally { Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools(); Directory.Delete(dir, true); }
+    }
+
+    [Test] public static void T37_database_check_spots_a_stale_db()
+    {
+        string dir = T37TempDir();
+        try
+        {
+            string db = Path.Combine(dir, "old.db");
+            using (var conn = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={db}"))
+            {
+                conn.Open();
+                using var cmd = conn.CreateCommand();
+                // A terasharp.db from before T30/T32: characters exist, the new columns do not.
+                cmd.CommandText =
+                    "CREATE TABLE accounts (id INTEGER PRIMARY KEY, name TEXT);"
+                    + "CREATE TABLE characters (id INTEGER PRIMARY KEY, name TEXT);"
+                    + "CREATE TABLE friends (character_id INTEGER, friend_id INTEGER);";
+                cmd.ExecuteNonQuery();
+            }
+            var result = SelfTest.CheckDatabase(db);
+            Hex.True(!result.Pass, "a pre-migration DB fails");
+            Hex.True(result.Detail.Contains("friend_groups"), "it names the missing table: " + result.Detail);
+            Hex.True(result.Detail.Contains("accounts.admin_level") || result.Detail.Contains("friends.memo"),
+                "and the missing columns: " + result.Detail);
+
+            Hex.True(!SelfTest.CheckDatabase(Path.Combine(dir, "nothing.db")).Pass, "no DB at all fails");
+        }
+        finally { Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools(); Directory.Delete(dir, true); }
+    }
+
+    [Test] public static void T37_required_lists_are_not_empty_and_name_real_things()
+    {
+        Hex.True(SelfTest.RequiredTables.Length >= 16, "every table CharacterStore creates");
+        Hex.True(SelfTest.RequiredTables.Contains("fatigability") && SelfTest.RequiredTables.Contains("friend_groups"),
+            "including the ones the newest migrations add");
+        Hex.True(SelfTest.RequiredColumns.Any(c => c.Table == "accounts" && c.Column == "admin_level"),
+            "the T32 GM column");
+        Hex.True(SelfTest.RequiredDefs.Contains("S_SYSTEM_MESSAGE_CUSTOM"), "the GM reply channel");
+        Hex.True(SelfTest.RequiredOpcodes.Contains("C_ADMIN"), "the GM entry point");
+    }
+
+    [Test] public static void T37_data_files_on_this_machine_pass_when_present()
+    {
+        // On the deploy box this is the real check; in a container without D:\ it skips.
+        var data = FindRepoFile(Path.Combine("data", "starter_blob.bin"));
+        if (data == null) { Console.WriteLine("        (skipped: repo data folder not found)"); return; }
+        string dir = Path.GetDirectoryName(data)!;
+
+        var blob = SelfTest.CheckFixedSize("starter blob", data, DbProxyHandlers.WorldBlobSize);
+        Hex.True(blob.Pass, "data/starter_blob.bin is the 15312-byte world blob: " + blob.Detail);
+
+        var inv = SelfTest.CheckFixedSize("starter inventory",
+            Path.Combine(dir, "starter_inventory.bin"), DbProxyHandlers.StarterInventorySize);
+        Hex.True(inv.Pass, "data/starter_inventory.bin: " + inv.Detail);
+
+        var promos = SelfTest.CheckRecordFile("promotion records",
+            Path.Combine(dir, "promotions_147E.bin"), DbProxyHandlers.PromotionRecordSize);
+        Hex.True(promos.Pass, "data/promotions_147E.bin: " + promos.Detail);
+
+        var burst = SelfTest.CheckHandshakeBurst(Path.Combine(dir, DbProxyHandlers.HandshakeBurstFile));
+        Hex.True(burst.Pass, "data/handshake_burst.bin parses to 63 frames: " + burst.Detail);
+    }
+
     /// <summary>Walks up from the test binary looking for a repo-relative file; null if not found.</summary>
     static string? FindRepoFile(string relative)
     {
