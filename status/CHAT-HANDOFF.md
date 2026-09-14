@@ -113,6 +113,18 @@ and look for the next caller.
 
 ## Next steps (in order)
 
+**Update 2026-09-14 late.** Merged T24-T34 (361 tests). Master now also has: dungeon cool-times,
+reputation + per-account fatigability, MULTIPLAYER-DESIGN.md (routing = Ticket index into a session
+table; SA_BYPASS_TO_CLIENT is N x 16-byte recipients, packet at payload[8]-6 - our parser is wrong
+for 2+ players; six Routing_* tests report PENDING until section 6's WorldBridge/GameSession diffs
+are applied), PARTY-DESIGN.md + the party packet codec (no PartyManager yet), HANDSHAKE-DATA.md
+(0x1581 burst = echo of World's non-empty 0x13F2; HandleFrame now dispatches it; fallback burst
+still on via DbProxyHandlers.SendPostHandshakeDungeonBurst - flip to false once the log shows
+`0x13F2: echoed 98 ...`). Cowork session 1 has T30 friends / T31 auth / T32 GM commands queued.
+EVERYTHING since T19 is live-untested - the first live session is a fresh World + new character
++ 9827 relog + keybind check, then the routing diffs and the two-client capture (checklist in
+MULTIPLAYER-DESIGN.md section 8: the tap must label frames by client socket).
+
 **Scope reference (2026-09-14 ~06:20).** `status/arbiter_c_handlers.txt` (~270 `C_` handlers the real
 Arbiter serves) and `status/arbiter_s_packets.txt` (~200 `S_` it builds via the PDL template writer -
 a lower bound). HandlerRegistry registers 44. By area: login/lobby/characters/settings/exit (done),
