@@ -143,6 +143,13 @@ public static class HandlerRegistry
             Reg(guildName, GuildWiring.MinBodyLength(guildOp),
                 (s, body) => GuildWiring.OnClientPacket(s, guildOp, body));
 
+        // --- Trade broker (T55, status/BROKER-DESIGN.md section 8.2): 15 C_ packets
+        //     (C_TRADE_BROKER_HIGHEST_ITEM_LEVEL is T45's, registered below) ---
+        var broker = new BrokerHandlers(loggerFactory.CreateLogger<BrokerHandlers>());
+        foreach (var (brokerName, brokerOp) in BrokerHandlers.ClientOpcodes)
+            Reg(brokerName, BrokerHandlers.MinBodyLength(brokerOp),
+                (s, body) => broker.Handle(s, brokerOp, body));
+
         // --- Client settings (Arbiter-owned) ---
         Reg("C_REQUEST_CLIENT_CHAT_OPTION_SETTING", 0, ClientSettingsHandlers.OnRequestChatOption);
         Reg("C_REQUEST_CLIENT_UI_SETTING", 0, ClientSettingsHandlers.OnRequestUiSetting);

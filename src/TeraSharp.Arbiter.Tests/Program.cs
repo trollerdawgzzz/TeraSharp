@@ -14695,15 +14695,15 @@ some prose with `backticks` that is not a table row
     /// </summary>
     [Test] public static void T53_five_broker_requests_are_unanswered_DLM_items()
     {
+        // T53 found them unanswered; T55 answers them. The tripwire now guards the other way.
         ushort[] withDlm = { 0x2817, 0x2819, 0x281B, 0x281D, 0x281F };
         ushort[] withoutDlm = { 0x2821, 0x2824 };
 
         foreach (ushort op in withDlm)
         {
             Hex.True(BrokerPackets.CarriesDlmId(op), $"0x{op:X4} carries a DlmId");
-            Hex.True(!DbProxyHandlers.IsHandledRequest(op),
-                $"0x{op:X4} is still unanswered - if this fails, T53's headline is stale and "
-                + "status/BROKER-DESIGN.md section 8 needs updating");
+            Hex.True(DbProxyHandlers.IsHandledRequest(op),
+                $"0x{op:X4} must be answered (T55) - an unanswered DlmId wedges the character's DB queue");
             Hex.True(!WorldReplayTable.OneWayFromWorld.Contains(op),
                 $"0x{op:X4} is not sealed one-way either - World really is waiting for a reply");
             Hex.True(BrokerPackets.ReplyFor(op) == (ushort)(op + 1),
