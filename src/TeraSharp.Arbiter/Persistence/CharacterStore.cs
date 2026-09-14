@@ -688,7 +688,7 @@ CREATE TABLE IF NOT EXISTS reputations (
 );
 CREATE INDEX IF NOT EXISTS ix_reputations_owner ON reputations(owner_id);
 
--- T26: fatigability. PER ACCOUNT, not per character: dob and "Test" share account 1 and the
+-- T26: fatigability. PER ACCOUNT, not per character: dob and Test share account 1 and the
 -- point they are served is the same running total, proven three times across the captures
 -- (2505 + 15 = 2520; 2520 + 135 + 0 = 2655; 2655 + 270 + 15 = 2940 - the second and third chains
 -- cross both characters). SDB_UPDATE_FATIGABILITY_POINT (0x2910) carries a DELTA, not a total.

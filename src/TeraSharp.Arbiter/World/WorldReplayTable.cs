@@ -83,7 +83,8 @@ public sealed class WorldReplayTable
                 //   arrives BETWEEN S_UPDATE_EXP_LEVEL and its reply (cap_newchar.log seq 2994
                 //   is 0x273B then 0x156F then 0x273C). Without this entry 0x156F becomes a
                 //   request whose "response" is 0x273C, and the real 0x273B loses it.
-        0x13B6, // SA_UPDATE_DUNGEON_COOLTIME
+        // 0x13B6 SA_UPDATE_DUNGEON_COOLTIME is a real (reply-less) handler since T25 - see
+        // DbProxyHandlers.IsHandledRequest; it must not also be sealed here.
         0x13C5, // SA_ADD_DUNGEON_CHANNEL          (zone change)
         0x13C6, // SA_REMOVE_DUNGEON_CHANNEL       (zone change)
         0x1499, // SA_SAVE_ETC_DATA_FOR_MOVE_WORLD (zone change)
