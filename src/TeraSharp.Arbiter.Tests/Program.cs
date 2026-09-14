@@ -7389,7 +7389,7 @@ public bool TryHandle(WorldBridge bridge, WorldLink link, ushort op, byte[] payl
 
     static PartyManager.PartyPlayer P(uint ticket, int dbId, string name, int cls = 12) =>
         new(Ticket: ticket, UserDbId: dbId, Name: name, Level: 65, Class: cls, Race: 4, Gender: 1,
-            GameId: 0x80000AF00000UL | (ulong)dbId, Laurel: 3, AwakenGrade: 1);
+            GameId: 0x80000AF00000UL | (uint)dbId, Laurel: 3, AwakenGrade: 1);
 
     /// <summary>An SA_JOIN_PARTY frame: World telling us member+invitee agreed.</summary>
     static byte[] SaJoinPartyPayload(int memberDbId, int inviteeDbId, long partyId = 0,
@@ -7399,7 +7399,7 @@ public bool TryHandle(WorldBridge bridge, WorldLink link, ushort op, byte[] payl
         void U32(int frameOff, int v) => BitConverter.GetBytes(v).CopyTo(p, frameOff - 6);
         U32(0x06, PartyManager.PlanetId); U32(0x0A, PartyManager.PlanetId); U32(0x0E, memberDbId);
         U32(0x12, PartyManager.PlanetId); U32(0x16, inviteeDbId);
-        BitConverter.GetBytes(0x80000AF00000UL | (ulong)inviteeDbId).CopyTo(p, 0x1E - 6);
+        BitConverter.GetBytes(0x80000AF00000UL | (uint)inviteeDbId).CopyTo(p, 0x1E - 6);
         U32(0x26, 65); U32(0x2A, 12); U32(0x2E, 4); U32(0x32, 1); U32(0x36, -1);
         p[0x3A - 6] = 1; p[0x3B - 6] = 1;                       // alive, online
         U32(0x3C, 3); U32(0x40, 1);                             // achievement, awaken
@@ -7530,14 +7530,14 @@ public bool TryHandle(WorldBridge bridge, WorldLink link, ushort op, byte[] payl
         var m0 = PartyPackets.ParseMemberBasicInfo(body, 0x32);
         var m1 = PartyPackets.ParseMemberBasicInfo(body, 0x32 + PartyPackets.MemberBasicInfoSize);
         Hex.True(m0!.Value.Name == "dob" && m1!.Value.Name == "Test", $"{m0?.Name}/{m1?.Name} in slot order");
-        Hex.True(m0.Value.CanInvite && !m1.Value.CanInvite, "only the manager carries AuthorityAboutInvitation");
+        Hex.True(m0!.Value.CanInvite && !m1!.Value.CanInvite, "only the manager carries AuthorityAboutInvitation");
 
         // A second join adds one member rather than recreating the party.
         pm.Register(P(12, 3, "Testtwo"));
         var b = pm.OnWorldFrame(PartyPackets.SA_JOIN_PARTY, SaJoinPartyPayload(1, 3));
         Hex.True(b.ToWorld.Count == 1 && b.ToWorld[0].Opcode == PartyPackets.AS_DO_ADD_PARTY_MEMBER, WorldOps(b));
         Hex.True(b.ToClients.Count == 3, $"all three get the refreshed list: {Names(b)}");
-        Hex.True(pm.FindByMember(3)!.Id == party.Id, "and they are in the same party");
+        Hex.True(pm.FindByMember(3)!.Id == party!.Id, "and they are in the same party");
     }
 
     [Test] public static void Party_join_is_refused_when_the_invitee_already_has_a_party()
