@@ -28,6 +28,7 @@ public sealed class SocialHandlers
     {
         _log = log;
         UseChatLogger(log);   // T47: the chat manager logs through the same sink
+        PartyWiring.UsePartyLogger(log);   // T49: and so does the party manager
     }
 
     // ---- Limits and constants, all from the decompile (status/FRIENDS.md section 3) ----
@@ -171,6 +172,11 @@ public sealed class SocialHandlers
         if (chr == null) return;
         Chat.Register(new ChatPlayer((int)chr.Id, chr.Name, session!.GameId, chr.Level, chr.Class,
                                      IsAdmin: false));
+        // T49: parties key on the tunnel Ticket and need exactly the same "who is online" edge,
+        // so PartyManager registration rides this call rather than adding a second line to the
+        // human-owned WorldEntry. PartyWiring.Register ignores a session that is not in world,
+        // because the Ticket it keys on is only allocated one line earlier in WorldEntry.
+        PartyWiring.Register(session);
     }
 
     internal static void UnregisterSession(string characterName)
@@ -190,6 +196,10 @@ public sealed class SocialHandlers
         Sessions.TryRemove(chr.Name, out _);
         var actions = Chat.Unregister((int)chr.Id);
         if (!actions.IsEmpty) ChatDispatcher(session!, ChatLog).Dispatch(actions, "chat-leave");
+        // T49: the party SURVIVES a logout - the member is marked offline and the rest are told
+        // with S_LOGOUT_PARTY_MEMBER - so this has to run on the same two leave paths
+        // GameSession already calls UnregisterChat from (OnWorldLeaveConfirmed and LeaveWorld).
+        PartyWiring.Unregister(session);
     }
 
     /// <summary>
@@ -202,6 +212,7 @@ public sealed class SocialHandlers
     {
         var world = Program.World;
         if (world == null) return;
+        // T49: RegisterChat now also registers the party roster, so this one loop heals both.
         foreach (var s in world.InWorldSessions()) RegisterChat(s);
     }
 

@@ -12908,4 +12908,277 @@ some prose with `backticks` that is not a table row
         Hex.True(store.GetFriendGroups(1)[0].Name == "Friends",
             "the seed is once per character - dbo.spIsProvideSampleFriendGroup");
     }
+
+    // =======================================================================================
+    // T49 - PartyWiring. Research: status/PARTY-DESIGN.md section 10 (and the T49 notes in 11).
+    //
+    // T35 left PartyManager pure and unwired. These drive the WIRING - PartyWiring's own static
+    // entry points, over the T41 dispatcher with recording fakes - so what is checked is the code
+    // the two human-owned lines will call, not a copy of it written a second time in the test.
+    //
+    // No capture contains a party frame, so the SA_ inputs are the same golden payload builders
+    // T35's tests use (PARTY-DESIGN.md section 5.1, from the decompiled writers).
+    // =======================================================================================
+
+    /// <summary>
+    /// The registration numbers, and the one mistake this pair exists to stop.
+    /// <c>PacketDispatcher.Register</c> takes a minimum BODY length and compares it against
+    /// <c>packet[4..]</c>; every guard in the decompile is a FRAME length that includes the
+    /// 4-byte <c>[u16 len][u16 opcode]</c> header. Registering the frame figure would drop
+    /// C_APPLY_PARTY (4-byte body vs a "min 8"), and C_DISMISS_PARTY - which has no guard and no
+    /// body at all - would never run.
+    /// </summary>
+    [Test] public static void T49_party_registrations_use_the_body_length_not_the_frame_length()
+    {
+        // (name, opcode, the decompile's frame guard)
+        var expected = new (string Name, ushort Op, int Frame)[]
+        {
+            ("C_APPLY_PARTY",              0xA889, 0x08),   // FUN_1404db920 Arb_part_040.c:19121
+            ("C_PARTY_APPLICATION_DENIED", 0x4F00, 0x08),   // FUN_1404e3f60 Arb_part_041.c:5023
+            ("C_DISMISS_PARTY",            0xC8B9, 0x04),   // FUN_1404def50 - no guard at all
+            ("C_BAN_PARTY_MEMBER",         0x59C1, 0x0C),   // FUN_1404dbcb0 Arb_part_040.c:19255
+            ("C_PARTY_LOOTING_METHOD",     0x5D24, 0x17),   // FUN_1404e40a0 Arb_part_041.c:5086
+            ("C_MERGE_PARTY_TO_RAID",      0xB8D0, 0x0D),   // FUN_1404e3870 Arb_part_041.c:4724
+            ("C_REQUEST_PARTY_INFO",       0xFD35, 0x08),   // FUN_1404e9b50 Arb_part_041.c:8911
+        };
+
+        Hex.True(PartyWiring.ClientOpcodes.Length == expected.Length,
+            $"seven Arbiter-side party opcodes, got {PartyWiring.ClientOpcodes.Length}");
+
+        for (int i = 0; i < expected.Length; i++)
+        {
+            var (name, op, frame) = expected[i];
+            var (gotName, gotOp) = PartyWiring.ClientOpcodes[i];
+            Hex.True(gotName == name && gotOp == op,
+                $"slot {i}: expected {name} 0x{op:X4}, got {gotName} 0x{gotOp:X4}");
+            Hex.True(PartyWiring.MinFrameLength(op) == frame,
+                $"{name} frame guard: want 0x{frame:X2}, got 0x{PartyWiring.MinFrameLength(op):X2}");
+            Hex.True(PartyWiring.MinBodyLength(op) == frame - PartyWiring.ClientHeaderSize,
+                $"{name} body minimum must be the frame guard minus the 4-byte header, " +
+                $"got {PartyWiring.MinBodyLength(op)} for frame 0x{frame:X2}");
+            Hex.True(PartyWiring.IsArbiterSide(op), $"{name} is Arbiter-side");
+        }
+
+        // The two the party UI sends that the real Arbiter has NO handler for. They must stay
+        // unregistered so PacketDispatcher keeps forwarding them to World, which answers with
+        // SA_LEAVE_PARTY / SA_CHANGE_PARTY_MANAGER.
+        Hex.True(!PartyWiring.IsArbiterSide(0xFFB6), "C_LEAVE_PARTY belongs to World");
+        Hex.True(!PartyWiring.IsArbiterSide(0x60D6), "C_CHANGE_PARTY_MANAGER belongs to World");
+        Hex.True(PartyWiring.MinBodyLength(0xFFB6) == 0 && PartyWiring.MinFrameLength(0xFFB6) == 0,
+            "and neither table answers for an opcode we do not own");
+    }
+
+    /// <summary>
+    /// The gate the one WorldBridge line uses. It has to be true for every W-&gt;A party opcode
+    /// (so the frame reaches the manager instead of the replay table) and false for everything
+    /// else (so nothing else is stolen). SA_BYPASS_TO_GROUP 0x13F8 sits one below the tunnel
+    /// opcode 0x13F7, which HandleFrame answers in its own case - a gate that caught that would
+    /// break every client packet World sends.
+    /// </summary>
+    [Test] public static void T49_the_world_frame_gate_is_exactly_the_party_opcodes()
+    {
+        ushort[] party =
+        {
+            0x1395, 0x1396, 0x1397, 0x1398, 0x1399, 0x139A, 0x139B, 0x139C, 0x139D,
+            0x13AB, 0x13AC, 0x13F8,
+        };
+        foreach (ushort op in party)
+        {
+            Hex.True(PartyWiring.HandlesWorldFrame(op), $"0x{op:X4} must reach PartyManager");
+            Hex.True(!WorldReplayTable.OneWayFromWorld.Contains(op),
+                $"0x{op:X4} is not in the replay table's one-way set - nothing is being taken away");
+            Hex.True(!DbProxyHandlers.IsHandledRequest(op),
+                $"0x{op:X4} is not a DB-proxy request either");
+        }
+        Hex.True(party.Length == 12, "twelve W->A party opcodes");
+
+        // the neighbours, and a sample of what else crosses that default: arm
+        foreach (ushort op in new ushort[] { 0x13F7, 0x13F2, 0x13FA, 0x13AA, 0x13B6, 0x1394,
+                                             0x139F, 0x13A0, 0x2809, 0x27A2, 0x1436 })
+            Hex.True(!PartyWiring.HandlesWorldFrame(op), $"0x{op:X4} must NOT be gated to parties");
+    }
+
+    /// <summary>
+    /// The whole point of T49: two live sessions, invite -&gt; accept -&gt; leave, every packet
+    /// arriving through PartyWiring's own entry points and the real ActionDispatcher. The sinks
+    /// are fakes, so no socket and no GameSession - ActionDispatcher.ForSessions binds the same
+    /// IClientSink to the real one.
+    /// </summary>
+    [Test] public static void T49_two_sessions_invite_accept_and_leave_through_the_dispatcher()
+    {
+        var pm = NewPartyManager();
+        pm.Register(P(10, 1, "dob"));            // ticket 10, character 1 - the one invited from
+        pm.Register(P(11, 2, "Test"));           // ticket 11, character 2 - the applicant
+
+        var h = new DispatchHarness().Build();
+        var leader = h.Ticket(10);
+        var joiner = h.Ticket(11);
+
+        // ---- invite: C_APPLY_PARTY arrives on ticket 11 and is answered to the TARGET ----
+        var r1 = PartyWiring.DispatchClientPacket(pm, h.Dispatcher, 11,
+            PartyPackets.C_APPLY_PARTY, BitConverter.GetBytes(1));
+        Hex.True(r1.ClientsSent == 1 && !r1.RejectionSent, $"apply: {r1}");
+        Hex.True(string.Join(",", leader.Log) == "def:S_OTHER_USER_APPLY_PARTY", string.Join(",", leader.Log));
+        Hex.True(joiner.Log.Count == 0, "the applicant hears nothing back");
+        Hex.True(pm.HasApplication(2, 1), "the pending edge is remembered");
+
+        // ---- accept: World completes the handshake and tells us with SA_JOIN_PARTY ----
+        leader.Log.Clear(); joiner.Log.Clear();
+        var r2 = PartyWiring.DispatchWorldFrame(pm, h.Dispatcher,
+            PartyPackets.SA_JOIN_PARTY, SaJoinPartyPayload(1, 2));
+        var party = pm.FindByMember(1);
+        Hex.True(party != null && party.Count == 2, "the party exists and holds both");
+        Hex.True(party!.IsManager(1), "the inviter is the manager");
+        Hex.True(!pm.HasApplication(2, 1), "and the application edge is spent");
+
+        Hex.True(string.Join(",", leader.Log) == "def:S_PARTY_MEMBER_LIST", string.Join(",", leader.Log));
+        Hex.True(string.Join(",", joiner.Log) == "def:S_PARTY_MEMBER_LIST", string.Join(",", joiner.Log));
+        Hex.True(r2.WorldSent == 1 && h.WorldLog.Count == 1 && h.WorldLog[0].Op == PartyPackets.AS_DO_CREATE_PARTY,
+            $"World gets the whole member list as AS_DO_CREATE_PARTY (0x139E): {r2}");
+        Hex.True(!r2.RejectionSent, "a World frame has no originating client to reject to");
+
+        // ---- leave: the joiner presses the button, World answers with SA_LEAVE_PARTY ----
+        leader.Log.Clear(); joiner.Log.Clear(); h.WorldLog.Clear();
+        var r3 = PartyWiring.DispatchWorldFrame(pm, h.Dispatcher,
+            PartyPackets.SA_LEAVE_PARTY, SaLeavePartyPayload(party.Id, 2));
+
+        // the leaver is told they left; the other is told who left; then the party of one dissolves
+        Hex.True(string.Join(",", joiner.Log) == "def:S_LEAVE_PARTY", string.Join(",", joiner.Log));
+        Hex.True(string.Join(",", leader.Log) == "def:S_LEAVE_PARTY_MEMBER,def:S_LEAVE_PARTY",
+            string.Join(",", leader.Log));
+        Hex.True(string.Join(",", h.WorldLog.Select(w => $"0x{w.Op:X4}")) == "0x13A0,0x13A1",
+            "AS_DO_REMOVE_PARTY_MEMBER then AS_DO_DISMISS_PARTY: " +
+            string.Join(",", h.WorldLog.Select(w => $"0x{w.Op:X4}")));
+        Hex.True(r3.ClientsDropped == 0, $"nobody was unreachable: {r3}");
+        Hex.True(pm.FindByMember(1) == null && pm.FindByMember(2) == null && pm.PartyCount == 0,
+            "a party that falls to one member is not a party - New_CreateParty refuses to make one");
+    }
+
+    /// <summary>
+    /// A refused party command is not a log line the player never sees. PartyManager stamps the
+    /// originating ticket, so ActionDispatcher relays the reason as S_SYSTEM_MESSAGE_CUSTOM - to
+    /// the sender, and to nobody else.
+    /// </summary>
+    [Test] public static void T49_a_refused_party_command_answers_the_sender_only()
+    {
+        var pm = NewPartyManager();
+        pm.Register(P(10, 1, "dob"));
+        pm.Register(P(11, 2, "Test"));
+
+        var h = new DispatchHarness().Build();
+        var sender = h.Ticket(11);
+        var bystander = h.Ticket(10);
+
+        var r = PartyWiring.DispatchClientPacket(pm, h.Dispatcher, 11,
+            PartyPackets.C_APPLY_PARTY, BitConverter.GetBytes(99));   // 99 is not online
+        Hex.True(r.RejectionSent && r.ClientsSent == 0, $"nothing happened, and the sender was told: {r}");
+        Hex.True(string.Join(",", sender.Log) == $"def:{ActionDispatcher.RejectionPacket}",
+            string.Join(",", sender.Log));
+        Hex.True(bystander.Log.Count == 0, "and nobody else heard about it");
+
+        // An unregistered ticket - a packet that arrived after the session went away - is the
+        // same shape: refused, not thrown, and not sent to whoever holds that ticket next.
+        var ghost = PartyWiring.DispatchClientPacket(pm, h.Dispatcher, 4095,
+            PartyPackets.C_DISMISS_PARTY, Array.Empty<byte>());
+        Hex.True(!ghost.AnythingSent, $"an unknown ticket sends nothing at all: {ghost}");
+    }
+
+    /// <summary>
+    /// Logging out does NOT break the party: PartyMemberInfo+0x70 is an Online flag, not a
+    /// removal (PartyManager::MemberLeaveWorld), so the slot is kept and the rest are told with
+    /// S_LOGOUT_PARTY_MEMBER. This is the path SocialHandlers.UnregisterChat now drives, which is
+    /// why no new line is needed in the human-owned GameSession.
+    /// </summary>
+    [Test] public static void T49_logging_out_keeps_the_party_and_tells_the_others()
+    {
+        var pm = NewPartyManager();
+        pm.Register(P(10, 1, "dob"));
+        pm.Register(P(11, 2, "Test"));
+
+        var h = new DispatchHarness().Build();
+        var stays = h.Ticket(10);
+        var leaves = h.Ticket(11);
+        PartyWiring.DispatchWorldFrame(pm, h.Dispatcher, PartyPackets.SA_JOIN_PARTY, SaJoinPartyPayload(1, 2));
+        var party = pm.FindByMember(1)!;
+        stays.Log.Clear(); leaves.Log.Clear(); h.WorldLog.Clear();
+
+        var r = PartyWiring.DispatchLeave(pm, h.Dispatcher, 11);
+
+        Hex.True(string.Join(",", stays.Log) == "def:S_LOGOUT_PARTY_MEMBER", string.Join(",", stays.Log));
+        Hex.True(leaves.Log.Count == 0, "the one who left is not told about themselves");
+        Hex.True(h.WorldLog.Count == 0, "World already knows - it is the one that despawned them");
+        Hex.True(r.ClientsSent == 1, $"{r}");
+
+        Hex.True(pm.PartyCount == 1 && pm.FindByMember(2) == party,
+            "the party survives and still holds the offline member");
+        int slot = party.IndexOf(2);
+        Hex.True(slot >= 0 && party.Slots[slot]!.Value.Online == false, "the slot is kept, marked offline");
+        Hex.True(!pm.TryGetTicket(2, out _), "but the ticket is gone, so nothing is sent to it");
+
+        // coming back online re-flags the same slot rather than making a second one
+        pm.Register(P(12, 2, "Test"));
+        Hex.True(party.IndexOf(2) == slot && party.Slots[slot]!.Value.Online,
+            "the same slot comes back online - slot indices are wire-visible and must not shift");
+        Hex.True(party.Count == 2, "and there is still exactly one of them");
+    }
+
+    /// <summary>
+    /// C_REQUEST_PARTY_INFO is Arbiter-owned (Handler_C_REQUEST_PARTY_INFO queues a
+    /// PartyMatchManager job) but party matching is not modelled - none of the three shipped
+    /// S_PARTY_MEMBER_INFO defs matches the v100 writer. Section 10's wiring hands all seven
+    /// straight to the manager, which would answer this one with a system-message rejection every
+    /// time the panel opens. It is registered (so it never reaches World, which has no handler
+    /// either) and swallowed.
+    /// </summary>
+    [Test] public static void T49_the_party_match_query_is_swallowed_rather_than_refused()
+    {
+        Hex.True(PartyWiring.IsArbiterSide(PartyPackets.C_REQUEST_PARTY_INFO),
+            "it is registered, so PacketDispatcher never forwards it to World");
+        Hex.True(PartyWiring.NotModelled.Contains(PartyPackets.C_REQUEST_PARTY_INFO),
+            "and it is the one we deliberately do not answer");
+        Hex.True(PartyWiring.NotModelled.Count == 1, "only that one");
+
+        // the reason: the manager's switch has no case for it, so it would reject
+        var pm = NewPartyManager();
+        pm.Register(P(10, 1, "dob"));
+        var direct = pm.OnClientPacket(10, PartyPackets.C_REQUEST_PARTY_INFO, BitConverter.GetBytes(1));
+        Hex.True(direct.IsEmpty && direct.Rejected != null,
+            "PartyManager would refuse it - which is what the swallow exists to stop");
+
+        // the other six do reach the manager
+        foreach (var (name, op) in PartyWiring.ClientOpcodes)
+            Hex.True(PartyWiring.NotModelled.Contains(op) == (op == PartyPackets.C_REQUEST_PARTY_INFO),
+                $"{name} routing");
+    }
+
+    /// <summary>
+    /// The roster edge, through the static the wiring actually uses. PartyWiring.Register is
+    /// called from SocialHandlers.RegisterChat, so a character that is online for whisper is
+    /// online for parties too - one roster, not two that can disagree.
+    /// </summary>
+    [Test] public static void T49_the_shared_roster_registers_a_player_for_parties()
+    {
+        PartyWiring.ResetForTests();
+        try
+        {
+            Hex.True(!PartyWiring.Manager.TryGetPlayer(77, out _), "nobody yet");
+
+            PartyWiring.Register(ticket: 77, userDbId: 9, name: "dob", level: 65, cls: 12,
+                                 race: 4, gender: 1, gameId: 0x80000AF00009UL);
+
+            Hex.True(PartyWiring.Manager.TryGetPlayer(77, out var p), "the ticket resolves");
+            Hex.True(p.UserDbId == 9 && p.Name == "dob" && p.Level == 65 && p.Class == 12
+                     && p.Race == 4 && p.Gender == 1,
+                $"the character came through intact: db {p.UserDbId} '{p.Name}' L{p.Level} c{p.Class}");
+            Hex.True(PartyWiring.Manager.TryGetTicket(9, out uint back) && back == 77,
+                "and the reverse lookup, which is how a broadcast finds a member");
+
+            // idempotent: the enter-world call and SyncRoster's self-heal both run
+            PartyWiring.Register(ticket: 77, userDbId: 9, name: "dob", level: 66, cls: 12,
+                                 race: 4, gender: 1, gameId: 0x80000AF00009UL);
+            Hex.True(PartyWiring.Manager.TryGetPlayer(77, out var again) && again.Level == 66,
+                "re-registering updates rather than duplicating");
+        }
+        finally { PartyWiring.ResetForTests(); }
+    }
 }
