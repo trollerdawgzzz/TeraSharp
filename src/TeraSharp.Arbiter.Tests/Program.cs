@@ -1005,10 +1005,8 @@ public static class Tests
         bridge.HandleFrame(link, WorldBridge.OpTunnelToClient,
             BuildTestTunnelPayload(conn: 99, idx: 99, seq: 0, clientPkt: pkt));
 
-        Hex.True(received1.Count == 1, $"broadcast: session 1 got {received1.Count}");
-        Hex.True(received2.Count == 1, $"broadcast: session 2 got {received2.Count}");
-        Hex.True(received1[0][2] == 0x03, "broadcast: session 1 got opcode 3");
-        Hex.True(received2[0][2] == 0x03, "broadcast: session 2 got opcode 3");
+        Hex.True(received1.Count == 0, $"unknown ticket with 2 sessions must be DROPPED (multiplayer routing, 2026-09-15): session 1 got {received1.Count}");
+        Hex.True(received2.Count == 0, $"unknown ticket with 2 sessions must be DROPPED: session 2 got {received2.Count}");
     }
 
     [Test] public static void TunnelRouting_per_session_reorder()
@@ -1043,13 +1041,12 @@ public static class Tests
         var replay = WorldReplayTable.Load("/nonexistent", log);
         var bridge = new WorldBridge(replay, log);
 
-        // Single-player fix: AllocateTunnelKey is pinned to 5 (the slot World's handshake
-        // wires). Incrementing (5,6,7...) broke relog because World never wired slot 6.
-        // Multi-player will revisit this once we have a two-login capture.
+        // TicketAllocator: the first ticket is still 5 (what every single-player session has
+        // always sent in AS_ENTER_WORLD[80]); a second concurrent session gets a DIFFERENT one.
         uint k1 = bridge.AllocateTunnelKey();
         uint k2 = bridge.AllocateTunnelKey();
         Hex.True(k1 == 5, $"first key {k1} != 5");
-        Hex.True(k2 == 5, $"second key {k2} != 5 (pinned for single-player)");
+        Hex.True(k2 != k1, $"second concurrent key {k2} must differ from the first");
     }
 
     [Test] public static void TunnelKeyOffset_is_idx_field()
@@ -7104,7 +7101,7 @@ public bool TryHandle(WorldBridge bridge, WorldLink link, ushort op, byte[] payl
     //
     /// <summary>Flip to true the moment MULTIPLAYER-DESIGN.md section 6 is applied to
     /// WorldBridge.cs; the six pending tests below then become hard failures again.</summary>
-    public static bool RoutingDiffsApplied = false;
+    public static bool RoutingDiffsApplied = true;   // WorldBridge swap applied 2026-09-15 00:20
 
     static void PendingUntilRoutingDiffs(string name, Action body)
     {
@@ -7288,7 +7285,7 @@ public bool TryHandle(WorldBridge bridge, WorldLink link, ushort op, byte[] payl
             // 6(4) lands this line becomes bridge.ResetTunnelSequence(0) and the test goes green;
             // the assertion - one player's reset must not discard another's queue - is the same
             // either way, because sequence numbers are per-Ticket.
-            bridge.ResetTunnelSequence();
+            bridge.ResetTunnelSequence(0);   // keyed reset landed 2026-09-15 (section 6(4))
 
             bridge.HandleFrame(link, WorldBridge.OpTunnelToClient, BuildTunnelFrame(ClientPkt(0xB0), (1, 0)));
             Hex.True(b.Count == 2, $"B should drain both, got {b.Count} - a global reset threw its queue away");

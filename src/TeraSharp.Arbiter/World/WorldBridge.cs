@@ -92,11 +92,12 @@ public sealed class WorldBridge
     private const int StallMs = 150;
 
     /// <summary>
-    /// Next tunnel key to allocate. Starts at 5 to match the capture's
-    /// PacketBypassManager::BypassStart() return value; increments for each
-    /// additional player so every session has a unique routing key.
+    /// Per-session Ticket allocator (T38 TicketAllocator: linear-probing cursor, a freed ticket is
+    /// not reissued until the cursor wraps). Before this every session got 5 - the first time two
+    /// clients logged in together World saw both as one ticket ("SpawnMe twice", both stuck at
+    /// 100% loading, 2026-09-15 00:04).
     /// </summary>
-    private uint _nextTunnelKey = 5;
+    private readonly TicketAllocator _tickets = new();
 
     /// <summary>
     /// In-world players keyed by gameId, for control-message routing (e.g. SA_LEAVE_WORLD
@@ -105,8 +106,8 @@ public sealed class WorldBridge
     private readonly Dictionary<ulong, GameSession> _players = new();
     private readonly object _playersLock = new();
 
-    /// <summary>Allocate a unique tunnel key for a new player session.</summary>
-    internal uint AllocateTunnelKey() { lock (_reorderLock) return _nextTunnelKey; }  // pinned to 5 for single-player; see field comment  // single-player: always slot 5 (what World's handshake wires). Multi-player revisits this with the 2-login capture.
+    /// <summary>Allocate a unique tunnel Ticket for a new player session.</summary>
+    internal uint AllocateTunnelKey() => _tickets.Allocate();
 
     public void RegisterPlayer(GameSession s)
     {
@@ -119,6 +120,15 @@ public sealed class WorldBridge
     {
         lock (_playersLock) _players.Remove(gameId);
         lock (_reorderLock) _tunnels.Remove(tunnelKey);
+        _tickets.Free(tunnelKey);
+    }
+
+    /// <summary>The session that owns a tunnel Ticket, or null (ActionDispatcher / party / chat).</summary>
+    public GameSession? SessionForTicket(uint ticket)
+    {
+        lock (_playersLock)
+            foreach (var s in _players.Values) if (s.TunnelKey == ticket) return s;
+        return null;
     }
 
     /// <summary>Register a tunnel route by key with a custom callback (test-facing).</summary>
@@ -161,6 +171,7 @@ public sealed class WorldBridge
         _log = log;
     }
 
+    /// <summary>Reset every reorder buffer (World restarted).</summary>
     public void ResetTunnelSequence()
     {
         lock (_reorderLock)
@@ -174,6 +185,18 @@ public sealed class WorldBridge
         }
     }
 
+    /// <summary>Reset ONE player's reorder buffer (their re-enter), leaving the others' queues alone.</summary>
+    public void ResetTunnelSequence(uint tunnelKey)
+    {
+        lock (_reorderLock)
+        {
+            if (!_tunnels.TryGetValue(tunnelKey, out var buf)) return;
+            buf.Pending.Clear();
+            buf.NextSeq = 0;
+            buf.LastDelivery = DateTime.UtcNow;
+        }
+    }
+
     /// <summary>
     /// Deliver a reordered client packet to the session that owns the given tunnel key.
     /// Falls back to broadcasting to all registered sessions when the key is unknown
@@ -181,6 +204,24 @@ public sealed class WorldBridge
     /// we don't recognise yet ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â the two-login capture will clarify).
     /// </summary>
     internal void RouteToClient(uint key, byte[] packet)
+    {
+        // Unknown ticket: with exactly one session registered, deliver to it (a frame World
+        // sends before RegisterPlayer ran - the single-player behaviour that always worked);
+        // with several, DROP it - broadcasting one player's packets to everyone is how two
+        // clients ended up with each other's spawn (MULTIPLAYER-DESIGN.md section 6).
+        Action<byte[]>? deliver = null;
+        int count;
+        lock (_reorderLock)
+        {
+            count = _tunnels.Count;
+            if (_tunnels.TryGetValue(key, out var buf)) deliver = buf.Deliver;
+            else if (count == 1) foreach (var b in _tunnels.Values) { deliver = b.Deliver; break; }
+        }
+        if (deliver != null) { deliver(packet); return; }
+        _log.LogDebug("Tunnel ticket {Key} unknown with {N} session(s) - dropped", key, count);
+    }
+
+    private void RouteToClientLegacyBroadcast(uint key, byte[] packet)
     {
         Action<byte[]>? deliver = null;
         lock (_reorderLock)
@@ -294,53 +335,21 @@ public sealed class WorldBridge
 
             case OpTunnelToClient:
             {
-                if (payload.Length < 32) { _log.LogWarning("Short 13F7 on link #{Id}", link.Id); return; }
-                int clientLen = BitConverter.ToInt32(payload, 12);
-                if (32 + clientLen > payload.Length) clientLen = payload.Length - 32;
-                var clientPkt = new byte[clientLen];
-                Array.Copy(payload, 32, clientPkt, 0, clientLen);
-
-                uint seq = (uint)(BitConverter.ToUInt16(payload, 30) >> 3);
-                uint key = BitConverter.ToUInt32(payload, TunnelKeyOffset);
-                ushort cop = clientLen >= 4 ? (ushort)(clientPkt[2] | (clientPkt[3] << 8)) : (ushort)0;
-                _log.LogTrace("TUNNEL W->C #{Id} key={Key} seq={Seq} client-op={Cop} len={Len}",
-                    link.Id, key, seq, cop, clientLen);
-
-                // SINGLE-PLAYER FAST PATH: one session -> ignore routing key, one shared queue.
-                // Byte-identical to the broadcast tunnel that worked for login AND logout.
-                // Per-key path only engages with 2+ sessions (deferred until two-login capture).
-                TunnelReorderBuffer? solo = null;
-                lock (_reorderLock)
+                // SA_BYPASS_TO_CLIENT addresses N recipients (16 B each) and the client packet
+                // follows the list - TunnelFrames owns the layout (T38 / MULTIPLAYER-DESIGN.md
+                // section 6). Each recipient has its own Ticket and sequence, so each gets the
+                // packet through its own reorder buffer; a second recipient gets a clone because
+                // GameSession.Send encrypts in place.
+                var frame = TunnelFrames.ParseBypassToClient(payload);
+                if (frame == null)
                 {
-                    if (_tunnels.Count == 1)
-                        foreach (var b in _tunnels.Values) { solo = b; break; }
-                }
-                if (solo != null)
-                {
-                    List<(uint, byte[])> ds;
-                    lock (_reorderLock)
-                    {
-                        solo.Pending[seq] = clientPkt;
-                        ds = DrainInOrder(0, solo);
-                    }
-                    var cb = solo.Deliver;
-                    if (cb != null) foreach (var (_, p) in ds) cb(p);
+                    _log.LogWarning("Malformed 13F7 on link #{Id} ({Len} B)", link.Id, payload.Length);
                     return;
                 }
-
-                List<(uint k, byte[] p)>? deliver = null;
-                lock (_reorderLock)
-                {
-                    if (_tunnels.TryGetValue(key, out var buf))
-                    {
-                        buf.Pending[seq] = clientPkt;
-                        deliver = DrainInOrder(key, buf);
-                    }
-                }
-                if (deliver != null)
-                    foreach (var (k, p) in deliver) RouteToClient(k, p);
-                else
-                    RouteToClient(key, clientPkt); // unknown key ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â broadcast immediately
+                bool solo = frame.Recipients.Count == 1;
+                foreach (var r in frame.Recipients)
+                    DeliverTunnelPacket(r.Ticket, r.Sequence,
+                        solo ? frame.ClientPacket : (byte[])frame.ClientPacket.Clone());
                 return;
             }
 
@@ -385,17 +394,37 @@ public sealed class WorldBridge
         primary?.SendFrame(op, payload);
     }
 
+    /// <summary>
+    /// One recipient's share of an SA_BYPASS_TO_CLIENT: queue it in that Ticket's reorder buffer
+    /// and drain in sequence order. An unknown Ticket goes through <see cref="RouteToClient"/>'s
+    /// single-session fallback (or is dropped).
+    /// </summary>
+    private void DeliverTunnelPacket(uint ticket, uint seq, byte[] clientPkt)
+    {
+        List<(uint k, byte[] p)>? deliver = null;
+        lock (_reorderLock)
+        {
+            TunnelReorderBuffer? buf = null;
+            if (!_tunnels.TryGetValue(ticket, out buf) && _tunnels.Count == 1)
+                foreach (var b in _tunnels.Values) { buf = b; break; }
+            if (buf != null)
+            {
+                buf.Pending[seq] = clientPkt;
+                deliver = DrainInOrder(ticket, buf);
+            }
+        }
+        if (deliver != null) { foreach (var (k, p) in deliver) RouteToClient(k, p); return; }
+        RouteToClient(ticket, clientPkt);   // logs + drops with 2+ sessions
+    }
+
     public void TunnelFromClient(ulong gameId, byte[] clientPacket)
     {
-        var payload = new byte[24 + clientPacket.Length];
-        BitConverter.GetBytes(30).CopyTo(payload, 0);
-        BitConverter.GetBytes(clientPacket.Length).CopyTo(payload, 4);
-        BitConverter.GetBytes(gameId).CopyTo(payload, 8);
-        BitConverter.GetBytes((ulong)Environment.TickCount64).CopyTo(payload, 16);
-        clientPacket.CopyTo(payload, 24);
+        // The real Arbiter refuses to tunnel a packet of 0x1F41+ bytes and kicks instead.
+        if (!TunnelFrames.IsTunnellable(clientPacket)) return;
         ushort cop = clientPacket.Length >= 4 ? (ushort)(clientPacket[2] | (clientPacket[3] << 8)) : (ushort)0;
         _log.LogTrace("TUNNEL C->W client-op={Cop} len={Len}", cop, clientPacket.Length);
-        SendFrame(OpTunnelFromClient, payload);
+        SendFrame(OpTunnelFromClient,
+            TunnelFrames.BuildBypassToWorld(gameId, clientPacket, (ulong)Environment.TickCount64));
     }
 
     /// <summary>
