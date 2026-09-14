@@ -87,6 +87,7 @@ public static class HandlerRegistry
                 SocialHandlers.SendUpdateFriendInfo(s);      // real Arbiter sends it too (cap_newchar_client frame 307)
                 ClientSettingsHandlers.SendAccountSetting(s);
                 ClientSettingsHandlers.SendUserSetting(s);
+                ParcelHandlers.SendReadRecvStatus(s);        // T42: 13-byte S_PARCEL_READ_RECV_STATUS (cap frame 312)
                 return true;
             }
             return login.OnLoadTopoFin(s, body);
@@ -122,6 +123,12 @@ public static class HandlerRegistry
         var gm = new GmCommandHandlers(loggerFactory.CreateLogger<GmCommandHandlers>());
         Reg("C_ADMIN", 4, gm.OnAdminCommand);
         Reg("C_OP_COMMAND", 4, gm.OnOpCommand);
+
+        // --- Parcels (T42, status/MAIL-WAREHOUSE.md): the three client packets the Arbiter owns ---
+        var parcels = new ParcelHandlers(loggerFactory.CreateLogger<ParcelHandlers>());
+        Reg("C_SHOW_PARCEL_MESSAGE", 4, parcels.OnShowParcelMessage);
+        Reg("C_PARCEL_READ_RECV_STATUS", 0, parcels.OnParcelReadRecvStatus);
+        Reg("C_PARCEL_REPORT", 10, parcels.OnParcelReport);
 
         // --- Client settings (Arbiter-owned) ---
         Reg("C_REQUEST_CLIENT_CHAT_OPTION_SETTING", 0, ClientSettingsHandlers.OnRequestChatOption);
