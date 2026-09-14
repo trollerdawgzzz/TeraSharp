@@ -910,35 +910,35 @@ dumper guard proves. **The wiring must call this, not `defs.Get(name)`.**
 
 ### The wiring diff — human-owned files, not applied
 
-**1. `Handlers/HandlerRegistry.cs`** — after the social block:
+Since **T41** the sends are not part of this diff: `World/ActionDispatcher.cs` walks any
+subsystem's action list and performs them. `GuildActions` implements `IArbiterActions` and every
+item in it implements `IArbiterAction`, so the guild wiring is the dispatcher (built once, shared
+with parties), a resolver, and one line per call site.
+
+**0. `Program.cs`** — the one dispatcher. Identical to the block in
+`status/PARTY-DESIGN.md` section 10; build it once and both subsystems use it:
 
 ```csharp
-        // --- Guilds: Arbiter-owned reads/writes (T39). status/GUILD-DESIGN.md section 10.
+        var actions = ActionDispatcher.ForSessions(
+            ticket   => worldBridge.SessionForTicket(ticket),      // parties
+            playerId => GameSession.ByPlayerId(playerId),          // guilds; step 2
+            (op, payload) => Program.World?.SendFrame(op, payload) ?? false,
+            loggerFactory.CreateLogger<ActionDispatcher>())
+        { ResolveDef = n => GuildHandlers.ResolveDef(null, n) };
+```
+
+**`ResolveDef` is not optional for guilds.** `GameSession.SendByDef` resolves the packet
+definition from the SHIPPED `DefinitionRegistry`, and ten of the guild .def files are wrong
+(section 5.5). Without that one line a handler emitting `S_ADD_GUILD_MEMBER` puts the .def's
+0x33-byte body on the wire instead of the 0x38 the Arbiter's own dumper guard proves. Passing a
+null registry makes `ResolveDef` return the corrections and nothing else, so every other packet
+still takes the ordinary path. `Dispatcher_encodes_with_the_corrected_def_when_one_resolves` is
+the test that fails if this line is dropped.
+
+**1. `Handlers/HandlerRegistry.cs`** — the seventeen packets `GuildHandlers` answers:
+
+```csharp
         var guild = new GuildHandlers(Program.Store!, loggerFactory.CreateLogger<GuildHandlers>());
-        void RegGuild(string name)
-        {
-            if (!opcodes.TryGetCode(name, out ushort op)) { log.LogError("{Name} not in opcode map", name); return; }
-            if (!GuildHandlers.Handles(op)) { log.LogError("{Name} is not answered by GuildHandlers", name); return; }
-            dispatcher.Register(op, name, GuildPackets.MinClientLength(op), (s, body) =>
-            {
-                var actions = guild.OnClientPacket(s.PlayerId, op, body.ToArray());
-                if (actions.Rejected != null) log.LogDebug("{Name}: {Why}", name, actions.Rejected);
-                foreach (var c in actions.ToClients)
-                {
-                    var target = GameSession.ByPlayerId(c.CharacterId);   // null = offline, drop it
-                    if (target == null) continue;
-                    if (c.IsRaw) target.Send(c.RawPacket!);
-                    else
-                    {
-                        var def = GuildHandlers.ResolveDef(defs, c.PacketName);   // NOT defs.Get
-                        if (def == null) { log.LogError("no def for {P}", c.PacketName); continue; }
-                        target.Send(target.Frame(c.PacketName, new DefinitionWriter().Write(def, c.Fields!)));
-                    }
-                }
-                foreach (var w in actions.ToWorld) Program.World?.SendFrame(w.Opcode, w.Payload);
-                return true;
-            });
-        }
         foreach (var name in new[]
         {
             "C_REQUEST_GUILD_INFO", "C_REQUEST_GUILD_MEMBER_LIST", "C_GET_GUILD_HISTORY",
@@ -947,31 +947,57 @@ dumper guard proves. **The wiring must call this, not `defs.Get(name)`.**
             "C_REQUEST_COOLTIME_TO_JOIN_GUILD", "C_REQUEST_GUILD_INFO_BEFORE_APPLY_GUILD",
             "C_CHECK_CHANGE_GUILDNAME", "C_APPLY_GUILD", "C_ACCEPT_GUILD_APPLY",
             "C_REJECT_INVITE_USER_TO_GUILD", "C_REQUEST_UPDATE_ANNOUNCE", "C_REQUEST_UPDATE_INTRODUCE",
-        }) RegGuild(name);
+        })
+        {
+            if (!opcodes.TryGetCode(name, out ushort op)) { log.LogError("{Name} not in opcode map", name); continue; }
+            if (!GuildHandlers.Handles(op)) { log.LogError("{Name} is not answered by GuildHandlers", name); continue; }
+            dispatcher.Register(op, name, GuildPackets.MinClientLength(op), (s, body) =>
+            {
+                actions.Dispatch(guild.OnClientPacket((int)s.PlayerId, op, body.ToArray()), "guild");
+                return true;
+            });
+        }
 ```
 
-Two things this needs that may not exist yet, both in human-owned files:
+That is the whole call site: no session lookup, no def resolution, no rejection logging. A
+rejection goes back to `s` as S_SYSTEM_MESSAGE_CUSTOM — the literal channel every Arbiter-side GM
+command already answers on — because `OnClientPacket` stamps
+`Origin = Recipient.Player(characterId)`.
 
-* **`GameSession.ByPlayerId(int)`** — a db id → session lookup. The same thing
-  `status/MULTIPLAYER-DESIGN.md` §6 needs for party routing; if that lands first, reuse it.
-  Until it exists, the single-player shortcut is `c.CharacterId == s.PlayerId ? s : null`, which
-  is correct for every self-addressed reply and silently drops the broadcasts.
-* **`GameSession.Frame(name, body)`** — whatever `SendByDef` already uses internally to prepend
-  `[u16 len][u16 opcode]`. If `SendByDef` can take a pre-encoded body, call that instead.
+`GuildPackets.MinClientLength(op)` is the real handler's own guard, so a short packet is rejected
+by `PacketDispatcher` before `GuildHandlers` sees it.
 
-**2. The ten World-side guild `C_` packets must be tunnelled, not answered.** They are in
-§5.2 and in `GuildPackets.ArbiterHandlesClientPacket`. If the dispatcher already forwards
-anything unregistered to World, nothing is needed; if not, register them with the existing
-`RegNoop`-style forward. Answering one in the Arbiter double-answers the client, because World
-answers it too.
+**2. `Network/GameSession.cs`** — the db id → session lookup the dispatcher's second resolver
+needs:
 
-**3. `World/DbProxyHandlers.cs`** (Cowork-editable, deliberately not done here) — the guild boot
+```csharp
+    private static readonly ConcurrentDictionary<uint, GameSession> _byPlayerId = new();
+    /// <summary>The in-world session for a character db id, or null. Guild broadcasts name every
+    /// member and most are usually offline, so null is the normal answer, not an error.</summary>
+    public static GameSession? ByPlayerId(int playerId)
+        => _byPlayerId.TryGetValue(unchecked((uint)playerId), out var s) ? s : null;
+```
+
+filled where `PlayerId` is assigned on entering the world and removed on the leave path. This is
+the same lookup `status/MULTIPLAYER-DESIGN.md` section 6 needs for chat and whisper targets; if
+that lands first, reuse it and delete this step.
+
+Until it exists, `playerId => playerId == currentSession.PlayerId ? currentSession : null` is
+correct for every self-addressed reply and silently drops the broadcasts — which is exactly the
+single-player behaviour we have today.
+
+**3. The ten World-side guild `C_` packets must be tunnelled, not answered.** They are in
+section 5.2 and in `GuildPackets.ArbiterHandlesClientPacket`. If the dispatcher already forwards
+anything unregistered to World, nothing is needed. Answering one in the Arbiter double-answers
+the client, because World answers it too.
+
+**4. `World/DbProxyHandlers.cs`** (Cowork-editable, deliberately not done here) — the guild boot
 load. `SDB_INIT_GUILD` (0x27CF) is answered today by `WorldReplayTable` with `arb_world.log`'s
-bytes, which carry two leaked padding bytes (§2.1). With rows to build from, the answer becomes
-the §4.3 sequence: `DBS_INIT_GUILD_DATA` per guild → `0x27D0` → `0x27D1` → `0x27D2` → `0x27D3`,
-then a final `DBS_INIT_GUILD_DATA` with `Success = 0`. With no guilds in the DB that collapses to
-`GuildPackets.BuildEmptyDbsInitGuildData()`, which is byte-identical to the capture apart from
-the leak. That is a one-line replay change and a real win on its own.
+bytes, which carry two leaked padding bytes (section 2.1). With rows to build from, the answer
+becomes the section 4.3 sequence: `DBS_INIT_GUILD_DATA` per guild → `0x27D0` → `0x27D1` →
+`0x27D2` → `0x27D3`, then a final `DBS_INIT_GUILD_DATA` with `Success = 0`. With no guilds in the
+DB that collapses to `GuildPackets.BuildEmptyDbsInitGuildData()`, which is byte-identical to the
+capture apart from the leak. That is a one-line replay change and a real win on its own.
 
 ### What is NOT modelled
 

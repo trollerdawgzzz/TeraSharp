@@ -8261,6 +8261,369 @@ public bool TryHandle(WorldBridge bridge, WorldLink link, ushort op, byte[] payl
                "S_GUILD_HISTORY: shipped .def == builder");
     }
 
+
+    // =======================================================================================
+    // T41 - ActionDispatcher. One place PartyManager's and GuildHandlers' action lists turn
+    // into sends. The sends go through IClientSink, so these tests use a recording fake and
+    // never need a socket; ActionDispatcher.ForSessions binds the same interface to the real
+    // GameSession, whose Send / SendByDef / SendRawBody have exactly these signatures.
+    // =======================================================================================
+
+    /// <summary>Records what was sent and by which of the three routes.</summary>
+    sealed class FakeSink : IClientSink
+    {
+        public readonly List<string> Log = new();
+        public readonly List<byte[]> Bodies = new();
+        /// <summary>Simulates a socket that has already gone away underneath us.</summary>
+        public bool Throws;
+
+        public void SendByDef(string packetName, IReadOnlyDictionary<string, object> fields)
+        { Boom(); Log.Add($"def:{packetName}"); }
+
+        public void SendRawBody(string packetName, byte[] body)
+        { Boom(); Log.Add($"body:{packetName}:{body.Length}"); Bodies.Add(body); }
+
+        public void Send(byte[] framedPacket)
+        { Boom(); Log.Add($"raw:{framedPacket.Length}"); }
+
+        private void Boom() { if (Throws) throw new InvalidOperationException("socket is gone"); }
+    }
+
+    /// <summary>An IArbiterClientAction the tests can build in any shape - the real two are each
+    /// locked to one recipient kind and one payload kind.</summary>
+    readonly record struct TestClientAction(
+        Recipient To, string PacketName, IReadOnlyDictionary<string, object>? Fields,
+        byte[]? RawPacket, byte[]? RawBody) : IArbiterClientAction;
+
+    /// <summary>A scripted action set, so emission order can be stated rather than coaxed out of
+    /// a manager.</summary>
+    sealed class ScriptedActions : IArbiterActions
+    {
+        private readonly List<IArbiterAction> _ordered = new();
+        public Recipient Origin { get; set; } = Recipient.None;
+        public IReadOnlyList<IArbiterAction> Ordered => _ordered;
+        public string? Rejected { get; set; }
+
+        public ScriptedActions Def(Recipient to, string name, IReadOnlyDictionary<string, object>? fields = null)
+        { _ordered.Add(new TestClientAction(to, name, fields ?? new Dictionary<string, object>(), null, null)); return this; }
+
+        public ScriptedActions Raw(Recipient to, byte[] packet)
+        { _ordered.Add(new TestClientAction(to, "(raw)", null, packet, null)); return this; }
+
+        public ScriptedActions Body(Recipient to, string name, byte[] body)
+        { _ordered.Add(new TestClientAction(to, name, null, null, body)); return this; }
+
+        /// <summary>Neither fields nor bytes - a bug in an emitter, which the dispatcher must
+        /// survive rather than propagate.</summary>
+        public ScriptedActions Malformed(Recipient to, string name)
+        { _ordered.Add(new TestClientAction(to, name, null, null, null)); return this; }
+
+        public ScriptedActions WorldFrame(ushort op, params byte[] payload)
+        { _ordered.Add(new WorldAction(op, payload)); return this; }
+    }
+
+    /// <summary>A dispatcher over a fixed session table, plus the World log it wrote to.</summary>
+    sealed class DispatchHarness
+    {
+        public readonly Dictionary<uint, FakeSink> ByTicket = new();
+        public readonly Dictionary<int, FakeSink> ByPlayer = new();
+        public readonly List<(ushort Op, byte[] Payload)> WorldLog = new();
+        public bool WorldRefuses;
+        public ActionDispatcher Dispatcher = null!;
+
+        public FakeSink Ticket(uint t) { var s = new FakeSink(); ByTicket[t] = s; return s; }
+        public FakeSink Player(int p) { var s = new FakeSink(); ByPlayer[p] = s; return s; }
+
+        public DispatchHarness Build(Func<string, TeraSharp.Arbiter.Protocol.PacketDef?>? resolveDef = null,
+            bool relayRejections = true)
+        {
+            Dispatcher = new ActionDispatcher(
+                t => ByTicket.TryGetValue(t, out var s) ? s : null,
+                p => ByPlayer.TryGetValue(p, out var s) ? s : null,
+                (op, payload) => { if (WorldRefuses) return false; WorldLog.Add((op, payload)); return true; },
+                QuietLog())
+            { ResolveDef = resolveDef, RelayRejections = relayRejections };
+            return this;
+        }
+    }
+
+    static Recipient ToTicket(uint t) => Recipient.Ticket(t);
+    static Recipient ToPlayer(int p) => Recipient.Player(p);
+
+    /// <summary>
+    /// The whole point of the Ordered list: a subsystem that emits client, world, client gets
+    /// them sent in that order. The two typed lists PartyActions/GuildActions also expose cannot
+    /// express this - reading ToClients then ToWorld reorders every interleaving.
+    /// </summary>
+    [Test] public static void Dispatcher_preserves_emission_order()
+    {
+        var h = new DispatchHarness().Build();
+        var a = h.Ticket(7);
+        var b = h.Player(3);
+
+        var r = h.Dispatcher.Dispatch(new ScriptedActions()
+            .Def(ToTicket(7), "S_FIRST")
+            .WorldFrame(0x1234, 1, 2)
+            .Def(ToPlayer(3), "S_SECOND")
+            .WorldFrame(0x5678, 3)
+            .Def(ToTicket(7), "S_THIRD"), "test");
+
+        Hex.True(r.ClientsSent == 3 && r.WorldSent == 2 && r.ClientsDropped == 0, $"counts: {r}");
+        Hex.True(string.Join(",", a.Log) == "def:S_FIRST,def:S_THIRD", string.Join(",", a.Log));
+        Hex.True(string.Join(",", b.Log) == "def:S_SECOND", string.Join(",", b.Log));
+        Hex.True(h.WorldLog.Count == 2 && h.WorldLog[0].Op == 0x1234 && h.WorldLog[1].Op == 0x5678,
+            "World frames kept their order");
+        Hex.True(h.WorldLog[0].Payload.Length == 2 && h.WorldLog[1].Payload.Length == 1, "payloads intact");
+    }
+
+    /// <summary>
+    /// A guild-wide broadcast names every member and most are offline. That is the normal case,
+    /// not an error: the missing one is logged and skipped, everything after it still goes out,
+    /// and the count says so.
+    /// </summary>
+    [Test] public static void Dispatcher_drops_an_unresolvable_recipient_and_keeps_going()
+    {
+        var h = new DispatchHarness().Build();
+        var before = h.Player(1);
+        var after = h.Player(3);           // player 2 is deliberately absent from the table
+
+        var r = h.Dispatcher.Dispatch(new ScriptedActions()
+            .Def(ToPlayer(1), "S_ONE").Def(ToPlayer(2), "S_TWO").Def(ToPlayer(3), "S_THREE"), "test");
+
+        Hex.True(r.ClientsSent == 2 && r.ClientsDropped == 1, $"counts: {r}");
+        Hex.True(before.Log.Count == 1 && after.Log.Count == 1, "the ones either side still got theirs");
+        Hex.True(r.AnythingSent, "AnythingSent is true when two of three landed");
+    }
+
+    /// <summary>The three payload shapes take three different routes: a framed packet goes out
+    /// whole, a body is framed by name, and fields are encoded.</summary>
+    [Test] public static void Dispatcher_routes_raw_packets_bodies_and_fields_differently()
+    {
+        var h = new DispatchHarness().Build();
+        var s = h.Ticket(7);
+
+        h.Dispatcher.Dispatch(new ScriptedActions()
+            .Raw(ToTicket(7), new byte[] { 8, 0, 0x4C, 0x99, 1, 2, 3, 4 })
+            .Body(ToTicket(7), "S_SOMETHING", new byte[] { 9, 9, 9 })
+            .Def(ToTicket(7), "S_FIELDS"), "test");
+
+        Hex.True(string.Join(",", s.Log) == "raw:8,body:S_SOMETHING:3,def:S_FIELDS",
+            string.Join(",", s.Log));
+    }
+
+    /// <summary>An action with neither fields nor bytes is a bug in the emitter. The dispatcher
+    /// logs it and carries on rather than taking the connection down.</summary>
+    [Test] public static void Dispatcher_drops_a_malformed_action_without_throwing()
+    {
+        var h = new DispatchHarness().Build();
+        var s = h.Ticket(7);
+        var r = h.Dispatcher.Dispatch(new ScriptedActions()
+            .Malformed(ToTicket(7), "S_NOTHING").Def(ToTicket(7), "S_REAL"), "test");
+        Hex.True(r.ClientsSent == 1 && r.ClientsDropped == 1, $"counts: {r}");
+        Hex.True(string.Join(",", s.Log) == "def:S_REAL", string.Join(",", s.Log));
+    }
+
+    /// <summary>
+    /// The hook that makes T39's .def corrections real. GameSession.SendByDef resolves from the
+    /// SHIPPED registry, so without ResolveDef a guild handler emitting S_ADD_GUILD_MEMBER would
+    /// put the .def's 0x33-byte body on the wire. With it, the dispatcher encodes and sends a
+    /// body - and that body carries the 0x38 fixed part the Arbiter's dumper guard proves.
+    /// </summary>
+    [Test] public static void Dispatcher_encodes_with_the_corrected_def_when_one_resolves()
+    {
+        var h = new DispatchHarness().Build(resolveDef: n => GuildHandlers.ResolveDef(null, n));
+        var s = h.Player(2);
+
+        // a packet with no correction takes the ordinary SendByDef route
+        h.Dispatcher.Dispatch(new ScriptedActions().Def(ToPlayer(2), "S_NO_CORRECTION_FOR_THIS"), "guild");
+        Hex.True(string.Join(",", s.Log) == "def:S_NO_CORRECTION_FOR_THIS", string.Join(",", s.Log));
+
+        s.Log.Clear();
+        var member = new Dictionary<string, object>
+        {
+            ["memberDbId"] = 11, ["name"] = "dob", ["worldId"] = 1, ["guardId"] = 2, ["sectionId"] = 3,
+            ["groupId"] = 4, ["userLevel"] = 60, ["race"] = 5, ["userClass"] = 6, ["state"] = 0,
+            ["gender"] = 1, ["lastLogoutTime"] = 0L, ["isWorldEventTarget"] = false,
+            ["cityWarCompensationStatus"] = false,
+        };
+        h.Dispatcher.Dispatch(new ScriptedActions().Def(ToPlayer(2), "S_ADD_GUILD_MEMBER", member), "guild");
+
+        Hex.True(s.Log.Count == 1 && s.Log[0].StartsWith("body:S_ADD_GUILD_MEMBER:"),
+            $"the corrected def routes through SendRawBody: {string.Join(",", s.Log)}");
+        Hex.True(BitConverter.ToUInt16(s.Bodies[0], 0) == 0x38,
+            $"fixed part 0x{BitConverter.ToUInt16(s.Bodies[0], 0):X2}, want 0x38 - the correction reached the wire");
+    }
+
+    /// <summary>
+    /// A rejection is not a log line the player never sees: it goes back to the session that
+    /// caused it, as S_SYSTEM_MESSAGE_CUSTOM - the same literal channel every Arbiter-side GM
+    /// command answers on (GmCommandHandlers.SendCustom).
+    /// </summary>
+    [Test] public static void Dispatcher_relays_the_rejection_to_the_originator()
+    {
+        var h = new DispatchHarness().Build();
+        var origin = h.Player(5);
+        var other = h.Player(6);
+
+        var r = h.Dispatcher.Dispatch(new ScriptedActions
+        {
+            Origin = ToPlayer(5),
+            Rejected = "C_APPLY_GUILD: applicant is already in a guild",
+        }.Def(ToPlayer(6), "S_SOMETHING_ELSE"), "guild");
+
+        Hex.True(r.RejectionSent, "the rejection was relayed");
+        Hex.True(string.Join(",", origin.Log) == $"def:{ActionDispatcher.RejectionPacket}",
+            string.Join(",", origin.Log));
+        Hex.True(string.Join(",", other.Log) == "def:S_SOMETHING_ELSE",
+            "the other recipient got its own packet and not the rejection");
+        Hex.True(ActionDispatcher.RejectionPacket == "S_SYSTEM_MESSAGE_CUSTOM"
+                 && ActionDispatcher.RejectionField == "formatted",
+            "the literal form GmCommands already uses");
+    }
+
+    /// <summary>An OnWorldFrame input has no originating client, so its rejection has nowhere to
+    /// go. That is a log line, not an error, and nothing else in the set is affected.</summary>
+    [Test] public static void Dispatcher_keeps_an_unaddressed_rejection_in_the_log()
+    {
+        var h = new DispatchHarness().Build();
+        var s = h.Ticket(7);
+        var r = h.Dispatcher.Dispatch(new ScriptedActions
+        {
+            Origin = Recipient.None,
+            Rejected = "SA_JOIN_PARTY: short frame",
+        }.Def(ToTicket(7), "S_STILL_SENT"), "party");
+
+        Hex.True(!r.RejectionSent, "nothing to relay it to");
+        Hex.True(r.ClientsSent == 1, "the rest of the set still went out");
+        Hex.True(string.Join(",", s.Log) == "def:S_STILL_SENT", string.Join(",", s.Log));
+    }
+
+    /// <summary>RelayRejections = false keeps it out of the client's face entirely.</summary>
+    [Test] public static void Dispatcher_can_be_told_not_to_relay_rejections()
+    {
+        var h = new DispatchHarness().Build(relayRejections: false);
+        var origin = h.Player(5);
+        var r = h.Dispatcher.Dispatch(new ScriptedActions { Origin = ToPlayer(5), Rejected = "nope" }, "guild");
+        Hex.True(!r.RejectionSent && origin.Log.Count == 0, "silent");
+    }
+
+    /// <summary>A socket that died between the manager deciding and the dispatcher sending is a
+    /// dropped packet, not an exception out of Dispatch.</summary>
+    [Test] public static void Dispatcher_survives_a_sink_that_throws()
+    {
+        var h = new DispatchHarness().Build();
+        var bad = h.Player(1); bad.Throws = true;
+        var good = h.Player(2);
+
+        var r = h.Dispatcher.Dispatch(new ScriptedActions()
+            .Def(ToPlayer(1), "S_ONE").Def(ToPlayer(2), "S_TWO"), "test");
+
+        Hex.True(r.ClientsSent == 1 && r.ClientsDropped == 1, $"counts: {r}");
+        Hex.True(good.Log.Count == 1, "the healthy session still got its packet");
+    }
+
+    /// <summary>World refusing a frame is counted, not thrown, and does not stop the client
+    /// sends that follow it.</summary>
+    [Test] public static void Dispatcher_counts_a_refused_world_frame()
+    {
+        var h = new DispatchHarness().Build();
+        h.WorldRefuses = true;
+        var s = h.Ticket(7);
+        var r = h.Dispatcher.Dispatch(new ScriptedActions()
+            .WorldFrame(0x140A, 1, 2, 3).Def(ToTicket(7), "S_AFTER"), "guild");
+        Hex.True(r.WorldFailed == 1 && r.WorldSent == 0, $"counts: {r}");
+        Hex.True(r.ClientsSent == 1 && s.Log.Count == 1, "the client send after it still happened");
+    }
+
+    /// <summary>
+    /// The two id spaces are genuinely separate tables: ticket 5 and player 5 are different
+    /// recipients. PartyManager addresses by ticket (GameSession.TunnelKey), GuildHandlers by
+    /// character db id (GameSession.PlayerId), and a dispatcher that confused them would look
+    /// like it worked until two players collided.
+    /// </summary>
+    [Test] public static void Dispatcher_keeps_the_ticket_and_player_tables_apart()
+    {
+        var h = new DispatchHarness().Build();
+        var byTicket = h.Ticket(5);
+        var byPlayer = h.Player(5);
+
+        h.Dispatcher.Dispatch(new ScriptedActions()
+            .Def(ToTicket(5), "S_VIA_TICKET").Def(ToPlayer(5), "S_VIA_PLAYER"), "test");
+        Hex.True(string.Join(",", byTicket.Log) == "def:S_VIA_TICKET", string.Join(",", byTicket.Log));
+        Hex.True(string.Join(",", byPlayer.Log) == "def:S_VIA_PLAYER", string.Join(",", byPlayer.Log));
+    }
+
+    /// <summary>
+    /// The real thing, party side: PartyManager's own output, unmodified, dispatched. Proves the
+    /// interface extraction did not change what the manager emits, and that a ticket which is not
+    /// in the session table is simply skipped.
+    /// </summary>
+    [Test] public static void Dispatcher_sends_a_real_PartyActions()
+    {
+        var pm = NewPartyManager();
+        pm.Register(P(10, 1, "dob"));
+        pm.Register(P(11, 2, "Test"));
+
+        var h = new DispatchHarness().Build();
+        var applicant = h.Ticket(11);
+        var target = h.Ticket(10);
+
+        var apply = pm.OnClientPacket(11, PartyPackets.C_APPLY_PARTY, BitConverter.GetBytes(1));
+        Hex.True(apply.Origin.Kind == RecipientKind.Ticket && apply.Origin.Id == 11,
+            "the origin is the ticket that sent the packet");
+        Hex.True(apply.Ordered.Count == apply.ToClients.Count + apply.ToWorld.Count,
+            "Ordered holds exactly the same items as the two typed lists");
+
+        var r = h.Dispatcher.Dispatch(apply, "party");
+        Hex.True(r.ClientsSent == 1 && target.Log.Count == 1,
+            $"S_OTHER_USER_APPLY_PARTY goes to the TARGET, not the applicant: {r}");
+        Hex.True(applicant.Log.Count == 0, "the applicant hears nothing");
+
+        // a World frame input: no origin, so its rejection cannot be relayed
+        var bad = pm.OnWorldFrame(PartyPackets.SA_JOIN_PARTY, new byte[4]);
+        Hex.True(bad.Origin.Kind == RecipientKind.None, "a World frame has no origin");
+        var r2 = h.Dispatcher.Dispatch(bad, "party");
+        Hex.True(!r2.RejectionSent, "and its rejection stays in the log");
+    }
+
+    /// <summary>
+    /// The real thing, guild side: the create -&gt; apply -&gt; accept path dispatched end to end,
+    /// with the joining member offline. Order is checked against the emission order, not against
+    /// the two typed lists - the accept emits S_ADD_GUILD_MEMBER to both members and only THEN
+    /// the two World frames, and that is what has to reach the wire.
+    /// </summary>
+    [Test] public static void Dispatcher_sends_a_real_GuildActions()
+    {
+        using var store = GuildStore();
+        var g = NewGuildHandlers(store);
+        var h = new DispatchHarness().Build(resolveDef: n => GuildHandlers.ResolveDef(null, n));
+
+        var setup = new GuildActions();
+        g.CreateGuild(setup, 1, "Ere");
+        Hex.True(setup.Origin.Kind == RecipientKind.PlayerId && setup.Origin.Id == 1,
+            "CreateGuild stamps the founder as the origin");
+
+        var chief = h.Player(1);           // character 2 is NOT in the session table
+        g.OnClientPacket(2, GuildPackets.C_APPLY_GUILD, CApplyGuildBody("Ere", "hi"));
+        var accept = g.OnClientPacket(1, GuildPackets.C_ACCEPT_GUILD_APPLY, CAcceptGuildApplyBody(true, 2));
+
+        Hex.True(accept.Ordered.Count == accept.ToClients.Count + accept.ToWorld.Count,
+            "Ordered holds exactly the same items as the two typed lists");
+
+        var r = h.Dispatcher.Dispatch(accept, "guild");
+        Hex.True(r.ClientsDropped == 1, $"the joiner is offline and is skipped: {r}");
+        Hex.True(r.WorldSent == 2, $"both World frames went: {r}");
+        Hex.True(h.WorldLog[0].Op == GuildPackets.AS_ADD_GUILDMEMBER
+                 && h.WorldLog[1].Op == GuildPackets.AS_GUILD_JOINED,
+            "AS_ADD_GUILDMEMBER before AS_GUILD_JOINED, as GuildUtil::UserJoinToGuild sends them");
+
+        // the chief's S_ADD_GUILD_MEMBER went out as a corrected body, not through SendByDef
+        Hex.True(chief.Log.Count > 0 && chief.Log[0].StartsWith("body:S_ADD_GUILD_MEMBER:"),
+            $"S_ADD_GUILD_MEMBER took the corrected-def route: {string.Join(",", chief.Log)}");
+        Hex.True(BitConverter.ToUInt16(chief.Bodies[0], 0) == 0x38,
+            "and carries the 0x38 fixed part, not the .def's 0x33");
+    }
+
     /// <summary>The .def folder, or null with a printed note (the tests run where the repo is).</summary>
     static TeraSharp.Arbiter.Protocol.DefinitionRegistry? LoadDefinitionsOrSkip()
     {
