@@ -21,13 +21,13 @@ back in the matching load.
 | 0x278E SDB_USER_LEARN_SKILL (896 B)               | 0x278F        | 23-B header + the fee atoms + EMPTY SkillPeriodData list | 1 | **real (T15)** |
 | 0x27FA SDB_UPDATE_USER_ACHIEVEMENT (1478-1558 B)  | 0x27FB        | [u32 reqId][u8 ok], reqId at [280]            | 4     | **real (T22)**, the whole payload persisted and served back by 0x27F9 |
 | 0x2802 SDB_ACCOMPLISH_USER_ACHIEVEMENT (46 B)     | 0x2803        | 13-B header + the NEWLY accomplished records (43 B) or none (19 B) | 3 | **real (T22)**, persisted first-write-wins; the 19-B form now happens for the right reason |
-| 0x2891 SDB_UPDATE_REPUTATION_INFO (78 B)          | 0x2892        | [u8 ok][u32 reqId] - ok FIRST                 | 1     | **real (T15)** |
+| 0x2891 SDB_UPDATE_REPUTATION_INFO (78 B)          | 0x2892        | [u8 ok][u32 reqId] - ok FIRST, ok=0 for an UpdateType that is neither 1, 2 nor 4 | 1 | **real (T26)**, the 52-B record persisted and served back by 0x2890 |
 | 0x286E SDB_ADD_TUTORIAL_SIMPLE_TIP (18 B)         | 0x286F        | [u32 reqId][u8 ok]                            | 4     | **real (T22)**, persisted and served back by 0x2873 |
 | 0x2944 SDB_UPDATE_SEREN_GUIDE_INFO (22 B)         | 0x2945        | [u32 reqId][u32 playerId][u8 ok]              | 2     | **real (T22)**, persisted and served back by 0x2943 |
 | 0x293C SDB_UPDATE_USER_DAILY_EVENT_COUNT (58 B)   | 0x293D        | [u32 reqId][u8 ok], reqId at [8]              | 1     | **real (T15)** |
 | 0x293E SDB_UPDATE_GET_EXTRA_REWARD (20 B)         | 0x293F        | [u32 reqId][u8 ok]                            | 1     | **real (T15)** |
 | 0x297B SDB_UPDATE_USER_ACTPOINT (22 B)            | 0x297C        | [u32 reqId][u8 ok]                            | 1     | real (master) |
-| 0x2910 SDB_UPDATE_FATIGABILITY_POINT (23 B)       | 0x2911        | [u8 ok][u32 reqId]                            | 2     | real (the C# const is misnamed SDB_LOAD_FRIEND_INFO) |
+| 0x2910 SDB_UPDATE_FATIGABILITY_POINT (23 B)       | 0x2911        | [u8 ok][u32 reqId]                            | 2     | **real (T26)**, carries a DELTA added to the ACCOUNT total, served back by 0x2909 (const `SDB_FATIGABILITY_UPDATE`; the old `SDB_LOAD_FRIEND_INFO` name is a documented alias) |
 | 0x2924 SDB_UPDATE_PASSIVITY_COOLTIME              | 0x2925        | [u32 reqId][u8 ok]                            | logout| real |
 | 0x2936 SDB_CHECK_DAILY_ATTENDANCE                 | 0x2937        | [u32 reqId][u32 0x300][u32 0]                 | login+logout | real |
 | 0x2930 SDB_UPDATE_HOLD_CHARACTER_STATUS           | 0x2931        | [u32 reqId][u8 ok][u8 0]                      | spawn | real |
@@ -35,13 +35,18 @@ back in the matching load.
 | 0x2736 SDB_END_START_QUEST_LIST (10 B)            | 0x2737        | [u32 reqId][u8 ok]                            | many  | real |
 | 0x27CB SDB_UPDATE_USER_DATA (blob)                | 0x27CC        | [u32 reqId][u32 1]                            | spawn, zone change, logout | real, persisted (SQLite) |
 | 0x2927 SDB_CANCEL_NPC_ARENA_BET (14 B)            | none          | fire-and-forget - the Arbiter handler has no SendToSession | periodic | **one-way (T15)**, in WorldReplayTable.OneWayFromWorld |
+| 0x13B6 SA_UPDATE_DUNGEON_COOLTIME (74 B)          | none          | one-way; the 52-B CoolTimeElem is persisted | 1 | **real (T25)**, served back by 0x2868 and 0x148D |
+| 0x13B7 SA_UPDATE_DUNGEON_CLEAR_COUNT (22 B)       | none          | one-way; stored, not served (ClearCountElem layout unobserved) | 0 | **real (T25)** |
+| 0x13BD SA_DELETE_DUNGEON_COOLTIME (18 B)          | none          | one-way; clears the cool time, keeps the clear count | 0 | **real (T25)** |
 | 0x138D SA_ENTER_WORLD_FAIL (38 B)                 | 0x148D        | two AS_CACHE_DUNGEON_COOL_TIME_TO_WORLD pushes, then a re-sent 0x138E with the stored return point | relog into an instance | **real (T21)**, status/ENTER-WORLD-FALLBACK.md |
 
 The login LOADS those writes feed are in `status/ACHIEVEMENTS.md`: `0x27F8` -> `0x27F9`,
-`0x2872` -> `0x2873`, `0x2942` -> `0x2943` and `0x2867` -> `0x2868` are rebuilt from rows as of
-T22 and byte-exact for a brand-new character and for one with progress. `0x288F` -> `0x2890`
-(reputation) and `0x2908` -> `0x2909` (fatigability) are still dob's captured bytes: neither
-layout is pinnable from the captures we have, and that file says exactly what would settle each.
+`0x2872` -> `0x2873` and `0x2942` -> `0x2943` are rebuilt from rows as of T22, and
+`0x2867` -> `0x2868` from `dungeon_cooldowns` as of T25 (`status/DUNGEON-COOLTIME.md`); all are
+byte-exact for a brand-new character and for one with progress. `0x288F` -> `0x2890`
+(reputation) and `0x2908` -> `0x2909` (fatigability) followed in T26, pinned from the decompile
+rather than the captures — `status/REPUTATION-FATIGABILITY.md`. Fatigability is the one load
+keyed on the ACCOUNT, not the character.
 
 Every row above is covered by a test: `Every_per_user_request_opcode_is_answered` parses this
 table and fails the build if an opcode is neither in `DbProxyHandlers.IsHandledRequest` nor in
@@ -116,9 +121,10 @@ NEWLY accomplished, so a repeat comes back as an empty 19-byte frame.
    stored items. Layout: `Handler_SDB_ITEM_SINGLE` + `FUN_…(pkt,0x27a4)` writer. Also 0x2813
    SDB_EQUIP_ITEM (not seen this session — equip via C_EQUIP_ITEM may route differently).
 3. **Level/exp** — 0x273B store into the characters row (level shows in S_GET_USER_LIST).
-4. **Achievements** (0x27FA/0x2802 -> 0x27F9), **reputation** (0x2891 -> 0x2890), **tutorial
-   tips** (0x286E -> 0x2873), **seren guide** (0x2944 -> 0x2943), **daily event** (0x293C -> 0x293B),
-   **fatigability** (0x2910 -> 0x2909) — small, same pattern each.
+4. **Achievements** (0x27FA/0x2802 -> 0x27F9), **tutorial tips** (0x286E -> 0x2873), **seren
+   guide** (0x2944 -> 0x2943) — done in T22; **reputation** (0x2891 -> 0x2890) and
+   **fatigability** (0x2910 -> 0x2909) — done in T26. Still open: **daily event**
+   (0x293C -> 0x293B).
 5. **Skills** — 0x278E is answered as of T15 (the reply is the fee atoms plus an empty
    SkillPeriodData list). Still open: where World reads learned skills from at login. It is not
    0x278F — World's handler only stores the skill-period list and two flags — so the learned set
