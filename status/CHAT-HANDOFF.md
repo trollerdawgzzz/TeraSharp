@@ -124,6 +124,26 @@ and look for the next caller.
 
 ## Next steps (in order)
 
+**CAPTURE 2026-09-15 13:52-13:56 (real Arbiter + T56 tap, two clients): D:\packetlogs\cap_social.log +
+cap_social_client.log (+ _ctl.txt/_frames.txt via tools/reframe-*.ps1).** Contains: party lifecycle
+through contracts (0x2809/0x280B/0x280C/0x280A/0x280D invite, 0x280F/0x2810 accept, 0x13AB -> 0x139E party
+list, 0x13F8 SA_BYPASS_TO_GROUP fan-outs, 0x13BB leave, 0x139D/0x13A6, 0x139B/0x13A4), loot method change,
+mail with an attachment (0x2779 5282 B make -> 0x277A, 0x2777/0x2778 list with a parcel, 0x277B/0x277C
+receive, 0x2811 delete), whisper both ways, friend add/accept/delete, block/unblock (0x1644/0x1645, 0x2862,
+0x1475/0x1476, 0x28C1), guild window opened (no guild created), the six silent windows. Enabler: the
+low-memory config from the community guide (ContinentData initChannelCount=1 everywhere,
+ServerConfig worldSessions=4 clientSessions=8 arbiterClient=1 World threadNum=2) brought World to 13.6 GB
+and the real Arbiter to 1.7 GB - no datasheet trimming needed. Both files live as
+D:\ServerConfig.lowmem.xml / D:\ContinentData.lowmem.xml. Gotchas: tera-api privilege 33 puts the
+character in GM-invisible mode (skills disabled) - use 0 for players; the real Arbiter still refused /@
+(Abuse Command) with Users.adminLevel=5 - not traced. Consumers: T61 (mail), T64 (party/contracts/social
+byte-exact), T63 no longer blocking captures (still useful for a smaller World).
+Cowork assignments at 2026-09-15 14:30: session 1 = T63 on TeraSharp-cowork (cowork/T8); session 2 = T64
+on TeraSharp-cowork2 (cowork/T27); queued T61 (mail, session 2 next), T62 (friend menu / cutscene flag /
+name completion, session 1 next), T58 (selftest completeness + scratch cleanup). Open blockers for the
+next capture: real-Arbiter GM refusal (Abuse Command despite Users.adminLevel=5) - needed for guild
+create (gold), Phargo/warehouse, broker listings.
+
 **2026-09-15 06:20 - 624 tests; T57/T59/T60 merged (character money, guild SA_ handlers, contract broker
 for party invites + C_ADD_TRADE_BAG), all wired, none live-tested yet.** Capture-box work: World
 partial loading is a DATASHEET trim, not a ServerConfig list; six families cleared by hand
