@@ -68,76 +68,90 @@ Read `status/STATUS.md` after this file. Everything you need is on disk. **Read 
 
 ---
 
-## 0. State of play (updated 2026-09-14 ~05:30 - after the new-character milestone)
+## 0. State of play (updated 2026-09-15 — T1-T51 merged, 583 tests)
 
-**Milestone: a brand-new character works end-to-end on a fresh WorldServer** - creation, per-class
-starter kit and default skills, quests, inventory, client settings all persist through TeraSharp's SQLite.
-"Everything works like it did on Arbiter" (human, live). 278 tests. Two Cowork sessions run in parallel now,
-each in its own worktree (`TeraSharp-cowork` on `cowork/T8`, `TeraSharp-cowork2` on `cowork/T<n>`); the
-human rebases a worktree on master before a new task if master moved. The current task queue is at the
-bottom of this section; `status/CHAT-HANDOFF.md` has the day-by-day state and the live-debug recipes.
+**Two milestones behind us.** A brand-new character works end-to-end on a fresh WorldServer —
+creation, per-class starter kit and skills, quests, inventory, keybinds, teleports, exit and relog
+all persist through TeraSharp's SQLite. And since 2026-09-15 00:25, **multiplayer**: two accounts
+on two clients, both in world at once, seeing each other, `/say` and global chat crossing, one
+logging out without disturbing the other. Tunnel routing is `status/MULTIPLAYER-DESIGN.md` §6
+applied to `WorldBridge` — TicketAllocator, N-recipient `SA_BYPASS_TO_CLIENT`, per-ticket reorder,
+unknown ticket dropped when 2+ sessions are in world. World echoes the ticket we put in
+`AS_ENTER_WORLD[80]`, so the two-client capture is no longer needed for routing.
+
+**Everything merged since that milestone is live-untested.** T45-T51 added whisper through
+`ChatManager`, the 18 Arbiter-owned client packets (tooltips, visited sections, client log, the
+small acks), the six `SDB_*_PARCEL` pairs, parties, guilds, World GM forwarding, `AdminLevel` in
+`AS_ENTER_WORLD[111]`, and the security audit + fuzz suite. None of it has met a real client.
+`status/LIVE-CHECKLIST.md` is the pass that closes that, and it is the next thing to do.
+
+Two Cowork sessions run in parallel, each in its own worktree (`TeraSharp-cowork`,
+`TeraSharp-cowork2`); the human rebases a worktree on master before a new task if master moved.
+`status/STATUS.md` has the full area-by-area table; `status/CHAT-HANDOFF.md` has the day-by-day
+state and the live-debug recipes.
 
 Cowork-editable files also include: `Auth/*`, `Handlers/GmCommands.cs`, `Protocol/V100Definitions.cs`,
-`World/PartyManager.cs`, `World/StarterInventory.cs`, `World/DbProxyStaticData.cs` (added 2026-09-14).
+`World/PartyManager.cs`, `World/StarterInventory.cs`, `World/DbProxyStaticData.cs`, plus every file
+a task brief has named explicitly and thereby created — `World/ChatManager.cs`,
+`World/ActionDispatcher.cs`, `World/ParcelDbHandlers.cs`, `World/PartyWiring.cs`,
+`World/GuildWiring.cs`, `Handlers/GuildHandlers.cs`, `Handlers/ArbiterClientHandlers.cs`,
+`Auth/LoginLanguage.cs`. **`World/TunnelFrames.cs` is human-owned** — it is the live tunnel path.
 
-### Hard rules learned the expensive way (2026-09-14)
-- **Input hardening (from the real Arbiter's two known remote crashes, D:\arbiter_handoff_fixes.md):**
-  every packet-derived index is bounds-checked as UNSIGNED on both sides (the real C_CHECK_VERSION
-  crashed pre-auth on a negative module index); every paginated list checks `page*size < count`, not
-  just `>= 0` (the real C_VIEW_GUILD_WAR crashed on page 0 of an empty history) - applies to guild war
-  history, rankings, broker, parcels. And never hold a lock across blocking I/O.
-- **Commit in the worktree BEFORE merging, and verify the branch moved** (`git log --oneline -1` in the
-  worktree must show the new commit). T20 (inventory persistence) was merged with nothing committed and
-  the worktree was then removed - the work was lost and only noticed a day later. Never `git worktree
-  remove --force` a worktree whose branch tip is still the base commit.
-- **Cowork must never copy a file from master into its worktree by hand** ("I took master's test file as
-  the base"). The worktree base is whatever `git rebase master` gives it; a hand-copied snapshot is
-  silently stale and the merge deletes everything added since (T39 lost 60 tests this way). If the worktree
-  is behind, STOP and ask the human to rebase.
-- **No `"` inside C# verbatim strings** (`@"..."`, e.g. the SQL DDL in CharacterStore) - a lone double quote
-  terminates the string and the build fails with 300+ errors. Use single quotes or no quotes in SQL comments.
-  Cowork cannot build, so this has broken three merges in a row.
-- **Never send a `DBS_*` reply World did not ask for.** Every DBS_ carries a DLM id World looks up; an
-  unsolicited one completes whichever item currently holds that id. A pre-emptive `0x2738` with playerId in the
-  id slot crashed a fresh World for every character except playerId 1 (found via minidump stack walk).
-  Pushes (AS_*, no id) are fine; replies are not.
-- **Every per-user W->A request must be answered** (allow-list in `DbProxyHandlers.IsHandledRequest`, or
-  `WorldReplayTable.OneWayFromWorld`, or a replay entry) - the test `Every_per_user_request_opcode_is_answered`
-  enforces it from `status/PERSISTENCE-MAP.md`. `no replay for 0xNNNN` right before silence is the tell.
-- **Captured per-character data must never be served to other characters.** Quests (0x272D), inventory
-  (0x27A4), the world blob, skills - each of these bit us as "every new character got dob's X". The remaining
-  statics (achievements 0x27F9, reputation 0x2890, tutorial tips 0x2873, seren 0x2943, fatigability 0x2909,
-  EP 0x27BA, dungeon history 0x2868) are Cowork T22.
-- **The world blob is per-character state we DO patch at creation** (playerId, name, identity block, skills,
-  position - see `StarterBlob`) and otherwise store verbatim; zone is u32@236 (208 is HP).
-- The real Arbiter's DLM ids are what World looks up; the blob-derived `questDbId` (0x272F payload[25]) is
-  the `quests` row id; item ids come from `counters` (starter kit ids 7.. are deterministic per character).
-- Minidump analysis without WinDbg: parse streams 4/6/3 with PowerShell, scan the faulting thread's stack for
-  addresses inside WorldServer.exe, map `WorldServer+0xNNN` to `FUN_1400NNN` in the decompile (recipe in
-  CHAT-HANDOFF.md). Delete `*_full.dmp` (30 GB each) immediately.
+### Hard rules learned the expensive way
+- **Input hardening.** Every packet-derived index is bounds-checked as UNSIGNED on both sides, and
+  every paginated list checks `page*size < count`. Two more rules the T50 fuzz added: **never
+  `Convert.ToInt32` a value the def reader produced** (a `uint32` field arrives as `uint` and half
+  of all four-byte values overflow — use `Protocol/DefField`), and **never add a packet-supplied
+  length to an offset before comparing** (`a + len > buf.Length` overflows; write
+  `len > buf.Length - a`). `status/SECURITY-AUDIT.md`.
+- **SQLite foreign keys are ENFORCED.** `Microsoft.Data.Sqlite` issues `PRAGMA foreign_keys = 1`
+  unless the connection string says otherwise, so every `REFERENCES characters(id)` in
+  `CharacterStore` is real. A per-character INSERT with an owner that has no row throws, and on
+  the World side that used to close the link. Every such write now checks the owner first.
+- **Commit in the worktree BEFORE merging, and verify the branch moved.** T20 (inventory) was
+  merged with nothing committed and the worktree removed — the work was lost and redone as T44.
+- **Cowork must never copy a file from master into its worktree by hand.** If the worktree is
+  behind, STOP and ask the human to rebase (T39 lost 60 tests this way).
+- **No `"` inside C# verbatim strings** (`@"..."`) — a lone double quote terminates the string and
+  the build fails with 300+ errors. Cowork cannot build, so this has broken merges.
+- **Never send a `DBS_*` reply World did not ask for.** Every `DBS_` carries a DLM id World looks
+  up; an unsolicited one completes whichever item currently holds that id. Pushes (`AS_*`, no id)
+  are fine; replies are not.
+- **Every per-user W->A request must be answered** — allow-listed in
+  `DbProxyHandlers.IsHandledRequest`, or in `WorldReplayTable.OneWayFromWorld`, or with a replay
+  entry. `Every_per_user_request_opcode_is_answered` enforces it from `status/PERSISTENCE-MAP.md`;
+  `no replay for 0xNNNN` right before silence is the tell.
+- **Captured per-character data must never be served to another character.** playerId 1 (dob) is
+  the one character that still gets the captures, on purpose —
+  `DbProxyHandlers.ServesCapturedStatics` is the single place that decides it.
+- **The world blob is per-character state we DO patch at creation** (playerId, name, identity
+  block, skills, position — see `StarterBlob`) and otherwise store verbatim; zone is u32@236
+  (208 is HP).
+- Minidump analysis without WinDbg: parse streams 4/6/3 with PowerShell, scan the faulting
+  thread's stack for addresses inside WorldServer.exe, map `WorldServer+0xNNN` to `FUN_1400NNN`
+  in the decompile (recipe in `status/CHAT-HANDOFF.md`). Delete `*_full.dmp` (30 GB each).
 
-### Status by area
-| Area | Status |
-|---|---|
-| Client crypto/codec/login/char list/select/create/delete | real |
-| Chat, client settings (persisted), social lists | real |
-| World handshake + 0x147D promotion records (live timestamps) + 0x1581 burst | real |
-| Enter-world, blob save/load, restriction, gameId per login | real, live-verified |
-| Per-user DB writes during play (T15), quests (T17), inventory (T20), skills in blob (T18) | real |
-| Relog into an instance (0x138D -> retry at stored return point) | implemented (T21), **live test pending** |
-| Zone change / quest teleport (0x13BE/0x13C0 echoes) | real, live-verified (via T21 capture) |
-| Remaining per-character statics (achievements, reputation, tips, seren, fatigability, EP, dungeon history) | replayed from dob - T22 |
-| Post-handshake ~64-push config burst | not sent explicitly - T23 |
-| Multiple players | blocked on a 2-login capture |
-| Account auth | accept-all |
+### Where each area stands
+Full table with the live / wired / designed distinction: `status/STATUS.md`. In one line each:
 
-### Cowork task queue (current)
-- [x] T1-T21 done and merged (see git log).
-- [ ] **T22** - per-character loads from rows (achievements first). Prompt in CHAT-HANDOFF.md.
-- [ ] **T23** - post-handshake config burst as a real step + 0x15ED/0x295D replies.
-- [ ] Exit countdown display: `S_PREPARE_EXIT` not in the def registry (human-owned HandlerRegistry).
-- [ ] Continent fallback table for characters with no stored return point (ENTER-WORLD-FALLBACK.md section 9).
-- [ ] Two-login capture -> multi-player tunnel routing.
+- **live** — login, characters, chat, settings, the whole single-player persistence loop, relog
+  into a dead instance, friends and blocks, two players in one world, accept-all and tera-api auth,
+  `/@` recognised by the client.
+- **wired, never run live** — whisper, the 18 Arbiter-owned client packets, mail, warehouse,
+  parties, guilds, GM World forwarding and `AdminLevel`, the fuzz suite's fixes.
+- **designed, nothing routes to it** — private chat channels.
+- **not started** — trade broker, lord/election/city war, petitions, rankings, appearance and name
+  change, multi-World.
+
+### Cowork task queue
+- [x] **T1-T51 done and merged** — `git log --oneline` is the record.
+- [ ] **T52** — guild `SA_` direction + `C_INVITE_USER_TO_GUILD` (in flight).
+- [ ] **T53** — trade broker research (in flight).
+- [ ] **T54** — docs and the live checklist brought up to master (this pass).
+- [ ] The live pass: `status/LIVE-CHECKLIST.md` §§5-11, two clients, ~45 minutes.
+- [ ] Then the two capture sessions, in order: `status/CAPTURE-PLAN.md`.
+- [ ] Human-owned, still open: the `TunnelFrames.ParseBypassToClient` overflow bound and
+  `Program.Store`'s private setter (`status/STATUS.md` Open, `status/SECURITY-AUDIT.md` §5).
 
 ---
 

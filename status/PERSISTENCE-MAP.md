@@ -194,20 +194,21 @@ Two things that will hang a user if they are ever "fixed":
 - **0x2754 must stay unanswered.** It is sealed in `WorldReplayTable.OneWayFromWorld` so the replay
   table cannot hand it somebody else's reply.
 
-## Mail — Arbiter-owned, only the client half is implemented
+## Mail — Arbiter-owned, both halves implemented
 
 T42 added the three client packets the Arbiter answers itself and the `parcels` table behind them
-(`Handlers/ParcelHandlers.cs`); the six `SDB_*_PARCEL` requests World sends are **not** answered yet
-and are therefore deliberately not in a table above.
+(`Handlers/ParcelHandlers.cs`); **T45 added the six `SDB_*_PARCEL` requests World sends**
+(`World/ParcelDbHandlers.cs`) — they are tabled in §C.2 at the bottom of this file.
 
 - Implemented, client-side: `C_SHOW_PARCEL_MESSAGE` 0xFA59 -> `S_SHOW_PARCEL_MESSAGE` 0xABD3,
   `C_PARCEL_READ_RECV_STATUS` 0xE292 -> `S_PARCEL_READ_RECV_STATUS` 0xF26E (byte-exact against
   `cap_newchar_client.log` frame 312), `C_PARCEL_REPORT` 0xC09A -> `S_PARCEL_REPORT` 0x73FC.
   The 13-byte 0xF26E frame is also pushed unprompted at `C_LOAD_TOPO_FIN`, which is what the real
   Arbiter does from `User::OnLoadTopoFin`.
-- Still unanswered: `0x2777` LIST, `0x2779` MAKE, `0x277B` RECV, `0x277D` RECV_EX, `0x2781` RETURN,
-  `0x2811` DELETE - each answered by the next opcode up. The first mailbox a live player opens
-  produces `no replay for 0x2777` and head-blocks that user's DLM queue.
+- Answered as of T45: `0x2777` LIST, `0x2779` MAKE, `0x277B` RECV, `0x277D` RECV_EX, `0x2781`
+  RETURN, `0x2811` DELETE - each by the next opcode up (§C.2). Before T45 the first mailbox a live
+  player opened produced `no replay for 0x2777` and head-blocked that user's DLM queue; the
+  12-phantom-row mailbox in the 2026-09-14 live session was the replay table answering instead.
 - `C_RETURN_USER_GIFT` 0xF7FD is **not** a parcel packet - it is the returning-player reward claim
   (-> AS 0x15C0). Return-to-sender is `C_RETURN_PARCEL` 0xF294, handled by World.
 - Warehouse moves do **not** ride `SDB_ITEM_SINGLE` 0x2768 - that handler binds only the bag
@@ -266,27 +267,78 @@ every World boot re-sent two bytes of the real Arbiter's uninitialised stack fro
 The four one-way `AS_`/`SA_` guild frames are not in this table because none of them is a
 DB-proxy request: they are in `GUILD-DESIGN.md` §4.1 and §4.2.
 
+## Coverage — every opcode `TryHandle` answers, T54 reconciliation
 
-## Trade broker — T53 research, nothing answered yet
+The tables above grew one subsystem at a time and drifted: 27 of the 59 opcodes in
+`DbProxyHandlers.IsHandledRequest` had no row, and 11 of those were not mentioned anywhere in this
+file. `Every_per_user_request_opcode_is_answered` never caught it because it checks the
+implication in one direction only — every row in this file must be answered, not every answer must
+have a row. The three tables below close the gap; together with the ones above they now cover all
+59.
 
-Deliberately **not** a table in this file. The coverage guard
-(`Every_per_user_request_opcode_is_answered`) reads the tables above and fails for any row that
-has neither a handler nor a one-way seal — and these five have neither, on purpose, because T53
-was research and a codec. Adding them as rows would break the build to say what this paragraph
-already says.
+### C.1 Login-time and spawn-time loads answered from rows
 
-Five of the seven `SDB_TRADE_BROKER_*` requests carry a **DlmId**, so each is a per-user DLMItem
-and an unanswered one head-blocks that character's DB queue for the life of the World process
-(`status/HANDOFF.md` §1):
+These are per-user DLM items exactly like the writes at the top of this file: an unanswered one
+head-blocks that character's queue for the life of the World process.
 
-    0x2817 SDB_TRADE_BROKER_REGISTER_ITEM     -> 0x2818, frame 0x16
-    0x2819 SDB_TRADE_BROKER_UNREGISTER_ITEM   -> 0x281A, frame 0x1E
-    0x281B SDB_TRADE_BROKER_CALC_SOLD_ITEM    -> 0x281C, frame 0x22
-    0x281D SDB_TRADE_BROKER_CALC_BOUGHT_ITEM  -> 0x281E, frame 0x22
-    0x281F SDB_TRADE_BROKER_BUY_IT_NOW        -> 0x2820, frame 0x27
+| request (W->A)                                   | reply (A->W)  | reply shape                                   | count | state |
+|---------------------------------------------------|---------------|-----------------------------------------------|-------|-------|
+| 0x2711 SDB_USER_ENTERWORLD                        | 0x2738        | the 15312-B world blob, or the 13-B not-found form | 1 per enter | **real**, from `characters.world_blob` |
+| 0x272C SDB_QUEST_LIST                             | 0x272D        | active quests in list 1, completed ids in list 2 | 1 per enter | **real (T17)**, from `quests` |
+| 0x27A2 SDB_USER_LOAD_INVENTORY                    | 0x27A3        | then 0x27A4, N x 536-B ItemData from the rows | 1 per enter | **real (T44)**, from `items` |
+| 0x27F8 SDB_USER_ACHIEVEMENT                       | 0x27F9        | the stored 0x27FA payload + the accomplished list, reqId@304 | 1 per enter | **real (T22)** |
+| 0x2872 SDB_TUTORIAL_SIMPLE_TIP                    | 0x2873        | 45 B, reqId@8, tips in first-seen order       | 1 per enter | **real (T22)** |
+| 0x2942 SDB_SEREN_GUIDE                            | 0x2943        | 65 B, reqId@8, six fixed rows                 | 1 per enter | **real (T22)** |
+| 0x288F SDB_REPUTATION_LIST                        | 0x2890        | 65 B, reqId@9, the stored 52-B records        | 1 per enter | **real (T26)** |
+| 0x2908 SDB_FATIGABILITY_LIST                      | 0x2909        | 45 B, reqId@9 — keyed on the ACCOUNT, not the character | 1 per enter | **real (T26)** |
+| 0x2867 SDB_LOAD_2867                              | 0x2868        | three lists; list 0 is the stored cool times  | 1 per enter | **real (T25)**, from `dungeon_cooldowns` |
+| 0x2869 SDB_LOAD_2869                              | 0x286A        | a 0x15E0 push first, then an empty list + [ok][reqId] + the SAME reset time | 1 per enter | real |
+| 0x290C SDB_LOAD_290C                              | 0x290D        | four pushes first (0x15B1, 0x2847, 0x1440, 0x143E), then [01][reqId] | 1 per enter | real |
+| 0x27B9 SDB_EP_PERK                                | 0x27BA        | 113 B, reqId@8, static                        | 1 per enter | real |
+| 0x27B3 SDB_LOAD_WORLD_EVENT                       | 0x27B4        | [u32 reqId][u8 ok]                            | spawn | real |
+| 0x2897 SDB_DAILY_QUEST                            | 0x2898        | [u32 reqId][u8 ok], reqId@16                  | login | real |
+| 0x2899 SDB_DAILY_QUEST_SEED                       | 0x289A        | [u32 reqId][u8 ok], reqId@8 — plus the empty 159-B 0x272D that makes World take the seed branch | login | real |
+| 0x295C SDB_RESULT_CITY_WAR                        | 0x295D        | request+16 / +20 echoed; 0x15ED goes with it  | World start | real |
 
-`SDB_TRADE_BROKER_START_DEAL` (0x2821) and `_CANCEL_DEAL` (0x2824) carry no DlmId and are safe to
-leave alone. **Opening the broker on a live TeraSharp today wedges the character** — the same
-failure the mailbox had before T45, and for the same reason: no handler, and no capture for the
-replay table to fall back on. Layouts, reply builders and the `Step` caveat are in
-`status/BROKER-DESIGN.md` §3; §8 says what to do first.
+### C.2 Mail — the six `SDB_*_PARCEL` pairs (T45 answered them; this file still said they were open)
+
+Every one is a DLM item. Before T45 nothing answered `0x2777`, so the first mailbox a live player
+opened produced `no replay for 0x2777` and head-blocked that character — which is exactly what the
+12-phantom-row mailbox in the 2026-09-14 live session was.
+
+| request (W->A)                                   | reply (A->W)  | reply shape                                   | count | state |
+|---------------------------------------------------|---------------|-----------------------------------------------|-------|-------|
+| 0x2777 SDB_LIST_PARCEL                            | 0x2778        | 35-B empty form byte-exact from the decompile; MaxPage = 1, ParcelCount = 0 | 1 per mailbox open | **real (T45)**, from `parcels` |
+| 0x2779 SDB_MAKE_PARCEL                            | 0x277A        | [DlmId][ok] + the new parcel id               | per send | **real (T45)** |
+| 0x277B SDB_RECV_PARCEL                            | 0x277C        | the claim step, atoms applied to `items`      | per claim | **real (T45)** |
+| 0x277D SDB_RECV_PARCEL_EX                         | 0x277E        | the claim-all step                            | per claim-all | **real (T45)** |
+| 0x2781 SDB_RETURN_PARCEL                          | 0x2782        | [DlmId][ok]                                   | per return | **real (T45)** |
+| 0x2811 SDB_DELETE_PARCEL                          | 0x2812        | [DlmId][ok]                                   | per delete | **real (T45)** |
+
+`ParcelDataNoMsg`'s 0x9e8-byte interior is still unknown — no capture contains one — so
+`ParcelCount = 0` is the only honest answer a non-empty inbox could get today.
+`status/MAIL-WAREHOUSE.md` §9 and `status/CAPTURE-PLAN.md` §B.4.
+
+### C.3 Session and handshake requests that are not per-user DB items
+
+These carry no DlmId, so an unanswered one cannot head-block a user's queue — but three of them
+block something else entirely, which is why they are handlers and not replay entries.
+
+| request (W->A)                                   | reply (A->W)  | reply shape                                   | count | state |
+|---------------------------------------------------|---------------|-----------------------------------------------|-------|-------|
+| 0x147D AS_PROMOTION_LIST_REQ                      | 0x1484        | then 23 x 0x147E promotion records re-stamped with the current UTC time, then 0x1480 | 1 per World boot | **real**, stale timestamps crash `PromotionController::NewPromotion` for a level-1 character |
+| 0x13F2 DSA_DUNGEON_TIMELINE_OPEN_INFO             | 0x1581        | World's own open-info list echoed back, one push per dungeon | 1 per World boot | real |
+| 0x1463 SA_LEARN_ALL_CREST_ACQUIRABLE              | 0x1464        | every requested (crestId, value) echoed as learned | first login of a class with level-1 crests | real |
+| 0x1562 SA_CLEAR_BATTLE_FIELD_ENTER_COUNT          | 0x1563        | [u8 ok][u32 reqId], reqId@8                   | daily reset mid-session | real |
+| 0x13BE SA_REQUEST_ENTER_DUNGEON                   | 0x13BF        | the 215-B request echoed, struct padding zeroed | per zone change | real, live-verified |
+| 0x13C0 SA_RESPONSE_ENTER_DUNGEON                  | 0x13C1        | the same echo rule                            | per zone change | real, live-verified |
+
+### C.4 Keeping this honest
+
+`Every_per_user_request_opcode_is_answered` reads the first column of every table in this file and
+fails the build for an opcode nothing answers. It does **not** check the other direction, so a
+handler added without a row here is invisible to it. Until that second check exists, the rule is:
+**adding an opcode to `DbProxyHandlers.IsHandledRequest` means adding a row to this file in the
+same commit.** The reconciliation that produced C.1-C.3 is three lines of Python — extract the
+`case` labels from `IsHandledRequest`, extract the leading `0xNNNN` of every table row here, and
+diff the two sets.

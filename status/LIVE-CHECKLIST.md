@@ -1,17 +1,21 @@
-# Live-session checklist — everything merged since T19
+# Live-session checklist — everything merged through T51
 
-One pass, ~30 minutes, **two characters on one account** (`dob` = playerId 1, the capture
-character, and a second character you create in step 4). Work straight down: each step leaves the
-server in the state the next one needs.
+Two accounts, two clients, ~45 minutes. Sections 1-4 are the regression pass over what is already
+live-proven; sections 5-11 are the six things merged since the last live session that have **never
+run against a real client**. If time is short, do 0, 1, then jump to 5.
 
 Watch two windows: **A** = the TeraSharp console, **W** = the WorldServer console
 (`C:\TERA_SERVER.100\Executable\Logs\Console\WorldServerConsole_<date>_2800.log`). Log lines are
-quoted as they appear with `{}` placeholders filled in.
+quoted as they appear with `{}` placeholders filled in. TeraSharp's default level is Debug; the
+guild and party steps below need it, so do not raise it to Information for this pass.
 
 The single most useful failure signature on the whole list: **`no replay for 0xNNNN`** (Debug
 level, window A) immediately before the client or World goes quiet. It means a per-user request
 reached neither a handler nor the replay table, and — if that opcode carries a DLM id — the user's
 DB queue is now head-blocked for the life of the World process (`status/HANDOFF.md` §1).
+
+**Environment for this pass:** `TERASHARP_GM_ACCOUNTS=<account A>` must be set (sections 5 and 9
+both need it), and `deploy.ps1` has it commented out by default.
 
 ---
 
@@ -29,223 +33,299 @@ file and the path it looked at — fix that before starting WorldServer. `[WARN]
 |---|---|
 | `opcode map`, `packet defs` | a wrong `TERASHARP_DATA` is otherwise only visible as "no def for S_…" at login |
 | `starter blob`, `starter inventory` | a short copy makes character creation and the first inventory silently wrong |
-| `promotion records`, `handshake burst` | both are load-bearing for a FRESH World (steps 1-2) |
+| `promotion records`, `handshake burst` | both are load-bearing for a FRESH World (section 1) |
 | `world replay log` | without `arb_world.log` the replay table is empty and half the login sequence disappears |
-| `DB schema` | a `terasharp.db` from before T30/T32 is missing `friend_groups`, `friends.memo`, `accounts.admin_level` |
+| `DB schema` | 20 tables and 8 late-migration columns; a `terasharp.db` from before T42 is missing `items`, `warehouses`, `parcels` |
 
-## 1. Start TeraSharp, then WorldServer — the handshake
+`SelfTest.RequiredTables` does **not** yet list `guilds`, `guild_members` or `visited_sections`
+(T39, T45), so a database older than those migrations passes `--selftest` and then fails at
+runtime. If the guild step in section 9 produces a SQLite error rather than a guild, that is why:
+delete `terasharp.db` and let it be recreated.
 
-**Do:** start TeraSharp, then WorldServer. Do not touch the client yet.
+---
 
-| window | line |
-|---|---|
-| A | `TeraSharp Arbiter starting (protocol 376012, patch 100)` |
-| A | `Auth provider: accept-all` (or `tera-api` — step 3) |
-| A | `Loaded {N} opcodes for protocol 376012` and `Loaded 4548 schema defs ({N} distinct packets), skipped 1` |
-| A | `WorldBridge listening on 127.0.0.1:{Port} for WorldServer` |
-| A | `WorldServer link #1 connected (1 active)` |
-| A | `WorldServer handshake complete - READY for players` |
-| A | `Post-handshake: sent 63 config pushes (0x15BD = {now}, 0x14D1 daily reset = {reset})` |
-| A | `0x147D: sent 23 x 0x147E promotion records stamped {now}` |
-| A | `0x13F2: echoed {N} dungeon-timeline states back as 0x1581 (fallback burst also sent …/disabled)` |
-| W | one `… open` line per dungeon id (DungeonManager), then World idles |
+## 1. Regression pass — proven on 2026-09-14/15, confirm it still holds
 
-**Failures**
+Everything in this section has been seen working live. Do not spend time on it beyond the lines
+below; if one of them is missing, stop and fix that before going near sections 5-11.
 
-* `Post-handshake: data/handshake_burst.bin missing or malformed - the 63-push config burst was NOT sent` → step 0 lied to you or the deploy copied the exe without `data\`.
-* `0x147D: promotions_147E.bin missing or malformed - falling back to replay (stale timestamps)` → the level-1 crash is back: a new character entering a fresh World dies in `PromotionController::NewPromotion`.
-* `0x13F2: malformed open-info list ({N}-byte payload) - not echoed` → World changed the push shape; the fallback burst still covers it, but say so before blaming anything else.
-* No `READY for players` → the client will get `C_SELECT_USER while World not ready - rejecting`.
+**Do:** start TeraSharp, then WorldServer, then log in account A and enter the world with an
+existing character.
 
-## 2. Log in (auth)
+| window | line | what it proves |
+|---|---|---|
+| A | `WorldServer handshake complete - READY for players` | handshake |
+| A | `Post-handshake: sent 63 config pushes (0x15BD = {now}, 0x14D1 daily reset = {reset})` | the config burst |
+| A | `0x147D: sent 23 x 0x147E promotion records stamped {now}` | a level-1 character will not crash a fresh World |
+| A | `C_LOGIN_ARBITER: account '{Acct}' (id {Id}) language 6, {N} character(s)` | auth (accept-all) |
+| A | `C_SELECT_USER: entering world as '{Name}' (gameId {G})` | select |
+| A | `Handed session {Id} to WorldServer (gameId {G}, char '{Name}')` | AS_ENTER_WORLD built from rows |
+| A | `C_LOAD_TOPO_FIN -> spawning '{Name}' at ({X},{Y},{Z}) in zone {Z}` | spawn at the stored position |
+| W | `EnterWorld [1] {name}({id})` | World accepted it |
 
-**Do:** launcher → client → login screen.
-
-| window | line |
-|---|---|
-| A | `C_LOGIN_ARBITER: account '1' (id 1) language 6, {N} character(s)` |
-| A | `C_GET_USER_LIST -> {N} character(s)` |
-
-**Failure:** `C_LOGIN_ARBITER: account '1' rejected by {provider}: {code} {msg}` — with
-`accept-all` this cannot happen, so it means `TERASHARP_AUTH` is set. Codes:
-`50011 authkey mismatch` (stale launcher ticket — log in through the launcher again),
-`50000 account does not exist`, `50012 account banned`, `-1 tera-api unreachable`.
-Full flow: `status/AUTH-DESIGN.md`.
-
-> **Auth pass (optional, 3 min).** Stop TeraSharp, restart with `TERASHARP_AUTH=true`, log in
-> through the launcher: expect the same success lines plus `Auth provider: tera-api`. Then edit
-> the ticket (or log in twice from the launcher so the first ticket goes stale) and expect
-> `rejected by tera-api: 50011 authkey mismatch` and the client stuck at the login screen. Put it
-> back to accept-all before continuing.
-
-## 3. Select `dob` — enter world, blob, gameId
-
-**Do:** pick `dob`, enter the world.
-
-| window | line |
-|---|---|
-| A | `C_SELECT_USER: entering world as 'dob' (gameId {G})` |
-| A | `Handed session {Id} to WorldServer (gameId {G}, char 'dob')` |
-| A | `SDB_USER_ENTERWORLD` … then the login loads below |
-| A | `C_LOAD_TOPO_FIN -> spawning 'dob' at ({X},{Y},{Z}) in zone {Z}` |
-| W | `EnterWorld [1] dob(1)` |
-
-**Failures:** `SDB_USER_ENTERWORLD: player {Id} has no world blob (found=…) - replying not-found`
-(the character never entered, or the blob column is empty); `Session {Id}: SA_LEAVE_WORLD not
-received in 5s - forcing delete` at logout (see step 11); a silent client after
-`DBS_USER_ENTERWORLD` on a **fresh** World is the promotion-record crash from step 1.
-
-## 4. The login loads — achievements, reputation, fatigability, tips, seren, cool times
-
-These all fire inside step 3, in this order. Tick them off in window A:
+Then, in one five-minute run: kill a few mobs, take loot, advance a quest, change a keybind, use
+the Island of Dawn teleport, Exit, and log back in. These are the lines that say the persistence
+layer is still intact:
 
 | line | feature |
 |---|---|
-| `SDB_LOAD_USER_ACHIEVEMENT: player 1 -> {what}, {N} accomplished achievement(s)` | T22 achievements |
-| `SDB_LOAD_TUTORIAL_SIMPLE_TIP: player 1 -> {N} tip(s)` | T22 tips |
-| `SDB_INIT_SEREN_GUIDE_INFO: player 1 -> {N} stored slot(s)` | T22 seren |
-| `SDB_LOAD_REPUTATION_LIST: player 1 -> {N} reputation(s)` | T26 reputation |
-| `SDB_LOAD_FATIGABILITY_LIST: account 1 -> {P} fatigue point(s)` | T26 fatigability (per ACCOUNT) |
-| `SDB_LOAD_DUNGEON_COOL_TIME: player 1 -> {N} cool time(s)` | T25 cool times |
-| `SDB_LOAD_QUEST_LIST: player 1 -> {N} active quest(s), {C} completed` | T17/T21 quests |
-| `SDB_USER_LOAD_INVENTORY: player {Pid} -> {N} starter items for class {Cls} ({Name})` | inventory rows (new characters only) |
-| W | `LoadFatigability …` |
+| `S_UPDATE_EXP_LEVEL: player {Pid} level {L}, exp {E} (rest {R})` | level/exp on the row |
+| `SDB_ITEM_SINGLE: echoed {N} transaction atom(s) for player {Pid}` | inventory writes |
+| `SDB_UPDATE_USER_DATA: player {Pid} blob pos {Pos}` | the world blob |
+| `SDB_LOAD_QUEST_LIST: player {Pid} -> {N} active quest(s), {C} completed` | quests, on the relog |
+| `SDB_LOAD_USER_ACHIEVEMENT: player {Pid} -> {what}, {N} accomplished achievement(s)` | achievements |
+| `SDB_LOAD_DUNGEON_COOL_TIME: player {Pid} -> {N} cool time(s)` | cool times |
+| `SDB_LOAD_FATIGABILITY_LIST: account {Acct} -> {P} fatigue point(s)` | fatigability, per ACCOUNT |
+| `SA_ENTER_WORLD_FAIL: World refused enter-world - gameId 0x{G:X}, ticket {T}, …` then a second `AS_ENTER_WORLD` | relog into a dead instance (T21) |
 
-**Failures:** any of these missing → look for `no replay for 0x27F8 / 0x288F / 0x2908 / 0x2867`.
-`SDB_USER_LOAD_INVENTORY: starter_inventory.bin not found - falling back to replay` plus
-`EnterWorld Failed [..] [{name}] [1]` in W = World rejected the inventory because the item owner
-is dob's playerId, not this character's.
+**Failures that end the session here**
 
-## 5. Client settings
+* `Post-handshake: data/handshake_burst.bin missing or malformed - the 63-push config burst was NOT sent` → the deploy copied the exe without `data\`.
+* `0x147D: promotions_147E.bin missing or malformed - falling back to replay (stale timestamps)` → a level-1 character entering a fresh World will die in `PromotionController::NewPromotion`.
+* `SDB_USER_ENTERWORLD: player {Id} has no world blob (found=…) - replying not-found` → the character's state is gone, not merely stale.
+* `Session {Id}: SA_LEAVE_WORLD not received in 5s - forcing delete` at logout → a DLM head-block; see section 11.
 
-**Do:** open Options, change one chat-window setting and one UI setting, close the client's option
-window. Then `/logout` to the lobby and back in (step 11 is the full relog; a quick one is enough
-here).
+> **Auth pass (optional, 3 min).** Restart with `TERASHARP_AUTH=true` and log in through the
+> launcher: expect `Auth provider: tera-api` and the same success lines. Log in twice from the
+> launcher so the first ticket goes stale and expect
+> `C_LOGIN_ARBITER: account '{Acct}' rejected by tera-api: 50011 authkey mismatch`.
+> Put it back to accept-all before continuing. Full flow: `status/AUTH-DESIGN.md`.
 
-**Proof:** the settings are still there after the relog. The handlers are deliberately silent —
-there is no arbiter line for a successful save. What you are looking for is the **absence** of
-`SaveClientSetting: refusing a {N}-byte blob for character {Id}`; that warning means the client
-sent 0 bytes or more than the cap, and the row was not written.
+---
 
-## 6. Play for five minutes — the per-user writes
+## 2. Both clients in world
 
-**Do:** kill a few mobs, pick up loot, complete one quest step, learn a skill if you can, level up
-if you can.
-
-| line | feature |
-|---|---|
-| `S_UPDATE_EXP_LEVEL: player 1 level {L}, exp {E} (rest {R})` | level/exp on the row |
-| `SDB_ITEM_SINGLE: echoed {N} transaction atom(s) for player 1` | inventory writes |
-| `SDB_SET_QUEST_INFO` … then `SDB_LOAD_QUEST_LIST` on the next login | quests |
-| `SDB_ACCOMPLISH_USER_ACHIEVEMENT: player 1 offered {O}, {N} newly accomplished` | achievements |
-| `SDB_UPDATE_USER_ACHIEVEMENT: stored {N} B for player 1` | achievements (on zone change/logout) |
-| `SDB_ADD_TUTORIAL_SIMPLE_TIP: player 1 saw tip {T}` | tips |
-| `SDB_UPDATE_REPUTATION_INFO: player 1 reputation {R} (op {Op})` | reputation (needs a faction action) |
-| `SDB_UPDATE_USER_DATA: player 1 blob pos {Pos}` | the world blob |
-
-**Failures:** `SDB_SET_QUEST_INFO: bad quest record … - acking without storing`;
-`SDB_UPDATE_USER_DATA: unexpected blob (off …) for player 1 - not saved` — the blob did not
-persist, so the next login restores the old position.
-
-## 7. A dungeon — cool times and the enter-world fallback
-
-**Do:** enter any instanced dungeon, then **log out while still inside it**, then log back in.
+**Do:** with account A still in world, log account B in on the second client, same zone, in view
+of A. This is the multiplayer milestone and it is proven — the point here is to get to the state
+sections 7-9 need.
 
 | window | line |
 |---|---|
-| A | `SA_REQUEST_ENTER_DUNGEON: player 1 -> dungeon/zone {Dg} ({N} B)` |
-| A | `Player 1 is in dungeon {Dg}, instance 0x{Pd:X8}` |
-| A | `SA_UPDATE_DUNGEON_COOLTIME: player 1 dungeon {Dg} cool time stored` |
-| A (on the relog) | `SA_ENTER_WORLD_FAIL: World refused enter-world - gameId 0x{G:X}, ticket {T}, …` |
-| A | then a second `AS_ENTER_WORLD` and a normal spawn at the stored return point |
+| A | a second `C_SELECT_USER: entering world as '{B}' (gameId {G2})` with a **different** gameId |
+| A | `Handed session {Id2} to WorldServer (gameId {G2}, char '{B}')` |
+| W | `EnterWorld [1] {b}({idB})` |
 
-This is the T21 path and it has **never been live-verified** — it is the highest-value item on
-this list.
+**Proof:** each client can see the other character move, and `/say` from one appears in the
+other's chat window.
 
-**Failures:**
-* `EnterWorld retry for '{Name}': no stored return point for continent {C}` → the 0x13BE that took you into the dungeon never stored one; you land in the fallback continent instead.
-* `SA_ENTER_WORLD_FAIL: ResendEnterWorld is not wired, so no AS_ENTER_WORLD retry` → a Program.cs regression (the hook block).
-* `SA_ENTER_WORLD_FAIL: reason {R} is outside 1-3` → a failure the real Arbiter does not retry either; read the reason before retrying by hand.
-* `{What}: no live session owns gameId 0x{G:X} - not stored` → the cool time was dropped because the session had already gone.
+**Failure:** B enters but A's client freezes, or A sees nothing of B. That is the tunnel routing
+(ticket allocation / N-recipient `SA_BYPASS_TO_CLIENT`) and it means
+`status/MULTIPLAYER-DESIGN.md` §6 regressed. The tell in window A is a burst of
+`Tunnel: dropped frame for unknown ticket {T}` while two sessions are in world.
 
-## 8. Friends, groups, memos, blocks
+---
 
-**Do:** open the Friends panel. With one account you can exercise everything except an actual
-friendship (the Arbiter refuses two characters of one account — that refusal is itself a test):
+## 3. A brand-new character
 
-1. Friends panel opens → the three login lists were accepted by the client.
-2. `/@`-free: add your own second character as a friend → refused.
-3. Create a friend group, rename it, delete it.
-4. Block a name, edit its memo, unblock.
-
-| window | line |
-|---|---|
-| A | `C_ADD_FRIEND: dob -> {Target} refused (CannotAddSelf)` (same account) |
-| A | `C_ADD_FRIEND_GROUP: dob group {Id}` / `C_DELETE_FRIEND_GROUP` |
-| A | `C_BLOCK_USER: dob -> {Target}` then `C_REMOVE_BLOCKED_USER: dob x {Target}` |
-
-**Proof the lists are right:** the panel shows the seeded group 好友 and your profile message
-(今天也是愉快的一天!) on a character that has never touched the panel. An empty or garbled panel
-means the def override did not load — see `status/FRIENDS.md` §2.
-
-> **Two-account pass (optional, 5 min).** Log a second client in as account `2` (accept-all takes
-> any name), create a character, then: add friend → accept → whisper → delete. Expect
-> `C_ADD_FRIEND: {A} -> {B} (request)`, `C_ACCEPT_FRIEND: {B} accepted {A}`,
-> `Whisper: {A} -> {B}`, `C_DELETE_FRIEND: {A} x {B} (was type 0)`. Everything cross-session is
-> listed in `status/MULTIPLAYER-DESIGN.md`.
-
-## 9. GM commands
-
-**Do:** restart TeraSharp with `TERASHARP_GM_ACCOUNTS=1` (the account name you log in with), log
-in, and type `/@query_point`, then `/@warehousegold_max 100`, then `/@nonsense_command`.
-
-| window | line |
-|---|---|
-| A | `C_ADMIN from account '1' level 5: query_point -> Local` |
-| client | `Can't request coin` (the real Arbiter's own reply — there is no billing service) |
-| A | `C_ADMIN from account '1' level 5: warehousegold_max 100 -> Local` |
-| A | `C_ADMIN from account '1' level 5: nonsense_command -> Unknown` → client shows `Invalid QA Command` |
-| A | `C_ADMIN from account '1' level 5: {world command} -> ForwardToWorld` for anything in the World catalogue |
-
-**Failures:** nothing happens at all and there is no `C_ADMIN from account` line → the client is
-not in QA mode; `S_LOGIN_ARBITER.status` must be 31 or 33 for a GM login
-(`status/GM-DESIGN.md` §6), and that one-line change may not be in yet. A line ending
-`-> NotAuthorised` means the account is not in `TERASHARP_GM_ACCOUNTS` — and note the client gets
-**nothing** back, which is exactly what the real Arbiter does.
-
-Then `/@set_admin_level {yourOtherCharacter} 5` and check the `accounts.admin_level` row —
-that is the only GM command that writes to the DB.
-
-## 10. The second character
-
-**Do:** back to the lobby, create a new character (any class), enter the world with it.
-
-This re-runs steps 3-5 on a character with **no** history, which is the case that broke most
-often:
+**Do:** on account B, back to the lobby, create a character of a class you have not used, enter
+the world with it.
 
 | line | what it proves |
 |---|---|
 | `C_CREATE_USER from {Id}: created '{Name}' id={N} template={T} … (identity patched into the blob)` | creation + blob identity |
 | `SDB_USER_LOAD_INVENTORY: player {N} -> {M} starter items for class {C} ({Name})` | the class kit, not dob's |
 | `SDB_LOAD_USER_ACHIEVEMENT: player {N} -> brand-new-character reply, 0 accomplished achievement(s)` | no captured statics leaked |
-| `SDB_LOAD_FATIGABILITY_LIST: account 1 -> {P} fatigue point(s)` | the SAME total as dob — it is per account |
-| W | `EnterWorld [1] {name}({N})` |
 
 **Failure:** anything that shows dob's data for the new character (a full achievement list, dob's
 quests, dob's inventory) is the "captured per-character data served to another character" bug
-class — `status/STATUS.md` rule 3.
+class. `EnterWorld Failed [..] [{name}] [1]` in W = World rejected the inventory because the item
+owner is dob's playerId, not this character's.
+
+---
+
+## 4. Friends, groups, memos, blocks
+
+**Do:** open the Friends panel on A. Create a friend group, rename it, delete it; block a name,
+edit its memo, unblock; try to add your own other character (it must be refused). Then, with both
+clients up, A adds B, B accepts, A deletes.
+
+| window | line |
+|---|---|
+| A | `C_ADD_FRIEND: {A} -> {Target} refused (CannotAddSelf)` (same account) |
+| A | `C_ADD_FRIEND: {A} -> {B} (request)` then `C_ACCEPT_FRIEND: {B} accepted {A}` |
+| A | `C_ADD_FRIEND_GROUP: {A} group {Id}` / `C_DELETE_FRIEND_GROUP` |
+| A | `C_BLOCK_USER: {A} -> {Target}` then `C_REMOVE_BLOCKED_USER: {A} x {Target}` |
+| A | `C_DELETE_FRIEND: {A} x {B} (was type {Type})` |
+
+**Failure:** an empty or garbled panel means the def override did not load —
+`status/FRIENDS.md` §2. Note that the seeded group name and profile message are now
+language-aware (T45): an EUR client (`language 6`) gets `Friends` and an empty profile message,
+not the Taiwanese capture's 好友.
+
+---
+
+# The six unproven things — everything below here is new since the last live session
+
+---
+
+## 5. Potions decrement on screen  ← **start here if time is short**
+
+This is the one known live break. `C_SHOW_ITEM_TOOLTIP_EX` (30152 / `0x75C8`) fires once per
+potion use; the amount reaches the store either way, but without the Arbiter's
+`S_SHOW_ITEM_TOOLTIP` reply the client never refreshes the count. T45 made TeraSharp answer it
+and stopped forwarding it to World.
+
+**Do:** use a stackable potion three times, watching the count in the quickslot.
+
+| window | line |
+|---|---|
+| A | `SDB_ITEM_SINGLE: echoed {N} transaction atom(s) for player {Pid}` — once per use |
+| client | the count goes 5 → 4 → 3 **on screen, without relogging** |
+
+**Failures**
+
+* `W` prints `handler has not been implemented yet!!! 30152 {len}` → the packet is still being forwarded; `ArbiterClientHandlers.ArbiterOwned` or the `C_SHOW_ITEM_TOOLTIP_EX` registration did not ship.
+* `A` prints `30152 (0x75C8) is Arbiter-owned and has no handler - dropped, NOT forwarded` → the deny-list shipped but the handler registration did not. This is the half-applied state.
+* `A` prints `C_SHOW_ITEM_TOOLTIP_EX: {Len} B body (want 38)` → the client's fixed part is not 0x26 on this build; re-derive it from the PDL dumper before touching anything else.
+* `A` (Debug) prints `C_SHOW_ITEM_TOOLTIP_EX: item {Item} not owned by {Owner} - no reply` for **your own** potion → the item db id the client names is not the one in the `items` row; the atom application allocated a different id.
+* The count only updates after a relog → the row is right and the reply is wrong; compare the emitted `S_SHOW_ITEM_TOOLTIP` against `status/CLIENT-REJECTS.md` §2.
+
+Same step covers the other Arbiter-owned client packets T45 added: the World console must print
+**no** `handler has not been implemented yet!!!` lines at all for 43407, 61398, 39349 or 46956
+during this session.
+
+## 6. The mailbox is empty, not twelve blank rows
+
+Before T45 nothing answered `SDB_LIST_PARCEL` (0x2777), so the replay table handed every character
+dob's captured list and the mailbox rendered 12 phantom rows and a `00`.
+
+**Do:** open the mailbox on a character that has never received mail.
+
+| window | line |
+|---|---|
+| A | `SDB_LIST_PARCEL: user {Pid} view {View} page {Page} -> 0 parcel(s)` |
+| client | an empty mailbox — no rows at all |
+
+**Failures**
+
+* `no replay for 0x2777` → the allow-list entry did not ship, and that character's DB queue is now head-blocked: the next logout will hang (section 11).
+* `SDB_LIST_PARCEL: {Len} B payload (want {Want}) or no store - empty inbox` (Warning) → the request shape is not what `ParcelDbHandlers.ListRequestSize` expects. The mailbox is still empty, so the client looks right, but the layout is wrong and MAKE/RECV will be wrong too.
+* Twelve rows still appear → the replay table answered first; `DbProxyHandlers.IsHandledRequest` does not contain 0x2777 in the binary that is running.
+
+## 7. Whisper between the two clients
+
+Whisper now goes through `ChatManager` and resolves the recipient through
+`WorldBridge.SessionForPlayerId` (T43 built it, T47 wired the roster). Before that it always said
+"offline" with two players in world.
+
+**Do:** A whispers B, B whispers back. Then A whispers a name that does not exist. Then B blocks A
+and A whispers again.
+
+| window | line |
+|---|---|
+| A | `Whisper from {A} delivered (1 client packet(s))` |
+| A | `Whisper from {B} delivered (1 client packet(s))` |
+| A | `C_WHISPER from {A}: {Why} ({N} in world)` for the three refusal cases |
+| client | the text appears in the other client's whisper tab, with the sender's name |
+
+**Failures**
+
+* `C_WHISPER from {A}: … (0 in world)` while both clients are clearly in world → the chat roster is not being registered; `SocialHandlers.RegisterChat` is called from `WorldEntry` and from `GameSession`, and one of those two call sites is missing.
+* `Whisper from {A} delivered (0 client packet(s))` → the recipient resolved but the session lookup returned nothing; window A also shows `chat: S_WHISPER for {To} dropped - no session` at Debug.
+* Delivered but nothing renders in the client → `S_LOAD_CLIENT_USER_SETTING` never reached that client, so the chat window has no tabs configured. It is sent at `C_LOAD_TOPO_FIN`, not at select.
+
+## 8. Party: invite, accept, leave
+
+`PartyManager` (T35/T49) is wired through `PartyWiring`: 7 client opcodes registered, 12 `SA_`
+opcodes gated out of the tunnel in `WorldBridge.HandleFrame`.
+
+**Do:** A invites B, B accepts, both send party chat, A changes the looting method, B leaves.
+
+| window | line |
+|---|---|
+| A | `Party 0x{Id:X} created: {A} + {B}` |
+| A | `Party 0x{Id:X}: {B} joined ({N} members)` |
+| A | `Party 0x{Id:X} {why}` on leave/dissolve |
+| client | the party frame appears on both clients with both names and levels |
+
+**Failures**
+
+* Nothing at all in window A when A clicks invite → the `PartyWiring.ClientOpcodes` loop in `HandlerRegistry` did not ship; the packet is being forwarded and `W` prints `handler has not been implemented yet!!!`.
+* A party packet reaches World and the World link drops → the `HandleFrame` gate did not ship; `status/PARTY-DESIGN.md` §11.5 has the exact line.
+* Window A (Debug) prints `party: {reason}` — e.g. `C_APPLY_PARTY: player {id} is not online`, `C_APPLY_PARTY: applicant is already in a party` — and the client shows a system message. That is the designed refusal path, not a bug; the four `SA_` opcodes with no case yet (`0x139A`, `0x139C`, `0x13AB`, `0x13AC`) log and send nothing, per `status/PARTY-DESIGN.md` §11.6.
+* Party chat works but the roster frame is empty → the client packet built, the member list did not; compare against `status/PARTY-DESIGN.md` §6.
+
+## 9. Guild: create, invite, accept, announce
+
+17 client guild packets are registered through `GuildWiring` (T51), the guild rows persist, and
+`SDB_INIT_GUILD` (0x27CF) rebuilds World's guild table from those rows at boot.
+
+**Note before you start:** guild handlers do **not** log at Information — there is no
+`C_CREATE_GUILD: …` line to look for. Run at Debug and use the client plus the two proofs below.
+(Adding an Information line per guild command is the obvious follow-up; it is the only subsystem
+on this list you cannot watch from the console.)
+
+**Do:** A creates a guild (needs the gold and level the client enforces), invites B, B accepts, A
+sets the announcement, A opens the guild window.
+
+| window | line / proof |
+|---|---|
+| client | the guild window renders with the name, the announcement, and both members |
+| A (Debug) | `guild: DispatchResult(…)` lines only when something was dropped — silence here is success |
+| DB | a row in `guilds` and two in `guild_members` |
+| A, **after restarting WorldServer** | `SDB_INIT_GUILD: sent {N} frame(s) for 1 guild(s)` |
+
+That last line is the real proof: it means the guild survived a World restart and was rebuilt from
+rows rather than replayed from `arb_world.log`.
+
+**Failures**
+
+* `guild: 0x{Op:X4} dropped - no store open` → `Program.Store` was null when the packet arrived.
+* `guild: World did not accept 0x{Op:X4} ({Len} B payload)` → a guild frame was rejected by World; this is the highest-risk area in the whole document because `SDB_CREATE_GUILD2`'s fixed part has never been seen on a tap (`status/GUILD-DESIGN.md` §8.1) and a wrong size kills the link.
+* `guild: {Packet} for {To} dropped - no session` for an **online** member → the recipient lookup is wrong; for offline members this line is normal and expected.
+* `SDB_INIT_GUILD: sent {N} frame(s) for 0 guild(s)` after a restart, with a guild in the DB → the boot load is not reading the rows.
+* The guild window opens empty → `S_GUILD_INFO` / `S_GUILD_MEMBER_LIST` layout; 31 unaligned fields, `status/GUILD-DESIGN.md` §8.2.
+
+## 10. GM: `/@teleport` and `AdminLevel[5]` in World
+
+Two separate things that both have to be true before any of the 416 World GM commands work:
+the Arbiter must classify the command as `ForwardToWorld` (T47), and World must have been told
+the account's admin level in `AS_ENTER_WORLD[111]` (T46).
+
+**Do:** with `TERASHARP_GM_ACCOUNTS=<account A>` set, log in as A and enter the world. Then type
+`/@query_point`, `/@teleport {B's character name}`, and `/@nonsense_command`.
+
+| window | line |
+|---|---|
+| W | `AdminLevel[5]` in the enter-world line for A — **not** `AdminLevel[0]` |
+| A | `C_ADMIN from account '{A}' level 5: query_point -> Local` |
+| client | `Can't request coin` (the real Arbiter's own reply — there is no billing service) |
+| A | `C_ADMIN from account '{A}' level 5: teleport {name} -> ForwardToWorld` |
+| client | A is standing next to B |
+| A | `C_ADMIN from account '{A}' level 5: nonsense_command -> ForwardToWorld`, then World refuses it |
+
+**Failures**
+
+* `W` prints `AdminLevel[0]` → the env value matches neither the account name nor the character name. `GmCommandHandlers.LevelOf` matches both, so check the spelling of what you actually typed at the character screen.
+* `A` prints `… level 0: teleport … -> NotAuthorised` and the client gets **nothing back** → same cause, seen from the Arbiter side. The silence is correct: the real Arbiter logs abuse and answers nothing.
+* `A` prints `… -> Unknown` → a stale binary. `Classify` has forwarded by default since T47; `Unknown` is no longer produced.
+* `A` prints `… -> ForwardToWorld` but nothing happens in game → the command reached World and World refused it. Check `AdminLevel` first, then the command's own arguments; `status/GM-COMMANDS-FULL.md` has all 608 names.
+* No `C_ADMIN from account` line at all → the client is not in QA mode. `S_LOGIN_ARBITER.status` must be 31 or 33; 31 was confirmed live on 2026-09-14 (`status/GM-DESIGN.md` §6).
+
+Finish with `/@set_admin_level {B's character} 5` and check the `accounts.admin_level` row — it is
+the only GM command that writes to the DB:
+
+| window | line |
+|---|---|
+| A | `GM set_admin_level: '{Target}' (account {Acct}) -> level 5 by '{A}'` (Warning level, deliberately) |
+
+---
 
 ## 11. Logout, relog, and the DLM check
 
-**Do:** Logout button → lobby → select the other character → enter → Exit.
+**Do:** A logs out to the lobby while B stays in world; A selects the other character and enters;
+then A exits the client.
 
 | window | line |
 |---|---|
 | A | `C_RETURN_TO_LOBBY from {Id} - starting lobby-return` |
 | A | `Sent AS_USER_REQUEST_EXIT (0x14FF) for player {N}` |
 | A | `Sent AS_CANCEL_SKILL_STRICTLY (0x1460) + AS_LEAVE_WORLD (0x1392) gameId={G:X} type=3 reason=0` |
-| A | `SDB_UPDATE_FATIGABILITY_POINT: account 1 +{D} fatigue -> {Total}` (the logout write) |
+| A | `SA_LEAVE_WORLD (0x1393) -> AS_ARBITER_USER_DELETE (0x1433) for gameId {G:X}` |
 | A | `Session {Id}: sent S_RETURN_TO_LOBBY` |
+
+**Proof B was not disturbed:** B's client keeps rendering the world throughout, and window A shows
+no `WorldServer link #{Id} closed` line.
 
 **The failure that matters:** `Session {Id}: SA_LEAVE_WORLD not received in 5s - forcing delete`
 followed by `Session {Id}: forcing AS_ARBITER_USER_DELETE`. That is a **DLM head-block**: some
@@ -254,19 +334,39 @@ head of World's queue. Scroll back for the last `no replay for 0x….` before it
 the culprit. The next `C_SELECT_USER` will then stall at `0x1626` because World still holds the
 character.
 
-## 12. Party (merged alongside, not in the T19-T37 list)
-
-If two clients are up: invite, accept, leave. Window A shows
-`Party 0x{Id:X} created: {A} + {B}`, `Party 0x{Id:X}: {B} joined ({N} members)`,
-`Party 0x{Id:X} {why}` on dissolve.
-
 ---
 
-## Quick reference — the six lines that mean "stop and read"
+## Quick reference — the seven lines that mean "stop and read"
 
 1. `no replay for 0xNNNN` — an unanswered per-user request; the next logout will hang.
 2. `SA_LEAVE_WORLD not received in 5s` — the head-block already happened.
-3. `promotions_147E.bin missing or malformed` — a fresh World will crash on a level-1 character.
-4. `the 63-push config burst was NOT sent` — first enter-world into a fresh World gets dropped.
-5. `DbProxy: {Op} is allow-listed but has no handler` — a dispatch/allow-list mismatch shipped.
-6. `has no world blob (found=…) - replying not-found` — the character's state is gone, not merely stale.
+3. `{Opcode} (0x{Opcode:X4}) is Arbiter-owned and has no handler - dropped, NOT forwarded` — a half-applied T45; the client is waiting for a reply nobody will send.
+4. `guild: World did not accept 0x{Op:X4}` — a guild frame World rejected; the link is one wrong size away from dying.
+5. `promotions_147E.bin missing or malformed` — a fresh World will crash on a level-1 character.
+6. `the 63-push config burst was NOT sent` — first enter-world into a fresh World gets dropped.
+7. `DbProxy: {Op} is allow-listed but has no handler` — a dispatch/allow-list mismatch shipped.
+
+And two more that are new since the last revision of this list:
+
+- `Link #{Id}: handler for 0x{Op:X4} ({Len} B) threw - frame dropped` (window A, Error) — the
+  per-frame try/catch T48 asked for is now in `WorldLink.ReceiveLoop`, so a throwing `SDB_`
+  handler drops one frame instead of closing the link and disconnecting everyone. It is no longer
+  fatal, which means it is now easy to miss: every one of these is a bug that used to end the
+  session, and the frame it dropped was a DLM item, so that user is head-blocked anyway.
+- In the World console: `handler has not been implemented yet!!! {opcode} {len}` — an
+  Arbiter-owned client packet is still being forwarded. `status/CLIENT-REJECTS.md` names all 18.
+
+---
+
+## What this pass cannot cover
+
+Even with two clients, these stay untested until the capture sessions in
+`status/CAPTURE-PLAN.md` happen:
+
+- **Warehouse** — no capture contains a single warehouse frame; every offset in
+  `World/WarehouseHandlers.cs` comes from the decompile alone.
+- **Mail with actual mail in it** — `ParcelDataNoMsg`'s 0x9e8-byte interior is unknown, so
+  `ParcelCount = 0` is the only honest answer this build can give (section 6 tests exactly that).
+- **Broker** — not implemented at all (T53 research).
+- **Private chat channels** — `ChatManager` implements them but no client packet has ever been
+  seen; section 7 exercises whisper only.
