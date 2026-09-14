@@ -278,3 +278,114 @@ public sealed class DefinitionReader
         return b;
     }
 }
+
+/// <summary>
+/// Narrowing helpers for values that came out of <see cref="DefinitionReader"/>.
+///
+/// <para>T50. The reader hands back the CLR type the .def declares: a <c>uint32</c> field arrives
+/// as <see cref="uint"/>, a <c>uint64</c> as <see cref="ulong"/>, and roughly half of all
+/// four-byte values on the wire are 0x80000000 or higher. <c>Convert.ToInt32</c> throws
+/// <see cref="OverflowException"/> on every one of those - not because the packet is malformed
+/// but because the id is large - and that single line was 125 of the 126 client-fuzz errors
+/// (the C_DELETE_USER id read; status/FUZZ-FINDINGS.txt).</para>
+///
+/// <para>These reinterpret the bits instead of refusing them, which is what the real Arbiter
+/// does: Handler_C_DELETE_USER copies the DWORD straight into a signed slot and compares it
+/// against the account's character ids, so 0xFFFFFFFF simply matches nothing. Every method here
+/// is total - no input of any type throws.</para>
+/// </summary>
+public static class DefField
+{
+    /// <summary>The field as an <see cref="int"/>, reinterpreting the bits rather than throwing.</summary>
+    public static int I32(object? v) => v switch
+    {
+        null => 0,
+        int i => i,
+        uint u => unchecked((int)u),
+        short sh => sh,
+        ushort us => us,
+        sbyte sb => sb,
+        byte by => by,
+        long l => unchecked((int)l),
+        ulong ul => unchecked((int)ul),
+        bool bo => bo ? 1 : 0,
+        float f => ClampI32(f),
+        double d => ClampI32(d),
+        string s => int.TryParse(s, out int p) ? p : 0,
+        _ => 0,
+    };
+
+    /// <summary>The field as a <see cref="uint"/>. Same bits as <see cref="I32(object)"/>.</summary>
+    public static uint U32(object? v) => unchecked((uint)I32(v));
+
+    /// <summary>The field as a <see cref="long"/>, reinterpreting the bits rather than throwing.</summary>
+    public static long I64(object? v) => v switch
+    {
+        null => 0L,
+        long l => l,
+        ulong ul => unchecked((long)ul),
+        int i => i,
+        uint u => u,
+        short sh => sh,
+        ushort us => us,
+        sbyte sb => sb,
+        byte by => by,
+        bool bo => bo ? 1L : 0L,
+        float f => ClampI64(f),
+        double d => ClampI64(d),
+        string s => long.TryParse(s, out long p) ? p : 0L,
+        _ => 0L,
+    };
+
+    /// <summary>The field as a <see cref="ulong"/>. Same bits as <see cref="I64(object)"/>.</summary>
+    public static ulong U64(object? v) => unchecked((ulong)I64(v));
+
+    /// <summary>The field as a bool. Anything non-zero is true; nothing throws.</summary>
+    public static bool Bool(object? v) => v switch
+    {
+        null => false,
+        bool b => b,
+        string s => s.Length > 0 && !s.Equals("0", StringComparison.Ordinal)
+                                 && !s.Equals("false", StringComparison.OrdinalIgnoreCase),
+        _ => I64(v) != 0,
+    };
+
+    /// <summary>The field as a string. Never null.</summary>
+    public static string Str(object? v) => v?.ToString() ?? string.Empty;
+
+    /// <summary>Look one field up in a decoded packet without throwing on a missing name.</summary>
+    public static int I32(IReadOnlyDictionary<string, object>? f, string name)
+        => f != null && f.TryGetValue(name, out object? v) ? I32(v) : 0;
+
+    /// <summary>Look one field up as a <see cref="uint"/>; absent means 0.</summary>
+    public static uint U32(IReadOnlyDictionary<string, object>? f, string name)
+        => f != null && f.TryGetValue(name, out object? v) ? U32(v) : 0u;
+
+    /// <summary>Look one field up as a <see cref="long"/>; absent means 0.</summary>
+    public static long I64(IReadOnlyDictionary<string, object>? f, string name)
+        => f != null && f.TryGetValue(name, out object? v) ? I64(v) : 0L;
+
+    /// <summary>Look one field up as a bool; absent means false.</summary>
+    public static bool Bool(IReadOnlyDictionary<string, object>? f, string name)
+        => f != null && f.TryGetValue(name, out object? v) && Bool(v);
+
+    /// <summary>Look one field up as a string; absent means empty.</summary>
+    public static string Str(IReadOnlyDictionary<string, object>? f, string name)
+        => f != null && f.TryGetValue(name, out object? v) ? Str(v) : string.Empty;
+
+    /// <summary>The element list of an array field, or an empty list when it is absent.</summary>
+    public static List<object> List(IReadOnlyDictionary<string, object>? f, string name)
+        => f != null && f.TryGetValue(name, out object? v) && v is List<object> l ? l : new List<object>();
+
+    private static int ClampI32(double d)
+        => double.IsNaN(d) ? 0
+         : d <= int.MinValue ? int.MinValue
+         : d >= int.MaxValue ? int.MaxValue
+         : (int)d;
+
+    private static long ClampI64(double d)
+        => double.IsNaN(d) ? 0L
+         : d <= long.MinValue ? long.MinValue
+         : d >= long.MaxValue ? long.MaxValue
+         : (long)d;
+}

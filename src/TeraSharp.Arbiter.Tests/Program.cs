@@ -13281,6 +13281,48 @@ some prose with `backticks` that is not a table row
     // makes that distinction observable.
     // =======================================================================================
 
+    /// <summary>
+    /// One line per distinct (where, exception) pair, most frequent first, each with its count
+    /// and one sample message.
+    ///
+    /// <para>T50. The first real run of this suite printed its first 20 failure lines and every
+    /// one of them was the same finding, so the report said nothing at all about the other 106.
+    /// Counting distinct pairs is the list that is actually actionable: the 126 client errors
+    /// were two findings and the 21 DB-proxy failures were two more.</para>
+    /// </summary>
+    static List<string> FuzzSummary(IEnumerable<(string Key, string Sample)> items)
+    {
+        var order = new List<string>();
+        var count = new Dictionary<string, int>(StringComparer.Ordinal);
+        var sample = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var (key, text) in items)
+        {
+            if (!count.ContainsKey(key)) { order.Add(key); count[key] = 0; sample[key] = text; }
+            count[key]++;
+        }
+        order.Sort((a, b) => count[b] != count[a]
+            ? count[b].CompareTo(count[a])
+            : string.CompareOrdinal(a, b));
+        var outp = new List<string>();
+        foreach (var key in order) outp.Add($"{count[key]} x {key}  --  {sample[key]}");
+        return outp;
+    }
+
+    /// <summary>
+    /// The (packet or opcode, exception type) pair a captured log line is about. Everything else
+    /// in the message - the session guid, the body length, the offending index - varies per body
+    /// and would make every line distinct, which is exactly how the first run lost its findings.
+    /// </summary>
+    static string FuzzKeyOf(string error)
+    {
+        var where = System.Text.RegularExpressions.Regex.Match(
+            error, @"\b(0x[0-9A-Fa-f]{4}|(?:C|SDB|DBS|SA|AS|S)_[A-Z0-9_]+)\b");
+        int colon = error.IndexOf(':');
+        string who = where.Success ? where.Groups[1].Value : colon > 0 ? error[..colon] : error;
+        var kind = System.Text.RegularExpressions.Regex.Match(error, @"\b([A-Za-z0-9_]*Exception)\b");
+        return $"{who} / {(kind.Success ? kind.Groups[1].Value : "logged at Error")}";
+    }
+
     /// <summary>An ILogger that remembers what was logged at Error level or above.</summary>
     sealed class CapturingLogger : Microsoft.Extensions.Logging.ILogger
     {
@@ -13727,6 +13769,14 @@ some prose with `backticks` that is not a table row
         Hex.True(dispatcher.RegisteredCount > 40,
             $"only {dispatcher.RegisteredCount} handlers registered - the fuzz would prove nothing");
 
+        // T50: registration-time complaints are not fuzz findings. RegisterAll logs at Error for
+        // any name missing from the opcode map, and in build 376012 C_CHECK_ALIVE is missing (the
+        // client never sends it) - that one line was the 126th "handler error" of the first run.
+        // Report it, then start the fuzz from a clean list.
+        List<string> registration;
+        lock (factory.Errors) { registration = new List<string>(factory.Errors); factory.Errors.Clear(); }
+        foreach (var line in registration) Console.WriteLine($"        (registration: {line})");
+
         using var socket = new System.Net.Sockets.Socket(
             System.Net.Sockets.AddressFamily.InterNetwork,
             System.Net.Sockets.SocketType.Stream,
@@ -13754,10 +13804,12 @@ some prose with `backticks` that is not a table row
         errors.AddRange(dispatchLog.Errors);
         lock (factory.Errors) errors.AddRange(factory.Errors);
 
+        var summary = FuzzSummary(errors.Select(e => (FuzzKeyOf(e), e)));
         Hex.True(errors.Count == 0,
             $"{errors.Count} handler error(s) out of {packets} hostile packets across {names.Count} "
-            + "opcodes. Each one is a packet-derived value used without a bounds check:\n    "
-            + string.Join("\n    ", errors.Take(20)));
+            + $"opcodes, {summary.Count} distinct (opcode, exception) pair(s). Each one is a "
+            + "packet-derived value used without a bounds check:\n    "
+            + string.Join("\n    ", summary));
 
         Console.WriteLine($"        ({packets} hostile packets over {names.Count} opcodes, no handler errors)");
     }
@@ -13816,7 +13868,10 @@ some prose with `backticks` that is not a table row
         Hex.True(guildId > 0, "the scratch guild was created");
 
         int calls = 0;
-        var failures = new List<string>();
+        // T50: keyed by (what, exception type) so one finding is one line, however many bodies
+        // hit it. The cap is a memory stop, not a reporting one - the old `> 20` cut the run
+        // short and hid every opcode after the first failing one.
+        var failures = new List<(string Key, string Sample)>();
 
         void Drive(string what, Action<byte[]> f, int seed)
         {
@@ -13825,8 +13880,9 @@ some prose with `backticks` that is not a table row
                 try { f(body); }
                 catch (Exception ex)
                 {
-                    failures.Add($"{what} threw {ex.GetType().Name} on a {body.Length}-byte body: {ex.Message}");
-                    if (failures.Count > 20) return;
+                    if (failures.Count < 5000)
+                        failures.Add(($"{what} / {ex.GetType().Name}",
+                            $"{what} threw {ex.GetType().Name} on a {body.Length}-byte body: {ex.Message}"));
                 }
                 calls++;
             }
@@ -13849,9 +13905,11 @@ some prose with `backticks` that is not a table row
         foreach (ushort o in PartyFuzzOpcodes())
             Drive($"PartyManager 0x{o:X4}", b => party.OnClientPacket(1, o, b), o);
 
+        var parserSummary = FuzzSummary(failures);
         Hex.True(failures.Count == 0,
-            $"{failures.Count} parser failure(s) over {calls} hostile bodies:\n    "
-            + string.Join("\n    ", failures.Take(20)));
+            $"{failures.Count} parser failure(s) over {calls} hostile bodies, "
+            + $"{parserSummary.Count} distinct (parser, exception) pair(s):\n    "
+            + string.Join("\n    ", parserSummary));
 
         // the store must still be usable afterwards - a fuzzed write that corrupted it would
         // show up here rather than as a silent half-commit
@@ -13902,7 +13960,10 @@ some prose with `backticks` that is not a table row
         Hex.True(ops.Count >= 30, $"only {ops.Count} allow-listed opcodes - the parser broke, not the code");
 
         int calls = 0;
-        var failures = new List<string>();
+        // T50: every opcode is fuzzed, every time. The old `> 20` break stopped the whole run at
+        // the 21st failure, which in practice meant it stopped inside 0x27FA and never touched a
+        // single opcode above it - the findings for the rest of the table were simply absent.
+        var failures = new List<(string Key, string Sample)>();
         foreach (ushort op in ops)
         {
             foreach (var payload in FuzzBodies(op))
@@ -13910,19 +13971,21 @@ some prose with `backticks` that is not a table row
                 try { proxy.TryHandle(null!, link, op, payload); }
                 catch (Exception ex)
                 {
-                    failures.Add($"0x{op:X4} ({DbProxyOpcodeNames.Describe(op)}) threw "
-                        + $"{ex.GetType().Name} on a {payload.Length}-byte payload: {ex.Message}");
-                    if (failures.Count > 20) break;
+                    if (failures.Count < 5000)
+                        failures.Add(($"0x{op:X4} {DbProxyOpcodeNames.Describe(op)} / {ex.GetType().Name}",
+                            $"0x{op:X4} ({DbProxyOpcodeNames.Describe(op)}) threw "
+                            + $"{ex.GetType().Name} on a {payload.Length}-byte payload: {ex.Message}"));
                 }
                 calls++;
             }
-            if (failures.Count > 20) break;
         }
 
+        var dbSummary = FuzzSummary(failures);
         Hex.True(failures.Count == 0,
-            $"{failures.Count} DB-proxy failure(s) over {calls} hostile payloads. Each one closes "
+            $"{failures.Count} DB-proxy failure(s) over {calls} hostile payloads, "
+            + $"{dbSummary.Count} distinct (opcode, exception) pair(s). Each one closes "
             + "the World link and disconnects every player:\n    "
-            + string.Join("\n    ", failures.Take(20)));
+            + string.Join("\n    ", dbSummary));
 
         Hex.True(store.GetCharacter(1) != null, "the store still answers after the fuzz");
         Console.WriteLine($"        ({calls} hostile payloads over {ops.Count} DB-proxy opcodes)");
@@ -14054,5 +14117,159 @@ some prose with `backticks` that is not a table row
         var rc = ChatPackets.ParseCCreatePrivateChannel(c);
         Hex.True(rc != null && rc.Value.invited.Count == 1,
             $"a self-loop yields one invitee, got {rc?.invited.Count}");
+    }
+
+    // =======================================================================================
+    // T50 - the three findings the T48 fuzz suite actually produced when it was run for real.
+    // status/FUZZ-FINDINGS.txt, status/SECURITY-AUDIT.md.
+    // =======================================================================================
+
+    /// <summary>
+    /// T50 finding 1, 125 of the 126 client-fuzz errors. C_DELETE_USER.1 is <c>uint32 id</c>, so
+    /// the def reader hands the handler a <see cref="uint"/>, and <c>Convert.ToInt32</c> throws
+    /// OverflowException for every id past int.MaxValue - which is half of all four-byte values.
+    /// It is not a malformed packet, just a large id, and the real handler reinterprets the DWORD
+    /// into a signed slot where 0xFFFFFFFF simply matches none of the account's characters.
+    /// </summary>
+    [Test] public static void DefField_reinterprets_instead_of_throwing()
+    {
+        Hex.True(DefField.I32(0xFFFFFFFFu) == -1, "0xFFFFFFFF reinterprets to -1");
+        Hex.True(DefField.I32(0x80000000u) == int.MinValue, "and 0x80000000 to int.MinValue");
+        Hex.True(DefField.U32(-1) == 0xFFFFFFFFu, "U32 gives the same bits back");
+        Hex.True(DefField.I64(ulong.MaxValue) == -1L, "the 64-bit pair behaves the same way");
+        Hex.True(DefField.I32(null) == 0, "an absent field is 0, not an exception");
+        Hex.True(DefField.I32("not a number") == 0, "and so is an unparseable one");
+        Hex.True(DefField.I32(float.NaN) == 0, "NaN is 0");
+        Hex.True(DefField.I32(double.PositiveInfinity) == int.MaxValue, "infinity clamps");
+        Hex.True(DefField.I32(double.NegativeInfinity) == int.MinValue, "both ways");
+        Hex.True(DefField.Bool(0u) == false && DefField.Bool(7u), "Bool takes any integer");
+        Hex.True(DefField.Str(null).Length == 0, "Str is never null");
+
+        var f = new Dictionary<string, object> { ["id"] = 0xC0000000u };
+        Hex.True(DefField.I32(f, "id") == unchecked((int)0xC0000000u), "the dictionary overload agrees");
+        Hex.True(DefField.I32(f, "absent") == 0, "a name that is not there is 0");
+        Hex.True(DefField.List(f, "absent").Count == 0, "and an absent array is empty, not null");
+    }
+
+    /// <summary>
+    /// The same finding through the real dispatcher, which is where it was logged at Error:
+    /// PacketDispatcher catches everything, so what this asserts is that it never took its
+    /// <c>catch (Exception)</c> branch for any id C_DELETE_USER can carry.
+    /// </summary>
+    [Test] public static void Delete_user_logs_no_error_for_an_id_past_int_max()
+    {
+        var defs = LoadDefinitionsOrSkip();
+        if (defs == null) return;
+        var opcodes = LoadOpcodesOrSkip();
+        if (opcodes == null) return;
+        if (!opcodes.TryGetCode("C_DELETE_USER", out ushort op)) return;
+
+        var factory = new CapturingLoggerFactory();
+        var dispatchLog = new CapturingLogger("PacketDispatcher");
+        var dispatcher = new TeraSharp.Arbiter.Network.PacketDispatcher(
+            new LoggerAdapter<TeraSharp.Arbiter.Network.PacketDispatcher>(dispatchLog));
+        HandlerRegistry.RegisterAll(dispatcher, opcodes, defs, factory);
+        lock (factory.Errors) factory.Errors.Clear();     // registration noise, not a finding
+        dispatchLog.Errors.Clear();
+
+        using var socket = new System.Net.Sockets.Socket(
+            System.Net.Sockets.AddressFamily.InterNetwork,
+            System.Net.Sockets.SocketType.Stream,
+            System.Net.Sockets.ProtocolType.Tcp);
+        var session = new TeraSharp.Arbiter.Network.GameSession(
+            socket, dispatcher, opcodes, defs, 376012, 0, QuietLog());
+
+        foreach (uint id in new uint[] { 0u, 1u, 0x7FFFFFFFu, 0x80000000u, 0xFFFFFFFFu })
+        {
+            var packet = new byte[8];
+            BitConverter.GetBytes((ushort)8).CopyTo(packet, 0);
+            BitConverter.GetBytes(op).CopyTo(packet, 2);
+            BitConverter.GetBytes(id).CopyTo(packet, 4);
+            dispatcher.Dispatch(session, packet);
+        }
+
+        var errors = new List<string>(dispatchLog.Errors);
+        lock (factory.Errors) errors.AddRange(factory.Errors);
+        Hex.True(errors.Count == 0,
+            "C_DELETE_USER must not log an error for any id: " + string.Join(" | ", errors));
+    }
+
+    /// <summary>
+    /// T50 finding 2, 2 of the 21 DB-proxy failures. <c>off + 16</c> was int arithmetic on a
+    /// packet-supplied offset, so a listOff of int.MaxValue - and int.MinValue, which wraps to
+    /// the same place - made the sum negative, the bound passed, and BitConverter threw
+    /// ArgumentOutOfRangeException. WorldLink.ReceiveLoop has no per-frame catch, so that one
+    /// exception closes the World link and disconnects every player.
+    /// </summary>
+    [Test] public static void Learn_all_crest_bounds_a_wrapping_list_offset()
+    {
+        foreach (uint listOff in new uint[]
+                 { 0u, 19u, 32u, 0x7FFFFFFFu, 0x80000000u, 0xFFFFFFF9u, 0xFFFFFFFFu })
+        {
+            var req = new byte[32];
+            BitConverter.GetBytes(1u).CopyTo(req, 0);
+            BitConverter.GetBytes(listOff).CopyTo(req, 4);
+            BitConverter.GetBytes(0x1234u).CopyTo(req, 16);
+            var r = DbProxyHandlers.BuildLearnAllCrest(req);
+            Hex.True(r != null && r.Length >= 13, $"listOff 0x{listOff:X8} must still build a reply");
+            Hex.True(BitConverter.ToUInt32(r!, 8) == 0x1234u, "and echo the reqId");
+        }
+
+        // the request header is 20 bytes, so the first entry can sit at payload 20 = frame 26
+        var loop = new byte[36];
+        BitConverter.GetBytes(9u).CopyTo(loop, 0);        // count lies
+        BitConverter.GetBytes(26u).CopyTo(loop, 4);       // listOff -> payload 20
+        BitConverter.GetBytes(0x77u).CopyTo(loop, 16);    // reqId
+        BitConverter.GetBytes(26u).CopyTo(loop, 20);      // this
+        BitConverter.GetBytes(26u).CopyTo(loop, 24);      // next -> itself
+        BitConverter.GetBytes(4242).CopyTo(loop, 28);     // crestId
+        BitConverter.GetBytes(1).CopyTo(loop, 32);        // value
+        var rl = DbProxyHandlers.BuildLearnAllCrest(loop);
+        Hex.True(rl != null && BitConverter.ToUInt32(rl, 0) == 1,
+            $"a self-referential chain yields one entry, got {(rl == null ? -1L : BitConverter.ToUInt32(rl, 0))}");
+        Hex.True(rl!.Length == 13 + 16, $"and one entry of payload, got {rl.Length} B");
+        Hex.True(BitConverter.ToInt32(rl, 13 + 8) == 4242, "which is the one that was sent");
+    }
+
+    /// <summary>
+    /// T50 finding 3, 19 of the 21 DB-proxy failures. Microsoft.Data.Sqlite issues
+    /// <c>PRAGMA foreign_keys = 1</c> unless the connection string says otherwise, so every
+    /// REFERENCES clause in this schema is enforced: an INSERT naming a character that has no row
+    /// throws SqliteException 19, and out of a DB-proxy handler that closes the World link and
+    /// disconnects everyone. Every per-character INSERT now checks the owner first and drops the
+    /// write with a warning - the caller still sends its DLM ack, which is what keeps the user's
+    /// DB queue moving (status/HANDOFF.md section 1).
+    /// </summary>
+    [Test] public static void Per_character_writes_drop_an_owner_that_has_no_row()
+    {
+        using var store = StoreWithTwoCharacters();
+        Hex.True(store.CharacterExists(1) && store.CharacterExists(2), "the fixture has 1 and 2");
+        Hex.True(!store.CharacterExists(9999), "and nothing else");
+        Hex.True(!store.CharacterExists(0) && !store.CharacterExists(-1), "0 and negatives never exist");
+
+        var payload = new byte[288];
+        Hex.True(!store.SaveAchievements(9999, payload), "SaveAchievements drops an unknown owner");
+        Hex.True(store.SaveAchievements(1, payload), "and still takes a real one");
+
+        Hex.True(store.UpsertQuest(9999, 1, 1, 1, new byte[80]) == 0, "UpsertQuest drops it");
+        Hex.True(!store.AddTutorialTip(9999, 1), "AddTutorialTip drops it");
+        Hex.True(store.AddAccomplishedAchievements(9999, new[] { (1, new byte[24]) }).Count == 0,
+            "AddAccomplishedAchievements drops it");
+        Hex.True(!store.AddFriend(1, 9999), "AddFriend checks the friend as well as the owner");
+        Hex.True(!store.AddFriend(9999, 1), "both ends, either way round");
+        Hex.True(!store.AddBlock(9999, 1), "AddBlock too");
+
+        // the void ones: the assertion is that none of these throws
+        store.SetSerenGuide(9999, 1, 1);
+        store.UpsertReputation(9999, 1, new byte[52]);
+        store.UpsertDungeonCoolTime(9999, 1, new byte[52]);
+        store.SetDungeonClearCount(9999, 1, 1);
+        store.UpsertFriend(9999, 1, 0, "", 1);
+        store.UpsertFriendGroup(9999, 2, "g");
+
+        // and the real owner is untouched by any of it
+        Hex.True(store.GetCharacter(1) != null, "the store still answers afterwards");
+        Hex.True(store.GetAchievements(1) != null, "character 1 still has its achievements");
+        Hex.True(store.GetAchievements(9999) == null, "and 9999 never got any");
     }
 }

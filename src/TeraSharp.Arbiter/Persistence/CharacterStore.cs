@@ -1497,6 +1497,7 @@ SELECT last_insert_rowid();";
     public int UpsertQuest(int ownerId, int questId, int status, int step, byte[] record)
     {
         ArgumentNullException.ThrowIfNull(record);
+        if (NoSuchOwner("UpsertQuest", ownerId)) return 0;
         lock (_lock)
         {
             int id;
@@ -1583,6 +1584,48 @@ SELECT last_insert_rowid();";
         }
     }
 
+    // ---- Foreign-key guards (T50) ----
+
+    /// <summary>True when a <c>characters</c> row with this id exists.</summary>
+    public bool CharacterExists(long id)
+    {
+        if (id <= 0) return false;
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT 1 FROM characters WHERE id = $i LIMIT 1";
+            cmd.Parameters.AddWithValue("$i", id);
+            return cmd.ExecuteScalar() is not null;
+        }
+    }
+
+    /// <summary>
+    /// The guard in front of every per-character INSERT. Returns true when the write must be
+    /// dropped because one of the character ids it would store has no row.
+    ///
+    /// <para>T50. Microsoft.Data.Sqlite issues <c>PRAGMA foreign_keys = 1</c> unless the
+    /// connection string says otherwise, so the REFERENCES clauses in this schema ARE enforced -
+    /// the comment above the guild tables saying they are documentation only is wrong, and was
+    /// written before anyone had watched one fail. An INSERT naming a character that does not
+    /// exist therefore throws SqliteException 19, and on the World side that exception unwinds
+    /// out of DbProxyHandlers into WorldLink.ReceiveLoop, which has no per-frame catch: one bad
+    /// owner id closes the World link and disconnects every player. 19 of the 21 DB-proxy fuzz
+    /// failures were exactly this, all of them SDB_UPDATE_USER_ACHIEVEMENT (0x27FA) for a player
+    /// id the payload invented. Dropping the write with a warning is what the real Arbiter does
+    /// with a row it cannot key - and the caller still sends its DLM ack, which is what keeps the
+    /// user's DB queue moving (status/HANDOFF.md section 1).</para>
+    /// </summary>
+    private bool NoSuchOwner(string what, params long[] ids)
+    {
+        foreach (long id in ids)
+        {
+            if (CharacterExists(id)) continue;
+            _log.LogWarning("{What}: no character row for id {Id} - write dropped", what, id);
+            return true;
+        }
+        return false;
+    }
+
     // ---- Achievements (T22) ----
 
     /// <summary>
@@ -1594,6 +1637,7 @@ SELECT last_insert_rowid();";
     public bool SaveAchievements(int ownerId, byte[] payload)
     {
         ArgumentNullException.ThrowIfNull(payload);
+        if (NoSuchOwner("SaveAchievements", ownerId)) return false;
         if (payload.Length < 288)
         {
             _log.LogWarning("SaveAchievements: {Len} B payload for character {Id} is too short to be 0x27FA",
@@ -1633,6 +1677,7 @@ SELECT last_insert_rowid();";
     public List<byte[]> AddAccomplishedAchievements(int ownerId, IReadOnlyList<(int Id, byte[] Record)> records)
     {
         ArgumentNullException.ThrowIfNull(records);
+        if (NoSuchOwner("AddAccomplishedAchievements", ownerId)) return new List<byte[]>();
         var added = new List<byte[]>();
         lock (_lock)
         {
@@ -1678,6 +1723,7 @@ SELECT last_insert_rowid();";
     /// </summary>
     public bool AddTutorialTip(int ownerId, int tipId)
     {
+        if (NoSuchOwner("AddTutorialTip", ownerId)) return false;
         lock (_lock)
         {
             using var cmd = _db.CreateCommand();
@@ -1706,6 +1752,7 @@ SELECT last_insert_rowid();";
     /// <summary>One seren-guide slot, last write wins.</summary>
     public void SetSerenGuide(int ownerId, int serenType, int serenId)
     {
+        if (NoSuchOwner("SetSerenGuide", ownerId)) return;
         lock (_lock)
         {
             using var cmd = _db.CreateCommand();
@@ -1743,6 +1790,7 @@ SELECT last_insert_rowid();";
     public void UpsertDungeonCoolTime(int ownerId, int dungeonId, byte[] record)
     {
         ArgumentNullException.ThrowIfNull(record);
+        if (NoSuchOwner("UpsertDungeonCoolTime", ownerId)) return;
         lock (_lock)
         {
             using var cmd = _db.CreateCommand();
@@ -1763,6 +1811,7 @@ SELECT last_insert_rowid();";
     /// </summary>
     public void SetDungeonClearCount(int ownerId, int dungeonId, int clearCount)
     {
+        if (NoSuchOwner("SetDungeonClearCount", ownerId)) return;
         lock (_lock)
         {
             using var cmd = _db.CreateCommand();
@@ -1836,6 +1885,7 @@ SELECT last_insert_rowid();";
     public void UpsertReputation(int ownerId, int reputationId, byte[] record)
     {
         ArgumentNullException.ThrowIfNull(record);
+        if (NoSuchOwner("UpsertReputation", ownerId)) return;
         lock (_lock)
         {
             using var cmd = _db.CreateCommand();
@@ -2121,6 +2171,7 @@ DELETE FROM guild_members     WHERE user_db_id = $id;";
     public void UpsertFriend(int characterId, int friendId, int type, string memo, int groupId = 1)
     {
         ArgumentNullException.ThrowIfNull(memo);
+        if (NoSuchOwner("UpsertFriend", characterId, friendId)) return;
         lock (_lock)
         {
             using var cmd = _db.CreateCommand();
@@ -2139,6 +2190,7 @@ DELETE FROM guild_members     WHERE user_db_id = $id;";
 
     public bool AddFriend(int characterId, int friendId, int type = 0)
     {
+        if (NoSuchOwner("AddFriend", characterId, friendId)) return false;
         lock (_lock)
         {
             using var cmd = _db.CreateCommand();
@@ -2215,6 +2267,7 @@ DELETE FROM guild_members     WHERE user_db_id = $id;";
     {
         ArgumentNullException.ThrowIfNull(name);
         if (name.Length > 40) name = name[..40];
+        if (NoSuchOwner("UpsertFriendGroup", characterId)) return;
         lock (_lock)
         {
             using var cmd = _db.CreateCommand();
@@ -2326,6 +2379,7 @@ DELETE FROM guild_members     WHERE user_db_id = $id;";
 
     public bool AddBlock(int characterId, int blockedId)
     {
+        if (NoSuchOwner("AddBlock", characterId, blockedId)) return false;
         lock (_lock)
         {
             using var cmd = _db.CreateCommand();
@@ -2751,6 +2805,7 @@ DELETE FROM guild_members     WHERE user_db_id = $id;";
         int gender, int level, long accountId, int guildGroupId = DefaultGuildGroupId, long joinDate = 0)
     {
         ArgumentNullException.ThrowIfNull(name);
+        if (NoSuchOwner("AddGuildMember", userDbId)) return 0;
         lock (_lock)
         {
             using var probe = _db.CreateCommand();
@@ -3002,6 +3057,7 @@ DELETE FROM guild_members     WHERE user_db_id = $id;";
     /// message, which is what an INSERT on the real primary key does.</summary>
     public void InsertGuildApply(int guildId, int userDbId, string joinMsg, long appliedAt = 0)
     {
+        if (NoSuchOwner("InsertGuildApply", userDbId)) return;
         lock (_lock)
         {
             if (appliedAt == 0) appliedAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
@@ -3062,6 +3118,7 @@ DELETE FROM guild_members     WHERE user_db_id = $id;";
     /// <summary>spAddInviteUserToGuild(guildDbId, userDbId, invitorDbId).</summary>
     public void AddGuildInvite(int guildId, int userDbId, int invitorDbId, long invitedAt = 0)
     {
+        if (NoSuchOwner("AddGuildInvite", userDbId)) return;
         lock (_lock)
         {
             if (invitedAt == 0) invitedAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds();

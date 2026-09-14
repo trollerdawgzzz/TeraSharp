@@ -413,3 +413,167 @@ the human builds.**
   no client def we read has one. If one ever appears, the budget is the only thing between it and
   `count^depth`.
 - **The `PacketReader` decision** (H3) — delete or adopt — is a judgement call, not an audit finding.
+
+---
+
+## 9. T50 — the suite was run for real, and what came out of it
+
+T48 wrote the fuzz suite without being able to run it. The human ran it. Two tests failed:
+
+```
+FAIL Fuzz_client_dispatch_survives_hostile_bodies: 126 handler error(s) out of 20400 hostile
+     packets across 68 opcodes
+FAIL Fuzz_dbproxy_dispatch_survives_hostile_frames: 21 DB-proxy failure(s) over 10387 hostile
+     payloads
+PASS Fuzz_subsystem_parsers_survive_hostile_bodies                  (9600 bodies, clean)
+```
+
+147 lines of output, **three** findings. The report printed its first 20 lines and all 20 were the
+same one, which is the first thing fixed below.
+
+### 9.0 The report itself
+
+`FuzzSummary` collapses the failures to one line per distinct `(opcode, exception type)` pair with
+a count and one sample, sorted most-frequent-first, and the DB-proxy test no longer stops at the
+21st failure. That cap was not just a display limit: `ops` is walked in ascending opcode order, so
+breaking out at failure 21 stopped the run inside `0x27FA` and **23 of the 58 allow-listed opcodes
+were never fuzzed at all** — everything above `0x27FA`. They are audited by hand in 9.4 below, but
+the next run is the first time they are actually exercised.
+
+Registration-time errors are also separated out now. `HandlerRegistry.RegisterAll` logs at Error
+for any name missing from the opcode map, the capturing factory collected that, and it counted as
+a "handler error": `C_CHECK_ALIVE` is not in build 376012's map (the client never sends it), and
+that one line was the 126th error. It is printed as a note before the fuzz starts.
+
+### 9.1 Finding 1 — `Convert.ToInt32` on a `uint32` def field (125 of the 126)
+
+`C_DELETE_USER.1` is one field, `uint32 id`. `DefinitionReader.ReadPrimitive` returns `FieldKind`
+`UInt32` as a boxed **`uint`**, and `Convert.ToInt32(uint)` throws `OverflowException` for every
+value at or above `0x80000000` — half of all four-byte values. `PacketDispatcher` catches it in its
+`catch (Exception)` arm and logs at **Error**, which is what the test counts.
+
+Reproduced exactly: porting `FuzzBodies` and .NET's `Random` to Python and counting the bodies
+whose first four bytes are >= `0x80000000` gives **125**, and 125 + the `C_CHECK_ALIVE`
+registration line = 126. The whole failure was two lines of code.
+
+This is not a malformed packet, it is a large id, and the real handler does not refuse it:
+`Handler_C_DELETE_USER` copies the DWORD into a signed slot and compares it against the account's
+character ids, where `0xFFFFFFFF` matches nothing and the reply is `success = 0`.
+
+**Fix.** `Protocol/DefinitionReader.cs` gains `DefField` — total narrowing helpers (`I32`, `U32`,
+`I64`, `U64`, `Bool`, `Str`, `List`, plus dictionary overloads) that reinterpret the bits instead
+of range-checking them, clamp floats, and never throw for any input of any type.
+
+| Call site | Def type | Was | Now |
+|---|---|---|---|
+| `CharacterHandlers.OnDeleteUser` | `uint32 id` | `Convert.ToInt32` | `DefField.I32` |
+| `CharacterHandlers.FromFields` x7 | mixed | `Convert.To*` | `DefField.*` |
+| `SocialHandlers.I32` helper | used by 5 handlers | `Convert.ToInt32` | `DefField.I32` |
+| `SocialHandlers.OnAddFriendGroup` | `array<uint32> friends` | `Convert.ToInt32(raw)` | `DefField.I32(raw)` |
+| `SocialHandlers.OnEditFriendGroup` | `{uint32 playerId, uint32 id}` | `Convert.ToInt32(e["playerId"])` | `DefField.I32(e, ...)` |
+
+The five `SocialHandlers` paths never appeared in the fuzz output for one reason only: the fuzz
+runs with `Program.Store == null` (H4 is still open), and every one of them returns before the
+conversion. They are reachable in a live session from `C_ADD_FRIEND_GROUP`,
+`C_EDIT_FRIEND_GROUP`, `C_DELETE_FRIEND_GROUP`, `C_CHANGE_FRIEND_MEMO` and
+`C_EDIT_BLOCKED_USER_MEMO`. The `e["playerId"]` indexer was a second bug in the same line — a
+`KeyNotFoundException` for any element the reader could not fill.
+
+`LoginHandlers` (human-owned) was checked and needs nothing: `language` is `uint32` read with
+`Convert.ToUInt32`, `patchVersion` and `C_SELECT_USER.id` are `int32` read with `Convert.ToInt32`.
+`ChatHandlers` and `ParcelHandlers` are clean for the same reason.
+
+### 9.2 Finding 2 — `off + 16` wraps in `BuildLearnAllCrest` (2 of the 21)
+
+`SA_LEARN_ALL_CREST_ACQUIRABLE` (0x1463) walks a chain of 16-byte entries at a frame-relative
+offset the packet supplies. The bound was `off + 16 <= req.Length` in **int** arithmetic, so a
+`listOff` of `int.MaxValue` — and `int.MinValue`, which wraps to the same place — made the sum
+negative, the bound passed, and `BitConverter.ToInt32(req, off + 8)` threw
+`ArgumentOutOfRangeException`. Simulated over the 300 bodies for that opcode: exactly 2, which is
+exactly what the run reported.
+
+Out of a DB-proxy handler that is not a dropped packet. `WorldLink.ReceiveLoop` has no per-frame
+catch (H2), so one such frame closes the World link and disconnects every player at once.
+
+**Fix.** The offsets are `long` (they are unsigned on the wire, so they are read as `uint` and
+widened — the old `(int)` cast happened to be safe for `0xFFFFFFFF` but for the wrong reason), and
+the walk keeps a visited set so a `next` that points at itself ends the chain instead of running
+to the 512 guard. The dead `uint count` local went with it.
+
+### 9.3 Finding 3 — foreign keys are enforced, and the schema assumed they were not (19 of the 21)
+
+Every `0x27FA` failure was `SQLite Error 19: FOREIGN KEY constraint failed` — a
+`SDB_UPDATE_USER_ACHIEVEMENT` whose payload named a player id with no `characters` row.
+
+The comment above the guild tables says the REFERENCES clauses are "documentation, not
+enforcement: this DB never sets PRAGMA foreign_keys". **That is wrong.**
+`Microsoft.Data.Sqlite` issues `PRAGMA foreign_keys = 1` on open unless the connection string says
+otherwise, and the connection string here is `Data Source={path}` and nothing else. Fifteen
+columns across thirteen tables reference `characters(id)`, and every INSERT into one of them can
+throw.
+
+**Fix.** `CharacterStore` gains `CharacterExists(long)` and a private `NoSuchOwner(what, ids...)`
+guard, and every per-character INSERT calls it first and drops the write with a warning:
+
+`UpsertQuest`, `SaveAchievements`, `AddAccomplishedAchievements`, `AddTutorialTip`,
+`SetSerenGuide`, `UpsertDungeonCoolTime`, `SetDungeonClearCount`, `UpsertReputation`,
+`UpsertFriend`, `AddFriend`, `UpsertFriendGroup`, `AddBlock`, `AddGuildMember`,
+`InsertGuildApply`, `AddGuildInvite`.
+
+`AddFriend`, `UpsertFriend` and `AddBlock` check **both** ids — both columns are foreign keys.
+Pure-UPDATE writers (`SetFriendMemo`, `SetFriendGroup`, `SetBlockMemo`, `DeleteFriendGroup`,
+`SetGuildMemberGroup`, `UpdateGuildMember*`, `AddGuildContribution`, `DeleteGuildGroup`,
+`ClearDungeonCoolTime`) are left alone: an UPDATE that does not set a foreign-key column cannot
+violate one, and matching no row is already the right answer.
+
+Dropping rather than throwing is what the caller needs. `OnSaveUserAchievement` sends its
+`DBS_SAVE_27FB` ack whether or not the store took the write, and it has to: an unanswered per-user
+DB item head-blocks that user's whole World queue for the life of the World process
+(`status/HANDOFF.md` section 1).
+
+**Note for the human, not a T50 fix:** if foreign keys are enforced, then every DELETE that leaves
+children behind can fail the same way. `DeleteGuild` already deletes its children explicitly, but
+`DeleteCharacter` is worth a look — a character with quests, achievements, friends or a guild row
+is the normal case, not the edge case.
+
+### 9.4 The 23 opcodes the aborted run never reached
+
+Audited by hand, since the next run is the first that will actually fuzz them.
+
+| Opcode | Handler | Verdict |
+|---|---|---|
+| 0x2802 `SDB_ACCOMPLISH_USER_ACHIEVEMENT` | `OnAccomplishUserAchievement` | `SliceAchievementRecords` rejects a wrapped `start` via `start > request.Length`; store write now guarded |
+| 0x286E `SDB_ADD_TUTORIAL_SIMPLE_TIP` | `OnAddTutorialTip` | length-guarded; store write now guarded |
+| 0x2891 `SDB_UPDATE_REPUTATION_INFO` | `OnUpdateReputation` | length-guarded; store write now guarded |
+| 0x2944 `SDB_UPDATE_SEREN_GUIDE_INFO` | `OnUpdateSerenGuide` | length-guarded; store write now guarded |
+| 0x2811 `SDB_DELETE_PARCEL` | `OnDeleteParcel` | `ParcelDbHandlers.Ref`/`U32` are bounds-safe; DELETE cannot break a foreign key |
+| 0x283F `SDB_INCREASE_WAREHOUSE_SIZE` | `OnIncreaseWarehouseSize` | `WhU32` is bounds-safe; no `characters` foreign key on the warehouse rows |
+| 0x2867, 0x2869, 0x2872, 0x288F, 0x2908, 0x290C, 0x2930, 0x2942 | loads | every read is behind a `payload.Length >=` check |
+| 0x2897, 0x2899, 0x2924, 0x2936, 0x293C, 0x293E, 0x297B | acks | `BuildReqIdAck` / `BuildOkReqId` / `BuildDbs2937` all bound the reqId read themselves |
+| 0x295C `SDB_RESULT_CITY_WAR` | `OnResultCityWar` | guarded by `payload.Length < CityWarResultOffset + 4` |
+
+No further finding, but that is a reading, not a run.
+
+### 9.5 What the next run should say
+
+- `Fuzz_client_dispatch_survives_hostile_bodies` — pass, with one `(registration: ...)` note for
+  `C_CHECK_ALIVE`.
+- `Fuzz_dbproxy_dispatch_survives_hostile_frames` — pass, and this time over all 58 opcodes
+  (roughly 17400 payloads rather than 10387).
+- `Fuzz_subsystem_parsers_survive_hostile_bodies` — still pass.
+
+If anything new appears, it will be in the 23 opcodes above and the summary now names it in one
+line.
+
+### 9.6 Still human-owned
+
+- **H2** — `WorldLink.ReceiveLoop` still has no per-frame `try/catch`. The human is adding it.
+  Findings 2 and 3 are each a total disconnect *because* of H2; the per-frame catch is what turns
+  the next one into a dropped frame.
+- **H4** — `Program.Store` still has a private setter, so the client fuzz runs against a null
+  store and the deep half of `SocialHandlers`, `ParcelHandlers` and `CharacterHandlers` is still
+  uncovered. The five `Convert.ToInt32` sites in 9.1 are fixed, but they were found by reading, not
+  by the suite, and the suite still cannot reach them.
+- **`C_CHECK_ALIVE` is registered but not in map 376012.** `HandlerRegistry` logs an Error for it
+  at every startup. Either drop the registration or let `Reg` log at Warning for a name the map
+  does not have — both are one line in a human-owned file.
