@@ -81,6 +81,10 @@ Cowork-editable files also include: `Auth/*`, `Handlers/GmCommands.cs`, `Protoco
 `World/PartyManager.cs`, `World/StarterInventory.cs`, `World/DbProxyStaticData.cs` (added 2026-09-14).
 
 ### Hard rules learned the expensive way (2026-09-14)
+- **Commit in the worktree BEFORE merging, and verify the branch moved** (`git log --oneline -1` in the
+  worktree must show the new commit). T20 (inventory persistence) was merged with nothing committed and
+  the worktree was then removed - the work was lost and only noticed a day later. Never `git worktree
+  remove --force` a worktree whose branch tip is still the base commit.
 - **Cowork must never copy a file from master into its worktree by hand** ("I took master's test file as
   the base"). The worktree base is whatever `git rebase master` gives it; a hand-copied snapshot is
   silently stale and the merge deletes everything added since (T39 lost 60 tests this way). If the worktree

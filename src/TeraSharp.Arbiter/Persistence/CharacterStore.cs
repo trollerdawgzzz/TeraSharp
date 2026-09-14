@@ -1887,15 +1887,40 @@ SELECT last_insert_rowid();";
     {
         lock (_lock)
         {
-            using var friends = _db.CreateCommand();
-            friends.CommandText = @"
-DELETE FROM friends WHERE character_id IN (SELECT id FROM characters WHERE id = $id AND account_id = $a)
-                       OR friend_id    IN (SELECT id FROM characters WHERE id = $id AND account_id = $a);
-DELETE FROM blocks  WHERE character_id IN (SELECT id FROM characters WHERE id = $id AND account_id = $a)
-                       OR blocked_id   IN (SELECT id FROM characters WHERE id = $id AND account_id = $a);";
-            friends.Parameters.AddWithValue("$id", id);
-            friends.Parameters.AddWithValue("$a", accountId);
-            friends.ExecuteNonQuery();
+            // Ownership check first; nothing below runs for someone else's character.
+            using (var own = _db.CreateCommand())
+            {
+                own.CommandText = "SELECT 1 FROM characters WHERE id = $id AND account_id = $a";
+                own.Parameters.AddWithValue("$id", id);
+                own.Parameters.AddWithValue("$a", accountId);
+                if (own.ExecuteScalar() == null)
+                {
+                    _log.LogWarning("DeleteCharacter: {Id} not found on account {A}", id, accountId);
+                    return false;
+                }
+            }
+
+            // Microsoft.Data.Sqlite enforces foreign keys, and every per-character table added
+            // since T17 references characters(id) - delete the children first (live failure
+            // 2026-09-14 22:46: SQLite Error 19 on C_DELETE_USER for a character with quest rows).
+            using var kids = _db.CreateCommand();
+            kids.CommandText = @"
+DELETE FROM friends           WHERE character_id = $id OR friend_id = $id;
+DELETE FROM blocks            WHERE character_id = $id OR blocked_id = $id;
+DELETE FROM friend_groups     WHERE character_id = $id;
+DELETE FROM quests            WHERE owner_id = $id;
+DELETE FROM achievements      WHERE owner_id = $id;
+DELETE FROM achievements_done WHERE owner_id = $id;
+DELETE FROM dungeon_cooldowns WHERE owner_id = $id;
+DELETE FROM reputations       WHERE owner_id = $id;
+DELETE FROM tutorial_tips     WHERE owner_id = $id;
+DELETE FROM seren_guide       WHERE owner_id = $id;
+DELETE FROM client_settings   WHERE character_id = $id;
+DELETE FROM guild_applies     WHERE user_db_id = $id;
+DELETE FROM guild_invites     WHERE user_db_id = $id;
+DELETE FROM guild_members     WHERE user_db_id = $id;";
+            kids.Parameters.AddWithValue("$id", id);
+            kids.ExecuteNonQuery();
 
             using var cmd = _db.CreateCommand();
             cmd.CommandText = "DELETE FROM characters WHERE id = $id AND account_id = $a";
