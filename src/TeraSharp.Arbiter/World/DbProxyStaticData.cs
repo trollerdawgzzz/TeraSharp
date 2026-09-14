@@ -2143,6 +2143,88 @@ array logList
         ["C_UPDATE_GUILD_LOGO"] = "bytes logoImage\n",
     };
 
+    // =======================================================================================
+    // NamedDefs (T39) - defs whose LAYOUT the shipped file already gets right, re-stated with
+    // the field names the Arbiter's own PDL dumper uses. Nothing here changes a byte; the test
+    // Guild_named_defs_are_byte_identical_to_the_shipped_ones proves it for the same data.
+    //
+    // Purely for the code that fills them in: the shipped S_GUILD_INFO.1.def calls 20 of its 31
+    // fields unk1..unk20, and a handler assembling that dictionary by number is unreadable and
+    // unreviewable. Two fields also merge or split: unk1+unk2 are one i64 GuildInfo, and unk12
+    // is really LordBehaviorRank + LordBehaviorPoints.
+    // =======================================================================================
+    public static IReadOnlyDictionary<string, string> NamedDefs { get; } = new Dictionary<string, string>
+    {
+        ["S_GUILD_INFO"] = @"ref guildGroups
+ref guildName
+ref chiefName
+ref guildAnnounce
+ref guildGroupName
+ref guildPromotion
+ref guildLogoId
+
+int32 guildDbId
+int64 guildInfo
+int32 chiefDbId
+int64 guildCreateDate
+int32 guildLevel
+int64 guildExp
+int64 guildNextExp
+int64 guildMoney
+int32 recommendationPoint
+int32 policyPoint
+bool  needChangeGuildName
+int32 battleChip
+int32 guildSize
+int32 playingMemberCount
+int32 memberCount
+int32 accountCount
+int32 maxAccountCount
+int32 accountCountCanGuildWar
+bool  isGuildWarAcceptable
+int64 guildWarAcceptableToggleTime
+int32 lordBehaviorRank
+int32 lordBehaviorPoints
+bool  isHaveFloatingCastle
+int32 floatingCastleCoinAmount
+int32 guildPreference
+int32 joinMinLevel
+int32 joinMaxLevel
+int32 joinType
+int32 guildWindowType
+bool  isOccupation
+
+string guildName
+string chiefName
+string guildAnnounce
+string guildGroupName
+string guildPromotion
+string guildLogoId
+
+array guildGroups
+- ref groupName
+- int32 groupId
+- int32 groupAuthority
+- string groupName
+",
+        ["S_GUILD_APPLY_LIST"] = @"ref guildApplyList
+
+bool  inviteAuthority
+int32 curPageNum
+int32 totalPageCount
+
+array guildApplyList
+- ref userName
+- ref joinMsg
+- int32 userDbId
+- int32 classType
+- int32 userLevel
+- int64 dateTime
+- string userName
+- string joinMsg
+",
+    };
+
     // ---------------------------------- private helpers ----------------------------------
 
     /// <summary>Reads a NUL-terminated UTF-16LE string whose u16 PACKET offset sits at

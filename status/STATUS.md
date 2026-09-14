@@ -55,6 +55,7 @@ Deploy check: `TeraSharp.Arbiter.exe --selftest` — one PASS/FAIL line per data
 | Dungeon cool times and entry counts | `status/DUNGEON-COOLTIME.md` |
 | Everything else in the 2026-09-13 relog capture | `status/RELOG-CAPTURE-NOTES.md` |
 | Guilds - the object, the SQL schema, the opcodes and the .def corrections | `status/GUILD-DESIGN.md` |
+| Guild rows, the Arbiter-side guild handlers, and the wiring they still need | `status/GUILD-DESIGN.md` section 10 |
 
 ## The three rules that cost the most to learn
 
