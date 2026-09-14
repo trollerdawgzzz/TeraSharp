@@ -19,6 +19,7 @@ Deploy check: `TeraSharp.Arbiter.exe --selftest` — one PASS/FAIL line per data
 |---|---|
 | Client crypto / codec / login / char list / select / create / delete | real |
 | Chat, client settings (persisted) | real |
+| Whisper + private chat channels - layouts, the channel object, `ChatManager` | implemented (T43), RAM-only, **not wired** |
 | Friends, friend groups, memos, block list — two-step requests, all from rows | real (T30) |
 | World handshake, 0x147D promotion records (live timestamps), 0x1581 burst, post-handshake config burst | real |
 | Enter-world, blob save/load, restriction, gameId per login | real, live-verified |
@@ -62,7 +63,9 @@ Deploy check: `TeraSharp.Arbiter.exe --selftest` — one PASS/FAIL line per data
 | Everything else in the 2026-09-13 relog capture | `status/RELOG-CAPTURE-NOTES.md` |
 | Guilds - the object, the SQL schema, the opcodes and the .def corrections | `status/GUILD-DESIGN.md` |
 | Guild rows, the Arbiter-side guild handlers, and the wiring they still need | `status/GUILD-DESIGN.md` section 10 |
-| How a subsystem's action list becomes sends (parties, guilds, and whatever is next) | `World/ActionDispatcher.cs`, and section 10 of both design docs |
+| How a subsystem's action list becomes sends (parties, guilds, chat, and whatever is next) | `World/ActionDispatcher.cs`, and the wiring section of each design doc |
+| Whisper, private channels, the slot-not-an-id trap, and the chat .def corrections | `status/CHAT-DESIGN.md` |
+| The `SocialHandlers.OnWhisper` -> `ChatManager` swap, and what it changes for blocked users | `status/CHAT-DESIGN.md` section 7.2 |
 
 ## The three rules that cost the most to learn
 
@@ -97,6 +100,9 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
 ## Open
 
 - Live test of the relog-into-instance fallback (T21).
+- Private channels: the member cap default (`DAT_140e315a8`), what the create/edit invite list
+  actually sends each invitee, and the master-promotion rule - all three are ours, not the
+  binary's (`status/CHAT-DESIGN.md` section 9). No capture contains a single channel packet.
 - The trailing u32 of the fatigability element (630 / 1626 / 88 in the captures) is sent as 0;
   nothing explains it and World never reads it (`status/REPUTATION-FATIGABILITY.md` §2.3).
 - Continent fallback table for a character with no stored return point
