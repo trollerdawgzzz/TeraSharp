@@ -7016,7 +7016,7 @@ public bool TryHandle(WorldBridge bridge, WorldLink link, ushort op, byte[] payl
         Hex.True(nodes!.All(n => n.isOn && n.nextChange == 0),
             "every captured record is CurrOpen=1, NextChange=0 - which is why the old builder's "
             + "wrong field shape never showed up on the wire");
-        Hex.True(nodes.Select(n => n.dungeonId).SequenceEqual(DbProxyHandlers.PostHandshakeDungeonIds),
+        Hex.True(nodes!.Select(n => n.dungeonId).SequenceEqual(DbProxyHandlers.PostHandshakeDungeonIds),
             "the echoed ids are exactly PostHandshakeDungeonIds, in order - the captured burst IS this echo");
     }
 
