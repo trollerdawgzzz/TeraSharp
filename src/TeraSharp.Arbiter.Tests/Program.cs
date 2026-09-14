@@ -14998,4 +14998,266 @@ some prose with `backticks` that is not a table row
         Hex.True(BrokerPackets.AS_TRADE_BROKER_ITEM_SOLD == 0x286D,
             "which sits in the DB-proxy range despite being an AS_");
     }
+
+    // =======================================================================================
+    // T55 - the broker DLM answers. Research: status/BROKER-DESIGN.md sections 3 and 8.
+    //
+    // T53 mapped the family and said section 8 was the one thing to do first: five SDB_ requests
+    // carry a DlmId, the broker window sends the first of them the moment it opens, and nothing
+    // answered them - so walking up to a broker NPC stopped that character's DB queue for the
+    // life of the World process. These tests pin the answer, and in particular the two things a
+    // hand-written empty form gets wrong (the backpatched offset slots, and the atom stride).
+    // =======================================================================================
+
+    /// <summary>
+    /// The five are allow-listed, dispatched, and paired with the right reply opcode. The
+    /// allow-list entry is what takes them off the replay table's hands - TryHandle runs first.
+    /// </summary>
+    [Test] public static void T55_the_five_broker_DLM_requests_are_answered()
+    {
+        ushort[] five = { 0x2817, 0x2819, 0x281B, 0x281D, 0x281F };
+        foreach (ushort op in five)
+        {
+            Hex.True(BrokerPackets.CarriesDlmId(op), $"0x{op:X4} carries a DlmId");
+            Hex.True(DbProxyHandlers.IsHandledRequest(op),
+                $"0x{op:X4} must be allow-listed, or TryHandle returns false and the replay table "
+                + "(which has never seen a broker frame) gets it");
+            Hex.True(BrokerPackets.ReplyFor(op) == (ushort)(op + 1), $"0x{op:X4} -> 0x{op + 1:X4}");
+        }
+
+        // the two without a DlmId stay alone: an unanswered one cannot head-block anyone
+        foreach (ushort op in new ushort[] { 0x2821, 0x2824 })
+        {
+            Hex.True(!BrokerPackets.CarriesDlmId(op), $"0x{op:X4} carries no DlmId");
+            Hex.True(!DbProxyHandlers.IsHandledRequest(op),
+                $"0x{op:X4} is deliberately still unanswered - there is no deal to have yet");
+        }
+        // and the Arbiter->World push has no request at all
+        Hex.True(!DbProxyHandlers.IsHandledRequest(0x2823),
+            "DBS_TRADE_BROKER_ACCEPT_DEAL is a push, not a reply");
+    }
+
+    /// <summary>
+    /// The refusal, byte for byte, against the writers. Two things here that a hand-written empty
+    /// form gets wrong, and both are the reason this test exists:
+    /// <list type="number">
+    /// <item>the ref OFFSET slots are backpatched unconditionally - before the emptiness check -
+    /// so an empty answer carries 0x13 (or 0x1F) in the offset and 0 in the length, not two
+    /// zeros. Same convention as DBS_INIT_GUILD_DATA;</item>
+    /// <item>the 0x1F family has TWO ref pairs, not one, and the fixed part therefore ends at
+    /// 0x1F rather than 0x17.</item>
+    /// </list>
+    /// </summary>
+    [Test] public static void T55_the_broker_refusal_is_the_writers_empty_form()
+    {
+        // 0x2818 DBS_TRADE_BROKER_REGISTER_ITEM, frame 0x13 = 6-byte header + 13 of payload
+        var reg = BrokerPackets.BuildDbsRegisterItem(0x3C, success: false);
+        Hex.True(reg.Length == 0x13 - 6, $"payload {reg.Length}, want {0x13 - 6}");
+        Hex.Eq(reg, "13 00 00 00  00 00 00 00  3C 00 00 00  00",
+            "offset backpatched to 0x13, length 0, DlmId echoed, Success 0");
+
+        // the 0x1F family - four opcodes, one writer
+        var ack = BrokerPackets.BuildDbsStepAck(0x41, step: 2, success: false);
+        Hex.True(ack.Length == 0x1F - 6, $"payload {ack.Length}, want {0x1F - 6}");
+        Hex.Eq(ack, "1F 00 00 00  00 00 00 00  1F 00 00 00  00 00 00 00  41 00 00 00  02 00 00 00  00",
+            "both offsets 0x1F, both lengths 0, DlmId, Step echoed, Success 0");
+
+        // and the one entry point the handler uses
+        foreach (ushort op in new ushort[] { 0x2819, 0x281B, 0x281D, 0x281F })
+            Hex.Eq(BrokerPackets.BuildEmptyRefusal(op, 0x41, 2)!, ack,
+                $"0x{op:X4} is the same 0x1F shape");
+        Hex.Eq(BrokerPackets.BuildEmptyRefusal(0x2817, 0x3C, 0)!, reg, "0x2817 is the 0x13 shape");
+        Hex.True(BrokerPackets.BuildEmptyRefusal(0xDEAD, 1, 1) == null, "and nothing else gets one");
+
+        // non-empty: the offsets move, the lengths are count * 0x358, and ItemBinary is the ATOM
+        Hex.True(BrokerPackets.AtomSize == 0x358,
+            "ItemBinary is an ItemTransactionAtom array - the same 856-byte record the warehouse "
+            + "uses - not the ItemData listing T53 guessed at");
+        var oneAtom = new byte[BrokerPackets.AtomSize];
+        var full = BrokerPackets.BuildDbsStepAck(1, 0, true, refA: new byte[8], atoms: oneAtom);
+        Hex.True(BitConverter.ToInt32(full, 0x06 - 6) == 0x1F
+                 && BitConverter.ToInt32(full, 0x0A - 6) == 8
+                 && BitConverter.ToInt32(full, 0x0E - 6) == 0x1F + 8
+                 && BitConverter.ToInt32(full, 0x12 - 6) == BrokerPackets.AtomSize,
+            "refB's offset is refA's offset plus refA's length, and its length is count * 0x358");
+        Hex.True(full.Length == (0x1F - 6) + 8 + BrokerPackets.AtomSize, $"payload {full.Length}");
+    }
+
+    /// <summary>
+    /// The handler end to end: a real request in, a reply carrying that request's own DlmId and
+    /// Step out. The id is the whole point - DLMExistManager::Find matches on it, so a reply with
+    /// the wrong one is no better than none.
+    /// </summary>
+    [Test] public static void T55_the_broker_handler_echoes_the_DlmId_and_step()
+    {
+        // 0x2817: i32 DlmId@0E, i32 OwnerDbId@12
+        var reg = new byte[0x16 - 6];
+        BitConverter.GetBytes(0x7Bu).CopyTo(reg, 0x0E - 6);
+        BitConverter.GetBytes(42).CopyTo(reg, 0x12 - 6);
+        var parsedReg = BrokerPackets.ParseSdbRegisterItem(reg);
+        Hex.True(parsedReg != null && parsedReg.Value.dlmId == 0x7B, "the request parses");
+        Hex.True(BitConverter.ToUInt32(
+                     BrokerPackets.BuildEmptyRefusal(0x2817, parsedReg!.Value.dlmId, 0)!, 0x0E - 6) == 0x7B,
+            "and the reply carries that id, not a captured one");
+
+        // 0x281F: the step at 0x16 is echoed, never invented
+        var buy = new byte[0x27 - 6];
+        BitConverter.GetBytes(0x99u).CopyTo(buy, 0x0E - 6);
+        BitConverter.GetBytes(7).CopyTo(buy, 0x12 - 6);
+        BitConverter.GetBytes(3).CopyTo(buy, 0x16 - 6);
+        BitConverter.GetBytes(1234).CopyTo(buy, 0x1A - 6);
+        buy[0x1E - 6] = 1;
+        BitConverter.GetBytes(55_000L).CopyTo(buy, 0x1F - 6);
+        var b = BrokerPackets.ParseSdbBuyItNow(buy)!.Value;
+        var reply = BrokerPackets.BuildEmptyRefusal(0x281F, b.dlmId, b.step)!;
+        Hex.True(BitConverter.ToUInt32(reply, 0x16 - 6) == 0x99, "DlmId echoed");
+        Hex.True(BitConverter.ToInt32(reply, 0x1A - 6) == 3,
+            "and the Step - its values were never traced, so inventing one tells World a stage "
+            + "completed that did not");
+        Hex.True(reply[0x1E - 6] == 0, "Success = 0: the item stays where it was");
+        Hex.True(b.totalPriceWithTax == 55_000L, "and the price the .def forgets was read");
+    }
+
+    /// <summary>
+    /// A frame shorter than the handler's own guard must be dropped, not thrown out of. The real
+    /// Arbiter kills the World link over this; we cannot, because WorldLink.ReceiveLoop has no
+    /// per-frame catch and one exception disconnects every player (status/SECURITY-AUDIT.md).
+    /// Fuzz_dbproxy_dispatch_survives_hostile_frames covers the general case; this pins the
+    /// five specifically, since they are new.
+    /// </summary>
+    [Test] public static void T55_a_short_broker_frame_is_refused_not_thrown()
+    {
+        foreach (ushort op in new ushort[] { 0x2817, 0x2819, 0x281B, 0x281D, 0x281F })
+        {
+            int frame = BrokerPackets.MinFrameLength(op);
+            Hex.True(frame > 0, $"0x{op:X4} has a guard");
+            for (int len = 0; len < frame - 6; len++)
+            {
+                var shortBody = new byte[len];
+                Hex.True(BrokerPackets.BuildEmptyRefusal(op, 0, 0) != null, "the builder still works");
+                // the parsers are what the handler asks first, and all of them answer null
+                bool any = op switch
+                {
+                    0x2817 => BrokerPackets.ParseSdbRegisterItem(shortBody) != null,
+                    0x2819 => BrokerPackets.ParseSdbUnregisterItem(shortBody) != null,
+                    0x281B or 0x281D => BrokerPackets.ParseSdbCalcItem(op, shortBody) != null,
+                    _ => BrokerPackets.ParseSdbBuyItNow(shortBody) != null,
+                };
+                Hex.True(!any, $"0x{op:X4}: a {len}-byte payload must parse as null, not read past");
+            }
+        }
+    }
+
+    /// <summary>
+    /// The fifteen client packets BrokerHandlers registers, their body lengths, and the one it
+    /// deliberately leaves alone. Registering C_TRADE_BROKER_HIGHEST_ITEM_LEVEL here would throw
+    /// at startup - PacketDispatcher.Register refuses a duplicate and T45 already has it.
+    /// </summary>
+    [Test] public static void T55_the_broker_client_registrations_avoid_the_T45_duplicate()
+    {
+        Hex.True(BrokerHandlers.ClientOpcodes.Length == 15,
+            $"sixteen Arbiter-answered minus the one T45 owns, got {BrokerHandlers.ClientOpcodes.Length}");
+
+        foreach (var (name, op) in BrokerHandlers.ClientOpcodes)
+        {
+            Hex.True(BrokerPackets.ArbiterHandlesClientPacket(op), $"{name} is Arbiter-side");
+            int frame = BrokerPackets.MinClientLength(op);
+            Hex.True(BrokerHandlers.MinBodyLength(op) == (frame <= 4 ? 0 : frame - 4),
+                $"{name}: the body minimum is the frame guard minus the 4-byte header, got "
+                + $"{BrokerHandlers.MinBodyLength(op)} for frame 0x{frame:X2}");
+        }
+
+        Hex.True(BrokerHandlers.AlreadyAnsweredByT45 == 0xEAFB
+                 && BrokerPackets.ArbiterHandlesClientPacket(0xEAFB),
+            "C_TRADE_BROKER_HIGHEST_ITEM_LEVEL is Arbiter-side and answered - just not here");
+        Hex.True(!BrokerHandlers.ClientOpcodes.Any(c => c.Opcode == 0xEAFB),
+            "and must NOT be in this list, or Register throws on the duplicate at startup");
+        Hex.True(ArbiterClientHandlers.ArbiterOwned.Contains((ushort)0xEAFB),
+            "T45 owns it");
+
+        // the five World owns must not be here either - answering one double-answers the client
+        foreach (ushort op in new ushort[] { 0x7E74, 0xB8BA, 0x7516, 0x5C10, 0xF66D })
+            Hex.True(!BrokerHandlers.ClientOpcodes.Any(c => c.Opcode == op),
+                $"0x{op:X4} is World's");
+    }
+
+    /// <summary>
+    /// Every reply BrokerHandlers sends, at the size its S_ dumper guard gives. The three that
+    /// answer nothing are the deal family: each reaches a TradeBroker:: method that looks the
+    /// deal up first and returns before any writer, and with no listings there is never a deal.
+    /// </summary>
+    [Test] public static void T55_the_broker_replies_are_the_empty_forms()
+    {
+        (ushort C, ushort S, int Frame)[] answered =
+        {
+            (0xABCA, 0x53C0, 0x08), (0xB981, 0xCDEA, 0x08), (0x92E5, 0x5587, 0x18),
+            (0x76B4, 0x9372, 0x10), (0xE53F, 0x9372, 0x10), (0x983A, 0x9372, 0x10),
+            (0x8DC7, 0xFD2C, 0x10), (0x8CFB, 0xFD2C, 0x10), (0x8863, 0xFD2C, 0x10),
+            (0x6F34, 0x4FE6, 0x2C), (0xA788, 0xD0E6, 0x05),
+        };
+        foreach (var (c, sOp, frame) in answered)
+        {
+            var f = BrokerHandlers.ReplyFor(c);
+            Hex.True(f != null, $"0x{c:X4} must be answered");
+            Hex.True(BitConverter.ToUInt16(f!, 0) == f.Length && f.Length == frame,
+                $"0x{c:X4} -> 0x{sOp:X4}: {f.Length} bytes, want {frame}, and the length field agrees");
+            Hex.True(BitConverter.ToUInt16(f, 2) == sOp, $"0x{c:X4} answers with 0x{sOp:X4}");
+        }
+
+        // the four that send nothing to the client
+        foreach (ushort c in new ushort[] { 0x961B, 0x9FA3, 0xDB7F, 0xB33F })
+            Hex.True(BrokerHandlers.ReplyFor(c) == null,
+                $"0x{c:X4} has no client reply while the broker is empty");
+
+        // the paged lists say page 1 of 1, not 0 of 0 - page 0 of an empty history is the bug
+        // that crashed the real Arbiter's C_VIEW_GUILD_WAR (CLAUDE.md's hard rules)
+        var hist = BrokerHandlers.ReplyFor(0x76B4)!;
+        Hex.True(BitConverter.ToInt32(hist, 8) == 1 && BitConverter.ToInt32(hist, 12) == 1,
+            $"page {BitConverter.ToInt32(hist, 8)} of {BitConverter.ToInt32(hist, 12)}");
+        Hex.True(BitConverter.ToUInt16(hist, 4) == 0 && BitConverter.ToUInt16(hist, 6) == 0,
+            "and the array slots are (count 0, offset 0)");
+
+        // S_TRADE_BROKER_SOLD_ITEM_LIST carries the second i64 the shipped .def drops
+        var sold = BrokerHandlers.ReplyFor(0x92E5)!;
+        Hex.True(sold.Length == 0x18 && BitConverter.ToInt64(sold, 8) == 0
+                 && BitConverter.ToInt64(sold, 16) == 0,
+            "TotalCalcMoney and TotalCalcTCatMoney, both zero");
+
+        // and the suggest refusal is one byte
+        var sug = BrokerHandlers.ReplyFor(0xA788)!;
+        Hex.True(sug.Length == 5 && sug[4] == 0, "S_TRADE_BROKER_REQUEST_DEAL_RESULT{false}");
+    }
+
+    /// <summary>
+    /// The correction with teeth: SDB_TRADE_BROKER_BUY_IT_NOW's shipped .def stops before
+    /// <c>i64 TotalPriceWithTax</c> at frame 0x1F, so a codec built from it would be 8 bytes
+    /// short of the price the buyer actually paid - and would mis-read everything after it if the
+    /// field ever moved. Pinned against the shipped file, not just against itself.
+    /// </summary>
+    [Test] public static void T55_the_corrected_buy_it_now_def_carries_the_price()
+    {
+        var corrected = BrokerPackets.ResolveDef(null, "SDB_TRADE_BROKER_BUY_IT_NOW");
+        Hex.True(corrected != null, "the correction resolves");
+        var names = corrected!.Fields.Select(f => f.Name).ToList();
+        Hex.True(names.Contains("totalPriceWithTax"), $"fields: {string.Join(",", names)}");
+        Hex.True(names[^1] == "totalPriceWithTax",
+            "and it is LAST - it sits past the binary ref, at frame 0x1F");
+
+        var defs = LoadDefinitionsOrSkip();
+        if (defs == null) return;
+        var shipped = defs.Get("SDB_TRADE_BROKER_BUY_IT_NOW");
+        Hex.True(shipped != null, "the shipped .def exists");
+        Hex.True(!shipped!.Fields.Any(f => f.Name.Equals("totalPriceWithTax", StringComparison.OrdinalIgnoreCase)),
+            "the shipped one really is missing it - if this fails the .def was fixed upstream and "
+            + "the correction can go");
+        Hex.True(corrected.Fields.Count == shipped.Fields.Count + 1,
+            $"exactly one field more: {corrected.Fields.Count} vs {shipped.Fields.Count}");
+
+        // the parser reads it at the offset the dumper gives, which is what the .def would miss
+        var buy = new byte[0x27 - 6];
+        BitConverter.GetBytes(long.MaxValue).CopyTo(buy, 0x1F - 6);
+        Hex.True(BrokerPackets.ParseSdbBuyItNow(buy)!.Value.totalPriceWithTax == long.MaxValue,
+            "read at frame 0x1F");
+        Hex.True(buy.Length == 0x21, "and it is the last thing in the frame");
+    }
 }

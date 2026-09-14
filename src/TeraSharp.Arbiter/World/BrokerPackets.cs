@@ -373,31 +373,102 @@ public static class BrokerPackets
     // handler passes the request's own bytes back rather than inventing a record.
     // =========================================================================================
 
-    /// <summary>DBS_TRADE_BROKER_REGISTER_ITEM (0x2818), frame 0x13:
-    /// `ref ItemBinary@06, i32 DlmId@0E, u8 Success@12`. The ref is written empty here - offset
-    /// 0 is what the real Arbiter writes for an absent list.</summary>
-    public static byte[] BuildDbsRegisterItem(uint dlmId, bool success)
+    /// <summary>
+    /// The size of one <c>ItemTransactionAtom</c>, which is what the broker's <c>ItemBinary</c>
+    /// ref actually carries - the same 856-byte record the warehouse and item paths use
+    /// (status/INVENTORY-DESIGN.md, status/MAIL-WAREHOUSE.md). T53 said "ItemData-shaped and not
+    /// decoded"; T55 read the writers and it is the atom, which is already decoded.
+    /// The proof is the stride in every one of the five reply writers: the copy loop advances by
+    /// <c>0x358</c> and the byte-length slot is filled with <c>count * 0x358</c>.
+    /// </summary>
+    public const int AtomSize = 0x358;
+
+    /// <summary>
+    /// DBS_TRADE_BROKER_REGISTER_ITEM (0x2818), frame 0x13. Writer FUN_1407658c0
+    /// (Arb_part_064.c:9859), in its own order:
+    /// <code>
+    ///   [06] u32 ItemBinary.offset   written 0, then backpatched to the running frame length
+    ///   [0A] u32 ItemBinary.byteLen  count * 0x358
+    ///   [0E] u32 DlmId
+    ///   [12] u8  Success
+    ///   [13] ItemTransactionAtom[]
+    /// </code>
+    /// <b>The offset slot is backpatched unconditionally</b>, before the emptiness check, so an
+    /// empty answer carries offset 0x13 and length 0 - not two zeros. That is the same convention
+    /// DBS_INIT_GUILD_DATA and the guild init arrays follow (status/GUILD-DESIGN.md section 11.4),
+    /// and it is the one thing a hand-written empty form gets wrong.
+    /// </summary>
+    public static byte[] BuildDbsRegisterItem(uint dlmId, bool success, byte[]? atoms = null)
     {
-        var p = new byte[0x13 - FrameHeaderSize];
+        var body = atoms ?? Array.Empty<byte>();
+        var p = new byte[(0x13 - FrameHeaderSize) + body.Length];
+        BitConverter.GetBytes(0x13).CopyTo(p, 0x06 - FrameHeaderSize);
+        BitConverter.GetBytes(body.Length).CopyTo(p, 0x0A - FrameHeaderSize);
         BitConverter.GetBytes(dlmId).CopyTo(p, 0x0E - FrameHeaderSize);
         p[0x12 - FrameHeaderSize] = (byte)(success ? 1 : 0);
+        body.CopyTo(p, 0x13 - FrameHeaderSize);
         return p;
     }
 
     /// <summary>
     /// DBS_TRADE_BROKER_UNREGISTER_ITEM (0x281A), _CALC_SOLD_ITEM (0x281C), _CALC_BOUGHT_ITEM
-    /// (0x281E) and _BUY_IT_NOW (0x2820) share one 0x1F-byte shape: two refs, then
-    /// `i32 DlmId@16, i32 Step@1A, u8 Success@1E`. Echo the Step you were given - its values
-    /// were not traced (BROKER-DESIGN.md section 3).
+    /// (0x281E) and _BUY_IT_NOW (0x2820) are one writer four times over (FUN_1406f60f0 and its
+    /// three twins, Arb_part_060.c:12177/12330/12563/12794), frame 0x1F:
+    /// <code>
+    ///   [06] u32 refA.offset   backpatched to the running length (= 0x1F)
+    ///   [0A] u32 refA.byteLen  raw bytes, written with FUN_1403c98b0
+    ///   [0E] u32 refB.offset   backpatched (= 0x1F + refA.byteLen)
+    ///   [12] u32 refB.byteLen  count * 0x358
+    ///   [16] u32 DlmId
+    ///   [1A] u32 Step
+    ///   [1E] u8  Success
+    /// </code>
+    /// refA is the dumper's first ref - <c>TradeData</c> on the unregister/buy replies,
+    /// <c>CalcItemList</c> on the two calc replies - and refB is <c>ItemBinary</c>, the atom
+    /// array. <b>Both offset slots are backpatched whether or not there is anything to point
+    /// at</b>, so an empty answer carries 0x1F in both and 0 in both lengths.
+    ///
+    /// <para>Echo the <c>Step</c> you were given. Its values were never traced
+    /// (BROKER-DESIGN.md section 3) and inventing one tells World a stage completed that did
+    /// not.</para>
     /// </summary>
-    public static byte[] BuildDbsStepAck(uint dlmId, int step, bool success)
+    public static byte[] BuildDbsStepAck(uint dlmId, int step, bool success,
+                                         byte[]? refA = null, byte[]? atoms = null)
     {
-        var p = new byte[0x1F - FrameHeaderSize];
+        var a = refA ?? Array.Empty<byte>();
+        var b = atoms ?? Array.Empty<byte>();
+        var p = new byte[(0x1F - FrameHeaderSize) + a.Length + b.Length];
+        BitConverter.GetBytes(0x1F).CopyTo(p, 0x06 - FrameHeaderSize);
+        BitConverter.GetBytes(a.Length).CopyTo(p, 0x0A - FrameHeaderSize);
+        BitConverter.GetBytes(0x1F + a.Length).CopyTo(p, 0x0E - FrameHeaderSize);
+        BitConverter.GetBytes(b.Length).CopyTo(p, 0x12 - FrameHeaderSize);
         BitConverter.GetBytes(dlmId).CopyTo(p, 0x16 - FrameHeaderSize);
         BitConverter.GetBytes(step).CopyTo(p, 0x1A - FrameHeaderSize);
         p[0x1E - FrameHeaderSize] = (byte)(success ? 1 : 0);
+        a.CopyTo(p, 0x1F - FrameHeaderSize);
+        b.CopyTo(p, 0x1F - FrameHeaderSize + a.Length);
         return p;
     }
+
+    /// <summary>
+    /// The refusal every one of the five DlmId-carrying requests gets while there is no listings
+    /// table: the ids echoed, both refs empty, <c>Success = 0</c>. Returns null for an opcode
+    /// that is not one of the five.
+    ///
+    /// <para>This is what stops the character's DB queue wedging. World does not need the answer
+    /// to be yes - it needs an answer with its own DlmId in it, or DLMExistManager::Find misses
+    /// and the item never completes (status/HANDOFF.md section 1).</para>
+    /// </summary>
+    public static byte[]? BuildEmptyRefusal(ushort request, uint dlmId, int step)
+        => request switch
+        {
+            SDB_TRADE_BROKER_REGISTER_ITEM => BuildDbsRegisterItem(dlmId, success: false),
+            SDB_TRADE_BROKER_UNREGISTER_ITEM => BuildDbsStepAck(dlmId, step, success: false),
+            SDB_TRADE_BROKER_CALC_SOLD_ITEM => BuildDbsStepAck(dlmId, step, success: false),
+            SDB_TRADE_BROKER_CALC_BOUGHT_ITEM => BuildDbsStepAck(dlmId, step, success: false),
+            SDB_TRADE_BROKER_BUY_IT_NOW => BuildDbsStepAck(dlmId, step, success: false),
+            _ => null,
+        };
 
     /// <summary>DBS_TRADE_BROKER_CANCEL_DEAL (0x282C), frame 0x0A: `i32 UserDbId@06`.</summary>
     public static byte[] BuildDbsCancelDeal(int userDbId) => BitConverter.GetBytes(userDbId);
@@ -414,6 +485,82 @@ public static class BrokerPackets
         BitConverter.GetBytes(agreedPrice).CopyTo(p, 16);
         return p;
     }
+
+    // =========================================================================================
+    // Arbiter -> client reply BODIES (T55). Built by hand rather than through SendByDef for the
+    // reason ParcelHandlers gives: several broker .def files are wrong (section 5), and bytes
+    // built here are testable without a def registry.
+    //
+    // Every one is the EMPTY form - an Arbiter with no listings table. The shapes are from the
+    // S_ dumpers; the values are all zero, which is what "you have nothing" looks like.
+    // =========================================================================================
+
+    /// <summary>
+    /// An ARRAY field reserves two u16 slots in the order <b>(count, offset)</b> - the reverse of
+    /// a bytes field's (offset, count). status/GUILD-DESIGN.md section 5.3 proves it from
+    /// S_GET_USER_GUILD_LOGO's writer, and Protocol/DefinitionWriter.cs already does it this way.
+    /// An empty array is (0, 0): with no elements there is nothing for the offset to point at,
+    /// and the real writers leave it at the reserved zero.
+    /// </summary>
+    public const int EmptyArraySlots = 4;
+
+    /// <summary>S_TRADE_BROKER_BOUGHT_ITEM_LIST (0x53C0) and S_TRADE_BROKER_REGISTERED_ITEM_LIST
+    /// (0xCDEA), min total 8: one array and nothing else.</summary>
+    public static byte[] BuildSEmptyItemListBody() => new byte[EmptyArraySlots];
+
+    /// <summary>S_TRADE_BROKER_SOLD_ITEM_LIST (0x5587), min total 0x18:
+    /// `[u16 count][u16 off][i64 TotalCalcMoney][i64 TotalCalcTCatMoney]`. The second i64 is the
+    /// one the shipped .def drops (section 5).</summary>
+    public static byte[] BuildSSoldItemListBody(long totalCalcMoney = 0, long totalCalcTCatMoney = 0)
+    {
+        var p = new byte[0x18 - ClientHeaderSize];
+        BitConverter.GetBytes(totalCalcMoney).CopyTo(p, 4);
+        BitConverter.GetBytes(totalCalcTCatMoney).CopyTo(p, 12);
+        return p;
+    }
+
+    /// <summary>S_TRADE_BROKER_HISTORY_ITEM_LIST (0x9372) and S_TRADE_BROKER_WAITING_ITEM_LIST
+    /// (0xFD2C), min total 0x10: `[u16 count][u16 off][i32 CurrentPage][i32 TotalPage]`.
+    /// An empty result is page 1 of 1 - page 0 of 0 is what made the real Arbiter's
+    /// C_VIEW_GUILD_WAR crash, and the paging guard in CLAUDE.md's hard rules is about exactly
+    /// this shape.</summary>
+    public static byte[] BuildSPagedListBody(int currentPage = 1, int totalPage = 1)
+    {
+        var p = new byte[0x10 - ClientHeaderSize];
+        BitConverter.GetBytes(currentPage).CopyTo(p, 4);
+        BitConverter.GetBytes(totalPage).CopyTo(p, 8);
+        return p;
+    }
+
+    /// <summary>S_TRADE_BROKER_INPUT_PRICE (0x4FE6), min total 0x2C: five i64 -
+    /// `MinPrice, AvgPrice, MinTCatPrice, AvgTCatPrice, RegisterFeeRate`, from
+    /// TradeBrokerSearchAgent::CalcMinAvgPrice. All zero when nothing has ever been listed.</summary>
+    public static byte[] BuildSInputPriceBody(long minPrice = 0, long avgPrice = 0,
+        long minTCatPrice = 0, long avgTCatPrice = 0, long registerFeeRate = 0)
+    {
+        var p = new byte[0x2C - ClientHeaderSize];
+        BitConverter.GetBytes(minPrice).CopyTo(p, 0);
+        BitConverter.GetBytes(avgPrice).CopyTo(p, 8);
+        BitConverter.GetBytes(minTCatPrice).CopyTo(p, 16);
+        BitConverter.GetBytes(avgTCatPrice).CopyTo(p, 24);
+        BitConverter.GetBytes(registerFeeRate).CopyTo(p, 32);
+        return p;
+    }
+
+    /// <summary>S_TRADE_BROKER_CALC_NOTIFY (0x6AF1), min total 0x0C:
+    /// `[i32 SoldCount][i32 BoughtCount]` - the two numbers on the broker NPC's badge.</summary>
+    public static byte[] BuildSCalcNotifyBody(int soldCount = 0, int boughtCount = 0)
+    {
+        var p = new byte[0x0C - ClientHeaderSize];
+        BitConverter.GetBytes(soldCount).CopyTo(p, 0);
+        BitConverter.GetBytes(boughtCount).CopyTo(p, 4);
+        return p;
+    }
+
+    /// <summary>The four one-byte answers: S_TRADE_BROKER_SUGGEST_DEAL (0x7066),
+    /// S_TRADE_BROKER_REQUEST_DEAL_RESULT (0xD0E6), S_TRADE_BROKER_BUY_IT_NOW (0xEC54) and the
+    /// two CALC results - all min total 5, all one u8.</summary>
+    public static byte[] BuildSFlagBody(bool value) => new[] { (byte)(value ? 1 : 0) };
 
     // =========================================================================================
     // The inter-server six

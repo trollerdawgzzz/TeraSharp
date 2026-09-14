@@ -342,3 +342,45 @@ handler added without a row here is invisible to it. Until that second check exi
 same commit.** The reconciliation that produced C.1-C.3 is three lines of Python — extract the
 `case` labels from `IsHandledRequest`, extract the leading `0xNNNN` of every table row here, and
 diff the two sets.
+
+
+## Trade broker — T55, the five DLM answers
+
+Five of the seven `SDB_TRADE_BROKER_*` requests carry a **DlmId**, so each is a per-user DLMItem
+and an unanswered one head-blocks that character's DB queue for the life of the World process.
+**The broker window sends the first of them the moment it opens**, so before T55 walking up to a
+broker NPC wedged the character — the same failure the mailbox had before T45, and for the same
+reason: no handler, and no capture for the replay table to fall back on.
+
+| request (W->A)                                    | reply (A->W)  | reply shape                                   | count | state |
+|---------------------------------------------------|---------------|-----------------------------------------------|-------|-------|
+| 0x2817 SDB_TRADE_BROKER_REGISTER_ITEM             | 0x2818        | frame 0x13: `[u32 off=0x13][u32 len=0][u32 DlmId][u8 Success=0]` | per listing | **refusal (T55)**, no listings table yet |
+| 0x2819 SDB_TRADE_BROKER_UNREGISTER_ITEM           | 0x281A        | frame 0x1F: two empty refs, DlmId, Step echoed, Success=0 | per delist | **refusal (T55)** |
+| 0x281B SDB_TRADE_BROKER_CALC_SOLD_ITEM            | 0x281C        | frame 0x1F, same shape                        | per collect | **refusal (T55)** |
+| 0x281D SDB_TRADE_BROKER_CALC_BOUGHT_ITEM          | 0x281E        | frame 0x1F, same shape                        | per collect | **refusal (T55)** |
+| 0x281F SDB_TRADE_BROKER_BUY_IT_NOW                | 0x2820        | frame 0x1F, same shape                        | per purchase | **refusal (T55)** |
+
+`SDB_TRADE_BROKER_START_DEAL` (0x2821) and `_CANCEL_DEAL` (0x2824) carry **no DlmId**, so an
+unanswered one cannot head-block anyone; they are left alone until there is a deal to have.
+`DBS_TRADE_BROKER_ACCEPT_DEAL` (0x2823) has no `SDB_` partner at all — it is an Arbiter->World
+push, not a reply.
+
+### Why a refusal is the right answer, and what would be wrong
+
+World does not need the answer to be yes. It needs an answer carrying that request's own DlmId,
+because `DLMExistManager::Find` matches on the id — a reply with the wrong one is no better than
+none. `Success = 0` means the item stays where it was and the client shows the failure, which is
+true: there is no listings table (`status/BROKER-DESIGN.md` §7, waiting on a capture).
+`Success = 1` would be the wrong thing, because it tells World an item moved.
+
+Two details the writers settle, both of which a hand-written empty form gets wrong:
+
+* **The ref offset slots are backpatched unconditionally**, before the emptiness check, so an
+  empty answer carries `0x13` (or `0x1F`) in the offset and `0` in the length — not two zeros.
+  Same convention as `DBS_INIT_GUILD_DATA` and the guild init arrays.
+* **`ItemBinary` is an `ItemTransactionAtom` array**, stride `0x358` — the same 856-byte record
+  the warehouse and item paths already use, not the `ItemData` listing T53 guessed at. The proof
+  is the copy loop's stride and the `count * 0x358` byte-length slot in all five writers.
+
+**`Step` is echoed, never invented.** Four of the five carry a multi-stage commit step whose
+values were never traced; echoing the one we were given is the only safe answer.

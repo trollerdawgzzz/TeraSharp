@@ -8,7 +8,7 @@ Read order for anyone new: `CLAUDE.md` (workspace rules at the top) -> `status/H
 (every per-user W->A opcode and how it is answered) -> this file.
 
 Build: `dotnet build TeraSharp.sln` — 0 warnings, 0 errors.
-Tests: `dotnet run --project src\TeraSharp.Arbiter.Tests` — **583**.
+Tests: `dotnet run --project src\TeraSharp.Arbiter.Tests` — **605**.
 Deploy check: `TeraSharp.Arbiter.exe --selftest` — one PASS/FAIL line per data dependency (T37).
 
 **Where the project is (2026-09-15).** T1-T51 are merged. Two accounts on two clients have been in
@@ -52,7 +52,7 @@ exist, nothing routes to it.
 | GM World forward (anything not Arbiter-owned -> `AS_ADMIN_COMMAND` 0x2829) + `AS_ENTER_WORLD[111]` AdminLevel | **wired** (T46/T47) |
 | Packet-handling security — bounds, pagination, allocate-by-count, 37k-input fuzz suite | **wired** (T48/T50), 2 human-owned items open |
 | Private chat channels — the channel object, join/leave/kick/password | **designed** (T43), no client packet ever seen |
-| Trade broker | **not started** (T53 research) |
+| Trade broker — 57 opcodes mapped, codec, 4 corrected `.def`s; the 5 DLM requests answered with the refusal form; 15 `C_` packets answer empty | **half real** (T53 research, T55 answers). No listings table — waits on a capture |
 | Lord / election / city war, petitions, rankings, appearance & name change, TBA battlepass | **not started** |
 | Multi-World / multi-planet | **not started** |
 ## Where the truth lives
@@ -131,7 +131,10 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
 - [x] **T1-T51 merged.** `git log --oneline` is the record; the last merge is
   `Merge cowork T48+T50: security audit + fuzz suite (37k hostile inputs green)`.
 - [ ] **T52** — guild `SA_` direction + `C_INVITE_USER_TO_GUILD` (in flight).
-- [ ] **T53** — trade broker research (in flight, session 2).
+- [x] **T53** — trade broker research + codec (`status/BROKER-DESIGN.md`, `World/BrokerPackets.cs`).
+- [x] **T55** — broker DLM answers: the five `SDB_TRADE_BROKER_*` that carry a DlmId are
+  answered, so opening the broker no longer wedges the character. Needs the one
+  `HandlerRegistry` loop (`status/BROKER-DESIGN.md` §8.2).
 - [ ] **T54** — docs and the live checklist brought up to master (this pass).
 - [ ] The live pass itself: `status/LIVE-CHECKLIST.md` sections 5-11, two clients.
 - [ ] Then the two capture sessions in `status/CAPTURE-PLAN.md`, in that order.
@@ -188,7 +191,11 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
 - Six `S_` reply shapes whose requests cannot be answered properly until a client sends them:
   `S_DUNGEON_COOL_TIME_LIST`, `S_REPLY_GUILD_LIST`, `S_SHOW_PARTY_MATCH_INFO`,
   `S_MY_PARTY_MATCH_INFO`, `S_SHOW_CANDIDATE_LIST`, `S_VIEW_BATTLE_FIELD_RESULT`.
-- Trade broker: nothing at all (T53).
+- Trade broker: no listings table, so every answer is an empty form or a refusal. The five
+  DLM-carrying requests ARE answered (T55) — that was the part that wedged characters. A real
+  broker needs the two tables of `BROKER-DESIGN.md` §6.1 and a manager, both of which wait on
+  a capture. `SDB_TRADE_BROKER_START_DEAL` and `_CANCEL_DEAL` are still unanswered on purpose:
+  neither carries a DlmId, so neither can head-block anyone.
 
 **Known-incomplete, by choice**
 
