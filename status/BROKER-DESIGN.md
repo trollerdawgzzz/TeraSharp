@@ -1,0 +1,301 @@
+# BROKER-DESIGN.md — the trade broker (T53, research + codec)
+
+The last big Arbiter-owned social system. This is research and a codec only: there is **no
+manager**, no store tables and no handler layer, exactly the shape `PARTY-DESIGN.md` and
+`GUILD-DESIGN.md` had after their first task. What is here is pinned to the binary; what is not
+here is named as missing.
+
+Code: `src/TeraSharp.Arbiter/World/BrokerPackets.cs`. Tests: `Broker_*`.
+
+---
+
+## 0. The headline
+
+**The broker is Arbiter-owned state with a World-owned item half.** Of the 21 `C_TRADE_BROKER_*`
+packets in 376012, the Arbiter answers **16** itself and never sees the other **5** — and the
+five it never sees are exactly the five that move an item between an inventory and the broker.
+Those go to WorldServer, which turns each into an `SDB_TRADE_BROKER_*` on the DB-proxy link and
+waits for the Arbiter's `DBS_` answer. The split is not a guess: the C_ name and the SDB_ name are
+the same word.
+
+| the five World owns | the DB-proxy pair it becomes |
+|---|---|
+| `C_TRADE_BROKER_REGISTER_ITEM` 0x7E74 | `SDB_..._REGISTER_ITEM` 0x2817 → `DBS_` 0x2818 |
+| `C_TRADE_BROKER_UNREGISTER_ITEM` 0xB8BA | `SDB_..._UNREGISTER_ITEM` 0x2819 → `DBS_` 0x281A |
+| `C_TRADE_BROKER_CALC_SOLD_ITEM` 0x7516 | `SDB_..._CALC_SOLD_ITEM` 0x281B → `DBS_` 0x281C |
+| `C_TRADE_BROKER_CALC_BOUGHT_ITEM` 0x5C10 | `SDB_..._CALC_BOUGHT_ITEM` 0x281D → `DBS_` 0x281E |
+| `C_TRADE_BROKER_BUY_IT_NOW` 0xF66D | `SDB_..._BUY_IT_NOW` 0x281F → `DBS_` 0x2820 |
+
+Every one of those `SDB_` requests carries a **DlmId**, which makes each of them a per-user
+DLMItem: an unanswered one head-blocks that character's DB queue for the life of the World
+process (`status/HANDOFF.md` §1). **Opening the broker on a live TeraSharp today wedges the
+character**, the same way opening the mailbox did before T45 — and for the same reason, because
+no capture contains a broker frame either, so the replay table cannot cover for us.
+
+That is the finding that matters most in this document.
+
+---
+
+## 1. Where the code is
+
+| what | where |
+|---|---|
+| the 16 Arbiter-side `C_` handlers | `Arb_part_041.c:12715`–`13500`, one contiguous block |
+| the 7 `SDB_` handlers | `Arb_part_064.c:8385`–`10140` |
+| the PDL dumpers (**the field names**) | `C_` `Arb_part_014.c`, `DBS_` `Arb_part_015.c`, `SA_` `Arb_part_016.c`, `SDB_` `Arb_part_017.c`, `S_` `Arb_part_023.c`, `AS_` `Arb_part_012.c` |
+| `TradeBroker::*` — the manager | `Arb_part_057.c` |
+| `TradeBrokerSearchAgent::*` — search, sort, paging | `Arb_part_057.c`, `Arb_part_058.c` |
+
+**Method.** Every layout below comes from the packet's own PDL dumper: a function that begins
+`wcscpy_s(name, 0x100, L"<PACKET>")` and then emits one `L"FieldName"` per field with the offset
+it reads. 57 of them exist — the whole family, every direction. Two independent checks make them
+trustworthy:
+
+1. each dumper's guard (`if (0xNN < param_2)`) lands exactly on the end of its last field, and
+2. for all seven `SDB_` packets the dumper's guard equals the *handler's* guard, byte for byte.
+
+The same pair of checks is what `GUILD-DESIGN.md` §5 rests on.
+
+---
+
+## 2. The opcodes — 57 of them
+
+Client opcodes are from `data.json` `maps."376012"` **and** independently from WorldServer's own
+opcode→name switch; all 36 client-facing ids agree. The inter-server ids are World's table only
+(the client never sees them).
+
+### 2.1 Client → Arbiter — the 16 the Arbiter answers
+
+| opcode | packet | frame guard | **body** |
+|---|---|---|---|
+| 0xABCA | `C_TRADE_BROKER_BOUGHT_ITEM_LIST` | 4 | **0** |
+| 0x961B | `C_TRADE_BROKER_CLOSE` | *none* | **0** |
+| 0x9FA3 | `C_TRADE_BROKER_DEAL_CONFIRM` | 0x0C | **8** |
+| 0xDB7F | `C_TRADE_BROKER_DEAL_PRICE_UPDATE` | 0x10 | **0x0C** |
+| 0xEAFB | `C_TRADE_BROKER_HIGHEST_ITEM_LEVEL` | 4 | **0** |
+| 0x76B4 | `C_TRADE_BROKER_HISTORY_ITEM_LIST_NEW` | **0x6C** | **0x68** |
+| 0xE53F | `C_TRADE_BROKER_HISTORY_ITEM_LIST_PAGE` | 8 | **4** |
+| 0x983A | `C_TRADE_BROKER_HISTORY_ITEM_LIST_SORT` | 9 | **5** |
+| 0x6F34 | `C_TRADE_BROKER_INPUT_PRICE` | 0x10 | **0x0C** |
+| 0xB981 | `C_TRADE_BROKER_REGISTERED_ITEM_LIST` | *none* | **0** |
+| 0xB33F | `C_TRADE_BROKER_REJECT_SUGGEST` | 0x0C | **8** |
+| 0x92E5 | `C_TRADE_BROKER_SOLD_ITEM_LIST` | 4 | **0** |
+| 0xA788 | `C_TRADE_BROKER_SUGGEST_DEAL` | 0x10 | **0x0C** |
+| 0x8DC7 | `C_TRADE_BROKER_WAITING_ITEM_LIST_NEW` | **0x75** | **0x71** |
+| 0x8CFB | `C_TRADE_BROKER_WAITING_ITEM_LIST_PAGE` | 8 | **4** |
+| 0x8863 | `C_TRADE_BROKER_WAITING_ITEM_LIST_SORT` | 9 | **5** |
+
+The **body** column is the frame guard minus the 4-byte `[u16 len][u16 opcode]` header — the
+number `PacketDispatcher.Register` wants. The same −4 that bit the guild and chat wirings
+(`CLIENT-REJECTS.md` §7.2c); `BrokerPackets.MinBodyLength` does the subtraction once.
+
+Five of the sixteen carry no fields at all — `_BOUGHT_ITEM_LIST`, `_SOLD_ITEM_LIST`,
+`_REGISTERED_ITEM_LIST`, `_CLOSE`, `_HIGHEST_ITEM_LEVEL` — so their dumpers have no guard to
+give. Three of those five still guard on 4 in the handler and two (`_CLOSE`,
+`_REGISTERED_ITEM_LIST`) do not guard at all; either way the answer is the same, because a
+4-byte frame is just the header. **The rule the codec follows: take the dumper's guard when the
+dumper has one, otherwise 4.** Where both exist they agree on all eleven.
+
+### 2.2 Client → WorldServer — the 5 the Arbiter must NOT answer
+
+`C_TRADE_BROKER_REGISTER_ITEM` 0x7E74 (frame 0x2C) · `C_TRADE_BROKER_UNREGISTER_ITEM` 0xB8BA
+(0x10) · `C_TRADE_BROKER_CALC_SOLD_ITEM` 0x7516 (8) · `C_TRADE_BROKER_CALC_BOUGHT_ITEM` 0x5C10
+(8) · `C_TRADE_BROKER_BUY_IT_NOW` 0xF66D (0x11).
+
+They have **dumpers but no `Handler_C_*`** in ArbiterServer.exe, which is the same evidence
+`GUILD-DESIGN.md` §5.2 uses. They must stay unregistered and be tunnelled.
+
+### 2.3 Arbiter → client — the 15
+
+| opcode | packet | frame | fields |
+|---|---|---|---|
+| 0x53C0 | `S_TRADE_BROKER_BOUGHT_ITEM_LIST` | 8 | one array, `ItemList` |
+| 0xEC54 | `S_TRADE_BROKER_BUY_IT_NOW` | 5 | `u8 Result` |
+| 0xDEC6 | `S_TRADE_BROKER_CALC_BOUGHT_ITEM` | 5 | `u8 Result` |
+| 0x6AF1 | `S_TRADE_BROKER_CALC_NOTIFY` | 0x0C | `i32 SoldCount, i32 BoughtCount` |
+| 0x97ED | `S_TRADE_BROKER_CALC_SOLD_ITEM` | 5 | `u8 Result` |
+| 0xB9E0 | `S_TRADE_BROKER_DEAL_INFO_UPDATE` | 0x18 | `i64 Price, i32 SellerDealStatus, i32 BuyerDealStatus` |
+| 0xED80 | `S_TRADE_BROKER_DEAL_SUGGESTED` | 0x2A | ref `UserName`, then 5 i32 and 2 i64 |
+| 0x7E53 | `S_TRADE_BROKER_HIGHEST_ITEM_LEVEL` | 8 | `i32 HighestLevel` |
+| 0x9372 | `S_TRADE_BROKER_HISTORY_ITEM_LIST` | 0x10 | `i32 CurrentPage, i32 TotalPage` + array |
+| 0x4FE6 | `S_TRADE_BROKER_INPUT_PRICE` | 0x2C | 5 × i64 (see 4.2) |
+| 0xCDEA | `S_TRADE_BROKER_REGISTERED_ITEM_LIST` | 8 | one array |
+| 0xD0E6 | `S_TRADE_BROKER_REQUEST_DEAL_RESULT` | 5 | `u8 Success` |
+| 0x5587 | `S_TRADE_BROKER_SOLD_ITEM_LIST` | 0x18 | `i64 TotalCalcMoney, i64 TotalCalcTCatMoney` + array |
+| 0x7066 | `S_TRADE_BROKER_SUGGEST_DEAL` | 5 | `u8 Result` |
+| 0xFD2C | `S_TRADE_BROKER_WAITING_ITEM_LIST` | 0x10 | `i32 CurrentPage, i32 TotalPage` + array |
+
+### 2.4 The inter-server six
+
+| op | name | frame | payload |
+|---|---|---|---|
+| 0x1457 | `SA_TRADE_BROKER_OPEN` | 0x0E | `i64 ArbiterUser@06` |
+| 0x1458 | `AS_TRADE_BROKER_CLOSE` | 0x0A | `i32 UserDbId@06` |
+| 0x1459 | `SA_TRADE_BROKER_DEAL_OPEN` | 0x13 | `i64 ArbiterUser@06, i32 TradeId@0E, u8 Result@12` |
+| 0x145A | `AS_TRADE_BROKER_DEAL_OPEN` | 0x12 | `i32 BuyerDbId@06, i32 TradeId@0A, i32 OpenType@0E` |
+| 0x145B | `AS_TRADE_BROKER_DEAL_CLOSE` | 0x0A | `i32 UserDbId@06` |
+| 0x286D | `AS_TRADE_BROKER_ITEM_SOLD` | 0x0B | `i32 UserDbId@06, u8 InstantBuy@0A` |
+
+`SA_TRADE_BROKER_OPEN` is World saying "this player walked up to a broker NPC"; the Arbiter
+answers by pushing the player's lists. The `DEAL_OPEN` pair is the bargaining window.
+
+---
+
+## 3. The DB-proxy half — the seven that wedge a character
+
+All frame-relative. Every one of the five that carries a `DlmId` is a DLMItem.
+
+| op | request | frame | fields |
+|---|---|---|---|
+| 0x2817 | `SDB_TRADE_BROKER_REGISTER_ITEM` | 0x16 | `i32 DlmId@0E, i32 OwnerDbId@12, ref ItemBinary` |
+| 0x2819 | `SDB_TRADE_BROKER_UNREGISTER_ITEM` | 0x1E | `i32 DlmId@0E, i32 OwnerDbId@12, i32 Step@16, i32 TradeId@1A, ref ItemBinary` |
+| 0x281B | `SDB_TRADE_BROKER_CALC_SOLD_ITEM` | 0x22 | `i32 DlmId@16, i32 OwnerDbId@1A, i32 Step@1E, ref CalcList, ref ItemBinary` |
+| 0x281D | `SDB_TRADE_BROKER_CALC_BOUGHT_ITEM` | 0x22 | same shape as CALC_SOLD |
+| 0x281F | `SDB_TRADE_BROKER_BUY_IT_NOW` | 0x27 | `i32 DlmId@0E, i32 OwnerDbId@12, i32 Step@16, i32 TradeId@1A, u8 InstantBuy@1E, ref ItemBinary, i64 TotalPriceWithTax@1F` |
+| 0x2821 | `SDB_TRADE_BROKER_START_DEAL` | 0x12 | `i32 BuyerDbId@06, i32 SellerDbId@0A, i32 TradeId@0E` — **no DlmId** |
+| 0x2824 | `SDB_TRADE_BROKER_CANCEL_DEAL` | 0x0E | `i32 UserDbId@06, i32 TradeId@0A` — **no DlmId** |
+
+| op | reply | frame | fields |
+|---|---|---|---|
+| 0x2818 | `DBS_TRADE_BROKER_REGISTER_ITEM` | 0x13 | `i32 DlmId@0E, u8 Success@12, ref ItemBinary` |
+| 0x281A | `DBS_TRADE_BROKER_UNREGISTER_ITEM` | 0x1F | `i32 DlmId@16, i32 Step@1A, u8 Success@1E, ref TradeData, ref ItemBinary` |
+| 0x281C | `DBS_TRADE_BROKER_CALC_SOLD_ITEM` | 0x1F | `i32 DlmId@16, i32 Step@1A, u8 Success@1E, ref CalcItemList, ref ItemBinary` |
+| 0x281E | `DBS_TRADE_BROKER_CALC_BOUGHT_ITEM` | 0x1F | same |
+| 0x2820 | `DBS_TRADE_BROKER_BUY_IT_NOW` | 0x1F | `i32 DlmId@16, i32 Step@1A, u8 Success@1E, ref TradeData, ref ItemBinary` |
+| 0x2822 | `DBS_TRADE_BROKER_START_DEAL` | **0x4C** | the whole deal: ids, item, both names, prices — see below |
+| 0x2823 | `DBS_TRADE_BROKER_ACCEPT_DEAL` | 0x1E | `i32 UserDbId@06, i32 BuyerDbId@0A, i32 SellerDbId@0E, i32 TradeId@12, i64 AgreedPrice@16` |
+| 0x282C | `DBS_TRADE_BROKER_CANCEL_DEAL` | 0x0A | `i32 UserDbId@06` |
+
+`DBS_TRADE_BROKER_ACCEPT_DEAL` (0x2823) is the odd one: it has **no `SDB_` partner** — it is an
+Arbiter→World push, not a reply, sent when both sides of a bargain confirm.
+
+`DBS_TRADE_BROKER_START_DEAL` (0x2822), frame-relative: two ref slots first, then
+`i32 UserDbId@0E, BuyerDbId@12, SellerDbId@16, TradeId@1A, ItemTemplateId@1E, ItemAmount@22,
+ItemEnchantCount@26`, `u8 Masterpiece@2E`, `i64 RegTotalPrice@2F`, `i64 SuggestPrice@37`,
+`u8 Awakened@47`, `i32 UnbindCount@48`, then the two wide strings `BuyerName` and `SellerName`.
+
+**`Step`** appears in five of them and is the multi-stage commit the item transfer runs through —
+the same idea as the warehouse's atom steps (`MAIL-WAREHOUSE.md` §5). Its values were not traced;
+a handler must echo the `Step` it was given rather than invent one.
+
+**`ItemBinary`** is a ref to the same `ItemData`-shaped record `DBS_USER_LOAD_INVENTORY` carries
+(`INVENTORY-DESIGN.md` §3). That is what makes the broker an inventory operation: the item
+physically leaves the seller's bag and comes back to the buyer's, and the atoms are what World
+applies.
+
+---
+
+## 4. The two search packets
+
+### 4.1 `C_TRADE_BROKER_HISTORY_ITEM_LIST_NEW` (0x76B4), fixed part **0x6C**
+
+Four ref slots, then 25 scalars. Packet-relative:
+
+```
+[04] ref Keyword      [06] ref Category   [08] ref ItemTemplateIdList   [0A] ref SecondaryKeyword
+[0C] i32 MinLevel     [10] i32 MaxLevel   [14] i32 Grade    [18] i32 UnidentifiedItem
+[1C] u8  Masterpiece  [1D] u8 Enchantable
+[1E] i32 MinItemLevel [22] i32 MaxItemLevel
+[26] i32 OptionPassivityType    [2A] i64 OptionValue   [32] i32 OptionSearchCompareType
+[36] i32 MinExtractLevel [3A] i32 MaxExtractLevel
+[3E] i32 MinEnchantLevel [42] i32 MaxEnchantLevel
+[46] i64 MinPrice     [4E] i64 MaxPrice
+[56] u8 ExactMatch    [57] u8 EquipmentSet
+[58] i64 MinTCatPrice [60] i64 MaxTCatPrice
+[68] u8 UseDetailSearch [69] u8 Awakened  [6A] u8 Unbindable  [6B] u8 Wearable
+```
+
+`0x6B + 1 = 0x6C` — the guard lands exactly on the end of `Wearable`, which is the check that
+says the field list is complete.
+
+`WAITING_ITEM_LIST_NEW` (0x8DC7, fixed part **0x75**) is the same filter with
+`CanBargainItemsOnly` added and a different scalar order; `BrokerPackets` carries both.
+
+### 4.2 Paging and sorting
+
+`*_PAGE` is `[i32 PageNo]`; `*_SORT` is `[i32 Criteria][u8 IsAscend]`. Both exist twice, once for
+the waiting list (things for sale) and once for the history (things sold), and the Arbiter keeps
+the result set **cached per user** — `TradeBrokerSearchAgent::CacheWaitingSearch` /
+`CacheHistorySearch`, cleared by `ClearUserCache`. So a `_PAGE` with no preceding `_NEW` has
+nothing to page, which is the one piece of cross-packet state the broker has.
+
+`S_TRADE_BROKER_INPUT_PRICE` (0x4FE6) answers `C_TRADE_BROKER_INPUT_PRICE` with the five numbers
+the "suggest a price" box shows: `MinPrice, AvgPrice, MinTCatPrice, AvgTCatPrice, RegisterFeeRate`,
+all i64, computed by `TradeBrokerSearchAgent::CalcMinAvgPrice`.
+
+---
+
+## 5. `.def` files that are wrong
+
+Four of the 57, checked field-by-field against the dumpers. The first is the one that matters,
+because it is a live DB-proxy request.
+
+| file | problem |
+|---|---|
+| `SDB_TRADE_BROKER_BUY_IT_NOW.1.def` | **missing `i64 TotalPriceWithTax` @0x1F** — 8 bytes short, and it is the price the buyer actually paid |
+| `S_TRADE_BROKER_DEAL_SUGGESTED.1.def` | missing `ItemEnchantCount`, and its field order is wrong: the binary writes the name's ref slot FIRST |
+| `S_TRADE_BROKER_DEAL_INFO_UPDATE.1.def` | an extra `int32 unk` between `price` and `sellerStage` — 4 bytes too long |
+| `S_TRADE_BROKER_SOLD_ITEM_LIST.1.def` | missing `i64 TotalCalcTCatMoney`; the guard is 0x18 = header + two i64 |
+
+`BrokerPackets.CorrectedDefs` carries all four, and `BrokerPackets.ResolveDef(defs, name)` has the
+same contract as `GuildHandlers.ResolveDef` / `ChatManager.ResolveDef`, so a future wiring can
+chain them with `??`.
+
+Two more look wrong at a glance and are **not**: `C_TRADE_BROKER_CALC_BOUGHT_ITEM.1.def` and
+`S_TRADE_BROKER_BOUGHT_ITEM_LIST.1.def` are array packets whose dumper emits the array through a
+different helper, so a naive field count disagrees. Their layouts are fine.
+
+---
+
+## 6. What the manager does — for whoever builds it
+
+`TradeBroker::*` (Arb_part_057.c) is ~40 methods. The shape worth copying:
+
+* **Guards are their own methods** — `CanRegisterItem`, `CanUnregisterItem`, `CanBuyItNow`,
+  `CanStartDeal`, `CanSetSoldItemCalculated`, `CanSetBoughtItemCalculated`,
+  `CanUpdateItemSetSold`. Each answers before any row is touched.
+* **The search agent is separate** from the item store (`TradeBrokerSearchAgent`), holds the
+  per-user result cache, and is what `_NEW` / `_PAGE` / `_SORT` talk to.
+* **Expiry is a timer**, not a query: `TradeBrokerTimer::OnExecute` →
+  `TradeBroker::OnExpireWaitingItemsTick`, plus `ProcessExpiredTradeBrokerItemJob` and
+  `CreateNewTradeBrokerItemsJob` as async jobs.
+* **Bargaining is a lock**: `LockSuggest` / `AddSuggest` / `DeleteDeal`, with the deal window
+  opened by `AS_TRADE_BROKER_DEAL_OPEN` and closed by `AS_TRADE_BROKER_DEAL_CLOSE`.
+
+### 6.1 The stored procedures
+
+```
+dbo.spAddTradeBrokerItem            dbo.spLoadTradeBrokerItems
+dbo.spDeleteTradeBrokerItem         dbo.spUpdateTradeBrokerItem
+dbo.spAddTradeBrokerHistoryItem     dbo.spLoadTradeBrokerHistoryItems
+dbo.spLoadTradeBrokerRandomPassive  dbo.spLoadTradeBrokerHistoryRandomPassive
+dbo.spUpdateUserAchievementEtcOfTradeBrokerSellByDealCount
+dbo.spUpdateUserAchievementEtcOfTradeBrokerSellInstantCount
+```
+
+Two tables, then: a live listing table and a history table, plus a "random passive" load which is
+the rolled item option the listing carries. A future schema is two tables shaped like
+`GUILD-DESIGN.md` §3.3's, keyed by `TradeId`.
+
+---
+
+## 7. What T53 did NOT do
+
+* **No manager, no tables, no handlers.** By design — the task was research and a codec.
+* **No capture.** No broker frame exists in any log on disk; every layout here is golden against
+  the decompiled dumpers and handler guards, the same footing the party and guild codecs stand on.
+  `MULTIPLAYER-DESIGN.md` §8's checklist is what would change that: open a broker NPC on the tap
+  with the real Arbiter running and keep the log.
+* **`Step` values are unknown** (§3). A handler must echo, never invent.
+* **The `ItemBinary` / `CalcList` / `TradeData` ref payloads are named but not decoded.** They are
+  `ItemData`-shaped (`INVENTORY-DESIGN.md` §3) but the exact record for a broker listing was not
+  traced.
+
+## 8. The one thing to do before anything else
+
+Answer the five DLMItem-carrying `SDB_TRADE_BROKER_*` requests, even with `Success = 0`. Right
+now a player who opens the broker on a live TeraSharp gets `no replay for 0x2817` and their DB
+queue stops for the life of the World process — the exact failure T45 fixed for the mailbox. The
+opcodes, the guards and the reply layouts are all in §3; what is missing is only the decision
+about what a refusal should look like, and `Success = 0` with the `DlmId` and `Step` echoed is
+almost certainly it.

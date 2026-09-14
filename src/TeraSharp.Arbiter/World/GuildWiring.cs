@@ -90,15 +90,15 @@ public static class GuildWiring
     // =========================================================================================
 
     /// <summary>
-    /// The seventeen client packets <see cref="GuildHandlers"/> answers - GUILD-DESIGN.md
-    /// section 10's list, and exactly the set <see cref="GuildHandlers.Handles"/> returns true
-    /// for (test T51_the_registered_set_is_exactly_what_GuildHandlers_answers).
+    /// The <b>nineteen</b> client packets <see cref="GuildHandlers"/> answers - every
+    /// Arbiter-side guild packet in GUILD-DESIGN.md section 5.1, and exactly the set
+    /// <see cref="GuildHandlers.Handles"/> returns true for (test
+    /// T51_the_registered_set_is_exactly_what_GuildHandlers_answers).
     ///
-    /// <para>Two Arbiter-side packets are deliberately NOT here: <c>C_INVITE_USER_TO_GUILD</c>
-    /// (0xEF92) needs the wanted-board manager as well as the target's session, and
-    /// <c>C_CHANGE_GUILDNAME</c> (0x4E4A) needs the SDB_ASK_CHANGE_GUILD_NAME round trip.
-    /// Registering either without a handler would answer the player with a rejection; leaving
-    /// them unregistered forwards them to World, which at least logs. Both stay open.</para>
+    /// <para>T52 added the last two. <c>C_INVITE_USER_TO_GUILD</c> (0xEF92) was waiting on a
+    /// session lookup that now exists, and <c>C_CHANGE_GUILDNAME</c> (0xFC1C) turned out not to
+    /// need the SDB_ASK_CHANGE_GUILD_NAME round trip at all - the only thing that trip decides is
+    /// uniqueness, which the SQL UNIQUE index already answers (section 12.2).</para>
     ///
     /// <para>The ten World-side guild packets of section 5.2 (C_LEAVE_GUILD 0x7C83,
     /// C_BANISH_GUILD_MEMBER, C_DESTROY_GUILD, C_CHANGE_GUILD_CHIEF, the four guild-group ones,
@@ -122,6 +122,8 @@ public static class GuildWiring
         ("C_APPLY_GUILD",                          GuildPackets.C_APPLY_GUILD),
         ("C_ACCEPT_GUILD_APPLY",                   GuildPackets.C_ACCEPT_GUILD_APPLY),
         ("C_REJECT_INVITE_USER_TO_GUILD",          GuildPackets.C_REJECT_INVITE_USER_TO_GUILD),
+        ("C_INVITE_USER_TO_GUILD",                 GuildPackets.C_INVITE_USER_TO_GUILD),
+        ("C_CHANGE_GUILDNAME",                     GuildPackets.C_CHANGE_GUILDNAME),
         ("C_REQUEST_UPDATE_ANNOUNCE",              GuildHandlers.C_REQUEST_UPDATE_ANNOUNCE),
         ("C_REQUEST_UPDATE_INTRODUCE",             GuildHandlers.C_REQUEST_UPDATE_INTRODUCE),
     };
@@ -344,7 +346,172 @@ public static class GuildWiring
     }
 
     // =========================================================================================
-    // 6. The SDB_INIT_GUILD (0x27CF) boot load, built from rows
+    // 6. World -> Arbiter: the twelve SA_ guild frames (T52)
+    // =========================================================================================
+
+    /// <summary>
+    /// Every World -&gt; Arbiter guild opcode, in opcode order (GUILD-DESIGN.md section 4.2).
+    /// Ten of them have a layout and a parser in <see cref="GuildPackets"/>; the last two
+    /// (<c>SA_INC_GUILD_ACCOUNT_LIMIT</c> 0x1414 and <c>SA_PUSH_GUILD_BUFF</c> 0x145C) have
+    /// neither - the design doc's table leaves their payload column empty because no dumper for
+    /// them was found. They are gated anyway, and consumed with a log line, because the
+    /// alternative is the replay table handing World somebody else's reply.
+    /// </summary>
+    public static readonly ushort[] WorldOpcodes =
+    {
+        GuildPackets.SA_LOAD_GUILD,               // 0x13FB
+        GuildPackets.SA_DESTROY_GUILD,            // 0x13FC
+        GuildPackets.SA_LEAVE_GUILD,              // 0x13FE
+        GuildPackets.SA_BANISH_GUILD_MEMBER,      // 0x1400
+        GuildPackets.SA_CHANGE_GUILD_CHIEF,       // 0x1402
+        GuildPackets.SA_SET_GUILDGROUP_AUTHORITY, // 0x1404
+        GuildPackets.SA_CREATE_GUILD_GROUP,       // 0x1406
+        GuildPackets.SA_REMOVE_GUILD_GROUP,       // 0x1408
+        GuildPackets.SA_CHANGE_GUILDGROUP,        // 0x140B
+        GuildPackets.SA_UPDATE_GUILD_MEMBER,      // 0x140F
+        GuildPackets.SA_INC_GUILD_ACCOUNT_LIMIT,  // 0x1414 - layout unknown
+        GuildPackets.SA_PUSH_GUILD_BUFF,          // 0x145C - layout unknown
+    };
+
+    /// <summary>
+    /// Is this a World -&gt; Arbiter guild frame? The gate the one <c>WorldBridge</c> line uses,
+    /// and the twin of <see cref="PartyWiring.HandlesWorldFrame"/>. It is a membership test
+    /// rather than <c>GuildPackets.MinFrameLength(op) != 0</c> because that answers 0 for the two
+    /// opcodes whose layout is unknown, and those still must not reach the replay table.
+    /// None of the twelve is in <c>DbProxyHandlers</c> or <c>WorldReplayTable.OneWayFromWorld</c>.
+    /// </summary>
+    public static bool HandlesWorldFrame(ushort op)
+    {
+        foreach (ushort o in WorldOpcodes) if (o == op) return true;
+        return false;
+    }
+
+    /// <summary>
+    /// A World frame arrived. Returns true when it was a guild frame and has been dealt with, so
+    /// the caller can <c>return</c>; false leaves it to DbProxy and the replay table exactly as
+    /// before.
+    /// </summary>
+    public static bool TryHandleWorldFrame(ushort opcode, byte[] payload)
+    {
+        if (!HandlesWorldFrame(opcode)) return false;
+        var actions = OnWorldFrame(Store, opcode, payload);
+        Dispatcher(null, GuildLog).Dispatch(actions, "guild-world");
+        return true;
+    }
+
+    /// <summary>
+    /// The pure half: one W-&gt;A guild frame in, an action set out. <c>Origin</c> stays
+    /// <see cref="Recipient.None"/> - a World frame has no originating client - so a rejection
+    /// here goes to the log rather than to somebody's chat window, which matters because eight
+    /// of the twelve land there every time.
+    /// </summary>
+    internal static ArbiterActions OnWorldFrame(CharacterStore? store, ushort opcode, byte[] payload)
+    {
+        var a = new ArbiterActions();
+        if (store == null) return a.Reject($"0x{opcode:X4}: no store open");
+
+        switch (opcode)
+        {
+            case GuildPackets.SA_LEAVE_GUILD: return LeaveGuild(a, store, payload, banished: false);
+            case GuildPackets.SA_BANISH_GUILD_MEMBER: return LeaveGuild(a, store, payload, banished: true);
+            default:
+                return a.Reject($"0x{opcode:X4} is a guild frame we gate but do not model yet "
+                                + "(status/GUILD-DESIGN.md section 12.3)");
+        }
+    }
+
+    // ---- system message ids, from the decompiled leave worker ----
+
+    /// <summary>
+    /// GuildUtil::UserLeaveFromGuild (FUN_1408165f0, Arb_part_070.c:16414) sends exactly three
+    /// things and <b>no client packet at all</b>: 0x126 to the leaver with <c>GuildName</c>,
+    /// then 0x2F8 (voluntary) or 0x2F9 (banished) to the rest of the guild with <c>UserName</c>,
+    /// then AS_LEAVE_GUILD to every World session. Note the capitalisation: this path spells the
+    /// keys with capitals, while the invite path (GuildHandlers) spells them lowercase.
+    /// </summary>
+    public const int SmtYouLeftTheGuild = 0x126;
+    public const int SmtMemberLeft = 0x2F8;
+    public const int SmtMemberBanished = 0x2F9;
+
+    /// <summary>
+    /// SA_LEAVE_GUILD (0x13FE) and SA_BANISH_GUILD_MEMBER (0x1400) - the same worker in the
+    /// binary, with one enum apart. Payload (frame-relative):
+    /// <c>u32 nameOff@06, i64 ArbiterUser@0A, i32 GuildDbId@12, i32 MemberDbId@16</c>.
+    ///
+    /// <para>The real handler identifies the leaver by the <c>User</c> object at +0x0A and reads
+    /// only <c>GuildDbId</c> out of the frame (<c>*(u32 *)(packet + 0x12)</c>). We have no User
+    /// handles, so we use <c>MemberDbId</c> at +0x16, which the frame carries and which the
+    /// dumper names - and we verify it really is a member of that guild before touching a row.</para>
+    ///
+    /// <para>A guild that falls to zero members is destroyed
+    /// (<c>GuildManager::MemberLeave_DestroyGuildWithLock</c> is called on this exact path). The
+    /// real one also re-picks a chief; ours promotes the longest-serving remaining member, which
+    /// is ours and not the decompile's - see section 12.4.</para>
+    /// </summary>
+    private static ArbiterActions LeaveGuild(ArbiterActions a, CharacterStore store, byte[] payload, bool banished)
+    {
+        var f = GuildPackets.ParseSaLeaveGuild(payload);
+        if (f == null) return a.Reject("SA_LEAVE_GUILD: frame shorter than 0x1A");
+        var (nameInFrame, _, guildDbId, memberDbId) = f.Value;
+
+        var member = store.GetGuildMember(memberDbId);
+        if (member == null) return a.Reject($"SA_LEAVE_GUILD: {memberDbId} is in no guild");
+        if (member.GuildId != guildDbId)
+            return a.Reject($"SA_LEAVE_GUILD: {memberDbId} is in guild {member.GuildId}, not {guildDbId}");
+
+        var guild = store.GetGuild(guildDbId);
+        if (guild == null) return a.Reject($"SA_LEAVE_GUILD: no guild {guildDbId}");
+        string memberName = member.Name.Length > 0 ? member.Name : nameInFrame;
+
+        if (!store.RemoveGuildMember(memberDbId))
+            return a.Reject($"SA_LEAVE_GUILD: spLeaveGuildMember removed no row for {memberDbId}");
+        store.AddGuildLog(guildDbId, GuildHandlers.GuildLogLeave, memberName, actorDbId: memberDbId);
+
+        // 0x126 to the leaver, then 0x2F8 / 0x2F9 to everyone still in the guild.
+        Smt(a, memberDbId, SmtYouLeftTheGuild, "GuildName", guild.Name);
+        var remaining = store.GetGuildMembers(guildDbId);
+        int smt = banished ? SmtMemberBanished : SmtMemberLeft;
+        foreach (var other in remaining) Smt(a, other.UserDbId, smt, "UserName", memberName);
+
+        // World is told regardless of what happens to the guild next.
+        a.World(GuildPackets.AS_LEAVE_GUILD, GuildPackets.BuildAsLeaveGuild(guildDbId, memberDbId));
+
+        if (remaining.Count == 0)
+        {
+            // GuildManager::MemberLeave_DestroyGuildWithLock is called on this exact path.
+            store.DeleteGuild(guildDbId);
+            a.World(GuildPackets.AS_DESTROY_GUILD, GuildPackets.BuildAsDestroyGuild(guildDbId));
+            return a;
+        }
+
+        if (guild.ChiefDbId == memberDbId)
+        {
+            // The master left. Longest-serving member first; the real Arbiter certainly re-picks
+            // one (a guild with no chief is not a state the client can render) but the choice was
+            // not traced - section 12.4.
+            var next = remaining[0];
+            foreach (var m in remaining) if (m.GuildJoinDate < next.GuildJoinDate) next = m;
+            store.ChangeGuildChief(guildDbId, next.UserDbId);
+            // The shipped S_CHANGE_GUILD_CHIEF.def names its single field `playerId`, not the
+            // dumper's NewChiefDbId. The def wins - it is what the client reads.
+            foreach (var other in remaining)
+                a.ToPlayer(other.UserDbId, "S_CHANGE_GUILD_CHIEF",
+                    new Dictionary<string, object> { ["playerId"] = (uint)next.UserDbId });
+            a.World(GuildPackets.AS_CHANGE_GUILD_CHIEF,
+                GuildPackets.BuildAsChangeGuildChief(guildDbId, next.UserDbId));
+        }
+        return a;
+    }
+
+    /// <summary>One S_SYSTEM_MESSAGE to one character - the <c>@id\vKey\vValue</c> form.</summary>
+    private static void Smt(ArbiterActions a, int characterId, int id, params string[] keysAndValues)
+        => a.ToPlayer(characterId, "S_SYSTEM_MESSAGE", new Dictionary<string, object>
+        {
+            ["message"] = SocialHandlers.Smt(id, keysAndValues),
+        });
+
+    // =========================================================================================
+    // 7. The SDB_INIT_GUILD (0x27CF) boot load, built from rows
     // =========================================================================================
 
     /// <summary>

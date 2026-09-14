@@ -127,6 +127,14 @@ public sealed class GuildHandlers
     public const int MsgNoSuchUser = 0xE2B;
     /// <summary>"you do not have the authority" on the invite path.</summary>
     public const int MsgNoAuthority = 0xE2C;
+    /// <summary>T52, from Handler_C_INVITE_USER_TO_GUILD (FUN_1404e1890) and
+    /// GuildJoinManager::AddInviteUserToGuildInfo (FUN_140825d20). The key names are the
+    /// binary's and the CASE matters - the invite path spells them lowercase
+    /// (L"userName", L"guildName") while the leave path spells them capitalised.</summary>
+    public const int MsgNotOnWantedList = 0xE2E;   // fromWantedList set, but they are not on it
+    public const int MsgInviteSent = 0xE2F;        // -> the inviter,  {userName}
+    public const int MsgInviteReceived = 0xE30;    // -> the target,   {guildName}
+    public const int MsgAlreadyInAGuild = 0xE36;   // -> the inviter,  {userName}
 
     /// <summary>
     /// C_REQUEST_GUILD_INFO's windowType switch, from FUN_1404e7e80. 1 is a bare probe; 6 is the
@@ -163,6 +171,11 @@ public sealed class GuildHandlers
         GuildPackets.C_APPLY_GUILD => true,
         GuildPackets.C_ACCEPT_GUILD_APPLY => true,
         GuildPackets.C_REJECT_INVITE_USER_TO_GUILD => true,
+        // T52: the two section 10 left "for routing". The session lookup the first one waited
+        // for is WorldBridge.SessionForPlayerId (T47), and the second turned out not to need the
+        // SDB_ASK_CHANGE_GUILD_NAME round trip at all - see ChangeGuildName.
+        GuildPackets.C_INVITE_USER_TO_GUILD => true,
+        GuildPackets.C_CHANGE_GUILDNAME => true,
         C_REQUEST_UPDATE_ANNOUNCE => true,
         C_REQUEST_UPDATE_INTRODUCE => true,
         _ => false,
@@ -204,6 +217,8 @@ public sealed class GuildHandlers
             case GuildPackets.C_APPLY_GUILD: return ApplyGuild(a, characterId, body);
             case GuildPackets.C_ACCEPT_GUILD_APPLY: return AcceptGuildApply(a, characterId, body);
             case GuildPackets.C_REJECT_INVITE_USER_TO_GUILD: return RejectInvite(a, characterId, body);
+            case GuildPackets.C_INVITE_USER_TO_GUILD: return InviteUserToGuild(a, characterId, body);
+            case GuildPackets.C_CHANGE_GUILDNAME: return ChangeGuildName(a, characterId, body);
             case C_REQUEST_UPDATE_ANNOUNCE: return UpdateAnnounce(a, characterId, body);
             case C_REQUEST_UPDATE_INTRODUCE: return UpdateIntroduce(a, characterId, body);
             default:
@@ -608,6 +623,123 @@ public sealed class GuildHandlers
         BroadcastApplyCount(a, guild);
         return a;
     }
+
+    // =======================================================================================
+    // T52 - the two packets T39 left "for routing" (GUILD-DESIGN.md section 12).
+    // =======================================================================================
+
+    /// <summary>
+    /// C_INVITE_USER_TO_GUILD (0xEF92): `[u16 nameOff][u32 userDbId][u8 fromWantedList]`, min
+    /// total 0x0B. Handler FUN_1404e1890 (Arb_part_041.c) in the binary's own order:
+    /// <list type="number">
+    /// <item>the caller must be in a guild — else system message 0xE2B;</item>
+    /// <item><c>Guild::HaveGuildAuthority(guild, user, invite)</c> — else 0xE2C;</item>
+    /// <item>resolve the target: by NAME when <c>userDbId</c> is 0, by db id otherwise — a target
+    /// that cannot be resolved is 0xE2B again;</item>
+    /// <item>the target must not already be in a guild — else 0xE36 with <c>userName</c>;</item>
+    /// <item>if <c>fromWantedList</c>, the target must actually be on the wanted board — else
+    /// 0xE2E;</item>
+    /// <item>then <c>GuildJoinManager::AddInviteUserToGuildInfo</c>: reject a duplicate invite,
+    /// <c>spAddInviteUserToGuild</c>, 0xE2F to the inviter and 0xE30 to the target.</item>
+    /// </list>
+    ///
+    /// <para><b>One deviation, deliberate.</b> The real handler resolves the target through
+    /// <c>UserManager</c>, so an OFFLINE character is "no such user". We resolve through the
+    /// characters table instead and address the 0xE30 to their db id: the dispatcher drops it
+    /// when they are offline, which is what every other cross-session guild push already does,
+    /// and the invite row persists so the client's invite list shows it at next login. Requiring
+    /// the target online would also make this untestable without a live roster.</para>
+    ///
+    /// <para>There is no wanted board (GUILD-DESIGN.md section 10, "What is NOT modelled"), so
+    /// <c>fromWantedList</c> is answered with 0xE2E rather than silently treated as a plain
+    /// invite — refusing is honest, inviting anyway would claim a board we do not have.</para>
+    /// </summary>
+    private GuildActions InviteUserToGuild(GuildActions a, int characterId, byte[] body)
+    {
+        var req = GuildPackets.ParseCInviteUserToGuild(body);
+        if (req == null) return a.Reject("C_INVITE_USER_TO_GUILD: short body");
+        var (name, userDbId, fromWantedList) = req.Value;
+
+        var guild = MyGuild(characterId);
+        if (guild == null) return a.Reject($"C_INVITE_USER_TO_GUILD: caller is in no guild (0x{MsgNoSuchUser:X})");
+        if (!_store.HasGuildAuthority(guild.GuildId, characterId, CharacterStore.GuildAuthorityInvite))
+            return a.Reject($"C_INVITE_USER_TO_GUILD: no invite authority (0x{MsgNoAuthority:X})");
+
+        var target = userDbId != 0 ? _store.GetCharacter(userDbId) : _store.GetCharacterByName(name);
+        if (target == null)
+            return a.Reject($"C_INVITE_USER_TO_GUILD: no such user '{name}'/{userDbId} (0x{MsgNoSuchUser:X})");
+        int targetId = target.Id;
+        if (targetId == characterId)
+            return a.Reject("C_INVITE_USER_TO_GUILD: cannot invite yourself");
+
+        if (_store.GetGuildIdOf(targetId) != 0)
+        {
+            Smt(a, characterId, MsgAlreadyInAGuild, "userName", target.Name);
+            return a;
+        }
+        if (fromWantedList)
+            return a.Reject($"C_INVITE_USER_TO_GUILD: no wanted board in this build (0x{MsgNotOnWantedList:X})");
+
+        foreach (var existing in _store.GetGuildInvites(targetId))
+            if (existing.GuildId == guild.GuildId)
+                return a.Reject("C_INVITE_USER_TO_GUILD: already invited (GuildJoinManager::AlreadyInvitedGuild)");
+
+        _store.AddGuildInvite(guild.GuildId, targetId, characterId);
+        Smt(a, characterId, MsgInviteSent, "userName", target.Name);
+        Smt(a, targetId, MsgInviteReceived, "guildName", guild.Name);
+        _log.LogInformation("Guild {G} '{GN}': {A} invited {B}", guild.GuildId, guild.Name, characterId, target.Name);
+        return a;
+    }
+
+    /// <summary>
+    /// C_CHANGE_GUILDNAME (0xFC1C): one `[u16 off]` + wstring, min total 6. Handler FUN_1404dc6a0
+    /// (Arb_part_040.c:19716) has exactly one guard before it hands off, and it is worth quoting
+    /// because it is not the invite authority: <c>*(int *)(guild + 0xd8) == *(int *)(user +
+    /// 0x120)</c> — Guild+0xD8 is GuildData+0x50, i.e. <c>ChiefDbId</c>, so <b>only the guild
+    /// master may rename</b>. A non-master is answered with nothing at all; we relay the reason.
+    ///
+    /// <para><b>What we skip, and why it is safe.</b> The real handler then runs
+    /// <c>InputRestrictionHelper::CheckGuildName</c> (banned words, NetModerator) and an
+    /// <c>SDB_ASK_CHANGE_GUILD_NAME</c> round trip whose only job is the uniqueness check the
+    /// SQL UNIQUE index already performs. We have neither moderator, so the name goes straight to
+    /// <see cref="CharacterStore.RenameGuild"/>, which answers false when it is taken — the same
+    /// answer, one hop earlier. The reply is <c>S_CHANGE_GUILDNAME</c>
+    /// (<c>string guildName, bool usable</c> — GuildPackets.CorrectedDefs; the shipped .def drops
+    /// the flag), and World is told with AS_UPDATE_GUILD_NAME (0x1490), the same
+    /// `[u32 stringOff][i32 GuildDbId]` + wstring shape AS_UPDATE_GUILD_TITLE uses.</para>
+    /// </summary>
+    private GuildActions ChangeGuildName(GuildActions a, int characterId, byte[] body)
+    {
+        string? raw = GuildPackets.ParseCSingleString(body);
+        if (raw == null) return a.Reject("C_CHANGE_GUILDNAME: short body");
+        var guild = MyGuild(characterId);
+        if (guild == null) return a.Reject($"C_CHANGE_GUILDNAME: caller is in no guild (0x{MsgNoSuchGuild:X})");
+        if (guild.ChiefDbId != characterId)
+            return a.Reject($"C_CHANGE_GUILDNAME: only the guild master may rename (0x{MsgNotGuildMaster:X})");
+
+        string wanted = Truncate(EscapeGuildText(raw), CharacterStore.MaxGuildName);
+        bool ok = wanted.Length > 0 && _store.RenameGuild(guild.GuildId, wanted);
+
+        a.Client(GuildClientAction.Def(characterId, "S_CHANGE_GUILDNAME", new Dictionary<string, object>
+        {
+            ["guildName"] = wanted,
+            ["usable"] = ok,
+        }));
+        if (!ok) return a;
+
+        a.World(GuildPackets.AS_UPDATE_GUILD_NAME, GuildPackets.BuildAsGuildString(guild.GuildId, wanted));
+        _log.LogInformation("Guild {G} renamed '{Old}' -> '{New}'", guild.GuildId, guild.Name, wanted);
+        return a;
+    }
+
+    /// <summary>
+    /// One S_SYSTEM_MESSAGE to one character. The Arbiter builds these as
+    /// <c>@id\vKey\vValue</c> pairs (SocialHandlers.Smt is the same builder for the friends
+    /// paths); the guild paths that use it are quoted to their message id in the callers.
+    /// </summary>
+    private static void Smt(GuildActions a, int characterId, int id, params string[] keysAndValues)
+        => a.Client(GuildClientAction.Def(characterId, "S_SYSTEM_MESSAGE",
+            new Dictionary<string, object> { ["message"] = SocialHandlers.Smt(id, keysAndValues) }));
 
     /// <summary>C_REJECT_INVITE_USER_TO_GUILD (0xDE54): `[i32 guildDbId]` - spDeleteInviteUserToGuild
     /// then S_REQUEST_INVITE_GUILD_TAG with the caller's remaining invitation count.</summary>
