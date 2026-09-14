@@ -29,21 +29,12 @@ the whole point.
 
 ## A.0 Setup
 
-1. **Patch the tap to label the socket.** `D:\v100\TERA_SERVER.100\arbiter-world-tap.js` writes
-   `[seq] [dir] <iso> len=N` and nothing else, so a frame cannot be attributed to one of World's 25
-   links. Give each `net.createServer` connection an incrementing id and put it in the line:
-
-   ```js
-   let connSeq = 0;
-   const server = net.createServer((worldSock) => {
-       const conn = ++connSeq;
-       ...
-       worldSock.on('data', (d) => { log(`W->A#${conn}`, d); arbSock.write(d); });
-       arbSock.on('data',   (d) => { log(`A->W#${conn}`, d); worldSock.write(d); });
-   ```
-
-   Without this, question Q2 below cannot be answered at all and the party frames cannot be told
-   apart from the tunnel.
+1. **The tap already labels the socket** — done in T56. Every line is now
+   `[seq] [W->A#3] <iso> len=N`, where 3 is the World socket the chunk arrived on, counted from 1
+   in connect order. Confirm it by looking at the first few lines of a fresh log: if the direction
+   token has no `#N`, the box is running an old copy of
+   `D:\v100\TERA_SERVER.100\arbiter-world-tap.js` and Q2 below cannot be answered at all.
+   `tools/README.md` has the format and the regex any other parser needs.
 2. **Record each socket's `SA_REGISTER` (0x138A)** as it arrives: `IsBypass` u8 @+6, `PlanetId`
    @+7, `WorldId` @+0x0B, `TotalBypassCount` @+0x0F, `BypassIndex` i32 @+0x13. That is what turns
    a connection id into "the bypass link" or "the data link".
@@ -58,6 +49,20 @@ the whole point.
    start — every step below is found in the log by timestamp.
 6. Keep each step separated by ~10 seconds of standing still. The single most expensive thing about
    the existing captures is that everything overlaps.
+7. **Afterwards, reframe both logs before reading either.** A tap chunk is not a frame — the 23
+   `0x147E` promotion records arrive as one 30234-byte write — so anything that reads a chunk as a
+   packet is wrong:
+
+   ```powershell
+   cd D:\v100\TERA_SERVER.100\TeraSharp\tools
+   .\reframe-tap.ps1    -Log D:\packetlogs\arb_world_<stamp>.log -Opcodes 0x139E,0x139F,0x13F8
+   .\reframe-client.ps1 -Log D:\packetlogs\capture_<stamp>.log   -Packets S_GUILD_INFO
+   ```
+
+   Each writes `<log>_ctl.txt` (one line per frame, noise removed — read this first) and
+   `<log>_frames.txt` (full hex of the opcodes you named). Both print a reject count at the end;
+   a non-zero one means part of the capture is unusable and it is worth knowing that before the
+   server is torn down. `tools/README.md`.
 
 ## A.1 Two players, in view of each other
 
