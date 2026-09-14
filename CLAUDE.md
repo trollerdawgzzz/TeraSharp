@@ -77,6 +77,9 @@ each in its own worktree (`TeraSharp-cowork` on `cowork/T8`, `TeraSharp-cowork2`
 human rebases a worktree on master before a new task if master moved. The current task queue is at the
 bottom of this section; `status/CHAT-HANDOFF.md` has the day-by-day state and the live-debug recipes.
 
+Cowork-editable files also include: `Auth/*`, `Handlers/GmCommands.cs`, `Protocol/V100Definitions.cs`,
+`World/PartyManager.cs`, `World/StarterInventory.cs`, `World/DbProxyStaticData.cs` (added 2026-09-14).
+
 ### Hard rules learned the expensive way (2026-09-14)
 - **No `"` inside C# verbatim strings** (`@"..."`, e.g. the SQL DDL in CharacterStore) - a lone double quote
   terminates the string and the build fails with 300+ errors. Use single quotes or no quotes in SQL comments.

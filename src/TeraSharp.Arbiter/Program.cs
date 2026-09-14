@@ -1,5 +1,6 @@
 ﻿using System.Net;
 using Microsoft.Extensions.Logging;
+using TeraSharp.Arbiter.Auth;
 using TeraSharp.Arbiter.Handlers;
 using TeraSharp.Arbiter.Network;
 using TeraSharp.Arbiter.Persistence;
@@ -28,10 +29,8 @@ public static class Program
     private static string BindAddress => Environment.GetEnvironmentVariable("TERASHARP_BIND") ?? "127.0.0.1";
     private const int BindPort = 7701;
 
-    /// <summary>When true, C_LOGIN_ARBITER validates accounts against tera-api. Default off (accept all).</summary>
-    public static bool AuthEnabled { get; internal set; }
-    /// <summary>Base URL of the tera-api auth endpoint (default http://127.0.0.1:8080).</summary>
-    public static string AuthApiUrl { get; internal set; } = "http://127.0.0.1:8080";
+    /// <summary>Login authority (status/AUTH-DESIGN.md). AcceptAll by default; TERASHARP_AUTH=true selects tera-api.</summary>
+    public static IAuthProvider Auth { get; internal set; } = new AcceptAllAuthProvider();
 
     public static WorldBridge? World { get; private set; }
     public static CharacterStore? Store { get; private set; }
@@ -45,11 +44,10 @@ public static class Program
         });
 
         var log = loggerFactory.CreateLogger("Arbiter");
-        AuthEnabled = Environment.GetEnvironmentVariable("TERASHARP_AUTH") is "true" or "1";
-        AuthApiUrl = Environment.GetEnvironmentVariable("TERASHARP_AUTH_URL") ?? "http://127.0.0.1:8080";
+        Auth = AuthProviders.FromEnvironment(log);
         log.LogInformation("TeraSharp Arbiter starting (protocol {Proto}, patch {Patch})", ProtocolVersion, MajorPatchVersion);
         log.LogInformation("Data root: {Root}, logs: {Logs}, db: {Db}", DataRoot, PacketLogsPath, DbPath);
-        log.LogInformation("Auth: {Enabled} (API {Url})", AuthEnabled ? "enabled" : "disabled", AuthApiUrl);
+        log.LogInformation("Auth provider: {Name}", Auth.Name);
 
         OpcodeTable opcodes;
         try

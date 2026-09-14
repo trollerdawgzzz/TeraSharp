@@ -84,6 +84,7 @@ public static class HandlerRegistry
                 SocialHandlers.SendBlockList(s);
                 SocialHandlers.SendFriendGroupList(s);
                 SocialHandlers.SendFriendList(s);
+                SocialHandlers.SendUpdateFriendInfo(s);      // real Arbiter sends it too (cap_newchar_client frame 307)
                 ClientSettingsHandlers.SendAccountSetting(s);
                 ClientSettingsHandlers.SendUserSetting(s);
                 return true;
@@ -108,6 +109,19 @@ public static class HandlerRegistry
         Reg("C_BLOCK_USER", 4, social.OnBlockUser);
         Reg("C_REMOVE_BLOCKED_USER", 4, social.OnRemoveBlockedUser);
         Reg("C_WHISPER", 4, social.OnWhisper);
+        // T30 - friends, groups, memos, blocks (status/FRIENDS.md)
+        Reg("C_ACCEPT_FRIEND", 4, social.OnAcceptFriend);
+        Reg("C_UPDATE_FRIEND_INFO", 0, social.OnUpdateFriendInfo);
+        Reg("C_ADD_FRIEND_GROUP", 4, social.OnAddFriendGroup);
+        Reg("C_EDIT_FRIEND_GROUP", 4, social.OnEditFriendGroup);
+        Reg("C_DELETE_FRIEND_GROUP", 4, social.OnDeleteFriendGroup);
+        Reg("C_CHANGE_FRIEND_MEMO", 4, social.OnChangeFriendMemo);
+        Reg("C_EDIT_BLOCKED_USER_MEMO", 4, social.OnEditBlockedUserMemo);
+
+        // --- GM commands (T32, status/GM-DESIGN.md): the client sends /@name args as C_ADMIN or C_OP_COMMAND ---
+        var gm = new GmCommandHandlers(loggerFactory.CreateLogger<GmCommandHandlers>());
+        Reg("C_ADMIN", 4, gm.OnAdminCommand);
+        Reg("C_OP_COMMAND", 4, gm.OnOpCommand);
 
         // --- Client settings (Arbiter-owned) ---
         Reg("C_REQUEST_CLIENT_CHAT_OPTION_SETTING", 0, ClientSettingsHandlers.OnRequestChatOption);

@@ -849,25 +849,13 @@ public static class Tests
     // Account auth (Task E)
     // =========================================================================
 
-    [Test] public static void AuthEnabled_defaults_to_false()
+    [Test] public static void Auth_defaults_to_accept_all()
     {
-        // TERASHARP_AUTH is not set in the test env -> Program.AuthEnabled should be false.
-        // (Program.AuthEnabled is set from env in Main; in tests it retains the default false.)
-        Hex.True(!TeraSharp.Arbiter.Program.AuthEnabled, "AuthEnabled should default to false");
-    }
-
-    [Test] public static void ValidateAccount_rejects_when_api_unreachable()
-    {
-        // With no tera-api running, ValidateAccount should return false (fail-closed).
-        // Point at a port nothing is listening on.
-        var saved = TeraSharp.Arbiter.Program.AuthApiUrl;
-        TeraSharp.Arbiter.Program.AuthApiUrl = "http://127.0.0.1:19999";
-        try
-        {
-            bool result = LoginHandlers.ValidateAccount("testaccount");
-            Hex.True(!result, "ValidateAccount should reject when API unreachable");
-        }
-        finally { TeraSharp.Arbiter.Program.AuthApiUrl = saved; }
+        // TERASHARP_AUTH is not set in the test env -> Program.Auth is the AcceptAll provider
+        // (Program.Auth is set from env in Main; in tests it retains the default). T31 covers the
+        // tera-api provider itself (T31_teraapi_provider_fails_closed etc.).
+        Hex.True(TeraSharp.Arbiter.Program.Auth is TeraSharp.Arbiter.Auth.AcceptAllAuthProvider,
+            "Program.Auth should default to AcceptAllAuthProvider");
     }
 
     // =========================================================================
@@ -7747,6 +7735,8 @@ public bool TryHandle(WorldBridge bridge, WorldLink link, ushort op, byte[] payl
         }
         if (!Directory.Exists(folder)) { Console.WriteLine("        (skipped: tera_v100_MASTER_FINAL not found)"); return null; }
         return TeraSharp.Arbiter.Protocol.DefinitionRegistry.LoadFromFolder(folder, QuietLog());
+    }
+
     // ================================================================================
     // T30 - friends, friend groups, memos and the block list, from rows.
     //

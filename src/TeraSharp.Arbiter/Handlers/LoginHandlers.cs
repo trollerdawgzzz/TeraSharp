@@ -1,5 +1,5 @@
-﻿using System.Net.Http;
-using Microsoft.Extensions.Logging;
+﻿using Microsoft.Extensions.Logging;
+using TeraSharp.Arbiter.Auth;
 using TeraSharp.Arbiter.Network;
 using TeraSharp.Arbiter.Game;
 
@@ -13,25 +13,6 @@ public sealed class LoginHandlers
     /// <summary>When true, C_SELECT_USER and C_LOAD_TOPO_FIN replay the capture verbatim instead of generating packets.</summary>
     public static bool PureReplay = false;
 
-    /// <summary>
-    /// Validate an account name against tera-api. Returns true if accepted.
-    /// Fail-closed: network errors or non-200 responses reject the login.
-    /// </summary>
-    internal static bool ValidateAccount(string accountName)
-    {
-        try
-        {
-            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
-            var resp = http.GetAsync($"{Program.AuthApiUrl}/auth/validate?account={Uri.EscapeDataString(accountName)}")
-                .GetAwaiter().GetResult();
-            return resp.IsSuccessStatusCode;
-        }
-        catch
-        {
-            return false; // fail closed
-        }
-    }
-
     public bool OnLoginArbiter(GameSession s, ReadOnlyMemory<byte> body)
     {
         var f = s.ReadByDef("C_LOGIN_ARBITER", body);
@@ -39,14 +20,19 @@ public sealed class LoginHandlers
         uint language = f != null && f.TryGetValue("language", out var l) ? Convert.ToUInt32(l) : 6;
         s.Account.Name = string.IsNullOrEmpty(name) ? s.Account.Name : name;
 
-        // Auth gate (default off). When TERASHARP_AUTH=true, validate against tera-api.
-        if (Program.AuthEnabled && !ValidateAccount(s.Account.Name))
+        // Auth gate (status/AUTH-DESIGN.md). Default provider accepts everything; TERASHARP_AUTH=true
+        // validates the launcher's authKey ticket against tera-api's /authApi/GameAuthenticationLogin.
+        string ticket = AuthTicket.Decode(f != null && f.TryGetValue("ticket", out var tk) ? tk : null);
+        int patch = f != null && f.TryGetValue("patchVersion", out var pv) ? Convert.ToInt32(pv) : 0;
+        var verdict = AuthProviders.Authenticate(Program.Auth,
+            new AuthRequest(s.Account.Name, (long)s.Account.AccountId, ticket, "", language, patch));
+        if (!verdict.Accepted)
         {
-            _log.LogWarning("C_LOGIN_ARBITER: account '{Name}' rejected by auth (API {Url})",
-                s.Account.Name, Program.AuthApiUrl);
+            _log.LogWarning("C_LOGIN_ARBITER: account '{Name}' rejected by {Provider}: {Code} {Msg}",
+                s.Account.Name, Program.Auth.Name, verdict.Code, verdict.Message);
             s.SendByDef("S_LOGIN_ARBITER", new Dictionary<string, object>
             {
-                ["success"] = false, ["loginQueue"] = false, ["status"] = 0u, ["unk"] = 0u,
+                ["success"] = false, ["loginQueue"] = false, ["status"] = (uint)verdict.Code, ["unk"] = 0u,
                 ["language"] = language, ["pvpDisabled"] = false, ["unk1"] = (ushort)0, ["unk2"] = (ushort)0,
             });
             return true;
@@ -63,7 +49,9 @@ public sealed class LoginHandlers
         s.SendByDef("S_REMAIN_PLAY_TIME", new Dictionary<string, object> { ["accountType"] = 6, ["minutesLeft"] = 0 });
         s.SendByDef("S_LOGIN_ARBITER", new Dictionary<string, object>
         {
-            ["success"] = true, ["loginQueue"] = false, ["status"] = 0u, ["unk"] = 0u,
+            // status 31/33 is what makes the client offer /@ GM commands (status/GM-COMMANDS-FULL.md note);
+            // untested live - accounts in TERASHARP_GM_ACCOUNTS get 31, everyone else 0.
+            ["success"] = true, ["loginQueue"] = false, ["status"] = GmAccounts.IsListed(s.Account.Name) ? 31u : 0u, ["unk"] = 0u,
             ["language"] = language, ["pvpDisabled"] = false, ["unk1"] = (ushort)0, ["unk2"] = (ushort)0,
         });
         s.SendByDef("S_LOGIN_ACCOUNT_INFO", new Dictionary<string, object>
