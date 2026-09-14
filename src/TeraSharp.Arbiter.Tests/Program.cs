@@ -7376,6 +7376,401 @@ public bool TryHandle(WorldBridge bridge, WorldLink link, ushort op, byte[] payl
         }
     }
 
+    // ===================== T35: PartyManager (status/PARTY-DESIGN.md) =====================
+    //
+    // Parties are Arbiter-owned in-memory state. These drive PartyManager's two entry points and
+    // then push every emitted client action through the REAL .def codec, so the scenario is
+    // checked end to end rather than against a layout written down twice. No capture contains a
+    // party frame, so the A->W bytes are golden against PARTY-DESIGN.md section 5.1 (which came
+    // from the decompiled writers), and the client packets are round-tripped through
+    // DefinitionWriter -> DefinitionReader.
+
+    static PartyManager NewPartyManager() => new(QuietLog());
+
+    static PartyManager.PartyPlayer P(uint ticket, int dbId, string name, int cls = 12) =>
+        new(Ticket: ticket, UserDbId: dbId, Name: name, Level: 65, Class: cls, Race: 4, Gender: 1,
+            GameId: 0x80000AF00000UL | (ulong)dbId, Laurel: 3, AwakenGrade: 1);
+
+    /// <summary>An SA_JOIN_PARTY frame: World telling us member+invitee agreed.</summary>
+    static byte[] SaJoinPartyPayload(int memberDbId, int inviteeDbId, long partyId = 0,
+        bool raid = false, int maxMembers = 5)
+    {
+        var p = new byte[0x56 - 6];
+        void U32(int frameOff, int v) => BitConverter.GetBytes(v).CopyTo(p, frameOff - 6);
+        U32(0x06, PartyManager.PlanetId); U32(0x0A, PartyManager.PlanetId); U32(0x0E, memberDbId);
+        U32(0x12, PartyManager.PlanetId); U32(0x16, inviteeDbId);
+        BitConverter.GetBytes(0x80000AF00000UL | (ulong)inviteeDbId).CopyTo(p, 0x1E - 6);
+        U32(0x26, 65); U32(0x2A, 12); U32(0x2E, 4); U32(0x32, 1); U32(0x36, -1);
+        p[0x3A - 6] = 1; p[0x3B - 6] = 1;                       // alive, online
+        U32(0x3C, 3); U32(0x40, 1);                             // achievement, awaken
+        BitConverter.GetBytes(partyId).CopyTo(p, 0x44 - 6);
+        U32(0x4C, -1);                                          // partyType
+        p[0x50 - 6] = 0; p[0x51 - 6] = (byte)(raid ? 1 : 0);
+        U32(0x52, maxMembers);
+        return p;
+    }
+
+    static byte[] SaLeavePartyPayload(long partyId, int memberDbId)
+    {
+        var p = new byte[0x1A - 6];
+        BitConverter.GetBytes(PartyManager.PlanetId).CopyTo(p, 0);
+        BitConverter.GetBytes(partyId).CopyTo(p, 4);
+        BitConverter.GetBytes(PartyManager.PlanetId).CopyTo(p, 12);
+        BitConverter.GetBytes(memberDbId).CopyTo(p, 16);
+        return p;
+    }
+
+    static byte[] SaPartyActorPayload(int memberDbId)
+    {
+        var p = new byte[0x12 - 6];
+        BitConverter.GetBytes(PartyManager.PlanetId).CopyTo(p, 0);
+        BitConverter.GetBytes(PartyManager.PlanetId).CopyTo(p, 4);
+        BitConverter.GetBytes(memberDbId).CopyTo(p, 8);
+        return p;
+    }
+
+    static byte[] SaExtendPartyPayload(int memberDbId, bool raid)
+    {
+        var p = new byte[0x13 - 6];
+        BitConverter.GetBytes(PartyManager.PlanetId).CopyTo(p, 0);
+        BitConverter.GetBytes(PartyManager.PlanetId).CopyTo(p, 4);
+        BitConverter.GetBytes(memberDbId).CopyTo(p, 8);
+        p[12] = (byte)(raid ? 1 : 0);
+        return p;
+    }
+
+    static byte[] SaChangeLootingPayload(int memberDbId, in PartyPackets.LootSettings s)
+    {
+        var p = new byte[0x25 - 6];
+        BitConverter.GetBytes(PartyManager.PlanetId).CopyTo(p, 0);
+        BitConverter.GetBytes(PartyManager.PlanetId).CopyTo(p, 4);
+        BitConverter.GetBytes(memberDbId).CopyTo(p, 8);
+        BitConverter.GetBytes(s.Method).CopyTo(p, 12);
+        BitConverter.GetBytes(s.RareGradeForDicing).CopyTo(p, 16);
+        BitConverter.GetBytes(s.RareItemDistributionMethod).CopyTo(p, 20);
+        p[24] = (byte)(s.EquipmentForDicing ? 1 : 0);
+        p[25] = (byte)(s.FindClassForDicing ? 1 : 0);
+        BitConverter.GetBytes(s.BoundOnLootItemDistributionMethod).CopyTo(p, 26);
+        p[30] = (byte)(s.ForbidLootingInBattle ? 1 : 0);
+        return p;
+    }
+
+    static byte[] SaBypassToGroupPayload(long groupId, int groupType, int originatorDbId, byte[] clientPkt)
+    {
+        var p = new byte[0x22 - 6 + clientPkt.Length];
+        BitConverter.GetBytes((uint)0x22).CopyTo(p, 0);
+        BitConverter.GetBytes((uint)clientPkt.Length).CopyTo(p, 4);
+        BitConverter.GetBytes(groupType).CopyTo(p, 8);
+        BitConverter.GetBytes(groupId).CopyTo(p, 12);
+        BitConverter.GetBytes(PartyManager.PlanetId).CopyTo(p, 20);
+        BitConverter.GetBytes(originatorDbId).CopyTo(p, 24);
+        clientPkt.CopyTo(p, 0x22 - 6);
+        return p;
+    }
+
+    static readonly PartyPackets.LootSettings RoundRobinLoot = new(
+        Method: 1, RareGradeForDicing: 4, RareItemDistributionMethod: 1,
+        EquipmentForDicing: true, FindClassForDicing: false,
+        BoundOnLootItemDistributionMethod: 1, ForbidLootingInBattle: true);
+
+    static string Names(PartyActions a) =>
+        string.Join(",", a.ToClients.Select(c => $"{c.Ticket}:{c.PacketName}"));
+    static string WorldOps(PartyActions a) =>
+        string.Join(",", a.ToWorld.Select(w => $"0x{w.Opcode:X4}"));
+
+    [Test] public static void Party_id_has_the_planet_shape()
+    {
+        var pm = NewPartyManager();
+        long first = pm.NextPartyId(), second = pm.NextPartyId();
+        // (PlanetId << 16 | PlanetInnerId) << 32 | ++counter. PlanetId 2800 = 0x0AF0.
+        Hex.True(first == 0x0AF0000100000001L, $"first party id should be 0x0AF0000100000001, got 0x{first:X}");
+        Hex.True(second == 0x0AF0000100000002L, $"and then ...0002, got 0x{second:X}");
+        Hex.True((int)(first >> 48) == PartyManager.PlanetId, "the top 16 bits are the PlanetId");
+    }
+
+    [Test] public static void Party_apply_needs_a_target_who_is_online_and_an_applicant_with_no_party()
+    {
+        var pm = NewPartyManager();
+        pm.Register(P(10, 1, "dob")); pm.Register(P(11, 2, "Test"));
+
+        var self = pm.OnClientPacket(10, PartyPackets.C_APPLY_PARTY, BitConverter.GetBytes(1));
+        Hex.True(self.IsEmpty && self.Rejected != null, $"applying to yourself: {self.Rejected}");
+        var gone = pm.OnClientPacket(10, PartyPackets.C_APPLY_PARTY, BitConverter.GetBytes(99));
+        Hex.True(gone.IsEmpty && gone.Rejected!.Contains("not online"), $"offline target: {gone.Rejected}");
+
+        // The real answer is S_OTHER_USER_APPLY_PARTY to the TARGET, and nothing to World.
+        var ok = pm.OnClientPacket(10, PartyPackets.C_APPLY_PARTY, BitConverter.GetBytes(2));
+        Hex.True(ok.ToWorld.Count == 0, "C_APPLY_PARTY never reaches World");
+        Hex.True(ok.ToClients.Count == 1 && ok.ToClients[0].Ticket == 11
+                 && ok.ToClients[0].PacketName == "S_OTHER_USER_APPLY_PARTY", Names(ok));
+        Hex.True(pm.HasApplication(1, 2), "the pending application is recorded");
+
+        var denied = pm.OnClientPacket(11, PartyManager.C_PARTY_APPLICATION_DENIED, BitConverter.GetBytes(1));
+        Hex.True(denied.IsEmpty && denied.Rejected == null, "a decline is silent");
+        Hex.True(!pm.HasApplication(1, 2), "and clears the edge");
+    }
+
+    [Test] public static void Party_join_creates_the_party_and_mirrors_the_whole_member_list()
+    {
+        var pm = NewPartyManager();
+        pm.Register(P(10, 1, "dob")); pm.Register(P(11, 2, "Test"));
+
+        var a = pm.OnWorldFrame(PartyPackets.SA_JOIN_PARTY, SaJoinPartyPayload(1, 2));
+        Hex.True(a.Rejected == null, $"rejected: {a.Rejected}");
+        Hex.True(a.ToWorld.Count == 1 && a.ToWorld[0].Opcode == PartyPackets.AS_DO_CREATE_PARTY, WorldOps(a));
+        Hex.True(a.ToClients.Count == 2 && a.ToClients.All(c => c.PacketName == "S_PARTY_MEMBER_LIST"), Names(a));
+
+        // AS_DO_CREATE_PARTY: 0x32 fixed payload bytes then N x 0xA0 raw member records.
+        var body = a.ToWorld[0].Payload;
+        Hex.True(body.Length == 0x32 + 2 * PartyPackets.MemberBasicInfoSize, $"0x139E is 0x32+2*0xA0, got {body.Length}");
+        Hex.True(BitConverter.ToUInt32(body, 4) == 2, "two members in the list header");
+        var party = pm.FindByMember(1);
+        Hex.True(party != null && BitConverter.ToInt64(body, 8) == party!.Id, "the PartyId matches the manager's");
+        Hex.True(BitConverter.ToInt32(body, 0x18) == 1, "+1E ManagerDbId is the inviter, not the invitee");
+        var m0 = PartyPackets.ParseMemberBasicInfo(body, 0x32);
+        var m1 = PartyPackets.ParseMemberBasicInfo(body, 0x32 + PartyPackets.MemberBasicInfoSize);
+        Hex.True(m0!.Value.Name == "dob" && m1!.Value.Name == "Test", $"{m0?.Name}/{m1?.Name} in slot order");
+        Hex.True(m0.Value.CanInvite && !m1.Value.CanInvite, "only the manager carries AuthorityAboutInvitation");
+
+        // A second join adds one member rather than recreating the party.
+        pm.Register(P(12, 3, "Testtwo"));
+        var b = pm.OnWorldFrame(PartyPackets.SA_JOIN_PARTY, SaJoinPartyPayload(1, 3));
+        Hex.True(b.ToWorld.Count == 1 && b.ToWorld[0].Opcode == PartyPackets.AS_DO_ADD_PARTY_MEMBER, WorldOps(b));
+        Hex.True(b.ToClients.Count == 3, $"all three get the refreshed list: {Names(b)}");
+        Hex.True(pm.FindByMember(3)!.Id == party.Id, "and they are in the same party");
+    }
+
+    [Test] public static void Party_join_is_refused_when_the_invitee_already_has_a_party()
+    {
+        var pm = NewPartyManager();
+        pm.Register(P(10, 1, "dob")); pm.Register(P(11, 2, "Test")); pm.Register(P(12, 3, "Testtwo"));
+        pm.OnWorldFrame(PartyPackets.SA_JOIN_PARTY, SaJoinPartyPayload(1, 2));
+        var again = pm.OnWorldFrame(PartyPackets.SA_JOIN_PARTY, SaJoinPartyPayload(3, 2));
+        Hex.True(again.IsEmpty && again.Rejected!.Contains("already in a party"), $"{again.Rejected}");
+        Hex.True(pm.PartyCount == 1, $"no second party was made: {pm.PartyCount}");
+    }
+
+    [Test] public static void Party_slot_indices_are_stable_and_capacity_is_5_then_30()
+    {
+        var pm = NewPartyManager();
+        for (int i = 1; i <= 6; i++) pm.Register(P((uint)(10 + i), i, "p" + i));
+        pm.OnWorldFrame(PartyPackets.SA_JOIN_PARTY, SaJoinPartyPayload(1, 2));
+        var party = pm.FindByMember(1)!;
+        for (int i = 3; i <= 5; i++) pm.OnWorldFrame(PartyPackets.SA_JOIN_PARTY, SaJoinPartyPayload(1, i));
+        Hex.True(party.Count == 5, $"a party holds 5, has {party.Count}");
+
+        var full = pm.OnWorldFrame(PartyPackets.SA_JOIN_PARTY, SaJoinPartyPayload(1, 6));
+        Hex.True(full.Rejected != null && full.Rejected.Contains("full"), $"the sixth is refused: {full.Rejected}");
+
+        // Slot indices are wire-visible (S_PARTY_MEMBER_LIST.slot, AS_DO_SWAP_PARTY) so a
+        // departure must leave a hole, not shuffle everyone up.
+        int slotOf5 = party.IndexOf(5);
+        pm.OnWorldFrame(PartyPackets.SA_LEAVE_PARTY, SaLeavePartyPayload(party.Id, 3));
+        Hex.True(party.IndexOf(5) == slotOf5, "slot indices do not shift when someone leaves");
+        Hex.True(party.Slots[2] == null, "the vacated slot stays empty");
+
+        pm.OnWorldFrame(PartyPackets.SA_EXTEND_PARTY, SaExtendPartyPayload(1, raid: true));
+        Hex.True(party.Raid && party.MaxMembers == 30, $"a raid holds 30, MaxMembers={party.MaxMembers}");
+    }
+
+    [Test] public static void Party_dismiss_is_manager_only_and_needs_Worlds_blessing()
+    {
+        var pm = NewPartyManager();
+        pm.Register(P(10, 1, "dob")); pm.Register(P(11, 2, "Test"));
+        pm.OnWorldFrame(PartyPackets.SA_JOIN_PARTY, SaJoinPartyPayload(1, 2));
+
+        var notManager = pm.OnClientPacket(11, PartyPackets.C_DISMISS_PARTY, Array.Empty<byte>());
+        Hex.True(notManager.IsEmpty && notManager.Rejected!.Contains("manager"), $"{notManager.Rejected}");
+
+        // The manager's request is exactly AS_DISMISS_PARTY [i64 UserPDId][i32 onlineCount] -
+        // a REQUEST; nothing changes until World answers.
+        var req = pm.OnClientPacket(10, PartyPackets.C_DISMISS_PARTY, Array.Empty<byte>());
+        Hex.True(req.ToClients.Count == 0, "the request tells no client anything");
+        Hex.Eq(req.ToWorld[0].Payload, "F0 0A 00 00 01 00 00 00  02 00 00 00", "AS_DISMISS_PARTY");
+        Hex.True(pm.PartyCount == 1, "and the party still exists");
+
+        var done = pm.OnWorldFrame(PartyPackets.SA_DISMISS_PARTY, SaPartyActorPayload(1));
+        Hex.True(done.ToClients.Count == 2 && done.ToClients.All(c => c.PacketName == "S_LEAVE_PARTY"), Names(done));
+        Hex.True(done.ToWorld.Count == 1 && done.ToWorld[0].Opcode == PartyPackets.AS_DO_DISMISS_PARTY, WorldOps(done));
+        Hex.True(pm.PartyCount == 0 && pm.FindByMember(1) == null, "the party is gone");
+    }
+
+    [Test] public static void Party_last_member_standing_dissolves_the_party()
+    {
+        var pm = NewPartyManager();
+        pm.Register(P(10, 1, "dob")); pm.Register(P(11, 2, "Test"));
+        pm.OnWorldFrame(PartyPackets.SA_JOIN_PARTY, SaJoinPartyPayload(1, 2));
+        var id = pm.FindByMember(1)!.Id;
+
+        // PartyManager::New_CreateParty refuses fewer than two members, so one is not a party.
+        var a = pm.OnWorldFrame(PartyPackets.SA_LEAVE_PARTY, SaLeavePartyPayload(id, 2));
+        Hex.True(a.ToClients.Any(c => c.Ticket == 11 && c.PacketName == "S_LEAVE_PARTY"), Names(a));
+        Hex.True(a.ToClients.Any(c => c.Ticket == 10 && c.PacketName == "S_LEAVE_PARTY_MEMBER"), Names(a));
+        Hex.True(a.ToClients.Any(c => c.Ticket == 10 && c.PacketName == "S_LEAVE_PARTY"), "and the survivor is dropped too");
+        Hex.True(a.ToWorld.Select(w => w.Opcode).SequenceEqual(new[]
+            { PartyPackets.AS_DO_REMOVE_PARTY_MEMBER, PartyPackets.AS_DO_DISMISS_PARTY }), WorldOps(a));
+        Hex.True(pm.PartyCount == 0, "the party is gone");
+    }
+
+    [Test] public static void Party_offline_member_keeps_the_slot()
+    {
+        var pm = NewPartyManager();
+        pm.Register(P(10, 1, "dob")); pm.Register(P(11, 2, "Test")); pm.Register(P(12, 3, "Testtwo"));
+        pm.OnWorldFrame(PartyPackets.SA_JOIN_PARTY, SaJoinPartyPayload(1, 2));
+        pm.OnWorldFrame(PartyPackets.SA_JOIN_PARTY, SaJoinPartyPayload(1, 3));
+        var party = pm.FindByMember(1)!;
+        int slot = party.IndexOf(3);
+
+        // PartyMemberInfo+0x70 is an Online flag, not a removal.
+        var bye = pm.Unregister(12);
+        Hex.True(party.IndexOf(3) == slot && party.Count == 3, "the member keeps the slot");
+        Hex.True(party.Slots[slot]!.Value.Online == false, "but is marked offline");
+        Hex.True(bye.ToClients.Count == 2 && bye.ToClients.All(c => c.PacketName == "S_LOGOUT_PARTY_MEMBER"), Names(bye));
+
+        pm.Register(P(20, 3, "Testtwo"));
+        Hex.True(party.Slots[slot]!.Value.Online, "coming back online restores the flag");
+    }
+
+    [Test] public static void Party_bypass_to_group_fans_out_and_skips_the_originator()
+    {
+        var pm = NewPartyManager();
+        pm.Register(P(10, 1, "dob")); pm.Register(P(11, 2, "Test")); pm.Register(P(12, 3, "Testtwo"));
+        pm.OnWorldFrame(PartyPackets.SA_JOIN_PARTY, SaJoinPartyPayload(1, 2));
+        pm.OnWorldFrame(PartyPackets.SA_JOIN_PARTY, SaJoinPartyPayload(1, 3));
+        var id = pm.FindByMember(1)!.Id;
+        var pkt = Hex.B("08 00 6B 7D 01 02 03 04");     // an S_CHAT-shaped stand-in
+
+        // Party::BroadcastPacket skips the originator unless GroupType == 1:
+        //   if (param_2 != 1) { if (planet == param_3 && db == param_4) goto skip; }
+        var skip = pm.OnWorldFrame(PartyPackets.SA_BYPASS_TO_GROUP, SaBypassToGroupPayload(id, 0, 1, pkt));
+        Hex.True(skip.ToWorld.Count == 0, "a fan-out never goes back to World");
+        Hex.True(skip.ToClients.Count == 2 && skip.ToClients.All(c => c.IsRaw), Names(skip));
+        Hex.True(skip.ToClients.Select(c => c.Ticket).OrderBy(x => x).SequenceEqual(new uint[] { 11, 12 }),
+            "everyone but the originator");
+        Hex.Eq(skip.ToClients[0].RawPacket!, pkt, "the packet is passed through untouched");
+
+        var all = pm.OnWorldFrame(PartyPackets.SA_BYPASS_TO_GROUP, SaBypassToGroupPayload(id, 1, 1, pkt));
+        Hex.True(all.ToClients.Count == 3, $"GroupType 1 includes the originator: {Names(all)}");
+
+        var nobody = pm.OnWorldFrame(PartyPackets.SA_BYPASS_TO_GROUP, SaBypassToGroupPayload(0x1234, 0, 1, pkt));
+        Hex.True(nobody.IsEmpty && nobody.Rejected!.Contains("no party"), $"{nobody.Rejected}");
+
+        // An offline member simply has nowhere to send to.
+        pm.Unregister(12);
+        var two = pm.OnWorldFrame(PartyPackets.SA_BYPASS_TO_GROUP, SaBypassToGroupPayload(id, 1, 1, pkt));
+        Hex.True(two.ToClients.Count == 2, $"offline members are skipped: {Names(two)}");
+    }
+
+    [Test] public static void Party_end_to_end_invite_accept_loot_leave_dismiss()
+    {
+        var pm = NewPartyManager();
+        pm.Register(P(10, 1, "dob")); pm.Register(P(11, 2, "Test")); pm.Register(P(12, 3, "Testtwo"));
+        var log = new List<string>();
+        void Step(string what, PartyActions a)
+        {
+            Hex.True(a.Rejected == null, $"{what} rejected: {a.Rejected}");
+            log.Add($"{what} -> [{Names(a)}] [{WorldOps(a)}]");
+        }
+
+        // 1. Test applies to dob. Arbiter-only; the target gets S_OTHER_USER_APPLY_PARTY.
+        Step("apply", pm.OnClientPacket(11, PartyPackets.C_APPLY_PARTY, BitConverter.GetBytes(1)));
+        // 2. dob accepts -> World completes the handshake and tells us.
+        Step("accept", pm.OnWorldFrame(PartyPackets.SA_JOIN_PARTY, SaJoinPartyPayload(1, 2)));
+        var party = pm.FindByMember(1)!;
+        Step("accept2", pm.OnWorldFrame(PartyPackets.SA_JOIN_PARTY, SaJoinPartyPayload(1, 3)));
+        // 3. The manager asks for round-robin; World has to agree.
+        Step("loot-request", pm.OnClientPacket(10, PartyPackets.C_PARTY_LOOTING_METHOD,
+            PartyPackets.BuildSPartyLootingMethodBody(RoundRobinLoot)));
+        Step("loot-applied", pm.OnWorldFrame(PartyPackets.SA_CHANGE_LOOTING_METHOD,
+            SaChangeLootingPayload(1, RoundRobinLoot)));
+        // 4. Testtwo leaves; the party survives with two.
+        Step("leave", pm.OnWorldFrame(PartyPackets.SA_LEAVE_PARTY, SaLeavePartyPayload(party.Id, 3)));
+        // 5. dob dismisses.
+        Step("dismiss-request", pm.OnClientPacket(10, PartyPackets.C_DISMISS_PARTY, Array.Empty<byte>()));
+        Step("dismiss", pm.OnWorldFrame(PartyPackets.SA_DISMISS_PARTY, SaPartyActorPayload(1)));
+
+        var expected = new[]
+        {
+            "apply -> [10:S_OTHER_USER_APPLY_PARTY] []",
+            "accept -> [10:S_PARTY_MEMBER_LIST,11:S_PARTY_MEMBER_LIST] [0x139E]",
+            "accept2 -> [10:S_PARTY_MEMBER_LIST,11:S_PARTY_MEMBER_LIST,12:S_PARTY_MEMBER_LIST] [0x139F]",
+            "loot-request -> [] [0x13BB]",
+            "loot-applied -> [10:S_PARTY_LOOTING_METHOD,11:S_PARTY_LOOTING_METHOD,12:S_PARTY_LOOTING_METHOD] [0x13A6]",
+            "leave -> [12:S_LEAVE_PARTY,10:S_LEAVE_PARTY_MEMBER,11:S_LEAVE_PARTY_MEMBER,10:S_PARTY_MEMBER_LIST,11:S_PARTY_MEMBER_LIST] [0x13A0]",
+            "dismiss-request -> [] [0x13BA]",
+            "dismiss -> [10:S_LEAVE_PARTY,11:S_LEAVE_PARTY] [0x13A1]",
+        };
+        for (int i = 0; i < expected.Length; i++)
+            Hex.True(log[i] == expected[i], $"step {i}\n   expected: {expected[i]}\n   actual:   {log[i]}");
+        Hex.True(pm.PartyCount == 0, "and nothing is left behind");
+        Hex.True(party.Loot == RoundRobinLoot, "the loot settings were applied when World agreed, not before");
+    }
+
+    [Test] public static void Party_end_to_end_client_packets_go_through_the_real_def_codec()
+    {
+        var defs = LoadDefinitionsOrSkip();
+        if (defs == null) return;
+
+        var pm = NewPartyManager();
+        pm.Register(P(10, 1, "dob")); pm.Register(P(11, 2, "Test"));
+        var all = new List<ClientAction>();
+        all.AddRange(pm.OnClientPacket(11, PartyPackets.C_APPLY_PARTY, BitConverter.GetBytes(1)).ToClients);
+        var join = pm.OnWorldFrame(PartyPackets.SA_JOIN_PARTY, SaJoinPartyPayload(1, 2));
+        all.AddRange(join.ToClients);
+        all.AddRange(pm.OnWorldFrame(PartyPackets.SA_CHANGE_LOOTING_METHOD,
+            SaChangeLootingPayload(1, RoundRobinLoot)).ToClients);
+        var party = pm.FindByMember(1)!;
+        all.AddRange(pm.OnWorldFrame(PartyPackets.SA_DISMISS_PARTY, SaPartyActorPayload(1)).ToClients);
+
+        // Every def-driven action must survive the real writer, and the ones with a reader-safe
+        // shape must round-trip back to the same values.
+        foreach (var c in all)
+        {
+            if (c.IsRaw) continue;
+            var def = defs.Get(c.PacketName);
+            Hex.True(def != null, $"no def for {c.PacketName} - the wiring would log and drop it");
+            var bytes = new TeraSharp.Arbiter.Protocol.DefinitionWriter().Write(def!, c.Fields!);
+            Hex.True(bytes.Length >= 0, $"{c.PacketName} wrote {bytes.Length} bytes");
+            var back = new TeraSharp.Arbiter.Protocol.DefinitionReader(bytes).Read(def!);
+            Hex.True(back != null, $"{c.PacketName} did not read back");
+        }
+
+        // S_PARTY_LOOTING_METHOD is seven scalars with no ref block, so its bytes are pinned.
+        var loot = all.First(c => c.PacketName == "S_PARTY_LOOTING_METHOD");
+        var lootBytes = new TeraSharp.Arbiter.Protocol.DefinitionWriter()
+            .Write(defs.Get("S_PARTY_LOOTING_METHOD")!, loot.Fields!);
+        Hex.Eq(lootBytes, PartyPackets.BuildSPartyLootingMethodBody(RoundRobinLoot),
+            "the codec and PartyPackets agree on S_PARTY_LOOTING_METHOD");
+
+        // S_PARTY_MEMBER_LIST has the array; check the fields survive the trip.
+        var listAction = join.ToClients.First(c => c.PacketName == "S_PARTY_MEMBER_LIST");
+        var listDef = defs.Get("S_PARTY_MEMBER_LIST")!;
+        var listBytes = new TeraSharp.Arbiter.Protocol.DefinitionWriter().Write(listDef, listAction.Fields!);
+        var read = new TeraSharp.Arbiter.Protocol.DefinitionReader(listBytes).Read(listDef);
+        Hex.True(Convert.ToUInt64(read["id"]) == (ulong)party.Id, $"id round-tripped: {read["id"]}");
+        Hex.True(Convert.ToUInt32(read["memberLimit"]) == 5, $"memberLimit: {read["memberLimit"]}");
+        var members = (System.Collections.IList)read["members"];
+        Hex.True(members.Count == 2, $"two members read back, got {members.Count}");
+    }
+
+    /// <summary>The .def folder, or null with a printed note (the tests run where the repo is).</summary>
+    static TeraSharp.Arbiter.Protocol.DefinitionRegistry? LoadDefinitionsOrSkip()
+    {
+        var root = Environment.GetEnvironmentVariable("TERASHARP_DATA") ?? @"D:\v100\TERA_SERVER.100";
+        var folder = Path.Combine(root, "tera_v100_MASTER_FINAL");
+        if (!Directory.Exists(folder))
+        {
+            var dir = new DirectoryInfo(AppContext.BaseDirectory);
+            for (int i = 0; i < 10 && dir != null; i++, dir = dir.Parent)
+            {
+                var c = Path.Combine(dir.FullName, "tera_v100_MASTER_FINAL");
+                if (Directory.Exists(c)) { folder = c; break; }
+            }
+        }
+        if (!Directory.Exists(folder)) { Console.WriteLine("        (skipped: tera_v100_MASTER_FINAL not found)"); return null; }
+        return TeraSharp.Arbiter.Protocol.DefinitionRegistry.LoadFromFolder(folder, QuietLog());
+    }
+
     /// <summary>Walks up from the test binary looking for a repo-relative file; null if not found.</summary>
     static string? FindRepoFile(string relative)
     {
