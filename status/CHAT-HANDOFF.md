@@ -95,6 +95,11 @@ and look for the next caller.
 
 ## Rules that bit us
 
+- **Every `C:\deploy.ps1` requires a WorldServer restart afterwards** - World cannot survive the
+  Arbiter link dropping; it will not reconnect. Budget ~3 min per deploy for that.
+- **`deploy.ps1` now runs `--selftest` first** and aborts on a required failure; it sets
+  TERASHARP_DATA / TERASHARP_LOGS / TERASHARP_STARTER_BLOB and has a commented
+  `TERASHARP_GM_ACCOUNTS` line.
 - **Never send a `DBS_*` reply World didn't ask for.** Every DBS_ carries a DLM id that World looks up
   in DLMExistManager; an unsolicited one (the pre-emptive 0x2738 WorldEntry used to send with
   playerId in the id slot) completes whichever item currently holds that id. It only "worked" for

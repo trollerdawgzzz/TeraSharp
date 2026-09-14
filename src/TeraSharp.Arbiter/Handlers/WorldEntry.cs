@@ -123,8 +123,12 @@ public static class WorldEntry
         //          deserialization). World re-derives from blob; capture default.
         w.U32(194942);
 
-        // [48..51] Zone (param_8, User+0x19c)
-        w.U32((uint)chr.Zone);
+        // [48..51] Zone (param_8, User+0x19c). The blob's zone (u32 @236) is the authority: the
+        //          in-memory FakeCharacter is built at C_LOGIN_ARBITER and goes stale as soon as
+        //          the character moves (live 2026-09-14 22:59: relog sent zone 5 with 9827
+        //          coordinates -> spawned in the void + cheat flag).
+        int zone = worldBlob != null && worldBlob.Length >= 240 ? BitConverter.ToInt32(worldBlob, 236) : chr.Zone;
+        w.U32((uint)zone);
 
         // [52..55] param_9 = ChannelInstanceId (User+0x1a0). -1 for the open world (live-verified,
         //          lobby_tap.log pkt 127; World then restores position from the blob). A character
@@ -133,7 +137,7 @@ public static class WorldEntry
         //          then answers SA_ENTER_WORLD_FAIL and we retry at the return point
         //          (status/ENTER-WORLD-FALLBACK.md).
         var savedReturn = Program.Store?.GetDungeonReturn((int)chr.Id);
-        w.U32(savedReturn != null && savedReturn.DungeonId == chr.Zone && savedReturn.InstancePdId != 0
+        w.U32(savedReturn != null && savedReturn.DungeonId == zone && savedReturn.InstancePdId != 0
             ? (uint)savedReturn.InstancePdId
             : 0xFFFFFFFF);
 
