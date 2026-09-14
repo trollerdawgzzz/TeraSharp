@@ -1,13 +1,17 @@
 # tools/ — capture tooling
 
-Two reframers, one per side of a capture session. Both take a log and write the same two
-shapes, so the Arbiter<->World tap and the client packet log can be read side by side and
-lined up by wall clock.
-
 | | input | what it does |
 |---|---|---|
 | `reframe-tap.ps1` | `arbiter-world-tap.js` log | reassembles the TCP stream and cuts it into frames |
 | `reframe-client.ps1` | packet-logger `capture_*.log` | validates each record and resolves names from `data.json` |
+| `trim-datasheets.ps1` | the server's `Datasheet\` folder | cuts it down to a keep-list of continent ids so the real servers fit in memory |
+| `restore-datasheets.ps1` | a trim manifest | puts it all back |
+
+## The two reframers
+
+One per side of a capture session. Both take a log and write the same two
+shapes, so the Arbiter<->World tap and the client packet log can be read side by side and
+lined up by wall clock.
 
 Outputs, for either script:
 
@@ -202,3 +206,86 @@ And one that is not PowerShell's fault: a parameter named `-Link` and a local `$
 Paths: every `[IO.*]` call here runs through `Resolve-Path` first, because `[IO.File]` and
 `[IO.StreamReader]` resolve relative paths against the process working directory — usually
 `system32`, never the shell's.
+
+---
+
+## `trim-datasheets.ps1` / `restore-datasheets.ps1` — partial continent loading (T63)
+
+Boots the real `ArbiterServer.exe` + `WorldServer.exe` with only the continents you name, so the
+pair fits beside MSSQL on the 32 GB capture box. The full reasoning, the complete list of sheets
+that reference continent or dungeon ids, and the memory model are in
+`status/WORLD-PARTIAL-LOAD.md`; this is the operating summary.
+
+The mechanism is `loadAllContinents="true"` plus a trimmed `Datasheet\ContinentData.xml`. The
+`<WorldServer loadAllContinents="false"><Continent id=.../></WorldServer>` list is **not** the
+mechanism: that lookup only searches the *normal*-channelType bucket, so a dungeon continent such as
+9827 is discarded from it silently.
+
+```powershell
+cd D:\v100\TERA_SERVER.100\TeraSharp\tools
+
+# look first - changes nothing
+.\trim-datasheets.ps1 -DatasheetRoot D:\v100\TERA_SERVER.100\Executable\Datasheet `
+                      -KeepContinents 5,9827,9828,9829 `
+                      -AsideRoot     D:\v100\TERA_SERVER.100\DatasheetAside `
+                      -ServerConfig  D:\v100\TERA_SERVER.100\Executable\ServerConfig.xml -WhatIf
+
+# a trimmed COPY - the original is never touched. Do this first.
+.\trim-datasheets.ps1 -DatasheetRoot D:\v100\TERA_SERVER.100\Executable\Datasheet `
+                      -KeepContinents 5,9827,9828,9829 `
+                      -Destination   D:\v100\scratch\Datasheet `
+                      -AsideRoot     D:\v100\scratch\aside
+
+# in place, reversible
+.\trim-datasheets.ps1 -DatasheetRoot D:\v100\TERA_SERVER.100\Executable\Datasheet `
+                      -KeepContinents 5,9827,9828,9829 `
+                      -AsideRoot     D:\v100\TERA_SERVER.100\DatasheetAside
+.\restore-datasheets.ps1 -Manifest D:\v100\TERA_SERVER.100\DatasheetAside\trim-manifest.json
+```
+
+It does three kinds of thing, all recorded in `trim-manifest.json` and all reversible:
+
+1. **row trims** in the seven sheets that resolve continent or dungeon ids at boot — `AreaList.xml`,
+   `ContinentData.xml`, `DungeonConstraint.xml`, `DungeonMatching.xml`, `CompetitionDungeon.xml`,
+   `Leaderboards.xml`, `EventMatching.xml`. Each is backed up before it is touched;
+2. **file moves** for the per-continent families (`AreaData_<id>_*.xml`, `DungeonData_<id>.xml`,
+   `ShieldTerritory_*.xml`, …) into an aside folder;
+3. **ShieldTerritory stubs**, only for a kept continent that has no `<Zone>` of its own.
+
+`-Aggressiveness Minimal` (default) moves only the families whose loader resolves `continentId`
+fatally; `Standard` adds the self-filtering territory families; `Aggressive` adds hunting-zone
+families, resolved through `ContinentData`'s `<HuntingZone>` children. `NpcData_*`, the skill sheets,
+`S1ActionScripts_*` and `PegasusPath_*` are never moved at any tier.
+
+Two guards worth knowing. **`-AsideRoot` must be outside the `Datasheet\` tree** —
+`DataXmlManager::SearchFilesInDirectory` recurses into every subfolder under `rootFolder`, so an
+aside folder inside it would still be loaded; the script refuses. And **`ContinentData` ids must stay
+a subset of `AreaList` ids** — `LoadContinentData` requires a record that only `LoadAreaList`
+creates, so a ContinentData row with no AreaList entry is a fatal PreLoad error. The script trims
+both with the same keep-list and re-checks at the end.
+
+### The AreaList trap
+
+`AreaList.xml` holds **two** kinds of continent record: 252 top-level `<Continent>` and 18
+`<ChannelContinent>` **nested inside them** (2000/2050/2052/2054 under continent 6; 7001-7005 under
+1; 7011-7015 under 2; 7021-7023 under 3; 7031 under 4). A parse that only looks at root-level
+elements reports those 18 as missing and makes the sheet look broken. It is not; the script reads
+both forms.
+
+### Dry run
+
+Run in the container under PowerShell 7.4.6 against a reconstructed mirror of the real
+`Datasheet\` tree (3,229 files: the real bytes of every sheet the trim edits, the real filenames of
+the `Datasheet\` root, and synthesised names for the families the directory listing cap cut off).
+Keep-list `5,9827,9828,9829`:
+
+| tier | files left | moved aside |
+|---|---|---|
+| Minimal | 2,325 | 904 |
+| Standard | 1,991 | 1,238 |
+| Aggressive | 411 | 2,818 |
+
+Rows removed, the same at every tier: 248 `<Continent>` from AreaList, 250 from ContinentData, 166
+`<Constraint>`, 39 + 8 `<Dungeon>`, 7 `<ContentInfo>`, 154 `<Event>` + 6 `<EnableTime>` + 5 empty
+`<EnableDay>`. `-WhatIf` changed 0 of 3,229 files; **trim -> restore was byte-identical at all three
+tiers**. What that does not prove is that the result boots — only the real binaries can say that.
