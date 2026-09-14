@@ -218,3 +218,82 @@ It performs **no admin-level check of its own**, and World never tests the `Admi
 from AS_ENTER_WORLD either (`status/ENTER-WORLD-FALLBACK.md` §5a). So nothing on the World side
 gates `/@`; what still has to be right for a live test is the client offering the `/@` channel at
 all — §6, `S_LOGIN_ARBITER.status`.
+
+---
+
+## 8. Forward by default (T47)
+
+`/@teleport warriortwo` and bare `/@teleport` both came back **Unknown** in the live test, with
+`teleport` sitting in `GM-COMMANDS-FULL.md` line 384 the whole time. Two causes, both in
+`GmCommandHandlers.Classify`:
+
+1. **`GmCommandCatalog` reads the catalogue off disk and leaves both sets EMPTY when it cannot
+   find the files** — which is the normal case for a deployed binary with no `status/` folder
+   beside it. Every command then fell past both `IsWorldCommand` and `IsArbiterCommand` to
+   `Unknown`.
+2. `GM-COMMANDS-FULL.md` is **all 608 names, the Arbiter's included**, and the World check came
+   first — so an Arbiter-owned command that we had not implemented would have been forwarded to
+   World instead of answered.
+
+New order, and the forward is now the default:
+
+```
+Implemented        -> Local
+IsArbiterCommand   -> NotImplemented
+otherwise          -> ForwardToWorld
+```
+
+**This diverges from the original on purpose.** The real Arbiter has both tables compiled in, so
+a name in neither is a typo and `ArbiterCommandDistributor::OnUnregisteredCommand`
+(`Arb_part_085.c:12895`) answers "Invalid QA Command" plus `S_COMMAND_HELP` with near matches. We
+only know the names when the markdown is on disk, so refusing locally meant refusing every real
+World command too. Forwarding costs one wasted frame on a typo — World rejects it — and buys the
+416 World commands. `GmDispatch.Unknown` is no longer produced by `Classify`; the enum value stays
+so its tests remain meaningful.
+
+The frame itself was verified byte-exact in T46 (§7), and World's `Handler_AS_ADMIN_COMMAND` does
+no admin check of its own, so nothing else stands between this and a live `/@teleport`.
+
+### `LevelOf`
+
+`GmCommandHandlers.LevelOf` returned 0 at enter-world for an account in `TERASHARP_GM_ACCOUNTS`,
+so World logged `AdminLevel[0]` (T46 wired payload 111 to it). It now:
+
+* takes the **max** of the stored `accounts.admin_level` and what the allow-list grants, rather
+  than letting the list override — being listed must not demote an account stored above 5; and
+* matches the list against the **character** name as well as the account name. The variable is
+  called GM_ACCOUNTS, but the name a person has to hand is the one on the character-select
+  screen, and putting that in the list is the obvious thing to do.
+
+If it still logs 0 after this, the value in the env matches neither name — that is the thing to
+check first.
+
+## 9. The chat wiring (T47)
+
+`ChatManager` (T43) had the whole whisper rule and was wired to nothing. `SocialHandlers.OnWhisper`
+now hands `C_WHISPER` straight to it and dispatches the result through `ActionDispatcher`, so
+recipients resolve via `WorldBridge.SessionForPlayerId`.
+
+The old body looked the target up in `SocialHandlers.Sessions`, a map whose only writer —
+`RegisterSession` — **was never called**. It was always empty, so every whisper answered
+"offline". The same empty map silently killed every cross-session friend push in that file
+(the online flag in `S_FRIEND_LIST`, and the request / accept / delete notifications);
+`SessionForCharacter` now asks the bridge first and those start working too.
+
+Two lines are still the human's, and they are what make registration exact rather than
+self-healing:
+
+```csharp
+// Handlers/WorldEntry.cs, in EnterWorld, after the session is registered with the bridge:
+SocialHandlers.RegisterChat(s);
+
+// Network/GameSession.cs, in Close() (or LeaveWorld), before the socket goes:
+SocialHandlers.UnregisterChat(this);
+```
+
+Until they are added, `OnWhisper` calls `SocialHandlers.SyncChatRoster()` on every whisper, which
+registers everyone `WorldBridge.InWorldSessions()` reports. That is a dictionary write per session
+per whisper — correct, just wasteful — and it is why whisper works without the diff.
+`UnregisterChat` also dispatches the private-channel leave announcements `ChatManager.Unregister`
+returns; without the line, a character who logs out stays in their channels until the server
+restarts.

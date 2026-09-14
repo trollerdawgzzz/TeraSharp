@@ -214,3 +214,28 @@ and are therefore deliberately not in a table above.
   inventory, so an atom naming a warehouse pocket resolves to NULL. The pocket id is
   `enum INVEN_TYPE` and is what picks the container (0 bag, 1 account bank, 3 guild, 9 character
   bank, 12 style); `status/MAIL-WAREHOUSE.md` section 6 has the proof.
+
+## The Arbiter Contract family — one-way, T47
+
+`0x2809` and `0x280E` turned up in the first two-client test (58-66 B each) and are the two-party
+interactions the Arbiter brokers, which is why one player never sees them. **None of the family
+carries a DlmId** — the dumpers name `ContractorDbId`, `ContractType`, `ContractId` and nothing
+else — so an unanswered one cannot head-block the per-user DB queue the way a missing `DBS_` reply
+does. They are in `WorldReplayTable.OneWayFromWorld` so the replay table cannot hand them somebody
+else's reply.
+
+| opcode | name | handler | sends |
+|---|---|---|---|
+| `0x2809` | SDB_FETCH_THROUGH_ARBITER_CONTRACT | `Arb_part_063.c:7017` | nothing — dispatches on ContractType (4, 5, 10, 0x23) into four managers |
+| `0x280C` | SDB_ASK_THROUGH_ARBITER_CONTRACT | `Arb_part_063.c:810` | nothing (38 lines) |
+| `0x280D` | SDB_SEND_BEGIN_THROUGH_ARBITER_CONTRACT | `Arb_part_064.c:2732` | only the CLIENT packet S_BEGIN_THROUGH_ARBITER_CONTRACT |
+| `0x280E` | SDB_SEND_END_THROUGH_ARBITER_CONTRACT | `Arb_part_064.c:2983` | `0x280F`, but as a FAN-OUT, not a reply |
+
+Request shape, both observed ones identical (guard `0x21 < len`, min frame 34):
+`[6] Param ref` `[14] list ref` `[22] u32 ContractorDbId` `[26] u32 ContractType` `[30] u32 ContractId`.
+
+`0x280E` is the one worth understanding: it walks the `AskUserList` and, for each other
+participant that is in world, pushes `DBS_SEND_END_THROUGH_ARBITER_CONTRACT` to **that user's**
+World session carrying `[ContractorDbId][ContractType][ContractId][thatUserDbId]`. Reproducing it
+faithfully needs the contract/trade system we do not have, and inventing a reply would tell World
+a contract completed that we never brokered.

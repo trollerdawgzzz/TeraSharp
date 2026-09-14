@@ -3,6 +3,7 @@ using Microsoft.Extensions.Logging;
 using TeraSharp.Arbiter.Network;
 using TeraSharp.Arbiter.Persistence;
 using TeraSharp.Arbiter.Protocol;
+using TeraSharp.Arbiter.World;
 
 namespace TeraSharp.Arbiter.Handlers;
 
@@ -23,7 +24,11 @@ namespace TeraSharp.Arbiter.Handlers;
 public sealed class SocialHandlers
 {
     private readonly ILogger _log;
-    public SocialHandlers(ILogger log) => _log = log;
+    public SocialHandlers(ILogger log)
+    {
+        _log = log;
+        UseChatLogger(log);   // T47: the chat manager logs through the same sink
+    }
 
     // ---- Limits and constants, all from the decompile (status/FRIENDS.md section 3) ----
 
@@ -116,18 +121,142 @@ public sealed class SocialHandlers
     /// <summary>Name -> session lookup. Case-insensitive.</summary>
     internal static readonly ConcurrentDictionary<string, GameSession> Sessions = new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>
+    /// The process-wide chat manager (T43's <see cref="ChatManager"/>, wired up in T47). It owns
+    /// whisper and the private channels; this file owns friends and blocks. Built lazily because
+    /// <c>Program.Store</c> is not open when this class is first touched, and rebuilt if the
+    /// store is replaced (which only happens in tests).
+    /// </summary>
+    internal static ChatManager Chat
+    {
+        get
+        {
+            var store = Program.Store;
+            lock (ChatGate)
+            {
+                if (_chat == null || !ReferenceEquals(_chatStore, store))
+                {
+                    _chatStore = store;
+                    _chat = new ChatManager(store!, ChatLog);
+                }
+                return _chat;
+            }
+        }
+    }
+
+    private static readonly object ChatGate = new();
+    private static ChatManager? _chat;
+    private static CharacterStore? _chatStore;
+    private static ILogger ChatLog = Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance;
+
+    /// <summary>Give the chat manager a real logger. Called once from the handler ctor.</summary>
+    internal static void UseChatLogger(ILogger log)
+    {
+        lock (ChatGate) { ChatLog = log; _chat = null; }
+    }
+
     internal static void RegisterSession(string characterName, GameSession session)
-        => Sessions[characterName] = session;
+    {
+        Sessions[characterName] = session;
+        RegisterChat(session);
+    }
+
+    /// <summary>
+    /// Tell the chat manager this character is online. Idempotent, so the enter-world line and
+    /// the self-heal in <see cref="OnWhisper"/> can both call it.
+    /// </summary>
+    internal static void RegisterChat(GameSession? session)
+    {
+        var chr = session?.SelectedCharacter;
+        if (chr == null) return;
+        Chat.Register(new ChatPlayer((int)chr.Id, chr.Name, session!.GameId, chr.Level, chr.Class,
+                                     IsAdmin: false));
+    }
 
     internal static void UnregisterSession(string characterName)
-        => Sessions.TryRemove(characterName, out _);
+    {
+        Sessions.TryRemove(characterName, out var gone);
+        if (gone?.SelectedCharacter != null) UnregisterChat(gone);
+    }
+
+    /// <summary>
+    /// Leave world or drop the connection. <see cref="ChatManager.Unregister"/> returns the
+    /// channel-leave announcements it produced, so they have to be dispatched, not discarded.
+    /// </summary>
+    internal static void UnregisterChat(GameSession? session)
+    {
+        var chr = session?.SelectedCharacter;
+        if (chr == null) return;
+        Sessions.TryRemove(chr.Name, out _);
+        var actions = Chat.Unregister((int)chr.Id);
+        if (!actions.IsEmpty) ChatDispatcher(session!, ChatLog).Dispatch(actions, "chat-leave");
+    }
+
+    /// <summary>
+    /// Register every in-world session with the chat manager. Cheap (a dictionary write each)
+    /// and idempotent, and it is what makes whisper work before the two wiring lines in
+    /// status/CHAT-DESIGN.md section 7 are added: <see cref="ChatManager"/> resolves both ends
+    /// of a whisper out of its own online map, so an unregistered character reads as offline.
+    /// </summary>
+    internal static void SyncChatRoster()
+    {
+        var world = Program.World;
+        if (world == null) return;
+        foreach (var s in world.InWorldSessions()) RegisterChat(s);
+    }
 
     /// <summary>The online session playing a given character, or null.</summary>
+    /// <remarks>
+    /// <b>T47: the bridge is asked first.</b> <see cref="Sessions"/> is only populated by
+    /// <see cref="RegisterSession"/>, and until T47 nothing called it - so this returned null for
+    /// everyone, every time. That is why whisper answered "offline" for a character standing in
+    /// world, and it is also why every cross-session friend push in this file (the online flag in
+    /// S_FRIEND_LIST, and the request / accept / delete notifications) silently did nothing.
+    /// <c>WorldBridge</c>'s player table is the one thing that is authoritative about who is in
+    /// world, so it wins; the map stays as a fallback for a session that has selected a character
+    /// but not yet entered world.
+    /// </remarks>
     internal static GameSession? SessionForCharacter(int characterId)
     {
+        var live = Program.World?.SessionForPlayerId(characterId);
+        if (live != null) return live;
         foreach (var s in Sessions.Values)
             if (s.SelectedCharacter != null && (int)s.SelectedCharacter.Id == characterId) return s;
         return null;
+    }
+
+    /// <summary>
+    /// An <see cref="ActionDispatcher"/> bound to live sessions, for anything that emits
+    /// <see cref="ArbiterActions"/>. Two differences from the guild wiring:
+    /// <list type="bullet">
+    /// <item>the player lookup falls back to <paramref name="origin"/>, so the sender still gets
+    /// their own refusal when World is not up - standalone mode, and every unit test;</item>
+    /// <item><c>ResolveDef</c> is the chat one, because several chat .def files are wrong in the
+    /// same way the guild ones are (status/CHAT-DESIGN.md).</item>
+    /// </list>
+    /// </summary>
+    internal static ActionDispatcher ChatDispatcher(GameSession origin, ILogger log)
+    {
+        var world = Program.World;
+        int originId = origin?.SelectedCharacter != null ? (int)origin.SelectedCharacter.Id : -1;
+        return new ActionDispatcher(
+            t => Sink(world?.SessionForTicket(t)),
+            p => Sink(world?.SessionForPlayerId(p) ?? (p == originId ? origin : null)),
+            (op, payload) => { if (world == null) return false; world.SendFrame(op, payload); return true; },
+            log)
+        { ResolveDef = n => ChatManager.ResolveDef(null, n) };
+    }
+
+    private static IClientSink? Sink(GameSession? s) => s == null ? null : new SessionSinkAdapter(s);
+
+    /// <summary>ActionDispatcher's sink over a real session: the same three methods, same signatures.</summary>
+    private sealed class SessionSinkAdapter : IClientSink
+    {
+        private readonly GameSession _s;
+        public SessionSinkAdapter(GameSession s) => _s = s;
+        public void SendByDef(string packetName, IReadOnlyDictionary<string, object> fields) => _s.SendByDef(packetName, fields);
+        public void SendRawBody(string packetName, byte[] body) => _s.SendRawBody(packetName, body);
+        public void Send(byte[] framedPacket) => _s.Send(framedPacket);
     }
 
     /// <summary>Builds an S_SYSTEM_MESSAGE payload: <c>@id</c> then \v-separated key/value pairs.</summary>
@@ -896,61 +1025,46 @@ public sealed class SocialHandlers
     // Whisper (unchanged behaviour, now block-aware through the same rows)
     // =====================================================================
 
+    /// <summary>
+    /// C_WHISPER. T47 hands this to <see cref="ChatManager"/> (T43), which already had the whole
+    /// rule - the self, offline and both blocked-direction checks, with the Arbiter's real
+    /// message ids - and had simply never been wired to anything.
+    ///
+    /// <para><b>The bug this replaces.</b> The old body looked the target up in
+    /// <see cref="Sessions"/>, a map whose only writer, <see cref="RegisterSession"/>, was never
+    /// called. It was therefore always empty and every whisper took the not-found branch:
+    /// <c>Whisper from accountonetest to warriortwo: offline</c> with warriortwo standing in
+    /// world. Recipients now resolve through <c>WorldBridge.SessionForPlayerId</c> via
+    /// <see cref="ActionDispatcher"/>, which is the table that actually knows.</para>
+    ///
+    /// <para>The refusals change on the wire, and deliberately: ChatManager sends the real
+    /// Arbiter's blocked messages (1338 <c>_BlockedByTarget</c> / 1463 <c>_BlockingTarget</c>,
+    /// each with a UserName parameter) where this file sent a bare SMT 113. Self (111) and
+    /// not-found (831) are unchanged.</para>
+    /// </summary>
     public bool OnWhisper(GameSession s, ReadOnlyMemory<byte> body)
     {
-        var f = s.ReadByDef("C_WHISPER", body);
-        if (f == null) return true;
-
-        string targetName = Str(f, "target");
-        string message = Str(f, "message");
         var chr = s.SelectedCharacter;
         if (chr == null) return true;
+        // ChatManager resolves the target by name through the store; without one there is
+        // nothing to resolve against and the old code would have said "offline" anyway.
+        if (Program.Store == null) return true;
 
-        string senderName = chr.Name;
+        // Both ends have to be in the chat manager's online map for a whisper to resolve, so
+        // make sure everyone in world is, then send. This is redundant once the two wiring lines
+        // are in; without them it is the whole fix.
+        SyncChatRoster();
+        RegisterChat(s);
 
-        if (string.Equals(senderName, targetName, StringComparison.OrdinalIgnoreCase))
-        {
-            SendSmt(s, 0x6F);        // 111: cannot whisper yourself
-            return true;
-        }
+        var actions = Chat.OnClientPacket((int)chr.Id, ChatPackets.C_WHISPER, body.ToArray());
+        var sent = ChatDispatcher(s, _log).Dispatch(actions, "chat");
 
-        if (!Sessions.TryGetValue(targetName, out var targetSession))
-        {
-            SendSmt(s, 0x33F);       // 831: user not found / offline
-            _log.LogInformation("Whisper from {Name} to {Target}: offline", senderName, targetName);
-            return true;
-        }
-
-        var store = Program.Store;
-        if (store != null)
-        {
-            var targetChr = targetSession.SelectedCharacter;
-            if (targetChr != null)
-            {
-                int me = (int)chr.Id, them = (int)targetChr.Id;
-                if (store.GetBlocks(me).Contains(them) || store.GetBlocks(them).Contains(me))
-                {
-                    SendSmt(s, 0x71);   // 113: restricted user
-                    return true;
-                }
-            }
-        }
-
-        var whisperFields = new Dictionary<string, object>
-        {
-            ["gameId"] = s.GameId,
-            ["isWorldEventTarget"] = false,
-            ["gm"] = false,
-            ["founder"] = false,
-            ["name"] = senderName,
-            ["recipient"] = targetName,
-            ["message"] = message,
-        };
-
-        s.SendByDef("S_WHISPER", whisperFields);
-        targetSession.SendByDef("S_WHISPER", whisperFields);
-
-        _log.LogInformation("Whisper: {Sender} -> {Target}", senderName, targetName);
+        if (actions.Rejected != null)
+            _log.LogInformation("C_WHISPER from {Name}: {Why} ({N} in world)",
+                chr.Name, actions.Rejected, Program.World?.InWorldSessions().Count ?? 0);
+        else
+            _log.LogInformation("Whisper from {Name} delivered ({N} client packet(s))",
+                chr.Name, sent.ClientsSent);
         return true;
     }
 
