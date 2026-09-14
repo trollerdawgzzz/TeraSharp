@@ -124,6 +124,16 @@ and look for the next caller.
 
 ## Next steps (in order)
 
+**2026-09-15 06:20 - 624 tests; T57/T59/T60 merged (character money, guild SA_ handlers, contract broker
+for party invites + C_ADD_TRADE_BAG), all wired, none live-tested yet.** Capture-box work: World
+partial loading is a DATASHEET trim, not a ServerConfig list; six families cleared by hand
+(ContinentData/AreaList to {5,9827,9828,9829}, ShieldTerritory stub, AreaData_/DungeonData_ moved out of
+the Datasheet tree, DungeonConstraint rows, EventMatching events) - next was Leaderboards.xml; T63 finishes
+the list + writes tools/trim-datasheets.ps1. Netcup fully restored (254 continents, 26 ShieldTerritory,
+294 AreaData, 224 DungeonData, line 46 = 7802, TeraSharp deployed). _capture_aside on netcup holds the
+.full backups. In flight: T63 (session 2, TeraSharp-cowork), T61 mail contents (session 1,
+TeraSharp-cowork2); T62 (friend menu 22073, cutscene flag 0x27FE, name completion 31605) queued.
+
 **Checkpoint 2026-09-15 late - 605 tests, T52-T56 merged.** Since the last checkpoint: guild SA_
 direction (leave/banish) + C_INVITE_USER_TO_GUILD/C_CHANGE_GUILDNAME real, GuildWiring gate in
 HandleFrame; broker research (BROKER-DESIGN.md) + the five SDB_TRADE_BROKER_* DLM answers (opening the
