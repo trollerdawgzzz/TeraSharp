@@ -1030,3 +1030,177 @@ the most weight:
 No build is available in the Cowork container, so the whole handler layer and the def encoding
 were additionally transliterated into Python and run: 80 behavioural checks and 19 packet
 encodings, all green, before any of it was written to disk.
+
+
+---
+
+## 11. T51 — `World/GuildWiring.cs`, and what section 10 got wrong
+
+Section 10's diff was written against a tree that has since moved. `GuildWiring.cs` is that diff,
+applied on the Cowork side, and what it leaves the human is **one line**.
+
+### 11.1 What changed since section 10
+
+| section 10 said | now |
+|---|---|
+| build the one `ActionDispatcher` in `Program.cs` | not needed — `GuildWiring.Dispatcher()` builds one per call over `Program.World`, carrying `GuildHandlers.ResolveDef` |
+| add `GameSession.ByPlayerId` (step 2) | not needed — the human added `WorldBridge.SessionForPlayerId(int)` for T47, and that is the authoritative in-world table |
+| `dispatcher.Register(op, name, GuildPackets.MinClientLength(op), …)` | **wrong by 4** — `MinClientLength` is a TOTAL packet length and `PacketDispatcher` wants a BODY length. See 11.2 |
+| seventeen names listed inline in `HandlerRegistry` | `GuildWiring.ClientOpcodes`, so the registry loop has no list to drift from |
+| step 4: answer `SDB_INIT_GUILD` from rows, "deliberately not done here" | done — see 11.4 |
+| nothing about the roster | guild membership now rides `SocialHandlers.RegisterChat` / `UnregisterChat`, the same edge parties use (T49). See 11.3 |
+
+`ResolveDef` is the one thing section 10 was right about and is easy to lose:
+`GameSession.SendByDef` resolves from the SHIPPED registry, ten guild `.def` files are wrong
+(§5.5), and without the hook `S_ADD_GUILD_MEMBER` goes out with the `.def`'s 0x33-byte body
+instead of the 0x38 the dumper guard proves. `GuildWiring.Dispatcher` sets it unconditionally and
+`T51_the_wiring_dispatcher_carries_the_corrected_defs` fails if it is ever dropped.
+
+### 11.2 The −4 body-length correction
+
+`PacketDispatcher.Register` takes a **minimum BODY length** and compares it against
+`packet[4..]`. `GuildPackets.MinClientLength` is documented as, and is, the **TOTAL** packet
+length the real handler guards on — header included. Every registration is therefore
+`MinClientLength(op) − 4`, which is what `GuildWiring.MinBodyLength` returns.
+
+Two of the seventeen are not in `GuildPackets` at all, because their names contain no `GUILD` and
+T36's sweep was by name: `C_REQUEST_UPDATE_ANNOUNCE` (0x9CB1) and `C_REQUEST_UPDATE_INTRODUCE`
+(0xD434), both `[u16 off]` + wstring, min total 6 → body 2.
+`GuildWiring.MinFrameLength` adds exactly those two and defers to `GuildPackets` for the rest.
+
+| opcode | packet | frame | **body** |
+|---|---|---|---|
+| 0x5B51 | `C_REQUEST_GUILD_INFO` | 0x0C | **8** |
+| 0x6657 | `C_REQUEST_GUILD_MEMBER_LIST` | 0x04 | **0** |
+| 0xDC60 | `C_GET_GUILD_HISTORY` | 0x08 | **4** |
+| 0x716B | `C_GUILD_APPLY_LIST` | 0x04 | **0** |
+| 0xDB53 | `C_GUILD_APPLY_LIST_PAGE` | 0x08 | **4** |
+| 0x584B | `C_GET_USER_GUILD_LOGO` | 0x0C | **8** |
+| 0x60C1 | `C_UPDATE_GUILD_LOGO` | 0x08 | **4** |
+| 0x807B | `C_UPDATE_GUILD_TITLE` | 0x06 | **2** |
+| 0xFFDB | `C_SET_GUILD_JOIN_CONDITION` | 0x16 | **0x12** |
+| 0xC9C4 | `C_REQUEST_COOLTIME_TO_JOIN_GUILD` | 0x04 | **0** |
+| 0xC046 | `C_REQUEST_GUILD_INFO_BEFORE_APPLY_GUILD` | 0x0A | **6** |
+| 0xB77C | `C_CHECK_CHANGE_GUILDNAME` | 0x06 | **2** |
+| 0xA0DF | `C_APPLY_GUILD` | 0x08 | **4** |
+| 0xDBE4 | `C_ACCEPT_GUILD_APPLY` | 0x09 | **5** |
+| 0xDE54 | `C_REJECT_INVITE_USER_TO_GUILD` | 0x08 | **4** |
+| 0x9CB1 | `C_REQUEST_UPDATE_ANNOUNCE` | 0x06 | **2** |
+| 0xD434 | `C_REQUEST_UPDATE_INTRODUCE` | 0x06 | **2** |
+
+(The opcode column is `GuildPackets`'; the table is the shape, not a second source of truth —
+`T51_guild_registrations_use_the_body_length_not_the_frame_length` reads the constants.)
+
+Still **unregistered**, on purpose:
+
+* `C_INVITE_USER_TO_GUILD` (0xEF92) and `C_CHANGE_GUILDNAME` (0xFC1C) — Arbiter-side, but `GuildHandlers`
+  has no case (the first needs the wanted-board manager, the second the
+  `SDB_ASK_CHANGE_GUILD_NAME` round trip). Registering either would answer the player with an
+  `S_SYSTEM_MESSAGE_CUSTOM` rejection every time they pressed the button.
+* the ten World-side packets of §5.2. World answers them; answering one here double-answers the
+  client.
+
+`T51_the_registered_set_is_exactly_what_GuildHandlers_answers` sweeps all 65536 opcodes and
+asserts the registered set and `GuildHandlers.Handles` are the same set in both directions.
+
+### 11.3 The roster
+
+`SocialHandlers.RegisterChat` now calls `GuildWiring.Register(session)` and `UnregisterChat`
+calls `GuildWiring.Unregister(session)`, so guilds hang off the two call sites `GameSession` and
+`WorldEntry` already have (T47) — no new human-owned line.
+
+A member coming online or going offline is a **state flip, not a row change**:
+`GuildMemberData+0x70` is what moves, so `GuildWiring.MemberState` emits
+`S_UPDATE_GUILD_MEMBER` (status 0 / 2) to every OTHER member and `AS_UPDATE_GUILD_MEMBER`
+(0x1410) to World, and the logout path additionally stores `LastLogoutTime` so an offline member
+still renders a sensible "last seen" in `S_GUILD_MEMBER_LIST`. A character with no guild row
+produces nothing at all, which is the normal case.
+
+**Leaving the world is not leaving the guild.** `C_LEAVE_GUILD` (0x7C83) is World-side and comes
+back as `SA_LEAVE_GUILD` (0x13FE); nothing answers that yet — see 11.6.
+
+### 11.4 The `0x27CF → 0x27ED` boot load, from rows
+
+`GuildWiring.BuildInitGuildLoad(store)` returns the whole §4.3 sequence as (opcode, payload)
+pairs, and `DbProxyHandlers.OnInitGuild` sends them in order. Per guild:
+
+```
+0x27ED DBS_INIT_GUILD_DATA   Success = 1, GuildData built from the guilds row
+0x27D0 DBS_INIT_GUILD_GROUP  the guild_groups rows
+0x27D1 DBS_INIT_GUILD_MEMBER the guild_members rows, 31 per frame
+0x27D2 DBS_INIT_GUILD_PERK_LIST   always empty - nothing fills guild_perks
+0x27D3 DBS_LOAD_GUILD_COMPLETE    empty payload
+```
+
+then one `0x27ED` with `Success = 0`, the terminator World waits for. With no guilds the whole
+thing collapses to that single terminator, which is `GuildPackets.BuildEmptyDbsInitGuildData()`.
+
+The three array frames are **one writer three times over** (`Arb_part_072.c:14299`, `:14378`,
+`:14502`) and share a header that is worth spelling out, because the second slot is not what it
+looks like:
+
+```
+  [06] u32 arrayOffset      backpatched to the running frame length -> always 0x12
+  [0A] u32 arrayByteLength  count * recordSize - a BYTE length, not an element count
+  [0E] u32 guildDbId        Guild+0x88+0, i.e. GuildData.GuildDbId
+  [12] record[]             raw, no per-element header
+```
+
+The proof for the byte length is the member frame's backpatch,
+`*local_2508 = ((int)(lVar10 >> 7) - (int)(lVar10 >> 0x3f)) * 0xf0` — element count times the
+0xF0 stride. The group frame's records are 0x28 and the perk frame's are 0x0C
+(`*local_24f8 = *local_24f8 + 0xc`). `DBS_LOAD_GUILD_COMPLETE` has **no payload at all**: its
+writer (`Arb_part_069.c:13947`) opens the packet and sends it.
+
+**This is what retires the replay entry.** `WorldBridge.HandleFrame` consults `DbProxy.TryHandle`
+before the replay table, so adding `0x27CF` to `DbProxyHandlers.IsHandledRequest` takes
+`arb_world.log`'s bytes out of the boot path — and with them the two bytes of the real Arbiter's
+uninitialised stack it leaks inside `GuildData` (`0xB379` at blob `0x024A`, §2.1). World never
+read those bytes, so that half is hygiene; the real win is that the answer now reflects guilds
+that exist. `T51_the_guild_boot_load_is_the_capture_when_there_are_no_guilds` asserts our empty
+answer differs from `data/cap_guild.bin` seq 2 in exactly those two bytes and nowhere else.
+
+### 11.5 The one human-owned line
+
+**`Handlers/HandlerRegistry.cs`**, in `RegisterAll`, after the T49 party block. The file already
+has `using TeraSharp.Arbiter.World;`, so no new using:
+
+```csharp
+        // --- Guilds (T51, status/GUILD-DESIGN.md section 11): the seventeen client packets
+        //     GuildHandlers answers. GuildWiring holds the handler, the dispatcher and the
+        //     corrected defs; the body minimum is GuildPackets' TOTAL length minus the 4-byte
+        //     header (section 11.2).
+        foreach (var (guildName, guildOp) in GuildWiring.ClientOpcodes)
+            Reg(guildName, GuildWiring.MinBodyLength(guildOp),
+                (s, body) => GuildWiring.OnClientPacket(s, guildOp, body));
+```
+
+`Reg` resolves the name through `OpcodeTable`, logs and skips if it is missing, and
+`PacketDispatcher.Register` throws on a duplicate — none of the seventeen is registered today.
+The loop variable is captured per-iteration in C# 5+, so `guildOp` inside the lambda is that
+iteration's opcode.
+
+Nothing else. In particular there is **no** `WorldBridge` line: the guild boot load is a
+`DbProxyHandlers` allow-list entry, and that file is Cowork-editable, so T51 added it directly:
+
+```csharp
+        public const ushort SDB_INIT_GUILD = 0x27CF;     // next to the T45 parcel opcodes
+        case SDB_INIT_GUILD:                             // in IsHandledRequest
+        case SDB_INIT_GUILD:  return OnInitGuild(link);  // in TryHandle
+```
+
+### 11.6 Still open after T51
+
+1. **`C_INVITE_USER_TO_GUILD`** (11.2). The session lookup it was waiting for now exists
+   (`WorldBridge.SessionForPlayerId`), so the remaining blocker is the wanted board and
+   `S_REQUEST_INVITE_GUILD_TAG` — a handler, not wiring.
+2. **`C_CHANGE_GUILDNAME`** needs the `SDB_ASK_CHANGE_GUILD_NAME` round trip.
+3. **The `SA_` direction is unanswered** — all twelve of §4.2, including `SA_LEAVE_GUILD`
+   (0x13FE) and `SA_DESTROY_GUILD` (0x13FC). Until they are, a player can leave a guild in the
+   client and World will believe it while the Arbiter's rows do not. That is the next task, and
+   it is the one that needs a `WorldBridge.HandleFrame` line (the party one, T49, is the model).
+4. **The non-empty boot load has never been sent to a real World**, because no guild has ever
+   existed on the tap. The frame shapes are from the decompiled writers, not a capture; §8's
+   checklist is what would fix that.
+5. Guild wars, quests, towers, the warehouse, perks, the wanted board, contribution decay and the
+   level/exp curve are all still unmodelled (§10, "What is NOT modelled").

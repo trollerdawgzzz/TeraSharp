@@ -809,6 +809,19 @@ public sealed class DbProxyHandlers
     public const ushort SDB_RETURN_PARCEL = 0x2781;    public const ushort DBS_RETURN_PARCEL = 0x2782;
     public const ushort SDB_DELETE_PARCEL = 0x2811;    public const ushort DBS_DELETE_PARCEL = 0x2812;
 
+    // ===================== T51: the guild boot load (status/GUILD-DESIGN.md section 4.3) ======
+    // World asks once, at boot, with a ZERO-LENGTH SDB_INIT_GUILD and then waits for a
+    // DBS_INIT_GUILD_DATA whose Success byte is 0. Until T51 that terminator came from the
+    // replay table - i.e. from arb_world.log - which meant every boot re-sent the real
+    // Arbiter's two bytes of uninitialised stack padding inside GuildData (0xB379 at blob
+    // 0x024A; GUILD-DESIGN.md section 2.1). Answering it from the `guilds` table retires that
+    // entry: TryHandle returns true before WorldBridge ever reaches the replay table.
+    //
+    // The frames themselves are built by World/GuildWiring.BuildInitGuildLoad; only the opcode
+    // lives here, because Dispatch_switch_and_the_allow_list_agree resolves `case NAME:` by
+    // reflecting over public const ushort fields on THIS class.
+    public const ushort SDB_INIT_GUILD = 0x27CF;
+
     // --- SDB_ADD_TUTORIAL_SIMPLE_TIP (0x286E) -> DBS_ADD_TUTORIAL_SIMPLE_TIP (0x286F) ---
     // cap_newchar.log seq 719/765/864/911, 18 B -> 11 B each.
     // Handler_SDB_ADD_TUTORIAL_SIMPLE_TIP (Arb_part_063.c:36) needs frame >= 0x12 and reads
@@ -1035,6 +1048,12 @@ public sealed class DbProxyHandlers
             case SDB_RECV_PARCEL_EX:              // 0x277e, "receive all"
             case SDB_RETURN_PARCEL:               // 0x2782 = [DlmId][ok]
             case SDB_DELETE_PARCEL:               // 0x2812 = [DlmId][ok]
+            // --- T51: the guild boot load. Zero-length request, and the answer is a SEQUENCE
+            // ending in DBS_INIT_GUILD_DATA with Success = 0. It carries no DlmId, so an
+            // unanswered one cannot head-block a user - but it does leave World with no guild
+            // mirror at all, and until T51 the answer came from the capture, padding leak and
+            // all.
+            case SDB_INIT_GUILD:                  // 0x27CF -> 0x27ED (+ 0x27D0..0x27D3 per guild)
                 return true;
             default:
                 return false;        // -> replay table
@@ -1102,6 +1121,9 @@ public sealed class DbProxyHandlers
             case SDB_RECV_PARCEL_EX:          return OnRecvParcelEx(link, payload);
             case SDB_RETURN_PARCEL:           return OnReturnParcel(link, payload);
             case SDB_DELETE_PARCEL:           return OnDeleteParcel(link, payload);
+
+            // --- T51: guilds ---
+            case SDB_INIT_GUILD:              return OnInitGuild(link);
 
             // --- Post-spawn (reqId at payload[0] for all three) ---
             case SDB_END_START_QUEST_LIST: link.SendFrame(DBS_END_START_QUEST_LIST, BuildReqIdAck(payload, 0)); return true;
@@ -4178,6 +4200,34 @@ public sealed class DbProxyHandlers
         }
         _log.LogInformation("SDB_DELETE_PARCEL: {N} of {M} parcel(s) deleted", deleted, list.Length / 4);
         link.SendFrame(DBS_DELETE_PARCEL, ParcelDbHandlers.BuildDbsDlmAck(dlmId, ok: true));
+        return true;
+    }
+
+    // =======================================================================================
+    // T51: the guild boot load. status/GUILD-DESIGN.md sections 4.3 and 11.
+    // =======================================================================================
+
+    /// <summary>
+    /// SDB_INIT_GUILD (0x27CF, zero-length) -&gt; the whole guild mirror, from the `guilds` table.
+    ///
+    /// <para>Per guild: DBS_INIT_GUILD_DATA (0x27ED, Success = 1) -&gt; DBS_INIT_GUILD_GROUP
+    /// (0x27D0) -&gt; DBS_INIT_GUILD_MEMBER (0x27D1, batched) -&gt; DBS_INIT_GUILD_PERK_LIST
+    /// (0x27D2) -&gt; DBS_LOAD_GUILD_COMPLETE (0x27D3). Then one DBS_INIT_GUILD_DATA with
+    /// Success = 0, which is the terminator World waits for. With no guilds the whole sequence
+    /// collapses to that single terminator.</para>
+    ///
+    /// <para>This is what retires the replay entry for 0x27ED. The captured frame carries two
+    /// bytes of the real Arbiter's uninitialised stack (0xB379 inside GuildData at blob 0x024A),
+    /// which TeraSharp re-sent on every boot; <c>GuildWiring</c> writes zeros there. World never
+    /// reads those bytes, so this is hygiene rather than a fix - the real win is that the answer
+    /// now reflects guilds that actually exist.</para>
+    /// </summary>
+    private bool OnInitGuild(WorldLink link)
+    {
+        var frames = GuildWiring.BuildInitGuildLoad(_store);
+        foreach (var (op, body) in frames) link.SendFrame(op, body);
+        _log.LogInformation("SDB_INIT_GUILD: sent {N} frame(s) for {G} guild(s)",
+            frames.Count, _store?.GetAllGuilds().Count ?? 0);
         return true;
     }
 }

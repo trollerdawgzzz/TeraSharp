@@ -13181,4 +13181,385 @@ some prose with `backticks` that is not a table row
         }
         finally { PartyWiring.ResetForTests(); }
     }
+
+
+    /// <summary>Reset the recording fakes AND the World log between the steps of a scenario.
+    /// FakeSink.Bodies is a separate list from FakeSink.Log, so clearing only the log leaves the
+    /// next Bodies[0] pointing at the previous step's packet.</summary>
+    static void ClearSinks(DispatchHarness h, params FakeSink[] sinks)
+    {
+        foreach (var s in sinks) { s.Log.Clear(); s.Bodies.Clear(); }
+        h.WorldLog.Clear();
+    }
+
+    // =======================================================================================
+    // T51 - GuildWiring. Research: status/GUILD-DESIGN.md section 11 (and section 10's diff,
+    // which this supersedes in four places).
+    //
+    // T39 left GuildHandlers pure and unwired. These drive the WIRING - GuildWiring's own static
+    // entry points, over the T41 dispatcher with recording fakes - so what is checked is the code
+    // the one human-owned line will call, not a copy of it written a second time here.
+    //
+    // The boot load is the one piece with ground truth: data/cap_guild.bin seq 2 is the real
+    // Arbiter's "no guilds" terminator, and answering 0x27CF from rows has to reproduce it.
+    // =======================================================================================
+
+    /// <summary>
+    /// The registration numbers, and the mistake this pair exists to stop.
+    /// <c>PacketDispatcher.Register</c> takes a minimum BODY length and compares it against
+    /// <c>packet[4..]</c>; <c>GuildPackets.MinClientLength</c> is a TOTAL packet length that
+    /// includes the 4-byte header. Section 10's diff passes the total straight through, which
+    /// rejects every guild packet four bytes short - the bug status/CLIENT-REJECTS.md section
+    /// 7.2c already recorded against both the guild and the chat wiring.
+    /// </summary>
+    [Test] public static void T51_guild_registrations_use_the_body_length_not_the_frame_length()
+    {
+        Hex.True(GuildWiring.ClientOpcodes.Length == 17,
+            $"seventeen Arbiter-answered guild opcodes, got {GuildWiring.ClientOpcodes.Length}");
+        Hex.True(GuildWiring.ClientHeaderSize == 4, "the client header is [u16 len][u16 opcode]");
+
+        foreach (var (name, op) in GuildWiring.ClientOpcodes)
+        {
+            int frame = GuildWiring.MinFrameLength(op);
+            Hex.True(frame >= 4, $"{name}: frame guard {frame} is shorter than the header itself");
+            Hex.True(GuildWiring.MinBodyLength(op) == frame - GuildWiring.ClientHeaderSize,
+                $"{name}: body minimum must be the frame guard minus 4, got "
+                + $"{GuildWiring.MinBodyLength(op)} for frame 0x{frame:X2}");
+            Hex.True(GuildWiring.IsRegistered(op), $"{name} is one of the seventeen");
+        }
+
+        // Fifteen come straight from GuildPackets; the two that do not are the packets whose
+        // names contain no GUILD, so T36's sweep never saw them.
+        foreach (var (name, op) in GuildWiring.ClientOpcodes)
+        {
+            if (op == GuildHandlers.C_REQUEST_UPDATE_ANNOUNCE || op == GuildHandlers.C_REQUEST_UPDATE_INTRODUCE)
+            {
+                Hex.True(GuildPackets.MinClientLength(op) == 0, $"{name} is not in GuildPackets");
+                Hex.True(GuildWiring.MinFrameLength(op) == 6, $"{name}: [u16 off] + wstring, min total 6");
+                Hex.True(GuildWiring.MinBodyLength(op) == 2, $"{name}: body 2");
+                continue;
+            }
+            Hex.True(GuildWiring.MinFrameLength(op) == GuildPackets.MinClientLength(op),
+                $"{name}: the frame guard is GuildPackets'");
+        }
+
+        // a couple of the numbers spelled out, so a silent edit to GuildPackets is visible here
+        Hex.True(GuildWiring.MinBodyLength(GuildPackets.C_REQUEST_GUILD_INFO) == 0x0C - 4,
+            "C_REQUEST_GUILD_INFO: [i32 guildDbId][i32 windowType] = 8 bytes of body");
+        Hex.True(GuildWiring.MinBodyLength(GuildPackets.C_GUILD_APPLY_LIST) == 0,
+            "C_GUILD_APPLY_LIST is header-only");
+        Hex.True(GuildWiring.MinBodyLength(GuildPackets.C_ACCEPT_GUILD_APPLY) == 5,
+            "C_ACCEPT_GUILD_APPLY: [u8 accept][u32 userDbId], unaligned");
+
+        // Not registered: two Arbiter-side packets that still need routing work...
+        Hex.True(!GuildWiring.IsRegistered(GuildPackets.C_INVITE_USER_TO_GUILD),
+            "C_INVITE_USER_TO_GUILD needs the wanted-board manager - still open");
+        Hex.True(!GuildWiring.IsRegistered(GuildPackets.C_CHANGE_GUILDNAME),
+            "C_CHANGE_GUILDNAME needs the SDB_ASK_CHANGE_GUILD_NAME round trip - still open");
+        // ...and the ten that belong to WorldServer. Answering one double-answers the client.
+        foreach (ushort op in new ushort[] { 0x7C83, 0xE303, 0xC4CC, 0x8C0F, 0xBC8A,
+                                             0x8148, 0x73F1, 0xE885, 0xA6EF, 0x99CC })
+        {
+            Hex.True(!GuildWiring.IsRegistered(op), $"0x{op:X4} is World's (GUILD-DESIGN section 5.2)");
+            Hex.True(GuildWiring.MinBodyLength(op) == 0, $"0x{op:X4} has no entry in either table");
+        }
+    }
+
+    /// <summary>
+    /// The registered set and <see cref="GuildHandlers.Handles"/> must be the same set, in both
+    /// directions. Registering an opcode the handler does not answer would reply to the player
+    /// with an S_SYSTEM_MESSAGE_CUSTOM rejection every time they opened that window; leaving one
+    /// out forwards it to World, which answers "handler has not been implemented yet!!!".
+    /// </summary>
+    [Test] public static void T51_the_registered_set_is_exactly_what_GuildHandlers_answers()
+    {
+        var registered = GuildWiring.ClientOpcodes.Select(c => c.Opcode).ToHashSet();
+        Hex.True(registered.Count == GuildWiring.ClientOpcodes.Length, "no duplicate opcodes");
+
+        var answered = new List<ushort>();
+        for (int op = 0; op <= ushort.MaxValue; op++)
+            if (GuildHandlers.Handles((ushort)op)) answered.Add((ushort)op);
+
+        var missing = answered.Where(o => !registered.Contains(o)).ToArray();
+        Hex.True(missing.Length == 0,
+            "GuildHandlers answers these but GuildWiring does not register them, so they are "
+            + "forwarded to World: " + string.Join(", ", missing.Select(o => $"0x{o:X4}")));
+
+        var extra = registered.Where(o => !GuildHandlers.Handles(o)).ToArray();
+        Hex.True(extra.Length == 0,
+            "GuildWiring registers these but GuildHandlers has no case, so every one would answer "
+            + "the player with a rejection: " + string.Join(", ", extra.Select(o => $"0x{o:X4}")));
+
+        Hex.True(answered.Count == 17, $"seventeen answered opcodes, saw {answered.Count}");
+    }
+
+    /// <summary>
+    /// <b>ResolveDef is not optional for guilds.</b> GameSession.SendByDef resolves from the
+    /// SHIPPED registry, and ten guild .def files are wrong (GUILD-DESIGN section 5.5). The
+    /// dispatcher GuildWiring builds must carry GuildHandlers.ResolveDef, or S_ADD_GUILD_MEMBER
+    /// goes out with the .def's 0x33-byte body instead of the 0x38 the dumper guard proves.
+    /// </summary>
+    [Test] public static void T51_the_wiring_dispatcher_carries_the_corrected_defs()
+    {
+        var d = GuildWiring.Dispatcher(null, QuietLog());
+        Hex.True(d.ResolveDef != null, "the guild dispatcher must have a ResolveDef hook");
+
+        var corrected = d.ResolveDef!("S_ADD_GUILD_MEMBER");
+        Hex.True(corrected != null, "S_ADD_GUILD_MEMBER resolves to the correction, not the .def");
+
+        // the correction, encoded, is 0x38 - the number the Arbiter's own dumper guard gives
+        var member = new Dictionary<string, object>
+        {
+            ["memberDbId"] = 11, ["name"] = "g1", ["worldId"] = 1, ["guardId"] = 2, ["sectionId"] = 3,
+            ["groupId"] = 4, ["userLevel"] = 60, ["race"] = 5, ["userClass"] = 6, ["state"] = 0,
+            ["gender"] = 1, ["lastLogoutTime"] = 0L, ["isWorldEventTarget"] = false,
+            ["cityWarCompensationStatus"] = false,
+        };
+        var bytes = new TeraSharp.Arbiter.Protocol.DefinitionWriter().Write(corrected!, member);
+        Hex.True(BitConverter.ToUInt16(bytes, 0) == 0x38,
+            $"fixed part 0x{BitConverter.ToUInt16(bytes, 0):X2}, want 0x38");
+
+        // and a packet with no correction falls through to the session's own registry
+        Hex.True(d.ResolveDef("S_NO_CORRECTION_FOR_THIS") == null,
+            "an uncorrected packet must take the ordinary SendByDef path");
+    }
+
+    /// <summary>
+    /// The whole point of T51: two live sessions, create -&gt; apply -&gt; accept -&gt; announce
+    /// -&gt; leave, every packet arriving through GuildWiring's own entry points and the real
+    /// ActionDispatcher. Guilds address clients by character db id, so the harness's player table
+    /// is the one that resolves; the sinks are fakes, so no socket and no GameSession.
+    /// </summary>
+    [Test] public static void T51_create_invite_accept_announce_leave_across_two_sessions()
+    {
+        using var store = GuildStore();
+        var guilds = NewGuildHandlers(store);
+        var h = new DispatchHarness().Build(resolveDef: n => GuildHandlers.ResolveDef(null, n));
+        var chief = h.Player(1);
+        var joiner = h.Player(2);
+
+        // ---- create. There is no C_ packet for it: the client asks World, which sends
+        //      SDB_CREATE_GUILD2 down the DB-proxy link, so this is the seam that half calls.
+        var (guildId, created) = GuildWiring.DispatchCreateGuild(guilds, h.Dispatcher, 1, "Ere");
+        Hex.True(guildId > 0, $"CreateGuild returned {guildId}");
+        Hex.True(chief.Log.Count == 2
+                 && chief.Log[0] == "def:S_REQUEST_JOIN_GUILD_NOTICE"
+                 && chief.Log[1].StartsWith("body:S_ADD_GUILD_MEMBER:"),
+            "the notice, then the member - and the member through SendRawBody, which is what a "
+            + "CORRECTED def looks like on the wire: " + string.Join(",", chief.Log));
+        Hex.True(BitConverter.ToUInt16(chief.Bodies[0], 0) == 0x38,
+            $"S_ADD_GUILD_MEMBER fixed part 0x{BitConverter.ToUInt16(chief.Bodies[0], 0):X2}, want 0x38 "
+            + "- the .def's 0x33 would mean the correction never reached the wire");
+        Hex.True(joiner.Log.Count == 0, "character 2 is not in the guild yet");
+        Hex.True(string.Join(",", h.WorldLog.Select(w => $"0x{w.Op:X4}")) == "0x140A,0x2866",
+            "AS_ADD_GUILDMEMBER (0x140A) then AS_GUILD_JOINED (0x2866), the order "
+            + "GuildUtil::UserJoinToGuild sends them: "
+            + string.Join(",", h.WorldLog.Select(w => $"0x{w.Op:X4}")));
+        Hex.True(created.ClientsSent == 2, $"{created}");
+
+        // ---- apply. C_INVITE_USER_TO_GUILD still needs the wanted board, so the invite that
+        //      IS wired is the applicant's half: the holders of the invite authority are told.
+        ClearSinks(h, chief, joiner);
+        var applied = GuildWiring.DispatchClientPacket(guilds, h.Dispatcher, 2,
+            GuildPackets.C_APPLY_GUILD, CApplyGuildBody("Ere", "let me in"));
+        Hex.True(string.Join(",", chief.Log) == "def:S_GUILD_APPLY_COUNT",
+            "the chief holds the invite authority: " + string.Join(",", chief.Log));
+        Hex.True(joiner.Log.Count == 0 && !applied.RejectionSent, $"the applicant waits: {applied}");
+        Hex.True(store.GetGuildApplies(guildId).Count == 1, "spInsertGuildApply wrote the row");
+
+        // ---- accept ----
+        ClearSinks(h, chief, joiner);
+        var accepted = GuildWiring.DispatchClientPacket(guilds, h.Dispatcher, 1,
+            GuildPackets.C_ACCEPT_GUILD_APPLY, CAcceptGuildApplyBody(true, 2));
+        Hex.True(store.GetGuildIdOf(2) == guildId, "character 2 is a member");
+        Hex.True(store.GetGuildApplies(guildId).Count == 0, "and the application is spent");
+        Hex.True(chief.Log.Any(l => l.StartsWith("body:S_ADD_GUILD_MEMBER:"))
+                 && joiner.Log.Any(l => l.StartsWith("body:S_ADD_GUILD_MEMBER:")),
+            "both members are told about the new one: "
+            + string.Join(" | ", chief.Log) + " // " + string.Join(" | ", joiner.Log));
+        Hex.True(joiner.Bodies.Count > 0 && BitConverter.ToUInt16(joiner.Bodies[0], 0) == 0x38,
+            "and still through the corrected def");
+        Hex.True(string.Join(",", h.WorldLog.Select(w => $"0x{w.Op:X4}")) == "0x140A,0x2866",
+            string.Join(",", h.WorldLog.Select(w => $"0x{w.Op:X4}")));
+        Hex.True(accepted.ClientsDropped == 0, $"both members were online: {accepted}");
+
+        // ---- announce ----
+        ClearSinks(h, chief, joiner);
+        GuildWiring.DispatchClientPacket(guilds, h.Dispatcher, 1,
+            GuildHandlers.C_REQUEST_UPDATE_ANNOUNCE, CStringBody("raid at 8 & <late>"));
+        Hex.True(string.Join(",", chief.Log) == "def:S_UPDATE_GUILD_ANNOUNCE", string.Join(",", chief.Log));
+        Hex.True(string.Join(",", joiner.Log) == "def:S_UPDATE_GUILD_ANNOUNCE", string.Join(",", joiner.Log));
+        Hex.True(store.GetGuild(guildId)!.Announce == "raid at 8 &amp; &lt;late&gt;",
+            $"Guild::UpdateGuildAnnounce escapes & < > in that order: '{store.GetGuild(guildId)!.Announce}'");
+
+        // ---- leave the world. The MEMBERSHIP survives - GuildMemberData+0x70 is a state flag,
+        //      not a removal - so the rest of the guild is told, and World's mirror is updated.
+        ClearSinks(h, chief, joiner);
+        long when = 1_700_000_000L;
+        var left = h.Dispatcher.Dispatch(
+            GuildWiring.MemberState(store, 2, GuildWiring.StateOffline, when), "guild-leave");
+
+        Hex.True(chief.Log.Count == 1 && chief.Log[0].StartsWith("body:S_UPDATE_GUILD_MEMBER:"),
+            string.Join(",", chief.Log));
+        Hex.True(BitConverter.ToUInt16(chief.Bodies[0], 0) == 0x39,
+            $"S_UPDATE_GUILD_MEMBER fixed part 0x{BitConverter.ToUInt16(chief.Bodies[0], 0):X2}, want 0x39 "
+            + "- three trailing bools, not the .def's two");
+        Hex.True(joiner.Log.Count == 0, "the member who left is not told about themselves");
+        Hex.True(string.Join(",", h.WorldLog.Select(w => $"0x{w.Op:X4}")) == "0x1410",
+            "AS_UPDATE_GUILD_MEMBER so World's read-only mirror agrees");
+        Hex.True(BitConverter.ToInt32(h.WorldLog[0].Payload, 24) == GuildWiring.StateOffline,
+            "the seventh i32 of AS_UPDATE_GUILD_MEMBER is State");
+        Hex.True(left.ClientsSent == 1 && left.WorldSent == 1, $"{left}");
+
+        Hex.True(store.GetGuildIdOf(2) == guildId, "still a member - logging out is not leaving");
+        Hex.True(store.GetGuildMember(2)!.LastLogoutTime == when, "and the logout time was stored");
+
+        // coming back online is the same flip the other way
+        ClearSinks(h, chief);
+        h.Dispatcher.Dispatch(GuildWiring.MemberState(store, 2, GuildWiring.StateOnline, null), "guild-join");
+        Hex.True(chief.Log.Count == 1 && chief.Log[0].StartsWith("body:S_UPDATE_GUILD_MEMBER:"),
+            string.Join(",", chief.Log));
+        Hex.True(BitConverter.ToInt32(h.WorldLog[0].Payload, 24) == GuildWiring.StateOnline, "state 0");
+        Hex.True(store.GetGuildMember(2)!.LastLogoutTime == when, "and the logout time was NOT touched");
+
+        // a character with no guild produces nothing at all - the normal case
+        Hex.True(GuildWiring.MemberState(store, 3, GuildWiring.StateOnline, null).IsEmpty,
+            "character 3 is in no guild");
+        Hex.True(GuildWiring.MemberState(null, 1, GuildWiring.StateOnline, null).IsEmpty,
+            "and with no store open, nothing happens rather than throwing");
+    }
+
+    /// <summary>
+    /// With no guilds the whole 0x27CF answer is the one terminator, and it has to be the frame
+    /// the real Arbiter sends - which is what retires the replay entry. data/cap_guild.bin seq 2
+    /// is that frame, from arb_world.log; the only bytes we deliberately differ on are the two
+    /// uninitialised padding holes it leaks (GUILD-DESIGN section 2.1).
+    /// </summary>
+    [Test] public static void T51_the_guild_boot_load_is_the_capture_when_there_are_no_guilds()
+    {
+        // the wiring is what answers it now, not the replay table
+        Hex.True(DbProxyHandlers.IsHandledRequest(DbProxyHandlers.SDB_INIT_GUILD),
+            "0x27CF must be in the allow-list, or TryHandle falls through to the capture");
+        Hex.True(DbProxyHandlers.SDB_INIT_GUILD == 0x27CF, "SDB_INIT_GUILD is 0x27CF");
+
+        foreach (var store in new TeraSharp.Arbiter.Persistence.CharacterStore?[] { null, GuildStore(1) })
+        {
+            var frames = GuildWiring.BuildInitGuildLoad(store);
+            Hex.True(frames.Count == 1, $"no guilds = one frame, got {frames.Count}");
+            Hex.True(frames[0].Op == GuildPackets.DBS_INIT_GUILD_DATA, $"0x{frames[0].Op:X4}");
+            Hex.Eq(frames[0].Payload, GuildPackets.BuildEmptyDbsInitGuildData(),
+                "the empty answer is the terminator and nothing else");
+            Hex.True(frames[0].Payload[12] == 0, "Success = 0 - the 'no guilds' terminator");
+            store?.Dispose();
+        }
+
+        var cap = LoadTsisOrSkip("cap_guild.bin");
+        if (cap == null) return;
+        Hex.True(cap.TryGetValue(1, out var request) && request!.Length == 0,
+            "seq 1 is the zero-length SDB_INIT_GUILD");
+        Hex.True(cap.TryGetValue(2, out var capture), "seq 2 is the DBS_INIT_GUILD_DATA terminator");
+
+        var ours = GuildWiring.BuildInitGuildLoad(null)[0].Payload;
+        Hex.True(ours.Length == capture!.Length, $"payload {ours.Length} != capture {capture.Length}");
+
+        var allowed = new HashSet<int>();
+        foreach (var hole in GuildPackets.GuildDataPaddingHoles) { allowed.Add(13 + hole); allowed.Add(13 + hole + 1); }
+        var differ = new List<int>();
+        for (int i = 0; i < ours.Length; i++) if (ours[i] != capture[i]) differ.Add(i);
+        foreach (var d in differ)
+            Hex.True(allowed.Contains(d),
+                $"payload byte 0x{d:X4} differs from arb_world.log and is not a GuildData padding hole");
+        Hex.True(differ.Count == 2,
+            $"arb_world.log leaks exactly 2 uninitialised bytes; we write zeros there. Saw {differ.Count}");
+    }
+
+    /// <summary>
+    /// With a guild in the table the answer is the full section 4.3 sequence. The three array
+    /// frames share one writer (Arb_part_072.c:14299 / :14378 / :14502) whose second u32 is a
+    /// BYTE length, not an element count - <c>*local_2508 = count * 0xf0</c> - which is the one
+    /// thing worth pinning here, because getting it wrong hands World a member list it reads as
+    /// 0xF0 times too short.
+    /// </summary>
+    [Test] public static void T51_the_guild_boot_load_carries_every_guild_then_the_terminator()
+    {
+        using var store = GuildStore();
+        var guilds = NewGuildHandlers(store);
+        var a = new GuildActions();
+        int guildId = guilds.CreateGuild(a, 1, "Ere", "Master", "Member");
+        guilds.OnClientPacket(2, GuildPackets.C_APPLY_GUILD, CApplyGuildBody("Ere", "hi"));
+        guilds.OnClientPacket(1, GuildPackets.C_ACCEPT_GUILD_APPLY, CAcceptGuildApplyBody(true, 2));
+        Hex.True(store.GetGuildMembers(guildId).Count == 2, "two members");
+
+        var frames = GuildWiring.BuildInitGuildLoad(store);
+        Hex.True(string.Join(",", frames.Select(f => $"0x{f.Op:X4}"))
+                 == "0x27ED,0x27D0,0x27D1,0x27D2,0x27D3,0x27ED",
+            "the section 4.3 sequence, then the terminator: "
+            + string.Join(",", frames.Select(f => $"0x{f.Op:X4}")));
+
+        // 1. the per-guild DBS_INIT_GUILD_DATA, Success = 1, with a real blob
+        var data = GuildPackets.ParseDbsInitGuildData(frames[0].Payload);
+        Hex.True(data != null && data.Value.Success, "the first frame is Success = 1");
+        var blob = data!.Value.GuildData;
+        Hex.True(blob.Length == GuildPackets.GuildDataSize, $"GuildData is 0x23A0, got 0x{blob.Length:X}");
+        Hex.True(BitConverter.ToInt32(blob, GuildPackets.GdGuildDbId) == guildId, "GuildDbId");
+        Hex.True(BitConverter.ToInt32(blob, GuildPackets.GdChiefDbId) == 1, "ChiefDbId");
+        Hex.True(BitConverter.ToInt32(blob, GuildPackets.GdGuildLevel) == 1, "GuildLevel");
+        Hex.True(BitConverter.ToInt32(blob, GuildPackets.GdJoinMinLevel) == 1
+                 && BitConverter.ToInt32(blob, GuildPackets.GdJoinMaxLevel) == 70
+                 && BitConverter.ToInt32(blob, GuildPackets.GdGuildJoinType) == 1,
+            "the three join fields the capture confirms");
+        Hex.Eq(blob[GuildPackets.GdGuildName..(GuildPackets.GdGuildName + 8)], "45 00 72 00 65 00 00 00",
+            "GuildName is UTF-16LE, NUL-terminated");
+        foreach (var hole in GuildPackets.GuildDataPaddingHoles)
+            Hex.True(blob[hole] == 0 && blob[hole + 1] == 0,
+                $"we never leak the padding hole at blob 0x{hole:X4}");
+
+        // 2. the three array frames: [u32 off = 0x12][u32 BYTE length][u32 guildDbId][records]
+        void CheckArray(byte[] p, int recordSize, int expectedCount, string what)
+        {
+            Hex.True(BitConverter.ToInt32(p, 0) == 0x12, $"{what}: array offset is frame 0x12");
+            Hex.True(BitConverter.ToInt32(p, 4) == expectedCount * recordSize,
+                $"{what}: slot 2 is a BYTE length ({expectedCount} x 0x{recordSize:X}), "
+                + $"got {BitConverter.ToInt32(p, 4)}");
+            Hex.True(BitConverter.ToInt32(p, 8) == guildId, $"{what}: guildDbId");
+            Hex.True(p.Length == 12 + expectedCount * recordSize, $"{what}: payload length");
+        }
+        CheckArray(frames[1].Payload, GuildPackets.GuildGroupDataSize, 2, "DBS_INIT_GUILD_GROUP");
+        CheckArray(frames[2].Payload, GuildPackets.GuildMemberDataSize, 2, "DBS_INIT_GUILD_MEMBER");
+        CheckArray(frames[3].Payload, GuildWiring.GuildPerkRecordSize, 0, "DBS_INIT_GUILD_PERK_LIST");
+        Hex.True(frames[4].Payload.Length == 0, "DBS_LOAD_GUILD_COMPLETE is empty");
+
+        // 3. one member record, at the documented offsets
+        var m0 = frames[2].Payload[12..(12 + GuildPackets.GuildMemberDataSize)];
+        Hex.True(BitConverter.ToInt32(m0, GuildPackets.GmUserDbId) == 1, "first member is the chief");
+        Hex.True(BitConverter.ToInt32(m0, GuildPackets.GmState) == GuildWiring.StateOffline,
+            "the load loop forces State = 2; the sessions flip it");
+        Hex.True(BitConverter.ToInt32(m0, GuildPackets.GmUnknown0080) == -1, "col 14 loads -1");
+        Hex.True(BitConverter.ToInt64(m0, GuildPackets.GmGuildJoinDate) > 0, "GuildJoinDate was stored");
+
+        // 4. and it still ends with the terminator, byte-identical to the empty answer
+        Hex.Eq(frames[5].Payload, GuildPackets.BuildEmptyDbsInitGuildData(),
+            "the last frame is the Success = 0 terminator World waits for");
+
+        // more members than fit one frame -> more 0x27D1 frames, same header shape
+        Hex.True(GuildWiring.MembersPerFrame == 31, "the captures batch members 31 per frame");
+    }
+
+    /// <summary>
+    /// The 16-byte tagTIMESTAMP_STRUCT GuildData stores. Unset is 1970-01-01, which is what the
+    /// capture's three unset timestamps hold - and the reason a 0 in the row must not become a
+    /// year-0 struct.
+    /// </summary>
+    [Test] public static void T51_guild_timestamps_default_to_the_epoch_the_capture_shows()
+    {
+        Hex.Eq(GuildWiring.Timestamp(0), GuildPackets.BuildEpochTimestamp(), "0 is 1970-01-01");
+        Hex.Eq(GuildWiring.Timestamp(-5), GuildPackets.BuildEpochTimestamp(), "so is anything before it");
+        Hex.Eq(GuildPackets.BuildEpochTimestamp(), "B2 07 01 00 01 00 00 00 00 00 00 00 00 00 00 00",
+            "the wire form the capture carries at blob 0x0080");
+
+        // 2023-11-14 22:13:20 UTC
+        Hex.Eq(GuildWiring.Timestamp(1_700_000_000L),
+            GuildPackets.BuildTimestamp(2023, 11, 14, 22, 13, 20),
+            "a real unix time becomes the same struct, field for field");
+    }
 }

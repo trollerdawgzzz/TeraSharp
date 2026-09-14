@@ -239,3 +239,29 @@ participant that is in world, pushes `DBS_SEND_END_THROUGH_ARBITER_CONTRACT` to 
 World session carrying `[ContractorDbId][ContractType][ContractId][thatUserDbId]`. Reproducing it
 faithfully needs the contract/trade system we do not have, and inventing a reply would tell World
 a contract completed that we never brokered.
+
+
+## Guilds — the boot load, T51
+
+Guild state is persisted (the opposite of parties — `GUILD-DESIGN.md` §3 and §4) but it does not
+travel as per-user DB messages, so none of this is a DLMItem and none of it can head-block a
+user. There is exactly one request: World asks once, at boot.
+
+| request (W->A) | reply | shape | count | feeds |
+|---|---|---|---|---|
+| 0x27CF SDB_INIT_GUILD (0 B)                       | 0x27ED        | zero-length request; the answer is a SEQUENCE per guild, ending in DBS_INIT_GUILD_DATA with Success = 0 | 1 per World boot | **real (T51)**, from the `guilds` table |
+
+The answer, per guild, is `GUILD-DESIGN.md` §4.3's sequence — `0x27ED` (Success = 1) ->
+`0x27D0 DBS_INIT_GUILD_GROUP` -> `0x27D1 DBS_INIT_GUILD_MEMBER` (31 members per frame) ->
+`0x27D2 DBS_INIT_GUILD_PERK_LIST` -> `0x27D3 DBS_LOAD_GUILD_COMPLETE` — then one final `0x27ED`
+with `Success = 0`. With no guilds in the DB that collapses to the single terminator, which is
+`GuildPackets.BuildEmptyDbsInitGuildData()`.
+
+Before T51 the terminator came from the replay table, i.e. from `arb_world.log`, which meant
+every World boot re-sent two bytes of the real Arbiter's uninitialised stack from inside
+`GuildData` (`0xB379` at blob `0x024A`; `GUILD-DESIGN.md` §2.1). Adding `0x27CF` to
+`DbProxyHandlers.IsHandledRequest` retires that entry outright — `TryHandle` returns true before
+`WorldBridge` ever reaches the replay table.
+
+The four one-way `AS_`/`SA_` guild frames are not in this table because none of them is a
+DB-proxy request: they are in `GUILD-DESIGN.md` §4.1 and §4.2.
