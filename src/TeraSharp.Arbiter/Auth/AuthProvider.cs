@@ -101,10 +101,11 @@ public static class AuthProviders
     public static AuthResult Authenticate(IAuthProvider provider, AuthRequest request)
     {
         ArgumentNullException.ThrowIfNull(provider);
+        ArgumentNullException.ThrowIfNull(request);
         // T45: the only place the client's language crosses from the (human-owned) login handler
         // into code Cowork owns. SocialHandlers reads it back to pick the seeded friend-group
         // name instead of shipping the TW capture's Chinese strings to every character.
-        LoginLanguage.Record(request?.AccountName, request?.Region ?? LoginLanguage.Default);
+        LoginLanguage.Record(request.AccountName, request.Region);
         try
         {
             return provider.AuthenticateAsync(request).GetAwaiter().GetResult();
