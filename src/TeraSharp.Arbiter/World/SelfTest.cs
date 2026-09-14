@@ -31,6 +31,8 @@ public static class SelfTest
         "fatigability", "tutorial_tips", "seren_guide", "counters",
         "client_settings", "account_settings",
         "items", "warehouses", "parcels", "parcel_items",   // T42
+        "guilds", "guild_members", "guild_groups", "guild_applies", "guild_invites", "guild_log", "guild_perks",   // T39
+        "visited_sections",   // T45
     };
 
     /// <summary>Columns added by a later migration - the ones a stale terasharp.db will be missing.</summary>

@@ -126,7 +126,7 @@ public static class TunnelFrames
         int packetStart = BitConverter.ToInt32(payload, PacketOffsetField) - FrameHeaderSize;
         int packetLength = BitConverter.ToInt32(payload, PacketLengthField);
         if (packetStart != listStart + userListBytes) return null;   // the invariant the capture proves
-        if (packetLength < 0 || packetStart + packetLength > payload.Length) return null;
+        if (packetLength < 0 || packetLength > payload.Length - packetStart) return null;   // no int overflow (T54 H1)
 
         var recipients = new TunnelRecipient[count];
         for (int i = 0; i < count; i++)
