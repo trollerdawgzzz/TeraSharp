@@ -1311,10 +1311,9 @@ test that keeps it that way.
 | 0x1414 | `SA_INC_GUILD_ACCOUNT_LIMIT` | **layout unknown** — no dumper found |
 | 0x145C | `SA_PUSH_GUILD_BUFF` | **layout unknown**; guild buffs are not modelled at all |
 
-The first eight are a handler each and no new research — their parsers are already in
-`GuildPackets` and their store methods already exist. They were left out of T52 on purpose: none
-of them can be reached until a guild exists live, and a handler nobody has ever run is worth less
-than one that is honest about not existing.
+**The first eight were built in T57 — see section 13.** Only `0x1414` and `0x145C` are still
+gated-but-unanswered, and `T52_the_unmodelled_guild_frames_are_consumed_not_answered` now covers
+exactly those two.
 
 ### 12.4 Ours, not the decompile's
 
@@ -1325,3 +1324,82 @@ with no chief is not a state the client can render — but the choice of success
 The same caveat `PARTY-DESIGN.md` §10 carries for party managers.
 
 Everything else in 12.2 is quoted to a function in `Arb_part_*.c`.
+
+---
+
+## 13. T57 — the eight `SA_` handlers §12.3 listed
+
+All eight are now answered; `GuildWiring.OnWorldFrame` has ten cases and two rejections. Each is
+quoted to its handler in `Arb_part_072.c`. Two shapes run through the whole set:
+
+* **only the chief change sends a client packet.** The rest are a store write plus an `AS_` frame
+  to every WorldServerSession — in the decompile a literal `do { if (slot[6] == 2) send } while
+  (--32)` loop, which `ArbiterActions.World` is the twin of. The guild window is refreshed by the
+  `S_` packets the `C_` handlers already answer, not by these.
+* **the fan-out is outside the success check** on the two group paths: the guild log entry is
+  written only when the store call took, the `AS_` frame goes out either way.
+
+| op | handler (Arb_part_072.c) | what it does |
+|---|---|---|
+| `0x13FB` | `Handler_SA_LOAD_GUILD` :14046 | re-push the mirror: `0x144D` `AS_LOAD_GUILD_DATA` (the whole 0x23A0 GuildData), `0x27D0` groups, `0x27D1` members (31 per frame), `0x27D2` perks |
+| `0x13FC` | `Handler_SA_DESTROY_GUILD` :13863 | one call to `GuildUtil::DestroyGuild` (Arb_part_069.c:5298): `spDeleteGuild` + children, then `AS_DESTROY_GUILD` |
+| `0x1402` | `Handler_SA_CHANGE_GUILD_CHIEF` :13621 | `Guild::ChangeChief`, then `S_CHANGE_GUILD_CHIEF` to every member and `AS_CHANGE_GUILD_CHIEF` |
+| `0x1404` | `Handler_SA_SET_GUILDGROUP_AUTHORITY` :14786 → callback :17704 | name check, one DB update, `AS_SET_GUILDGROUP_AUTHORITY`. No log, no client packet |
+| `0x1406` | `Handler_SA_CREATE_GUILD_GROUP` :13729 → callback :17616 | id from `Guild::GenerateNewGuildGroupId`, authority **0**, log `0x15`, `AS_CREATE_GUILD_GROUP` |
+| `0x1408` | `Handler_SA_REMOVE_GUILD_GROUP` :14643 | name read first (it is the log's string), remove, log `0x16`, `AS_REMOVE_GUILD_GROUP` |
+| `0x140B` | `Handler_SA_CHANGE_GUILDGROUP` :13469 | `Guild::ChangeMemberGroup`, log `0x20`, `AS_CHANGE_GUILDGROUP` |
+| `0x140F` | `Handler_SA_UPDATE_GUILD_MEMBER` :14924 | re-read one member and re-broadcast `AS_UPDATE_GUILD_MEMBER` |
+
+### 13.1 `SA_LOAD_GUILD` is not the boot load
+
+The four writer calls in `Handler_SA_LOAD_GUILD` are `0x144D`, `0x27D0`, `0x27D1`, `0x27D2` — and
+grepping the whole function finds **no `0x27ED` and no `0x27D3`**. So the single-guild re-push is
+*not* §11.4's `0x27CF` sequence with one guild in it: the blob travels as `AS_LOAD_GUILD_DATA`
+rather than `DBS_INIT_GUILD_DATA`, and there is no `DBS_LOAD_GUILD_COMPLETE` terminator, because
+World is not running its whole load state machine — it is refreshing one entry.
+
+### 13.2 Three real guild-log action ids
+
+`Guild::AddGuildLog` (`FUN_140566090`) takes the action as its second argument, and the three
+group paths pass literals: **0x15** add a group (:17662), **0x16** remove one (:14689), **0x20**
+move a member between groups (:13524). Those are the first log ids in this project that are not
+ours — `GuildLogCreate`/`Join`/`Leave` (0x0A/0x0B/0x0C) are still guesses.
+
+### 13.3 New group ids, and the group-name rule
+
+`Guild::GenerateNewGuildGroupId` (`FUN_14056cbf0`, Arb_part_046.c:1901) walks the guild's group
+map keeping the largest id and returns `max + 1`. `CreateGuild` seeds groups 1 (master) and 2
+(member), so the first group anyone creates is 3, and ids never come back down after a removal.
+
+`InputRestrictionHelper::CheckGuildGroupName` accepts a name of **1..15** code units
+(`len != 0 && len < 0x10`) and then runs it past forbidden-word list `0x11`
+(`FUN_140945c40`), for which we have no data. 15 is already `CharacterStore.MaxGuildGroupName`.
+
+### 13.4 Ours, not the decompile's
+
+* **`SA_UPDATE_GUILD_MEMBER` echoes the stored roster row.** The real handler pulls worldId /
+  guardId / sectionId / level / state off its own live `User` object (`User+0x3b88`, `+0x3b8c`,
+  `+0x3b90`, `+0x17c`, and `User::IsInWorld` for the state) and writes them into GuildMemberData
+  before broadcasting. We have no `User` objects; §11.3's roster is where those five fields live,
+  so we echo the row instead of inventing values, and use `StateOnline` because World only asks
+  about a member it is currently hosting.
+* **`SA_DESTROY_GUILD` tells the members nothing.** `GuildManager::DestroyGuildWithLock`'s
+  member-facing half was not traced. This matches what the last-member-leaves branch of §12.2
+  already does.
+* **Two refusals are unreachable rather than modelled.** `SA_CHANGE_GUILD_CHIEF` answers system
+  message **0xF5C** when the new chief's `User+0x1BC` is set, and `GuildUtil::DestroyGuild`
+  answers **0x820** when the guild is in a guild war. Neither flag nor guild wars are modelled, so
+  both ids are recorded as constants (`GuildWiring.SmtCannotBeGuildChief`,
+  `SmtGuildAtWarCannotDisband`) and nothing reaches them.
+
+### 13.5 Still gated, still unanswered
+
+| op | name | why |
+|---|---|---|
+| `0x1414` | `SA_INC_GUILD_ACCOUNT_LIMIT` | the **layout is now known** — `Handler_SA_INC_GUILD_ACCOUNT_LIMIT` (Arb_part_072.c:13924) guards `param_3 < 0xe`, reads `i32 GuildDbId@06` and `i32 @0A`, and calls one setter. What the second field means, and what an account limit does, is not modelled — `guilds.add_account_limit` exists and nothing reads it |
+| `0x145C` | `SA_PUSH_GUILD_BUFF` | no dumper, and guild buffs are not modelled at all |
+
+`T52_the_unmodelled_guild_frames_are_consumed_not_answered` now covers exactly these two, and
+`T57_every_gated_guild_frame_survives_a_hostile_payload` throws seven hostile payload shapes at all
+twelve: `WorldLink.ReceiveLoop` has no per-frame catch, so one exception here disconnects every
+player (`status/SECURITY-AUDIT.md`).

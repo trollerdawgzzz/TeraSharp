@@ -197,7 +197,7 @@ atom. Scanning `WorldServer.exe.c` for `*(undefined4 *)(X + 4) = N;` followed by
 | 5 | `PrepareChangeCustomizing` | customise |
 | 6 | `PrepareChangeInvenPos`, `PrepareSendStackableItem` | detach a fully-consumed stack (always paired with 11) |
 | 7 | *(insert path)* | **insert item** — the only op that arrives with DB id 0 |
-| 9 | `Inventory::GetAddableMoney` | change money (template id 0) |
+| 9 | `Inventory::PrepareMoneyTransaction` | change money by a signed DELTA (template id 0) — section 8.1 |
 | 11 | `PrepareSendNonStackItem`, `PrepareChangeInvenPos` | delete the row |
 | 13, 18 | warehouse | `DO_TS_WARE_*` |
 | 20, 37 | parcel | send / receive |
@@ -256,8 +256,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_items_pos ON items(owner_id, pocket, slot);
 CREATE INDEX        IF NOT EXISTS ix_items_owner ON items(owner_id);
 ```
 
-`money` is not an item — op 9 carries template id 0. It belongs on the `characters` row next to
-`level`/`exp` from T6, not here.
+`money` is not an item — op 9 carries template id 0. It lives on the `characters` row next to
+`level`/`exp` from T6, not here. **T59 built that column — section 8.**
 
 ### Why a `blob` column as well as the fields
 
@@ -414,7 +414,8 @@ World was never given. Four messages carry atoms — 0x2768, 0x272E (quest rewar
 fees) and the warehouse transfers — and all four go through the same code.
 
 Ops modelled: 2 amount, 3 move-to-empty-slot, 6 detach (a deliberate no-op; the paired 11 does the
-delete), 7 insert, 9 character money (not an item row), 11 delete, 36 swap two occupied slots, plus
+delete), 7 insert, 9 character money (a `characters.money` delta, not an item row — section 8),
+11 delete, 36 swap two occupied slots, plus
 the warehouse ops 13/14/15/17. **Everything else is echoed but not applied**, and logged. An atom
 that names no item at all is dropped rather than given a fresh id: a row under an id World has
 never seen is worse than a missing row, because the next operation on it misses.
@@ -438,9 +439,107 @@ Both triples are populated and equal for an op that stays in one container, whic
 
 ### Still open
 
-- **Character money** (op 9) is counted and dropped; it belongs on the `characters` row and nothing
-  reads it back yet.
+- ~~**Character money** (op 9) is counted and dropped.~~ **Done (T59)** - see section 8.
 - **`0x27A3` pocket data** is still the empty form. A character who has bought bag slots would have
   a non-empty list and we have never seen one.
 - **Expanded bag tabs.** Everything that is not a warehouse pocket is served as inventory, so an
   unknown tab id would come back in the load; that is the safe direction, but it is untested.
+
+---
+
+## 8. T59 — character money
+
+The live symptom was one log line per kill:
+
+```
+items: character money 10000000000 for owner 4 - not stored
+```
+
+§7 "Still open" had it as *counted and dropped*. It is stored now, and served back at login.
+
+### 8.1 The atom is a signed DELTA, not a new total
+
+`Inventory::PrepareMoneyTransaction(__int64 amount, enum ChangeMoneyReason, ...)`
+(WorldServer.exe.c:1407fa050) is the only builder of an op-9 atom, and it settles the question
+three ways over:
+
+```c
+if (param_2 != 0) {                                    // amount 0 -> NO atom at all
+    if ((param_2 < 0) && (*(longlong *)(param_1 + 0x78) + param_2 < 0)) { error 0x18/0x1a; }
+    //                    ^ Inventory+0x78 is the money it already holds
+    if (0 < param_2) { ... GetAddableMoney ... if (addable < param_2) error 0x19; }
+    atom = new;
+    *(u32     *)(atom + 4)     = 9;                    // op
+    *(longlong*)(atom + 0x20)  = playerId;             // srcOwner
+    *(longlong*)(atom + 0x38)  = playerId;             // dstOwner
+    *(u32     *)(atom + 0x28)  = 0;                    // srcInven
+    *(u32     *)(atom + 0x40)  = 0;                    // dstInven
+    *(longlong*)(atom + 0x50)  = param_2;              // <- the delta, verbatim
+    *(u32     *)(atom + 0x204) = reason;               // ChangeMoneyReason
+}
+```
+
+* the guard is `current + amount < 0`, i.e. the value is *added* to what the inventory holds;
+* an amount of 0 emits nothing, which an absolute update could never do;
+* item db id (+0x10) and template id (+0x18) stay 0 — op 9 is identified by the op alone.
+
+`ChangeMoneyReason` at **atom + 0x204** is new here; §3's table stops well before it. Nothing
+reads it yet.
+
+The capture agrees: `cap_newchar_client.log`'s `S_ITEMLIST` (48029) carries `int64 money` at body
++28, and for "Test" it runs 0 → 19 → 67 → 30 → 114 → 230 across the session. Every step is the
+previous total plus one atom's delta, and the 30 → 114 step is the `+84` §1 already recorded from
+a kill.
+
+### 8.2 Money reaches World inside the enter-world blob, at 448
+
+Not in `0x27A4`. `DBS_USER_LOAD_INVENTORY`'s whole layout is `InvenItems`, `DlmId`,
+`ContinueReceive` (dumper `FUN_140209730`, Arb_part_016.c:760), and its array is a plain run of
+0x218-byte `ItemData` records with no money entry (writer Arb_part_064.c:15328, stride `0x218`,
+byte length `count * 0x218`). Not in a separate load either: `Handler_DBS_GET_MONEY`
+(WorldServer.exe.c:3013535) is an empty stub, and neither `SDB_GET_MONEY` (0x2747) nor
+`DBS_UPDATE_USER_MONEY` (0x27EA) appears anywhere in the three captures.
+
+It is a field of the 15312-byte blob, i64 at **448 (0x1C0)**, proven from both sides:
+
+| side | evidence |
+|---|---|
+| Arbiter | `FUN_140044d50(recordset, L"money", UserData + 0x1c0)` — Arb_part_032.c:17798, in the same bind list as `gender` at +0xC4 and `class` at +0xC8, which are our `GenderOffset` / `ClassOffset` |
+| World | `Inventory::SetMoney(User + 0xA478, *(__int64 *)(context + 0x268))` — WorldServer.exe.c:1663604; the blob is memcpy'd to `context + 0xA8` by `UserEnterWorldContext::SetRecvData` (:1661252), so `0x268 - 0xA8 = 0x1C0` |
+
+`Inventory::SetMoney` is `*(__int64 *)(inv + 0x78) = money` (:1484331) — a plain assignment, so the
+blob value is **absolute**. `DBS_UPDATE_USER_MONEY` (0x27EA, `[06] u32 OwnerDbId, [0A] i64 Money`,
+frame 0x12) ends in the same setter through `User::UpdateMoneynShow(money, true)`, so a future GM
+`set_money` on another character has an unsolicited A→W push available. We do not send it yet.
+
+### 8.3 Why it needs its own column
+
+**World never writes the field back.** Blob + 0x1C0 is zero in all six `SDB_UPDATE_USER_DATA`
+(0x27CB) frames of `cap_newchar.log` — including the last one, sent after the character had earned
+230 gold. Storing money only inside the blob would therefore lose it on the first save.
+
+So `characters.money` is authoritative and the blob is stamped from it on the way out:
+
+```
+SDB_ITEM_SINGLE op-9 atom   ->  characters.money = MAX(0, money + delta)
+CharacterStore.Read(row)    ->  StarterBlob.WriteMoney(WorldBlob, money)   (blob + 448)
+DBS_USER_ENTERWORLD 0x2738  ->  [u32 19][u32 15312][u32 replyId][u8 1][blob]
+```
+
+Stamping in `Read` rather than in a builder means both 0x2738 senders get it — `OnUserEnterWorld`
+and the human-owned `WorldEntry.BuildCharacterDataPayload` — with no change to either.
+
+The clamp at 0 is ours: World refuses a negative result before it ever builds the atom, so a
+negative can only come from a frame World did not send.
+
+`T59_money_round_trips_into_the_enter_world_blob_byte_exact` pins it against
+`data/starter_blob.bin`: with money 0 the served blob is the capture byte for byte, and with money
+set exactly the eight bytes at 448 differ.
+
+### 8.4 Still open after T59
+
+- **`ChangeMoneyReason`** (atom + 0x204) is parsed by nobody. It is what a money log would key on.
+- **`DBS_UPDATE_USER_MONEY` (0x27EA)** is not sent. Until it is, a money change made outside
+  World's own inventory (a GM command against an offline character, a parcel payout) will not show
+  up until that character relogs.
+- **`S_ITEMLIST.money`** is built by WorldServer, not by us, so there is nothing to serve there.

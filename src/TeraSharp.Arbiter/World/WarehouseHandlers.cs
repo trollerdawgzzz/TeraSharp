@@ -422,11 +422,14 @@ public static class WarehouseHandlers
     // --------------------------------------------------------------- applying
 
     /// <summary>What <see cref="Apply"/> did, for the log line and the tests.</summary>
+    /// <param name="MoneyDelta">Net WAREHOUSE money moved (op 0x0D).</param>
     /// <param name="Ignored">Atoms that changed no row: an op we do not model, or one modelled
-    /// as a deliberate no-op (the detach half of a consumed stack, and character money, which
-    /// lives on the character row and not in <c>items</c>).</param>
+    /// as a deliberate no-op (the detach half of a consumed stack).</param>
+    /// <param name="CharacterMoneyDelta">Net CHARACTER money applied (op 9) - T59. It lands on
+    /// <c>characters.money</c>, not in <c>items</c>, so it is counted separately from the
+    /// warehouse total and is not an "ignored" atom any more.</param>
     public readonly record struct ApplyResult(int Inserted, int Moved, int AmountChanged, int Deleted,
-                                              long MoneyDelta, int Ignored);
+                                              long MoneyDelta, int Ignored, long CharacterMoneyDelta);
 
     /// <summary>
     /// Apply one message's atoms to the item rows.
@@ -458,7 +461,7 @@ public static class WarehouseHandlers
         atoms ??= Array.Empty<WarehouseAtom>();
 
         int inserted = 0, moved = 0, changed = 0, deleted = 0, ignored = 0;
-        long money = 0;
+        long money = 0, charMoney = 0;
 
         foreach (var a in atoms)
         {
@@ -478,12 +481,18 @@ public static class WarehouseHandlers
                     break;
 
                 case TsChangeMoney:
+                {
                     // Character money (template id 0). It lives on the character row, not in
-                    // `items`; nothing reads it back yet, so this is a no-op we count.
-                    log?.LogDebug("items: character money {Delta} for owner {Owner} - not stored",
-                        a.Delta, dstOwner);
-                    ignored++;
+                    // `items`. T59: the delta is SIGNED and RELATIVE -
+                    // Inventory::PrepareMoneyTransaction refuses the change when
+                    // (current money + amount) < 0 and then writes that same amount to
+                    // atom + 0x50, so it is what to add, never a new total.
+                    long now = store.AddCharacterMoney(dstOwner, a.Delta);
+                    charMoney += a.Delta;
+                    log?.LogDebug("items: character money {Delta} for owner {Owner} -> {Total}",
+                        a.Delta, dstOwner, now);
                     break;
+                }
 
                 // ---- insert ----
                 case TsInsertItem:
@@ -586,6 +595,6 @@ public static class WarehouseHandlers
         }
 
         store.PruneEmptyItems();
-        return new ApplyResult(inserted, moved, changed, deleted, money, ignored);
+        return new ApplyResult(inserted, moved, changed, deleted, money, ignored, charMoney);
     }
 }

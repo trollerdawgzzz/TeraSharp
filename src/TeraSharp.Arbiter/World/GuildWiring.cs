@@ -414,7 +414,18 @@ public static class GuildWiring
         {
             case GuildPackets.SA_LEAVE_GUILD: return LeaveGuild(a, store, payload, banished: false);
             case GuildPackets.SA_BANISH_GUILD_MEMBER: return LeaveGuild(a, store, payload, banished: true);
+            // ---- T57 ----
+            case GuildPackets.SA_LOAD_GUILD: return LoadGuild(a, store, payload);
+            case GuildPackets.SA_DESTROY_GUILD: return DestroyGuild(a, store, payload);
+            case GuildPackets.SA_CHANGE_GUILD_CHIEF: return ChangeGuildChief(a, store, payload);
+            case GuildPackets.SA_SET_GUILDGROUP_AUTHORITY: return SetGuildGroupAuthority(a, store, payload);
+            case GuildPackets.SA_CREATE_GUILD_GROUP: return CreateGuildGroup(a, store, payload);
+            case GuildPackets.SA_REMOVE_GUILD_GROUP: return RemoveGuildGroup(a, store, payload);
+            case GuildPackets.SA_CHANGE_GUILDGROUP: return ChangeGuildGroup(a, store, payload);
+            case GuildPackets.SA_UPDATE_GUILD_MEMBER: return UpdateGuildMember(a, store, payload);
             default:
+                // Only 0x1414 and 0x145C are left here: SA_INC_GUILD_ACCOUNT_LIMIT and
+                // SA_PUSH_GUILD_BUFF. Neither has a modelled subsystem behind it.
                 return a.Reject($"0x{opcode:X4} is a guild frame we gate but do not model yet "
                                 + "(status/GUILD-DESIGN.md section 12.3)");
         }
@@ -501,6 +512,300 @@ public static class GuildWiring
                 GuildPackets.BuildAsChangeGuildChief(guildDbId, next.UserDbId));
         }
         return a;
+    }
+
+
+    // =========================================================================================
+    // 6b. T57 - the eight gated frames that section 12.3 left unanswered
+    //
+    // Each one is quoted to its handler in Arb_part_072.c. Two things they have in common and
+    // that are easy to get wrong:
+    //   * NONE of them sends a client packet except the chief change. The guild window is
+    //     refreshed by the S_ packets the C_ handlers already answer, not by these.
+    //   * The AS_ fan-out in the decompile is a loop over all 32 WorldServerSession slots, i.e.
+    //     "tell every World". ArbiterActions.World is exactly that, so a.World is the twin.
+    // =========================================================================================
+
+    /// <summary>
+    /// SA_LOAD_GUILD (0x13FB) - Handler_SA_LOAD_GUILD, Arb_part_072.c:14046. Re-push one guild's
+    /// mirror to World. The writer calls in that function are, in order,
+    /// <c>0x144D</c>, <c>0x27D0</c>, <c>0x27D1</c>, <c>0x27D2</c> - so this is NOT the boot load:
+    /// the guild blob goes out as <c>AS_LOAD_GUILD_DATA</c> (0x144D) rather than
+    /// <c>DBS_INIT_GUILD_DATA</c> (0x27ED), and there is no <c>DBS_LOAD_GUILD_COMPLETE</c>
+    /// (0x27D3) terminator. Grepping the whole function for 0x27d3 / 0x27ed finds neither.
+    /// </summary>
+    private static ArbiterActions LoadGuild(ArbiterActions a, CharacterStore store, byte[] payload)
+    {
+        var f = GuildPackets.ParseSaGuildAction(payload);
+        if (f == null) return a.Reject("SA_LOAD_GUILD: frame shorter than 0x12");
+        int guildDbId = f.Value.guildDbId;
+
+        var g = store.GetGuild(guildDbId);
+        if (g == null) return a.Reject($"SA_LOAD_GUILD: no guild {guildDbId}");
+
+        a.World(GuildPackets.AS_LOAD_GUILD_DATA,
+            GuildPackets.BuildAsGuildData(BuildGuildDataBlob(g, store.GetGuildLogo(guildDbId))));
+
+        var groupBlobs = new List<byte[]>();
+        foreach (var gr in store.GetGuildGroups(guildDbId)) groupBlobs.Add(BuildGuildGroupDataBlob(gr));
+        a.World(GuildPackets.DBS_INIT_GUILD_GROUP,
+            BuildInitArrayPayload(guildDbId, groupBlobs, GuildPackets.GuildGroupDataSize));
+
+        var members = store.GetGuildMembers(guildDbId);
+        for (int i = 0; i < members.Count || i == 0; i += MembersPerFrame)
+        {
+            var batch = new List<byte[]>();
+            for (int j = i; j < members.Count && j < i + MembersPerFrame; j++)
+                batch.Add(BuildGuildMemberDataBlob(members[j]));
+            a.World(GuildPackets.DBS_INIT_GUILD_MEMBER,
+                BuildInitArrayPayload(guildDbId, batch, GuildPackets.GuildMemberDataSize));
+        }
+
+        a.World(GuildPackets.DBS_INIT_GUILD_PERK_LIST,
+            BuildInitArrayPayload(guildDbId, Array.Empty<byte[]>(), GuildPerkRecordSize));
+        return a;
+    }
+
+    /// <summary>
+    /// SA_DESTROY_GUILD (0x13FC) - Handler_SA_DESTROY_GUILD (Arb_part_072.c:13863) is one call to
+    /// <c>GuildUtil::DestroyGuild(User *, int)</c> (FUN_1407ed1f0, Arb_part_069.c:5298), which
+    /// refuses with system message <see cref="SmtGuildAtWarCannotDisband"/> when the guild is in a
+    /// guild war and otherwise runs <c>GuildManager::DestroyGuildWithLock</c> -&gt;
+    /// <c>dbo.spDeleteGuild</c>. Guild wars are not modelled at all, so the refusal branch is
+    /// unreachable here and the id is a constant rather than a code path.
+    ///
+    /// <para>The member-facing half of DestroyGuildWithLock was not traced, so - exactly as the
+    /// last-member-leaves path in <see cref="LeaveGuild"/> already does - we delete the rows and
+    /// tell World, and send the members nothing. Section 12.4.</para>
+    /// </summary>
+    private static ArbiterActions DestroyGuild(ArbiterActions a, CharacterStore store, byte[] payload)
+    {
+        var f = GuildPackets.ParseSaGuildAction(payload);
+        if (f == null) return a.Reject("SA_DESTROY_GUILD: frame shorter than 0x12");
+        int guildDbId = f.Value.guildDbId;
+
+        if (store.GetGuild(guildDbId) == null) return a.Reject($"SA_DESTROY_GUILD: no guild {guildDbId}");
+        if (!store.DeleteGuild(guildDbId)) return a.Reject($"SA_DESTROY_GUILD: spDeleteGuild removed no row for {guildDbId}");
+
+        a.World(GuildPackets.AS_DESTROY_GUILD, GuildPackets.BuildAsDestroyGuild(guildDbId));
+        return a;
+    }
+
+    /// <summary>
+    /// SA_CHANGE_GUILD_CHIEF (0x1402) - Handler_SA_CHANGE_GUILD_CHIEF, Arb_part_072.c:13621. The
+    /// real one looks up the CURRENT chief from <c>Guild+0xD8</c> and the new one from the frame,
+    /// does nothing when either user is missing or the two are the same, refuses with system
+    /// message <see cref="SmtCannotBeGuildChief"/> when <c>User+0x1BC != 0</c> on the new chief,
+    /// and otherwise calls <c>Guild::ChangeChief</c>.
+    ///
+    /// <para><c>User+0x1BC</c> is a per-user flag we do not model, so the refusal cannot fire
+    /// here; what we do model is the membership check, which the real one gets for free from the
+    /// Guild object. The client half is the same pair the leave path emits.</para>
+    /// </summary>
+    private static ArbiterActions ChangeGuildChief(ArbiterActions a, CharacterStore store, byte[] payload)
+    {
+        var f = GuildPackets.ParseSaChangeGuildChief(payload);
+        if (f == null) return a.Reject("SA_CHANGE_GUILD_CHIEF: frame shorter than 0x16");
+        var (_, guildDbId, newChiefDbId) = f.Value;
+
+        var g = store.GetGuild(guildDbId);
+        if (g == null) return a.Reject($"SA_CHANGE_GUILD_CHIEF: no guild {guildDbId}");
+        if (g.ChiefDbId == newChiefDbId)
+            return a.Reject($"SA_CHANGE_GUILD_CHIEF: {newChiefDbId} is already the chief of {guildDbId}");
+
+        var member = store.GetGuildMember(newChiefDbId);
+        if (member == null || member.GuildId != guildDbId)
+            return a.Reject($"SA_CHANGE_GUILD_CHIEF: {newChiefDbId} is not a member of guild {guildDbId}");
+
+        if (!store.ChangeGuildChief(guildDbId, newChiefDbId))
+            return a.Reject($"SA_CHANGE_GUILD_CHIEF: spUpdateGuildChief changed no row for {guildDbId}");
+
+        // The shipped S_CHANGE_GUILD_CHIEF.def names its single field `playerId`, not the
+        // dumper's NewChiefDbId - the def wins, it is what the client reads (section 12.2).
+        foreach (var other in store.GetGuildMembers(guildDbId))
+            a.ToPlayer(other.UserDbId, "S_CHANGE_GUILD_CHIEF",
+                new Dictionary<string, object> { ["playerId"] = (uint)newChiefDbId });
+        a.World(GuildPackets.AS_CHANGE_GUILD_CHIEF,
+            GuildPackets.BuildAsChangeGuildChief(guildDbId, newChiefDbId));
+        return a;
+    }
+
+    /// <summary>
+    /// SA_SET_GUILDGROUP_AUTHORITY (0x1404) - Handler_SA_SET_GUILDGROUP_AUTHORITY
+    /// (Arb_part_072.c:14786) validates the new name through
+    /// <c>InputRestrictionHelper::CheckGuildGroupName</c> and then runs
+    /// <c>_ChangeGuildGroupNameCallback::OnSuccess</c> (:17704): one DB update, one in-memory
+    /// update, then <c>AS_SET_GUILDGROUP_AUTHORITY</c> to every World. No guild log, no client
+    /// packet.
+    /// </summary>
+    private static ArbiterActions SetGuildGroupAuthority(ArbiterActions a, CharacterStore store, byte[] payload)
+    {
+        var f = GuildPackets.ParseSaSetGuildGroupAuthority(payload);
+        if (f == null) return a.Reject("SA_SET_GUILDGROUP_AUTHORITY: frame shorter than 0x1E");
+        var (newName, _, guildDbId, guildGroupId, authority) = f.Value;
+
+        if (!IsLegalGroupName(newName))
+            return a.Reject($"SA_SET_GUILDGROUP_AUTHORITY: '{newName}' is not a legal group name");
+        if (store.GetGuild(guildDbId) == null)
+            return a.Reject($"SA_SET_GUILDGROUP_AUTHORITY: no guild {guildDbId}");
+        if (!store.SetGuildGroupAuthority(guildDbId, guildGroupId, authority, newName))
+            return a.Reject($"SA_SET_GUILDGROUP_AUTHORITY: no group {guildGroupId} in guild {guildDbId}");
+
+        a.World(GuildPackets.AS_SET_GUILDGROUP_AUTHORITY,
+            GuildPackets.BuildAsSetGuildGroupAuthority(guildDbId, guildGroupId, authority, newName));
+        return a;
+    }
+
+    /// <summary>
+    /// SA_CREATE_GUILD_GROUP (0x1406) - Handler_SA_CREATE_GUILD_GROUP (Arb_part_072.c:13729) plus
+    /// <c>_AddGuildGroupNameCallback::OnSuccess</c> (:17616). The id comes from
+    /// <c>Guild::GenerateNewGuildGroupId</c> (FUN_14056cbf0, Arb_part_046.c:1901), which walks the
+    /// group map keeping the largest id and returns <c>max + 1</c> - so the first group of an
+    /// empty guild is 1, and ids are never reused below the maximum.
+    ///
+    /// <para>Authority is <b>0</b> on a new group: the handler builds its argument block as
+    /// <c>{ GuildDbId, 0 }</c> and the callback copies that second word into the record it adds
+    /// and into the AS_ frame. Then <c>Guild::AddGuildLog</c> with action
+    /// <see cref="GuildHandlers.GuildLogAddGroup"/>, and AS_CREATE_GUILD_GROUP to every World.</para>
+    /// </summary>
+    private static ArbiterActions CreateGuildGroup(ArbiterActions a, CharacterStore store, byte[] payload)
+    {
+        var f = GuildPackets.ParseSaCreateGuildGroup(payload);
+        if (f == null) return a.Reject("SA_CREATE_GUILD_GROUP: frame shorter than 0x16");
+        var (groupName, _, guildDbId) = f.Value;
+
+        if (!IsLegalGroupName(groupName))
+            return a.Reject($"SA_CREATE_GUILD_GROUP: '{groupName}' is not a legal group name");
+        if (store.GetGuild(guildDbId) == null)
+            return a.Reject($"SA_CREATE_GUILD_GROUP: no guild {guildDbId}");
+
+        int groupId = GenerateNewGuildGroupId(store, guildDbId);
+        if (!store.CreateGuildGroup(guildDbId, groupId, groupName, GuildGroupDefaultAuthority))
+            return a.Reject($"SA_CREATE_GUILD_GROUP: group {groupId} already exists in guild {guildDbId}");
+
+        store.AddGuildLog(guildDbId, GuildHandlers.GuildLogAddGroup, groupName, paramInt: groupId);
+        a.World(GuildPackets.AS_CREATE_GUILD_GROUP, GuildPackets.BuildAsCreateGuildGroup(
+            guildDbId, groupId, groupName, GuildGroupDefaultAuthority));
+        return a;
+    }
+
+    /// <summary>
+    /// SA_REMOVE_GUILD_GROUP (0x1408) - Handler_SA_REMOVE_GUILD_GROUP, Arb_part_072.c:14643. The
+    /// group name is read BEFORE the remove (it is the log's second string), the log entry is
+    /// written only when the remove returned true, and <c>AS_REMOVE_GUILD_GROUP</c> goes out
+    /// whether or not it did - the fan-out loop sits outside that <c>if</c>. We keep that order.
+    /// </summary>
+    private static ArbiterActions RemoveGuildGroup(ArbiterActions a, CharacterStore store, byte[] payload)
+    {
+        var f = GuildPackets.ParseSaRemoveGuildGroup(payload);
+        if (f == null) return a.Reject("SA_REMOVE_GUILD_GROUP: frame shorter than 0x16");
+        var (_, guildDbId, groupId) = f.Value;
+
+        if (store.GetGuild(guildDbId) == null)
+            return a.Reject($"SA_REMOVE_GUILD_GROUP: no guild {guildDbId}");
+
+        var group = store.GetGuildGroup(guildDbId, groupId);
+        if (store.DeleteGuildGroup(guildDbId, groupId))
+            store.AddGuildLog(guildDbId, GuildHandlers.GuildLogRemoveGroup,
+                group?.Name ?? string.Empty, paramInt: groupId);
+
+        a.World(GuildPackets.AS_REMOVE_GUILD_GROUP, GuildPackets.BuildAsRemoveGuildGroup(guildDbId, groupId));
+        return a;
+    }
+
+    /// <summary>
+    /// SA_CHANGE_GUILDGROUP (0x140B) - Handler_SA_CHANGE_GUILDGROUP, Arb_part_072.c:13469. Same
+    /// shape as the remove: <c>Guild::ChangeMemberGroup</c>, log action
+    /// <see cref="GuildHandlers.GuildLogChangeMemberGroup"/> only when it took, then
+    /// <c>AS_CHANGE_GUILDGROUP</c> to every World unconditionally.
+    /// </summary>
+    private static ArbiterActions ChangeGuildGroup(ArbiterActions a, CharacterStore store, byte[] payload)
+    {
+        var f = GuildPackets.ParseSaChangeGuildGroup(payload);
+        if (f == null) return a.Reject("SA_CHANGE_GUILDGROUP: frame shorter than 0x1A");
+        var (_, guildDbId, memberDbId, guildGroupId) = f.Value;
+
+        var member = store.GetGuildMember(memberDbId);
+        if (member == null || member.GuildId != guildDbId)
+            return a.Reject($"SA_CHANGE_GUILDGROUP: {memberDbId} is not a member of guild {guildDbId}");
+
+        if (store.SetGuildMemberGroup(memberDbId, guildGroupId))
+        {
+            var group = store.GetGuildGroup(guildDbId, guildGroupId);
+            store.AddGuildLog(guildDbId, GuildHandlers.GuildLogChangeMemberGroup,
+                group?.Name ?? string.Empty, targetName: member.Name,
+                actorDbId: memberDbId, paramInt: guildGroupId);
+        }
+
+        a.World(GuildPackets.AS_CHANGE_GUILDGROUP,
+            GuildPackets.BuildAsChangeGuildGroup(guildDbId, memberDbId, guildGroupId));
+        return a;
+    }
+
+    /// <summary>
+    /// SA_UPDATE_GUILD_MEMBER (0x140F) - Handler_SA_UPDATE_GUILD_MEMBER, Arb_part_072.c:14924.
+    /// The frame carries ONLY <c>GuildDbId</c> and <c>MemberDbId</c>: it is World saying "re-read
+    /// this member". The real Arbiter then pulls worldId / guardId / sectionId / level / state off
+    /// its own live <c>User</c> object, writes them into GuildMemberData and re-broadcasts
+    /// <c>AS_UPDATE_GUILD_MEMBER</c> to every World.
+    ///
+    /// <para>We have no User objects; the roster (section 11.3) is where those five fields live,
+    /// so we echo the stored row instead of inventing values. The state is
+    /// <see cref="StateOnline"/>: World only asks about a member it is currently hosting, and the
+    /// real handler reaches the same answer through <c>User::IsInWorld</c>.</para>
+    /// </summary>
+    private static ArbiterActions UpdateGuildMember(ArbiterActions a, CharacterStore store, byte[] payload)
+    {
+        var f = GuildPackets.ParseSaUpdateGuildMember(payload);
+        if (f == null) return a.Reject("SA_UPDATE_GUILD_MEMBER: frame shorter than 0x0E");
+        var (guildDbId, memberDbId) = f.Value;
+
+        var member = store.GetGuildMember(memberDbId);
+        if (member == null || member.GuildId != guildDbId)
+            return a.Reject($"SA_UPDATE_GUILD_MEMBER: {memberDbId} is not a member of guild {guildDbId}");
+
+        a.World(GuildPackets.AS_UPDATE_GUILD_MEMBER, GuildPackets.BuildAsUpdateGuildMember(
+            guildDbId, memberDbId, member.WorldId, member.GuardId, member.SectionId,
+            member.UserLevel, StateOnline));
+        return a;
+    }
+
+    /// <summary>Authority a freshly created guild group gets: 0 - see <see cref="CreateGuildGroup"/>.</summary>
+    public const int GuildGroupDefaultAuthority = 0;
+
+    /// <summary>
+    /// System message the real handler sends when the new chief's <c>User+0x1BC</c> is set
+    /// (Arb_part_072.c:13672). Unreachable here - that flag is not modelled - but recorded so the
+    /// id is not lost.
+    /// </summary>
+    public const int SmtCannotBeGuildChief = 0xF5C;
+
+    /// <summary>
+    /// System message <c>GuildUtil::DestroyGuild</c> sends when the guild is in a guild war
+    /// (Arb_part_069.c:5363). Also unreachable here - guild wars are not modelled.
+    /// </summary>
+    public const int SmtGuildAtWarCannotDisband = 0x820;
+
+    /// <summary>
+    /// <c>InputRestrictionHelper::CheckGuildGroupName</c>: the name must be non-empty and shorter
+    /// than 0x10 code units, i.e. 1..15 characters - the same bound as
+    /// <c>CharacterStore.MaxGuildGroupName</c>. The forbidden-word check that follows it
+    /// (FUN_140945c40 with list 0x11) has no data behind it here.
+    /// </summary>
+    internal static bool IsLegalGroupName(string? name)
+        => !string.IsNullOrEmpty(name) && name!.Length <= CharacterStore.MaxGuildGroupName;
+
+    /// <summary>
+    /// <c>Guild::GenerateNewGuildGroupId</c> (Arb_part_046.c:1901): walk the guild's groups
+    /// keeping the largest id, return <c>max + 1</c>. Starts at 0, so an empty guild's first
+    /// group is 1.
+    /// </summary>
+    internal static int GenerateNewGuildGroupId(CharacterStore store, int guildDbId)
+    {
+        int max = 0;
+        foreach (var gr in store.GetGuildGroups(guildDbId))
+            if (gr.GuildGroupId > max) max = gr.GuildGroupId;
+        return max + 1;
     }
 
     /// <summary>One S_SYSTEM_MESSAGE to one character - the <c>@id\vKey\vValue</c> form.</summary>
