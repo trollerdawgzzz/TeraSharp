@@ -822,6 +822,28 @@ public sealed class DbProxyHandlers
     // reflecting over public const ushort fields on THIS class.
     public const ushort SDB_INIT_GUILD = 0x27CF;
 
+    // ===================== T55: the broker DLM answers (status/BROKER-DESIGN.md) =============
+    // Five of the seven SDB_TRADE_BROKER_* requests carry a DlmId, so each is a per-user
+    // DLMItem: World waits for a reply carrying that same id before it lets the character's DB
+    // queue move again (status/HANDOFF.md section 1). Nothing answered them before T55 and no
+    // capture contains one, so the replay table could not cover either - opening the broker
+    // window wedged the character for the life of the World process, exactly as opening the
+    // mailbox did before T45.
+    //
+    // There is no listings table yet (that waits for a capture - BROKER-DESIGN.md section 7), so
+    // every answer is the empty/refusal form: the ids echoed, both refs empty, Success = 0. That
+    // is enough. World does not need the answer to be yes; it needs an answer with its own
+    // DlmId in it.
+    //
+    // Layouts and builders are in World/BrokerPackets.cs; only the opcodes live here, because
+    // Dispatch_switch_and_the_allow_list_agree resolves `case NAME:` by reflecting over public
+    // const ushort fields on THIS class.
+    public const ushort SDB_TRADE_BROKER_REGISTER_ITEM = 0x2817;
+    public const ushort SDB_TRADE_BROKER_UNREGISTER_ITEM = 0x2819;
+    public const ushort SDB_TRADE_BROKER_CALC_SOLD_ITEM = 0x281B;
+    public const ushort SDB_TRADE_BROKER_CALC_BOUGHT_ITEM = 0x281D;
+    public const ushort SDB_TRADE_BROKER_BUY_IT_NOW = 0x281F;
+
     // --- SDB_ADD_TUTORIAL_SIMPLE_TIP (0x286E) -> DBS_ADD_TUTORIAL_SIMPLE_TIP (0x286F) ---
     // cap_newchar.log seq 719/765/864/911, 18 B -> 11 B each.
     // Handler_SDB_ADD_TUTORIAL_SIMPLE_TIP (Arb_part_063.c:36) needs frame >= 0x12 and reads
@@ -1054,6 +1076,14 @@ public sealed class DbProxyHandlers
             // mirror at all, and until T51 the answer came from the capture, padding leak and
             // all.
             case SDB_INIT_GUILD:                  // 0x27CF -> 0x27ED (+ 0x27D0..0x27D3 per guild)
+            // --- T55: the five broker requests that carry a DlmId. Each one wedges the
+            // character's DB queue if it goes unanswered, and the broker window sends the first
+            // of them the moment it opens.
+            case SDB_TRADE_BROKER_REGISTER_ITEM:   // 0x2817 -> 0x2818, frame 0x16
+            case SDB_TRADE_BROKER_UNREGISTER_ITEM: // 0x2819 -> 0x281A, frame 0x1E
+            case SDB_TRADE_BROKER_CALC_SOLD_ITEM:  // 0x281B -> 0x281C, frame 0x22
+            case SDB_TRADE_BROKER_CALC_BOUGHT_ITEM:// 0x281D -> 0x281E, frame 0x22
+            case SDB_TRADE_BROKER_BUY_IT_NOW:      // 0x281F -> 0x2820, frame 0x27
                 return true;
             default:
                 return false;        // -> replay table
@@ -1124,6 +1154,13 @@ public sealed class DbProxyHandlers
 
             // --- T51: guilds ---
             case SDB_INIT_GUILD:              return OnInitGuild(link);
+
+            // --- T55: broker. One handler; the five differ only in which ids they echo. ---
+            case SDB_TRADE_BROKER_REGISTER_ITEM:
+            case SDB_TRADE_BROKER_UNREGISTER_ITEM:
+            case SDB_TRADE_BROKER_CALC_SOLD_ITEM:
+            case SDB_TRADE_BROKER_CALC_BOUGHT_ITEM:
+            case SDB_TRADE_BROKER_BUY_IT_NOW: return OnTradeBrokerRequest(link, op, payload);
 
             // --- Post-spawn (reqId at payload[0] for all three) ---
             case SDB_END_START_QUEST_LIST: link.SendFrame(DBS_END_START_QUEST_LIST, BuildReqIdAck(payload, 0)); return true;
@@ -4246,6 +4283,92 @@ public sealed class DbProxyHandlers
         foreach (var (op, body) in frames) link.SendFrame(op, body);
         _log.LogInformation("SDB_INIT_GUILD: sent {N} frame(s) for {G} guild(s)",
             frames.Count, _store?.GetAllGuilds().Count ?? 0);
+        return true;
+    }
+
+    // =======================================================================================
+    // T55: the broker. status/BROKER-DESIGN.md sections 3 and 8.
+    // =======================================================================================
+
+    /// <summary>
+    /// The five DlmId-carrying <c>SDB_TRADE_BROKER_*</c> requests, answered with the empty
+    /// refusal form. One handler for all five: they differ only in where the DlmId and Step sit,
+    /// and <see cref="BrokerPackets"/> knows that.
+    ///
+    /// <para><b>Why answer at all when there is nothing to sell.</b> Each of these is a per-user
+    /// DLMItem. World holds the character's DB queue until a reply carrying that request's own
+    /// DlmId arrives; <c>DLMExistManager::Find</c> matches on the id, so a reply with the wrong
+    /// id is no better than none. Before T55 the broker window's first request got neither - no
+    /// handler, and no capture for the replay table - and the character stopped for the life of
+    /// the World process (status/HANDOFF.md section 1).</para>
+    ///
+    /// <para><b>Why Success = 0.</b> There is no listings table yet (BROKER-DESIGN.md section 7
+    /// - it waits for a capture), so every one of these is a refusal. A refusal is a normal
+    /// answer on this path: the item stays where it was and the client shows the failure. The
+    /// wrong thing would be <c>Success = 1</c>, which tells World an item moved.</para>
+    ///
+    /// <para><b>Step is echoed, never invented.</b> Four of the five carry a multi-stage commit
+    /// step whose values were not traced. Echoing the one we were given is the only safe
+    /// answer.</para>
+    /// </summary>
+    private bool OnTradeBrokerRequest(WorldLink link, ushort op, byte[] payload)
+    {
+        uint dlmId = 0;
+        int step = 0;
+        int ownerDbId = 0;
+        bool parsed = true;
+
+        switch (op)
+        {
+            case SDB_TRADE_BROKER_REGISTER_ITEM:
+            {
+                var r = BrokerPackets.ParseSdbRegisterItem(payload);
+                if (r == null) { parsed = false; break; }
+                dlmId = r.Value.dlmId; ownerDbId = r.Value.ownerDbId;
+                break;
+            }
+            case SDB_TRADE_BROKER_UNREGISTER_ITEM:
+            {
+                var r = BrokerPackets.ParseSdbUnregisterItem(payload);
+                if (r == null) { parsed = false; break; }
+                dlmId = r.Value.dlmId; ownerDbId = r.Value.ownerDbId; step = r.Value.step;
+                break;
+            }
+            case SDB_TRADE_BROKER_CALC_SOLD_ITEM:
+            case SDB_TRADE_BROKER_CALC_BOUGHT_ITEM:
+            {
+                var r = BrokerPackets.ParseSdbCalcItem(op, payload);
+                if (r == null) { parsed = false; break; }
+                dlmId = r.Value.dlmId; ownerDbId = r.Value.ownerDbId; step = r.Value.step;
+                break;
+            }
+            default:   // SDB_TRADE_BROKER_BUY_IT_NOW
+            {
+                var r = BrokerPackets.ParseSdbBuyItNow(payload);
+                if (r == null) { parsed = false; break; }
+                dlmId = r.Value.dlmId; ownerDbId = r.Value.ownerDbId; step = r.Value.step;
+                break;
+            }
+        }
+
+        if (!parsed)
+        {
+            // A frame shorter than the handler's own guard. The real Arbiter kills the World link
+            // over this; we do not, because a malformed frame from a fuzzer must not take the
+            // server down (status/SECURITY-AUDIT.md). Returning true still consumes it, which is
+            // right: the replay table has no answer for it either.
+            _log.LogWarning("{Name}: {Len}-byte frame is shorter than the handler's guard - dropped",
+                DbProxyOpcodeNames.Describe(op), payload.Length + 6);
+            return true;
+        }
+
+        var reply = BrokerPackets.BuildEmptyRefusal(op, dlmId, step);
+        if (reply == null) return false;          // unreachable: the allow-list is the same five
+
+        link.SendFrame(BrokerPackets.ReplyFor(op), reply);
+        _log.LogInformation("{Name}: refused for player {Owner} (DlmId {Dlm}, step {Step}) - "
+            + "no broker listings table yet (status/BROKER-DESIGN.md section 7)",
+            DbProxyOpcodeNames.Describe(op), ownerDbId, dlmId, step);
         return true;
     }
 }

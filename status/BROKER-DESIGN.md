@@ -291,11 +291,68 @@ the rolled item option the listing carries. A future schema is two tables shaped
   `ItemData`-shaped (`INVENTORY-DESIGN.md` §3) but the exact record for a broker listing was not
   traced.
 
-## 8. The one thing to do before anything else
+## 8. T55 — the five DLM answers, done
 
-Answer the five DLMItem-carrying `SDB_TRADE_BROKER_*` requests, even with `Success = 0`. Right
-now a player who opens the broker on a live TeraSharp gets `no replay for 0x2817` and their DB
-queue stops for the life of the World process — the exact failure T45 fixed for the mailbox. The
-opcodes, the guards and the reply layouts are all in §3; what is missing is only the decision
-about what a refusal should look like, and `Success = 0` with the `DlmId` and `Step` echoed is
-almost certainly it.
+This section used to say "answer the five, even with `Success = 0`, before anything else."
+T55 did it. `DbProxyHandlers.OnTradeBrokerRequest` answers all five; the rows are in
+`status/PERSISTENCE-MAP.md` under "Trade broker — T55", so the coverage guard holds them.
+
+**Walking up to a broker NPC no longer wedges the character.** The window opens, draws an empty
+grid, and every request gets a refusal carrying its own DlmId.
+
+### 8.1 Two things the writers settled that §3 and §7 had wrong
+
+Reading the reply writers rather than only the dumpers corrected two guesses:
+
+1. **The ref offset slots are backpatched unconditionally**, before the emptiness check. An
+   empty answer therefore carries `0x13` (or `0x1F`) in the offset slot and `0` in the length —
+   not two zeros, which is what T53's stub builders wrote. Same convention as
+   `DBS_INIT_GUILD_DATA` and the guild init arrays (`GUILD-DESIGN.md` §11.4).
+2. **`ItemBinary` is an `ItemTransactionAtom` array**, stride `0x358` — the same 856-byte record
+   the warehouse and item paths already use (`INVENTORY-DESIGN.md`, `MAIL-WAREHOUSE.md`), not
+   the `ItemData` listing §7 guessed at. The proof is in all five writers: the copy loop
+   advances by `0x358` and the byte-length slot is filled with `count * 0x358`. So when the
+   listings table does arrive, the item half is already decoded.
+
+The 0x1F family also has **two** ref pairs, not one: `refA` (the dumper's first ref —
+`TradeData`, or `CalcItemList` on the two calc replies) is a raw blob written with
+`FUN_1403c98b0`, and `refB` is `ItemBinary`, the atom array. That is why the fixed part ends at
+`0x1F` and not `0x17`.
+
+### 8.2 What the client half answers
+
+`Handlers/BrokerHandlers.cs` registers **fifteen** of the sixteen Arbiter-answered `C_` packets
+and answers eleven of them with the empty form — the three list packets, the two search
+families, `C_TRADE_BROKER_INPUT_PRICE`, and `C_TRADE_BROKER_SUGGEST_DEAL`.
+
+The sixteenth is `C_TRADE_BROKER_HIGHEST_ITEM_LEVEL` (0xEAFB): **T45 already answers and
+registers it**, and `PacketDispatcher.Register` throws on a duplicate, so registering it again
+would take the server down at startup rather than fix anything.
+
+Four send nothing to the client:
+
+* `C_TRADE_BROKER_CLOSE` has no client reply at all — what it sends is `AS_TRADE_BROKER_CLOSE`
+  (0x1458) to World, which opened the window with `SA_TRADE_BROKER_OPEN` and would otherwise
+  believe the player is still standing at the NPC.
+* `C_TRADE_BROKER_DEAL_CONFIRM`, `_DEAL_PRICE_UPDATE` and `_REJECT_SUGGEST` each reach a
+  `TradeBroker::` method that looks the deal up first and returns before any writer — and with
+  no listings there is never a deal. `C_TRADE_BROKER_SUGGEST_DEAL` is the one deal packet that
+  IS answered, because its failure packet is pinned: `TradeBrokerOpenDealFetchWork::operator()`
+  (`Arb_part_084.c:6070`) writes `S_TRADE_BROKER_REQUEST_DEAL_RESULT` with a single bool, and a
+  suggestion against a listing that does not exist is exactly the false case.
+
+The paged lists answer **page 1 of 1**, not page 0 of 0. Page 0 of an empty history is the bug
+that crashed the real Arbiter's `C_VIEW_GUILD_WAR`, and `CLAUDE.md`'s hard rules name this
+shape specifically.
+
+### 8.3 Still open
+
+* **No listings table.** Everything above is a refusal. A real broker needs the two tables of
+  §6.1 and a manager; both wait for a capture, because no broker frame exists in any log on
+  disk.
+* **`Step` values are still unknown.** The handlers echo what they were given, which is safe but
+  is not the same as knowing what stage 2 means.
+* **`SDB_TRADE_BROKER_START_DEAL` (0x2821) and `_CANCEL_DEAL` (0x2824) are still unanswered.**
+  Neither carries a DlmId, so neither can head-block anyone; they are left alone until there is
+  a deal to have.
+* **The `refA` payloads** (`TradeData`, `CalcItemList`) are named and sized but not decoded.
