@@ -576,7 +576,7 @@ Offsets below are **packet-relative**: the `[u16 len][u16 opcode]` header is inc
 first ref slot is `0x04`. Handler minimum lengths are **total packet length**, matching the
 `if (local_res18[0] < N)` guard.
 
-### 5.1 Client → Arbiter — the 17 the Arbiter answers
+### 5.1 Client → Arbiter — the 19 the Arbiter answers
 
 | opcode | packet | body | min | handler |
 |---|---|---|---|---|
@@ -597,6 +597,46 @@ first ref slot is `0x04`. Handler minimum lengths are **total packet length**, m
 | `0xFFDB` | `C_SET_GUILD_JOIN_CONDITION` | `u16 introOff, i32 min, i32 max, i32 joinType, i32 preference` | 0x16 | `FUN_1404ed2d0` |
 | `0xC046` | `C_REQUEST_GUILD_INFO_BEFORE_APPLY_GUILD` | `u16 nameOff, i32 guildDbId` | 0x0A | `FUN_1404e8100` |
 | `0xC9C4` | `C_REQUEST_COOLTIME_TO_JOIN_GUILD` | *(empty)* | 4 | `FUN_1404e75f0` |
+| `0x9CB1` | `C_REQUEST_UPDATE_ANNOUNCE` | `u16 motdOff` | 6 | `Handler_C_REQUEST_UPDATE_ANNOUNCE` |
+| `0xD434` | `C_REQUEST_UPDATE_INTRODUCE` | `u16 messageOff` | 6 | `Handler_C_REQUEST_UPDATE_INTRODUCE` |
+
+**The last two were missed by T36** and found in T39: neither name contains GUILD, so a sweep of
+`*GUILD*` does not see them, but both are in `status/arbiter_c_handlers.txt` and both land in
+guild code. `Handler_C_REQUEST_UPDATE_ANNOUNCE::_ChangeGuildNoticeCallback::OnSuccess`
+(`Arb_part_040.c:6664`) → `Guild::UpdateGuildAnnounce` (`Arb_part_046.c:14684`), and
+`Handler_C_REQUEST_UPDATE_INTRODUCE::_ChangeGuildIntroduceCallback::OnSuccess`
+(`Arb_part_040.c:6579`) → `Guild::UpdateGuildmemberIntroduce` (`Arb_part_046.c:16088`). The
+announce is the guild's; the introduce is the MEMBER's own note. Both route through
+`NetModeratorHelper::RequestToEvaluateString` first — the profanity filter — which TeraSharp
+does not have and which this design treats as a no-op.
+
+`Guild::UpdateGuildAnnounce` is worth quoting, because three of its rules are not obvious:
+
+```c
+  FUN_14002ce70(&local_58,&DAT_140ad89e0,&DAT_140d3dc2c);   /* & -> &amp;  */
+  FUN_14002ce70(&local_58,&DAT_140bebc7c,L"&lt;");          /* < -> &lt;   */
+  FUN_14002ce70(&local_58,&DAT_140bebc8c,L"&gt;");          /* > -> &gt;   */
+  cVar3 = FUN_140572c70(param_1,param_2,4);                 /* GuildAuthority bit 2, NOT chief */
+  ...
+  wcsncpy_s((wchar_t *)(param_1 + 0x118),0xc9,pwVar5,...);  /* truncate at 200 chars */
+```
+
+The ampersand is replaced FIRST, so an escape it introduces is not escaped again; the gate is an
+authority bit rather than "is the chief"; and the DB gets the full escaped string while
+`GuildData` gets it truncated.
+
+`Guild::HaveGuildAuthorityWithLock(User*, enum GuildAuthority)` (`FUN_140572c70`,
+`Arb_part_046.c:6358`) is that gate everywhere:
+
+```c
+  if (*(int *)(param_1 + 0xd8) == *(int *)(param_2 + 0x120)) { return 1; }   /* chief passes */
+  lVar1 = FUN_14056e030(param_1,*(undefined4 *)(lVar1 + 0x5c));              /* member's group */
+  if ((lVar1 != 0) && ((param_3 & *(uint *)(lVar1 + 0x24)) != 0)) { return 1; }
+```
+
+Masks the callers actually pass: **0x01** invite / manage applications (the `InviteAuthority`
+bool in `S_GUILD_APPLY_LIST` is this bit), **0x02**, **0x04** change the announce, **0x10**,
+**0x20**, **0x40**. The enum's names are not in the binary.
 
 `C_REQUEST_GUILD_INFO`'s `windowType` is the whole guild window in one switch:
 **1** probe only · **2** `S_GUILD_INFO` + `S_GUILD_HISTORY` page 1 (members) ·
@@ -809,3 +849,158 @@ of how much a capture would change:
 * **Guild fan-out has no helper**, so a TeraSharp `GuildManager` should add one rather than
   copying the real Arbiter's inlined `Guild+0x68` walks — the party code already has the shape
   (`PartyManager.BypassToGroup`).
+
+---
+
+## 10. T39 — persistence and the Arbiter-owned handlers, and the wiring the human has to do
+
+T36 was research plus a codec. T39 makes it real on the Arbiter side: the schema of §3.3 in
+`Persistence/CharacterStore.cs`, and a handler layer in `Handlers/GuildHandlers.cs` that answers
+17 of the 19 Arbiter-side guild `C_` packets from rows. **Nothing is wired.** `HandlerRegistry`,
+`GameSession` and `WorldBridge` are human-owned; the diff is below.
+
+### What T39 implemented
+
+**`Persistence/CharacterStore.cs`** — seven tables (`guilds`, `guild_members`, `guild_groups`,
+`guild_applies`, `guild_invites`, `guild_log`, `guild_perks`), one new `characters` column
+(`guild_leave_time`, the real Arbiter's `User+0x3c48`), and ~35 methods, each named after the
+stored procedure it stands in for. Two deviations from §3.3, both deliberate: timestamps are unix
+seconds rather than `tagTIMESTAMP_STRUCT`, and `guild_members` is keyed by `user_db_id` alone
+because `spLeaveGuildMember` takes only a user id. `REFERENCES` clauses are documentation — this
+DB never sets `PRAGMA foreign_keys`, so `DeleteGuild` deletes its children explicitly, the way
+the friends and quests tables already do.
+
+**`Handlers/GuildHandlers.cs`** — pure, session-agnostic, `PartyManager`-shaped:
+
+```
+OnClientPacket(characterId, opcode, body) -> GuildActions { ToClients, ToWorld, Rejected }
+```
+
+Client packets come back as a NAME plus a field dictionary, addressed **by character db id**
+rather than by session ticket — db id is the key the guild tables use, and the routing layer is
+what resolves it to a ticket and drops the members who are offline. `AS_` frames come back as
+bytes from `GuildPackets` and are emitted-but-unwired, exactly like `PartyManager`'s.
+
+Answered: `C_REQUEST_GUILD_INFO` (all six window types), `C_REQUEST_GUILD_MEMBER_LIST`,
+`C_GET_GUILD_HISTORY`, `C_GUILD_APPLY_LIST`, `C_GUILD_APPLY_LIST_PAGE`, `C_GET_USER_GUILD_LOGO`,
+`C_UPDATE_GUILD_LOGO`, `C_UPDATE_GUILD_TITLE`, `C_SET_GUILD_JOIN_CONDITION`,
+`C_REQUEST_COOLTIME_TO_JOIN_GUILD`, `C_REQUEST_GUILD_INFO_BEFORE_APPLY_GUILD`,
+`C_CHECK_CHANGE_GUILDNAME`, `C_APPLY_GUILD`, `C_ACCEPT_GUILD_APPLY`,
+`C_REJECT_INVITE_USER_TO_GUILD`, `C_REQUEST_UPDATE_ANNOUNCE`, `C_REQUEST_UPDATE_INTRODUCE`.
+Plus `CreateGuild(...)`, which is not a client packet at all — guild creation arrives as
+`SDB_CREATE_GUILD2` on the DB-proxy link (§6), so this is the half the DB-proxy handler calls.
+
+Left for routing: **`C_INVITE_USER_TO_GUILD`** needs the target's live session (and the
+wanted-board manager) and **`C_CHANGE_GUILDNAME`** needs the `SDB_ASK_CHANGE_GUILD_NAME` round
+trip. `GuildHandlers.Handles(op)` is the implemented set; `GuildPackets.ArbiterHandlesClientPacket(op)`
+is still the wider Arbiter/World line.
+
+**`GuildPackets.NamedDefs`** (new, in `DbProxyStaticData.cs`) — `S_GUILD_INFO` and
+`S_GUILD_APPLY_LIST` re-stated with the field names the Arbiter's own dumper uses. Nothing
+changes a byte; the point is that the shipped `S_GUILD_INFO.1.def` calls 20 of its 31 fields
+`unk1`..`unk20`, and a handler filling that dictionary by number is unreviewable. Two fields also
+merge or split: `unk1`+`unk2` are one i64 `GuildInfo`, `unk12` is `LordBehaviorRank` +
+`LordBehaviorPoints`. `Guild_named_defs_are_byte_identical_to_the_shipped_ones` proves the
+rename is cosmetic by writing both and comparing bytes.
+
+**`GuildHandlers.ResolveDef(defs, name)`** is what makes §5.5's corrections take effect:
+`CorrectedDefs` first, then `NamedDefs`, then the shipped registry. Without it a handler emitting
+`S_ADD_GUILD_MEMBER` would send the `.def`'s 0x33-byte body instead of the 0x38 the Arbiter's
+dumper guard proves. **The wiring must call this, not `defs.Get(name)`.**
+
+### The wiring diff — human-owned files, not applied
+
+**1. `Handlers/HandlerRegistry.cs`** — after the social block:
+
+```csharp
+        // --- Guilds: Arbiter-owned reads/writes (T39). status/GUILD-DESIGN.md section 10.
+        var guild = new GuildHandlers(Program.Store!, loggerFactory.CreateLogger<GuildHandlers>());
+        void RegGuild(string name)
+        {
+            if (!opcodes.TryGetCode(name, out ushort op)) { log.LogError("{Name} not in opcode map", name); return; }
+            if (!GuildHandlers.Handles(op)) { log.LogError("{Name} is not answered by GuildHandlers", name); return; }
+            dispatcher.Register(op, name, GuildPackets.MinClientLength(op), (s, body) =>
+            {
+                var actions = guild.OnClientPacket(s.PlayerId, op, body.ToArray());
+                if (actions.Rejected != null) log.LogDebug("{Name}: {Why}", name, actions.Rejected);
+                foreach (var c in actions.ToClients)
+                {
+                    var target = GameSession.ByPlayerId(c.CharacterId);   // null = offline, drop it
+                    if (target == null) continue;
+                    if (c.IsRaw) target.Send(c.RawPacket!);
+                    else
+                    {
+                        var def = GuildHandlers.ResolveDef(defs, c.PacketName);   // NOT defs.Get
+                        if (def == null) { log.LogError("no def for {P}", c.PacketName); continue; }
+                        target.Send(target.Frame(c.PacketName, new DefinitionWriter().Write(def, c.Fields!)));
+                    }
+                }
+                foreach (var w in actions.ToWorld) Program.World?.SendFrame(w.Opcode, w.Payload);
+                return true;
+            });
+        }
+        foreach (var name in new[]
+        {
+            "C_REQUEST_GUILD_INFO", "C_REQUEST_GUILD_MEMBER_LIST", "C_GET_GUILD_HISTORY",
+            "C_GUILD_APPLY_LIST", "C_GUILD_APPLY_LIST_PAGE", "C_GET_USER_GUILD_LOGO",
+            "C_UPDATE_GUILD_LOGO", "C_UPDATE_GUILD_TITLE", "C_SET_GUILD_JOIN_CONDITION",
+            "C_REQUEST_COOLTIME_TO_JOIN_GUILD", "C_REQUEST_GUILD_INFO_BEFORE_APPLY_GUILD",
+            "C_CHECK_CHANGE_GUILDNAME", "C_APPLY_GUILD", "C_ACCEPT_GUILD_APPLY",
+            "C_REJECT_INVITE_USER_TO_GUILD", "C_REQUEST_UPDATE_ANNOUNCE", "C_REQUEST_UPDATE_INTRODUCE",
+        }) RegGuild(name);
+```
+
+Two things this needs that may not exist yet, both in human-owned files:
+
+* **`GameSession.ByPlayerId(int)`** — a db id → session lookup. The same thing
+  `status/MULTIPLAYER-DESIGN.md` §6 needs for party routing; if that lands first, reuse it.
+  Until it exists, the single-player shortcut is `c.CharacterId == s.PlayerId ? s : null`, which
+  is correct for every self-addressed reply and silently drops the broadcasts.
+* **`GameSession.Frame(name, body)`** — whatever `SendByDef` already uses internally to prepend
+  `[u16 len][u16 opcode]`. If `SendByDef` can take a pre-encoded body, call that instead.
+
+**2. The ten World-side guild `C_` packets must be tunnelled, not answered.** They are in
+§5.2 and in `GuildPackets.ArbiterHandlesClientPacket`. If the dispatcher already forwards
+anything unregistered to World, nothing is needed; if not, register them with the existing
+`RegNoop`-style forward. Answering one in the Arbiter double-answers the client, because World
+answers it too.
+
+**3. `World/DbProxyHandlers.cs`** (Cowork-editable, deliberately not done here) — the guild boot
+load. `SDB_INIT_GUILD` (0x27CF) is answered today by `WorldReplayTable` with `arb_world.log`'s
+bytes, which carry two leaked padding bytes (§2.1). With rows to build from, the answer becomes
+the §4.3 sequence: `DBS_INIT_GUILD_DATA` per guild → `0x27D0` → `0x27D1` → `0x27D2` → `0x27D3`,
+then a final `DBS_INIT_GUILD_DATA` with `Success = 0`. With no guilds in the DB that collapses to
+`GuildPackets.BuildEmptyDbsInitGuildData()`, which is byte-identical to the capture apart from
+the leak. That is a one-line replay change and a real win on its own.
+
+### What is NOT modelled
+
+Guild wars, quests, towers/city war, the warehouse, perks (the table exists, nothing fills it),
+the wanted board, contribution decay, the weekly play-time roll, and the level/exp curve
+(`guild_exp` is stored, `guildNextExp` is sent as 0). Every one of them has stored procedures in
+§3.1 and none is reachable until a guild exists live.
+
+Three numbers in `GuildHandlers` are ours, not the binary's, and are marked in the source:
+`GuildSize(level)`'s thresholds (the real one is a `FUN_140067ca0` datasheet lookup),
+`BaseMaxAccounts = 30` (the real one is `GuildConfigDataSheet+0x20`), and
+`RejoinCooldownSeconds = 0` (the real one is config). All three are settable.
+
+### Tests
+
+21, all prefixed `Guild_store_` or `Guild_handlers_`, plus two codec ones. The two that carry
+the most weight:
+
+* **`Guild_handlers_apply_then_accept_is_a_membership`** — the whole path in one golden test:
+  `spInsertGuildApply`, the apply-count broadcast to holders of the invite authority,
+  `spAddGuildMember`, the 0x0B history row, the `S_ADD_GUILD_MEMBER` fan-out, and the two World
+  frames in the order `GuildUtil::UserJoinToGuild` sends them — `AS_ADD_GUILDMEMBER` broadcast,
+  then `AS_GUILD_JOINED` to the joiner alone.
+* **`Guild_every_emitted_packet_encodes_through_the_codec`** — runs create → apply → accept →
+  announce → logo → every window type, and pushes all 19 emitted packets through
+  `ResolveDef` + the real `DefinitionWriter`. It asserts `S_ADD_GUILD_MEMBER` comes out with the
+  0x38 fixed part, which is the thing that fails the moment someone resolves defs the ordinary
+  way.
+
+No build is available in the Cowork container, so the whole handler layer and the def encoding
+were additionally transliterated into Python and run: 80 behavioural checks and 19 packet
+encodings, all green, before any of it was written to disk.

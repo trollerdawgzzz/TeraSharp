@@ -766,6 +766,132 @@ CREATE TABLE IF NOT EXISTS account_settings (
   blob       BLOB NOT NULL,
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+-- ---- Guilds (T39). Schema from status/GUILD-DESIGN.md section 3.3, which derives it
+-- column-by-column from the real Arbiter's spLoadAllGuild / spLoadAllGuildMemberData /
+-- spLoadGuildGroup binds. Two deliberate deviations from the original, both documented there:
+-- timestamps are unix seconds rather than tagTIMESTAMP_STRUCT (GuildPackets.BuildTimestamp
+-- converts at the wire edge), and guild_members is keyed by user_db_id alone because
+-- spLeaveGuildMember takes only a userDbId - a character is in at most one guild.
+--
+-- REFERENCES clauses are documentation, not enforcement: this DB never sets
+-- PRAGMA foreign_keys, exactly like the friends/quests tables above, so DeleteGuild deletes
+-- its children explicitly.
+--
+-- Not columns, on purpose: member_count, account_count, max_account_count, guild_size,
+-- policy_point, quest points. The real Arbiter computes every one of them at send time
+-- (max accounts = config + add_account_limit; guild_size from level), and a stored copy
+-- would drift.
+CREATE TABLE IF NOT EXISTS guilds (
+  guild_id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  name                  TEXT    NOT NULL UNIQUE COLLATE NOCASE,
+  chief_db_id           INTEGER NOT NULL,
+  create_date           INTEGER NOT NULL DEFAULT 0,
+  level                 INTEGER NOT NULL DEFAULT 1,
+  exp                   INTEGER NOT NULL DEFAULT 0,
+  point                 INTEGER NOT NULL DEFAULT 0,
+  money                 INTEGER NOT NULL DEFAULT 0,
+  announce              TEXT    NOT NULL DEFAULT '',
+  recommendation_point  INTEGER NOT NULL DEFAULT 0,
+  title                 TEXT    NOT NULL DEFAULT '',
+  logo                  BLOB,
+  logo_id               INTEGER NOT NULL DEFAULT 0,
+  promotion             TEXT    NOT NULL DEFAULT '',
+  war_acceptable        INTEGER NOT NULL DEFAULT 0,
+  war_toggle_time       INTEGER NOT NULL DEFAULT 0,
+  general_coin          INTEGER NOT NULL DEFAULT 0,
+  forever_emblem_id     INTEGER NOT NULL DEFAULT 0,
+  emblem_id             INTEGER NOT NULL DEFAULT 0,
+  preference            INTEGER NOT NULL DEFAULT 0,
+  join_min_level        INTEGER NOT NULL DEFAULT 1,
+  join_max_level        INTEGER NOT NULL DEFAULT 70,
+  join_type             INTEGER NOT NULL DEFAULT 1,
+  last_week_play_time   INTEGER NOT NULL DEFAULT 0,
+  this_week_play_time   INTEGER NOT NULL DEFAULT 0,
+  last_incentive_time   INTEGER NOT NULL DEFAULT 0,
+  add_account_limit     INTEGER NOT NULL DEFAULT 0,
+  created_at            TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+-- spLoadAllGuildMemberData's 17 columns. name/level/race/class/gender are DUPLICATED from
+-- characters on purpose: the real Arbiter keeps them in GuildMemberData so an OFFLINE member
+-- still renders in S_GUILD_MEMBER_LIST. state (online/offline) and can_guild_war are runtime
+-- only and are not stored - the load loop forces state to 2 (offline).
+CREATE TABLE IF NOT EXISTS guild_members (
+  user_db_id            INTEGER PRIMARY KEY REFERENCES characters(id),
+  guild_id              INTEGER NOT NULL REFERENCES guilds(guild_id),
+  name                  TEXT    NOT NULL,
+  world_id              INTEGER NOT NULL DEFAULT 0,
+  guard_id              INTEGER NOT NULL DEFAULT 0,
+  section_id            INTEGER NOT NULL DEFAULT 0,
+  guild_group_id        INTEGER NOT NULL DEFAULT 2,
+  user_level            INTEGER NOT NULL DEFAULT 1,
+  race                  INTEGER NOT NULL DEFAULT 0,
+  user_class            INTEGER NOT NULL DEFAULT 0,
+  gender                INTEGER NOT NULL DEFAULT 0,
+  introduce             TEXT    NOT NULL DEFAULT '',
+  last_logout_time      INTEGER NOT NULL DEFAULT 0,
+  account_id            INTEGER NOT NULL DEFAULT 0,
+  guild_join_date       INTEGER NOT NULL DEFAULT 0,
+  weekly_contribution   INTEGER NOT NULL DEFAULT 0,
+  total_contribution    INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS ix_guild_members_guild ON guild_members(guild_id);
+
+-- GuildGroupData = {i32 GuildGroupId, wchar Name[16], i32 Authority}. Authority is a bitmask;
+-- Guild::HaveGuildAuthorityWithLock tests (wanted & group.authority) != 0, and the chief
+-- bypasses it entirely.
+CREATE TABLE IF NOT EXISTS guild_groups (
+  guild_id              INTEGER NOT NULL REFERENCES guilds(guild_id),
+  guild_group_id        INTEGER NOT NULL,
+  name                  TEXT    NOT NULL,
+  authority             INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (guild_id, guild_group_id)
+);
+
+-- spInsertGuildApply / spLoadGuildApplyList / spDeleteGuildApply*
+CREATE TABLE IF NOT EXISTS guild_applies (
+  guild_id              INTEGER NOT NULL REFERENCES guilds(guild_id),
+  user_db_id            INTEGER NOT NULL REFERENCES characters(id),
+  join_msg              TEXT    NOT NULL DEFAULT '',
+  applied_at            INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (guild_id, user_db_id)
+);
+
+-- spAddInviteUserToGuild / spLoadInviteUserToGuild / spDeleteInviteUserToGuild*
+CREATE TABLE IF NOT EXISTS guild_invites (
+  guild_id              INTEGER NOT NULL REFERENCES guilds(guild_id),
+  user_db_id            INTEGER NOT NULL REFERENCES characters(id),
+  invitor_db_id         INTEGER NOT NULL DEFAULT 0,
+  invited_at            INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (guild_id, user_db_id)
+);
+
+-- spCreateGuildLog / spLoadGuildLog. The real proc binds 13 parameters; these are the ones
+-- S_GUILD_HISTORY can actually render (log_time, action_type, actor_name, detail) plus the
+-- ids worth keeping.
+CREATE TABLE IF NOT EXISTS guild_log (
+  id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+  guild_id              INTEGER NOT NULL REFERENCES guilds(guild_id),
+  action_type           INTEGER NOT NULL DEFAULT 0,
+  log_time              INTEGER NOT NULL DEFAULT 0,
+  actor_db_id           INTEGER NOT NULL DEFAULT 0,
+  actor_name            TEXT    NOT NULL DEFAULT '',
+  target_name           TEXT    NOT NULL DEFAULT '',
+  param_int             INTEGER NOT NULL DEFAULT 0,
+  param_i64             INTEGER NOT NULL DEFAULT 0,
+  detail                TEXT    NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS ix_guild_log_guild_time ON guild_log(guild_id, log_time DESC, id DESC);
+
+-- spLoadGuildPerkList returns {int perkId, tinyint, tinyint}. Stored so DBS_INIT_GUILD_PERK_LIST
+-- has rows to build from; nothing reads them yet.
+CREATE TABLE IF NOT EXISTS guild_perks (
+  guild_id              INTEGER NOT NULL REFERENCES guilds(guild_id),
+  perk_id               INTEGER NOT NULL,
+  flag_a                INTEGER NOT NULL DEFAULT 0,
+  flag_b                INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (guild_id, perk_id)
+);
 ");
         // CREATE TABLE IF NOT EXISTS does nothing to a DB that already has `characters`, so
         // columns added later need their own idempotent step. terasharp.db predates `exp`.
@@ -786,6 +912,8 @@ CREATE TABLE IF NOT EXISTS account_settings (
         AddColumnIfMissing("characters", "sample_group_provided", "INTEGER NOT NULL DEFAULT 0");
         // T32: GM level, per account (see AccountRecord.AdminLevel).
         AddColumnIfMissing("accounts", "admin_level", "INTEGER NOT NULL DEFAULT 0");
+        // T39: when this character last left a guild (User+0x3c48), for Guild::CanRejoinGuild.
+        AddColumnIfMissing("characters", "guild_leave_time", "INTEGER NOT NULL DEFAULT 0");
     }
 
     /// <summary>ALTER TABLE ADD COLUMN, but a no-op when the column is already there.</summary>
@@ -2114,6 +2242,829 @@ DELETE FROM blocks  WHERE character_id IN (SELECT id FROM characters WHERE id = 
             cmd.Parameters.AddWithValue("$c", characterId);
             cmd.Parameters.AddWithValue("$b", blockedId);
             return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+
+    // =======================================================================================
+    // Guilds (T39). Research and the column-by-column derivation: status/GUILD-DESIGN.md.
+    //
+    // Guilds are the mirror image of parties: a party lives only in Arbiter RAM and is never
+    // persisted, a guild is persisted BY THE ARBITER in SQL and World only gets a read-only
+    // mirror. That is why this lives here and not in a manager - status/GUILD-DESIGN.md section 0.
+    //
+    // Every method below maps to a named stored procedure in the real Arbiter; the comment on
+    // each says which. Timestamps are unix seconds (see the DDL note in Migrate).
+    // =======================================================================================
+
+    /// <summary>Announce is a wchar[201] in GuildData (Guild::UpdateGuildAnnounce truncates with
+    /// <c>wcsncpy_s(guild+0x118, 0xc9, ...)</c>), so 200 characters plus the NUL.</summary>
+    public const int MaxGuildAnnounce = 200;
+    /// <summary>GuildTitle is a wchar[15]: <c>wcsncpy_s(guild+0x2b4, 0xf, ...)</c>.</summary>
+    public const int MaxGuildTitle = 14;
+    /// <summary>GuildPromotion (the recruit blurb) is a wchar[201], same as the announce.</summary>
+    public const int MaxGuildPromotion = 200;
+    /// <summary>A member's own note: <c>wcsncpy_s(member+0x90, 0x1f, ...)</c>.</summary>
+    public const int MaxGuildIntroduce = 30;
+    /// <summary>GuildName is a wchar[37].</summary>
+    public const int MaxGuildName = 36;
+    /// <summary>GuildGroupData.Name is a wchar[16].</summary>
+    public const int MaxGuildGroupName = 15;
+    /// <summary>Guild::UpdateGuildLogo rejects <c>8000 &lt; len</c> before it binds the varbinary.</summary>
+    public const int MaxGuildLogoBytes = 8000;
+
+    /// <summary>The group id a new member gets. Hardcoded in Guild::AddUserToGuildMemberNoLock
+    /// (<c>local_dc = 2</c>).</summary>
+    public const int DefaultGuildGroupId = 2;
+
+    /// <summary>One row of <c>guilds</c>. Field order follows spLoadAllGuild's 28 column binds.</summary>
+    public sealed record GuildRow(
+        int GuildId, string Name, int ChiefDbId, long CreateDate, int Level, long Exp, long Point,
+        long Money, string Announce, int RecommendationPoint, string Title, int LogoId,
+        string Promotion, bool WarAcceptable, long WarToggleTime, int GeneralCoin,
+        int ForeverEmblemId, int EmblemId, int Preference, int JoinMinLevel, int JoinMaxLevel,
+        int JoinType, long LastWeekPlayTime, long ThisWeekPlayTime, long LastIncentiveTime,
+        int AddAccountLimit);
+
+    /// <summary>One row of <c>guild_members</c> - the persisted half of GuildMemberData (0xF0).
+    /// State and CanGuildWar are runtime-only and deliberately absent.</summary>
+    public sealed record GuildMemberRow(
+        int UserDbId, int GuildId, string Name, int WorldId, int GuardId, int SectionId,
+        int GuildGroupId, int UserLevel, int Race, int UserClass, int Gender, string Introduce,
+        long LastLogoutTime, long AccountId, long GuildJoinDate, int WeeklyContribution,
+        long TotalContribution);
+
+    /// <summary>GuildGroupData (0x28): id, wchar[16] name, authority bitmask.</summary>
+    public sealed record GuildGroupRow(int GuildGroupId, string Name, int Authority);
+
+    public sealed record GuildApplyRow(int UserDbId, string JoinMsg, long AppliedAt);
+    public sealed record GuildInviteRow(int GuildId, int UserDbId, int InvitorDbId, long InvitedAt);
+    public sealed record GuildLogRow(
+        long Id, int ActionType, long LogTime, int ActorDbId, string ActorName, string TargetName,
+        int ParamInt, long ParamI64, string Detail);
+
+    private const string GuildColumns =
+        "guild_id, name, chief_db_id, create_date, level, exp, point, money, announce, " +
+        "recommendation_point, title, logo_id, promotion, war_acceptable, war_toggle_time, " +
+        "general_coin, forever_emblem_id, emblem_id, preference, join_min_level, join_max_level, " +
+        "join_type, last_week_play_time, this_week_play_time, last_incentive_time, add_account_limit";
+
+    private static GuildRow ReadGuild(SqliteDataReader r) => new(
+        r.GetInt32(0), r.GetString(1), r.GetInt32(2), r.GetInt64(3), r.GetInt32(4), r.GetInt64(5),
+        r.GetInt64(6), r.GetInt64(7), r.GetString(8), r.GetInt32(9), r.GetString(10), r.GetInt32(11),
+        r.GetString(12), r.GetInt32(13) != 0, r.GetInt64(14), r.GetInt32(15), r.GetInt32(16),
+        r.GetInt32(17), r.GetInt32(18), r.GetInt32(19), r.GetInt32(20), r.GetInt32(21),
+        r.GetInt64(22), r.GetInt64(23), r.GetInt64(24), r.GetInt32(25));
+
+    private const string GuildMemberColumns =
+        "user_db_id, guild_id, name, world_id, guard_id, section_id, guild_group_id, user_level, " +
+        "race, user_class, gender, introduce, last_logout_time, account_id, guild_join_date, " +
+        "weekly_contribution, total_contribution";
+
+    private static GuildMemberRow ReadGuildMember(SqliteDataReader r) => new(
+        r.GetInt32(0), r.GetInt32(1), r.GetString(2), r.GetInt32(3), r.GetInt32(4), r.GetInt32(5),
+        r.GetInt32(6), r.GetInt32(7), r.GetInt32(8), r.GetInt32(9), r.GetInt32(10), r.GetString(11),
+        r.GetInt64(12), r.GetInt64(13), r.GetInt64(14), r.GetInt32(15), r.GetInt64(16));
+
+    private static string Clamp(string? s, int max)
+    {
+        s ??= "";
+        return s.Length <= max ? s : s[..max];
+    }
+
+    // ---- guilds ----
+
+    /// <summary>
+    /// spCreateGuild(nvarchar name, int chiefDbId, bit warAcceptable) -> OUT int guildDbId.
+    /// Returns 0 when the name is already taken, which is what the OUT parameter being 0 means
+    /// in GuildManager::CreateGuildData (`if (local_158[0] == 0) ... abort`).
+    /// Also seeds the two ranks SDB_CREATE_GUILD2 carries names for and inserts the chief.
+    /// </summary>
+    public int CreateGuild(string name, int chiefDbId, bool warAcceptable,
+        string masterGroupName = "Master", string memberGroupName = "Member", long createdAt = 0)
+    {
+        ArgumentNullException.ThrowIfNull(name);
+        if (name.Length == 0) return 0;
+        lock (_lock)
+        {
+            using var tx = _db.BeginTransaction();
+            using (var probe = _db.CreateCommand())
+            {
+                probe.Transaction = tx;
+                probe.CommandText = "SELECT COUNT(*) FROM guilds WHERE name = $n COLLATE NOCASE";
+                probe.Parameters.AddWithValue("$n", name);
+                if ((long)probe.ExecuteScalar()! > 0) return 0;
+            }
+            if (createdAt == 0) createdAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+
+            int guildId;
+            using (var ins = _db.CreateCommand())
+            {
+                ins.Transaction = tx;
+                ins.CommandText =
+                    "INSERT INTO guilds(name, chief_db_id, create_date, war_acceptable) " +
+                    "VALUES($n,$c,$d,$w); SELECT last_insert_rowid()";
+                ins.Parameters.AddWithValue("$n", Clamp(name, MaxGuildName));
+                ins.Parameters.AddWithValue("$c", chiefDbId);
+                ins.Parameters.AddWithValue("$d", createdAt);
+                ins.Parameters.AddWithValue("$w", warAcceptable ? 1 : 0);
+                guildId = Convert.ToInt32(ins.ExecuteScalar()!);
+            }
+
+            // The two groups SDB_CREATE_GUILD2 names. Group 1 is the officer rank (authority
+            // 0x7F = every bit we have seen used); group 2 is the plain-member rank and is the
+            // id Guild::AddUserToGuildMemberNoLock hands every new member.
+            InsertGroup(tx, guildId, 1, masterGroupName, GuildAuthorityAll);
+            InsertGroup(tx, guildId, DefaultGuildGroupId, memberGroupName, 0);
+            tx.Commit();
+            return guildId;
+        }
+    }
+
+    /// <summary>Every authority bit the decompile actually tests, OR-ed. Guild::HaveGuildAuthorityWithLock
+    /// masks seen in callers: 0x01 invite/applications, 0x02, 0x04 announce, 0x10, 0x20, 0x40.</summary>
+    public const int GuildAuthorityAll = 0x7F;
+    /// <summary>Bit 0: invite a user and manage the apply list. C_INVITE_USER_TO_GUILD's handler
+    /// and GuildJoinManager::SendGuildApplyList both test it (mask 1).</summary>
+    public const int GuildAuthorityInvite = 0x01;
+    /// <summary>Bit 2: change the announce. Guild::UpdateGuildAnnounce tests mask 4.</summary>
+    public const int GuildAuthorityAnnounce = 0x04;
+
+    private void InsertGroup(SqliteTransaction tx, int guildId, int groupId, string name, int authority)
+    {
+        using var cmd = _db.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = "INSERT OR REPLACE INTO guild_groups(guild_id, guild_group_id, name, authority) " +
+                          "VALUES($g,$i,$n,$a)";
+        cmd.Parameters.AddWithValue("$g", guildId);
+        cmd.Parameters.AddWithValue("$i", groupId);
+        cmd.Parameters.AddWithValue("$n", Clamp(name, MaxGuildGroupName));
+        cmd.Parameters.AddWithValue("$a", authority);
+        cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>spLoadAllGuild, one row.</summary>
+    public GuildRow? GetGuild(int guildId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = $"SELECT {GuildColumns} FROM guilds WHERE guild_id = $g";
+            cmd.Parameters.AddWithValue("$g", guildId);
+            using var r = cmd.ExecuteReader();
+            return r.Read() ? ReadGuild(r) : null;
+        }
+    }
+
+    /// <summary>GuildManager::GetGuildWithLock(const wchar_t *) - the by-name lookup
+    /// C_APPLY_GUILD and C_REQUEST_GUILD_INFO_BEFORE_APPLY_GUILD use when the id is 0.</summary>
+    public GuildRow? GetGuildByName(string name)
+    {
+        ArgumentNullException.ThrowIfNull(name);
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = $"SELECT {GuildColumns} FROM guilds WHERE name = $n COLLATE NOCASE";
+            cmd.Parameters.AddWithValue("$n", name);
+            using var r = cmd.ExecuteReader();
+            return r.Read() ? ReadGuild(r) : null;
+        }
+    }
+
+    /// <summary>spLoadAllGuild with no parameter - every guild, for the DBS_INIT_GUILD_* boot load.</summary>
+    public List<GuildRow> GetAllGuilds()
+    {
+        lock (_lock)
+        {
+            var list = new List<GuildRow>();
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = $"SELECT {GuildColumns} FROM guilds ORDER BY guild_id";
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) list.Add(ReadGuild(r));
+            return list;
+        }
+    }
+
+    /// <summary>True when a guild already has this name. spCreateGuild's uniqueness check, and
+    /// the answer C_CHECK_CHANGE_GUILDNAME needs.</summary>
+    public bool GuildNameTaken(string name)
+    {
+        ArgumentNullException.ThrowIfNull(name);
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT COUNT(*) FROM guilds WHERE name = $n COLLATE NOCASE";
+            cmd.Parameters.AddWithValue("$n", name);
+            return (long)cmd.ExecuteScalar()! > 0;
+        }
+    }
+
+    /// <summary>spUpdateGuildAnnounce(int guildDbId, nvarchar announce). Truncated to 200 chars,
+    /// exactly as Guild::UpdateGuildAnnounce does when it copies into GuildData+0x118.</summary>
+    public bool UpdateGuildAnnounce(int guildId, string announce)
+        => SetGuildText(guildId, "announce", Clamp(announce, MaxGuildAnnounce));
+
+    /// <summary>spUpdateGuildTitle(int guildDbId, nvarchar title). wchar[15].</summary>
+    public bool UpdateGuildTitle(int guildId, string title)
+        => SetGuildText(guildId, "title", Clamp(title, MaxGuildTitle));
+
+    /// <summary>spUpdateGuildPromotionStr - the recruit blurb S_GUILD_INFO carries as GuildPromotion.</summary>
+    public bool UpdateGuildPromotion(int guildId, string promotion)
+        => SetGuildText(guildId, "promotion", Clamp(promotion, MaxGuildPromotion));
+
+    private bool SetGuildText(int guildId, string column, string value)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = $"UPDATE guilds SET {column} = $v WHERE guild_id = $g";
+            cmd.Parameters.AddWithValue("$v", value);
+            cmd.Parameters.AddWithValue("$g", guildId);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    /// <summary>
+    /// spUpdateGuildJoinCondition. The four values C_SET_GUILD_JOIN_CONDITION carries; the
+    /// introduction string it also carries is the guild's promotion blurb, so pass it to
+    /// <see cref="UpdateGuildPromotion"/>.
+    /// </summary>
+    public bool UpdateGuildJoinCondition(int guildId, int minLevel, int maxLevel, int joinType, int preference)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE guilds SET join_min_level = $min, join_max_level = $max, " +
+                              "join_type = $t, preference = $p WHERE guild_id = $g";
+            cmd.Parameters.AddWithValue("$min", minLevel);
+            cmd.Parameters.AddWithValue("$max", maxLevel);
+            cmd.Parameters.AddWithValue("$t", joinType);
+            cmd.Parameters.AddWithValue("$p", preference);
+            cmd.Parameters.AddWithValue("$g", guildId);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    /// <summary>
+    /// spUpdateGuildLogo(int guildDbId, varbinary logo, int newLogoId). The real Arbiter computes
+    /// the new id as <c>Guild+0x2434 + 1</c> and stores the byte length beside it; we bump the
+    /// stored id the same way. Returns the new logo id, or 0 when the guild is missing or the
+    /// blob is over 8000 bytes - the cap Guild::UpdateGuildLogo enforces before binding.
+    /// </summary>
+    public int UpdateGuildLogo(int guildId, byte[]? logo)
+    {
+        if (logo != null && logo.Length > MaxGuildLogoBytes) return 0;
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE guilds SET logo = $l, logo_id = logo_id + 1 WHERE guild_id = $g; " +
+                              "SELECT logo_id FROM guilds WHERE guild_id = $g";
+            cmd.Parameters.AddWithValue("$l", (object?)logo ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$g", guildId);
+            var v = cmd.ExecuteScalar();
+            return v == null || v == DBNull.Value ? 0 : Convert.ToInt32(v);
+        }
+    }
+
+    /// <summary>The raw logo image, or null. Guild::SendGuildLogo reads it to build
+    /// S_GET_USER_GUILD_LOGO; it never crosses the World link.</summary>
+    public byte[]? GetGuildLogo(int guildId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT logo FROM guilds WHERE guild_id = $g";
+            cmd.Parameters.AddWithValue("$g", guildId);
+            using var r = cmd.ExecuteReader();
+            if (!r.Read() || r.IsDBNull(0)) return null;
+            return (byte[])r["logo"];
+        }
+    }
+
+    /// <summary>spChangeGuildChief(int guildDbId, int newChiefDbId).</summary>
+    public bool ChangeGuildChief(int guildId, int newChiefDbId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE guilds SET chief_db_id = $c WHERE guild_id = $g";
+            cmd.Parameters.AddWithValue("$c", newChiefDbId);
+            cmd.Parameters.AddWithValue("$g", guildId);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    /// <summary>
+    /// spDeleteGuild(int guildDbId), plus the children the real Arbiter drops through
+    /// spDeleteGuildMemberDataOfGuild / spDeleteGuildGroup / spDeleteGuildApplyForGuildSide /
+    /// spDeleteInviteUserToGuildForGuildSide. Explicit because this DB never enables
+    /// PRAGMA foreign_keys.
+    /// </summary>
+    public bool DeleteGuild(int guildId)
+    {
+        lock (_lock)
+        {
+            using var tx = _db.BeginTransaction();
+            foreach (var table in new[] { "guild_members", "guild_groups", "guild_applies",
+                                          "guild_invites", "guild_log", "guild_perks" })
+            {
+                using var del = _db.CreateCommand();
+                del.Transaction = tx;
+                del.CommandText = $"DELETE FROM {table} WHERE guild_id = $g";
+                del.Parameters.AddWithValue("$g", guildId);
+                del.ExecuteNonQuery();
+            }
+            int n;
+            using (var cmd = _db.CreateCommand())
+            {
+                cmd.Transaction = tx;
+                cmd.CommandText = "DELETE FROM guilds WHERE guild_id = $g";
+                cmd.Parameters.AddWithValue("$g", guildId);
+                n = cmd.ExecuteNonQuery();
+            }
+            tx.Commit();
+            return n > 0;
+        }
+    }
+
+    // ---- members ----
+
+    /// <summary>spLoadAllGuildMemberData(int guildDbId), in join order - the order
+    /// S_GUILD_MEMBER_LIST walks the map.</summary>
+    public List<GuildMemberRow> GetGuildMembers(int guildId)
+    {
+        lock (_lock)
+        {
+            var list = new List<GuildMemberRow>();
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = $"SELECT {GuildMemberColumns} FROM guild_members " +
+                              "WHERE guild_id = $g ORDER BY guild_join_date, user_db_id";
+            cmd.Parameters.AddWithValue("$g", guildId);
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) list.Add(ReadGuildMember(r));
+            return list;
+        }
+    }
+
+    /// <summary>One member row, or null when the character is in no guild. The lookup
+    /// spLeaveGuildMember implies: a character is in at most one guild.</summary>
+    public GuildMemberRow? GetGuildMember(int userDbId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = $"SELECT {GuildMemberColumns} FROM guild_members WHERE user_db_id = $u";
+            cmd.Parameters.AddWithValue("$u", userDbId);
+            using var r = cmd.ExecuteReader();
+            return r.Read() ? ReadGuildMember(r) : null;
+        }
+    }
+
+    /// <summary>The guild a character belongs to, or 0. User+0x1b54 in the real Arbiter.</summary>
+    public int GetGuildIdOf(int userDbId) => GetGuildMember(userDbId)?.GuildId ?? 0;
+
+    /// <summary>
+    /// spAddGuildMember(int userDbId, int guildDbId, int guildGroupId) -> OUT rows, OUT joinDate.
+    /// Returns the join date it stored, or 0 when the character is already in a guild - the real
+    /// Arbiter's OUT rows == 0 case.
+    /// </summary>
+    public long AddGuildMember(int guildId, int userDbId, string name, int race, int userClass,
+        int gender, int level, long accountId, int guildGroupId = DefaultGuildGroupId, long joinDate = 0)
+    {
+        ArgumentNullException.ThrowIfNull(name);
+        lock (_lock)
+        {
+            using var probe = _db.CreateCommand();
+            probe.CommandText = "SELECT COUNT(*) FROM guild_members WHERE user_db_id = $u";
+            probe.Parameters.AddWithValue("$u", userDbId);
+            if ((long)probe.ExecuteScalar()! > 0) return 0;
+
+            if (joinDate == 0) joinDate = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "INSERT INTO guild_members(user_db_id, guild_id, name, guild_group_id, user_level, " +
+                "race, user_class, gender, account_id, guild_join_date) " +
+                "VALUES($u,$g,$n,$grp,$lvl,$race,$cls,$sex,$acc,$jd)";
+            cmd.Parameters.AddWithValue("$u", userDbId);
+            cmd.Parameters.AddWithValue("$g", guildId);
+            cmd.Parameters.AddWithValue("$n", name);
+            cmd.Parameters.AddWithValue("$grp", guildGroupId);
+            cmd.Parameters.AddWithValue("$lvl", level);
+            cmd.Parameters.AddWithValue("$race", race);
+            cmd.Parameters.AddWithValue("$cls", userClass);
+            cmd.Parameters.AddWithValue("$sex", gender);
+            cmd.Parameters.AddWithValue("$acc", accountId);
+            cmd.Parameters.AddWithValue("$jd", joinDate);
+            cmd.ExecuteNonQuery();
+            return joinDate;
+        }
+    }
+
+    /// <summary>
+    /// spLeaveGuildMember(int userDbId) - the SAME proc for leaving and being kicked; there is
+    /// no spBanishGuildMember (status/GUILD-DESIGN.md section 3.1). Its second OUT parameter is
+    /// the leave time, which the real Arbiter keeps at User+0x3c48 and Guild::CanRejoinGuild
+    /// reads later, so it is stamped on the character here.
+    /// </summary>
+    public bool RemoveGuildMember(int userDbId, long leftAt = 0)
+    {
+        lock (_lock)
+        {
+            if (leftAt == 0) leftAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            int n;
+            using (var cmd = _db.CreateCommand())
+            {
+                cmd.CommandText = "DELETE FROM guild_members WHERE user_db_id = $u";
+                cmd.Parameters.AddWithValue("$u", userDbId);
+                n = cmd.ExecuteNonQuery();
+            }
+            if (n > 0)
+            {
+                using var stamp = _db.CreateCommand();
+                stamp.CommandText = "UPDATE characters SET guild_leave_time = $t WHERE id = $u";
+                stamp.Parameters.AddWithValue("$t", leftAt);
+                stamp.Parameters.AddWithValue("$u", userDbId);
+                stamp.ExecuteNonQuery();
+            }
+            return n > 0;
+        }
+    }
+
+    /// <summary>
+    /// When this character last left a guild, 0 if never. User+0x3c48 in the real Arbiter;
+    /// Guild::CanRejoinGuild compares it against a config cooldown to answer
+    /// S_REQUEST_COOLTIME_TO_JOIN_GUILD.
+    /// </summary>
+    public long GetGuildLeaveTime(int characterId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT guild_leave_time FROM characters WHERE id = $u";
+            cmd.Parameters.AddWithValue("$u", characterId);
+            var v = cmd.ExecuteScalar();
+            return v == null || v == DBNull.Value ? 0 : Convert.ToInt64(v);
+        }
+    }
+
+    /// <summary>spUpdateGuildMember(int userDbId, int guildDbId, int newGuildGroupId) -
+    /// Guild::ChangeGuildGroup, i.e. a rank change.</summary>
+    public bool SetGuildMemberGroup(int userDbId, int guildGroupId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE guild_members SET guild_group_id = $grp WHERE user_db_id = $u";
+            cmd.Parameters.AddWithValue("$grp", guildGroupId);
+            cmd.Parameters.AddWithValue("$u", userDbId);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    /// <summary>spUpdateUserGuildIntroduce(int userDbId, nvarchar introduce). Truncated to 30
+    /// chars, as Guild::UpdateGuildmemberIntroduce does (wcsncpy_s(member+0x90, 0x1f, ...)).</summary>
+    public bool UpdateGuildMemberIntroduce(int userDbId, string introduce)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE guild_members SET introduce = $i WHERE user_db_id = $u";
+            cmd.Parameters.AddWithValue("$i", Clamp(introduce, MaxGuildIntroduce));
+            cmd.Parameters.AddWithValue("$u", userDbId);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    /// <summary>The five fields AS_UPDATE_GUILD_MEMBER carries, written back when a member moves
+    /// or levels. The real Arbiter keeps them in GuildMemberData so an offline member still
+    /// renders in S_GUILD_MEMBER_LIST.</summary>
+    public bool UpdateGuildMemberLocation(int userDbId, int worldId, int guardId, int sectionId,
+        int level, long lastLogoutTime)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE guild_members SET world_id = $w, guard_id = $g, section_id = $s, " +
+                              "user_level = $l, last_logout_time = $t WHERE user_db_id = $u";
+            cmd.Parameters.AddWithValue("$w", worldId);
+            cmd.Parameters.AddWithValue("$g", guardId);
+            cmd.Parameters.AddWithValue("$s", sectionId);
+            cmd.Parameters.AddWithValue("$l", level);
+            cmd.Parameters.AddWithValue("$t", lastLogoutTime);
+            cmd.Parameters.AddWithValue("$u", userDbId);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    /// <summary>spUpdateGuildContributionPoint(.., int weekly, bigint total).</summary>
+    public bool AddGuildContribution(int userDbId, int weekly, long total)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE guild_members SET weekly_contribution = weekly_contribution + $w, " +
+                              "total_contribution = total_contribution + $t WHERE user_db_id = $u";
+            cmd.Parameters.AddWithValue("$w", weekly);
+            cmd.Parameters.AddWithValue("$t", total);
+            cmd.Parameters.AddWithValue("$u", userDbId);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    // ---- groups / ranks ----
+
+    /// <summary>spLoadGuildGroup(int guildDbId).</summary>
+    public List<GuildGroupRow> GetGuildGroups(int guildId)
+    {
+        lock (_lock)
+        {
+            var list = new List<GuildGroupRow>();
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT guild_group_id, name, authority FROM guild_groups " +
+                              "WHERE guild_id = $g ORDER BY guild_group_id";
+            cmd.Parameters.AddWithValue("$g", guildId);
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) list.Add(new GuildGroupRow(r.GetInt32(0), r.GetString(1), r.GetInt32(2)));
+            return list;
+        }
+    }
+
+    /// <summary>One group, or null. The lookup behind Guild::HaveGuildAuthorityWithLock.</summary>
+    public GuildGroupRow? GetGuildGroup(int guildId, int guildGroupId)
+    {
+        foreach (var g in GetGuildGroups(guildId))
+            if (g.GuildGroupId == guildGroupId) return g;
+        return null;
+    }
+
+    /// <summary>
+    /// Guild::HaveGuildAuthorityWithLock(User*, enum GuildAuthority): the chief always passes;
+    /// anyone else passes when <c>(wanted &amp; group.authority) != 0</c>.
+    /// </summary>
+    public bool HasGuildAuthority(int guildId, int userDbId, int wanted)
+    {
+        var guild = GetGuild(guildId);
+        if (guild == null) return false;
+        if (guild.ChiefDbId == userDbId) return true;
+        var member = GetGuildMember(userDbId);
+        if (member == null || member.GuildId != guildId) return false;
+        var group = GetGuildGroup(guildId, member.GuildGroupId);
+        return group != null && (wanted & group.Authority) != 0;
+    }
+
+    /// <summary>spCreateGuildGroup(int guildDbId, int guildGroupId, nvarchar name, int authority).</summary>
+    public bool CreateGuildGroup(int guildId, int guildGroupId, string name, int authority)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "INSERT OR REPLACE INTO guild_groups(guild_id, guild_group_id, name, authority) " +
+                              "VALUES($g,$i,$n,$a)";
+            cmd.Parameters.AddWithValue("$g", guildId);
+            cmd.Parameters.AddWithValue("$i", guildGroupId);
+            cmd.Parameters.AddWithValue("$n", Clamp(name, MaxGuildGroupName));
+            cmd.Parameters.AddWithValue("$a", authority);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    /// <summary>spUpdateGuildGroupAuthority(int guildDbId, int guildGroupId, int authority, nvarchar name).
+    /// Note the real proc renames AND re-authorises in one call.</summary>
+    public bool SetGuildGroupAuthority(int guildId, int guildGroupId, int authority, string name)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE guild_groups SET authority = $a, name = $n " +
+                              "WHERE guild_id = $g AND guild_group_id = $i";
+            cmd.Parameters.AddWithValue("$a", authority);
+            cmd.Parameters.AddWithValue("$n", Clamp(name, MaxGuildGroupName));
+            cmd.Parameters.AddWithValue("$g", guildId);
+            cmd.Parameters.AddWithValue("$i", guildGroupId);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    /// <summary>spDeleteGuildGroup(int guildDbId, int guildGroupId). Members on the removed rank
+    /// fall back to the default group, the same way DeleteFriendGroup moves orphans to 1.</summary>
+    public bool DeleteGuildGroup(int guildId, int guildGroupId)
+    {
+        if (guildGroupId == DefaultGuildGroupId) return false;
+        lock (_lock)
+        {
+            using var tx = _db.BeginTransaction();
+            using (var move = _db.CreateCommand())
+            {
+                move.Transaction = tx;
+                move.CommandText = "UPDATE guild_members SET guild_group_id = $d " +
+                                   "WHERE guild_id = $g AND guild_group_id = $i";
+                move.Parameters.AddWithValue("$d", DefaultGuildGroupId);
+                move.Parameters.AddWithValue("$g", guildId);
+                move.Parameters.AddWithValue("$i", guildGroupId);
+                move.ExecuteNonQuery();
+            }
+            int n;
+            using (var cmd = _db.CreateCommand())
+            {
+                cmd.Transaction = tx;
+                cmd.CommandText = "DELETE FROM guild_groups WHERE guild_id = $g AND guild_group_id = $i";
+                cmd.Parameters.AddWithValue("$g", guildId);
+                cmd.Parameters.AddWithValue("$i", guildGroupId);
+                n = cmd.ExecuteNonQuery();
+            }
+            tx.Commit();
+            return n > 0;
+        }
+    }
+
+    // ---- applies and invites ----
+
+    /// <summary>spInsertGuildApply. One row per (guild, applicant); re-applying overwrites the
+    /// message, which is what an INSERT on the real primary key does.</summary>
+    public void InsertGuildApply(int guildId, int userDbId, string joinMsg, long appliedAt = 0)
+    {
+        lock (_lock)
+        {
+            if (appliedAt == 0) appliedAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "INSERT INTO guild_applies(guild_id, user_db_id, join_msg, applied_at) " +
+                              "VALUES($g,$u,$m,$t) ON CONFLICT(guild_id, user_db_id) DO UPDATE SET " +
+                              "join_msg = $m, applied_at = $t";
+            cmd.Parameters.AddWithValue("$g", guildId);
+            cmd.Parameters.AddWithValue("$u", userDbId);
+            cmd.Parameters.AddWithValue("$m", joinMsg ?? "");
+            cmd.Parameters.AddWithValue("$t", appliedAt);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>spLoadGuildApplyList(int guildDbId), oldest first.</summary>
+    public List<GuildApplyRow> GetGuildApplies(int guildId)
+    {
+        lock (_lock)
+        {
+            var list = new List<GuildApplyRow>();
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT user_db_id, join_msg, applied_at FROM guild_applies " +
+                              "WHERE guild_id = $g ORDER BY applied_at, user_db_id";
+            cmd.Parameters.AddWithValue("$g", guildId);
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) list.Add(new GuildApplyRow(r.GetInt32(0), r.GetString(1), r.GetInt64(2)));
+            return list;
+        }
+    }
+
+    /// <summary>spDeleteGuildApply(guildDbId, userDbId).</summary>
+    public bool DeleteGuildApply(int guildId, int userDbId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "DELETE FROM guild_applies WHERE guild_id = $g AND user_db_id = $u";
+            cmd.Parameters.AddWithValue("$g", guildId);
+            cmd.Parameters.AddWithValue("$u", userDbId);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    /// <summary>spDeleteGuildApplyForUserSide(userDbId) - every application this character has
+    /// out, dropped the moment they join a guild.</summary>
+    public int DeleteGuildAppliesOfUser(int userDbId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "DELETE FROM guild_applies WHERE user_db_id = $u";
+            cmd.Parameters.AddWithValue("$u", userDbId);
+            return cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>spAddInviteUserToGuild(guildDbId, userDbId, invitorDbId).</summary>
+    public void AddGuildInvite(int guildId, int userDbId, int invitorDbId, long invitedAt = 0)
+    {
+        lock (_lock)
+        {
+            if (invitedAt == 0) invitedAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "INSERT INTO guild_invites(guild_id, user_db_id, invitor_db_id, invited_at) " +
+                              "VALUES($g,$u,$i,$t) ON CONFLICT(guild_id, user_db_id) DO UPDATE SET " +
+                              "invitor_db_id = $i, invited_at = $t";
+            cmd.Parameters.AddWithValue("$g", guildId);
+            cmd.Parameters.AddWithValue("$u", userDbId);
+            cmd.Parameters.AddWithValue("$i", invitorDbId);
+            cmd.Parameters.AddWithValue("$t", invitedAt);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>spLoadInviteUserToGuild(userDbId) - every guild that has invited this character.</summary>
+    public List<GuildInviteRow> GetGuildInvites(int userDbId)
+    {
+        lock (_lock)
+        {
+            var list = new List<GuildInviteRow>();
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT guild_id, user_db_id, invitor_db_id, invited_at FROM guild_invites " +
+                              "WHERE user_db_id = $u ORDER BY invited_at, guild_id";
+            cmd.Parameters.AddWithValue("$u", userDbId);
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                list.Add(new GuildInviteRow(r.GetInt32(0), r.GetInt32(1), r.GetInt32(2), r.GetInt64(3)));
+            return list;
+        }
+    }
+
+    /// <summary>spDeleteInviteUserToGuild(guildDbId, userDbId).</summary>
+    public bool DeleteGuildInvite(int guildId, int userDbId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "DELETE FROM guild_invites WHERE guild_id = $g AND user_db_id = $u";
+            cmd.Parameters.AddWithValue("$g", guildId);
+            cmd.Parameters.AddWithValue("$u", userDbId);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    /// <summary>spDeleteInviteUserToGuildForUserSide(userDbId).</summary>
+    public int DeleteGuildInvitesOfUser(int userDbId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "DELETE FROM guild_invites WHERE user_db_id = $u";
+            cmd.Parameters.AddWithValue("$u", userDbId);
+            return cmd.ExecuteNonQuery();
+        }
+    }
+
+    // ---- history log ----
+
+    /// <summary>spCreateGuildLog. ActionType 0x0B is the join entry GuildUtil::UserJoinToGuild
+    /// writes (FUN_140566090(guildDbId, 0xb, ...)).</summary>
+    public void AddGuildLog(int guildId, int actionType, string actorName, string targetName = "",
+        int actorDbId = 0, int paramInt = 0, long paramI64 = 0, string detail = "", long logTime = 0)
+    {
+        lock (_lock)
+        {
+            if (logTime == 0) logTime = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "INSERT INTO guild_log(guild_id, action_type, log_time, actor_db_id, actor_name, " +
+                "target_name, param_int, param_i64, detail) VALUES($g,$a,$t,$ai,$an,$tn,$pi,$p6,$d)";
+            cmd.Parameters.AddWithValue("$g", guildId);
+            cmd.Parameters.AddWithValue("$a", actionType);
+            cmd.Parameters.AddWithValue("$t", logTime);
+            cmd.Parameters.AddWithValue("$ai", actorDbId);
+            cmd.Parameters.AddWithValue("$an", actorName ?? "");
+            cmd.Parameters.AddWithValue("$tn", targetName ?? "");
+            cmd.Parameters.AddWithValue("$pi", paramInt);
+            cmd.Parameters.AddWithValue("$p6", paramI64);
+            cmd.Parameters.AddWithValue("$d", detail ?? "");
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>spLoadGuildLog(int guildDbId), newest first, one page. Guild::SendGuildHistory
+    /// pages by 0x14 rows (FUN_14056f060(..., 0x14)); page numbers are 1-based.</summary>
+    public List<GuildLogRow> GetGuildLog(int guildId, int page, int pageSize = GuildHistoryPageSize)
+    {
+        if (page < 1) page = 1;
+        lock (_lock)
+        {
+            var list = new List<GuildLogRow>();
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "SELECT id, action_type, log_time, actor_db_id, actor_name, target_name, " +
+                "param_int, param_i64, detail FROM guild_log WHERE guild_id = $g " +
+                "ORDER BY log_time DESC, id DESC LIMIT $n OFFSET $o";
+            cmd.Parameters.AddWithValue("$g", guildId);
+            cmd.Parameters.AddWithValue("$n", pageSize);
+            cmd.Parameters.AddWithValue("$o", (page - 1) * pageSize);
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                list.Add(new GuildLogRow(r.GetInt64(0), r.GetInt32(1), r.GetInt64(2), r.GetInt32(3),
+                    r.GetString(4), r.GetString(5), r.GetInt32(6), r.GetInt64(7), r.GetString(8)));
+            return list;
+        }
+    }
+
+    /// <summary>Guild::SendGuildHistory's page size: 0x14 rows.</summary>
+    public const int GuildHistoryPageSize = 0x14;
+
+    /// <summary>How many pages S_GUILD_HISTORY should advertise as LastPage. Always at least 1,
+    /// so an empty log still renders an empty page rather than page 1 of 0.</summary>
+    public int CountGuildLogPages(int guildId, int pageSize = GuildHistoryPageSize)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT COUNT(*) FROM guild_log WHERE guild_id = $g";
+            cmd.Parameters.AddWithValue("$g", guildId);
+            long n = (long)cmd.ExecuteScalar()!;
+            return n <= 0 ? 1 : (int)((n + pageSize - 1) / pageSize);
         }
     }
 
