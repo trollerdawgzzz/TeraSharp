@@ -192,7 +192,7 @@ public static class HandlerRegistry
 
         // --- Server time: T45 ArbiterClientHandlers.OnServerTime (registered above) ---
 
-        Reg("C_CHECK_ALIVE", 0, (s, body) => true);
+        // C_CHECK_ALIVE is not in the 376012 opcode map (it logged an error at every startup) - dropped.
 
         // Logout button -> character select. Mirror the real Arbiter
         // (User::OnRequestReturnToLobby -> OnLeaveWorldTick):
