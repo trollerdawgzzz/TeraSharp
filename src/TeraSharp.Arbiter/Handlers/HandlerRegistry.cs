@@ -138,6 +138,11 @@ public static class HandlerRegistry
             Reg(partyName, PartyWiring.MinBodyLength(partyOp),
                 (s, body) => PartyWiring.OnClientPacket(s, partyOp, body));
 
+        // --- Guilds (T51, status/GUILD-DESIGN.md section 11): the 17 Arbiter-owned guild packets ---
+        foreach (var (guildName, guildOp) in GuildWiring.ClientOpcodes)
+            Reg(guildName, GuildWiring.MinBodyLength(guildOp),
+                (s, body) => GuildWiring.OnClientPacket(s, guildOp, body));
+
         // --- Client settings (Arbiter-owned) ---
         Reg("C_REQUEST_CLIENT_CHAT_OPTION_SETTING", 0, ClientSettingsHandlers.OnRequestChatOption);
         Reg("C_REQUEST_CLIENT_UI_SETTING", 0, ClientSettingsHandlers.OnRequestUiSetting);
