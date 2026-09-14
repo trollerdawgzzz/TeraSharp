@@ -373,6 +373,7 @@ public sealed class WorldBridge
 
             default:
                 if (PartyWiring.TryHandleWorldFrame(op, payload)) return;   // T49: the twelve party SA_ opcodes incl. SA_BYPASS_TO_GROUP
+                if (GuildWiring.TryHandleWorldFrame(op, payload)) return;   // T52: guild SA_ opcodes (membership test, not a length gate)
                 if (op is not (0x138A or 0x15A8 or 0x1436 or 0x164D))
                     _log.LogInformation("W->A #{Id} 0x{Op:X4} len={Len}", link.Id, op, payload.Length + 6);
                 if (DbProxy != null && DbProxy.TryHandle(this, link, op, payload)) return;

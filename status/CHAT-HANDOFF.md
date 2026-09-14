@@ -118,6 +118,20 @@ and look for the next caller.
 
 ## Next steps (in order)
 
+**Checkpoint 2026-09-15 - 583 tests, T45-T51 merged.** New on master since the multiplayer milestone:
+whisper via ChatManager (roster registered in WorldEntry/GameSession), World GM commands forwarded
+(anything not Arbiter-owned -> AS_ADMIN_COMMAND 0x2829), AdminLevel in AS_ENTER_WORLD[111] +
+TERASHARP_GM_ACCOUNTS honoured at enter, the 18 Arbiter-owned client packets answered (tooltip reply,
+visited sections, parcel DB, C_CLIENT_LOG printed) and dropped-not-forwarded via
+ArbiterClientHandlers.ArbiterOwned, PartyWiring (7 C_ + 12 SA_ party opcodes) and GuildWiring (17 C_ +
+0x27CF boot load from rows) wired, security audit + fuzz suite (T48/T50: DefinitionReader bounds, DefField
+narrowing, FK owner guards, crest offset wrap, WorldLink per-frame try/catch), language-aware social
+seed. Live-untested: all of it. In flight: T52 guild SA_ direction + C_INVITE_USER_TO_GUILD, T53 broker
+research (session 2). Next live session: LIVE-CHECKLIST + whisper, /@teleport, party invite, guild
+create, potions, mailbox, GM AdminLevel[5] in World's console; then the real-Arbiter capture session
+(party/guild/warehouse/mail/broker) with both accounts GM in tera-api, or a client-side capture on a
+populated 100.02 server with mods/packet-logger.
+
 **MILESTONE 2026-09-15 00:25 - MULTIPLAYER.** Two accounts, two clients, both in world at once, see each
 other, /say and global chat cross, one logs out without disturbing the other. Routing = MULTIPLAYER-DESIGN
 section 6 applied to WorldBridge (TicketAllocator 5,6,...; N-recipient SA_BYPASS_TO_CLIENT via
