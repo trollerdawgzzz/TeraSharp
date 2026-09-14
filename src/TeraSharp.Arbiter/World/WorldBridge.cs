@@ -281,8 +281,15 @@ public sealed class WorldBridge
     {
         switch (op)
         {
-            case OpHeartbeat14:
             case OpHeartbeat6:
+                return;
+
+            case OpHeartbeat14:
+                // DSA_DUNGEON_TIMELINE_OPEN_INFO. 909 of the 911 frames across the four captures
+                // are the empty 14-byte form - a real heartbeat - but the first one after World
+                // registers its dungeons carries the open-state list the real Arbiter echoes back
+                // as 0x1581, one frame per record (status/HANDSHAKE-DATA.md section 0, T33).
+                if (payload.Length > 8) DbProxy?.TryHandle(this, link, op, payload);
                 return;
 
             case OpTunnelToClient:

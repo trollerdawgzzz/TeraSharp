@@ -2186,8 +2186,11 @@ array items
         // real request/reply pair and the missing reply wedged a login. It is a real handler now,
         // and an opcode may never be in both places - the set makes the replay table drop the
         // frame, so a real handler is the only thing that can answer it.
+        // Exception: 0x13F2 DSA_DUNGEON_TIMELINE_OPEN_INFO. It must SEAL when the replay table is
+        // loaded (909 of 911 frames are heartbeats), and the non-empty form is dispatched by
+        // WorldBridge.HandleFrame straight to DbProxy.TryHandle, never via the replay table (T33).
         foreach (var op in WorldReplayTable.OneWayFromWorld)
-            Hex.True(!DbProxyHandlers.IsHandledRequest(op),
+            Hex.True(op == 0x13F2 || !DbProxyHandlers.IsHandledRequest(op),
                 $"0x{op:X4} is in OneWayFromWorld AND in the TryHandle allow-list - pick one");
         // The tunnel interleaves constantly; sealing on it would break every attribution.
         Hex.True(!WorldReplayTable.OneWayFromWorld.Contains(WorldBridge.OpTunnelToClient),
