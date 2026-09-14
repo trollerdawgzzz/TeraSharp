@@ -169,6 +169,13 @@ public static class HandlerRegistry
         Reg("C_SAVE_CLIENT_UI_SETTING", 0, (s, b) => ArbiterClientHandlers.OnSaveClientUiSetting(s, b, misc));
         Reg("C_TRADE_BROKER_HIGHEST_ITEM_LEVEL", 0,
             (s, b) => ArbiterClientHandlers.OnTradeBrokerHighestItemLevel(s, b, misc));
+        // T60: party invites/applies are World-side contracts brokered through the Arbiter; the
+        // target's accept/reject comes back as C_REPLY_THROUGH_ARBITER_CONTRACT. C_ADD_TRADE_BAG
+        // (58817) is Arbiter-owned and forwards as AS_ADD_TRADE_BAG.
+        Reg("C_REPLY_THROUGH_ARBITER_CONTRACT", ContractBroker.ReplyMinBodyLength,
+            (s, b) => ContractBroker.OnClientReply(s, b, misc));
+        Reg("C_ADD_TRADE_BAG", ArbiterClientHandlers.AddTradeBagBodySize,
+            (s, b) => ArbiterClientHandlers.OnAddTradeBag(s, b, misc));
         foreach (var name in new[]
         {
             "C_REQUEST_PARTY_MATCH_INFO", "C_REQUEST_MY_PARTY_MATCH_INFO", "C_PARTY_MATCH_WINDOW_CLOSED",
