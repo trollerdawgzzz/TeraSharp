@@ -8,7 +8,7 @@ Read order for anyone new: `CLAUDE.md` (workspace rules at the top) -> `status/H
 (every per-user W->A opcode and how it is answered) -> this file.
 
 Build: `dotnet build TeraSharp.sln` — 0 warnings, 0 errors.
-Tests: `dotnet run --project src\TeraSharp.Arbiter.Tests` — **544**.
+Tests: `dotnet run --project src\TeraSharp.Arbiter.Tests` — **566**.
 Deploy check: `TeraSharp.Arbiter.exe --selftest` — one PASS/FAIL line per data dependency (T37).
 
 ---
@@ -37,6 +37,7 @@ Deploy check: `TeraSharp.Arbiter.exe --selftest` — one PASS/FAIL line per data
 | GM commands (`/@`) — dispatcher, gate, World forward, 6 Arbiter commands | real (T32), needs the HandlerRegistry lines |
 | Warehouse — 8 W->A requests answered from `items`/`warehouses` rows, `0x2754` sealed | real (T42) |
 | Mail — the 3 Arbiter-owned client packets + `parcels` table; World's 6 `SDB_*_PARCEL` are not answered | half real (T42) |
+| Parties — `PartyManager` (T35) wired through `World/PartyWiring.cs`, roster shared with chat | implemented (T49), needs the 2 human-owned lines |
 
 ## Where the truth lives
 
@@ -132,10 +133,20 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
 - Two-login capture -> multi-player tunnel routing, `S_CHANGE_FRIEND_STATE` on login/logout and
   the `AS_*` block-list pushes (`status/MULTIPLAYER-DESIGN.md`).
 - Friend/blocked memos skip the Arbiter's banned-word + NetModerator stage (we have neither).
-- T47 needs two lines in human-owned files: `SocialHandlers.RegisterChat(s)` in
-  `WorldEntry.EnterWorld` and `SocialHandlers.UnregisterChat(this)` in `GameSession.Close`
-  (`status/GM-DESIGN.md` §9). Whisper self-heals without them; private-channel membership
-  does not - a logged-out character stays in their channels until restart.
+- T49 needs two lines in human-owned files: one `foreach` over `PartyWiring.ClientOpcodes`
+  in `HandlerRegistry.RegisterAll` (the seven `C_` party opcodes, body length = the decompile's
+  frame guard MINUS 4) and `if (PartyWiring.TryHandleWorldFrame(op, payload)) return;` as the
+  first line of `WorldBridge.HandleFrame`'s `default:` arm (that one covers `SA_BYPASS_TO_GROUP`
+  0x13F8 and the eleven other W->A party opcodes). Exact text: `status/PARTY-DESIGN.md` §11.5.
+  Nothing is needed in `WorldEntry` or `GameSession` - party registration rides the chat roster.
+- Parties: four W->A opcodes are gated to `PartyManager` but have no case yet - `SA_SWAP_PARTY`
+  0x139A, `SA_CHANGE_PARTY_MEMBER_AUTHORITY` 0x139C, `SA_JOIN_PARTY_IN_ARBITER` 0x13AB,
+  `SA_MERGE_PARTY_TO_RAID` 0x13AC. They log a rejection and send nothing
+  (`status/PARTY-DESIGN.md` §11.6). Party matching (`C_REQUEST_PARTY_INFO` ->
+  `S_PARTY_MEMBER_INFO`) is registered but deliberately swallowed - §11.3.
+- T47's two lines are IN (`WorldEntry.EnterWorld:47`, and `GameSession.OnWorldLeaveConfirmed` /
+  `LeaveWorld` both call `SocialHandlers.UnregisterChat(this)`), which is what let T49 hang the
+  party roster off the same two call sites.
 - GM: the client only offers `/@` for a QA login (`S_LOGIN_ARBITER.status` 31/33) - LoginHandlers
   still sends 0, so the one-line diff in `status/GM-DESIGN.md` §6 is untested live. That is now
   the ONLY thing between us and trying the 416 World commands: the 0x2829 frame is verified

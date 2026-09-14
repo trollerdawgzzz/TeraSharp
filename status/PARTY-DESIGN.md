@@ -679,3 +679,145 @@ session registered last. T27 §6(2) is the prerequisite.
 3. **`Party.DefaultLoot`** is the client's out-of-the-box setting, not the Arbiter's: the real
    ctor copies its defaults from config at `+0x15f4..+0x1608`, and we have never seen those bytes.
 
+---
+
+## 11. T49 — `World/PartyWiring.cs`, and what section 10 got wrong
+
+Section 10 was written against a tree that has since moved. `PartyWiring.cs` is section 10's
+wiring, applied on the Cowork side, and the human-owned diff it leaves is **two lines**.
+
+### 11.1 What changed since section 10
+
+| section 10 said | now |
+|---|---|
+| add `WorldBridge.Party` and `WorldBridge.Actions` | not needed — both are new members on a human-owned file. `PartyWiring` holds the manager and builds the dispatcher itself, lazily, the way `SocialHandlers.Chat` does (T47) |
+| add `_byTicket` + `SessionForTicket` to `WorldBridge` | already there — the human added `SessionForTicket`, `SessionForPlayerId` and `InWorldSessions` for T47 |
+| build the dispatcher in `Program.cs` | not needed — `PartyWiring.Dispatcher()` builds one per call over `Program.World` |
+| register the player in `WorldEntry`, unregister in `GameSession` | not needed — party registration rides `SocialHandlers.RegisterChat` / `UnregisterChat`, which **both** call sites already have (`WorldEntry.EnterWorld:47`, `GameSession.OnWorldLeaveConfirmed` and `GameSession.LeaveWorld`) |
+| `{ ResolveDef = n => GuildHandlers.ResolveDef(null, n) }` | dropped. Every def `PartyManager` emits resolves out of the shipped registry — `Party_end_to_end_client_packets_go_through_the_real_def_codec` proves it — and `S_PARTY_MEMBER_LIST` has only a `.8.def`, so `DefinitionRegistry.Get` already picks the right one |
+| "not worth applying before T27 §6" | landed. `AllocateTunnelKey()` is `TicketAllocator.Allocate()`, a real per-session ticket, so the prerequisite is met |
+| register all seven `C_` opcodes straight to `OnClientPacket` | six. `C_REQUEST_PARTY_INFO` has no case in the manager's switch — see 11.3 |
+| `dispatcher.Register(op, name, 0, …)` | **0 is wrong for six of the seven** — see 11.2 |
+
+### 11.2 The −4 body-length correction
+
+`PacketDispatcher.Register` takes a **minimum BODY length** and compares it against
+`packet[4..]`. Every guard in the decompile is a **FRAME** length — `if (local_res18[0] < 0xc)`
+compares the total packet size, header included, and reports that same figure back as
+`GET_CLIENT_BUFFER_BUFSIZE_MISMATCH`. So every registration is `guard − 4`.
+`PartyWiring.MinFrameLength` is the decompile's table verbatim and `PartyWiring.MinBodyLength`
+is that minus `ClientHeaderSize`; test
+`T49_party_registrations_use_the_body_length_not_the_frame_length` pins both.
+
+| opcode | packet | handler | frame guard | **body** |
+|---|---|---|---|---|
+| 0xA889 | `C_APPLY_PARTY` | `FUN_1404db920` `Arb_part_040.c:19121` | 8 | **4** |
+| 0x4F00 | `C_PARTY_APPLICATION_DENIED` | `FUN_1404e3f60` `Arb_part_041.c:5023` | 8 | **4** |
+| 0xC8B9 | `C_DISMISS_PARTY` | `FUN_1404def50` `Arb_part_041.c:1463` | *no guard* | **0** |
+| 0x59C1 | `C_BAN_PARTY_MEMBER` | `FUN_1404dbcb0` `Arb_part_040.c:19255` | 0xC | **8** |
+| 0x5D24 | `C_PARTY_LOOTING_METHOD` | `FUN_1404e40a0` `Arb_part_041.c:5086` | 0x17 | **0x13** |
+| 0xB8D0 | `C_MERGE_PARTY_TO_RAID` | `FUN_1404e3870` `Arb_part_041.c:4724` | 0xD | **9** |
+| 0xFD35 | `C_REQUEST_PARTY_INFO` | `FUN_1404e9b50` `Arb_part_041.c:8911` | 8 | **4** |
+
+Registering the frame figure would drop `C_APPLY_PARTY` (a 4-byte body against a "min 8") and
+`C_DISMISS_PARTY` — which has no guard and no body at all — would never run once.
+
+`C_LEAVE_PARTY` (0xFFB6) and `C_CHANGE_PARTY_MANAGER` (0x60D6) stay **unregistered**: the real
+Arbiter has no handler for either, they belong to World, and they come back as `SA_LEAVE_PARTY` /
+`SA_CHANGE_PARTY_MANAGER`. All seven names above are in `data.json` `maps."376012"` at exactly
+these codes, so `HandlerRegistry`'s `Reg(name, …)` resolves them.
+
+### 11.3 `C_REQUEST_PARTY_INFO` is registered but not answered
+
+`Handler_C_REQUEST_PARTY_INFO` queues a `PartyMatchManager::DoAsyncJob` that answers with
+`S_PARTY_MEMBER_INFO` (0xBEC0), and none of the three shipped `S_PARTY_MEMBER_INFO.def` versions
+matches the v100 writer (§6.3) — which is why §10's "What is not" drops party matching outright.
+`PartyManager.OnClientPacket` therefore has no case for it and falls through to
+`default: return a.Reject(…)`.
+
+Three possible behaviours, one of them harmless:
+
+- **forward to World** → `handler has not been implemented yet!!!`, which is T45's whole point;
+- **hand it to the manager** → an `S_SYSTEM_MESSAGE_CUSTOM` rejection every time the panel opens;
+- **swallow it** → the party-match panel stays blank, which is what it already is.
+
+So it is registered (so it never reaches World) and listed in `PartyWiring.NotModelled`, which
+swallows it with a debug line. Test
+`T49_the_party_match_query_is_swallowed_rather_than_refused`.
+
+### 11.4 The roster
+
+`PartyManager` keys on the tunnel Ticket, so it needs exactly the "who is online" edge whisper
+needs. `SocialHandlers.RegisterChat` now calls `PartyWiring.Register(session)` and
+`SocialHandlers.UnregisterChat` calls `PartyWiring.Unregister(session)`, so:
+
+- enter world → `WorldEntry` already calls `RegisterChat(s)` (one line after `s.TunnelKey` is
+  allocated, which is why `PartyWiring.Register` gates on `InWorld` rather than on a ticket
+  sentinel — `TicketAllocator` wraps at 4096, so ticket 0 is a real ticket);
+- leave / disconnect → `GameSession.OnWorldLeaveConfirmed` and `GameSession.LeaveWorld` already
+  call `UnregisterChat(this)`;
+- `SocialHandlers.SyncChatRoster` heals both rosters in one loop, and `PartyWiring.OnClientPacket`
+  calls it before every party packet, so parties work for players who entered world first.
+
+Logging out does **not** break the party: `PartyMemberInfo+0x70` is an Online flag, not a removal,
+so the slot is kept (slot indices are wire-visible in `S_PARTY_MEMBER_LIST` and must not shift)
+and the rest are told with `S_LOGOUT_PARTY_MEMBER`. Test
+`T49_logging_out_keeps_the_party_and_tells_the_others`.
+
+### 11.5 The two human-owned lines
+
+**1. `Handlers/HandlerRegistry.cs`** — after the T42 parcel block, in `RegisterAll`:
+
+```csharp
+        // --- Parties (T49, status/PARTY-DESIGN.md section 11): the seven client packets the
+        //     Arbiter owns. PartyWiring holds the manager and performs the sends; the body
+        //     minimum is the decompile's frame guard minus the 4-byte header (section 11.2).
+        foreach (var (partyName, partyOp) in PartyWiring.ClientOpcodes)
+            Reg(partyName, PartyWiring.MinBodyLength(partyOp),
+                (s, body) => PartyWiring.OnClientPacket(s, partyOp, body));
+```
+
+`HandlerRegistry.cs` already has `using TeraSharp.Arbiter.World;`, so no new using. The loop
+variable is captured per-iteration in C# 5+, so `partyOp` inside the lambda is that iteration's
+opcode. `Reg` resolves the name through `OpcodeTable`, logs and skips if it is missing, and
+`PacketDispatcher.Register` throws on a duplicate — none of the seven is registered today.
+
+**2. `World/WorldBridge.cs`** — the first line of `HandleFrame`'s `default:` arm, **before**
+`DbProxy.TryHandle`, so a party frame never reaches the replay table:
+
+```csharp
+            default:
+                if (PartyWiring.TryHandleWorldFrame(op, payload)) return;   // T49
+                if (op is not (0x138A or 0x15A8 or 0x1436 or 0x164D))
+                    _log.LogInformation("W->A #{Id} 0x{Op:X4} len={Len}", link.Id, op, payload.Length + 6);
+```
+
+(If the `W->A` log line should still print for party frames, put the `if` after it instead —
+nothing else in the arm depends on the order.)
+
+`TryHandleWorldFrame` gates on `PartyPackets.MinFrameLength(op) != 0`, which is true for exactly
+the twelve W→A party opcodes — `SA_JOIN_PARTY` 0x1395 … `SA_CHANGE_LOOTING_METHOD` 0x139D,
+`SA_JOIN_PARTY_IN_ARBITER` 0x13AB, `SA_MERGE_PARTY_TO_RAID` 0x13AC and **`SA_BYPASS_TO_GROUP`
+0x13F8** — and false for everything else. None of the twelve appears in `DbProxyHandlers` or in
+`WorldReplayTable.OneWayFromWorld`, so nothing is taken away from either; today they fall through
+to `no replay for 0x1395`. `SA_BYPASS_TO_GROUP` sits one below the tunnel opcode 0x13F7, which
+`HandleFrame` answers in its own `case` above the `default:` and is therefore untouched. Test
+`T49_the_world_frame_gate_is_exactly_the_party_opcodes`.
+
+An `OnWorldFrame` action set carries `Origin = Recipient.None`, so a rejection there goes to the
+log rather than to a client — which is right, because a World frame has no originating session,
+and four of the twelve gated opcodes (`SA_SWAP_PARTY`, `SA_CHANGE_PARTY_MEMBER_AUTHORITY`,
+`SA_JOIN_PARTY_IN_ARBITER`, `SA_MERGE_PARTY_TO_RAID`) are gated but not yet modelled, so they land
+there every time.
+
+### 11.6 Still open after T49
+
+1. §10's open items 1–3 are unchanged: no captured party bytes, manager promotion on leave is
+   ours, `Party.DefaultLoot` is the client's default and not the Arbiter's.
+2. The four gated-but-unmodelled `SA_` opcodes above. Each needs a `case` in
+   `PartyManager.OnWorldFrame`; `PartyPackets` already has the parsers
+   (`ParseSaSwapParty`, `ParseSaChangeAuthority`) and the `AS_DO_SWAP_PARTY` /
+   `AS_DO_CHANGE_PARTY_MEMBER_AUTHORITY` builders.
+3. Party matching (11.3) needs `S_PARTY_MEMBER_INFO` from a capture before it can be answered.
+4. No `PERSISTENCE-MAP.md` row is added or needed: §4 proves nothing about a party is persisted,
+   and none of the twelve W→A opcodes is a DB-proxy request.
