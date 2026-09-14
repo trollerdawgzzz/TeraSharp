@@ -57,6 +57,11 @@ public static class ArbiterClientHandlers
     public const ushort S_SHOW_AWESOMIUMWEB_SHOP = 0xDFAE; // 57262
     public const ushort C_RESET_ALL_DUNGEON = 0x5867;      // 22631
 
+    /// <summary>T60. 58817. The Arbiter owns it and forwards it to World as AS_ADD_TRADE_BAG.</summary>
+    public const ushort C_ADD_TRADE_BAG = 0xE5C1;          // 58817
+    /// <summary>The frame C_ADD_TRADE_BAG becomes. 54 bytes.</summary>
+    public const ushort AS_ADD_TRADE_BAG = 0x1637;
+
     /// <summary>
     /// Every opcode above, as an explicit statement that these are the ARBITER's. The forwarding
     /// fallback in <c>PacketDispatcher</c> must never apply to one of them: forwarding produces
@@ -72,6 +77,7 @@ public static class ArbiterClientHandlers
         C_PARTY_MATCH_WINDOW_CLOSED, C_REQUEST_GUILD_INFO, C_REQUEST_GUILD_LIST,
         C_DUNGEON_COOL_TIME_LIST, C_VIEW_BATTLE_FIELD_RESULT, C_REQUEST_CANDIDATE_LIST,
         C_SHOW_AWESOMIUMWEB_SHOP, C_RESET_ALL_DUNGEON,
+        C_ADD_TRADE_BAG,   // T60 - the nineteenth, found the same way (live 2026-09-15)
     };
 
     // =========================================================================================
@@ -442,6 +448,102 @@ public static class ArbiterClientHandlers
     /// </summary>
     public static bool OnAcceptSilently(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
         => true;
+
+    // =========================================================================================
+    // 9. C_ADD_TRADE_BAG -> AS_ADD_TRADE_BAG                      (T60, the trade window)
+    // =========================================================================================
+
+    /// <summary>Minimum TOTAL length of C_ADD_TRADE_BAG - the handler's guard is `param_3 &lt; 0x34`.</summary>
+    public const int AddTradeBagPacketSize = 0x34;    // 52
+    /// <summary>The same as a BODY length, which is what PacketDispatcher compares.</summary>
+    public const int AddTradeBagBodySize = AddTradeBagPacketSize - 4;   // 48
+    /// <summary>AS_ADD_TRADE_BAG is 54 bytes: a 6-byte header and 48 of payload.</summary>
+    public const int AddTradeBagFrameSize = 0x36;     // 54
+
+    /// <summary>C_ADD_TRADE_BAG, read by absolute offset from Handler_C_ADD_TRADE_BAG.</summary>
+    public readonly record struct AddTradeBagRequest(
+        long TradeRequestor, long TradeRequestee, int ContractId, int TabIndex, int InvenPos,
+        int MoveAmount, long Money);
+
+    /// <summary>
+    /// Parse C_ADD_TRADE_BAG from the FULL packet. Offsets from the PDL dumper
+    /// <c>FUN_1401bd420</c> (Arb_part_013.c:8534) and confirmed against
+    /// <c>Handler_C_ADD_TRADE_BAG</c> (Arb_part_040.c:17084), whose reads are at exactly these
+    /// byte offsets.
+    ///
+    /// <para><b>Do not use C_ADD_TRADE_BAG.1.def.</b> Its field list is right but it starts at
+    /// [0x04] where the binary starts at [0x0C], and its header comment names opcode 65204, which
+    /// is a different build. The eight bytes at [0x04..0x0B] are read by neither the handler nor
+    /// the dumper, so they are read by neither of us. status/CONTRACT-DESIGN.md section 8.</para>
+    /// </summary>
+    public static AddTradeBagRequest? ParseAddTradeBag(ReadOnlySpan<byte> packet)
+    {
+        if (packet.Length < AddTradeBagPacketSize) return null;
+        return new AddTradeBagRequest(
+            BitConverter.ToInt64(packet[0x0C..]), BitConverter.ToInt64(packet[0x14..]),
+            BitConverter.ToInt32(packet[0x1C..]), BitConverter.ToInt32(packet[0x20..]),
+            BitConverter.ToInt32(packet[0x24..]), BitConverter.ToInt32(packet[0x28..]),
+            BitConverter.ToInt64(packet[0x2C..]));
+    }
+
+    /// <summary>
+    /// The AS_ADD_TRADE_BAG (0x1637) payload the real Arbiter forwards. The leading u64 is not
+    /// copied from the packet - the Arbiter builds it from its own planet id and the SENDER's
+    /// character db id (<c>CONCAT44(*(u32 *)(lVar9 + 0x120), DAT_140e2d020)</c>, so planet id in
+    /// the low half and db id in the high half).
+    /// </summary>
+    public static byte[] BuildAsAddTradeBag(int planetId, int senderDbId, AddTradeBagRequest r)
+    {
+        var p = new byte[AddTradeBagFrameSize - 6];
+        BitConverter.GetBytes(planetId).CopyTo(p, 0);
+        BitConverter.GetBytes(senderDbId).CopyTo(p, 4);
+        BitConverter.GetBytes(r.TradeRequestor).CopyTo(p, 8);
+        BitConverter.GetBytes(r.TradeRequestee).CopyTo(p, 16);
+        BitConverter.GetBytes(r.ContractId).CopyTo(p, 24);
+        BitConverter.GetBytes(r.TabIndex).CopyTo(p, 28);
+        BitConverter.GetBytes(r.InvenPos).CopyTo(p, 32);
+        BitConverter.GetBytes(r.MoveAmount).CopyTo(p, 36);
+        BitConverter.GetBytes(r.Money).CopyTo(p, 40);
+        return p;
+    }
+
+    /// <summary>
+    /// C_ADD_TRADE_BAG. Adding an item to a trade window; 52 bytes, seen live on 2026-09-15 being
+    /// forwarded to World, which answered "handler has not been implemented yet". World was right:
+    /// the client sends this to the ARBITER, which forwards it as AS_ADD_TRADE_BAG - World has no
+    /// C_ handler for it and never did.
+    ///
+    /// <para><b>One thing the real handler does that this does not.</b> Before forwarding, it
+    /// checks the item template against <c>RestrictionPeriodItemTradeDataSheet</c> and, if the
+    /// account is younger than the sheet's hour count, answers the client with system message
+    /// 0x115f carrying an `hour` parameter and forwards nothing. We have neither the datasheet nor
+    /// an account age, so every item is treated as unrestricted - which is what the real Arbiter
+    /// does for an item that is not on the sheet.</para>
+    /// </summary>
+    public static bool OnAddTradeBag(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        var packet = new byte[body.Length + 4];
+        BitConverter.GetBytes((ushort)packet.Length).CopyTo(packet, 0);
+        BitConverter.GetBytes(C_ADD_TRADE_BAG).CopyTo(packet, 2);
+        body.Span.CopyTo(packet.AsSpan(4));
+
+        var req = ParseAddTradeBag(packet);
+        if (req == null)
+        {
+            log.LogWarning("C_ADD_TRADE_BAG: {Len} B packet (want {Want})", packet.Length, AddTradeBagPacketSize);
+            return true;
+        }
+        var chr = s.SelectedCharacter;
+        if (chr == null) return true;
+
+        var payload = BuildAsAddTradeBag(TeraSharp.Arbiter.World.ContractBroker.PlanetId, (int)chr.Id, req.Value);
+        Program.World?.SendFrame(AS_ADD_TRADE_BAG, payload);
+        log.LogInformation(
+            "C_ADD_TRADE_BAG: {Name} -> AS_ADD_TRADE_BAG contract {Cid}, pocket {Tab} slot {Slot} x{N}{Money}",
+            chr.Name, req.Value.ContractId, req.Value.TabIndex, req.Value.InvenPos, req.Value.MoveAmount,
+            req.Value.Money != 0 ? $", {req.Value.Money} money" : string.Empty);
+        return true;
+    }
 
     // ---------------------------------------------------------------- helpers
 

@@ -216,30 +216,57 @@ T42 added the three client packets the Arbiter answers itself and the `parcels` 
   `enum INVEN_TYPE` and is what picks the container (0 bag, 1 account bank, 3 guild, 9 character
   bank, 12 style); `status/MAIL-WAREHOUSE.md` section 6 has the proof.
 
-## The Arbiter Contract family — one-way, T47
+## The Arbiter Contract family — brokered, T60 (was: one-way, T47)
 
 `0x2809` and `0x280E` turned up in the first two-client test (58-66 B each) and are the two-party
 interactions the Arbiter brokers, which is why one player never sees them. **None of the family
 carries a DlmId** — the dumpers name `ContractorDbId`, `ContractType`, `ContractId` and nothing
 else — so an unanswered one cannot head-block the per-user DB queue the way a missing `DBS_` reply
-does. They are in `WorldReplayTable.OneWayFromWorld` so the replay table cannot hand them somebody
-else's reply.
+does.
 
-| opcode | name | handler | sends |
+**T47 sealed the four W→A opcodes in `WorldReplayTable.OneWayFromWorld`; T60 unsealed them.** The
+seal was based on a wrong reading, and it is what made a party invite between two in-world players
+do nothing at all on 2026-09-15: `Handler_SDB_FETCH_THROUGH_ARBITER_CONTRACT` sends nothing, but it
+dispatches on `ContractType` into one of four `FetchWork` objects and **those** send —
+`FetchWork::ResponseFailure` / `::ResponseSuccess` (`FUN_1409cde70`) emit `0x280A`, and the success
+path fans `0x280B` out to every opponent. T47 stopped at the handler. Guild creation is
+`ContractType` 10 and is gated on being in a party, so the same seal blocked guilds too.
+
+The four are now gated off `WorldBridge.HandleFrame`'s `default:` arm into `World/ContractBroker.cs`,
+the way `PartyWiring` and `GuildWiring` are — a **sealed** opcode never reaches a gate, so the two
+cannot both be true. Full flow, layouts and citations: `status/CONTRACT-DESIGN.md`.
+
+| opcode | name | handler | ours does |
 |---|---|---|---|
-| `0x2809` | SDB_FETCH_THROUGH_ARBITER_CONTRACT | `Arb_part_063.c:7017` | nothing — dispatches on ContractType (4, 5, 10, 0x23) into four managers |
-| `0x280C` | SDB_ASK_THROUGH_ARBITER_CONTRACT | `Arb_part_063.c:810` | nothing (38 lines) |
-| `0x280D` | SDB_SEND_BEGIN_THROUGH_ARBITER_CONTRACT | `Arb_part_064.c:2732` | only the CLIENT packet S_BEGIN_THROUGH_ARBITER_CONTRACT |
-| `0x280E` | SDB_SEND_END_THROUGH_ARBITER_CONTRACT | `Arb_part_064.c:2983` | `0x280F`, but as a FAN-OUT, not a reply |
+| `0x2809` | SDB_FETCH_THROUGH_ARBITER_CONTRACT | `Arb_part_063.c:7017` | `OnFetch` — brokers types 4/5, refuses 10 and 0x23 with ErrorNo 2 |
+| `0x280C` | SDB_ASK_THROUGH_ARBITER_CONTRACT | `Arb_part_063.c:810` | `OnAsk` — records `CanContract`, sends nothing (38-line handler) |
+| `0x280D` | SDB_SEND_BEGIN_THROUGH_ARBITER_CONTRACT | `Arb_part_064.c:2732` | `OnSendBegin` — only the CLIENT packet `S_BEGIN_THROUGH_ARBITER_CONTRACT` (0x7E3F) |
+| `0x280E` | SDB_SEND_END_THROUGH_ARBITER_CONTRACT | `Arb_part_064.c:2983` | `OnSendEnd` — `S_END` (0xC7D7) to each participant, then a `0x280F` FAN-OUT, one frame each |
+
+The A→W half is ours to send and never arrives: `0x280A` DBS_FETCH (the verdict, with the AskList
+and an ErrorNo), `0x280B` DBS_ASK (one per opponent, both names as **offset-only** wstr refs),
+`0x280F` DBS_SEND_END, `0x2810` DBS_REPLY. Plus the client's `C_REPLY_THROUGH_ARBITER_CONTRACT`
+(0x5B7C), which is read by absolute offset — **its `.def` is wrong** and must not be used.
 
 Request shape, both observed ones identical (guard `0x21 < len`, min frame 34):
 `[6] Param ref` `[14] list ref` `[22] u32 ContractorDbId` `[26] u32 ContractType` `[30] u32 ContractId`.
 
 `0x280E` is the one worth understanding: it walks the `AskUserList` and, for each other
 participant that is in world, pushes `DBS_SEND_END_THROUGH_ARBITER_CONTRACT` to **that user's**
-World session carrying `[ContractorDbId][ContractType][ContractId][thatUserDbId]`. Reproducing it
-faithfully needs the contract/trade system we do not have, and inventing a reply would tell World
-a contract completed that we never brokered.
+World session carrying `[ContractorDbId][ContractType][ContractId][thatUserDbId]`. A fan-out, not
+an answer.
+
+**Still refused on purpose:** `ContractType` 10 (guild creation) and 0x23 (trade broker deal).
+`CreateGuildFetchWork` runs the guild-name restriction check before anything else and
+`TradeBrokerOpenDealFetchWork` needs the broker's own deal state; inventing a verdict would tell
+World a contract was brokered that never was. One open guess remains — whether the target is named
+by a db id in `FetchDataList` or by a name in `Param`; both readings are tried and
+`status/CAPTURE-PLAN.md` A.2.1 is the step that settles it.
+
+The first cells above stay backticked on purpose: the coverage guard
+(`Every_per_user_request_opcode_is_answered`) parses rows whose first cell starts with a bare `0x`,
+and these opcodes are answered by a WorldBridge gate rather than by the allow-list, `OneWayFromWorld`
+or a replay entry — none of the guard's three arms. A parseable row here would fail it.
 
 
 ## Guilds — the boot load, T51
