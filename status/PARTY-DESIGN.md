@@ -468,8 +468,9 @@ byte-for-byte against the layout in §5, every parser round-trips its builder, t
 paths return null, and one test pins each of the six `.def` corrections so a future codec
 change cannot silently re-adopt the wrong layout.
 
-**Not implemented, deliberately**: any `PartyManager`, any session wiring, any `S_PARTY_*`
-send. Those need T27's per-session routing and a live two-client test.
+**Not implemented by T28, deliberately**: any `PartyManager`, any session wiring, any
+`S_PARTY_*` send. `PartyManager` landed in T35 (section 10); the session wiring still needs
+T27's per-session routing and a live two-client test.
 
 ---
 
@@ -487,3 +488,190 @@ send. Those need T27's per-session routing and a live two-client test.
    `MA_ASK_TO_JOIN_PARTY_ABORT` 0x4662) was not traced. Only matters if matchmaking is built.
 5. **`S_OTHER_USER_APPLY_PARTY`'s `unk1`/`unk2`** are `PartyMatchInfo+0x98` and bit 4 of
    `Account+0x2adc`; what they mean to the client is unknown.
+
+---
+
+## 10. T35 — `World/PartyManager.cs`, and the wiring the human has to do
+
+Pure in-memory state plus two total functions. No I/O, no clock, no randomness, so the whole
+invite → accept → loot → leave → dismiss sequence is a golden test.
+
+```csharp
+PartyActions OnClientPacket(uint ticket, ushort opcode, byte[] body);
+PartyActions OnWorldFrame(ushort opcode, byte[] payload);
+PartyActions Unregister(uint ticket);     // logout: the member goes Offline, the party survives
+void         Register(PartyPlayer player);
+```
+
+```csharp
+sealed class PartyActions {
+    List<ClientAction> ToClients;   // one packet for one session
+    List<WorldAction>  ToWorld;     // opcode + payload, built by PartyPackets
+    string? Rejected;               // why nothing happened, when nothing happened
+}
+readonly record struct ClientAction(uint Ticket, string PacketName,
+                                    IReadOnlyDictionary<string,object>? Fields, byte[]? RawPacket);
+readonly record struct WorldAction(ushort Opcode, byte[] Payload);
+```
+
+**Client packets come back as a name plus a field dictionary, not bytes.** That is deliberate:
+`GameSession.SendByDef(name, fields)` already turns exactly that into bytes through the `.def`
+codec, so the manager does not need a second client-packet writer living next to the real one —
+and with two of the party `.def` files already known-wrong (section 6.3), a hand-rolled copy
+would bake those errors in twice. The tests still go through the codec end to end: they load
+`DefinitionRegistry` from `tera_v100_MASTER_FINAL` and write, then read back, every emitted
+action. `SA_BYPASS_TO_GROUP` is the exception — World hands over a finished client packet, so
+that one comes back as `RawPacket` for `GameSession.Send`.
+
+Arbiter → World frames **are** bytes, from `PartyPackets` (T28), byte-exact against section 5.1.
+
+### What is modelled
+
+| the real Arbiter | here |
+|---|---|
+| `PartyId = ((PlanetId<<16 \| PlanetInnerId)<<32) \| ++counter` | `NextPartyId()`; first id `0x0AF0000100000001` |
+| `Party+0xD8`, 30 fixed slots, empty = `{-1,0}` | `Party.Slots[30]`, empty = `null`; indices never shift, because `slot` is wire-visible in `S_PARTY_MEMBER_LIST` and `AS_DO_SWAP_PARTY` |
+| `PartyMemberBasicInfo`, 0xA0 bytes | `PartyPackets.PartyMember`, written by `BuildMemberBasicInfo` |
+| 5 members, 30 in a raid | `Party.MaxMembers`; the sixth join is refused |
+| `PartyMemberInfo+0x70` Online | `Unregister` marks offline and sends `S_LOGOUT_PARTY_MEMBER`; the slot is kept |
+| `New_CreateParty` refuses < 2 | a party that falls to one member dissolves |
+| `Party::BroadcastPacket`'s originator skip | `GroupType != 1` skips `(ObjectPlanetId, ObjectId)` |
+
+### What is not
+
+- **No `AA_*`.** One process, so the cross-Arbiter family is dropped (section 5.3).
+- **No world-majority rule.** `Handler_C_DISMISS_PARTY` also requires that a majority of online
+  members share the caller's world server (`GetOnLineMemberCount() - IsSameWorldPartyMember() <
+  IsSameWorldPartyMember()`), which needs state only World has. The manager does the
+  manager-only check and sends the request; World still runs the vote and answers.
+- **No `S_SYSTEM_MESSAGE`.** The real Arbiter answers a rejected `C_APPLY_PARTY` with
+  `FUN_1403aa760(user, 0x3ea, 0)` and a failed majority with `0xA64`. We have never seen those
+  on the wire, so `PartyActions.Rejected` carries the reason as text and the wiring decides,
+  rather than the manager guessing at message ids.
+- **No party matching**, no `S_PARTY_MEMBER_INFO` (none of the three shipped `.def`s matches the
+  binary — section 6.3).
+
+### The wiring diff — human-owned files, not applied
+
+**1. `Program.cs`** — construct it next to the other singletons and hand it to the bridge:
+
+```csharp
+        var party = new PartyManager(loggerFactory.CreateLogger<PartyManager>());
+        worldBridge.Party = party;
+```
+
+**2. `World/WorldBridge.cs`** — a property, and one call in `HandleFrame`'s `default:` arm,
+*before* `DbProxy.TryHandle` so a party frame never reaches the replay table:
+
+```csharp
+    /// <summary>Arbiter-owned party state; see status/PARTY-DESIGN.md.</summary>
+    public PartyManager? Party { get; set; }
+```
+
+```csharp
+            default:
+                if (Party != null && PartyPackets.MinFrameLength(op) != 0)
+                {
+                    var acts = Party.OnWorldFrame(op, payload);
+                    if (acts.Rejected != null) _log.LogWarning("party 0x{Op:X4}: {Why}", op, acts.Rejected);
+                    Dispatch(acts);
+                    return;
+                }
+                if (DbProxy != null && DbProxy.TryHandle(this, link, op, payload)) return;
+```
+
+`PartyPackets.MinFrameLength(op) != 0` is true for exactly the twelve W→A party opcodes and
+nothing else, so it is a safe gate.
+
+**3. `World/WorldBridge.cs`** — the dispatcher, next to `RouteToClient`:
+
+```csharp
+    /// <summary>Send what PartyManager produced. Def-driven packets go through the .def codec;
+    /// a raw packet is one World already framed (SA_BYPASS_TO_GROUP).</summary>
+    internal void Dispatch(PartyActions acts)
+    {
+        foreach (var w in acts.ToWorld) SendFrame(w.Opcode, w.Payload);
+        foreach (var c in acts.ToClients)
+        {
+            var s = SessionForTicket(c.Ticket);
+            if (s == null) continue;
+            if (c.IsRaw) s.Send(c.RawPacket!);
+            else s.SendByDef(c.PacketName, c.Fields!);
+        }
+    }
+```
+
+`SessionForTicket` does not exist yet. `_tunnels` is already keyed by Ticket but holds a
+delivery callback, not the session — the smallest change is a second dictionary alongside
+`_players`, filled in `RegisterPlayer` and cleared in `UnregisterPlayer`:
+
+```csharp
+    private readonly Dictionary<uint, GameSession> _byTicket = new();
+    internal GameSession? SessionForTicket(uint ticket)
+    { lock (_playersLock) return _byTicket.TryGetValue(ticket, out var s) ? s : null; }
+```
+
+**4. `Handlers/HandlerRegistry.cs`** — the seven Arbiter-side party opcodes. They are currently
+unregistered, so `PacketDispatcher` forwards them to World, which is wrong for all seven:
+
+```csharp
+        foreach (var (name, op) in new (string, ushort)[]
+                 {
+                     ("C_APPLY_PARTY",              PartyPackets.C_APPLY_PARTY),
+                     ("C_PARTY_APPLICATION_DENIED", PartyManager.C_PARTY_APPLICATION_DENIED),
+                     ("C_DISMISS_PARTY",            PartyPackets.C_DISMISS_PARTY),
+                     ("C_BAN_PARTY_MEMBER",         PartyPackets.C_BAN_PARTY_MEMBER),
+                     ("C_PARTY_LOOTING_METHOD",     PartyPackets.C_PARTY_LOOTING_METHOD),
+                     ("C_MERGE_PARTY_TO_RAID",      PartyPackets.C_MERGE_PARTY_TO_RAID),
+                     ("C_REQUEST_PARTY_INFO",       PartyPackets.C_REQUEST_PARTY_INFO),
+                 })
+            d.Register(op, name, 0, (s, body) =>
+            {
+                var w = Program.WorldBridgeInstance;           // however the registry reaches it
+                if (w?.Party == null) return false;
+                var acts = w.Party.OnClientPacket(s.TunnelKey, op, body.ToArray());
+                if (acts.Rejected != null) _log.LogInformation("{Name}: {Why}", name, acts.Rejected);
+                w.Dispatch(acts);
+                return true;
+            });
+```
+
+`C_LEAVE_PARTY` (0xFFB6) and `C_CHANGE_PARTY_MANAGER` (0x60D6) stay **unregistered** on purpose —
+the real Arbiter has no handler for either; they belong to World and come back as
+`SA_LEAVE_PARTY` / `SA_CHANGE_PARTY_MANAGER`.
+
+**5. `Handlers/WorldEntry.cs`** — register the player when they enter the world, so the manager
+can map a ticket to a character, and unregister on leave:
+
+```csharp
+        w.Party?.Register(new PartyManager.PartyPlayer(
+            Ticket: s.TunnelKey, UserDbId: (int)chr.Id, Name: chr.Name, Level: chr.Level,
+            Class: chr.Class, Race: chr.Race, Gender: chr.Gender, GameId: s.GameId));
+```
+
+and in `GameSession`'s leave path, next to `w.UnregisterPlayer(GameId, TunnelKey)`:
+
+```csharp
+        if (w.Party != null) w.Dispatch(w.Party.Unregister(TunnelKey));
+```
+
+### Order of operations
+
+None of this is worth applying before T27 §6 lands. `PartyManager` keys everything on the
+tunnel Ticket, and `AllocateTunnelKey()` currently returns a constant 5 for every session — so
+with two players the manager would see one ticket and route both players' packets to whichever
+session registered last. T27 §6(2) is the prerequisite.
+
+### Open
+
+1. **No captured party bytes anywhere**, so the A→W frames are golden against the decompiled
+   writers and the client packets are round-tripped through the codec rather than compared to a
+   capture. Steps 6–9 of the capture checklist in `MULTIPLAYER-DESIGN.md` §8 fix that.
+2. **Manager promotion on leave is ours, not the decompile's.** When the manager leaves, this
+   promotes the first remaining member and emits the `S_CHANGE_PARTY_MANAGER` World's
+   `SA_CHANGE_PARTY_MANAGER` would have produced. The real Arbiter certainly promotes — a
+   leaderless party is not a state the client can render — but the exact choice of successor was
+   not traced.
+3. **`Party.DefaultLoot`** is the client's out-of-the-box setting, not the Arbiter's: the real
+   ctor copies its defaults from config at `+0x15f4..+0x1608`, and we have never seen those bytes.
+
