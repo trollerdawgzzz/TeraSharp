@@ -3150,7 +3150,12 @@ DELETE FROM guild_members     WHERE user_db_id = $id;";
     /// pages by 0x14 rows (FUN_14056f060(..., 0x14)); page numbers are 1-based.</summary>
     public List<GuildLogRow> GetGuildLog(int guildId, int page, int pageSize = GuildHistoryPageSize)
     {
+        // T48: `page` reaches here from a packet. `if (page < 1) page = 1` alone left
+        // (page - 1) * pageSize free to overflow - page = int.MaxValue gave OFFSET -40, which
+        // SQLite silently treats as 0 and answers with page 1. Clamp so the multiply cannot wrap.
         if (page < 1) page = 1;
+        if (pageSize < 1) pageSize = GuildHistoryPageSize;
+        if (page > MaxPageNumber) page = MaxPageNumber;
         lock (_lock)
         {
             var list = new List<GuildLogRow>();
@@ -3172,6 +3177,14 @@ DELETE FROM guild_members     WHERE user_db_id = $id;";
 
     /// <summary>Guild::SendGuildHistory's page size: 0x14 rows.</summary>
     public const int GuildHistoryPageSize = 0x14;
+
+    /// <summary>
+    /// The largest page number any paginated query will act on. T48: the point is not the value
+    /// but that <c>page * pageSize</c> must be unable to overflow for ANY int the client sends -
+    /// status/ARBITER-SECURITY-NOTES.md bug #2. A million pages is more rows than this server
+    /// will ever hold and leaves three orders of magnitude of headroom under int.MaxValue.
+    /// </summary>
+    public const int MaxPageNumber = 1_000_000;
 
     /// <summary>How many pages S_GUILD_HISTORY should advertise as LastPage. Always at least 1,
     /// so an empty log still renders an empty page rather than page 1 of 0.</summary>

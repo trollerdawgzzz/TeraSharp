@@ -318,7 +318,7 @@ public sealed class GuildHandlers
         if (page == null) return a.Reject("C_GET_GUILD_HISTORY: short body");
         var guild = MyGuild(characterId);
         if (guild == null) return a.Reject("C_GET_GUILD_HISTORY: caller is in no guild");
-        return SendHistory(a, characterId, guild.GuildId, page.Value);
+        return SendHistory(a, characterId, guild.GuildId, page.Value);   // clamped in SendHistory
     }
 
     /// <summary>C_GUILD_APPLY_LIST_PAGE (0xDB53): `[i32 pageNumber]`.</summary>
@@ -740,6 +740,8 @@ public sealed class GuildHandlers
 
     private GuildActions SendHistory(GuildActions a, int characterId, int guildId, int page)
     {
+        // T48: clamp before the store multiplies it into a SQL OFFSET.
+        page = ClampPage(page, _store.CountGuildLogPages(guildId));
         var rows = _store.GetGuildLog(guildId, page);
         var events = new List<Dictionary<string, object>>(rows.Count);
         foreach (var r in rows)
@@ -760,12 +762,36 @@ public sealed class GuildHandlers
         return a;
     }
 
+    /// <summary>
+    /// A page number from a packet, clamped to 1..<paramref name="totalPages"/>. T48.
+    ///
+    /// <para>Every paginated handler must go through this. The rule from
+    /// status/ARBITER-SECURITY-NOTES.md bug #2 is that a page index is validated against BOTH
+    /// bounds - against the collection's real size, not just against being negative - and the
+    /// clamp has to happen <b>before</b> any <c>page * pageSize</c>, because that multiply
+    /// overflows in C# silently and turns a positive page into a negative offset.</para>
+    /// </summary>
+    public static int ClampPage(int page, int totalPages)
+    {
+        if (totalPages < 1) totalPages = 1;
+        if (page < 1) return 1;
+        return page > totalPages ? totalPages : page;
+    }
+
     private GuildActions SendApplyListFor(GuildActions a, int characterId, CharacterStore.GuildRow g, int page)
     {
-        if (page < 1) page = 1;
         var all = _store.GetGuildApplies(g.GuildId);
         int pageSize = GuildPackets.ApplyListPageSize;
         int totalPages = all.Count == 0 ? 1 : (all.Count + pageSize - 1) / pageSize;
+
+        // T48. `page` is an i32 straight off the wire and the old code was
+        //     for (int i = (page - 1) * pageSize; i < all.Count && i < page * pageSize; i++)
+        // with only `if (page < 1) page = 1;` in front of it - the one-sided guard that
+        // status/ARBITER-SECURITY-NOTES.md bug #2 describes, plus an overflow that defeats it.
+        // page = 165191051 makes (page-1)*13 wrap to -2147483646, which is BOTH less than
+        // all.Count and less than page*13 (also wrapped), so the loop runs and indexes all[-2^31].
+        // Clamping against totalPages first makes the multiply unreachable for any hostile value.
+        page = ClampPage(page, totalPages);
 
         var apps = new List<Dictionary<string, object>>();
         for (int i = (page - 1) * pageSize; i < all.Count && i < page * pageSize; i++)

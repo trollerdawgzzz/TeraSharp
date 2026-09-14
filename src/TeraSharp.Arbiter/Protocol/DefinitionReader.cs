@@ -27,13 +27,33 @@ public sealed class DefinitionReader
 {
     private const int Header = 4;
 
+    /// <summary>
+    /// Total array elements one packet may produce, across every array in it. T48.
+    ///
+    /// <para><b>Why this exists.</b> An array header is <c>[u16 count][u16 offset]</c>, so a
+    /// four-byte body can declare 65535 elements, and each element is a full
+    /// <see cref="ReadRecord"/> - a Dictionary allocation, plus a string scan per string field.
+    /// Worse, elements are chained by a <c>next</c> offset the packet also supplies, and nothing
+    /// stopped that chain pointing at itself. <c>C_CHECK_VERSION</c> is an array packet, it is
+    /// the FIRST handler registered, and it is reachable BEFORE authentication: the 16-byte body
+    /// <c>FF FF 08 00 08 00 08 00 01 00 00 00 01 00 00 00</c> declared 65535 elements whose
+    /// <c>next</c> pointed at themselves and cost ~13 MB of allocation per packet - an 850,000x
+    /// amplification, pre-auth, repeatable as fast as a socket can write.</para>
+    ///
+    /// <para>4096 is far above anything the real protocol sends to us (the largest client array
+    /// we answer is a 24-entry private-channel invite list) and far below anything that hurts.</para>
+    /// </summary>
+    public const int MaxElementsPerPacket = 4096;
+
     private readonly byte[] _body;
+    private int _elementBudget = MaxElementsPerPacket;
 
     public DefinitionReader(ReadOnlySpan<byte> body) => _body = body.ToArray();
 
     public Dictionary<string, object> Read(PacketDef def)
     {
         int pos = 0;
+        _elementBudget = MaxElementsPerPacket;
         return ReadRecord(def.Fields, ref pos);
     }
 
@@ -114,14 +134,41 @@ public sealed class DefinitionReader
         return result;
     }
 
+    /// <summary>
+    /// Walk an array's element chain. Three things here are defensive and all three matter (T48,
+    /// status/SECURITY-AUDIT.md):
+    /// <list type="number">
+    /// <item><b>The list is never pre-sized from the count.</b> <c>new List&lt;object&gt;(count)</c>
+    /// allocated 512 KB for a four-byte body that declared 65535 and then went nowhere.</item>
+    /// <item><b>Every element offset must be new.</b> The chain is packet-supplied; without this
+    /// an element whose <c>next</c> points at itself is walked <c>count</c> times.</item>
+    /// <item><b>A shared per-packet budget.</b> Nesting multiplies: an array of records that each
+    /// contain an array would otherwise be count^depth, and neither of the first two rules bounds
+    /// the product on its own.</item>
+    /// </list>
+    /// Hitting any limit truncates the array and stops - it does not throw, because a short read
+    /// is what every other malformed-packet path here does and the handler above copes with an
+    /// empty list.
+    /// </summary>
     private List<object> ReadArray(FieldDef arrayField, int count, int firstOffset)
     {
-        var list = new List<object>(count > 0 ? count : 0);
+        var list = new List<object>();
         if (count <= 0) return list;
 
+        // An element is at least its own here+next header, so the body itself caps the count.
+        int maxByBody = _body.Length / 4;
+        if (count > maxByBody) count = maxByBody;
+
+        HashSet<int>? seen = null;
         int elemBody = ToBody(firstOffset);
         for (int i = 0; i < count && elemBody >= 0; i++)
         {
+            if (_elementBudget <= 0) break;
+            _elementBudget--;
+
+            seen ??= new HashSet<int>();
+            if (!seen.Add(elemBody)) break;          // the chain looped back
+
             int pos = elemBody;
             ushort here = ReadU16(ref pos);
             ushort next = ReadU16(ref pos);

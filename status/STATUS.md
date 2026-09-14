@@ -19,6 +19,7 @@ Deploy check: `TeraSharp.Arbiter.exe --selftest` — one PASS/FAIL line per data
 |---|---|
 | Client crypto / codec / login / char list / select / create / delete | real |
 | Chat, client settings (persisted) | real |
+| Packet-handling security: bounds, pagination, allocate-by-count, plus a fuzz suite | audited (T48), 4 fixed, 2 human-owned open |
 | Whisper + private chat channels - layouts, the channel object, `ChatManager` | implemented (T43), RAM-only, **not wired** |
 | The 18 client packets World rejects - tooltips, exploration, client log, the small acks | implemented (T45), **not wired** |
 | Mail: the six `SDB_*_PARCEL` W<->A pairs, empty inbox byte-exact | real (T45) |
@@ -69,6 +70,8 @@ Deploy check: `TeraSharp.Arbiter.exe --selftest` — one PASS/FAIL line per data
 | Guild rows, the Arbiter-side guild handlers, and the wiring they still need | `status/GUILD-DESIGN.md` section 10 |
 | How a subsystem's action list becomes sends (parties, guilds, chat, and whatever is next) | `World/ActionDispatcher.cs`, and the wiring section of each design doc |
 | Why World logs "handler has not been implemented yet!!!", and who owns each of those packets | `status/CLIENT-REJECTS.md` |
+| Whether a packet field is bounds-checked, and what the fuzz suite covers | `status/SECURITY-AUDIT.md` |
+| Where `S_LOGIN_ARBITER.status` and `AdminLevel` come from, and why they are unrelated | `status/GM-ADMINLEVEL-TRACE.md` |
 | Why a fresh mailbox showed 12 blank rows, and the 35-byte empty `DBS_LIST_PARCEL` | `status/CLIENT-REJECTS.md` section 4 |
 | Whisper, private channels, the slot-not-an-id trap, and the chat .def corrections | `status/CHAT-DESIGN.md` |
 | The `SocialHandlers.OnWhisper` -> `ChatManager` swap, and what it changes for blocked users | `status/CHAT-DESIGN.md` section 7.2 |
@@ -106,6 +109,17 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
 ## Open
 
 - Live test of the relog-into-instance fallback (T21).
+- **T48 security audit**: two fixes are in human-owned files and NOT applied -
+  `World/WorldBridge.cs` needs the tunnel length check (a negative `clientLen` slips the bound and
+  a large one overflows it) and a per-frame try/catch (today one throwing `SDB_` handler closes
+  the World link and drops every player). Diffs in `status/SECURITY-AUDIT.md` section 5.
+- `Program.Store` has a private setter, so the T48 client fuzz runs against a null store and only
+  covers the shallow half of each handler. `internal set` would fix it
+  (`status/SECURITY-AUDIT.md` section 5.4).
+- `Network/PacketReader.cs` is dead code and its `ReadOffsetString` uses a body-relative offset
+  where the protocol is packet-relative - delete it or fix it before anyone wires it up.
+- `AS_ENTER_WORLD[111]` (AdminLevel) is never populated, so World treats every GM as an ordinary
+  player whatever `S_LOGIN_ARBITER.status` said (`status/GM-ADMINLEVEL-TRACE.md`).
 - **The `RegNoop` / `RegEmptyReply` in-world forward** (`HandlerRegistry`) sends Arbiter-owned
   packets to World, which drops them. Six packets are affected; the fix and the
   `PacketDispatcher` deny-list are in `status/CLIENT-REJECTS.md` section 7 (human-owned files).
