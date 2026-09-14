@@ -855,8 +855,8 @@ public static class PartyPackets
     {
         if (TooShort(SA_JOIN_PARTY, p)) return null;
         return new SaJoinParty(
-            BitConverter.ToInt32(p, 0x04), BitConverter.ToInt32(p, 0x08), BitConverter.ToInt32(p, 0x0C),
-            BitConverter.ToInt32(p, 0x10), BitConverter.ToInt32(p, 0x14), BitConverter.ToUInt64(p, 0x18),
+            BitConverter.ToInt32(p, 0x00), BitConverter.ToInt32(p, 0x04), BitConverter.ToInt32(p, 0x08),
+            BitConverter.ToInt32(p, 0x0C), BitConverter.ToInt32(p, 0x10), BitConverter.ToUInt64(p, 0x18),
             BitConverter.ToInt32(p, 0x20), BitConverter.ToInt32(p, 0x24), BitConverter.ToInt32(p, 0x28),
             BitConverter.ToInt32(p, 0x2C), BitConverter.ToInt32(p, 0x30),
             p[0x34] != 0, p[0x35] != 0,

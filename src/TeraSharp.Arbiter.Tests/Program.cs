@@ -6575,6 +6575,8 @@ public bool TryHandle(WorldBridge bridge, WorldLink link, ushort op, byte[] payl
         Hex.Eq(b, Hex.B("EA 07 09 00  0D 00 05 00  33 00 2D 00  00 00 00 00"),
             "2026-09-13 05:51:45 encodes exactly as the capture has it");
         Hex.True(b.Length == 16, "16 bytes");
+    }
+
     // ================= T28: the party packet layer (status/PARTY-DESIGN.md) =================
     //
     // No capture contains a party frame, so these are GOLDEN tests against the layouts in
