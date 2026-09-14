@@ -2983,9 +2983,14 @@ array items
         Hex.True(after.X == -449.5f && after.Y == 6239.25f && after.Z == 1956f,
             $"x/y/z come from blob[220/224/228], got ({after.X},{after.Y},{after.Z})");
 
-        // Read-only on the blob, in both directions.
+        // Read-only on the blob, in both directions - except the eight money bytes at 448, which
+        // T59 stamps from characters.money on every read (World writes them back as zero).
         Hex.Eq(blob, original, "SaveWorldBlob must not modify the caller's blob");
-        Hex.Eq(after.WorldBlob!, original, "the stored blob must be byte-identical to the one World sent");
+        var stored = (byte[])after.WorldBlob!.Clone();
+        var expect = (byte[])original.Clone();
+        Array.Clear(stored, TeraSharp.Arbiter.Persistence.StarterBlob.MoneyOffset, 8);
+        Array.Clear(expect, TeraSharp.Arbiter.Persistence.StarterBlob.MoneyOffset, 8);
+        Hex.Eq(stored, expect, "the stored blob must be byte-identical to the one World sent (outside the money field)");
     }
 
     [Test] public static void SaveWorldBlob_ignores_blob_offset_208_which_is_hp()
@@ -11417,10 +11422,10 @@ some prose with `backticks` that is not a table row
             Hex.True(r.Inserted == 0 && r.Ignored == 1, "dropped, not invented");
             Hex.True(store.CountInventoryItems(42) == 0, "no phantom row");
 
-            // Character money (op 9) is not an item row either.
+            // Character money (op 9) is not an item row - since T59 it is APPLIED to characters.money.
             var m = T44Apply(store, T44AtomPayload(DbProxyHandlers.ItemSingleRequestHeader,
                 (WarehouseHandlers.TsChangeMoney, 0, 0, 42, BagItems.Pocket, 0u, 42, BagItems.Pocket, 0u, 84)));
-            Hex.True(m.Ignored == 1 && store.CountInventoryItems(42) == 0,
+            Hex.True(store.CountInventoryItems(42) == 0,
                      "character money lives on the character row, not in items");
 
             // An op we have never seen leaves the rows alone rather than guessing.

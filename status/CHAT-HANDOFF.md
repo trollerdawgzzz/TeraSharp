@@ -95,6 +95,12 @@ and look for the next caller.
 
 ## Rules that bit us
 
+- **Session A (real Arbiter + tap) is NOT feasible on the 32 GB netcup box while World runs**: World
+  27 GB + real Arbiter 3.3 GB + MSSQL leaves ~400 MB, SQL pages and stored procs take 15-48 s, World
+  keeps the character in loading state (can move, cannot use skills). Options: Session B (client-side
+  capture on a populated 100.02 server), or a temporarily larger VM for one Session A. The T56 tap is
+  installed on netcup at C:\TERA_SERVER.100\arbiter-world-tap.js and PlanetDB Users.adminLevel = 5
+  for dob/Test/two.
 - **Every `C:\deploy.ps1` requires a WorldServer restart afterwards** - World cannot survive the
   Arbiter link dropping; it will not reconnect. Budget ~3 min per deploy for that.
 - **`deploy.ps1` now runs `--selftest` first** and aborts on a required failure; it sets

@@ -649,7 +649,7 @@ CREATE TABLE IF NOT EXISTS characters (
   position INTEGER NOT NULL DEFAULT 1,
   last_logout TEXT,
   world_blob BLOB,
-  -- T59: character money ("gold"). Not in the blob World saves - it is stamped into the blob at
+  -- T59: character money (gold). Not in the blob World saves - it is stamped into the blob at
   -- StarterBlob.MoneyOffset when a character is read, exactly as the real Arbiter binds its own
   -- `money` column into UserData + 0x1C0. The op-9 atom carries a signed DELTA, so this is the
   -- running total.
