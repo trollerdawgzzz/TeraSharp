@@ -1808,9 +1808,10 @@ public sealed class DbProxyHandlers
 
         var r = WarehouseHandlers.Apply(_store, parsed, _store.NextItemId, _log);
         if (parsed.Count > 0)
-            _log.LogInformation("{Op}: {N} atom(s) -> {Ins} inserted, {Mov} moved, {Chg} amount, {Del} deleted, {Money} money, {Ign} ignored",
+            _log.LogInformation("{Op}: {N} atom(s) -> {Ins} inserted, {Mov} moved, {Chg} amount, {Del} deleted, "
+                + "{Money} ware money, {Gold} character money, {Ign} ignored",
                 DbProxyOpcodeNames.Describe(replyOp), parsed.Count, r.Inserted, r.Moved, r.AmountChanged,
-                r.Deleted, r.MoneyDelta, r.Ignored);
+                r.Deleted, r.MoneyDelta, r.CharacterMoneyDelta, r.Ignored);
 
         // WareCommision is 0 in this build: CommisionPayed() returns 1 and GetWareCommision()
         // returns 0 in the decompile, so the fee path is effectively disabled.

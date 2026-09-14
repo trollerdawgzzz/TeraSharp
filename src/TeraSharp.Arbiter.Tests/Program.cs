@@ -13909,6 +13909,18 @@ some prose with `backticks` that is not a table row
         foreach (ushort o in PartyFuzzOpcodes())
             Drive($"PartyManager 0x{o:X4}", b => party.OnClientPacket(1, o, b), o);
 
+        // T57: the World -> Arbiter guild frames, which reach the same store methods from the
+        // other direction. Its own store, because these frames legitimately DELETE guilds and
+        // a body that happens to name the scratch one would otherwise look like corruption.
+        using (var worldStore = T48Store())
+        {
+            var g2 = new GuildHandlers(worldStore, QuietLog());
+            Hex.True(g2.CreateGuild(new GuildActions(), 1, "FuzzW") > 0, "the second scratch guild");
+            foreach (ushort o in GuildWiring.WorldOpcodes)
+                Drive($"GuildWiring 0x{o:X4}", b => GuildWiring.OnWorldFrame(worldStore, o, b), o);
+            Hex.True(worldStore.GetCharacter(1) != null, "the store still answers after the guild fuzz");
+        }
+
         var parserSummary = FuzzSummary(failures);
         Hex.True(failures.Count == 0,
             $"{failures.Count} parser failure(s) over {calls} hostile bodies, "
@@ -14508,9 +14520,13 @@ some prose with `backticks` that is not a table row
     }
 
     /// <summary>
-    /// The other ten gated opcodes are consumed and logged, not answered. That is on purpose:
-    /// consuming keeps the replay table out of it, and an OnWorldFrame action set carries
-    /// Origin = None, so the rejection reaches the log and not somebody's chat window.
+    /// After T57 only two gated opcodes have no handler: SA_INC_GUILD_ACCOUNT_LIMIT (0x1414) and
+    /// SA_PUSH_GUILD_BUFF (0x145C), neither of which has a modelled subsystem behind it. They are
+    /// consumed and logged, not answered. That is on purpose: consuming keeps the replay table
+    /// out of it, and an OnWorldFrame action set carries Origin = None, so the rejection reaches
+    /// the log and not somebody's chat window. The other ten reach the same place on a frame
+    /// that names no guild, which is what a zero payload is - so this doubles as the check that
+    /// a blank frame never writes a row.
     /// </summary>
     [Test] public static void T52_the_unmodelled_guild_frames_are_consumed_not_answered()
     {
@@ -14524,11 +14540,17 @@ some prose with `backticks` that is not a table row
             if (op == GuildPackets.SA_LEAVE_GUILD || op == GuildPackets.SA_BANISH_GUILD_MEMBER) continue;
             var a = GuildWiring.OnWorldFrame(store, op, new byte[32]);
             Hex.True(a.Origin.Kind == RecipientKind.None, $"0x{op:X4}: a World frame has no origin");
-            Hex.True(a.Rejected != null && a.IsEmpty, $"0x{op:X4} is not answered yet");
+            Hex.True(a.Rejected != null && a.IsEmpty,
+                $"0x{op:X4}: a frame naming no guild changes nothing and answers nothing");
             var r = h.Dispatcher.Dispatch(a, "guild-world");
             Hex.True(!r.RejectionSent, $"0x{op:X4}: the rejection stays in the log");
         }
         Hex.True(someone.Log.Count == 0, "and nobody's chat window was touched");
+
+        // The two that are gated on purpose stay that way whatever the payload names.
+        foreach (ushort op in new[] { GuildPackets.SA_INC_GUILD_ACCOUNT_LIMIT, GuildPackets.SA_PUSH_GUILD_BUFF })
+            Hex.True(GuildWiring.OnWorldFrame(store, op, new byte[64]).Rejected != null,
+                $"0x{op:X4} has no modelled subsystem - GUILD-DESIGN.md section 12.3");
     }
 
     /// <summary>
@@ -15260,4 +15282,498 @@ some prose with `backticks` that is not a table row
             "read at frame 0x1F");
         Hex.True(buy.Length == 0x21, "and it is the last thing in the frame");
     }
+
+    // ======================================================================
+    // T59 - character money
+    //
+    // Two facts the whole feature rests on, both read off the binaries rather
+    // than guessed:
+    //
+    //  1. The op-9 ItemTransactionAtom carries a signed DELTA.
+    //     Inventory::PrepareMoneyTransaction (WorldServer.exe.c:1407fa050)
+    //     refuses when `*(__int64 *)(inv + 0x78) + amount < 0` - it adds the
+    //     value to the money it already holds - then writes that same value to
+    //     atom + 0x50. It also emits NO atom when the amount is 0, which an
+    //     absolute update could never do.
+    //
+    //  2. Money reaches World in the enter-world BLOB, at offset 448 (0x1C0),
+    //     as an i64. The Arbiter binds its SQL `money` column to
+    //     UserData + 0x1C0 (Arb_part_032.c:17798); World's enter-world
+    //     finisher calls Inventory::SetMoney(User + 0xA478,
+    //     *(__int64 *)(context + 0x268)) (WorldServer.exe.c:1663604) and the
+    //     blob lands at context + 0xA8 - 0x268 - 0xA8 = 0x1C0.
+    //
+    // It is NOT in DBS_USER_LOAD_INVENTORY (0x27A4): that reply's only fields
+    // are InvenItems, DlmId and ContinueReceive (dumper FUN_140209730,
+    // Arb_part_016.c:760), and its array is a plain run of 0x218-byte
+    // ItemData records with no money entry (writer Arb_part_064.c:15328).
+    // And World never writes it back: blob + 0x1C0 is zero in all six
+    // SDB_UPDATE_USER_DATA frames of cap_newchar.log, including the ones sent
+    // after the character had earned 230 gold. That is why it needs a column.
+    // ======================================================================
+
+    /// <summary>A store with `count` characters, ids 1..count, none of them in a guild.</summary>
+    static TeraSharp.Arbiter.Persistence.CharacterStore T59Store(int count = 2)
+    {
+        var store = new TeraSharp.Arbiter.Persistence.CharacterStore(":memory:", QuietLog());
+        var acct = store.GetOrCreateAccount("t59");
+        for (int i = 1; i <= count; i++)
+        {
+            int id = store.CreateCharacter(new TeraSharp.Arbiter.Persistence.CharacterRecord
+            {
+                AccountId = acct.Id, Name = "m" + i, Gender = 1, Race = 4, Class = 12,
+                Level = 1, TemplateId = 10101, Zone = 5, X = 1f, Y = 2f, Z = 3f,
+                Appearance = new byte[8], Details = new byte[32], Shape = new byte[64],
+                Position = i,
+            });
+            Hex.True(id == i, $"expected character id {i}, got {id}");
+        }
+        return store;
+    }
+
+    /// <summary>One op-9 money atom for owner `who`, exactly as PrepareMoneyTransaction builds
+    /// it: no item id, template 0, both inven slots 0, both owners the player, delta at +0x50.</summary>
+    static byte[] T59MoneyAtoms(long who, params long[] deltas)
+    {
+        var atoms = new (uint Op, long ItemDbId, int Template, long SrcOwner, uint SrcInven,
+                         uint SrcSlot, long DstOwner, uint DstInven, uint DstSlot, long Delta)[deltas.Length];
+        for (int i = 0; i < deltas.Length; i++)
+            atoms[i] = (WarehouseHandlers.TsChangeMoney, 0L, 0, who, 0u, 0u, who, 0u, 0u, deltas[i]);
+        return T44AtomPayload(DbProxyHandlers.ItemSingleRequestHeader, atoms);
+    }
+
+    [Test] public static void T59_the_money_atom_is_a_delta_and_lands_on_the_character_row()
+    {
+        using var store = T59Store();
+
+        Hex.True(store.GetCharacterMoney(1) == 0, "a new character has no money");
+
+        var r = T44Apply(store, T59MoneyAtoms(1, 19));
+        Hex.True(store.GetCharacterMoney(1) == 19, $"first loot: {store.GetCharacterMoney(1)}");
+        Hex.True(r.CharacterMoneyDelta == 19, $"counted as character money, not warehouse: {r}");
+        Hex.True(r.MoneyDelta == 0, "and not as warehouse money");
+        Hex.True(r.Ignored == 0, "an op-9 atom is no longer an ignored atom");
+
+        // The sequence cap_newchar_client.log's S_ITEMLIST shows for "Test": 19 -> 67 -> 30 ->
+        // 114 -> 230. Every step is the running total plus the atom's signed delta; the 30 -> 114
+        // step is the +84 INVENTORY-DESIGN.md section 1 already recorded from a kill.
+        T44Apply(store, T59MoneyAtoms(1, 48, -37, 84, 116));
+        Hex.True(store.GetCharacterMoney(1) == 230,
+            $"19 + 48 - 37 + 84 + 116 = 230, got {store.GetCharacterMoney(1)}");
+
+        // Several atoms in one message accumulate, and the result reports the net.
+        var net = T44Apply(store, T59MoneyAtoms(1, 10, -4));
+        Hex.True(net.CharacterMoneyDelta == 6 && store.GetCharacterMoney(1) == 236, $"{net}");
+
+        // World refuses anything that would go negative before it ever builds the atom, so a
+        // negative total can only arrive from a frame World did not send. Clamped, not stored.
+        T44Apply(store, T59MoneyAtoms(1, long.MinValue / 2));
+        Hex.True(store.GetCharacterMoney(1) == 0, "clamped at zero, never negative");
+
+        // Money belongs to one character; the other one is untouched throughout.
+        Hex.True(store.GetCharacterMoney(2) == 0, "the second character earned nothing");
+
+        // An owner that is not a character is a warning, not a throw and not a stray row.
+        var miss = T44Apply(store, T59MoneyAtoms(9999, 5));
+        Hex.True(miss.CharacterMoneyDelta == 5 && store.GetCharacterMoney(9999) == 0,
+            "an unknown owner updates nothing");
+
+        // And money is never an item row: `items` stays empty through all of it.
+        Hex.True(store.GetItems(1, BagItems.Pocket).Count == 0, "op 9 writes no item row");
+    }
+
+    [Test] public static void T59_the_money_field_is_where_both_binaries_put_it()
+    {
+        Hex.True(TeraSharp.Arbiter.Persistence.StarterBlob.MoneyOffset == 448,
+            "blob + 0x1C0");
+        Hex.True(TeraSharp.Arbiter.Persistence.StarterBlob.MoneyOffset == 0x268 - 0xA8,
+            "which is exactly context + 0x268 with the blob memcpy'd to context + 0xA8");
+        Hex.True(TeraSharp.Arbiter.Persistence.StarterBlob.MoneyBlockEnd == 456, "i64, not i32");
+
+        // Short buffers: read 0, write nothing, throw nothing. A character that has never
+        // entered the world has no blob at all, so this is the normal case and not an error.
+        Hex.True(TeraSharp.Arbiter.Persistence.StarterBlob.ReadMoney(null) == 0, "null reads 0");
+        Hex.True(!TeraSharp.Arbiter.Persistence.StarterBlob.WriteMoney(null, 5), "null writes nothing");
+        var tooShort = new byte[455];
+        Hex.True(!TeraSharp.Arbiter.Persistence.StarterBlob.WriteMoney(tooShort, 5),
+            "one byte short of the field is refused, not written past");
+        Hex.True(TeraSharp.Arbiter.Persistence.StarterBlob.ReadMoney(tooShort) == 0, "and reads 0");
+
+        var template = LoadStarterTemplateOrSkip();
+        if (template == null) return;
+        Hex.True(TeraSharp.Arbiter.Persistence.StarterBlob.ReadMoney(template) == 0,
+            "the captured starter blob carries money 0 - the character had none yet");
+    }
+
+    /// <summary>
+    /// The round trip the live bug was about: World saves the blob with money ZEROED (it never
+    /// writes that field), we keep the number in its own column, and the next enter-world serves
+    /// it back inside the blob. Byte-exact against data/starter_blob.bin: the served blob differs
+    /// from the capture in exactly the eight bytes at 448.
+    /// </summary>
+    [Test] public static void T59_money_round_trips_into_the_enter_world_blob_byte_exact()
+    {
+        var template = LoadStarterTemplateOrSkip();
+        if (template == null) return;
+        using var store = T59Store(1);
+
+        // What World actually hands back in SDB_UPDATE_USER_DATA: the capture's bytes, money 0.
+        store.SaveWorldBlob(1, (byte[])template.Clone());
+        var fresh = store.GetCharacter(1)!;
+        Hex.True(fresh.Money == 0 && fresh.WorldBlob!.SequenceEqual(template),
+            "with no money the served blob is the capture, byte for byte");
+
+        // 267 is the figure the live session was chasing; the exact value does not matter, only
+        // that it is not representable in 32 bits by accident, so use a large one too.
+        store.AddCharacterMoney(1, 267);
+        var chr = store.GetCharacter(1)!;
+        Hex.True(chr.Money == 267, $"the column holds it: {chr.Money}");
+        Hex.True(TeraSharp.Arbiter.Persistence.StarterBlob.ReadMoney(chr.WorldBlob) == 267,
+            "and the blob we would send carries it at 448");
+
+        int diffs = 0;
+        for (int i = 0; i < template.Length; i++) if (chr.WorldBlob![i] != template[i]) diffs++;
+        Hex.True(diffs == 2, $"exactly the two bytes of 267 changed, got {diffs}");
+        for (int i = 0; i < template.Length; i++)
+            if (i < 448 || i >= 456)
+                Hex.True(chr.WorldBlob![i] == template[i], $"byte {i} must not move");
+
+        // The 0x2738 payload itself, which is what World reads.
+        var payload = DbProxyHandlers.BuildDbsUserEnterWorld(0x13, chr.WorldBlob);
+        Hex.True(payload.Length == 13 + 15312, $"header + blob: {payload.Length}");
+        Hex.True(BitConverter.ToInt64(payload, 13 + 448) == 267,
+            "money is at payload 13 + 448, i.e. frame 19 + 448");
+
+        // Beyond 32 bits, because the GM commands hand out ten-digit amounts.
+        store.SetCharacterMoney(1, 10_000_000_000L);
+        Hex.True(TeraSharp.Arbiter.Persistence.StarterBlob.ReadMoney(store.GetCharacter(1)!.WorldBlob)
+                 == 10_000_000_000L, "i64 all the way through");
+
+        // A second save from World zeroes the field again - and must not lose the money.
+        store.SaveWorldBlob(1, (byte[])template.Clone());
+        Hex.True(store.GetCharacterMoney(1) == 10_000_000_000L,
+            "World's save does not clear the column");
+        Hex.True(TeraSharp.Arbiter.Persistence.StarterBlob.ReadMoney(store.GetCharacter(1)!.WorldBlob)
+                 == 10_000_000_000L, "and the next login still serves it");
+    }
+
+    [Test] public static void T59_the_money_column_is_guarded_by_the_self_test()
+    {
+        Hex.True(SelfTest.RequiredColumns.Contains(("characters", "money")),
+            "a stale terasharp.db without characters.money must be reported, not silently reset "
+            + "everyone's gold to 0");
+    }
+
+
+    // ======================================================================
+    // T57 - the eight guild SA_ frames section 12.3 left gated but unanswered
+    //
+    // Every one is quoted to its handler in Arb_part_072.c. The two shapes
+    // worth remembering:
+    //   * only the chief change sends a client packet; the rest are a store
+    //     write plus an AS_ fan-out to every WorldServerSession;
+    //   * SA_LOAD_GUILD replies with 0x144D, 0x27D0, 0x27D1, 0x27D2 - the
+    //     guild blob goes out as AS_LOAD_GUILD_DATA, NOT as the boot load's
+    //     DBS_INIT_GUILD_DATA (0x27ED), and there is no 0x27D3 terminator.
+    // ======================================================================
+
+    /// <summary>SA_LOAD_GUILD / SA_DESTROY_GUILD: `i64 ArbiterUser@06, i32 GuildDbId@0E`.</summary>
+    static byte[] SaGuildActionPayload(int guildDbId)
+    {
+        var p = new byte[12];
+        BitConverter.GetBytes(0x8000_0AF0_0001L).CopyTo(p, 0);
+        BitConverter.GetBytes(guildDbId).CopyTo(p, 8);
+        return p;
+    }
+
+    /// <summary>SA_CHANGE_GUILD_CHIEF / SA_REMOVE_GUILD_GROUP: the same plus one more i32.</summary>
+    static byte[] SaGuildPairPayload(int guildDbId, int second)
+    {
+        var p = new byte[16];
+        BitConverter.GetBytes(0x8000_0AF0_0001L).CopyTo(p, 0);
+        BitConverter.GetBytes(guildDbId).CopyTo(p, 8);
+        BitConverter.GetBytes(second).CopyTo(p, 12);
+        return p;
+    }
+
+    /// <summary>SA_CHANGE_GUILDGROUP: `i64 ArbiterUser@06, i32 GuildDbId@0E, MemberDbId@12, GroupId@16`.</summary>
+    static byte[] SaChangeGuildGroupPayload(int guildDbId, int memberDbId, int groupId)
+    {
+        var p = new byte[20];
+        BitConverter.GetBytes(0x8000_0AF0_0001L).CopyTo(p, 0);
+        BitConverter.GetBytes(guildDbId).CopyTo(p, 8);
+        BitConverter.GetBytes(memberDbId).CopyTo(p, 12);
+        BitConverter.GetBytes(groupId).CopyTo(p, 16);
+        return p;
+    }
+
+    /// <summary>SA_UPDATE_GUILD_MEMBER: `i32 GuildDbId@06, i32 MemberDbId@0A` - no ArbiterUser.</summary>
+    static byte[] SaUpdateGuildMemberPayload(int guildDbId, int memberDbId)
+    {
+        var p = new byte[8];
+        BitConverter.GetBytes(guildDbId).CopyTo(p, 0);
+        BitConverter.GetBytes(memberDbId).CopyTo(p, 4);
+        return p;
+    }
+
+    /// <summary>SA_CREATE_GUILD_GROUP: `u32 nameOff@06, i64 ArbiterUser@0A, i32 GuildDbId@12`,
+    /// then the wstring; fixed part 0x16.</summary>
+    static byte[] SaCreateGuildGroupPayload(int guildDbId, string name)
+    {
+        var p = new byte[16 + (name.Length + 1) * 2];
+        BitConverter.GetBytes(0x16).CopyTo(p, 0);                    // frame-relative
+        BitConverter.GetBytes(0x8000_0AF0_0001L).CopyTo(p, 4);
+        BitConverter.GetBytes(guildDbId).CopyTo(p, 12);
+        for (int i = 0; i < name.Length; i++)
+        { p[16 + i * 2] = (byte)name[i]; p[17 + i * 2] = (byte)(name[i] >> 8); }
+        return p;
+    }
+
+    /// <summary>SA_SET_GUILDGROUP_AUTHORITY: `u32 nameOff@06, i64 ArbiterUser@0A, i32 GuildDbId@12,
+    /// i32 GroupId@16, i32 Authority@1A`, then the wstring; fixed part 0x1E.</summary>
+    static byte[] SaSetGroupAuthorityPayload(int guildDbId, int groupId, int authority, string name)
+    {
+        var p = new byte[24 + (name.Length + 1) * 2];
+        BitConverter.GetBytes(0x1E).CopyTo(p, 0);
+        BitConverter.GetBytes(0x8000_0AF0_0001L).CopyTo(p, 4);
+        BitConverter.GetBytes(guildDbId).CopyTo(p, 12);
+        BitConverter.GetBytes(groupId).CopyTo(p, 16);
+        BitConverter.GetBytes(authority).CopyTo(p, 20);
+        for (int i = 0; i < name.Length; i++)
+        { p[24 + i * 2] = (byte)name[i]; p[25 + i * 2] = (byte)(name[i] >> 8); }
+        return p;
+    }
+
+    [Test] public static void T57_load_guild_re_pushes_the_mirror_in_the_decompiles_order()
+    {
+        var (store, _, guildId) = T52Guild(3);
+        using var _s = store;
+        var h = new DispatchHarness().Build();
+        var chief = h.Player(1);
+
+        var a = GuildWiring.OnWorldFrame(store, GuildPackets.SA_LOAD_GUILD, SaGuildActionPayload(guildId));
+        Hex.True(a.Rejected == null, $"rejected: {a.Rejected}");
+        h.Dispatcher.Dispatch(a, "guild-world");
+
+        var ops = string.Join(",", h.WorldLog.Select(w => $"0x{w.Op:X4}"));
+        Hex.True(ops == "0x144D,0x27D0,0x27D1,0x27D2",
+            "AS_LOAD_GUILD_DATA, groups, members, perks - no 0x27ED and no 0x27D3 terminator: " + ops);
+        Hex.True(chief.Log.Count == 0, "and no client packet: the guild window is not refreshed by this");
+
+        // The blob goes out whole, behind the AS_LOAD_GUILD_DATA [u32 off][u32 len] header.
+        var data = h.WorldLog[0].Payload;
+        Hex.True(BitConverter.ToInt32(data, 0) == 6 + 8, "blob offset is frame-relative 0x0E");
+        Hex.True(BitConverter.ToInt32(data, 4) == GuildPackets.GuildDataSize,
+            $"and the whole 0x23A0 GuildData: {BitConverter.ToInt32(data, 4)}");
+        Hex.True(BitConverter.ToInt32(data, 8) == guildId, "which starts with the guild id");
+
+        // The member frame carries three members at 0xF0 each, keyed by guild id, as a BYTE length.
+        var mem = h.WorldLog[2].Payload;
+        Hex.True(BitConverter.ToInt32(mem, 4) == 3 * GuildPackets.GuildMemberDataSize,
+            $"3 members x 0xF0: {BitConverter.ToInt32(mem, 4)}");
+        Hex.True(BitConverter.ToInt32(mem, 8) == guildId, "and the guild id");
+
+        Hex.True(GuildWiring.OnWorldFrame(store, GuildPackets.SA_LOAD_GUILD,
+            SaGuildActionPayload(guildId + 99)).Rejected != null, "an unknown guild is refused");
+        Hex.True(GuildWiring.OnWorldFrame(store, GuildPackets.SA_LOAD_GUILD, new byte[8]).Rejected != null,
+            "and a frame shorter than 0x12 is refused, not read past");
+    }
+
+    [Test] public static void T57_destroy_and_chief_change()
+    {
+        var (store, _, guildId) = T52Guild(3);
+        using var _s = store;
+        var h = new DispatchHarness().Build(resolveDef: n => GuildHandlers.ResolveDef(null, n));
+        var chief = h.Player(1);
+        var member = h.Player(2);
+
+        // --- chief change: every member is told, then World.
+        var a = GuildWiring.OnWorldFrame(store, GuildPackets.SA_CHANGE_GUILD_CHIEF,
+            SaGuildPairPayload(guildId, 2));
+        Hex.True(a.Rejected == null, $"rejected: {a.Rejected}");
+        h.Dispatcher.Dispatch(a, "guild-world");
+        Hex.True(store.GetGuild(guildId)!.ChiefDbId == 2, "the row moved");
+        Hex.True(string.Join(",", chief.Log) == "def:S_CHANGE_GUILD_CHIEF", string.Join(",", chief.Log));
+        Hex.True(string.Join(",", member.Log) == "def:S_CHANGE_GUILD_CHIEF", string.Join(",", member.Log));
+        Hex.True(string.Join(",", h.WorldLog.Select(w => $"0x{w.Op:X4}")) == "0x1403",
+            "AS_CHANGE_GUILD_CHIEF and nothing else");
+        Hex.True(BitConverter.ToInt32(h.WorldLog[0].Payload, 0) == guildId
+                 && BitConverter.ToInt32(h.WorldLog[0].Payload, 4) == 2, "[GuildDbId][NewChiefDbId]");
+
+        Hex.True(GuildWiring.OnWorldFrame(store, GuildPackets.SA_CHANGE_GUILD_CHIEF,
+            SaGuildPairPayload(guildId, 2)).Rejected != null, "2 is already the chief");
+        Hex.True(GuildWiring.OnWorldFrame(store, GuildPackets.SA_CHANGE_GUILD_CHIEF,
+            SaGuildPairPayload(guildId, 99)).Rejected != null, "and a non-member cannot be promoted");
+
+        // --- destroy: rows and children gone, one AS_DESTROY_GUILD, nothing to the clients.
+        var h2 = new DispatchHarness().Build();
+        var stillThere = h2.Player(1);
+        var d = GuildWiring.OnWorldFrame(store, GuildPackets.SA_DESTROY_GUILD, SaGuildActionPayload(guildId));
+        Hex.True(d.Rejected == null, $"rejected: {d.Rejected}");
+        h2.Dispatcher.Dispatch(d, "guild-world");
+        Hex.True(store.GetGuild(guildId) == null, "the guild is gone");
+        Hex.True(store.GetGuildIdOf(1) == 0 && store.GetGuildIdOf(3) == 0, "and so are the memberships");
+        Hex.True(string.Join(",", h2.WorldLog.Select(w => $"0x{w.Op:X4}")) == "0x13FD", "AS_DESTROY_GUILD");
+        Hex.True(stillThere.Log.Count == 0,
+            "the member-facing half of DestroyGuildWithLock was not traced - section 12.4");
+        Hex.True(GuildWiring.OnWorldFrame(store, GuildPackets.SA_DESTROY_GUILD,
+            SaGuildActionPayload(guildId)).Rejected != null, "destroying it twice is refused");
+    }
+
+    [Test] public static void T57_the_guild_group_handlers_write_rows_and_fan_out()
+    {
+        var (store, _, guildId) = T52Guild(2);
+        using var _s = store;
+        var h = new DispatchHarness().Build();
+        var chief = h.Player(1);
+
+        // --- create. Guild::GenerateNewGuildGroupId is max(existing) + 1; the default group is 2
+        // (CharacterStore.DefaultGuildGroupId), so the first one created here is 3.
+        var a = GuildWiring.OnWorldFrame(store, GuildPackets.SA_CREATE_GUILD_GROUP,
+            SaCreateGuildGroupPayload(guildId, "Officers"));
+        Hex.True(a.Rejected == null, $"rejected: {a.Rejected}");
+        h.Dispatcher.Dispatch(a, "guild-world");
+
+        int expected = TeraSharp.Arbiter.Persistence.CharacterStore.DefaultGuildGroupId + 1;
+        var made = store.GetGuildGroup(guildId, expected);
+        Hex.True(made != null, $"group {expected} exists");
+        Hex.True(made!.Name == "Officers" && made.Authority == GuildWiring.GuildGroupDefaultAuthority,
+            $"name and authority 0: '{made.Name}' / {made.Authority}");
+        Hex.True(string.Join(",", h.WorldLog.Select(w => $"0x{w.Op:X4}")) == "0x1407", "AS_CREATE_GUILD_GROUP");
+        Hex.True(BitConverter.ToInt32(h.WorldLog[0].Payload, 4) == guildId
+                 && BitConverter.ToInt32(h.WorldLog[0].Payload, 8) == expected
+                 && BitConverter.ToInt32(h.WorldLog[0].Payload, 12) == 0,
+            "[off][GuildDbId][GroupId][Authority=0] then the name");
+        Hex.True(store.GetGuildLog(guildId, 1).Any(e => e.ActionType == GuildHandlers.GuildLogAddGroup),
+            "a 0x15 add-group row was written");
+        Hex.True(chief.Log.Count == 0, "and no client packet");
+
+        // ids never go back down, even after a removal
+        var second = GuildWiring.OnWorldFrame(store, GuildPackets.SA_CREATE_GUILD_GROUP,
+            SaCreateGuildGroupPayload(guildId, "Veterans"));
+        Hex.True(second.Rejected == null && store.GetGuildGroup(guildId, expected + 1) != null,
+            "the next one is max + 1");
+
+        // --- rename / re-authorise
+        h.WorldLog.Clear();
+        var auth = GuildWiring.OnWorldFrame(store, GuildPackets.SA_SET_GUILDGROUP_AUTHORITY,
+            SaSetGroupAuthorityPayload(guildId, expected, 7, "Elders"));
+        Hex.True(auth.Rejected == null, $"rejected: {auth.Rejected}");
+        h.Dispatcher.Dispatch(auth, "guild-world");
+        var changed = store.GetGuildGroup(guildId, expected)!;
+        Hex.True(changed.Name == "Elders" && changed.Authority == 7, $"'{changed.Name}' / {changed.Authority}");
+        Hex.True(string.Join(",", h.WorldLog.Select(w => $"0x{w.Op:X4}")) == "0x1405",
+            "AS_SET_GUILDGROUP_AUTHORITY");
+
+        // --- move a member into it
+        h.WorldLog.Clear();
+        var move = GuildWiring.OnWorldFrame(store, GuildPackets.SA_CHANGE_GUILDGROUP,
+            SaChangeGuildGroupPayload(guildId, 2, expected));
+        Hex.True(move.Rejected == null, $"rejected: {move.Rejected}");
+        h.Dispatcher.Dispatch(move, "guild-world");
+        Hex.True(store.GetGuildMember(2)!.GuildGroupId == expected, "the member moved group");
+        Hex.True(store.GetGuildLog(guildId, 1).Any(e => e.ActionType == GuildHandlers.GuildLogChangeMemberGroup),
+            "a 0x20 change-group row was written");
+        Hex.True(string.Join(",", h.WorldLog.Select(w => $"0x{w.Op:X4}")) == "0x140C", "AS_CHANGE_GUILDGROUP");
+        Hex.True(BitConverter.ToInt32(h.WorldLog[0].Payload, 0) == guildId
+                 && BitConverter.ToInt32(h.WorldLog[0].Payload, 4) == 2
+                 && BitConverter.ToInt32(h.WorldLog[0].Payload, 8) == expected,
+            "[GuildDbId][MemberDbId][GroupId]");
+
+        // --- remove. The decompile writes the log only when the remove took, but fans out either
+        // way - the loop sits outside that `if`.
+        h.WorldLog.Clear();
+        var gone = GuildWiring.OnWorldFrame(store, GuildPackets.SA_REMOVE_GUILD_GROUP,
+            SaGuildPairPayload(guildId, expected));
+        Hex.True(gone.Rejected == null, $"rejected: {gone.Rejected}");
+        h.Dispatcher.Dispatch(gone, "guild-world");
+        Hex.True(store.GetGuildGroup(guildId, expected) == null, "the group is gone");
+        Hex.True(store.GetGuildLog(guildId, 1).Any(e => e.ActionType == GuildHandlers.GuildLogRemoveGroup),
+            "a 0x16 remove-group row was written");
+        Hex.True(string.Join(",", h.WorldLog.Select(w => $"0x{w.Op:X4}")) == "0x1409", "AS_REMOVE_GUILD_GROUP");
+
+        h.WorldLog.Clear();
+        var again = GuildWiring.OnWorldFrame(store, GuildPackets.SA_REMOVE_GUILD_GROUP,
+            SaGuildPairPayload(guildId, expected));
+        Hex.True(again.Rejected == null && !again.IsEmpty,
+            "removing it twice still tells World, exactly as the decompile does");
+
+        // InputRestrictionHelper::CheckGuildGroupName: 1..15 characters.
+        Hex.True(GuildWiring.OnWorldFrame(store, GuildPackets.SA_CREATE_GUILD_GROUP,
+            SaCreateGuildGroupPayload(guildId, "")).Rejected != null, "an empty name is refused");
+        Hex.True(GuildWiring.OnWorldFrame(store, GuildPackets.SA_CREATE_GUILD_GROUP,
+            SaCreateGuildGroupPayload(guildId, new string('x', 16))).Rejected != null,
+            "and one of 16 characters");
+        Hex.True(GuildWiring.OnWorldFrame(store, GuildPackets.SA_CREATE_GUILD_GROUP,
+            SaCreateGuildGroupPayload(guildId, new string('x', 15))).Rejected == null,
+            "15 is legal");
+    }
+
+    [Test] public static void T57_update_guild_member_echoes_the_stored_roster_row()
+    {
+        var (store, _, guildId) = T52Guild(2);
+        using var _s = store;
+        var h = new DispatchHarness().Build();
+        var chief = h.Player(1);
+
+        store.UpdateGuildMemberLocation(2, worldId: 1, guardId: 4, sectionId: 9,
+            level: 37, lastLogoutTime: 0);
+
+        var a = GuildWiring.OnWorldFrame(store, GuildPackets.SA_UPDATE_GUILD_MEMBER,
+            SaUpdateGuildMemberPayload(guildId, 2));
+        Hex.True(a.Rejected == null, $"rejected: {a.Rejected}");
+        h.Dispatcher.Dispatch(a, "guild-world");
+
+        Hex.True(string.Join(",", h.WorldLog.Select(w => $"0x{w.Op:X4}")) == "0x1410",
+            "AS_UPDATE_GUILD_MEMBER and nothing else");
+        var p = h.WorldLog[0].Payload;
+        Hex.True(p.Length == 28, $"seven i32: {p.Length}");
+        int[] got = Enumerable.Range(0, 7).Select(i => BitConverter.ToInt32(p, i * 4)).ToArray();
+        Hex.True(string.Join(",", got) == $"{guildId},2,1,4,9,37,{GuildWiring.StateOnline}",
+            "[GuildDbId][MemberDbId][WorldId][GuardId][SectionId][Level][State]: " + string.Join(",", got));
+        Hex.True(chief.Log.Count == 0, "no client packet - the roster path is what tells the guild");
+
+        Hex.True(GuildWiring.OnWorldFrame(store, GuildPackets.SA_UPDATE_GUILD_MEMBER,
+            SaUpdateGuildMemberPayload(guildId + 99, 2)).Rejected != null, "wrong guild is refused");
+        Hex.True(GuildWiring.OnWorldFrame(store, GuildPackets.SA_UPDATE_GUILD_MEMBER,
+            SaUpdateGuildMemberPayload(guildId, 99)).Rejected != null, "and an unknown member");
+    }
+
+    /// <summary>
+    /// The ten modelled frames answer, the two without a known layout still do not, and NONE of
+    /// the twelve throws on a hostile payload - WorldLink.ReceiveLoop has no per-frame catch, so
+    /// one exception here disconnects every player (status/SECURITY-AUDIT.md).
+    /// </summary>
+    [Test] public static void T57_every_gated_guild_frame_survives_a_hostile_payload()
+    {
+        var (store, _, guildId) = T52Guild(2);
+        using var _s = store;
+
+        var hostile = new List<byte[]>
+        {
+            Array.Empty<byte>(), new byte[1], new byte[7], new byte[32],
+            Enumerable.Repeat((byte)0xFF, 64).ToArray(),
+            Enumerable.Repeat((byte)0xFF, 4096).ToArray(),
+        };
+        // A well-formed header with a string offset pointing outside the frame.
+        var badOffset = new byte[24];
+        BitConverter.GetBytes(int.MaxValue).CopyTo(badOffset, 0);
+        BitConverter.GetBytes(guildId).CopyTo(badOffset, 12);
+        hostile.Add(badOffset);
+
+        foreach (ushort op in GuildWiring.WorldOpcodes)
+            foreach (var payload in hostile)
+            {
+                var a = GuildWiring.OnWorldFrame(store, op, payload);
+                Hex.True(a.Origin.Kind == RecipientKind.None,
+                    $"0x{op:X4}: a World frame has no origin, so a rejection cannot reach a chat window");
+                Hex.True(GuildWiring.HandlesWorldFrame(op), $"0x{op:X4} is gated");
+            }
+
+        // With no store open every one of them is a rejection rather than a null dereference.
+        foreach (ushort op in GuildWiring.WorldOpcodes)
+            Hex.True(GuildWiring.OnWorldFrame(null, op, new byte[32]).Rejected != null,
+                $"0x{op:X4} with no store");
+    }
+
 }

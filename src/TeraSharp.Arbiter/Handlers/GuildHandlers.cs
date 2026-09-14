@@ -268,6 +268,15 @@ public sealed class GuildHandlers
     /// one before it. Both ids are ours - the real log's action enum is not in the decompile.</summary>
     public const int GuildLogCreate = 0x0A, GuildLogJoin = 0x0B, GuildLogLeave = 0x0C;
 
+    /// <summary>
+    /// Three the decompile DOES name - T57. They are the second argument to Guild::AddGuildLog
+    /// (FUN_140566090) on the three guild-group paths: 0x15 when a group is added
+    /// (Handler_SA_CREATE_GUILD_GROUP::_AddGuildGroupNameCallback::OnSuccess,
+    /// Arb_part_072.c:17662), 0x16 when one is removed (Handler_SA_REMOVE_GUILD_GROUP, :14689),
+    /// 0x20 when a member moves between groups (Handler_SA_CHANGE_GUILDGROUP, :13524).
+    /// </summary>
+    public const int GuildLogAddGroup = 0x15, GuildLogRemoveGroup = 0x16, GuildLogChangeMemberGroup = 0x20;
+
     // =======================================================================================
     // Read-only windows
     // =======================================================================================

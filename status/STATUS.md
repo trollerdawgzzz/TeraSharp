@@ -35,6 +35,7 @@ exist, nothing routes to it.
 | Chat (say / area / global), client settings, keybinds | **live** |
 | Per-user DB writes during play (T15), quests (T17), skills in blob (T18) | **live** |
 | Inventory — bag + worn slots as rows in `items`; 0x27A4 rebuilt from them, atoms applied | **live** (T44) |
+| Character money — `characters.money` from the op-9 atom delta, served back at blob + 448 | **wired** (T59) |
 | Achievements, tutorial tips, seren guide, reputation, fatigability, dungeon cool times — from rows | **live** (T22/T25/T26) |
 | Zone change / quest teleport (0x13BE/0x13C0 echoes) | **live** |
 | Relog into a dead instance (0x138D -> retry at the stored return point) | **live** (T21, verified twice) |
@@ -48,7 +49,7 @@ exist, nothing routes to it.
 | Mail — 3 Arbiter-owned client packets + the 6 `SDB_*_PARCEL` W<->A pairs, empty inbox byte-exact | **wired** (T42/T45) |
 | Warehouse — 8 W->A requests answered from `items`/`warehouses` rows, `0x2754` sealed | **wired** (T42) |
 | Parties — `PartyManager` via `PartyWiring`: 7 `C_` registered, 12 `SA_` gated out of the tunnel | **wired** (T35/T49) |
-| Guilds — 17 `C_` via `GuildWiring`, rows persisted, `0x27CF` boot load rebuilt from them | **wired** (T39/T51) |
+| Guilds — 17 `C_` via `GuildWiring`, rows persisted, `0x27CF` boot load rebuilt from them; 10 of the 12 `SA_` answered | **wired** (T39/T51/T52/T57) |
 | GM World forward (anything not Arbiter-owned -> `AS_ADMIN_COMMAND` 0x2829) + `AS_ENTER_WORLD[111]` AdminLevel | **wired** (T46/T47) |
 | Packet-handling security — bounds, pagination, allocate-by-count, 37k-input fuzz suite | **wired** (T48/T50), 2 human-owned items open |
 | Private chat channels — the channel object, join/leave/kick/password | **designed** (T43), no client packet ever seen |
@@ -83,6 +84,8 @@ exist, nothing routes to it.
 | Everything else in the 2026-09-13 relog capture | `status/RELOG-CAPTURE-NOTES.md` |
 | Guilds - the object, the SQL schema, the opcodes and the .def corrections | `status/GUILD-DESIGN.md` |
 | Guild rows, the Arbiter-side guild handlers, and the wiring they still need | `status/GUILD-DESIGN.md` section 10 |
+| What each World -> Arbiter guild frame does, and the two that are still gated only | `status/GUILD-DESIGN.md` sections 12-13 |
+| Where character money lives on each side of the wire, and why it is not in 0x27A4 | `status/INVENTORY-DESIGN.md` section 8 |
 | How a subsystem's action list becomes sends (parties, guilds, chat, and whatever is next) | `World/ActionDispatcher.cs`, and the wiring section of each design doc |
 | Why World logs "handler has not been implemented yet!!!", and who owns each of those packets | `status/CLIENT-REJECTS.md` |
 | Whether a packet field is bounds-checked, and what the fuzz suite covers | `status/SECURITY-AUDIT.md` |

@@ -37,6 +37,19 @@ public sealed class CharacterRecord
     /// <summary>Opaque WorldServer state (15312 bytes). Null for never-entered characters.</summary>
     public byte[]? WorldBlob { get; set; }
 
+    /// <summary>
+    /// Character money ("gold"), the <c>money</c> column - T59.
+    ///
+    /// <para>Money is the ARBITER's field, not part of the blob as World saves it: World writes
+    /// blob + 0x1C0 back as zero in all six <c>SDB_UPDATE_USER_DATA</c> frames of cap_newchar.log
+    /// even though the character had 230 gold by the last one. The real Arbiter binds its SQL
+    /// <c>money</c> column straight into <c>UserData + 0x1C0</c> when it builds the enter-world
+    /// record (Arb_part_032.c:17798), and we do the same: <see cref="CharacterStore.Read"/>
+    /// stamps this value into <see cref="WorldBlob"/> at <see cref="StarterBlob.MoneyOffset"/> on
+    /// every load, so both 0x2738 builders serve it without having to know about it.</para>
+    /// </summary>
+    public long Money { get; set; }
+
     // ---- T21: the dungeon return point (the real Arbiter's SysReturnLoc) ----
     /// <summary>Continent to return to when a dungeon enter-world fails, 0 = none. User+0x1a8.</summary>
     public int ReturnZone { get; set; }
@@ -352,6 +365,43 @@ public static class StarterBlob
     /// <summary>Smallest blob that carries a complete position block (<see cref="ZoneOffset"/> + 4).</summary>
     public const int PositionBlockEnd = ZoneOffset + 4;
 
+    // --- money (T59) ---
+    /// <summary>
+    /// i64 character money at blob offset 448 (0x1C0). Proven from BOTH sides of the wire:
+    ///   * the real Arbiter binds its SQL <c>money</c> column to <c>UserData + 0x1C0</c> when it
+    ///     fills the enter-world record (Arb_part_032.c:17798, next to <c>gender</c> at +0xC4 and
+    ///     <c>class</c> at +0xC8, which are our <see cref="GenderOffset"/> / <see cref="ClassOffset"/>);
+    ///   * WorldServer's enter-world finisher calls <c>Inventory::SetMoney(User + 0xA478,
+    ///     *(__int64 *)(context + 0x268))</c> (WorldServer.exe.c:1663604), and the blob lands at
+    ///     <c>context + 0xA8</c> (<c>UserEnterWorldContext::SetRecvData</c>, :1661252) - so the
+    ///     field it reads is blob + 0x268 - 0xA8 = 0x1C0. <c>SetMoney</c> is a plain assignment
+    ///     (<c>*(__int64 *)(inv + 0x78) = money</c>, :1484331), so the blob value is ABSOLUTE.
+    /// Zero in <c>data/starter_blob.bin</c>, and zero in every <c>SDB_UPDATE_USER_DATA</c> of
+    /// cap_newchar.log including the ones taken after the character had earned 230 gold: World
+    /// never writes this field back, which is why it has to live in its own column.
+    /// </summary>
+    public const int MoneyOffset = 448;
+    /// <summary>Smallest blob that carries the money field.</summary>
+    public const int MoneyBlockEnd = MoneyOffset + 8;
+
+    /// <summary>Money as a blob carries it; 0 when the buffer is too short to hold the field.</summary>
+    public static long ReadMoney(byte[]? blob) =>
+        blob == null || blob.Length < MoneyBlockEnd ? 0L : BitConverter.ToInt64(blob, MoneyOffset);
+
+    /// <summary>
+    /// Stamp money into a blob on its way out in 0x2738. A null or short buffer is not an error
+    /// - a character that has never entered the world has no blob - so this returns false and
+    /// writes nothing rather than throwing. Unlike <see cref="Build"/>, which composes a blob
+    /// once at character creation, this runs on every load - it is the one field we put back
+    /// into a blob World has already saved, and World never sets it itself.
+    /// </summary>
+    public static bool WriteMoney(byte[]? blob, long money)
+    {
+        if (blob == null || blob.Length < MoneyBlockEnd) return false;
+        BitConverter.TryWriteBytes(blob.AsSpan(MoneyOffset, 8), money);
+        return true;
+    }
+
     // --- default skills (T18) ---
     // The two skill arrays inside the blob, both proven from BOTH sides of the wire:
     //   * the real Arbiter writes them at UserData + 0x1AE0 / + 0x1C20 in
@@ -599,6 +649,11 @@ CREATE TABLE IF NOT EXISTS characters (
   position INTEGER NOT NULL DEFAULT 1,
   last_logout TEXT,
   world_blob BLOB,
+  -- T59: character money ("gold"). Not in the blob World saves - it is stamped into the blob at
+  -- StarterBlob.MoneyOffset when a character is read, exactly as the real Arbiter binds its own
+  -- `money` column into UserData + 0x1C0. The op-9 atom carries a signed DELTA, so this is the
+  -- running total.
+  money INTEGER NOT NULL DEFAULT 0,
   -- T21: the system return point. The real Arbiter keeps this in dbo.spUpdateSysReturnLoc and
   -- restores it when WorldServer answers AS_ENTER_WORLD with SA_ENTER_WORLD_FAIL -- see
   -- status/ENTER-WORLD-FALLBACK.md. return_zone 0 means no return point (the real Arbiter
@@ -999,6 +1054,9 @@ CREATE INDEX IF NOT EXISTS ix_visited_character ON visited_sections(character_id
         // T45: the exact ParcelData bytes World gave us in SDB_MAKE_PARCEL, so DBS_LIST_PARCEL
         // can list a parcel back byte-exactly (the 0x9e8 interior is not pinned by any capture).
         AddColumnIfMissing("parcels", "record", "BLOB");
+        // T59: character money. terasharp.db predates it, and every existing character starts
+        // at 0 - which is what they had, since nothing was storing it.
+        AddColumnIfMissing("characters", "money", "INTEGER NOT NULL DEFAULT 0");
     }
 
     /// <summary>ALTER TABLE ADD COLUMN, but a no-op when the column is already there.</summary>
@@ -1270,8 +1328,8 @@ ON CONFLICT(account_id) DO UPDATE SET blob = excluded.blob, updated_at = exclude
             using var cmd = _db.CreateCommand();
             cmd.CommandText = @"
 INSERT INTO characters(account_id,name,gender,race,class,level,template_id,zone,x,y,z,
-  appearance,details,shape,weapon,body,hand,feet,position,world_blob)
-VALUES($a,$n,$g,$r,$c,$l,$t,$zone,$x,$y,$z,$ap,$de,$sh,$w,$b,$h,$f,$p,$blob);
+  appearance,details,shape,weapon,body,hand,feet,position,world_blob,money)
+VALUES($a,$n,$g,$r,$c,$l,$t,$zone,$x,$y,$z,$ap,$de,$sh,$w,$b,$h,$f,$p,$blob,$money);
 SELECT last_insert_rowid();";
             cmd.Parameters.AddWithValue("$a", c.AccountId);
             cmd.Parameters.AddWithValue("$n", c.Name);
@@ -1293,6 +1351,7 @@ SELECT last_insert_rowid();";
             cmd.Parameters.AddWithValue("$f", c.Feet);
             cmd.Parameters.AddWithValue("$p", c.Position);
             cmd.Parameters.AddWithValue("$blob", (object?)c.WorldBlob ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$money", c.Money);          // T59, normally 0
             int id = (int)(long)cmd.ExecuteScalar()!;
             c.Id = id;
             _log.LogInformation("Created character '{Name}' id={Id} account={A}", c.Name, id, c.AccountId);
@@ -1304,7 +1363,9 @@ SELECT last_insert_rowid();";
     /// Store the WorldServer state struct after SDB_UPDATE_USER_DATA, and mirror the position
     /// out of it onto the row (T6).
     ///
-    /// The blob is opaque and is <b>read only</b> here — nothing is written back into it. The
+    /// The blob is opaque and is <b>read only</b> here — nothing is written back into it (the one
+    /// field we ever write into a blob, <c>money</c>, is stamped on the way OUT, in
+    /// <see cref="Read"/>; World sends that field back as zero every time). The
     /// row copy exists because the character-select screen and any future real
     /// <c>AS_ENTER_WORLD</c> builder need zone/x/y/z as columns, and World only ever hands us
     /// those numbers inside the blob:
@@ -1343,6 +1404,74 @@ SELECT last_insert_rowid();";
             else
                 _log.LogInformation("Saved world blob ({Len} bytes) for character {Id} (too short for a position)",
                     blob.Length, characterId);
+        }
+    }
+
+    // ============================================================ T59: character money
+
+    /// <summary>Current money; 0 for a character that does not exist.</summary>
+    public long GetCharacterMoney(long characterId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT money FROM characters WHERE id = $id";
+            cmd.Parameters.AddWithValue("$id", characterId);
+            return Convert.ToInt64(cmd.ExecuteScalar() ?? 0L);
+        }
+    }
+
+    /// <summary>
+    /// Apply one op-9 money atom. <paramref name="delta"/> is SIGNED and RELATIVE, not a new
+    /// total: <c>Inventory::PrepareMoneyTransaction</c> (WorldServer.exe.c:1407fa050) refuses the
+    /// change when <c>*(__int64 *)(inv + 0x78) + amount &lt; 0</c> - i.e. it adds the value to the
+    /// money it already holds - then writes that same value to <c>atom + 0x50</c> and pushes the
+    /// atom. It also emits NO atom at all when the amount is 0, which an absolute update could
+    /// never do. status/INVENTORY-DESIGN.md section 8.
+    ///
+    /// <para>Clamped at 0. World has already refused anything that would go negative, so a
+    /// negative total can only come from a frame World did not send; the clamp is the same
+    /// unsigned-index hardening every other packet-derived value gets. Returns the new total,
+    /// or 0 when the character does not exist.</para>
+    /// </summary>
+    public long AddCharacterMoney(long characterId, long delta)
+    {
+        lock (_lock)
+        {
+            using (var cmd = _db.CreateCommand())
+            {
+                cmd.CommandText = "UPDATE characters SET money = MAX(0, money + $d) WHERE id = $id";
+                cmd.Parameters.AddWithValue("$d", delta);
+                cmd.Parameters.AddWithValue("$id", characterId);
+                if (cmd.ExecuteNonQuery() != 1)
+                {
+                    _log.LogWarning("AddCharacterMoney: character {Id} not found ({Delta})", characterId, delta);
+                    return 0;
+                }
+            }
+        }
+        return GetCharacterMoney(characterId);
+    }
+
+    /// <summary>
+    /// Set money outright, clamped at 0. This is the shape a GM <c>set_money</c> and the
+    /// A-&gt;W <c>DBS_UPDATE_USER_MONEY</c> (0x27EA) push both want - World's handler for that
+    /// one ends in <c>Inventory::SetMoney</c>, a plain assignment. Returns the new total.
+    /// </summary>
+    public long SetCharacterMoney(long characterId, long money)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE characters SET money = $m WHERE id = $id";
+            cmd.Parameters.AddWithValue("$m", money < 0 ? 0L : money);
+            cmd.Parameters.AddWithValue("$id", characterId);
+            if (cmd.ExecuteNonQuery() != 1)
+            {
+                _log.LogWarning("SetCharacterMoney: character {Id} not found", characterId);
+                return 0;
+            }
+            return money < 0 ? 0L : money;
         }
     }
 
@@ -2077,38 +2206,51 @@ DELETE FROM guild_members     WHERE user_db_id = $id;";
         }
     }
 
-    private static CharacterRecord Read(SqliteDataReader r) => new()
+    /// <summary>
+    /// Materialise one row. T59: this is also where <c>money</c> is stamped into the world blob
+    /// (<see cref="StarterBlob.MoneyOffset"/>), so every caller that ships a 0x2738 -
+    /// <c>DbProxyHandlers.OnUserEnterWorld</c> and <c>WorldEntry.BuildCharacterDataPayload</c> -
+    /// serves the stored value without a change of its own. The blob byte array belongs to this
+    /// record and is freshly read from SQLite on every call, so stamping it mutates nothing shared.
+    /// </summary>
+    private static CharacterRecord Read(SqliteDataReader r)
     {
-        Id = r.GetInt32(r.GetOrdinal("id")),
-        AccountId = r.GetInt64(r.GetOrdinal("account_id")),
-        Name = r.GetString(r.GetOrdinal("name")),
-        Gender = r.GetInt32(r.GetOrdinal("gender")),
-        Race = r.GetInt32(r.GetOrdinal("race")),
-        Class = r.GetInt32(r.GetOrdinal("class")),
-        Level = r.GetInt32(r.GetOrdinal("level")),
-        Exp = r.GetInt64(r.GetOrdinal("exp")),
-        TemplateId = r.GetInt32(r.GetOrdinal("template_id")),
-        Zone = r.GetInt32(r.GetOrdinal("zone")),
-        X = (float)r.GetDouble(r.GetOrdinal("x")),
-        Y = (float)r.GetDouble(r.GetOrdinal("y")),
-        Z = (float)r.GetDouble(r.GetOrdinal("z")),
-        Appearance = (byte[])r["appearance"],
-        Details = (byte[])r["details"],
-        Shape = (byte[])r["shape"],
-        Weapon = r.GetInt32(r.GetOrdinal("weapon")),
-        Body = r.GetInt32(r.GetOrdinal("body")),
-        Hand = r.GetInt32(r.GetOrdinal("hand")),
-        Feet = r.GetInt32(r.GetOrdinal("feet")),
-        Position = r.GetInt32(r.GetOrdinal("position")),
-        LastLogout = r["last_logout"] is string s ? DateTime.Parse(s) : DateTime.MinValue,
-        WorldBlob = r["world_blob"] is byte[] b ? b : null,
-        ReturnZone = r.GetInt32(r.GetOrdinal("return_zone")),
-        ReturnX = (float)r.GetDouble(r.GetOrdinal("return_x")),
-        ReturnY = (float)r.GetDouble(r.GetOrdinal("return_y")),
-        ReturnZ = (float)r.GetDouble(r.GetOrdinal("return_z")),
-        DungeonId = r.GetInt32(r.GetOrdinal("dungeon_id")),
-        InstancePdId = r.GetInt32(r.GetOrdinal("instance_pdid")),
-    };
+        var c = new CharacterRecord
+        {
+            Id = r.GetInt32(r.GetOrdinal("id")),
+            AccountId = r.GetInt64(r.GetOrdinal("account_id")),
+            Name = r.GetString(r.GetOrdinal("name")),
+            Gender = r.GetInt32(r.GetOrdinal("gender")),
+            Race = r.GetInt32(r.GetOrdinal("race")),
+            Class = r.GetInt32(r.GetOrdinal("class")),
+            Level = r.GetInt32(r.GetOrdinal("level")),
+            Exp = r.GetInt64(r.GetOrdinal("exp")),
+            TemplateId = r.GetInt32(r.GetOrdinal("template_id")),
+            Zone = r.GetInt32(r.GetOrdinal("zone")),
+            X = (float)r.GetDouble(r.GetOrdinal("x")),
+            Y = (float)r.GetDouble(r.GetOrdinal("y")),
+            Z = (float)r.GetDouble(r.GetOrdinal("z")),
+            Appearance = (byte[])r["appearance"],
+            Details = (byte[])r["details"],
+            Shape = (byte[])r["shape"],
+            Weapon = r.GetInt32(r.GetOrdinal("weapon")),
+            Body = r.GetInt32(r.GetOrdinal("body")),
+            Hand = r.GetInt32(r.GetOrdinal("hand")),
+            Feet = r.GetInt32(r.GetOrdinal("feet")),
+            Position = r.GetInt32(r.GetOrdinal("position")),
+            LastLogout = r["last_logout"] is string s ? DateTime.Parse(s) : DateTime.MinValue,
+            WorldBlob = r["world_blob"] is byte[] b ? b : null,
+            ReturnZone = r.GetInt32(r.GetOrdinal("return_zone")),
+            ReturnX = (float)r.GetDouble(r.GetOrdinal("return_x")),
+            ReturnY = (float)r.GetDouble(r.GetOrdinal("return_y")),
+            ReturnZ = (float)r.GetDouble(r.GetOrdinal("return_z")),
+            DungeonId = r.GetInt32(r.GetOrdinal("dungeon_id")),
+            InstancePdId = r.GetInt32(r.GetOrdinal("instance_pdid")),
+            Money = r.GetInt64(r.GetOrdinal("money")),
+        };
+        StarterBlob.WriteMoney(c.WorldBlob, c.Money);
+        return c;
+    }
 
     // ---- Friends (T30) ----
 

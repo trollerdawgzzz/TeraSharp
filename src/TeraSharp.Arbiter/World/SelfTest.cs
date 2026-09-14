@@ -46,6 +46,7 @@ public static class SelfTest
         ("friends", "memo"),                      // T30
         ("blocks", "memo"),                       // T30
         ("accounts", "admin_level"),              // T32 GM
+        ("characters", "money"),                  // T59 character money
     };
 
     /// <summary>Packets whose def must exist or a login dies mid-sequence.</summary>
