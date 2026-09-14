@@ -88,6 +88,15 @@ public sealed class WorldReplayTable
         0x13C5, // SA_ADD_DUNGEON_CHANNEL          (zone change)
         0x13C6, // SA_REMOVE_DUNGEON_CHANNEL       (zone change)
         0x1499, // SA_SAVE_ETC_DATA_FOR_MOVE_WORLD (zone change)
+
+        // --- T42: SDB_MOVE_WAREHOUSE_ITEM. Not "one-way" because we chose not to answer it -
+        // the REAL Arbiter does not answer it. Handler_SDB_MOVE_WAREHOUSE_ITEM (FUN_1405b53c0,
+        // Arb_part_048.c:13050) is ten lines long: enter the scope tracer, leave it, return 1.
+        // No DB work, no SendToSession. Either World never sends 0x2754 in this build or it is a
+        // latent hang in the original; either way matching it means sending nothing, and sealing
+        // it here is what stops the replay table handing it somebody else's DBS_ reply.
+        // status/MAIL-WAREHOUSE.md section 4.1.
+        0x2754, // SDB_MOVE_WAREHOUSE_ITEM
         0x15FA, // one-way push, once per session
     };
 

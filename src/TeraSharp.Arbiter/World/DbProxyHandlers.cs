@@ -740,6 +740,40 @@ public sealed class DbProxyHandlers
     public const int FatigabilityUpdateKindOffset = 8;
     public const int FatigabilityUpdateDeltaOffset = 12;
 
+    // ===================== T42: warehouse (status/MAIL-WAREHOUSE.md section 4) =====================
+    // Numbers from data/dbproxy_opcodes.txt, each re-confirmed against the literal its sender
+    // passes to the packet writer. Layouts, atom parsing and the reply builders are in
+    // World/WarehouseHandlers.cs; only the opcodes live here, because
+    // Dispatch_switch_and_the_allow_list_agree resolves `case NAME:` by reflecting over this class.
+    //
+    // NO CAPTURE CONTAINS A WAREHOUSE FRAME. Both A<->W taps are one login and nobody opened a
+    // bank, so every offset comes from the Arbiter's PDL dumpers cross-checked against the
+    // writers. Each handler's min-length guard lands exactly on the end of its last field, which
+    // is what makes the offsets trustworthy without bytes on the wire.
+    //
+    // TRAP 1: SDB_INCREASE_WAREHOUSE_SIZE is answered with DBS_INCREASE_INVENTORY_SIZE (0x283E),
+    //         NOT 0x2840. Handler_SDB_INCREASE_WAREHOUSE_SIZE (Arb_part_063.c:8588) and
+    //         Handler_SDB_INCREASE_INVENTORY_SIZE (:8490) share the send helper FUN_1407ad2e0
+    //         (Arb_part_066.c:17451), and that helper writes 0x283E. The two DBS layouts are
+    //         byte-identical ([u8 Success][u32 DlmId]) so World's DLM matching still works.
+    //         Replying 0x2840 would head-block the user. 0x2840 is declared and never sent.
+    // TRAP 2: SDB_MOVE_WAREHOUSE_ITEM (0x2754) is a ten-line stub in the real Arbiter
+    //         (FUN_1405b53c0, Arb_part_048.c:13050) that sends nothing. We match it: the opcode
+    //         is in WorldReplayTable.OneWayFromWorld so it is never answered and never inherits
+    //         somebody else's reply. It is NOT in the allow-list.
+    public const ushort SDB_VIEW_WAREHOUSE = 0x274A;          public const ushort DBS_VIEW_WAREHOUSE = 0x274B;
+    public const ushort SDB_STORE_WAREHOUSE = 0x274C;         public const ushort DBS_STORE_WAREHOUSE = 0x274D;
+    public const ushort SDB_GET_WAREHOUSE = 0x274E;           public const ushort DBS_GET_WAREHOUSE = 0x274F;
+    public const ushort SDB_MOVE_WAREHOUSE_ITEM = 0x2754;     // -> nothing (stub in the original)
+    public const ushort DBS_MOVE_WAREHOUSE_ITEM_UNUSED = 0x2755;
+    public const ushort SDB_CHANGE_WAREHOUSE_POS = 0x277F;    public const ushort DBS_CHANGE_WAREHOUSE_POS = 0x2780;
+    public const ushort SDB_PAY_WAREHOUSE_COMMISION = 0x27C9; public const ushort DBS_PAY_WAREHOUSE_COMMISION = 0x27CA;
+    public const ushort SDB_CLEAR_WAREHOUSE = 0x27E0;         public const ushort DBS_CLEAR_WAREHOUSE = 0x27E1;
+    public const ushort SDB_WAREHOUSE_AUTO_SORT = 0x27E2;     public const ushort DBS_WAREHOUSE_AUTO_SORT = 0x27E3;
+    public const ushort SDB_INCREASE_WAREHOUSE_SIZE = 0x283F;
+    public const ushort DBS_INCREASE_INVENTORY_SIZE = 0x283E;
+    public const ushort DBS_INCREASE_WAREHOUSE_SIZE_UNUSED = 0x2840;
+
     // --- SDB_ADD_TUTORIAL_SIMPLE_TIP (0x286E) -> DBS_ADD_TUTORIAL_SIMPLE_TIP (0x286F) ---
     // cap_newchar.log seq 719/765/864/911, 18 B -> 11 B each.
     // Handler_SDB_ADD_TUTORIAL_SIMPLE_TIP (Arb_part_063.c:36) needs frame >= 0x12 and reads
@@ -946,6 +980,17 @@ public sealed class DbProxyHandlers
             // --- T33: World's dungeon-timeline broadcast. Not a DLM item and usually empty;
             // the non-empty form is echoed back one 0x1581 per record. ---
             case DSA_DUNGEON_TIMELINE_OPEN_INFO:  // 0x13F2 -> N x 0x1581
+            // --- T42: the warehouse. Eight live requests; the ninth (0x2754) is a stub in the
+            // real Arbiter and lives in WorldReplayTable.OneWayFromWorld instead, so it must NOT
+            // be here. status/MAIL-WAREHOUSE.md section 4. ---
+            case SDB_VIEW_WAREHOUSE:              // 0x274B, rebuilt from the item rows
+            case SDB_STORE_WAREHOUSE:             // 0x274D, atoms applied then echoed
+            case SDB_GET_WAREHOUSE:               // 0x274F, same
+            case SDB_CHANGE_WAREHOUSE_POS:        // 0x2780, same shape as the two above
+            case SDB_PAY_WAREHOUSE_COMMISION:     // 0x27CA = [reqId][ok][error]
+            case SDB_CLEAR_WAREHOUSE:             // 0x27E1 = [reqId][ok]
+            case SDB_WAREHOUSE_AUTO_SORT:         // 0x27E3, the request's fields echoed back
+            case SDB_INCREASE_WAREHOUSE_SIZE:     // -> 0x283E, NOT 0x2840 (trap 1 above)
                 return true;
             default:
                 return false;        // -> replay table
@@ -992,6 +1037,19 @@ public sealed class DbProxyHandlers
 
             // --- T33 ---
             case DSA_DUNGEON_TIMELINE_OPEN_INFO:    return OnDungeonTimelineOpenInfo(link, payload);
+
+            // --- T42: warehouse ---
+            case SDB_VIEW_WAREHOUSE:          return OnViewWarehouse(link, payload);
+            case SDB_STORE_WAREHOUSE:         return OnWarehouseTransfer(link, payload, DBS_STORE_WAREHOUSE,
+                                                     WarehouseHandlers.StoreReqDlmId, WarehouseHandlers.StoreReqBinaryRef, WarehouseHandlers.StoreRequestSize);
+            case SDB_GET_WAREHOUSE:           return OnWarehouseTransfer(link, payload, DBS_GET_WAREHOUSE,
+                                                     WarehouseHandlers.GetReqDlmId, WarehouseHandlers.GetReqBinaryRef, WarehouseHandlers.GetRequestSize);
+            case SDB_CHANGE_WAREHOUSE_POS:    return OnWarehouseTransfer(link, payload, DBS_CHANGE_WAREHOUSE_POS,
+                                                     WarehouseHandlers.ChangePosReqDlmId, WarehouseHandlers.ChangePosReqBinaryRef, WarehouseHandlers.ChangePosRequestSize);
+            case SDB_CLEAR_WAREHOUSE:         return OnClearWarehouse(link, payload);
+            case SDB_WAREHOUSE_AUTO_SORT:     return OnWarehouseAutoSort(link, payload);
+            case SDB_PAY_WAREHOUSE_COMMISION: return OnPayWarehouseCommision(link, payload);
+            case SDB_INCREASE_WAREHOUSE_SIZE: return OnIncreaseWarehouseSize(link, payload);
 
             // --- Post-spawn (reqId at payload[0] for all three) ---
             case SDB_END_START_QUEST_LIST: link.SendFrame(DBS_END_START_QUEST_LIST, BuildReqIdAck(payload, 0)); return true;
@@ -1499,7 +1557,196 @@ public sealed class DbProxyHandlers
             _log.LogInformation("SDB_ITEM_SINGLE: echoed {N} transaction atom(s) for player {Pid}",
                 declaredA + declaredB, playerId);
 
+        // T44: the atoms are applied to the item rows, not just echoed. Always from the REPLY -
+        // it is the copy that has the allocated item DB ids in it, so the id World is handed and
+        // the id the row gets are the same one. Both lists: World executes A then B.
+        if (_store is not null)
+        {
+            var a = BagItems.ApplyReplyAtoms(_store, reply, 0, _store.NextItemId, _log);
+            var b = BagItems.ApplyReplyAtoms(_store, reply, 8, _store.NextItemId, _log);
+            int touched = a.Inserted + a.Moved + a.AmountChanged + a.Deleted
+                        + b.Inserted + b.Moved + b.AmountChanged + b.Deleted;
+            if (touched > 0)
+                _log.LogInformation(
+                    "SDB_ITEM_SINGLE: player {Pid} -> {Ins} inserted, {Mov} moved, {Chg} amount, {Del} deleted ({Ign} atom(s) changed no row)",
+                    playerId, a.Inserted + b.Inserted, a.Moved + b.Moved,
+                    a.AmountChanged + b.AmountChanged, a.Deleted + b.Deleted, a.Ignored + b.Ignored);
+        }
+
         link.SendFrame(DBS_SAVE_2769, reply);
+        return true;
+    }
+
+
+    // ================================ T42: the warehouse ================================
+    // status/MAIL-WAREHOUSE.md section 4. Layouts and builders are in World/WarehouseHandlers.cs;
+    // these are the thin wrappers that read the live DlmId out of the request, touch the store
+    // and send. Every one of them answers unconditionally, even on a malformed request: an
+    // unanswered per-user DB item head-blocks that user's whole queue for the life of the World
+    // process (status/HANDOFF.md section 1), and a warehouse the player cannot open is a much
+    // smaller problem than a character that can never log out again.
+
+    // Payload-relative and bounds-checked. The file already has U32/I64 taking a FRAME offset
+    // (near BuildDbs2909); these take a payload index and return 0 rather than throwing, because
+    // a short warehouse request still has to be answered.
+    private static uint WhU32(byte[] p, int at) => at >= 0 && at + 4 <= p.Length ? BitConverter.ToUInt32(p, at) : 0u;
+    private static long WhI64(byte[] p, int at) => at >= 0 && at + 8 <= p.Length ? BitConverter.ToInt64(p, at) : 0L;
+
+    /// <summary>
+    /// SDB_VIEW_WAREHOUSE (0x274A) -> DBS_VIEW_WAREHOUSE (0x274B), rebuilt from the item rows.
+    ///
+    /// <para>This is the warehouse's load. There is <b>no login-time warehouse load</b> — no
+    /// SDB_LOAD_WAREHOUSE opcode exists in the 0x2700-0x29FF table, and neither capture contains
+    /// a single warehouse frame — so this arrives the moment the player first talks to a bank
+    /// NPC and never before.</para>
+    ///
+    /// <para>An owner with nothing banked gets the 45-byte empty form: Success = 1,
+    /// ViewSize = 0x48 (the literal the real writer emits), everything else 0 and no items.</para>
+    /// </summary>
+    private bool OnViewWarehouse(WorldLink link, byte[] payload)
+    {
+        uint dlmId = WhU32(payload, WarehouseHandlers.ViewReqDlmId);
+        long ownerDbId = WhI64(payload, WarehouseHandlers.ViewReqOwnerDbId);
+        uint invenType = WhU32(payload, WarehouseHandlers.ViewReqInvenType);
+        uint viewPos = WhU32(payload, WarehouseHandlers.ViewReqViewPos);
+
+        if (payload.Length < WarehouseHandlers.ViewRequestSize)
+        {
+            _log.LogWarning("SDB_VIEW_WAREHOUSE too short ({Len} B) - answering with an empty warehouse", payload.Length);
+            link.SendFrame(DBS_VIEW_WAREHOUSE,
+                WarehouseHandlers.BuildDbsViewWarehouse(dlmId, true, 0, 0, 0, 0, 0, null));
+            return true;
+        }
+
+        var records = new List<byte[]>();
+        long money = 0;
+        int slotCount = 0;
+
+        if (_store is not null)
+        {
+            var (m, sc) = _store.GetWarehouse(ownerDbId, (int)invenType);
+            money = m; slotCount = sc;
+            foreach (var row in _store.GetItems(ownerDbId, (int)invenType))
+            {
+                // A row that came in with a real 536-byte ItemData keeps it; anything banked from
+                // an atom has none, and a synthetic record is safe because the parts of the real
+                // record we leave zero are uninitialised Arbiter heap that World has to ignore
+                // (status/INVENTORY-DESIGN.md section 2).
+                byte[]? stored = row.Record;
+                records.Add(stored is not null && stored.Length == WarehouseHandlers.ItemRecordSize
+                    ? stored
+                    : WarehouseHandlers.BuildItemRecord(row.ItemDbId, row.TemplateId, (int)row.OwnerDbId,
+                                                        (int)row.Amount, row.InvenType, row.Slot));
+            }
+        }
+
+        // ViewPos/EndPos are the window into the page the client asked for. With one page of
+        // 0x48 slots and no paging UI of our own, the honest answer is "the whole list".
+        uint endPos = viewPos + (uint)records.Count;
+        _log.LogInformation("SDB_VIEW_WAREHOUSE: owner {Owner} pocket {Pocket} -> {N} item(s), {Money} money",
+            ownerDbId, invenType, records.Count, money);
+
+        link.SendFrame(DBS_VIEW_WAREHOUSE, WarehouseHandlers.BuildDbsViewWarehouse(
+            dlmId, ok: true, viewPos, endPos, (uint)records.Count, money,
+            (ushort)Math.Clamp(slotCount, 0, ushort.MaxValue), records));
+        return true;
+    }
+
+    /// <summary>
+    /// SDB_STORE_WAREHOUSE (0x274C), SDB_GET_WAREHOUSE (0x274E) and SDB_CHANGE_WAREHOUSE_POS
+    /// (0x277F). One shape, three opcodes: a list of <c>ItemTransactionAtom</c>s applied to the
+    /// item rows and echoed back with the ids we allocated.
+    ///
+    /// <para>The atoms are cloned <b>first</b> and the rows are built from the clone, so the id
+    /// World gets back is the id the row has. Parsing the request instead would allocate a
+    /// second id and hand World one we never stored.</para>
+    /// </summary>
+    private bool OnWarehouseTransfer(WorldLink link, byte[] payload, ushort replyOp,
+                                     int dlmOffset, int refOffset, int minStart)
+    {
+        uint dlmId = WhU32(payload, dlmOffset);
+
+        if (_store is null)
+        {
+            link.SendFrame(replyOp, WarehouseHandlers.BuildDbsTransfer(Array.Empty<byte>(), dlmId, true, 0, 0));
+            return true;
+        }
+
+        var (atoms, parsed) = WarehouseHandlers.CloneAtomsWithIds(payload, refOffset, minStart, _store.NextItemId);
+        if (atoms.Length == 0 && payload.Length > minStart)
+            _log.LogWarning("{Op}: could not read the atom list ({Len} B payload) - echoing an empty one",
+                DbProxyOpcodeNames.Describe(replyOp), payload.Length);
+
+        var r = WarehouseHandlers.Apply(_store, parsed, _store.NextItemId, _log);
+        if (parsed.Count > 0)
+            _log.LogInformation("{Op}: {N} atom(s) -> {Ins} inserted, {Mov} moved, {Chg} amount, {Del} deleted, {Money} money, {Ign} ignored",
+                DbProxyOpcodeNames.Describe(replyOp), parsed.Count, r.Inserted, r.Moved, r.AmountChanged,
+                r.Deleted, r.MoneyDelta, r.Ignored);
+
+        // WareCommision is 0 in this build: CommisionPayed() returns 1 and GetWareCommision()
+        // returns 0 in the decompile, so the fee path is effectively disabled.
+        link.SendFrame(replyOp, WarehouseHandlers.BuildDbsTransfer(atoms, dlmId, ok: true, error: 0, wareCommision: 0));
+        return true;
+    }
+
+    /// <summary>SDB_CLEAR_WAREHOUSE (0x27E0) -> 0x27E1. dbo.spClearWarehouse.</summary>
+    private bool OnClearWarehouse(WorldLink link, byte[] payload)
+    {
+        uint dlmId = WhU32(payload, WarehouseHandlers.ClearReqDlmId);
+        long owner = WhU32(payload, WarehouseHandlers.ClearReqOwnerDbId);
+        uint invenType = WhU32(payload, WarehouseHandlers.ClearReqInvenType);
+        int removed = _store?.ClearWarehouse(owner, (int)invenType) ?? 0;
+        _log.LogInformation("SDB_CLEAR_WAREHOUSE: owner {Owner} pocket {Pocket} -> {N} row(s) removed",
+            owner, invenType, removed);
+        link.SendFrame(DBS_CLEAR_WAREHOUSE, WarehouseHandlers.BuildDbsClearWarehouse(dlmId, ok: true));
+        return true;
+    }
+
+    /// <summary>
+    /// SDB_WAREHOUSE_AUTO_SORT (0x27E2) -> 0x27E3. The reply echoes the request's four fields
+    /// back. We do not renumber slots: the client re-reads the page with SDB_VIEW_WAREHOUSE
+    /// straight afterwards and our rows are already returned in slot order.
+    /// </summary>
+    private bool OnWarehouseAutoSort(WorldLink link, byte[] payload)
+    {
+        link.SendFrame(DBS_WAREHOUSE_AUTO_SORT, WarehouseHandlers.BuildDbsAutoSort(
+            WhU32(payload, WarehouseHandlers.SortReqDlmId), ok: true,
+            WhU32(payload, WarehouseHandlers.SortReqUserDbId),
+            WhU32(payload, WarehouseHandlers.SortReqInvenType),
+            WhU32(payload, WarehouseHandlers.SortReqBegin),
+            WhU32(payload, WarehouseHandlers.SortReqEnd),
+            errorMsg: 0, wareCommision: 0));
+        return true;
+    }
+
+    /// <summary>
+    /// SDB_PAY_WAREHOUSE_COMMISION (0x27C9) -> 0x27CA. The fee is disabled in this build
+    /// (<c>CommisionPayed()</c> returns 1 and <c>GetWareCommision()</c> returns 0), so this is a
+    /// success ack and nothing is charged.
+    /// </summary>
+    private bool OnPayWarehouseCommision(WorldLink link, byte[] payload)
+    {
+        link.SendFrame(DBS_PAY_WAREHOUSE_COMMISION, WarehouseHandlers.BuildDbsPayCommision(
+            WhU32(payload, WarehouseHandlers.PayReqDlmId), ok: true, error: 0));
+        return true;
+    }
+
+    /// <summary>
+    /// SDB_INCREASE_WAREHOUSE_SIZE (0x283F) -> <b>DBS_INCREASE_INVENTORY_SIZE (0x283E)</b>.
+    /// Not 0x2840 — see TRAP 1 in the constants block. Replying 0x2840 would head-block the user.
+    /// </summary>
+    private bool OnIncreaseWarehouseSize(WorldLink link, byte[] payload)
+    {
+        uint dlmId = WhU32(payload, WarehouseHandlers.IncReqDlmId);
+        long owner = WhU32(payload, WarehouseHandlers.IncReqUserDbId);
+        uint invenType = WhU32(payload, WarehouseHandlers.IncReqInvenType);
+        int delta = (int)WhU32(payload, WarehouseHandlers.IncReqDeltaAmount);
+
+        int newCount = _store?.AddWarehouseSlots(owner, (int)invenType, delta) ?? 0;
+        _log.LogInformation("SDB_INCREASE_WAREHOUSE_SIZE: owner {Owner} pocket {Pocket} +{Delta} -> {Count} slot(s)",
+            owner, invenType, delta, newCount);
+
+        link.SendFrame(DBS_INCREASE_INVENTORY_SIZE, WarehouseHandlers.BuildDbsIncreaseSize(ok: true, dlmId));
         return true;
     }
 
@@ -1542,8 +1789,16 @@ public sealed class DbProxyHandlers
             playerId, questId, sqlType, status, step, questDbId);
 
         // Only an INSERT write is told the id; every other write already carries it in record+0.
-        link.SendFrame(DBS_SET_QUEST_INFO,
-            BuildDbs272F(payload, sqlType == QuestSqlTypeInsert ? questDbId : 0, _store.NextItemId));
+        var questReply = BuildDbs272F(payload, sqlType == QuestSqlTypeInsert ? questDbId : 0, _store.NextItemId);
+
+        // T44: a quest reward is items. The atoms ride in the same 856-byte form as 0x2768 and
+        // land in the same rows; the ref pair is at reply[8]/[12], behind the quest record.
+        var rewards = BagItems.ApplyReplyAtoms(_store, questReply, 8, _store.NextItemId, _log);
+        if (rewards.Inserted + rewards.AmountChanged > 0)
+            _log.LogInformation("SDB_SET_QUEST_INFO: quest {Q} rewarded player {Pid} {Ins} new item(s), {Chg} stack change(s)",
+                questId, playerId, rewards.Inserted, rewards.AmountChanged);
+
+        link.SendFrame(DBS_SET_QUEST_INFO, questReply);
         return true;
     }
 
@@ -1764,6 +2019,11 @@ public sealed class DbProxyHandlers
 
         _log.LogInformation("SDB_USER_LEARN_SKILL: player {Pid} learned skill {Skill} ({N} atom(s))",
             playerId, skillId, declaredAtoms);
+
+        // T44: the fee atoms take the money and any consumed item out of the bag. Same rows,
+        // same rule - applied from the reply, whose ref pair is at [0]/[4].
+        if (_store is not null) BagItems.ApplyReplyAtoms(_store, reply, 0, _store.NextItemId, _log);
+
         link.SendFrame(DBS_USER_LEARN_SKILL, reply);
         return true;
     }
@@ -3471,20 +3731,55 @@ public sealed class DbProxyHandlers
         int classId = chr?.Class ?? -1;
         var kit = StarterInventory.Build(template, classId, playerId, reqId);
 
-        link.SendFrame(DBS_USER_LOAD_POCKET_DATA, BuildEmptyListType1(payload, 0));
+        // The kit is only the STARTING point now. T44: the inventory is rows in `items`, the
+        // same table the warehouse uses, so a character who has picked anything up gets what
+        // they actually have. The kit is written out once, the first time we see a character
+        // with no rows, and from then on the reply is rebuilt from the rows.
+        byte[] inventory;
         if (kit != null)
         {
-            link.SendFrame(DBS_USER_LOAD_INVENTORY, kit);
+            inventory = kit;
             _log.LogInformation("SDB_USER_LOAD_INVENTORY: player {Pid} -> {N} starter items for class {Cls} ({Name})",
                 playerId, StarterInventory.ForClass(classId)!.Count, classId,
                 classId >= 0 && classId < StarterInventory.ClassNames.Length ? StarterInventory.ClassNames[classId] : "?");
         }
         else
         {
-            link.SendFrame(DBS_USER_LOAD_INVENTORY, BuildStarterInventory(template, reqId, (uint)playerId));
+            inventory = BuildStarterInventory(template, reqId, (uint)playerId);
             _log.LogWarning("SDB_USER_LOAD_INVENTORY: player {Pid} has no class kit (class {Cls}) - serving the captured glaiver list",
                 playerId, classId);
         }
+
+        if (_store is not null)
+        {
+            if (_store.CountInventoryItems(playerId) == 0)
+            {
+                int seeded = BagItems.Seed(_store, playerId, inventory);
+                _log.LogInformation("SDB_USER_LOAD_INVENTORY: seeded {N} starter row(s) for player {Pid}",
+                    seeded, playerId);
+            }
+
+            var rows = _store.GetInventoryItems(playerId);
+            if (rows.Count > 0)
+            {
+                // Byte-identical to the kit for a character who has not touched anything: each
+                // row keeps the 536-byte record it was seeded with, and GetInventoryItems
+                // returns them in the (pocket, slot) order StarterInventory sorted them into.
+                inventory = BagItems.BuildPayload(rows, reqId, playerId);
+                _log.LogInformation("SDB_USER_LOAD_INVENTORY: player {Pid} -> {N} item row(s) from the store",
+                    playerId, rows.Count);
+            }
+            else
+            {
+                // Seeding produced nothing (a malformed kit). Serve what we built rather than an
+                // empty inventory - World rejects a mismatch, it does not tolerate a gap.
+                _log.LogWarning("SDB_USER_LOAD_INVENTORY: player {Pid} has no item rows after seeding - serving the kit directly",
+                    playerId);
+            }
+        }
+
+        link.SendFrame(DBS_USER_LOAD_POCKET_DATA, BuildEmptyListType1(payload, 0));
+        link.SendFrame(DBS_USER_LOAD_INVENTORY, inventory);
         return true;
     }
 
