@@ -47,7 +47,8 @@ public static class WorldEntry
 
         // 4. Tell World about the player â€” built from character data, not replayed.
         var record = Program.Store?.GetCharacter((int)chr.Id);
-        var enterPayload = BuildEnterWorldPayload(s.GameId, chr, record?.WorldBlob, s.TunnelKey);
+        var enterPayload = BuildEnterWorldPayload(s.GameId, chr, record?.WorldBlob, s.TunnelKey,
+            GmCommandHandlers.LevelOf(s, Program.Store));
         w.SendFrame(WorldBridge.OpPlayerEnter, enterPayload);
 
         // 5. Send character data (world blob) to World.
@@ -89,10 +90,10 @@ public static class WorldEntry
     ///   param_20 [103]    = 6                 (WorldSession+0x758)
     ///   param_27 [129]    = 3                 (FUN_1407176f0, server config)
     /// </summary>
-    internal static byte[] BuildEnterWorldPayload(ulong gameId, FakeCharacter chr, uint tunnelKey = 5)
-        => BuildEnterWorldPayload(gameId, chr, null, tunnelKey);
+    internal static byte[] BuildEnterWorldPayload(ulong gameId, FakeCharacter chr, uint tunnelKey = 5, int adminLevel = 0)
+        => BuildEnterWorldPayload(gameId, chr, null, tunnelKey, adminLevel);
 
-    internal static byte[] BuildEnterWorldPayload(ulong gameId, FakeCharacter chr, byte[]? worldBlob, uint tunnelKey = 5)
+    internal static byte[] BuildEnterWorldPayload(ulong gameId, FakeCharacter chr, byte[]? worldBlob, uint tunnelKey = 5, int adminLevel = 0)
     {
         var buf = new byte[183];
         var w = new SpanWriter(buf);
@@ -188,8 +189,9 @@ public static class WorldEntry
         // [107..110] From WorldSession bit-field (param_21). Capture=0.
         w.U32(0);
 
-        // [111..114] From User+0x3b98 (param_22). Capture=0.
-        w.U32(0);
+        // [111..114] AdminLevel (param_22, User+0x3b98 - what set_admin_level writes). World binds it
+        //          to User+0xA474 and only ever logs it (T46, ENTER-WORLD-FALLBACK.md section 5a).
+        w.U32((uint)adminLevel);
 
         // [115..116] Two u8s (param_23 from User+0x3c2a, param_24 from FUN_140386af0).
         w.U8(0);

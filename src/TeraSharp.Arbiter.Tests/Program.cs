@@ -11505,16 +11505,18 @@ some prose with `backticks` that is not a table row
                  "the rest of the AS_ENTER_WORLD field map is unchanged");
     }
 
-    [Test] public static void T46_world_entry_still_sends_admin_level_zero()
+    [Test] public static void T46_world_entry_sends_the_admin_level_it_is_given()
     {
-        // Documents the bug rather than hiding it: until WorldEntry is changed (human-owned,
-        // status/ENTER-WORLD-FALLBACK.md 8d) every login tells World the player is level 0.
-        // When the diff lands, flip this to assert the account's level instead.
+        // The WorldEntry diff (ENTER-WORLD-FALLBACK.md 8d) landed 2026-09-15: [111] carries the
+        // account's GM level (default 0), which is what World logs as AdminLevel[n].
         var chr = new TeraSharp.Arbiter.Game.FakeCharacter();
-        var p = WorldEntry.BuildEnterWorldPayload(GameId, chr);
-        Hex.True(p.Length == DbProxyHandlers.EnterWorldPayloadSize, "183 bytes");
-        Hex.True(BitConverter.ToUInt32(p, DbProxyHandlers.EnterWorldAdminLevelOffset) == 0,
-                 "WorldEntry hard-codes AdminLevel 0 - this is what World logs");
+        var p0 = WorldEntry.BuildEnterWorldPayload(GameId, chr);
+        Hex.True(p0.Length == DbProxyHandlers.EnterWorldPayloadSize, "183 bytes");
+        Hex.True(BitConverter.ToUInt32(p0, DbProxyHandlers.EnterWorldAdminLevelOffset) == 0,
+                 "default is AdminLevel 0");
+        var p5 = WorldEntry.BuildEnterWorldPayload(GameId, chr, tunnelKey: 5, adminLevel: 5);
+        Hex.True(BitConverter.ToUInt32(p5, DbProxyHandlers.EnterWorldAdminLevelOffset) == 5,
+                 "[111] carries the level passed in");
     }
 
     [Test] public static void T46_the_enter_world_retry_carries_admin_level_through()
