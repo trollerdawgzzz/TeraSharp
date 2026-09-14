@@ -8,7 +8,7 @@ Read order for anyone new: `CLAUDE.md` (workspace rules at the top) -> `status/H
 (every per-user W->A opcode and how it is answered) -> this file.
 
 Build: `dotnet build TeraSharp.sln` — 0 warnings, 0 errors.
-Tests: `dotnet run --project src\TeraSharp.Arbiter.Tests` — **538**.
+Tests: `dotnet run --project src\TeraSharp.Arbiter.Tests` — **544**.
 Deploy check: `TeraSharp.Arbiter.exe --selftest` — one PASS/FAIL line per data dependency (T37).
 
 ---
@@ -132,6 +132,10 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
 - Two-login capture -> multi-player tunnel routing, `S_CHANGE_FRIEND_STATE` on login/logout and
   the `AS_*` block-list pushes (`status/MULTIPLAYER-DESIGN.md`).
 - Friend/blocked memos skip the Arbiter's banned-word + NetModerator stage (we have neither).
+- T47 needs two lines in human-owned files: `SocialHandlers.RegisterChat(s)` in
+  `WorldEntry.EnterWorld` and `SocialHandlers.UnregisterChat(this)` in `GameSession.Close`
+  (`status/GM-DESIGN.md` §9). Whisper self-heals without them; private-channel membership
+  does not - a logged-out character stays in their channels until restart.
 - GM: the client only offers `/@` for a QA login (`S_LOGIN_ARBITER.status` 31/33) - LoginHandlers
   still sends 0, so the one-line diff in `status/GM-DESIGN.md` §6 is untested live. That is now
   the ONLY thing between us and trying the 416 World commands: the 0x2829 frame is verified

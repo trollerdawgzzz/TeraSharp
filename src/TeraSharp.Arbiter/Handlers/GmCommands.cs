@@ -348,26 +348,74 @@ public sealed class GmCommandHandlers
         if (!hasUser) return GmDispatch.NoUser;
         if (adminLevel < GmAccounts.MinimumAdminLevel) return GmDispatch.NotAuthorised;
         if (Implemented.Contains(line.Name)) return GmDispatch.Local;
-        if (GmCommandCatalog.IsWorldCommand(line.Name)) return GmDispatch.ForwardToWorld;
+        // The Arbiter's own table is checked BEFORE the forward, and the forward is the default.
+        // Two reasons, both learned the hard way in T47:
+        //   1. GM-COMMANDS-FULL.md lists all 608 names, the Arbiter's included, so asking
+        //      IsWorldCommand first sent Arbiter-owned commands to World.
+        //   2. GmCommandCatalog loads those markdown files from disk and leaves both sets EMPTY
+        //      when it cannot find them - which is the normal case for a deployed binary with no
+        //      status/ folder beside it. Every command then fell through to Unknown, which is
+        //      exactly what the live test saw: "/@teleport warriortwo" -> Unknown, with teleport
+        //      sitting in GM-COMMANDS-FULL.md line 384 all along.
+        // Forwarding by default makes the catalogue an optimisation rather than a dependency.
         if (GmCommandCatalog.IsArbiterCommand(line.Name)) return GmDispatch.NotImplemented;
-        return GmDispatch.Unknown;
+        return GmDispatch.ForwardToWorld;
     }
+
+    /// <summary>
+    /// <b>Divergence from the original, on purpose.</b> The real Arbiter knows all 608 names
+    /// because both tables are compiled into it, so a name in neither is a typo and
+    /// <c>ArbiterCommandDistributor::OnUnregisteredCommand</c> (Arb_part_085.c:12895) answers
+    /// "Invalid QA Command" plus S_COMMAND_HELP with near matches. We only know the names when
+    /// the catalogue files are on disk, so a typo would be indistinguishable from a real command
+    /// and would be refused locally instead of reaching World. We forward instead and let World
+    /// reject: a typo costs one wasted frame, a real command that we failed to recognise costs a
+    /// feature. <see cref="GmDispatch.Unknown"/> is therefore no longer produced by
+    /// <see cref="Classify"/>; it is kept so the enum and its tests stay meaningful.
+    /// </summary>
+    public const string ForwardByDefaultNote =
+        "T47: a command that is not in Implemented and not Arbiter-owned is forwarded to World.";
 
     /// <summary>The Arbiter-side commands TeraSharp actually runs.</summary>
     public static readonly IReadOnlySet<string> Implemented = new HashSet<string>(
         new[] { "set_admin_level", "create_user", "testitem", "clear_inven", "warehousegold_max", "query_point" },
         StringComparer.OrdinalIgnoreCase);
 
-    /// <summary>The account's effective admin level: allow-list first, then the stored row.</summary>
+    /// <summary>
+    /// The account's effective admin level: the higher of the stored row and what the
+    /// TERASHARP_GM_ACCOUNTS allow-list grants.
+    ///
+    /// <para><b>T47 widened this twice.</b> It is <c>max</c>, not "allow-list wins", so an account
+    /// stored above <see cref="GmAccounts.GmAdminLevel"/> is not demoted by being listed. And the
+    /// list is matched against the CHARACTER name as well as the account name: the variable is
+    /// called GM_ACCOUNTS, but the name a person has to hand is the one they typed at the
+    /// character screen, and putting it in the list is the obvious thing to do. Matching both is
+    /// strictly more forgiving and cannot grant anything the list does not already name.</para>
+    ///
+    /// <para>Why it mattered: <c>WorldEntry</c> calls this to fill AS_ENTER_WORLD payload 111
+    /// (T46), and a 0 there is what World prints as <c>AdminLevel[0]</c>. If it still logs 0
+    /// after this, the value in the env matches neither name - that is the thing to check, and
+    /// the level is otherwise resolved from the <c>accounts.admin_level</c> row.</para>
+    /// </summary>
     public static int LevelOf(GameSession s, CharacterStore? store)
     {
+        if (s == null) return 0;
         int stored = 0;
         if (store != null)
         {
             var acct = store.GetAccount(s.Account.Name);
             stored = acct?.AdminLevel ?? 0;
         }
-        return GmAccounts.LevelFor(s.Account.Name, stored);
+        return LevelOf(s.Account.Name, s.SelectedCharacter?.Name, stored,
+                       Environment.GetEnvironmentVariable(GmAccounts.EnvVariable));
+    }
+
+    /// <summary>The pure half of <see cref="LevelOf(GameSession, CharacterStore?)"/>, for tests.</summary>
+    public static int LevelOf(string? accountName, string? characterName, int storedLevel, string? envValue)
+    {
+        bool listed = GmAccounts.IsListed(accountName, envValue)
+                   || GmAccounts.IsListed(characterName, envValue);
+        return listed ? Math.Max(storedLevel, GmAccounts.GmAdminLevel) : storedLevel;
     }
 
     // ---- The forward ----

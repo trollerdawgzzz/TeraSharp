@@ -89,6 +89,35 @@ public sealed class WorldReplayTable
         0x13C6, // SA_REMOVE_DUNGEON_CHANNEL       (zone change)
         0x1499, // SA_SAVE_ETC_DATA_FOR_MOVE_WORLD (zone change)
 
+        // --- T47: the "Arbiter Contract" family. These are the two-party interactions the
+        // Arbiter brokers - the ContractType field selects which - so they only appear once two
+        // players can see each other, which is why nothing saw them before the two-client test.
+        //
+        // None of the four carries a DlmId (the dumpers name ContractorDbId / ContractType /
+        // ContractId and nothing else), so an unanswered one canNOT head-block the per-user DB
+        // queue the way a missing DBS_ reply does. What they would do without an entry here is
+        // worse in a subtler way: the replay table would pair them with whatever A->W frame
+        // happened to follow and send a captured reply.
+        //
+        // Why one-way, handler by handler:
+        //   0x2809 SDB_FETCH_THROUGH_ARBITER_CONTRACT  (Arb_part_063.c:7017, guard frame >= 0x22)
+        //       dispatches on ContractType (4, 5, 10, 0x23) into four managers and sends NOTHING
+        //       at all - no World frame, no client packet.
+        //   0x280C SDB_ASK_THROUGH_ARBITER_CONTRACT    (Arb_part_063.c:810)  - 38 lines, sends nothing.
+        //   0x280D SDB_SEND_BEGIN_THROUGH_ARBITER_CONTRACT (Arb_part_064.c:2732) - sends only the
+        //       CLIENT packet S_BEGIN_THROUGH_ARBITER_CONTRACT; no World frame.
+        //   0x280E SDB_SEND_END_THROUGH_ARBITER_CONTRACT   (Arb_part_064.c:2983) - the one that
+        //       does emit 0x280F, but NOT as a reply: it walks the AskUserList, and for each other
+        //       participant that is in world it pushes DBS_SEND_END_THROUGH_ARBITER_CONTRACT to
+        //       THAT user's World session with [ContractorDbId][ContractType][ContractId][thatUser].
+        //       A fan-out, not an answer. Faithfully reproducing it needs the contract/trade
+        //       system we do not have, and inventing one would tell World a contract completed
+        //       that we never brokered.
+        0x2809, // SDB_FETCH_THROUGH_ARBITER_CONTRACT       - observed live, 58-66 B
+        0x280C, // SDB_ASK_THROUGH_ARBITER_CONTRACT         - same family, not yet observed
+        0x280D, // SDB_SEND_BEGIN_THROUGH_ARBITER_CONTRACT  - same family, not yet observed
+        0x280E, // SDB_SEND_END_THROUGH_ARBITER_CONTRACT    - observed live, 58-66 B
+
         // --- T42: SDB_MOVE_WAREHOUSE_ITEM. Not "one-way" because we chose not to answer it -
         // the REAL Arbiter does not answer it. Handler_SDB_MOVE_WAREHOUSE_ITEM (FUN_1405b53c0,
         // Arb_part_048.c:13050) is ten lines long: enter the scope tracer, leave it, return 1.

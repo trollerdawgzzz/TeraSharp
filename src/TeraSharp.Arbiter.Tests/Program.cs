@@ -9419,8 +9419,12 @@ bytes  ticket
             "a World command is forwarded");
         Hex.True(GmCommandHandlers.Classify(true, 5, theirs) == GmDispatch.NotImplemented,
             "an Arbiter command we do not implement says so rather than lying to World");
-        Hex.True(GmCommandHandlers.Classify(true, 5, junk) == GmDispatch.Unknown,
-            "in neither catalogue -> Invalid QA Command");
+        // T47 changed this: a name in neither catalogue is FORWARDED, not refused. The real
+        // Arbiter can refuse because both tables are compiled into it; our catalogue comes off
+        // disk and is empty whenever status/ is not beside the binary, so refusing locally meant
+        // refusing every real World command too. GmCommandHandlers.ForwardByDefaultNote.
+        Hex.True(GmCommandHandlers.Classify(true, 5, junk) == GmDispatch.ForwardToWorld,
+            "in neither catalogue -> forwarded, and World rejects it");
         Hex.True(GmCommandHandlers.Classify(true, 5, null) == GmDispatch.Empty, "nothing to do");
 
         Hex.True(GmCommandHandlers.InvalidCommandMessage == "Invalid QA Command\n",
@@ -11579,6 +11583,158 @@ some prose with `backticks` that is not a table row
             uint off = BitConverter.ToUInt32(p, 0);
             Hex.True(off >= 6 && off < frame, $"the string offset {off} is inside the frame");
         }
+    }
+
+    // ======================================================================
+    // T47 — whisper routing, forward-by-default for /@, and the contract
+    // opcodes that only appear with two players in view.
+    //
+    // The whisper bug was not in the packet: SocialHandlers.Sessions was a
+    // name->session map whose RegisterSession nothing ever called, so it was
+    // always empty and every whisper answered SMT 831 "offline". The same
+    // empty map also silently killed every cross-session friend push in that
+    // file. ChatManager replaces it and resolves through WorldBridge.
+    // ======================================================================
+
+    [Test] public static void T47_whisper_is_offline_only_when_the_target_really_is()
+    {
+        // The live failure was not in the rule, it was that nobody was ever registered:
+        // SocialHandlers.Sessions had a RegisterSession that nothing called, so the map was
+        // always empty and ChatManager - had it been wired at all - would have had an empty
+        // online map too. Both halves of that are what T47 fixes.
+        using var store = ChatStore();
+        var cm = NewChatManager(store, online: 0);
+
+        // Nobody registered: the sender is not even known to the manager.
+        var none = cm.OnClientPacket(1, ChatPackets.C_WHISPER, CWhisperBody("c2", "hi"));
+        Hex.True(none.Rejected != null && none.Rejected!.Contains("not registered"),
+                 $"an unregistered SENDER is refused outright, got: {none.Rejected}");
+        Hex.True(ChatSeq(none).Count == 0, "and nothing goes on the wire");
+
+        // Sender only: the target reads as offline - exactly the live symptom.
+        cm.Register(new ChatPlayer(1, "c1", 0x0400000000000001UL, 60, 2, false));
+        var offline = cm.OnClientPacket(1, ChatPackets.C_WHISPER, CWhisperBody("c2", "hi"));
+        var offSeq = ChatSeq(offline);
+        Hex.True(offSeq.Count == 1 && offSeq[0] == (1, "S_SYSTEM_MESSAGE"),
+                 "one S_SYSTEM_MESSAGE back to the sender");
+        Hex.True((int)ChatFields(offline, 0)["sysMsgId"] == ChatManager.MsgWhisperNoSuchUser,
+                 "SMT 831 - 'Whisper ... offline', which is what the live test saw");
+
+        // Register the target and the same whisper is delivered. That is the whole of T47 part 1.
+        cm.Register(new ChatPlayer(2, "c2", 0x0400000000000002UL, 60, 2, false));
+        var ok = cm.OnClientPacket(1, ChatPackets.C_WHISPER, CWhisperBody("c2", "hi"));
+        Hex.True(ok.Rejected == null, $"delivered, got: {ok.Rejected}");
+        var seq = ChatSeq(ok);
+        Hex.True(seq.Count == 2 && seq[0] == (2, "S_WHISPER") && seq[1] == (1, "S_WHISPER"),
+                 "receiver then sender: " + string.Join(", ", seq.Select(x => $"{x.To}:{x.Packet}")));
+    }
+
+    [Test] public static void T47_leaving_world_takes_the_character_offline_for_chat()
+    {
+        // The other half of the wiring: without the unregister line a character who logs out
+        // stays whisperable forever, and ChatManager.Unregister is also what drops their private
+        // channel memberships - it returns the leave announcements, which must be dispatched.
+        using var store = ChatStore();
+        var cm = NewChatManager(store);
+        Hex.True(cm.IsOnline(2), "c2 is online to start with");
+
+        var leave = cm.Unregister(2);
+        Hex.True(!cm.IsOnline(2), "and offline after Unregister");
+        Hex.True(leave.Origin.Kind == RecipientKind.PlayerId && (int)leave.Origin.Id == 2,
+                 "the actions it returns are attributed to the leaver");
+
+        var after = cm.OnClientPacket(1, ChatPackets.C_WHISPER, CWhisperBody("c2", "hi"));
+        Hex.True((int)ChatFields(after, 0)["sysMsgId"] == ChatManager.MsgWhisperNoSuchUser,
+                 "whispering them now says not-found, as it should");
+    }
+
+    // ---- /@ forwarding ----
+
+    [Test] public static void T47_anything_we_do_not_own_is_forwarded()
+    {
+        // The live failure: "/@teleport warriortwo" and bare "/@teleport" both came back Unknown.
+        // With an EMPTY catalogue - which is what a deployed binary with no status/ folder has -
+        // every non-implemented name must now forward.
+        GmCommandCatalog.Set(arbiter: Array.Empty<string>(), world: Array.Empty<string>());
+
+        foreach (var line in new[] { "teleport warriortwo", "teleport", "not_a_command", "add_exp 1000" })
+            Hex.True(GmCommandHandlers.Classify(true, 5, GmCommandParser.Parse(line)) == GmDispatch.ForwardToWorld,
+                     $"'{line}' must be forwarded when the catalogue is empty");
+
+        // Ours still wins over the forward, catalogue or no catalogue.
+        Hex.True(GmCommandHandlers.Classify(true, 5, GmCommandParser.Parse("query_point")) == GmDispatch.Local,
+                 "an implemented command is still run locally");
+
+        // And an Arbiter-owned name we have not implemented says so instead of lying to World.
+        GmCommandCatalog.Set(arbiter: new[] { "crash_arbiter" }, world: Array.Empty<string>());
+        Hex.True(GmCommandHandlers.Classify(true, 5, GmCommandParser.Parse("crash_arbiter")) == GmDispatch.NotImplemented,
+                 "Arbiter-owned is checked BEFORE the forward");
+
+        // The gate still comes first.
+        Hex.True(GmCommandHandlers.Classify(true, 0, GmCommandParser.Parse("teleport")) == GmDispatch.NotAuthorised,
+                 "a non-GM is still refused");
+        Hex.True(GmCommandHandlers.Classify(false, 5, GmCommandParser.Parse("teleport")) == GmDispatch.NoUser,
+                 "no character selected is still NoUser");
+    }
+
+    [Test] public static void T47_teleport_forwards_with_the_real_catalogue_loaded()
+    {
+        var arbiterFile = FindRepoFile(Path.Combine("status", "GM-COMMANDS-ARBITER.md"));
+        var worldFile = FindRepoFile(Path.Combine("status", "GM-COMMANDS-FULL.md"));
+        if (arbiterFile == null || worldFile == null)
+        { Console.WriteLine("        (skipped: GM catalogue markdown not found)"); return; }
+
+        GmCommandCatalog.Set(
+            GmCommandCatalog.ParseMarkdown(File.ReadAllText(arbiterFile)),
+            GmCommandCatalog.ParseMarkdown(File.ReadAllText(worldFile)));
+
+        Hex.True(GmCommandCatalog.WorldCommands.Contains("teleport"),
+                 "teleport is in GM-COMMANDS-FULL.md (line 384)");
+        Hex.True(!GmCommandCatalog.ArbiterCommands.Contains("teleport"),
+                 "and NOT in GM-COMMANDS-ARBITER.md, so it is World's");
+        Hex.True(GmCommandHandlers.Classify(true, 5, GmCommandParser.Parse("teleport 1 2 3")) == GmDispatch.ForwardToWorld,
+                 "/@teleport forwards");
+
+        // GM-COMMANDS-FULL.md is ALL 608 names, the Arbiter's included. Before T47 the World
+        // check came first, so an Arbiter-owned name in that file was forwarded to World.
+        foreach (var own in GmCommandHandlers.Implemented)
+            Hex.True(GmCommandHandlers.Classify(true, 5, GmCommandParser.Parse(own)) == GmDispatch.Local,
+                     $"'{own}' is ours even though GM-COMMANDS-FULL.md lists it");
+    }
+
+    [Test] public static void T47_level_of_honours_the_env_allow_list()
+    {
+        const string env = "accountonetest, someoneelse";
+        Hex.True(GmCommandHandlers.LevelOf("accountonetest", null, 0, env) == GmAccounts.GmAdminLevel,
+                 "a listed ACCOUNT gets the GM level even with no stored row");
+        Hex.True(GmCommandHandlers.LevelOf("other", "accountonetest", 0, env) == GmAccounts.GmAdminLevel,
+                 "and so does a listed CHARACTER name - GM_ACCOUNTS is what people have to hand");
+        Hex.True(GmCommandHandlers.LevelOf("other", "nobody", 0, env) == 0, "an unlisted login stays 0");
+        Hex.True(GmCommandHandlers.LevelOf("other", "nobody", 3, env) == 3, "the stored row still counts");
+        Hex.True(GmCommandHandlers.LevelOf("accountonetest", null, 9, env) == 9,
+                 "max, not override: being listed must not DEMOTE an account stored above 5");
+        Hex.True(GmCommandHandlers.LevelOf("accountonetest", null, 0, null) == 0,
+                 "no env, no bootstrap");
+        Hex.True(GmCommandHandlers.LevelOf(null, null, 0, env) == 0, "no names, no level");
+    }
+
+    // ---- the Arbiter Contract opcodes ----
+
+    [Test] public static void T47_contract_family_is_sealed_one_way()
+    {
+        // 0x2809 SDB_FETCH_THROUGH_ARBITER_CONTRACT and 0x280E SDB_SEND_END_THROUGH_ARBITER_CONTRACT
+        // are the two seen live (58-66 B, only with two players in view). None of the family
+        // carries a DlmId, so an unanswered one cannot head-block the DB queue - but without an
+        // entry here the replay table would hand them somebody else's reply.
+        foreach (ushort op in new ushort[] { 0x2809, 0x280C, 0x280D, 0x280E })
+            Hex.True(WorldReplayTable.OneWayFromWorld.Contains(op),
+                     $"0x{op:X4} must be sealed one-way");
+
+        // And they must NOT be answered: the Arbiter's own handlers send nothing back over the
+        // World link (0x280E's 0x280F is a fan-out to the OTHER participants, not a reply).
+        foreach (ushort op in new ushort[] { 0x2809, 0x280C, 0x280D, 0x280E })
+            Hex.True(!DbProxyHandlers.IsHandledRequest(op),
+                     $"0x{op:X4} must not be in the allow-list - we have no contract system to answer with");
     }
 
     /// <summary>Walks up from the test binary looking for a repo-relative file; null if not found.</summary>
