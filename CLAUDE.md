@@ -78,6 +78,9 @@ human rebases a worktree on master before a new task if master moved. The curren
 bottom of this section; `status/CHAT-HANDOFF.md` has the day-by-day state and the live-debug recipes.
 
 ### Hard rules learned the expensive way (2026-09-14)
+- **No `"` inside C# verbatim strings** (`@"..."`, e.g. the SQL DDL in CharacterStore) - a lone double quote
+  terminates the string and the build fails with 300+ errors. Use single quotes or no quotes in SQL comments.
+  Cowork cannot build, so this has broken three merges in a row.
 - **Never send a `DBS_*` reply World did not ask for.** Every DBS_ carries a DLM id World looks up; an
   unsolicited one completes whichever item currently holds that id. A pre-emptive `0x2738` with playerId in the
   id slot crashed a fresh World for every character except playerId 1 (found via minidump stack walk).
