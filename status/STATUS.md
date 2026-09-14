@@ -20,6 +20,8 @@ Deploy check: `TeraSharp.Arbiter.exe --selftest` — one PASS/FAIL line per data
 | Client crypto / codec / login / char list / select / create / delete | real |
 | Chat, client settings (persisted) | real |
 | Whisper + private chat channels - layouts, the channel object, `ChatManager` | implemented (T43), RAM-only, **not wired** |
+| The 18 client packets World rejects - tooltips, exploration, client log, the small acks | implemented (T45), **not wired** |
+| Mail: the six `SDB_*_PARCEL` W<->A pairs, empty inbox byte-exact | real (T45) |
 | Friends, friend groups, memos, block list — two-step requests, all from rows | real (T30) |
 | World handshake, 0x147D promotion records (live timestamps), 0x1581 burst, post-handshake config burst | real |
 | Enter-world, blob save/load, restriction, gameId per login | real, live-verified |
@@ -64,6 +66,8 @@ Deploy check: `TeraSharp.Arbiter.exe --selftest` — one PASS/FAIL line per data
 | Guilds - the object, the SQL schema, the opcodes and the .def corrections | `status/GUILD-DESIGN.md` |
 | Guild rows, the Arbiter-side guild handlers, and the wiring they still need | `status/GUILD-DESIGN.md` section 10 |
 | How a subsystem's action list becomes sends (parties, guilds, chat, and whatever is next) | `World/ActionDispatcher.cs`, and the wiring section of each design doc |
+| Why World logs "handler has not been implemented yet!!!", and who owns each of those packets | `status/CLIENT-REJECTS.md` |
+| Why a fresh mailbox showed 12 blank rows, and the 35-byte empty `DBS_LIST_PARCEL` | `status/CLIENT-REJECTS.md` section 4 |
 | Whisper, private channels, the slot-not-an-id trap, and the chat .def corrections | `status/CHAT-DESIGN.md` |
 | The `SocialHandlers.OnWhisper` -> `ChatManager` swap, and what it changes for blocked users | `status/CHAT-DESIGN.md` section 7.2 |
 
@@ -100,6 +104,19 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
 ## Open
 
 - Live test of the relog-into-instance fallback (T21).
+- **The `RegNoop` / `RegEmptyReply` in-world forward** (`HandlerRegistry`) sends Arbiter-owned
+  packets to World, which drops them. Six packets are affected; the fix and the
+  `PacketDispatcher` deny-list are in `status/CLIENT-REJECTS.md` section 7 (human-owned files).
+- **The guild (T39) and chat (T43) wiring diffs pass a TOTAL packet length where
+  `PacketDispatcher` wants a BODY length** - every packet would be rejected four bytes short.
+  Subtract 4; `status/CLIENT-REJECTS.md` section 7.2c.
+- Whether answering `C_SHOW_ITEM_TOOLTIP_EX` is what makes a used potion's count repaint - the
+  packet is certainly the Arbiter's and certainly carries `Count`, but no capture has the
+  exchange. `C_CLIENT_LOG` is now printed and is the next evidence
+  (`status/CLIENT-REJECTS.md` section 2.4).
+- Six `S_` reply shapes that need a capture before their requests can be answered properly:
+  `S_DUNGEON_COOL_TIME_LIST`, `S_REPLY_GUILD_LIST`, `S_SHOW_PARTY_MATCH_INFO`,
+  `S_MY_PARTY_MATCH_INFO`, `S_SHOW_CANDIDATE_LIST`, `S_VIEW_BATTLE_FIELD_RESULT`.
 - Private channels: the member cap default (`DAT_140e315a8`), what the create/edit invite list
   actually sends each invitee, and the master-promotion rule - all three are ours, not the
   binary's (`status/CHAT-DESIGN.md` section 9). No capture contains a single channel packet.

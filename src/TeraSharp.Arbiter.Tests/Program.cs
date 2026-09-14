@@ -12232,4 +12232,521 @@ some prose with `backticks` that is not a table row
         Hex.True(encoded >= 25, $"only {encoded} packets encoded - the scenario got shorter");
         Console.WriteLine($"        ({encoded} chat packets encoded, {seen.Count} distinct)");
     }
+
+    // =======================================================================================
+    // T45 - the client packets World rejects, the mailbox, and the language-aware social seed.
+    // status/CLIENT-REJECTS.md.
+    //
+    // Nothing here has a capture behind it: no packet log contains a parcel frame, a tooltip
+    // request or a visited-section push. What stands in for one is that every layout below is
+    // walked field by field out of the Arbiter's own PDL dumper and lands EXACTLY on the
+    // min-length guard the real handler applies - see
+    // Tooltip_reply_fixed_part_ends_exactly_on_the_dumper_guard, which is the test that would
+    // catch a mis-read offset.
+    // =======================================================================================
+
+    /// <summary>An in-memory store with `count` characters named t1..tN, ids 1..count.</summary>
+    static TeraSharp.Arbiter.Persistence.CharacterStore T45Store(int count = 2)
+    {
+        var store = new TeraSharp.Arbiter.Persistence.CharacterStore(":memory:", QuietLog());
+        var acct = store.GetOrCreateAccount("t45");
+        for (int i = 1; i <= count; i++)
+        {
+            int id = store.CreateCharacter(new TeraSharp.Arbiter.Persistence.CharacterRecord
+            {
+                AccountId = acct.Id, Name = "t" + i, Gender = i % 2, Race = 1, Class = 2,
+                Level = 60, TemplateId = 10101, Zone = 7005, X = 1f, Y = 2f, Z = 3f,
+                Appearance = new byte[8], Details = new byte[32], Shape = new byte[64],
+                Position = i,
+            });
+            Hex.True(id == i, $"expected character id {i}, got {id}");
+        }
+        return store;
+    }
+
+    // ------------------------------------------------------------------ the mailbox
+
+    [Test] public static void Parcel_opcodes_match_dbproxy_opcodes_txt()
+    {
+        var path = FindRepoFile(Path.Combine("data", "dbproxy_opcodes.txt"));
+        if (path == null) { Console.WriteLine("        (skipped: data/dbproxy_opcodes.txt not found)"); return; }
+
+        var byName = new Dictionary<string, ushort>(StringComparer.Ordinal);
+        foreach (var line in File.ReadAllLines(path))
+        {
+            var parts = line.Split('|');
+            if (parts.Length != 2) continue;
+            var code = parts[0].Trim();
+            if (!code.StartsWith("0x", StringComparison.OrdinalIgnoreCase)) continue;
+            byName[parts[1].Trim()] = Convert.ToUInt16(code[2..], 16);
+        }
+
+        var want = new (string Name, ushort Op)[]
+        {
+            ("SDB_LIST_PARCEL", DbProxyHandlers.SDB_LIST_PARCEL),
+            ("DBS_LIST_PARCEL", DbProxyHandlers.DBS_LIST_PARCEL),
+            ("SDB_MAKE_PARCEL", DbProxyHandlers.SDB_MAKE_PARCEL),
+            ("DBS_MAKE_PARCEL", DbProxyHandlers.DBS_MAKE_PARCEL),
+            ("SDB_RECV_PARCEL", DbProxyHandlers.SDB_RECV_PARCEL),
+            ("DBS_RECV_PARCEL", DbProxyHandlers.DBS_RECV_PARCEL),
+            ("SDB_RECV_PARCEL_EX", DbProxyHandlers.SDB_RECV_PARCEL_EX),
+            ("DBS_RECV_PARCEL_EX", DbProxyHandlers.DBS_RECV_PARCEL_EX),
+            ("SDB_RETURN_PARCEL", DbProxyHandlers.SDB_RETURN_PARCEL),
+            ("DBS_RETURN_PARCEL", DbProxyHandlers.DBS_RETURN_PARCEL),
+            ("SDB_DELETE_PARCEL", DbProxyHandlers.SDB_DELETE_PARCEL),
+            ("DBS_DELETE_PARCEL", DbProxyHandlers.DBS_DELETE_PARCEL),
+        };
+        foreach (var (name, op) in want)
+        {
+            Hex.True(byName.TryGetValue(name, out ushort fromFile),
+                $"{name} is not in data/dbproxy_opcodes.txt");
+            Hex.True(fromFile == op, $"{name}: table says 0x{fromFile:X4}, we use 0x{op:X4}");
+        }
+    }
+
+    /// <summary>
+    /// The whole point of T45's mail half. Every byte of the empty reply is either echoed from
+    /// the request or a compiled-in default that Handler_SDB_LIST_PARCEL sets at
+    /// Arb_part_071.c:15334 (<c>local_ec = 1</c>, <c>local_f0 = 0</c>) before it consults the
+    /// parcel manager, so the frame is knowable byte-for-byte without a capture.
+    /// </summary>
+    [Test] public static void Parcel_empty_inbox_is_the_35_byte_frame()
+    {
+        var payload = ParcelDbHandlers.BuildEmptyDbsListParcel(dlmId: 0x1234, viewType: 2, curPage: 1);
+        Hex.True(payload.Length == ParcelDbHandlers.ListReplyHeader,
+            $"empty payload {payload.Length} B, want {ParcelDbHandlers.ListReplyHeader}");
+
+        // The frame the World link puts on the wire: [u32 len][u16 op][payload].
+        var frame = new byte[6 + payload.Length];
+        BitConverter.GetBytes((uint)frame.Length).CopyTo(frame, 0);
+        BitConverter.GetBytes(DbProxyHandlers.DBS_LIST_PARCEL).CopyTo(frame, 4);
+        payload.CopyTo(frame, 6);
+
+        Hex.Eq(frame,
+            "23 00 00 00 78 27  23 00 00 00  00 00 00 00  34 12 00 00  01  02 00 00 00  " +
+            "01 00 00 00  01 00 00 00  00 00 00 00",
+            "empty DBS_LIST_PARCEL: offset=35, bytes=0, dlm echoed, ok, view/page echoed, "
+            + "MaxPage=1, ParcelCount=0");
+    }
+
+    [Test] public static void Parcel_list_offset_is_the_header_length_and_bytes_track_the_count()
+    {
+        // The writer backpatches the OFFSET slot unconditionally (*local_c8 = *local_d8) and the
+        // BYTES slot only inside the non-empty branch - so an empty list has offset 35, not 0.
+        var empty = ParcelDbHandlers.BuildDbsListParcel(1, true, 0, 0, 1, 0, null);
+        Hex.True(BitConverter.ToUInt32(empty, ParcelDbHandlers.ListRspBinaryRef) == 6 + 29,
+            "empty list still points at the end of the header");
+        Hex.True(BitConverter.ToUInt32(empty, ParcelDbHandlers.ListRspBinaryRef + 4) == 0,
+            "empty list has zero bytes");
+
+        var two = ParcelDbHandlers.BuildDbsListParcel(1, true, 0, 0, 1, 2,
+            new byte[2 * ParcelDbHandlers.ParcelDataNoMsgSize]);
+        Hex.True(BitConverter.ToUInt32(two, ParcelDbHandlers.ListRspBinaryRef) == 6 + 29,
+            "the offset does not move when the list grows");
+        Hex.True(BitConverter.ToUInt32(two, ParcelDbHandlers.ListRspBinaryRef + 4)
+                 == 2 * ParcelDbHandlers.ParcelDataNoMsgSize, "bytes = N * 0x9e8");
+        Hex.True(two.Length == 29 + 2 * ParcelDbHandlers.ParcelDataNoMsgSize, "payload length");
+    }
+
+    [Test] public static void Parcel_request_layouts_land_on_the_handler_guards()
+    {
+        // Each Min* is the real handler's `param_3 < N` guard, and in every case it lands exactly
+        // on the end of the last field - the same property that makes the warehouse offsets safe.
+        Hex.True(6 + ParcelDbHandlers.ListRequestSize == ParcelDbHandlers.ListRequestFrameSize,
+            "SDB_LIST_PARCEL 0x17");
+        Hex.True(6 + ParcelDbHandlers.MakeRequestSize == ParcelDbHandlers.MakeRequestFrameSize,
+            "SDB_MAKE_PARCEL 0x1a");
+        Hex.True(6 + ParcelDbHandlers.RecvRequestSize == ParcelDbHandlers.RecvRequestFrameSize,
+            "SDB_RECV_PARCEL 0x1a");
+        Hex.True(6 + ParcelDbHandlers.RecvExRequestSize == ParcelDbHandlers.RecvExRequestFrameSize,
+            "SDB_RECV_PARCEL_EX 35");
+        Hex.True(6 + ParcelDbHandlers.ReturnRequestSize == ParcelDbHandlers.ReturnRequestFrameSize,
+            "SDB_RETURN_PARCEL 0x0e");
+        Hex.True(6 + ParcelDbHandlers.DeleteRequestSize == ParcelDbHandlers.DeleteRequestFrameSize,
+            "SDB_DELETE_PARCEL 0x17");
+
+        // and the reply fixed parts match the DBS_ dumpers
+        Hex.True(6 + ParcelDbHandlers.ListReplyHeader == 35, "DBS_LIST_PARCEL 35");
+        Hex.True(6 + ParcelDbHandlers.MakeReplyHeader == 27, "DBS_MAKE_PARCEL 27");
+        Hex.True(6 + ParcelDbHandlers.RecvReplyHeader == 31, "DBS_RECV_PARCEL 31");
+        Hex.True(6 + ParcelDbHandlers.RecvExReplyHeader == 35, "DBS_RECV_PARCEL_EX 35");
+        Hex.True(6 + ParcelDbHandlers.ReturnReplySize == 11, "DBS_RETURN_PARCEL 11");
+        Hex.True(6 + ParcelDbHandlers.DeleteReplySize == 11, "DBS_DELETE_PARCEL 11");
+    }
+
+    [Test] public static void Parcel_two_ref_reply_points_each_ref_at_its_own_data()
+    {
+        var record = new byte[ParcelDbHandlers.ParcelDataNoMsgSize];
+        record[0] = 0xAA;
+        var atoms = new byte[DbProxyHandlers.ItemAtomSize];
+        atoms[0] = 0xBB;
+
+        var p = ParcelDbHandlers.BuildDbsRecvParcel(record, atoms, dlmId: 5, step: 1, ok: true);
+        uint offA = BitConverter.ToUInt32(p, ParcelDbHandlers.RecvRspParcelDataRef);
+        uint lenA = BitConverter.ToUInt32(p, ParcelDbHandlers.RecvRspParcelDataRef + 4);
+        uint offB = BitConverter.ToUInt32(p, ParcelDbHandlers.RecvRspTransListRef);
+        uint lenB = BitConverter.ToUInt32(p, ParcelDbHandlers.RecvRspTransListRef + 4);
+
+        Hex.True(offA == 6 + ParcelDbHandlers.RecvReplyHeader, "ref A starts after the fixed part");
+        Hex.True(lenA == record.Length, "ref A length");
+        Hex.True(offB == offA + lenA, "ref B starts after ref A's data");
+        Hex.True(lenB == atoms.Length, "ref B length");
+        // offsets are FRAME-relative, so payload index = offset - 6
+        Hex.True(p[offA - 6] == 0xAA, "ref A resolves to the record");
+        Hex.True(p[offB - 6] == 0xBB, "ref B resolves to the atoms");
+    }
+
+    [Test] public static void Parcel_dlm_acks_are_the_five_byte_form()
+    {
+        var ok = ParcelDbHandlers.BuildDbsDlmAck(0xDEAD, true);
+        Hex.Eq(ok, "AD DE 00 00 01", "DBS_RETURN_PARCEL / DBS_DELETE_PARCEL = [u32 DlmId][u8 ok]");
+        Hex.Eq(ParcelDbHandlers.BuildDbsDlmAck(0xDEAD, false), "AD DE 00 00 00", "and the failure form");
+    }
+
+    [Test] public static void Parcel_list_rebuilds_from_the_store()
+    {
+        using var store = T45Store();
+
+        var none = ParcelDbHandlers.BuildParcelList(store, 1, out uint n0, out uint page0);
+        Hex.True(none.Length == 0 && n0 == 0, "a fresh character's inbox is empty");
+        Hex.True(page0 == 1, "MaxPage is 1 even with nothing in it - the handler's own default");
+
+        int id1 = store.CreateParcel(2, "t2", 1, "hi", "body", 0);
+        int id2 = store.CreateParcel(2, "t2", 1, "hi2", "body2", 500);
+
+        // one parcel keeps the exact bytes World gave us; the other has none and is synthesised
+        var record = new byte[ParcelDbHandlers.ParcelDataNoMsgSize];
+        for (int i = 0; i < record.Length; i++) record[i] = (byte)(i * 31);
+        Hex.True(store.SetParcelRecord(id1, record), "record stored");
+
+        var body = ParcelDbHandlers.BuildParcelList(store, 1, out uint n, out uint page);
+        Hex.True(n == 2, $"two parcels, got {n}");
+        Hex.True(page == 1, "still one page");
+        Hex.True(body.Length == 2 * ParcelDbHandlers.ParcelDataNoMsgSize, "0x9e8 stride");
+
+        var first = new byte[ParcelDbHandlers.ParcelDataNoMsgSize];
+        Array.Copy(body, 0, first, 0, first.Length);
+        Hex.Eq(first, record, "a parcel World created is listed back byte-for-byte");
+
+        int at = ParcelDbHandlers.ParcelDataNoMsgSize;
+        Hex.True(BitConverter.ToInt32(body, at) == id2, "the synthesised record carries the parcel id");
+        Hex.True(BitConverter.ToInt32(body, at + ParcelDbHandlers.ParcelDataReceiverDbId) == 1,
+            "and the receiver at +0x50");
+
+        // and the whole reply is well-formed
+        var reply = ParcelDbHandlers.BuildDbsListParcel(9, true, 2, 1, page, n, body);
+        Hex.True(reply.Length == ParcelDbHandlers.ListReplyHeader + body.Length, "payload length");
+        Hex.True(BitConverter.ToUInt32(reply, ParcelDbHandlers.ListRspParcelCount) == 2, "count field");
+    }
+
+    [Test] public static void Parcel_ref_reader_survives_a_malformed_request()
+    {
+        // Every parcel handler answers even a malformed request, because an unanswered per-user
+        // DB item head-blocks that user for the life of the World process.
+        Hex.True(ParcelDbHandlers.Ref(Array.Empty<byte>(), 0).Length == 0, "empty payload");
+        Hex.True(ParcelDbHandlers.U32(Array.Empty<byte>(), 0) == 0, "short u32 reads 0");
+
+        var p = new byte[16];
+        BitConverter.GetBytes(6u + 16u).CopyTo(p, 0);   // offset past the end
+        BitConverter.GetBytes(999u).CopyTo(p, 4);
+        Hex.True(ParcelDbHandlers.Ref(p, 0).Length == 0, "a ref that runs off the end reads empty");
+
+        BitConverter.GetBytes(6u + 8u).CopyTo(p, 0);
+        BitConverter.GetBytes(4u).CopyTo(p, 4);
+        p[8] = 0x77;
+        Hex.True(ParcelDbHandlers.Ref(p, 0).Length == 4 && ParcelDbHandlers.Ref(p, 0)[0] == 0x77,
+            "a valid ref resolves frame-relative");
+    }
+
+    // ------------------------------------------------------------- the item tooltip
+
+    /// <summary>
+    /// The reconstruction test. S_SHOW_ITEM_TOOLTIP has no .def in tera_v100_MASTER_FINAL, so
+    /// every offset comes from the dumper FUN_1402da6b0 - and the way we know the read is right
+    /// is that the fifty fields tile 0x16..0x12F with no gap and no overlap, ending exactly on
+    /// the handler's own <c>0x12f &lt; param_2</c> guard. A single mis-read offset breaks that.
+    /// </summary>
+    [Test] public static void Tooltip_reply_fixed_part_ends_exactly_on_the_dumper_guard()
+    {
+        // (offset, width) for every field the dumper emits, in its order.
+        var fields = new (int At, int Width, string Name)[]
+        {
+            (0x16, 4, "ToolTipType"), (0x1A, 8, "ItemDbId"), (0x22, 4, "TemplateId"),
+            (0x26, 8, "Dbid"), (0x2E, 8, "OwnerDbId"), (0x36, 4, "InvenType"),
+            (0x3A, 4, "TabIndex"), (0x3E, 4, "InvenPos"), (0x42, 4, "SavedCount"),
+            (0x46, 4, "Count"), (0x4A, 4, "EnchantCount"), (0x4E, 4, "Durability"),
+            (0x52, 1, "IsBound"), (0x53, 4, "Option"), (0x57, 4, "SelectedOptionIdx"),
+            (0x5B, 4, "OpenOptionIdx"), (0x5F, 1, "HavePaperDollCompare"),
+            (0x60, 32, "EnchantScrollPassive1..8"), (0x80, 64, "EnchantScrollRemainTime1..8"),
+            (0xC0, 4, "CurrentUnidentifiedItemGrade"), (0xC4, 1, "Masterpiece"),
+            (0xC5, 4, "CurrentSlotItemLevel"), (0xC9, 4, "ExteriorItemTemplateId"),
+            (0xCD, 4, "ColoringValue"), (0xD1, 4, "LeftColoringSecond"),
+            (0xD5, 8, "ColoringStartTime"), (0xDD, 8, "ColoringEndTime"),
+            (0xE5, 8, "OpenDateTime"), (0xED, 8, "RemainPeriodInSec"),
+            (0xF5, 4, "EquipmentSetId"), (0xF9, 4, "CompareEquipmentSetId"),
+            (0xFD, 4, "EnchantAdjustment"), (0x101, 4, "EnchantBoosterPoint"),
+            (0x105, 4, "EnchantBoosterMaxGrade"), (0x109, 8, "TradeBrokerMinPrice"),
+            (0x111, 4, "CumulatedEnchantAmount"), (0x115, 8, "DecompositionCost"),
+            (0x11D, 8, "EquipmentExp"), (0x125, 1, "Awakened"), (0x126, 4, "UnbindCount"),
+            (0x12A, 4, "BindItemTemplateId"), (0x12E, 1, "PromotionItem"), (0x12F, 1, "Damaged"),
+        };
+
+        int cursor = 0x16;
+        foreach (var (at, width, name) in fields)
+        {
+            Hex.True(at == cursor,
+                $"{name} sits at 0x{at:X} but the previous field ends at 0x{cursor:X} - "
+                + "the dumper offsets must tile with no gaps");
+            cursor = at + width;
+        }
+        Hex.True(cursor == ArbiterClientHandlers.TooltipFixedSize,
+            $"the last field ends at 0x{cursor:X}, want 0x{ArbiterClientHandlers.TooltipFixedSize:X}");
+
+        // the ref block: four arrays (two slots each) plus one string, ending where the first
+        // scalar begins
+        Hex.True(0x04 + 4 * 4 + 2 == 0x16, "9 ref slots fill 0x04..0x15");
+        Hex.True(ArbiterClientHandlers.TtItemBoundOwner == 0x14, "the string ref is the last slot");
+    }
+
+    [Test] public static void Tooltip_request_layout_matches_the_dumper()
+    {
+        Hex.True(ArbiterClientHandlers.TooltipRequestPacketSize == 0x26,
+            "C_SHOW_ITEM_TOOLTIP_EX fixed part 0x26 (guard `0x25 < param_2`)");
+
+        // [0x04] ref name [0x06] i32 type [0x0A] i64 itemDbId [0x12] i64 contentId
+        // [0x1A] i32 compareTpl [0x1E] i32 planetId [0x22] i32 ownerDbId
+        const string owner = "Tester";
+        var body = new byte[ArbiterClientHandlers.TooltipRequestBodySize + (owner.Length + 1) * 2];
+        BitConverter.GetBytes((ushort)ArbiterClientHandlers.TooltipRequestPacketSize).CopyTo(body, 0);
+        BitConverter.GetBytes(3).CopyTo(body, 2);
+        BitConverter.GetBytes(1042L).CopyTo(body, 6);
+        BitConverter.GetBytes(77L).CopyTo(body, 14);
+        BitConverter.GetBytes(6550).CopyTo(body, 22);
+        BitConverter.GetBytes(1).CopyTo(body, 26);
+        BitConverter.GetBytes(9).CopyTo(body, 30);
+        System.Text.Encoding.Unicode.GetBytes(owner).CopyTo(body, ArbiterClientHandlers.TooltipRequestBodySize);
+
+        var req = ArbiterClientHandlers.ParseTooltipRequest(body);
+        Hex.True(req != null, "parsed");
+        Hex.True(req!.Value.ToolTipType == 3, "ToolTipType");
+        Hex.True(req.Value.ItemDbId == 1042, "ItemDbId - the field only the Arbiter can resolve");
+        Hex.True(req.Value.ContentId == 77, "ContentId");
+        Hex.True(req.Value.CompareTemplateId == 6550, "CompareTemplateId");
+        Hex.True(req.Value.ItemOwnerPlanetId == 1, "ItemOwnerPlanetId");
+        Hex.True(req.Value.ItemOwnerDbId == 9, "ItemOwnerDbId");
+        Hex.True(req.Value.ItemOwnerName == owner, $"ItemOwnerName, got '{req.Value.ItemOwnerName}'");
+
+        Hex.True(ArbiterClientHandlers.ParseTooltipRequest(new byte[4]) == null, "a short body is null");
+
+        // the two lengths seen live are 54 and 62 TOTAL, i.e. a 7- and an 11-character name
+        foreach (int total in new[] { 54, 62 })
+        {
+            int nameBytes = total - ArbiterClientHandlers.TooltipRequestPacketSize;
+            Hex.True(nameBytes > 0 && nameBytes % 2 == 0,
+                $"live length {total} leaves {nameBytes} name bytes");
+        }
+    }
+
+    [Test] public static void Tooltip_reply_carries_the_stack_count_from_the_row()
+    {
+        var row = new TeraSharp.Arbiter.Persistence.CharacterStore.ItemRow(
+            ItemDbId: 1042, OwnerDbId: 1, InvenType: 0, Slot: 3,
+            TemplateId: 6550, Amount: 19, Record: null);
+
+        var p = ArbiterClientHandlers.BuildShowItemTooltip(toolTipType: 0, row);
+        Hex.True(BitConverter.ToUInt16(p, 0) == p.Length, "length field");
+        Hex.True(BitConverter.ToUInt16(p, 2) == ArbiterClientHandlers.S_SHOW_ITEM_TOOLTIP, "opcode");
+        Hex.True(p.Length == ArbiterClientHandlers.TooltipFixedSize + 2,
+            "an empty bound-owner is just the terminator");
+
+        Hex.True(BitConverter.ToInt64(p, ArbiterClientHandlers.TtItemDbId) == 1042, "ItemDbId");
+        Hex.True(BitConverter.ToInt32(p, ArbiterClientHandlers.TtTemplateId) == 6550, "TemplateId");
+        Hex.True(BitConverter.ToInt64(p, ArbiterClientHandlers.TtOwnerDbId) == 1, "OwnerDbId");
+        Hex.True(BitConverter.ToInt32(p, ArbiterClientHandlers.TtInvenType) == 0, "InvenType");
+        Hex.True(BitConverter.ToInt32(p, ArbiterClientHandlers.TtInvenPos) == 3, "InvenPos");
+        Hex.True(BitConverter.ToInt32(p, ArbiterClientHandlers.TtCount) == 19,
+            "Count - the stack size the client was never told about");
+        Hex.True(BitConverter.ToInt32(p, ArbiterClientHandlers.TtSavedCount) == 19, "SavedCount");
+
+        // the four arrays are empty and the string ref points past the fixed part
+        foreach (int at in new[]
+        {
+            ArbiterClientHandlers.TtCustomizingCount, ArbiterClientHandlers.TtCustomizingOffset,
+            ArbiterClientHandlers.TtOptionSetCount, ArbiterClientHandlers.TtOptionSetOffset,
+            ArbiterClientHandlers.TtCombinePassiveCount, ArbiterClientHandlers.TtCombinePassiveOffset,
+            ArbiterClientHandlers.TtCompareStatCount, ArbiterClientHandlers.TtCompareStatOffset,
+        })
+            Hex.True(BitConverter.ToUInt16(p, at) == 0, $"array slot 0x{at:X2} is empty");
+        Hex.True(BitConverter.ToUInt16(p, ArbiterClientHandlers.TtItemBoundOwner)
+                 == ArbiterClientHandlers.TooltipFixedSize, "ItemBoundOwner ref");
+
+        var named = ArbiterClientHandlers.BuildShowItemTooltip(0, row, "t1");
+        Hex.True(named.Length == ArbiterClientHandlers.TooltipFixedSize + 6, "\"t1\" + NUL = 6 bytes");
+        Hex.True(named[ArbiterClientHandlers.TooltipFixedSize] == (byte)'t', "the string lands at the ref");
+    }
+
+    // ------------------------------------------------------ visited sections / relog
+
+    [Test] public static void Visited_sections_record_only_the_first_visit()
+    {
+        using var store = T45Store();
+        Hex.True(store.AddVisitedSection(1, 7005, 1, 3), "the first visit is new");
+        Hex.True(!store.AddVisitedSection(1, 7005, 1, 3), "the second is not");
+        Hex.True(store.AddVisitedSection(1, 7005, 1, 4), "a different section is new");
+        Hex.True(store.AddVisitedSection(2, 7005, 1, 3), "a different character is new");
+
+        Hex.True(store.HasVisitedSection(1, 7005, 1, 3), "recorded");
+        Hex.True(!store.HasVisitedSection(1, 7005, 2, 3), "a different guard was not");
+
+        var rows = store.GetVisitedSections(1);
+        Hex.True(rows.Count == 2, $"two sections for character 1, got {rows.Count}");
+        Hex.True(rows[0].SectionId == 3 && rows[1].SectionId == 4, "insertion order");
+    }
+
+    /// <summary>
+    /// The relog half of T45. HandlerRegistry already sends AS_UPDATE_VISITED_SECTION_LIST on
+    /// every C_LOAD_TOPO_FIN with a hard-coded EMPTY list, so after a relog World is told the
+    /// character has explored nothing. This pins the frame both ways: the empty form is
+    /// byte-identical to the one already being sent (so nothing regresses), and the populated
+    /// form is the same header with a 12-byte stride.
+    /// </summary>
+    [Test] public static void Visited_section_push_matches_the_hard_coded_empty_frame()
+    {
+        var empty = ArbiterClientHandlers.BuildUpdateVisitedSectionList(
+            1, Array.Empty<TeraSharp.Arbiter.Persistence.CharacterStore.VisitedSection>());
+        Hex.Eq(empty, "12 00 00 00  00 00 00 00  01 00 00 00",
+            "the empty push is exactly what HandlerRegistry hard-codes today");
+
+        var rows = new List<TeraSharp.Arbiter.Persistence.CharacterStore.VisitedSection>
+        {
+            new(7005, 1, 3), new(7005, 1, 4),
+        };
+        var full = ArbiterClientHandlers.BuildUpdateVisitedSectionList(1, rows);
+        Hex.True(BitConverter.ToUInt32(full, 0) == 18,
+            "the entries offset is frame-relative: 6 header + 12 fixed");
+        Hex.True(BitConverter.ToUInt32(full, 4) == 24, "two entries x 12 bytes");
+        Hex.True(BitConverter.ToUInt32(full, 8) == 1, "playerId");
+        Hex.True(full.Length == 12 + 24, "payload length");
+        Hex.True(BitConverter.ToInt32(full, 12) == 7005 && BitConverter.ToInt32(full, 20) == 3,
+            "first entry is (map, guard, section)");
+    }
+
+    [Test] public static void Visit_new_section_reply_is_the_shipped_def()
+    {
+        var p = ArbiterClientHandlers.BuildVisitNewSection(true, 7005, 1, 3);
+        Hex.Eq(p, "11 00 23 5A  01  7D 1B 00 00  01 00 00 00  03 00 00 00",
+            "S_VISIT_NEW_SECTION: [bool isFirstVisit][u32 mapId][u32 guardId][u32 sectionId]");
+        Hex.True(ArbiterClientHandlers.BuildVisitNewSection(false, 0, 0, 0)[4] == 0,
+            "isFirstVisit is false on a revisit");
+        Hex.True(ArbiterClientHandlers.MaxGuardId == 0x40,
+            "Handler_C_VISIT_NEW_SECTION rejects guardId >= 0x40 (`if (uVar4 < 0x40)`)");
+        Hex.True(ArbiterClientHandlers.VisitPacketSize == 0x10, "guard 0x10 = 3 x u32 + header");
+    }
+
+    // ----------------------------------------------------------------- the rest
+
+    [Test] public static void Client_log_extracts_the_readable_text()
+    {
+        var body = new List<byte>();
+        body.AddRange(new byte[] { 0x01, 0x00, 0x02, 0x00 });                 // junk
+        body.AddRange(System.Text.Encoding.Unicode.GetBytes("ItemTooltip"));
+        body.AddRange(new byte[] { 0x00, 0x00 });
+        body.AddRange(System.Text.Encoding.Unicode.GetBytes("failed"));
+
+        string text = ArbiterClientHandlers.ExtractWideRuns(body.ToArray());
+        Hex.True(text.Contains("ItemTooltip", StringComparison.Ordinal), $"got '{text}'");
+        Hex.True(text.Contains("failed", StringComparison.Ordinal), $"got '{text}'");
+        Hex.True(ArbiterClientHandlers.ExtractWideRuns(new byte[] { 1, 0, 2, 0 }).Length == 0,
+            "runs shorter than the minimum are dropped");
+    }
+
+    [Test] public static void Small_acks_are_the_sizes_the_defs_say()
+    {
+        Hex.Eq(ArbiterClientHandlers.BuildServerTime(0x1122334455667788L),
+            "0C 00 CA 58  88 77 66 55 44 33 22 11",
+            "S_SERVER_TIME (0x58CA) = the 4-byte header and one i64, as S_SERVER_TIME.1.def says");
+        Hex.Eq(ArbiterClientHandlers.BuildSaveUiSettingAck(true), "05 00 51 F7 01",
+            "S_SAVE_CLIENT_UI_SETTING (0xF751) = one byte `result`");
+        Hex.Eq(ArbiterClientHandlers.BuildTradeBrokerHighestItemLevel(0f), "08 00 53 7E 00 00 00 00",
+            "S_TRADE_BROKER_HIGHEST_ITEM_LEVEL (0x7E53) = one f32");
+    }
+
+    [Test] public static void Arbiter_owned_set_covers_every_opcode_world_rejected()
+    {
+        // The eighteen decimal opcodes the live World console printed.
+        var observed = new ushort[]
+        {
+            30152, 43407, 61398, 23377, 28262, 64109, 33506, 57252, 46956,
+            39349, 60155, 27265, 54263, 60477, 33239, 34411, 53135, 22631,
+        };
+        Hex.True(ArbiterClientHandlers.ArbiterOwned.Count == observed.Length,
+            $"{ArbiterClientHandlers.ArbiterOwned.Count} in the set, {observed.Length} observed");
+        foreach (ushort op in observed)
+            Hex.True(ArbiterClientHandlers.ArbiterOwned.Contains(op),
+                $"0x{op:X4} ({op}) is missing from ArbiterOwned");
+
+        // and none of them is a World opcode by accident
+        Hex.True(!ArbiterClientHandlers.ArbiterOwned.Contains((ushort)0x13F7),
+            "SA_BYPASS_TO_CLIENT is not ours");
+    }
+
+    // ------------------------------------------------------- the social seed
+
+    [Test] public static void Login_language_is_recorded_per_account_and_defaults_to_eur()
+    {
+        TeraSharp.Arbiter.Auth.LoginLanguage.Clear();
+        Hex.True(TeraSharp.Arbiter.Auth.LoginLanguage.For("nobody")
+                 == TeraSharp.Arbiter.Auth.LoginLanguage.Eur, "unseen accounts default to EUR");
+        Hex.True(TeraSharp.Arbiter.Auth.LoginLanguage.For(null)
+                 == TeraSharp.Arbiter.Auth.LoginLanguage.Eur, "so does a null name");
+
+        TeraSharp.Arbiter.Auth.LoginLanguage.Record("1", TeraSharp.Arbiter.Auth.LoginLanguage.Twn);
+        Hex.True(TeraSharp.Arbiter.Auth.LoginLanguage.For("1")
+                 == TeraSharp.Arbiter.Auth.LoginLanguage.Twn, "recorded");
+        Hex.True(TeraSharp.Arbiter.Auth.LoginLanguage.For("2")
+                 == TeraSharp.Arbiter.Auth.LoginLanguage.Eur, "and only for that account");
+        TeraSharp.Arbiter.Auth.LoginLanguage.Clear();
+    }
+
+    /// <summary>
+    /// Until T45 every character on this server was seeded with the Chinese friend-group name and
+    /// greeting from cap_newchar_client.log, because they were hard-coded from that capture. The
+    /// capture's own login carried language 6 (EUR) - the strings came from the TW server's
+    /// string sheet, not from the packet - so the field is only a proxy, and the table defaults
+    /// to English.
+    /// </summary>
+    [Test] public static void Social_seed_is_english_by_default_and_chinese_only_for_tw()
+    {
+        Hex.True(SocialHandlers.SampleGroupNameFor(TeraSharp.Arbiter.Auth.LoginLanguage.Eur) == "Friends",
+            "EUR gets Friends");
+        Hex.True(SocialHandlers.DefaultProfileMessageFor(TeraSharp.Arbiter.Auth.LoginLanguage.Eur) == "",
+            "EUR gets no greeting at all");
+        Hex.True(SocialHandlers.SampleGroupNameFor(TeraSharp.Arbiter.Auth.LoginLanguage.Usa) == "Friends",
+            "so does every other unlisted language");
+
+        Hex.True(SocialHandlers.SampleGroupNameFor(TeraSharp.Arbiter.Auth.LoginLanguage.Twn)
+                 == SocialHandlers.SampleGroupNameTw, "TW still gets the captured name");
+        Hex.True(SocialHandlers.DefaultProfileMessageFor(TeraSharp.Arbiter.Auth.LoginLanguage.Twn)
+                 == SocialHandlers.DefaultProfileMessageTw, "and the captured greeting");
+
+        // the captured bytes, so the TW strings cannot drift
+        Hex.Eq(System.Text.Encoding.Unicode.GetBytes(SocialHandlers.SampleGroupNameTw),
+            "7D 59 CB 53", "cap_newchar_client.log frame 305");
+
+        using var store = T45Store();
+        SocialHandlers.ProvideSampleGroup(store, 1, TeraSharp.Arbiter.Auth.LoginLanguage.Eur);
+        var groups = store.GetFriendGroups(1);
+        Hex.True(groups.Count == 1 && groups[0].Name == "Friends", "seeded in English");
+        Hex.True(store.GetProfileMessage(1) == "", "and with no greeting");
+
+        SocialHandlers.ProvideSampleGroup(store, 2, TeraSharp.Arbiter.Auth.LoginLanguage.Twn);
+        var tw = store.GetFriendGroups(2);
+        Hex.True(tw.Count == 1 && tw[0].Name == SocialHandlers.SampleGroupNameTw, "seeded in Chinese");
+        Hex.True(store.GetProfileMessage(2) == SocialHandlers.DefaultProfileMessageTw, "with the greeting");
+
+        // once only, whatever the language
+        SocialHandlers.ProvideSampleGroup(store, 1, TeraSharp.Arbiter.Auth.LoginLanguage.Twn);
+        Hex.True(store.GetFriendGroups(1)[0].Name == "Friends",
+            "the seed is once per character - dbo.spIsProvideSampleFriendGroup");
+    }
 }

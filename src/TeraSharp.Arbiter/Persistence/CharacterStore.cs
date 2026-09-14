@@ -960,6 +960,20 @@ CREATE TABLE IF NOT EXISTS parcel_items (
   amount      INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (parcel_id, slot)
 );
+
+-- T45: the exploration record. C_VISIT_NEW_SECTION carries (mapId, guardId, sectionId) and the
+-- Arbiter answers S_VISIT_NEW_SECTION with isFirstVisit; it also pushes the whole list to World
+-- as AS_UPDATE_VISITED_SECTION_LIST on every C_LOAD_TOPO_FIN, which is what exploration quests
+-- and the teleport-scroll list read. Before T45 that push carried an empty list on every relog.
+CREATE TABLE IF NOT EXISTS visited_sections (
+  character_id INTEGER NOT NULL,
+  map_id       INTEGER NOT NULL,
+  guard_id     INTEGER NOT NULL,
+  section_id   INTEGER NOT NULL,
+  visited_at   TEXT    NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (character_id, map_id, guard_id, section_id)
+);
+CREATE INDEX IF NOT EXISTS ix_visited_character ON visited_sections(character_id);
 ");
         // CREATE TABLE IF NOT EXISTS does nothing to a DB that already has `characters`, so
         // columns added later need their own idempotent step. terasharp.db predates `exp`.
@@ -982,6 +996,9 @@ CREATE TABLE IF NOT EXISTS parcel_items (
         AddColumnIfMissing("accounts", "admin_level", "INTEGER NOT NULL DEFAULT 0");
         // T39: when this character last left a guild (User+0x3c48), for Guild::CanRejoinGuild.
         AddColumnIfMissing("characters", "guild_leave_time", "INTEGER NOT NULL DEFAULT 0");
+        // T45: the exact ParcelData bytes World gave us in SDB_MAKE_PARCEL, so DBS_LIST_PARCEL
+        // can list a parcel back byte-exactly (the 0x9e8 interior is not pinned by any capture).
+        AddColumnIfMissing("parcels", "record", "BLOB");
     }
 
     /// <summary>ALTER TABLE ADD COLUMN, but a no-op when the column is already there.</summary>
@@ -3698,6 +3715,127 @@ DELETE FROM guild_members     WHERE user_db_id = $id;";
             cmd.CommandText = "SELECT COUNT(*) FROM parcel_items WHERE parcel_id=$p";
             cmd.Parameters.AddWithValue("$p", parcelId);
             return Convert.ToInt32(cmd.ExecuteScalar()!);
+        }
+    }
+
+
+    // =========================================================== T45: parcels, the World half
+
+    /// <summary>
+    /// The exact <c>ParcelData</c> bytes World handed us in <c>SDB_MAKE_PARCEL</c>, or null.
+    ///
+    /// <para>Kept for the same reason <c>items.record</c> is kept (INVENTORY-DESIGN.md section 7):
+    /// the 2536-byte <c>ParcelDataNoMsg</c> interior is not pinned by any capture or dumper, so
+    /// the only way <c>DBS_LIST_PARCEL</c> can list a parcel back byte-exactly is to replay the
+    /// record World itself produced. A parcel with no stored record is listed from the
+    /// synthesised form in <see cref="World.ParcelDbHandlers.BuildParcelDataNoMsg"/>.</para>
+    /// </summary>
+    public byte[]? GetParcelRecord(int parcelId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT record FROM parcels WHERE parcel_id=$id";
+            cmd.Parameters.AddWithValue("$id", parcelId);
+            using var r = cmd.ExecuteReader();
+            if (!r.Read() || r.IsDBNull(0)) return null;
+            return (byte[])r.GetValue(0);
+        }
+    }
+
+    /// <summary>Store the ParcelData bytes for a parcel. A null or empty record clears it.</summary>
+    public bool SetParcelRecord(int parcelId, byte[]? record)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE parcels SET record = $b WHERE parcel_id=$id";
+            cmd.Parameters.AddWithValue("$id", parcelId);
+            if (record is null || record.Length == 0) cmd.Parameters.AddWithValue("$b", DBNull.Value);
+            else cmd.Parameters.AddWithValue("$b", record);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    /// <summary>
+    /// <c>ParcelManager::ReturnParcel</c>: the parcel goes back to whoever sent it. Sender and
+    /// receiver swap, and the read/claimed flags reset so it shows up as new mail. False when
+    /// the parcel does not exist or is not this character's.
+    /// </summary>
+    public bool ReturnParcel(int parcelId, int receiverDbId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "UPDATE parcels SET receiver_db_id = sender_db_id, sender_db_id = $r, " +
+                "is_read = 0, is_recved = 0 WHERE parcel_id=$id AND receiver_db_id=$r";
+            cmd.Parameters.AddWithValue("$id", parcelId);
+            cmd.Parameters.AddWithValue("$r", receiverDbId);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    // ================================================= T45: visited sections (exploration)
+
+    /// <summary>
+    /// One entry of the visited-section list. <c>C_VISIT_NEW_SECTION</c> carries
+    /// <c>(mapId, guardId, sectionId)</c> and <c>User::CanVisitNewSection</c> rejects a
+    /// guardId of 0x40 or more, so the trio is small and fixed.
+    /// </summary>
+    public sealed record VisitedSection(int MapId, int GuardId, int SectionId);
+
+    /// <summary>
+    /// Record a visit. Returns true the FIRST time this character sees this section - which is
+    /// exactly what <c>S_VISIT_NEW_SECTION.isFirstVisit</c> carries and what the exploration
+    /// quests key on.
+    /// </summary>
+    public bool AddVisitedSection(int characterId, int mapId, int guardId, int sectionId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "INSERT INTO visited_sections(character_id, map_id, guard_id, section_id) " +
+                "VALUES($c,$m,$g,$s) ON CONFLICT(character_id, map_id, guard_id, section_id) DO NOTHING";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            cmd.Parameters.AddWithValue("$m", mapId);
+            cmd.Parameters.AddWithValue("$g", guardId);
+            cmd.Parameters.AddWithValue("$s", sectionId);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    /// <summary>Every section this character has visited, in insertion order.</summary>
+    public IReadOnlyList<VisitedSection> GetVisitedSections(int characterId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "SELECT map_id, guard_id, section_id FROM visited_sections " +
+                "WHERE character_id=$c ORDER BY rowid";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            var rows = new List<VisitedSection>();
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) rows.Add(new VisitedSection(r.GetInt32(0), r.GetInt32(1), r.GetInt32(2)));
+            return rows;
+        }
+    }
+
+    public bool HasVisitedSection(int characterId, int mapId, int guardId, int sectionId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "SELECT COUNT(*) FROM visited_sections " +
+                "WHERE character_id=$c AND map_id=$m AND guard_id=$g AND section_id=$s";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            cmd.Parameters.AddWithValue("$m", mapId);
+            cmd.Parameters.AddWithValue("$g", guardId);
+            cmd.Parameters.AddWithValue("$s", sectionId);
+            return Convert.ToInt64(cmd.ExecuteScalar()!) > 0;
         }
     }
 

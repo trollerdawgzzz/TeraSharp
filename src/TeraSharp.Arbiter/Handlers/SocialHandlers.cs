@@ -45,12 +45,47 @@ public sealed class SocialHandlers
     public const int UngroupedGroupId = 1;
     /// <summary>The group User::ProvideSampleFriendGroup seeds once per character.</summary>
     public const int SampleGroupIndex = 2;
-    /// <summary>StrFriendDataSheet id 100 - the seeded group name. Captured bytes:
-    /// 7D 59 CB 53 in cap_newchar_client.log frame 305.</summary>
-    public const string SampleGroupName = "好友";
-    /// <summary>StrFriendDataSheet id 200 - the default profile message a new character gets.
+    /// <summary>StrFriendDataSheet id 100 as the TW server had it - the seeded group name.
+    /// Captured bytes: 7D 59 CB 53 in cap_newchar_client.log frame 305.</summary>
+    public const string SampleGroupNameTw = "好友";
+    /// <summary>StrFriendDataSheet id 200 as the TW server had it - the default profile message.
     /// Captured bytes: CA 4E 29 59 ... in frame 306.</summary>
-    public const string DefaultProfileMessage = "今天也是愉快的一天!";
+    public const string DefaultProfileMessageTw = "今天也是愉快的一天!";
+    /// <summary>The same two for every other language. T45: the capture's strings were being
+    /// seeded onto every character on a European server.</summary>
+    public const string SampleGroupNameEn = "Friends";
+
+    /// <summary>Back-compat for callers that predate the per-language table (T45). Resolves
+    /// through <see cref="SampleGroupNameFor"/> with the default language.</summary>
+    public static string SampleGroupName => SampleGroupNameFor(Auth.LoginLanguage.Default);
+    /// <summary>Back-compat, as above.</summary>
+    public static string DefaultProfileMessage => DefaultProfileMessageFor(Auth.LoginLanguage.Default);
+
+    /// <summary>
+    /// The seeded friend-group name, by client language — T45.
+    ///
+    /// <para>The Chinese strings below are what <c>cap_newchar_client.log</c> frames 305/306
+    /// contain, and until T45 every character on this server got them regardless of language,
+    /// because they were hard-coded from that capture. They are <c>StrFriendDataSheet</c> ids 100
+    /// and 200, which the real Arbiter reads from its own installed string sheet; the capture came
+    /// off a Taiwanese server while its client reported <c>language = 6</c> (EUR), so the packet
+    /// field never distinguished them. We have no string sheet, so this table keys off the field
+    /// and everything unlisted gets English. status/CLIENT-REJECTS.md section 8.</para>
+    /// </summary>
+    public static string SampleGroupNameFor(uint language) => language switch
+    {
+        Auth.LoginLanguage.Twn => SampleGroupNameTw,
+        _ => SampleGroupNameEn,
+    };
+
+    /// <summary>The default profile message, by client language. Empty everywhere but TW: a
+    /// greeting nobody wrote is worse than no greeting.</summary>
+    public static string DefaultProfileMessageFor(uint language) => language switch
+    {
+        Auth.LoginLanguage.Twn => DefaultProfileMessageTw,
+        _ => "",
+    };
+
 
     // System-message ids. The format is proven by the capture: @id then \v-separated
     // parameter/value pairs (cap_newchar_client.log frame 692: @2977\vquestTemplateId\v59901).
@@ -185,6 +220,8 @@ public sealed class SocialHandlers
         var chr = s.SelectedCharacter;
         if (chr == null) return;
         var store = Program.Store;
+        // T45: the seeded strings follow the client's language instead of the TW capture's.
+        uint language = Auth.LoginLanguage.For(s.Account?.Name);
 
         if (store == null)
         {
@@ -193,12 +230,12 @@ public sealed class SocialHandlers
                 ["groups"] = new List<object>
                 {
                     new Dictionary<string, object>
-                        { ["index"] = SampleGroupIndex, ["name"] = SampleGroupName },
+                        { ["index"] = SampleGroupIndex, ["name"] = SampleGroupNameFor(language) },
                 },
             });
             return;
         }
-        ProvideSampleGroup(store, (int)chr.Id);
+        ProvideSampleGroup(store, (int)chr.Id, language);
         s.SendByDef("S_FRIEND_GROUP_LIST", BuildFriendGroupListFields(store, (int)chr.Id));
     }
 
@@ -302,11 +339,18 @@ public sealed class SocialHandlers
     /// character in EnterWorldEnd and guards with dbo.spIsProvideSampleFriendGroup.
     /// </summary>
     public static void ProvideSampleGroup(CharacterStore store, int characterId)
+        => ProvideSampleGroup(store, characterId, Auth.LoginLanguage.Default);
+
+    /// <inheritdoc cref="ProvideSampleGroup(CharacterStore, int)"/>
+    /// <param name="language">The client language from C_LOGIN_ARBITER; picks the strings.</param>
+    public static void ProvideSampleGroup(CharacterStore store, int characterId, uint language)
     {
+        ArgumentNullException.ThrowIfNull(store);
         if (!store.TryProvideSampleFriendGroup(characterId)) return;
-        store.UpsertFriendGroup(characterId, SampleGroupIndex, SampleGroupName);
-        if (string.IsNullOrEmpty(store.GetProfileMessage(characterId)))
-            store.SetProfileMessage(characterId, DefaultProfileMessage);
+        store.UpsertFriendGroup(characterId, SampleGroupIndex, SampleGroupNameFor(language));
+        string greeting = DefaultProfileMessageFor(language);
+        if (greeting.Length > 0 && string.IsNullOrEmpty(store.GetProfileMessage(characterId)))
+            store.SetProfileMessage(characterId, greeting);
     }
 
     /// <summary>

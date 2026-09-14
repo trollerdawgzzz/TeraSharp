@@ -788,6 +788,27 @@ public sealed class DbProxyHandlers
     public const ushort DBS_INCREASE_INVENTORY_SIZE = 0x283E;
     public const ushort DBS_INCREASE_WAREHOUSE_SIZE_UNUSED = 0x2840;
 
+    // ===================== T45: parcels (status/MAIL-WAREHOUSE.md section 3) =====================
+    // The six W<->A pairs T42 left unimplemented. Layouts and reply builders are in
+    // World/ParcelDbHandlers.cs; only the opcodes live here, because
+    // Dispatch_switch_and_the_allow_list_agree resolves `case NAME:` by reflecting over this class.
+    //
+    // NO CAPTURE CONTAINS A PARCEL FRAME either - arb_world.log and cap_newchar.log were parsed
+    // frame by frame for all twelve opcodes and neither has one. So before T45 nothing answered
+    // SDB_LIST_PARCEL: not a handler, and not the replay table, which can only replay what it
+    // captured. Opening the mailbox left World's per-user DLM queue holding an item that never
+    // completes (status/HANDOFF.md section 1) and the client drew its own empty 12-row grid.
+    //
+    // SDB_RECV_PARCEL_EX shares the RECV path in the original (both reach the same
+    // ParcelManager::RecvParcel), but the two replies have different layouts and different
+    // opcodes, so they get separate cases here.
+    public const ushort SDB_LIST_PARCEL = 0x2777;      public const ushort DBS_LIST_PARCEL = 0x2778;
+    public const ushort SDB_MAKE_PARCEL = 0x2779;      public const ushort DBS_MAKE_PARCEL = 0x277A;
+    public const ushort SDB_RECV_PARCEL = 0x277B;      public const ushort DBS_RECV_PARCEL = 0x277C;
+    public const ushort SDB_RECV_PARCEL_EX = 0x277D;   public const ushort DBS_RECV_PARCEL_EX = 0x277E;
+    public const ushort SDB_RETURN_PARCEL = 0x2781;    public const ushort DBS_RETURN_PARCEL = 0x2782;
+    public const ushort SDB_DELETE_PARCEL = 0x2811;    public const ushort DBS_DELETE_PARCEL = 0x2812;
+
     // --- SDB_ADD_TUTORIAL_SIMPLE_TIP (0x286E) -> DBS_ADD_TUTORIAL_SIMPLE_TIP (0x286F) ---
     // cap_newchar.log seq 719/765/864/911, 18 B -> 11 B each.
     // Handler_SDB_ADD_TUTORIAL_SIMPLE_TIP (Arb_part_063.c:36) needs frame >= 0x12 and reads
@@ -1005,6 +1026,15 @@ public sealed class DbProxyHandlers
             case SDB_CLEAR_WAREHOUSE:             // 0x27E1 = [reqId][ok]
             case SDB_WAREHOUSE_AUTO_SORT:         // 0x27E3, the request's fields echoed back
             case SDB_INCREASE_WAREHOUSE_SIZE:     // -> 0x283E, NOT 0x2840 (trap 1 above)
+
+            // --- T45: the mailbox. Six live requests; before T45 none of them was answered at
+            // all, and no capture has one either, so the replay table could not cover for us.
+            case SDB_LIST_PARCEL:                 // 0x2778, the empty form is byte-exact
+            case SDB_MAKE_PARCEL:                 // 0x277a, atoms echoed with allocated ids
+            case SDB_RECV_PARCEL:                 // 0x277c, atoms applied then echoed
+            case SDB_RECV_PARCEL_EX:              // 0x277e, "receive all"
+            case SDB_RETURN_PARCEL:               // 0x2782 = [DlmId][ok]
+            case SDB_DELETE_PARCEL:               // 0x2812 = [DlmId][ok]
                 return true;
             default:
                 return false;        // -> replay table
@@ -1064,6 +1094,14 @@ public sealed class DbProxyHandlers
             case SDB_WAREHOUSE_AUTO_SORT:     return OnWarehouseAutoSort(link, payload);
             case SDB_PAY_WAREHOUSE_COMMISION: return OnPayWarehouseCommision(link, payload);
             case SDB_INCREASE_WAREHOUSE_SIZE: return OnIncreaseWarehouseSize(link, payload);
+
+            // --- T45: parcels ---
+            case SDB_LIST_PARCEL:             return OnListParcel(link, payload);
+            case SDB_MAKE_PARCEL:             return OnMakeParcel(link, payload);
+            case SDB_RECV_PARCEL:             return OnRecvParcel(link, payload);
+            case SDB_RECV_PARCEL_EX:          return OnRecvParcelEx(link, payload);
+            case SDB_RETURN_PARCEL:           return OnReturnParcel(link, payload);
+            case SDB_DELETE_PARCEL:           return OnDeleteParcel(link, payload);
 
             // --- Post-spawn (reqId at payload[0] for all three) ---
             case SDB_END_START_QUEST_LIST: link.SendFrame(DBS_END_START_QUEST_LIST, BuildReqIdAck(payload, 0)); return true;
@@ -3945,5 +3983,201 @@ public sealed class DbProxyHandlers
         BitConverter.GetBytes(reqId).CopyTo(r, 0);
         r[4] = (byte)(ok ? 1 : 0);
         return r;
+    }
+
+    // ================================ T45: the mailbox ================================
+    // status/MAIL-WAREHOUSE.md section 3 and status/CLIENT-REJECTS.md section 6. Layouts and
+    // builders are in World/ParcelDbHandlers.cs; these are the thin wrappers that read the live
+    // DlmId out of the request, touch the store and send.
+    //
+    // Every one of them answers unconditionally, even on a malformed request - an unanswered
+    // per-user DB item head-blocks that user's whole queue for the life of the World process,
+    // and a mailbox that shows nothing is a much smaller problem than a character that can
+    // never log out again. Same rule the warehouse handlers follow.
+
+    /// <summary>
+    /// SDB_LIST_PARCEL (0x2777) -> DBS_LIST_PARCEL (0x2778). The whole point of T45's mail half:
+    /// a fresh character gets <c>ParcelCount = 0</c>, <c>MaxPage = 1</c> and an empty list, which
+    /// is byte-for-byte what the real Arbiter sends (see
+    /// <see cref="ParcelDbHandlers.BuildDbsListParcel"/> for why that is knowable without a
+    /// capture).
+    /// </summary>
+    private bool OnListParcel(WorldLink link, byte[] payload)
+    {
+        uint dlmId = ParcelDbHandlers.U32(payload, ParcelDbHandlers.ListReqDlmId);
+        uint userDbId = ParcelDbHandlers.U32(payload, ParcelDbHandlers.ListReqUserDbId);
+        uint viewType = ParcelDbHandlers.U32(payload, ParcelDbHandlers.ListReqViewType);
+        uint curPage = ParcelDbHandlers.U32(payload, ParcelDbHandlers.ListReqCurPage);
+
+        if (payload.Length < ParcelDbHandlers.ListRequestSize || _store is null)
+        {
+            _log.LogWarning("SDB_LIST_PARCEL: {Len} B payload (want {Want}) or no store - empty inbox",
+                payload.Length, ParcelDbHandlers.ListRequestSize);
+            link.SendFrame(DBS_LIST_PARCEL,
+                ParcelDbHandlers.BuildEmptyDbsListParcel(dlmId, viewType, curPage));
+            return true;
+        }
+
+        var body = ParcelDbHandlers.BuildParcelList(_store, (int)userDbId, out uint count, out uint maxPage);
+        _log.LogInformation("SDB_LIST_PARCEL: user {User} view {View} page {Page} -> {N} parcel(s)",
+            userDbId, viewType, curPage, count);
+        link.SendFrame(DBS_LIST_PARCEL, ParcelDbHandlers.BuildDbsListParcel(
+            dlmId, ok: true, viewType, curPage, maxPage, count, body.Length == 0 ? null : body));
+        return true;
+    }
+
+    /// <summary>
+    /// SDB_MAKE_PARCEL (0x2779) -> DBS_MAKE_PARCEL (0x277a). World has already taken the items
+    /// out of the sender's bag and hands us both the ParcelData record and the transaction
+    /// atoms; we allocate the row, keep the record verbatim so DBS_LIST_PARCEL can replay it,
+    /// and echo the atoms with any insert ids filled in - the same rule as SDB_ITEM_SINGLE
+    /// (INVENTORY-DESIGN.md section 4, "atoms are applied from the reply, never the request").
+    /// </summary>
+    private bool OnMakeParcel(WorldLink link, byte[] payload)
+    {
+        uint dlmId = ParcelDbHandlers.U32(payload, ParcelDbHandlers.MakeReqDlmId);
+        var record = ParcelDbHandlers.Ref(payload, ParcelDbHandlers.MakeReqParcelDataRef);
+
+        if (payload.Length < ParcelDbHandlers.MakeRequestSize || _store is null)
+        {
+            _log.LogWarning("SDB_MAKE_PARCEL: {Len} B payload or no store - refusing", payload.Length);
+            link.SendFrame(DBS_MAKE_PARCEL,
+                ParcelDbHandlers.BuildDbsMakeParcel(null, dlmId, ok: false, sendParcelError: 1, recverDbId: 0));
+            return true;
+        }
+
+        // The receiver is the one field of ParcelData we have pinned (+0x50, from
+        // Handler_C_SHOW_PARCEL_MESSAGE's ownership test).
+        uint recverDbId = record.Length >= ParcelDbHandlers.ParcelDataReceiverDbId + 4
+            ? BitConverter.ToUInt32(record, ParcelDbHandlers.ParcelDataReceiverDbId)
+            : 0u;
+
+        var (atoms, parsed) = WarehouseHandlers.CloneAtomsWithIds(
+            payload, ParcelDbHandlers.MakeReqTransListRef, ParcelDbHandlers.MakeRequestSize, _store.NextItemId);
+
+        int parcelId = _store.CreateParcel(senderDbId: 0, senderName: "", receiverDbId: (int)recverDbId,
+            title: "", message: "", money: 0);
+        if (record.Length > 0) _store.SetParcelRecord(parcelId, record);
+
+        int slot = 0;
+        foreach (var atom in parsed)
+        {
+            if (slot >= CharacterStore.MaxParcelAttachments) break;
+            if (atom.ItemDbId == 0) continue;
+            _store.AddParcelItem(parcelId, slot++, (int)atom.ItemDbId, atom.TemplateId, atom.Delta);
+        }
+
+        _log.LogInformation("SDB_MAKE_PARCEL: parcel {Id} for user {User}, {N} attachment(s), {B} B record",
+            parcelId, recverDbId, slot, record.Length);
+        link.SendFrame(DBS_MAKE_PARCEL,
+            ParcelDbHandlers.BuildDbsMakeParcel(atoms, dlmId, ok: true, sendParcelError: 0, recverDbId));
+        return true;
+    }
+
+    /// <summary>
+    /// SDB_RECV_PARCEL (0x277b) -> DBS_RECV_PARCEL (0x277c). The attachments move into the
+    /// receiver's bag; World sent the atoms that do it, so we apply them and echo them back.
+    /// </summary>
+    private bool OnRecvParcel(WorldLink link, byte[] payload)
+    {
+        uint dlmId = ParcelDbHandlers.U32(payload, ParcelDbHandlers.RecvReqDlmId);
+        uint step = ParcelDbHandlers.U32(payload, ParcelDbHandlers.RecvReqStep);
+        uint parcelId = ParcelDbHandlers.U32(payload, ParcelDbHandlers.RecvReqParcelId);
+
+        if (payload.Length < ParcelDbHandlers.RecvRequestSize || _store is null)
+        {
+            _log.LogWarning("SDB_RECV_PARCEL: {Len} B payload or no store - refusing", payload.Length);
+            link.SendFrame(DBS_RECV_PARCEL,
+                ParcelDbHandlers.BuildDbsRecvParcel(null, null, dlmId, step, ok: false));
+            return true;
+        }
+
+        var (atoms, parsed) = WarehouseHandlers.CloneAtomsWithIds(
+            payload, ParcelDbHandlers.RecvReqTransListRef, ParcelDbHandlers.RecvRequestSize, _store.NextItemId);
+        var applied = WarehouseHandlers.Apply(_store, parsed, _store.NextItemId, _log);
+
+        var row = _store.GetParcel((int)parcelId);
+        var record = _store.GetParcelRecord((int)parcelId);
+        if (row is not null) _store.SetParcelRecved((int)parcelId, row.ReceiverDbId);
+
+        _log.LogInformation("SDB_RECV_PARCEL: parcel {Id} step {Step} -> {Ins} inserted, {Chg} amount",
+            parcelId, step, applied.Inserted, applied.AmountChanged);
+        link.SendFrame(DBS_RECV_PARCEL,
+            ParcelDbHandlers.BuildDbsRecvParcel(record, atoms, dlmId, step, ok: row is not null));
+        return true;
+    }
+
+    /// <summary>
+    /// SDB_RECV_PARCEL_EX (0x277d) -> DBS_RECV_PARCEL_EX (0x277e). "Receive all": the same
+    /// movement, but the request names an owner rather than one parcel and the reply carries the
+    /// count it could not deliver.
+    /// </summary>
+    private bool OnRecvParcelEx(WorldLink link, byte[] payload)
+    {
+        uint dlmId = ParcelDbHandlers.U32(payload, ParcelDbHandlers.RecvExReqDlmId);
+        uint step = ParcelDbHandlers.U32(payload, ParcelDbHandlers.RecvExReqStep);
+        uint ownerDbId = ParcelDbHandlers.U32(payload, ParcelDbHandlers.RecvExReqOwnerDbId);
+
+        if (payload.Length < ParcelDbHandlers.RecvExRequestSize || _store is null)
+        {
+            _log.LogWarning("SDB_RECV_PARCEL_EX: {Len} B payload or no store - refusing", payload.Length);
+            link.SendFrame(DBS_RECV_PARCEL_EX,
+                ParcelDbHandlers.BuildDbsRecvParcelEx(null, null, dlmId, step, noParcel: 0, ok: false));
+            return true;
+        }
+
+        var (atoms, parsed) = WarehouseHandlers.CloneAtomsWithIds(
+            payload, ParcelDbHandlers.RecvExReqRefB, ParcelDbHandlers.RecvExRequestSize, _store.NextItemId);
+        WarehouseHandlers.Apply(_store, parsed, _store.NextItemId, _log);
+
+        uint remaining = 0;
+        foreach (var row in _store.GetParcelsFor((int)ownerDbId))
+        {
+            if (!row.IsRecved) { _store.SetParcelRecved(row.ParcelId, row.ReceiverDbId); remaining++; }
+        }
+
+        _log.LogInformation("SDB_RECV_PARCEL_EX: owner {Owner} step {Step} -> {N} parcel(s) claimed",
+            ownerDbId, step, remaining);
+        link.SendFrame(DBS_RECV_PARCEL_EX,
+            ParcelDbHandlers.BuildDbsRecvParcelEx(null, atoms, dlmId, step, noParcel: 0, ok: true));
+        return true;
+    }
+
+    /// <summary>SDB_RETURN_PARCEL (0x2781) -> DBS_RETURN_PARCEL (0x2782): sender and receiver
+    /// swap and the mail goes back unread.</summary>
+    private bool OnReturnParcel(WorldLink link, byte[] payload)
+    {
+        uint dlmId = ParcelDbHandlers.U32(payload, ParcelDbHandlers.ReturnReqDlmId);
+        uint parcelId = ParcelDbHandlers.U32(payload, ParcelDbHandlers.ReturnReqParcelId);
+
+        bool ok = false;
+        if (payload.Length >= ParcelDbHandlers.ReturnRequestSize && _store is not null)
+        {
+            var row = _store.GetParcel((int)parcelId);
+            ok = row is not null && _store.ReturnParcel((int)parcelId, row.ReceiverDbId);
+        }
+        _log.LogInformation("SDB_RETURN_PARCEL: parcel {Id} -> {Ok}", parcelId, ok);
+        link.SendFrame(DBS_RETURN_PARCEL, ParcelDbHandlers.BuildDbsDlmAck(dlmId, ok));
+        return true;
+    }
+
+    /// <summary>
+    /// SDB_DELETE_PARCEL (0x2811) -> DBS_DELETE_PARCEL (0x2812). The request carries a list of
+    /// parcel ids as a binary ref; the real handler walks it as u32s.
+    /// </summary>
+    private bool OnDeleteParcel(WorldLink link, byte[] payload)
+    {
+        uint dlmId = ParcelDbHandlers.U32(payload, ParcelDbHandlers.DeleteReqDlmId);
+        var list = ParcelDbHandlers.Ref(payload, ParcelDbHandlers.DeleteReqDelListRef);
+
+        int deleted = 0;
+        if (_store is not null)
+        {
+            for (int at = 0; at + 4 <= list.Length; at += 4)
+                if (_store.DeleteParcel((int)BitConverter.ToUInt32(list, at))) deleted++;
+        }
+        _log.LogInformation("SDB_DELETE_PARCEL: {N} of {M} parcel(s) deleted", deleted, list.Length / 4);
+        link.SendFrame(DBS_DELETE_PARCEL, ParcelDbHandlers.BuildDbsDlmAck(dlmId, ok: true));
+        return true;
     }
 }
