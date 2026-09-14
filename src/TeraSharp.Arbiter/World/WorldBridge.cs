@@ -131,6 +131,20 @@ public sealed class WorldBridge
         return null;
     }
 
+    /// <summary>The in-world session for a character db id, or null (guild/chat/party actions address by player id).</summary>
+    public GameSession? SessionForPlayerId(int playerId)
+    {
+        lock (_playersLock)
+            foreach (var s in _players.Values) if (s.PlayerId == playerId) return s;
+        return null;
+    }
+
+    /// <summary>Snapshot of every in-world session (whisper/online lookups by name).</summary>
+    public List<GameSession> InWorldSessions()
+    {
+        lock (_playersLock) return _players.Values.ToList();
+    }
+
     /// <summary>Register a tunnel route by key with a custom callback (test-facing).</summary>
     internal void RegisterTunnelRoute(uint key, Action<byte[]> callback)
     {

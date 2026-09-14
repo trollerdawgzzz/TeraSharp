@@ -118,6 +118,18 @@ and look for the next caller.
 
 ## Next steps (in order)
 
+**MILESTONE 2026-09-15 00:25 - MULTIPLAYER.** Two accounts, two clients, both in world at once, see each
+other, /say and global chat cross, one logs out without disturbing the other. Routing = MULTIPLAYER-DESIGN
+section 6 applied to WorldBridge (TicketAllocator 5,6,...; N-recipient SA_BYPASS_TO_CLIENT via
+TunnelFrames; per-ticket reorder; unknown ticket dropped when 2+ sessions, delivered when 1). World echoes
+the ticket we put in AS_ENTER_WORLD[80] - the two-client capture on the real Arbiter is no longer needed
+for routing. Still broken with two players: whisper ("offline" - SocialHandlers has no session lookup;
+ChatManager wiring = T47), party (PartyManager not wired), World GM commands (`teleport -> Unknown`,
+T47), World logs AdminLevel[0] for the GM account (LevelOf ignores the env list at enter - T47). New
+pushes with two players in view: 0x2809, 0x280E (T47 names them). AS_ENTER_WORLD[111] now carries the
+admin level (T46). Session lookups available on WorldBridge: SessionForTicket, SessionForPlayerId,
+InWorldSessions, PlayerForGameId.
+
 **Live session 2026-09-14 22:45-23:55 - results.** Passed: fresh warrior on a fresh World with own
 hotbar/tooltips (fixed: empty S_LOAD_CLIENT_USER_SETTING default), quests through the 9827 teleport,
 loot persisted (T44 items table), level/exp/achievements/reputation/cooldowns/tips persisted, keybinds
