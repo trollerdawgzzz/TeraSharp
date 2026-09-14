@@ -590,8 +590,9 @@ completed in one edit if the human wants byte-parity with the capture.)
 
 ## 9. Open questions
 
-- **`ParcelDataNoMsg` interior (0x9e8 B).** Needed for a real `DBS_LIST_PARCEL`. No capture
-  contains one. The known anchors are: receiver dbId at `+0x50` (from the ownership test in
+- **`ParcelDataNoMsg` interior (0x9e8 B).** Needed for a `DBS_LIST_PARCEL` the Arbiter builds
+  itself. Neither capture contains one - T45 parsed `arb_world.log` (950 frames) and
+  `cap_newchar.log` (4218 frames) for all twelve parcel opcodes and found zero. The known anchors are: receiver dbId at `+0x50` (from the ownership test in
   `Handler_C_SHOW_PARCEL_MESSAGE`), and the record is the message-less prefix of the full
   `ParcelData`. A live session that sends one parcel and opens the mailbox would pin it; until
   then, `ParcelCount = 0` is the only honest answer.
@@ -604,9 +605,15 @@ completed in one edit if the human wants byte-parity with the capture.)
 - **`INVEN_TYPE` 3, 4, 5, 8 labels.** Mask membership is proven; the names are inference.
 - **Config values.** Every key name in §3.2 and §4.3 is verified from the binary; none of the
   values is. Read them from the live `ServerConfig.xml` before hard-coding anything.
-- **The six `SDB_*_PARCEL` requests are still unanswered** (§3). T42 did the client half and the
-  table; World's half needs `DBS_LIST_PARCEL` at minimum, and a real one needs the
-  `ParcelDataNoMsg` interior above.
+- ~~**The six `SDB_*_PARCEL` requests are still unanswered**~~ - **done in T45**
+  (`World/ParcelDbHandlers.cs`, `status/CLIENT-REJECTS.md` §4). The empty `DBS_LIST_PARCEL` turned
+  out to be byte-exact from the decompile alone: every field is either echoed from the request or
+  a default `Handler_SDB_LIST_PARCEL` sets at Arb_part_071.c:15334 (`local_ec = 1` MaxPage,
+  `local_f0 = 0` ParcelCount), and the writer backpatches the list-offset slot to the running
+  frame length unconditionally while the byte-count slot is only written in the non-empty branch.
+  A fresh inbox is 35 bytes with offset 35 and bytes 0. The interior question above still stands
+  for a non-empty list, which is why T45 keeps World's own `ParcelData` in `parcels.record` and
+  replays it verbatim.
 - **`MaxSlotCount` starts at 0** for an owner with no `warehouses` row, because the real caps
   (576 account / 360 character / 288 guild) live in `ServerConfig.xml`, which we do not read. If
   the client refuses to open a 0-slot bank, seed the row instead of guessing a constant.
