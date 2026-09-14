@@ -15199,7 +15199,7 @@ some prose with `backticks` that is not a table row
         {
             var f = BrokerHandlers.ReplyFor(c);
             Hex.True(f != null, $"0x{c:X4} must be answered");
-            Hex.True(BitConverter.ToUInt16(f!, 0) == f.Length && f.Length == frame,
+            Hex.True(BitConverter.ToUInt16(f!, 0) == f!.Length && f.Length == frame,
                 $"0x{c:X4} -> 0x{sOp:X4}: {f.Length} bytes, want {frame}, and the length field agrees");
             Hex.True(BitConverter.ToUInt16(f, 2) == sOp, $"0x{c:X4} answers with 0x{sOp:X4}");
         }
