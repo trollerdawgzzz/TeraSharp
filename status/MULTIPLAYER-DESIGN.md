@@ -611,6 +611,32 @@ needs. All of them fit the existing `RunHandler`-style harness in
 The synthetic ones can be written **now** — they do not need the capture and they pin the
 diffs in §6 before the live test.
 
+**Eight of them exist as of T34**, in `src/TeraSharp.Arbiter.Tests/Program.cs` under
+`Routing_*`. Six are red against the current `WorldBridge` — they are the executable form of
+§6's diffs — and report `PENDING` rather than throwing while
+`Tests.RoutingDiffsApplied` is `false`, so the test run stays usable as a merge gate. Flip that
+flag when §6 lands; a pending test that unexpectedly passes fails loudly, which is the reminder.
+
+What the six actually catch today:
+
+| test | current behaviour |
+|---|---|
+| `Routing_two_recipient_frame_splits_to_both_sessions` | A gets 1 packet, B gets 0 |
+| `Routing_packet_offset_follows_the_user_list_length` | the "client packet" is `f0 0a 00 00` — the second UserList entry's PlanetId, read from the hardcoded offset 32 |
+| `Routing_each_recipient_has_its_own_sequence` | B gets nothing; only entry 0's ticket and sequence are read |
+| `Routing_recipient_with_no_session_is_dropped_not_broadcast` | an unknown ticket is broadcast to **both** live sessions |
+| `Routing_two_sessions_get_distinct_tickets` | both get Ticket 5 |
+| `Routing_reset_for_one_player_keeps_the_others_pending_packets` | the global reset throws away the other player's queue |
+
+`Routing_out_of_order_two_players_do_not_block_each_other` and
+`Routing_leave_frees_only_the_leaving_ticket` already pass; they are regression locks so §6
+cannot break what works.
+
+**Two existing tests contradict the new ones and must go when §6 is applied**:
+`TunnelRouting_unknown_key_broadcasts` pins the broadcast fallback (delete it, or narrow it to
+the single-session case, which is the only place the fallback is wanted), and
+`AllocateTunnelKey_pinned_to_5` pins the constant Ticket.
+
 ---
 
 ## 8. Capture checklist for the human

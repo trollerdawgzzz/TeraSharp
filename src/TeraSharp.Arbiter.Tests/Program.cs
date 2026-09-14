@@ -6958,6 +6958,421 @@ public bool TryHandle(WorldBridge bridge, WorldLink link, ushort op, byte[] payl
             "PostHandshakeDungeonIds == HandshakeData.CapturedDungeonTimelineIds");
     }
 
+    // ============ T33: 0x13F2 -> N x 0x1581, and the corrected 0x1581 field shape ============
+    // status/HANDSHAKE-DATA.md section 0. The 98 ids are World's, not ours: the real Arbiter
+    // echoes them one 0x1581 per record out of DSA_DUNGEON_TIMELINE_OPEN_INFO.
+
+    static Dictionary<uint, byte[]>? LoadTimelineCaptureOrSkip() => LoadTsisOrSkip("cap_timeline.bin");
+
+    /// <summary>Split a concatenated run of 13-byte 0x1581 payloads back into frames.</summary>
+    static List<byte[]> SplitTimelineReplies(byte[] concatenated)
+    {
+        Hex.True(concatenated.Length % 13 == 0, $"0x1581 payloads are 13 bytes; got {concatenated.Length}");
+        var outp = new List<byte[]>(concatenated.Length / 13);
+        for (int o = 0; o < concatenated.Length; o += 13) outp.Add(concatenated[o..(o + 13)]);
+        return outp;
+    }
+
+    [Test] public static void Timeline_echo_reproduces_the_lobby_tap_burst_byte_for_byte()
+    {
+        var cap = LoadTimelineCaptureOrSkip();
+        if (cap == null) return;
+
+        var echo = DbProxyHandlers.BuildTimelineEcho(cap[122]);
+        var expected = SplitTimelineReplies(cap[123]);
+        Hex.True(echo != null, "the captured 0x13F2 must parse");
+        Hex.True(echo!.Count == expected.Count, $"98 echoes expected, built {echo.Count}");
+        for (int i = 0; i < expected.Count; i++)
+            Hex.Eq(echo[i], expected[i],
+                $"echo {i} (lobby_tap.log frame 122 record {i} -> frame 123/124)");
+    }
+
+    [Test] public static void Timeline_echo_reproduces_the_cap_newchar_burst_byte_for_byte()
+    {
+        var cap = LoadTimelineCaptureOrSkip();
+        if (cap == null) return;
+
+        var echo = DbProxyHandlers.BuildTimelineEcho(cap[111]);
+        var expected = SplitTimelineReplies(cap[112]);
+        Hex.True(echo != null && echo.Count == expected.Count, $"98 echoes expected, built {echo?.Count}");
+        for (int i = 0; i < expected.Count; i++)
+            Hex.Eq(echo![i], expected[i], $"echo {i} (cap_newchar.log frame 111 record {i} -> frame 112/113)");
+
+        // The two captures carry the same list, so the two stored frames must be identical.
+        Hex.Eq(cap[111], cap[122], "both captures' 0x13F2 frames are the same bytes");
+        Hex.Eq(cap[112], cap[123], "and so are both 0x1581 bursts");
+    }
+
+    [Test] public static void Timeline_echoed_ids_are_the_ones_OnWorldReady_falls_back_to()
+    {
+        var cap = LoadTimelineCaptureOrSkip();
+        if (cap == null) return;
+
+        var nodes = DbProxyHandlers.ParseTimelineOpenInfo(cap[122]);
+        Hex.True(nodes != null && nodes.Count == 98, $"98 records, got {nodes?.Count}");
+        Hex.True(nodes!.All(n => n.isOn && n.nextChange == 0),
+            "every captured record is CurrOpen=1, NextChange=0 - which is why the old builder's "
+            + "wrong field shape never showed up on the wire");
+        Hex.True(nodes.Select(n => n.dungeonId).SequenceEqual(DbProxyHandlers.PostHandshakeDungeonIds),
+            "the echoed ids are exactly PostHandshakeDungeonIds, in order - the captured burst IS this echo");
+    }
+
+    [Test] public static void Timeline_corrected_1581_is_byte_identical_for_the_captured_case()
+    {
+        // [u32 DungeonId][u8 IsOn][u64 NextChange]. With IsOn=1 and NextChange=0 this is the
+        // same 13 bytes the old [u32 id][u32 1][u32 0][u8 0] produced, which is why T23's tests
+        // and the live server never noticed. lobby_tap.log frame 123 verbatim:
+        Hex.Eq(DbProxyHandlers.Build1581(0x834), "34 08 00 00 01 00 00 00 00 00 00 00 00",
+            "0x1581 for dungeon 0x834");
+        foreach (var id in DbProxyHandlers.PostHandshakeDungeonIds)
+        {
+            var now = DbProxyHandlers.Build1581(id);
+            var old = new byte[13];
+            BitConverter.GetBytes(id).CopyTo(old, 0);
+            BitConverter.GetBytes(1u).CopyTo(old, 4);
+            Hex.Eq(now, old, $"the corrected builder matches the old one for 0x{id:X}");
+        }
+    }
+
+    [Test] public static void Timeline_1581_can_finally_carry_a_real_NextChange()
+    {
+        // The old builder had no way to express either field: it hardcoded 1 into a u32 at +4
+        // and left +5.. zero. A closing dungeon (IsOn=0) with a real reopen time would have
+        // gone out as garbage.
+        Hex.Eq(DbProxyHandlers.Build1581(0x2327, isOn: false, nextChange: 1789299742),
+            "27 23 00 00  00  1E 8C A6 6A 00 00 00 00",
+            "IsOn=0 with a 2026-09-13T11:42:22Z NextChange");
+        var p = DbProxyHandlers.Build1581(1, isOn: true, nextChange: ulong.MaxValue);
+        Hex.True(p.Length == 13 && p[4] == 1 && BitConverter.ToUInt64(p, 5) == ulong.MaxValue,
+            "IsOn is one byte at +4 and NextChange is the u64 at +5");
+    }
+
+    [Test] public static void Timeline_empty_heartbeat_form_echoes_nothing()
+    {
+        // 909 of the 911 captured 0x13F2 frames are this: an 8-byte payload, count 0. It is the
+        // reason the whole opcode was treated as a heartbeat.
+        var empty = Hex.B("00 00 00 00 0E 00 00 00");
+        var nodes = DbProxyHandlers.ParseTimelineOpenInfo(empty);
+        Hex.True(nodes != null && nodes.Count == 0, "the empty form parses to an empty list, not null");
+        var echo = DbProxyHandlers.BuildTimelineEcho(empty);
+        Hex.True(echo != null && echo.Count == 0, "and produces no frames");
+        Hex.True(HandlerAccepts(DbProxyHandlers.DSA_DUNGEON_TIMELINE_OPEN_INFO, empty),
+            "it is still handled - 0x13F2 must never reach the replay table");
+    }
+
+    [Test] public static void Timeline_malformed_lists_are_rejected_and_still_handled()
+    {
+        Hex.True(DbProxyHandlers.ParseTimelineOpenInfo(new byte[7]) == null, "a runt payload");
+        Hex.True(DbProxyHandlers.ParseTimelineOpenInfo(Hex.B("01 00 00 00 0E 00 00 00")) == null,
+            "count 1 with no node bytes");
+        Hex.True(DbProxyHandlers.ParseTimelineOpenInfo(Hex.B("FF FF FF FF 0E 00 00 00")) == null,
+            "a count past MaxTimelineNodes");
+        Hex.True(DbProxyHandlers.ParseTimelineOpenInfo(Hex.B("01 00 00 00 00 00 00 00")) == null,
+            "a listOffset below the frame header");
+
+        // A malformed list must still be HANDLED - falling through would hand 0x13F2 to the
+        // replay table, and it is sealed in OneWayFromWorld precisely so that cannot happen.
+        Hex.True(HandlerAccepts(DbProxyHandlers.DSA_DUNGEON_TIMELINE_OPEN_INFO, new byte[7]),
+            "a malformed 0x13F2 is still consumed");
+    }
+
+    [Test] public static void Timeline_handler_sends_one_1581_per_record()
+    {
+        var cap = LoadTimelineCaptureOrSkip();
+        if (cap == null) return;
+
+        var frames = RunHandler(DbProxyHandlers.DSA_DUNGEON_TIMELINE_OPEN_INFO, cap[122], 98);
+        var expected = SplitTimelineReplies(cap[123]);
+        for (int i = 0; i < frames.Count; i++)
+        {
+            Hex.True(frames[i].op == DbProxyHandlers.AS_DUNGEON_OPEN_1581,
+                $"frame {i} should be 0x1581, got 0x{frames[i].op:X4}");
+            Hex.Eq(frames[i].body, expected[i], $"frame {i} body");
+        }
+    }
+
+    [Test] public static void Timeline_fallback_burst_is_still_the_captured_bytes()
+    {
+        // OnWorldReady's 98-id burst is a FALLBACK now, but it must keep producing exactly what
+        // the real Arbiter sent, because until SendPostHandshakeDungeonBurst is switched off it
+        // is what World actually receives.
+        var cap = LoadTimelineCaptureOrSkip();
+        if (cap == null) return;
+
+        var expected = SplitTimelineReplies(cap[123]);
+        var fallback = DbProxyHandlers.PostHandshakeDungeonIds.Select(id => DbProxyHandlers.Build1581(id)).ToList();
+        Hex.True(fallback.Count == expected.Count, $"{expected.Count} expected, {fallback.Count} built");
+        for (int i = 0; i < expected.Count; i++)
+            Hex.Eq(fallback[i], expected[i], $"fallback push {i}");
+        Hex.True(DbProxyHandlers.SendPostHandshakeDungeonBurst,
+            "the fallback is on by default; flip it once a live run logs the 0x13F2 echo");
+    }
+
+    // ==================== T34: the routing tests MULTIPLAYER-DESIGN section 6 needs ====================
+    //
+    // These assert the behaviour status/MULTIPLAYER-DESIGN.md section 6 specifies. The current
+    // WorldBridge does not have it, so six of the eight are RED ON PURPOSE - they are the
+    // executable form of the diffs, written before the diffs so that applying them has a pass
+    // condition. WorldBridge.cs is human-owned; Cowork does not edit it.
+    //
+    // While RoutingDiffsApplied is false the six report PENDING instead of throwing, so
+    // `dotnet run --project src\TeraSharp.Arbiter.Tests` stays usable as a merge gate. A pending
+    // test that unexpectedly PASSES fails loudly - that is the signal that section 6 has landed
+    // and this flag should be flipped.
+    //
+    // TWO EXISTING TESTS CONTRADICT THESE AND MUST GO when section 6 is applied:
+    //   TunnelRouting_unknown_key_broadcasts  - pins the broadcast fallback that
+    //       Routing_recipient_with_no_session_is_dropped_not_broadcast forbids once 2+ sessions
+    //       are registered. Delete it, or narrow it to the single-session case.
+    //   AllocateTunnelKey_pinned_to_5         - pins the constant that
+    //       Routing_two_sessions_get_distinct_tickets forbids. Delete it.
+    //
+    /// <summary>Flip to true the moment MULTIPLAYER-DESIGN.md section 6 is applied to
+    /// WorldBridge.cs; the six pending tests below then become hard failures again.</summary>
+    public static bool RoutingDiffsApplied = false;
+
+    static void PendingUntilRoutingDiffs(string name, Action body)
+    {
+        if (RoutingDiffsApplied) { body(); return; }
+        try { body(); }
+        catch (Exception ex)
+        {
+            var first = ex.Message.Split('\n')[0];
+            Console.WriteLine($"        PENDING (MULTIPLAYER-DESIGN section 6): {name}: {first}");
+            return;
+        }
+        throw new Exception(
+            $"{name} PASSES against the current WorldBridge - MULTIPLAYER-DESIGN.md section 6 "
+            + "must have landed. Set Tests.RoutingDiffsApplied = true and delete "
+            + "TunnelRouting_unknown_key_broadcasts + AllocateTunnelKey_pinned_to_5.");
+    }
+
+    /// <summary>
+    /// A real SA_BYPASS_TO_CLIENT payload for N recipients. Unlike BuildTestTunnelPayload this
+    /// sets userListBytes = 16*N and packetOffset = 22 + userListBytes, which is what the wire
+    /// actually carries (Arb_part_016.c:8636); with one recipient the two agree.
+    ///   [0] u32 userListOffset = 22   [4] u32 userListBytes = 16*N
+    ///   [8] u32 packetOffset = 22+16N [12] u32 packetLength
+    ///   [16] N x { [+0] u32 planetId  [+4] u32 (unread)  [+8] u32 ticket  [+12] u32 seq&lt;&lt;19 }
+    /// </summary>
+    static byte[] BuildTunnelFrame(byte[] clientPkt, params (uint ticket, uint seq)[] to)
+    {
+        int listBytes = to.Length * 16;
+        var p = new byte[16 + listBytes + clientPkt.Length];
+        BitConverter.GetBytes(22u).CopyTo(p, 0);
+        BitConverter.GetBytes((uint)listBytes).CopyTo(p, 4);
+        BitConverter.GetBytes((uint)(22 + listBytes)).CopyTo(p, 8);
+        BitConverter.GetBytes(clientPkt.Length).CopyTo(p, 12);
+        for (int i = 0; i < to.Length; i++)
+        {
+            int b = 16 + i * 16;
+            BitConverter.GetBytes(2800u).CopyTo(p, b);            // PlanetId; ours, or the entry is dropped
+            BitConverter.GetBytes(0u).CopyTo(p, b + 4);           // never read by the Arbiter
+            BitConverter.GetBytes(to[i].ticket).CopyTo(p, b + 8);
+            BitConverter.GetBytes(to[i].seq << 19).CopyTo(p, b + 12);
+        }
+        clientPkt.CopyTo(p, 16 + listBytes);
+        return p;
+    }
+
+    static byte[] ClientPkt(byte tag) => new byte[] { 4, 0, tag, 0x00 };
+
+    /// <summary>Bridge + a dummy link. Tunnel frames never touch the link beyond its Id.</summary>
+    static (WorldBridge bridge, WorldLink link, Socket sock) TunnelHarness()
+    {
+        var log = QuietLog();
+        var bridge = new WorldBridge(WorldReplayTable.Load("/nonexistent", log), log);
+        var sock = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        return (bridge, new WorldLink(1, sock, bridge, log), sock);
+    }
+
+    [Test] public static void Routing_two_recipient_frame_splits_to_both_sessions()
+        => PendingUntilRoutingDiffs(nameof(Routing_two_recipient_frame_splits_to_both_sessions), () =>
+    {
+        var (bridge, link, sock) = TunnelHarness();
+        using (sock)
+        {
+            var a = new List<byte[]>(); var b = new List<byte[]>();
+            bridge.RegisterTunnelRoute(0, a.Add);
+            bridge.RegisterTunnelRoute(1, b.Add);
+
+            // One frame, two recipients - the shape World uses the moment two players can see
+            // each other. The Arbiter refcounts one BypassPacketInfo by recipient count and
+            // posts one job per live session (Arb_part_062.c:3736).
+            bridge.HandleFrame(link, WorldBridge.OpTunnelToClient,
+                BuildTunnelFrame(ClientPkt(0xAA), (0, 0), (1, 0)));
+
+            Hex.True(a.Count == 1 && b.Count == 1,
+                $"both sessions get the packet: A={a.Count} B={b.Count}");
+            Hex.Eq(a[0], ClientPkt(0xAA), "A's copy");
+            Hex.Eq(b[0], ClientPkt(0xAA), "B's copy");
+            Hex.True(!ReferenceEquals(a[0], b[0]),
+                "each session must get its own array - GameSession.Send encrypts in place with a "
+                + "stateful cipher, so a shared buffer corrupts the second session's stream");
+        }
+    });
+
+    [Test] public static void Routing_packet_offset_follows_the_user_list_length()
+        => PendingUntilRoutingDiffs(nameof(Routing_packet_offset_follows_the_user_list_length), () =>
+    {
+        var (bridge, link, sock) = TunnelHarness();
+        using (sock)
+        {
+            var got = new List<byte[]>();
+            bridge.RegisterTunnelRoute(0, got.Add);
+            bridge.RegisterTunnelRoute(1, _ => { });
+
+            // With two recipients the header is 48 bytes, not 32: payload[8]-6 == 16+userListBytes.
+            // Reading from a fixed 32 lands inside the SECOND UserList entry.
+            var frame = BuildTunnelFrame(ClientPkt(0xBB), (0, 0), (1, 0));
+            Hex.True(BitConverter.ToUInt32(frame, 4) == 32, "userListBytes = 16 * 2");
+            Hex.True(BitConverter.ToUInt32(frame, 8) - 6 == 48, "the packet starts at payload+48");
+
+            bridge.HandleFrame(link, WorldBridge.OpTunnelToClient, frame);
+            Hex.True(got.Count == 1, $"A got {got.Count} packets");
+            Hex.Eq(got[0], ClientPkt(0xBB),
+                "the client packet must come from payload[8]-6, not a hardcoded 32");
+        }
+    });
+
+    [Test] public static void Routing_each_recipient_has_its_own_sequence()
+        => PendingUntilRoutingDiffs(nameof(Routing_each_recipient_has_its_own_sequence), () =>
+    {
+        var (bridge, link, sock) = TunnelHarness();
+        using (sock)
+        {
+            var a = new List<byte[]>(); var b = new List<byte[]>();
+            bridge.RegisterTunnelRoute(0, a.Add);
+            bridge.RegisterTunnelRoute(1, b.Add);
+
+            // Sequence lives in each UserList entry (entry+12 >> 19), not once per frame. Here A
+            // is at seq 1 while B is at seq 0, so A's packet must be held and B's delivered.
+            bridge.HandleFrame(link, WorldBridge.OpTunnelToClient,
+                BuildTunnelFrame(ClientPkt(0xC1), (0, 1), (1, 0)));
+            Hex.True(a.Count == 0, $"A's seq 1 must wait for seq 0, got {a.Count}");
+            Hex.True(b.Count == 1, $"B's seq 0 delivers immediately, got {b.Count}");
+
+            bridge.HandleFrame(link, WorldBridge.OpTunnelToClient,
+                BuildTunnelFrame(ClientPkt(0xC0), (0, 0)));
+            Hex.True(a.Count == 2, $"A drains both once seq 0 arrives, got {a.Count}");
+            Hex.True(a[0][2] == 0xC0 && a[1][2] == 0xC1, "and in sequence order");
+        }
+    });
+
+    [Test] public static void Routing_recipient_with_no_session_is_dropped_not_broadcast()
+        => PendingUntilRoutingDiffs(nameof(Routing_recipient_with_no_session_is_dropped_not_broadcast), () =>
+    {
+        var (bridge, link, sock) = TunnelHarness();
+        using (sock)
+        {
+            var a = new List<byte[]>(); var b = new List<byte[]>();
+            bridge.RegisterTunnelRoute(0, a.Add);
+            bridge.RegisterTunnelRoute(1, b.Add);
+
+            // The real Arbiter backs the refcount out for a recipient with no live session
+            // (Arb_part_062.c:3800) - it does not hand the packet to somebody else. With two
+            // players the broadcast fallback means A sees packets addressed to B.
+            bridge.HandleFrame(link, WorldBridge.OpTunnelToClient,
+                BuildTunnelFrame(ClientPkt(0xDD), (99, 0)));
+            Hex.True(a.Count == 0 && b.Count == 0,
+                $"an unknown ticket must be dropped, not broadcast: A={a.Count} B={b.Count}");
+
+            // ...and a mixed frame delivers only to the live recipient.
+            bridge.HandleFrame(link, WorldBridge.OpTunnelToClient,
+                BuildTunnelFrame(ClientPkt(0xDE), (0, 0), (99, 0)));
+            Hex.True(a.Count == 1 && b.Count == 0,
+                $"only the live recipient is served: A={a.Count} B={b.Count}");
+        }
+    });
+
+    [Test] public static void Routing_two_sessions_get_distinct_tickets()
+        => PendingUntilRoutingDiffs(nameof(Routing_two_sessions_get_distinct_tickets), () =>
+    {
+        var (bridge, link, sock) = TunnelHarness();
+        using (sock)
+        {
+            // PacketBypassManager::BypassStart (FUN_1405afaf0, Arb_part_048.c:9296) probes
+            // linearly from a monotonic cursor; two live users can never share a Ticket, because
+            // it is the index of the ClientSession* table slot the packet is routed through.
+            uint k1 = bridge.AllocateTunnelKey();
+            bridge.RegisterTunnelRoute(k1, _ => { });
+            uint k2 = bridge.AllocateTunnelKey();
+            Hex.True(k1 != k2, $"two sessions must not share a Ticket (both got {k1})");
+
+            bridge.RegisterTunnelRoute(k2, _ => { });
+            uint k3 = bridge.AllocateTunnelKey();
+            Hex.True(k3 != k1 && k3 != k2, $"nor a third ({k3} collides with {k1}/{k2})");
+        }
+    });
+
+    [Test] public static void Routing_reset_for_one_player_keeps_the_others_pending_packets()
+        => PendingUntilRoutingDiffs(nameof(Routing_reset_for_one_player_keeps_the_others_pending_packets), () =>
+    {
+        var (bridge, link, sock) = TunnelHarness();
+        using (sock)
+        {
+            var a = new List<byte[]>(); var b = new List<byte[]>();
+            bridge.RegisterTunnelRoute(0, a.Add);
+            bridge.RegisterTunnelRoute(1, b.Add);
+
+            // B has an out-of-order packet waiting.
+            bridge.HandleFrame(link, WorldBridge.OpTunnelToClient, BuildTunnelFrame(ClientPkt(0xB1), (1, 1)));
+            Hex.True(b.Count == 0, "B's seq 1 is pending");
+
+            // A enters the world, which resets A's sequence. Once MULTIPLAYER-DESIGN.md section
+            // 6(4) lands this line becomes bridge.ResetTunnelSequence(0) and the test goes green;
+            // the assertion - one player's reset must not discard another's queue - is the same
+            // either way, because sequence numbers are per-Ticket.
+            bridge.ResetTunnelSequence();
+
+            bridge.HandleFrame(link, WorldBridge.OpTunnelToClient, BuildTunnelFrame(ClientPkt(0xB0), (1, 0)));
+            Hex.True(b.Count == 2, $"B should drain both, got {b.Count} - a global reset threw its queue away");
+            Hex.True(b[0][2] == 0xB0 && b[1][2] == 0xB1, "and in order");
+        }
+    });
+
+    // --- the two that already pass: regression locks, so section 6 cannot break them ---
+
+    [Test] public static void Routing_out_of_order_two_players_do_not_block_each_other()
+    {
+        var (bridge, link, sock) = TunnelHarness();
+        using (sock)
+        {
+            var a = new List<byte[]>(); var b = new List<byte[]>();
+            bridge.RegisterTunnelRoute(0, a.Add);
+            bridge.RegisterTunnelRoute(1, b.Add);
+
+            // Single-recipient frames, so this exercises the routing that already works. A is
+            // missing seq 1; B is complete. B must not wait behind A.
+            bridge.HandleFrame(link, WorldBridge.OpTunnelToClient, BuildTunnelFrame(ClientPkt(0xA0), (0, 0)));
+            bridge.HandleFrame(link, WorldBridge.OpTunnelToClient, BuildTunnelFrame(ClientPkt(0xA2), (0, 2)));
+            bridge.HandleFrame(link, WorldBridge.OpTunnelToClient, BuildTunnelFrame(ClientPkt(0xB0), (1, 0)));
+            bridge.HandleFrame(link, WorldBridge.OpTunnelToClient, BuildTunnelFrame(ClientPkt(0xB1), (1, 1)));
+
+            Hex.True(a.Count == 1, $"A holds seq 2 waiting for seq 1, got {a.Count}");
+            Hex.True(b.Count == 2, $"B is unaffected, got {b.Count}");
+            Hex.True(b[0][2] == 0xB0 && b[1][2] == 0xB1, "B's packets are in order");
+        }
+    }
+
+    [Test] public static void Routing_leave_frees_only_the_leaving_ticket()
+    {
+        var (bridge, link, sock) = TunnelHarness();
+        using (sock)
+        {
+            var a = new List<byte[]>(); var b = new List<byte[]>();
+            bridge.RegisterTunnelRoute(0, a.Add);
+            bridge.RegisterTunnelRoute(1, b.Add);
+
+            // SA_LEAVE_WORLD frees one Ticket (Handler_SA_LEAVE_WORLD -> BypassEnd, and
+            // GameSession calls UnregisterPlayer off 0x1393). The other player keeps streaming.
+            bridge.UnregisterTunnelRoute(0);
+            bridge.HandleFrame(link, WorldBridge.OpTunnelToClient, BuildTunnelFrame(ClientPkt(0xB0), (1, 0)));
+            Hex.True(b.Count == 1, $"B still receives, got {b.Count}");
+            Hex.True(a.Count == 0, "and the departed session receives nothing");
+        }
+    }
+
     /// <summary>Walks up from the test binary looking for a repo-relative file; null if not found.</summary>
     static string? FindRepoFile(string relative)
     {

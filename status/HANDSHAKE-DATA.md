@@ -311,88 +311,65 @@ fallback list is byte-identical anyway. The exact wiring, when the human wants i
 
 ## 6. Recommended follow-ups (not implemented — human-owned or behaviour-changing)
 
-### (a) Make `0x1581` an echo of `0x13F2`, with the list as a fallback
+### (a) `0x1581` as an echo of `0x13F2` — **DONE (T33)**, except one line in WorldBridge
 
-This is what the real Arbiter does, and it is the only version that is correct when World's
-dungeon set differs from this capture.
+Implemented in `World/DbProxyHandlers.cs`:
 
-`World/WorldReplayTable.cs` — `0x13F2` is currently sealed as a one-way heartbeat:
+- `Build1581(uint dungeonId, bool isOn = true, ulong nextChange = 0)` now writes the real shape,
+  `[u32 DungeonId][u8 IsOn][u64 NextChange]`. The defaults reproduce the captured bytes exactly,
+  so nothing on the wire changed.
+- `ParseTimelineOpenInfo` / `BuildTimelineEcho` / `OnDungeonTimelineOpenInfo` turn a non-empty
+  `0x13F2` into one `0x1581` per record, in order, and `0x13F2` is in the `TryHandle`
+  allow-list. A malformed list is consumed with a warning, never passed to the replay table.
+- `PostHandshakeDungeonIds` is now documented as a **fallback**. `OnWorldReady` still sends it,
+  gated on `DbProxyHandlers.SendPostHandshakeDungeonBurst` (default `true`).
+- `TimelineEchoed` says whether World has ever sent the list on this process.
 
-```csharp
-        0x13F2, // DSA_DUNGEON_TIMELINE_OPEN_INFO      (periodic heartbeat)
-```
+Ground truth is `data/cap_timeline.bin` — both captured `0x13F2` frames and both 98-frame
+`0x1581` bursts — and the `Timeline_*` tests rebuild the bursts from the requests byte for byte.
 
-It should stay in `OneWayFromWorld` (it must never become a replay request entry), but
-`DbProxyHandlers` should handle the non-empty form. Add to the `TryHandle` allow-list and
-dispatch:
-
-```csharp
-            case DSA_DUNGEON_TIMELINE_OPEN_INFO:   // 0x13F2, non-empty form only
-```
-
-```csharp
-            case DSA_DUNGEON_TIMELINE_OPEN_INFO: return OnDungeonTimelineOpenInfo(link, payload);
-```
-
-with
+**The one thing left is human-owned.** `WorldBridge.HandleFrame` swallows every `0x13F2` before
+`DbProxy.TryHandle` is reached, so the handler is unreachable as things stand:
 
 ```csharp
-    public const ushort DSA_DUNGEON_TIMELINE_OPEN_INFO = 0x13F2;
-    public const int TimelineNodeSize = 0x16;
-
-    /// <summary>
-    /// World's dungeon-open broadcast. Usually empty (the 14-byte frame everyone calls a
-    /// heartbeat); when it is not, each node must come back as one AS_DUNGEON_TIMELINE_ON_OFF.
-    /// Handler_DSA_DUNGEON_TIMELINE_OPEN_INFO (Arb_part_062.c:332) ->
-    /// DungeonManager::SetDungeonTimelineOpen (FUN_140786fd0, Arb_part_065.c:13433).
-    /// Node: [u32 self][u32 next][u32 DungeonId][u8 CurrOpen][i64 NextChange][u8 SendSystemMessage].
-    /// </summary>
-    private bool OnDungeonTimelineOpenInfo(WorldLink link, byte[] payload)
-    {
-        if (payload.Length < 8) return false;
-        int count = (int)BitConverter.ToUInt32(payload, 0);
-        int start = (int)BitConverter.ToUInt32(payload, 4) - 6;      // frame-relative
-        if (count <= 0) return true;                                  // the empty form: nothing to do
-        if (start < 0 || count > 4096 || start + count * TimelineNodeSize > payload.Length)
-        {
-            _log.LogWarning("0x13F2: bad node list count={N} start={S} len={L}", count, start, payload.Length);
-            return true;
-        }
-        for (int i = 0; i < count; i++)
-        {
-            int o = start + i * TimelineNodeSize;
-            link.SendFrame(AS_DUNGEON_OPEN_1581, Build1581(
-                BitConverter.ToUInt32(payload, o + 8), payload[o + 12] != 0,
-                BitConverter.ToUInt64(payload, o + 13)));
-        }
-        _log.LogInformation("0x13F2: echoed {N} dungeon-timeline states back as 0x1581", count);
-        return true;
-    }
+            case OpHeartbeat14:
+            case OpHeartbeat6:
+                return;
 ```
 
-and `Build1581` corrected to the real field shape (keeping the old signature as an overload so
-the T23 tests and `OnWorldReady` keep compiling):
+becomes
 
 ```csharp
-    /// <summary>AS_DUNGEON_TIMELINE_ON_OFF (0x1581): [u32 DungeonId][u8 IsOn][u64 NextChange]
-    /// — writer FUN_1407ace90 (Arb_part_066.c:17289), dumper field names Arb_part_011.c:10058.</summary>
-    public static byte[] Build1581(uint dungeonId, bool isOn = true, ulong nextChange = 0)
-    {
-        var p = new byte[13];
-        BitConverter.GetBytes(dungeonId).CopyTo(p, 0);
-        p[4] = (byte)(isOn ? 1 : 0);
-        BitConverter.GetBytes(nextChange).CopyTo(p, 5);
-        return p;
-    }
+            case OpHeartbeat6:
+                return;
+
+            case OpHeartbeat14:
+                // DSA_DUNGEON_TIMELINE_OPEN_INFO. 909 of the 911 frames across the four captures
+                // are the empty 14-byte form - a real heartbeat - but the first one after World
+                // registers its dungeons carries the open-state list the real Arbiter echoes back
+                // as 0x1581, one frame per record (status/HANDSHAKE-DATA.md section 0).
+                if (payload.Length > 8) DbProxy?.TryHandle(this, link, op, payload);
+                return;
 ```
 
-`Build1581(id)` then produces exactly the bytes it does today, so nothing regresses.
+The `payload.Length > 8` test keeps the heartbeat path free and means the replay table is never
+consulted for `0x13F2` — it stays sealed in `WorldReplayTable.OneWayFromWorld`, which is correct
+and unchanged.
 
-Once the echo exists, `OnWorldReady`'s unconditional 98-push burst becomes a **fallback**: keep
-it, but skip it if a non-empty `0x13F2` has already been answered on this World process. A
-boolean on `DbProxyHandlers` set by `OnDungeonTimelineOpenInfo` and cleared alongside
-`_gameIdSeq` is enough; without the echo the two would double up (World would get 196 pushes,
-98 of them with `IsOn` from the capture rather than from World).
+**Then, in order:**
+
+1. Apply the diff above and run a login. The log should carry
+   `0x13F2: echoed 98 dungeon-timeline states back as 0x1581 (fallback burst also sent ...)`.
+2. Once that line appears, set `DbProxyHandlers.SendPostHandshakeDungeonBurst = false`. From then
+   on the ids are World's own rather than a 2026-09-13 capture's, which is what the real Arbiter
+   does — it never sends an unsolicited `0x1581`.
+3. Keep the fallback available. In the two captures where World sent no list the real Arbiter
+   sent no `0x1581` at all and login still worked, but `CLAUDE.md` records a live-verified case
+   where the burst was what unblocked a first enter-world into a fresh World process. Until a
+   live run settles that, the flag is the way to move between the two behaviours in one line.
+
+Sending both is safe in the meantime: `0x1581` is an idempotent state push (`dungeon X is on
+until T`), and the echo carries World's values, so it supersedes anything the fallback got wrong.
 
 ### (b) Feed the burst list from the sheets at startup
 
