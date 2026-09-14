@@ -8,7 +8,7 @@ Read order for anyone new: `CLAUDE.md` (workspace rules at the top) -> `status/H
 (every per-user W->A opcode and how it is answered) -> this file.
 
 Build: `dotnet build TeraSharp.sln` — 0 warnings, 0 errors.
-Tests: `dotnet run --project src\TeraSharp.Arbiter.Tests` — **324**.
+Tests: `dotnet run --project src\TeraSharp.Arbiter.Tests` — **364**.
 
 ---
 
@@ -17,7 +17,8 @@ Tests: `dotnet run --project src\TeraSharp.Arbiter.Tests` — **324**.
 | Area | Status |
 |---|---|
 | Client crypto / codec / login / char list / select / create / delete | real |
-| Chat, client settings (persisted), social lists | real |
+| Chat, client settings (persisted) | real |
+| Friends, friend groups, memos, block list — two-step requests, all from rows | real (T30) |
 | World handshake, 0x147D promotion records (live timestamps), 0x1581 burst, post-handshake config burst | real |
 | Enter-world, blob save/load, restriction, gameId per login | real, live-verified |
 | Per-user DB writes during play (T15), quests (T17), inventory (T20), skills in blob (T18) | real |
@@ -27,7 +28,8 @@ Tests: `dotnet run --project src\TeraSharp.Arbiter.Tests` — **324**.
 | Reputation (0x2890), fatigability (0x2909) — rebuilt from rows | real (T26), pinned from the decompile |
 | Dungeon cool times (0x13B6 write, 0x2868 load, 0x148D pushes) | real (T25) |
 | Multiple players | blocked on a two-login capture |
-| Account auth | accept-all |
+| Account auth | accept-all by default; real tera-api validation behind `TERASHARP_AUTH=true` (T31) |
+| GM commands (`/@`) — dispatcher, gate, World forward, 6 Arbiter commands | real (T32), needs the HandlerRegistry lines |
 
 ## Where the truth lives
 
@@ -42,6 +44,11 @@ Tests: `dotnet run --project src\TeraSharp.Arbiter.Tests` — **324**.
 | Enter-world failure and the fallback retry | `status/ENTER-WORLD-FALLBACK.md` |
 | The per-character login loads, and the two that resisted | `status/ACHIEVEMENTS.md` |
 | Reputation and fatigability, and why the captures alone could not pin them | `status/REPUTATION-FATIGABILITY.md` |
+| Friends, groups, memos, blocks — and the patch-101 def trap | `status/FRIENDS.md` |
+| What a second player still needs | `status/MULTIPLAYER-DESIGN.md` |
+| The login ticket, and who actually checks it | `status/AUTH-DESIGN.md` |
+| How `/@` commands reach the server and who runs them | `status/GM-DESIGN.md` |
+| Every GM command, by side and risk tier | `status/GM-COMMANDS-ARBITER.md`, `status/GM-COMMANDS-FULL.md` |
 | Dungeon cool times and entry counts | `status/DUNGEON-COOLTIME.md` |
 | Everything else in the 2026-09-13 relog capture | `status/RELOG-CAPTURE-NOTES.md` |
 
@@ -87,6 +94,10 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
 - `C_DUNGEON_COOL_TIME_LIST` reply: needs a client capture and a registry entry
   (`status/DUNGEON-COOLTIME.md` §5).
 - Exit countdown: `S_PREPARE_EXIT` is not in the def registry (human-owned).
-- Two-login capture -> multi-player tunnel routing.
+- Two-login capture -> multi-player tunnel routing, `S_CHANGE_FRIEND_STATE` on login/logout and
+  the `AS_*` block-list pushes (`status/MULTIPLAYER-DESIGN.md`).
+- Friend/blocked memos skip the Arbiter's banned-word + NetModerator stage (we have neither).
+- GM: the client only offers `/@` for a QA login (`S_LOGIN_ARBITER.status` 31/33) - LoginHandlers
+  still sends 0, so the one-line diff in `status/GM-DESIGN.md` §6 is untested live.
 - `status/*.txt` (15 decompile scratch files) should be deleted; Cowork has no delete tool
   in this session, so the human runs the `git rm` in the T24 report.
