@@ -29,6 +29,7 @@ public sealed class SocialHandlers
         _log = log;
         UseChatLogger(log);   // T47: the chat manager logs through the same sink
         PartyWiring.UsePartyLogger(log);   // T49: and so does the party manager
+        GuildWiring.UseGuildLogger(log);    // T51: and the guild handler
     }
 
     // ---- Limits and constants, all from the decompile (status/FRIENDS.md section 3) ----
@@ -177,6 +178,10 @@ public sealed class SocialHandlers
         // human-owned WorldEntry. PartyWiring.Register ignores a session that is not in world,
         // because the Ticket it keys on is only allocated one line earlier in WorldEntry.
         PartyWiring.Register(session);
+        // T51: guilds ride the same edge. A character with no guild row produces nothing; one
+        // with a guild gets S_UPDATE_GUILD_MEMBER(status = online) fanned out to the rest of it
+        // and AS_UPDATE_GUILD_MEMBER sent to World, so its read-only mirror agrees.
+        GuildWiring.Register(session);
     }
 
     internal static void UnregisterSession(string characterName)
@@ -200,6 +205,9 @@ public sealed class SocialHandlers
         // with S_LOGOUT_PARTY_MEMBER - so this has to run on the same two leave paths
         // GameSession already calls UnregisterChat from (OnWorldLeaveConfirmed and LeaveWorld).
         PartyWiring.Unregister(session);
+        // T51: the GUILD MEMBERSHIP survives a logout - only GuildMemberData+0x70 moves - so
+        // this is a state flip plus a stored logout time, never a row delete.
+        GuildWiring.Unregister(session);
     }
 
     /// <summary>
