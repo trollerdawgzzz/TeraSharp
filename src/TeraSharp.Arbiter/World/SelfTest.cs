@@ -251,7 +251,7 @@ public static class SelfTest
             else { warnings++; log.LogWarning("{Line}", Format(r)); }
         }
         if (failures == 0 && warnings == 0)
-            log.LogInformation("selftest: {N}/{N} PASS - the deploy is complete", results.Count);
+            log.LogInformation("selftest: {N}/{Total} PASS - the deploy is complete", results.Count, results.Count);
         else if (failures == 0)
             log.LogWarning("selftest: {P}/{N} PASS, {W} optional missing - it will run",
                 results.Count - warnings, results.Count, warnings);
