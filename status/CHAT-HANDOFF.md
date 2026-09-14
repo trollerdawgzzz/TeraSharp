@@ -118,6 +118,19 @@ and look for the next caller.
 
 ## Next steps (in order)
 
+**Live session 2026-09-14 22:45-23:55 - results.** Passed: fresh warrior on a fresh World with own
+hotbar/tooltips (fixed: empty S_LOAD_CLIENT_USER_SETTING default), quests through the 9827 teleport,
+loot persisted (T44 items table), level/exp/achievements/reputation/cooldowns/tips persisted, keybinds
+persisted, Exit + relog -> 0x138D -> retry at return point -> Island of Dawn -> World re-teleports into
+a fresh instance (twice), friends groups + same-account refusal, chat, GM /@ recognised (status=31
+confirmed). Fixed during the session: C_DELETE_USER FK cascade; AS_ENTER_WORLD [48] zone from the blob
+(stale lobby record sent zone 5 with 9827 coords -> void spawn). Broken/pending: potions do not
+decrement on screen (client packet 30152 forwarded to World and rejected - T45), mailbox shows 12
+phantom rows (replayed list - T45), quest not advancing after relog (T45), forwarded World GM
+commands (`perfect_level -> Unknown`) and World's AdminLevel[0] (T46), warehouse untested, T20's
+inventory work had been LOST (never committed) and was redone as T44. deploy.ps1 now runs --selftest
+and needs TERASHARP_GM_ACCOUNTS uncommented for /@.
+
 **2026-09-15 checkpoint: 448 tests, T36-T38 merged.** Since the last checkpoint: TunnelFrames
 (multi-recipient 0x13F7 parser, 0x13F6 builder with WorldClient addressing, TicketAllocator -
 call-site swap for WorldBridge in the T38 report / MULTIPLAYER-DESIGN section 6, NOT applied yet),
