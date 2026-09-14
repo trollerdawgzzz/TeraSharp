@@ -8,7 +8,7 @@ Read order for anyone new: `CLAUDE.md` (workspace rules at the top) -> `status/H
 (every per-user W->A opcode and how it is answered) -> this file.
 
 Build: `dotnet build TeraSharp.sln` — 0 warnings, 0 errors.
-Tests: `dotnet run --project src\TeraSharp.Arbiter.Tests` — **429**.
+Tests: `dotnet run --project src\TeraSharp.Arbiter.Tests` — **517**.
 Deploy check: `TeraSharp.Arbiter.exe --selftest` — one PASS/FAIL line per data dependency (T37).
 
 ---
@@ -22,7 +22,8 @@ Deploy check: `TeraSharp.Arbiter.exe --selftest` — one PASS/FAIL line per data
 | Friends, friend groups, memos, block list — two-step requests, all from rows | real (T30) |
 | World handshake, 0x147D promotion records (live timestamps), 0x1581 burst, post-handshake config burst | real |
 | Enter-world, blob save/load, restriction, gameId per login | real, live-verified |
-| Per-user DB writes during play (T15), quests (T17), inventory (T20), skills in blob (T18) | real |
+| Per-user DB writes during play (T15), quests (T17), skills in blob (T18) | real |
+| Inventory — bag + worn slots are rows in the same `items` table as the warehouse; 0x27A4 rebuilt from them, atoms applied | real (T44) |
 | Zone change / quest teleport (0x13BE/0x13C0 echoes) | real, live-verified |
 | Relog into an instance (0x138D -> retry at the stored return point) | implemented (T21), **live test pending** |
 | Achievements, tutorial tips, seren guide, dungeon history — rebuilt from rows | real (T22) |
@@ -31,6 +32,8 @@ Deploy check: `TeraSharp.Arbiter.exe --selftest` — one PASS/FAIL line per data
 | Multiple players | blocked on a two-login capture |
 | Account auth | accept-all by default; real tera-api validation behind `TERASHARP_AUTH=true` (T31) |
 | GM commands (`/@`) — dispatcher, gate, World forward, 6 Arbiter commands | real (T32), needs the HandlerRegistry lines |
+| Warehouse — 8 W->A requests answered from `items`/`warehouses` rows, `0x2754` sealed | real (T42) |
+| Mail — the 3 Arbiter-owned client packets + `parcels` table; World's 6 `SDB_*_PARCEL` are not answered | half real (T42) |
 
 ## Where the truth lives
 
@@ -53,6 +56,9 @@ Deploy check: `TeraSharp.Arbiter.exe --selftest` — one PASS/FAIL line per data
 | The two tunnel frame layouts, and the Ticket | `status/MULTIPLAYER-DESIGN.md` §6, `World/TunnelFrames.cs` |
 | Every GM command, by side and risk tier | `status/GM-COMMANDS-ARBITER.md`, `status/GM-COMMANDS-FULL.md` |
 | Dungeon cool times and entry counts | `status/DUNGEON-COOLTIME.md` |
+| Mail, the warehouse, and which pocket id means what | `status/MAIL-WAREHOUSE.md` |
+| Where an item is, and which atom op moved it | `status/INVENTORY-DESIGN.md` §7, `status/PERSISTENCE-MAP.md` |
+| Why a warehouse move is not an `SDB_ITEM_SINGLE` atom | `status/MAIL-WAREHOUSE.md` §6 |
 | Everything else in the 2026-09-13 relog capture | `status/RELOG-CAPTURE-NOTES.md` |
 | Guilds - the object, the SQL schema, the opcodes and the .def corrections | `status/GUILD-DESIGN.md` |
 | Guild rows, the Arbiter-side guild handlers, and the wiring they still need | `status/GUILD-DESIGN.md` section 10 |
@@ -105,6 +111,14 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
 - Friend/blocked memos skip the Arbiter's banned-word + NetModerator stage (we have neither).
 - GM: the client only offers `/@` for a QA login (`S_LOGIN_ARBITER.status` 31/33) - LoginHandlers
   still sends 0, so the one-line diff in `status/GM-DESIGN.md` §6 is untested live.
+- Mail: World's six `SDB_*_PARCEL` requests are still unanswered, so the first mailbox a live
+  player opens gives `no replay for 0x2777` and head-blocks that character
+  (`status/MAIL-WAREHOUSE.md` §7). The client half and the `parcels` table are done (T42).
+- T42 needs four lines in `HandlerRegistry.cs` (human-owned): the three `C_PARCEL_*`
+  registrations and the `SendReadRecvStatus` push at `C_LOAD_TOPO_FIN` —
+  `status/MAIL-WAREHOUSE.md` §8.
+- Warehouse `MaxSlotCount` is 0 until a `warehouses` row exists; the real caps are in
+  `ServerConfig.xml`, which we do not read.
 - `status/*.txt` (15 decompile scratch files) should be deleted; Cowork has no delete tool
   in this session, so the human runs the `git rm` in the T24 report.
 - The replayed `DBS_INIT_GUILD_DATA` (0x27ED) leaks two bytes of the real Arbiter's

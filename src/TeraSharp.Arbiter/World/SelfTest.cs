@@ -30,6 +30,7 @@ public static class SelfTest
         "achievements", "achievements_done", "dungeon_cooldowns", "reputations",
         "fatigability", "tutorial_tips", "seren_guide", "counters",
         "client_settings", "account_settings",
+        "items", "warehouses", "parcels", "parcel_items",   // T42
     };
 
     /// <summary>Columns added by a later migration - the ones a stale terasharp.db will be missing.</summary>

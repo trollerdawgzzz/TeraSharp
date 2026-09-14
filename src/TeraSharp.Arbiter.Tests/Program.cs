@@ -2141,6 +2141,8 @@ array items
             0x2927, 0x1491, 0x156F, 0x13C5, 0x13C6, 0x1499, 0x15FA,   // 0x13B6 became a handler in T25
             // T23: Handler_SA_REWARD_CITYWAR_KILL_DEATH_COUNT has no SendToSession.
             0x15F9,
+            // T42: SDB_MOVE_WAREHOUSE_ITEM is a ten-line stub in the real Arbiter that sends nothing.
+            0x2754,
         };
         foreach (var op in expected)
             Hex.True(WorldReplayTable.OneWayFromWorld.Contains(op),
@@ -10686,6 +10688,788 @@ some prose with `backticks` that is not a table row
             b[7 + i * 2] = (byte)(guildName[i] >> 8);
         }
         return b;
+    }
+
+    // ======================================================================
+    // T42 — mail (the three Arbiter-owned client packets) and the warehouse.
+    // status/MAIL-WAREHOUSE.md. Only ONE frame in any capture belongs to this
+    // whole area: S_PARCEL_READ_RECV_STATUS in cap_newchar_client.log frame
+    // 312. Everything else is checked against the decompiled writers, and the
+    // min-length guard of each handler, which land exactly on the last field.
+    // ======================================================================
+
+    [Test] public static void T42_parcel_read_recv_status_is_byte_exact_against_the_capture()
+    {
+        // cap_newchar_client.log frame 312, sent unprompted after S_LOAD_CLIENT_USER_SETTING:
+        //   0D 00 6E F2 | 00 00 00 00 | 00 00 00 00 | 00
+        Hex.Eq(ParcelHandlers.BuildReadRecvStatus(0, 0),
+               "0D 00 6E F2 00 00 00 00 00 00 00 00 00",
+               "the empty S_PARCEL_READ_RECV_STATUS is the captured frame 312");
+    }
+
+    [Test] public static void T42_parcel_read_recv_status_is_thirteen_bytes_not_twelve()
+    {
+        // S_PARCEL_READ_RECV_STATUS.2.def declares only the two uint32 counters - 12 bytes on
+        // the wire. The writer (FUN_140979060, Arb_part_082.c:18805) emits two u32 AND a u8,
+        // and the capture is 13. SendByDef would send a frame the client cannot parse; this
+        // test is here so nobody "simplifies" the raw builder away.
+        var p = ParcelHandlers.BuildReadRecvStatus(3, 1);
+        Hex.True(p.Length == 13, $"13 bytes, not {p.Length} - the .def is missing the trailing byte");
+        Hex.True(BitConverter.ToUInt16(p, 0) == 13, "the length header agrees");
+        Hex.True(BitConverter.ToUInt32(p, 4) == 3, "totalUnread");
+        Hex.True(BitConverter.ToUInt32(p, 8) == 1, "readUnclaimedParcels");
+        Hex.True(p[12] == 0, "the trailing flag is 0 at every call site in the real Arbiter");
+    }
+
+    [Test] public static void T42_show_parcel_message_matches_the_writer()
+    {
+        // FUN_1404edc40: reserve a u16 string slot, write the u32 id, backpatch the slot to the
+        // running frame length (always 10), append the wide string with its terminator.
+        var p = ParcelHandlers.BuildShowParcelMessage(7, "hi");
+        Hex.Eq(p, "10 00 D3 AB 0A 00 07 00 00 00 68 00 69 00 00 00",
+               "S_SHOW_PARCEL_MESSAGE: [len][op][msgOffset=10][u32 id][wchar][NUL]");
+        Hex.True(BitConverter.ToUInt16(p, 4) == 10, "the message offset is packet-absolute and constant");
+        Hex.True(BitConverter.ToUInt16(p, 0) == p.Length, "the length header agrees");
+    }
+
+    [Test] public static void T42_show_parcel_message_handles_an_empty_body()
+    {
+        var p = ParcelHandlers.BuildShowParcelMessage(1, "");
+        Hex.Eq(p, "0C 00 D3 AB 0A 00 01 00 00 00 00 00", "an empty message is still terminated");
+    }
+
+    [Test] public static void T42_parcel_report_is_the_five_byte_failure_form()
+    {
+        Hex.Eq(ParcelHandlers.BuildParcelReport(false), "05 00 FC 73 00",
+               "S_PARCEL_REPORT failure - what the real Arbiter sends when the parcel lookup misses");
+        Hex.Eq(ParcelHandlers.BuildParcelReport(true), "05 00 FC 73 01", "and the success form");
+    }
+
+    [Test] public static void T42_parcel_opcodes_are_the_decompiled_ones()
+    {
+        // Cross-checked against tera-server-proxy/data/data.json maps."376012" outside the build.
+        Hex.True(ParcelHandlers.C_SHOW_PARCEL_MESSAGE == 0xFA59, "C_SHOW_PARCEL_MESSAGE");
+        Hex.True(ParcelHandlers.S_SHOW_PARCEL_MESSAGE == 0xABD3, "S_SHOW_PARCEL_MESSAGE");
+        Hex.True(ParcelHandlers.C_PARCEL_READ_RECV_STATUS == 0xE292, "C_PARCEL_READ_RECV_STATUS");
+        Hex.True(ParcelHandlers.S_PARCEL_READ_RECV_STATUS == 0xF26E, "S_PARCEL_READ_RECV_STATUS");
+        Hex.True(ParcelHandlers.C_PARCEL_REPORT == 0xC09A, "C_PARCEL_REPORT");
+        Hex.True(ParcelHandlers.S_PARCEL_REPORT == 0x73FC, "S_PARCEL_REPORT");
+    }
+
+    [Test] public static void T42_parcels_round_trip_through_the_store()
+    {
+        string dir = T37TempDir();
+        try
+        {
+            using var store = new TeraSharp.Arbiter.Persistence.CharacterStore(
+                Path.Combine(dir, "parcels.db"), QuietLog());
+
+            int a = store.CreateParcel(10, "Sender", 20, "subject", "body text", 500);
+            int b = store.CreateParcel(11, "Other", 20, "second", "more", 0);
+            Hex.True(a != b, "each parcel gets its own id");
+
+            var (unread, unclaimed) = store.GetParcelCounts(20);
+            Hex.True(unread == 2 && unclaimed == 0, $"two unread, none opened-but-unclaimed, got {unread}/{unclaimed}");
+
+            Hex.True(store.SetParcelRead(a, 20), "the receiver may mark it read");
+            Hex.True(!store.SetParcelRead(b, 21), "somebody else may not");
+
+            (unread, unclaimed) = store.GetParcelCounts(20);
+            Hex.True(unread == 1 && unclaimed == 1, $"one unread, one read-but-unclaimed, got {unread}/{unclaimed}");
+
+            var row = store.GetParcel(a);
+            Hex.True(row != null && row.Message == "body text" && row.Money == 500 && row.IsRead,
+                     "the body, the money and the read flag survive the round trip");
+            Hex.True(store.GetParcelsFor(20).Count == 2, "both parcels are listed for the receiver");
+            Hex.True(store.GetParcelsFor(99).Count == 0, "and none for anyone else");
+
+            Hex.True(store.AddParcelItem(a, 0, 1234, 6550, 20), "attachment slot 0");
+            Hex.True(!store.AddParcelItem(a, 5, 1, 1, 1),
+                     "slot 5 is refused - the real server has exactly five attachment slots");
+            Hex.True(store.CountParcelItems(a) == 1, "one attachment stored");
+        }
+        finally { Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools(); Directory.Delete(dir, true); }
+    }
+
+    // ---------------------------------------------------------------- warehouse
+
+    [Test] public static void T42_inven_type_masks_are_the_decompiled_ones()
+    {
+        // mask 0x120A at Arb_part_047.c:13295 and seven more sites.
+        foreach (uint t in new uint[] { 1, 3, 9, 12 })
+            Hex.True(WarehouseHandlers.IsWarehouse(t), $"INVEN_TYPE {t} is a warehouse");
+        foreach (uint t in new uint[] { 0, 2, 4, 5, 8, 13, 14, 99 })
+            Hex.True(!WarehouseHandlers.IsWarehouse(t), $"INVEN_TYPE {t} is not a warehouse");
+
+        // TransSQLExec::IsAccountDbIdInvenType, mask 0x1132 (FUN_14049ac90, Arb_part_038.c:11173).
+        foreach (uint t in new uint[] { 1, 4, 5, 8, 12 })
+            Hex.True(WarehouseHandlers.IsAccountKeyed(t), $"INVEN_TYPE {t} is keyed by account");
+        foreach (uint t in new uint[] { 0, 3, 9, 14 })
+            Hex.True(!WarehouseHandlers.IsAccountKeyed(t), $"INVEN_TYPE {t} is keyed by character");
+
+        Hex.True(WarehouseHandlers.InvenBag == 0 && WarehouseHandlers.InvenAccountWarehouse == 1
+                 && WarehouseHandlers.InvenCharacterWarehouse == 9 && WarehouseHandlers.InvenStyleWarehouse == 12,
+                 "the three ids the increase-size dispatch proves, plus the bag");
+    }
+
+    [Test] public static void T42_warehouse_field_offsets_are_payload_relative()
+    {
+        // Every offset is (frame offset - 6), and every handler's min-length guard lands exactly
+        // on the end of its last field. Checked pair by pair against the PDL dumpers.
+        void Field(string name, int actual, int frame) =>
+            Hex.True(actual == frame - 6, $"{name} is at payload {actual}, expected {frame - 6} (frame 0x{frame:X})");
+
+        Field("ViewReq.DlmId", WarehouseHandlers.ViewReqDlmId, 6);
+        Field("ViewReq.OwnerDBID", WarehouseHandlers.ViewReqOwnerDbId, 10);
+        Field("ViewReq.ArbiterUser", WarehouseHandlers.ViewReqArbiterUser, 0x12);
+        Field("ViewReq.InvenType", WarehouseHandlers.ViewReqInvenType, 0x1A);
+        Field("ViewReq.ViewPos", WarehouseHandlers.ViewReqViewPos, 0x1E);
+
+        Field("ViewRsp.DlmId", WarehouseHandlers.ViewRspDlmId, 0x0E);
+        Field("ViewRsp.Success", WarehouseHandlers.ViewRspSuccess, 0x12);
+        Field("ViewRsp.ViewSize", WarehouseHandlers.ViewRspViewSize, 0x17);
+        Field("ViewRsp.CurrentMoney", WarehouseHandlers.ViewRspCurrentMoney, 0x23);
+        Field("ViewRsp.MaxSlotCount", WarehouseHandlers.ViewRspMaxSlotCount, 0x2B);
+
+        Field("StoreReq.DlmId", WarehouseHandlers.StoreReqDlmId, 0x0E);
+        Field("StoreReq.InvenType", WarehouseHandlers.StoreReqInvenType, 0x22);
+        Field("StoreReq.MoneyDelta", WarehouseHandlers.StoreReqMoneyDelta, 0x37);
+        Field("GetReq.WareInvenType", WarehouseHandlers.GetReqWareInvenType, 0x1A);
+        Field("GetReq.MoneyDelta", WarehouseHandlers.GetReqMoneyDelta, 0x36);
+        Field("Transfer.WareCommision", WarehouseHandlers.TransferRspWareCommision, 0x17);
+
+        // The guards: min frame == 6 + the payload size.
+        Hex.True(WarehouseHandlers.ViewRequestSize == 0x22 - 6, "SDB_VIEW_WAREHOUSE guard is frame >= 0x22");
+        Hex.True(WarehouseHandlers.StoreRequestSize == 0x3F - 6, "SDB_STORE_WAREHOUSE guard is frame >= 0x3F");
+        Hex.True(WarehouseHandlers.GetRequestSize == 0x3E - 6, "SDB_GET_WAREHOUSE guard is frame >= 0x3E");
+        Hex.True(WarehouseHandlers.ViewReplyHeader == 0x2D - 6, "DBS_VIEW_WAREHOUSE header is 39 B");
+        Hex.True(WarehouseHandlers.TransferReplyHeader == 0x1F - 6, "the shared transfer header is 25 B");
+    }
+
+    [Test] public static void T42_view_warehouse_empty_form()
+    {
+        var p = WarehouseHandlers.BuildDbsViewWarehouse(0x1234, ok: true, viewPos: 0, endPos: 0,
+                                                        totalItemNum: 0, currentMoney: 0,
+                                                        maxSlotCount: 0, items: null);
+        Hex.True(p.Length == 39, $"the empty reply is the 39-byte header alone, got {p.Length}");
+        Hex.True(BitConverter.ToUInt32(p, 0) == 45, "the list offset is frame-relative: 6 + 39");
+        Hex.True(BitConverter.ToUInt32(p, 4) == 0, "and the list is empty");
+        Hex.True(BitConverter.ToUInt32(p, WarehouseHandlers.ViewRspDlmId) == 0x1234, "the LIVE DlmId is echoed");
+        Hex.True(p[WarehouseHandlers.ViewRspSuccess] == 1, "Success");
+        Hex.True(BitConverter.ToUInt32(p, WarehouseHandlers.ViewRspViewSize) == 0x48,
+                 "ViewSize is the hard-coded 0x48 the real writer emits (Arb_part_048.c:13834)");
+    }
+
+    [Test] public static void T42_view_warehouse_lists_item_records()
+    {
+        var one = WarehouseHandlers.BuildItemRecord(1001, 6550, 42, 20, WarehouseHandlers.InvenAccountWarehouse, 3);
+        var two = WarehouseHandlers.BuildItemRecord(1002, 6560, 42, 1, WarehouseHandlers.InvenAccountWarehouse, 4);
+        Hex.True(one.Length == 536 && two.Length == 536, "an ItemData record is 0x218 bytes");
+
+        var p = WarehouseHandlers.BuildDbsViewWarehouse(9, true, 0, 2, 2, 123456789L, 576,
+                                                        new[] { one, two });
+        Hex.True(p.Length == 39 + 2 * 536, "header plus two records");
+        Hex.True(BitConverter.ToUInt32(p, 4) == 2 * 536, "the list length is in bytes, not elements");
+        Hex.True(BitConverter.ToUInt32(p, WarehouseHandlers.ViewRspTotalItemNum) == 2, "TotalItemNum");
+        Hex.True(BitConverter.ToInt64(p, WarehouseHandlers.ViewRspCurrentMoney) == 123456789L, "CurrentMoney is i64");
+        Hex.True(BitConverter.ToUInt16(p, WarehouseHandlers.ViewRspMaxSlotCount) == 576, "MaxSlotCount is u16");
+
+        // The record fields the client reads, at the 0x27A4 offsets.
+        int at = 39;
+        Hex.True(BitConverter.ToInt32(p, at + 0) == 1001, "record: item DB id at +0");
+        Hex.True(BitConverter.ToInt32(p, at + 8) == 6550, "record: template id at +8");
+        Hex.True(BitConverter.ToInt32(p, at + 16) == 42, "record: owner at +16");
+        Hex.True(BitConverter.ToInt32(p, at + 24) == 20, "record: amount at +24");
+        Hex.True(BitConverter.ToInt32(p, at + 28) == 1, "record: pocket at +28 is the INVEN_TYPE");
+        Hex.True(BitConverter.ToInt32(p, at + 36) == 3, "record: slot at +36");
+    }
+
+    /// <summary>A synthetic SDB_STORE_WAREHOUSE payload: the 57-byte header then packed atoms.</summary>
+    static byte[] T42StorePayload(params (uint Op, long ItemDbId, int Template, long SrcOwner, uint SrcInven,
+                                          long DstOwner, uint DstInven, uint DstSlot, long Delta)[] atoms)
+    {
+        int header = WarehouseHandlers.StoreRequestSize;
+        var p = new byte[header + atoms.Length * DbProxyHandlers.ItemAtomSize];
+        BitConverter.GetBytes((uint)(6 + header)).CopyTo(p, WarehouseHandlers.StoreReqBinaryRef);
+        BitConverter.GetBytes((uint)(atoms.Length * DbProxyHandlers.ItemAtomSize)).CopyTo(p, WarehouseHandlers.StoreReqBinaryRef + 4);
+        BitConverter.GetBytes(0xABCDu).CopyTo(p, WarehouseHandlers.StoreReqDlmId);
+        for (int i = 0; i < atoms.Length; i++)
+        {
+            int a = header + i * DbProxyHandlers.ItemAtomSize;
+            var x = atoms[i];
+            BitConverter.GetBytes(i).CopyTo(p, a);
+            BitConverter.GetBytes(x.Op).CopyTo(p, a + WarehouseHandlers.AtomOp);
+            BitConverter.GetBytes(x.ItemDbId).CopyTo(p, a + WarehouseHandlers.AtomItemDbId);
+            BitConverter.GetBytes(x.Template).CopyTo(p, a + WarehouseHandlers.AtomTemplateId);
+            BitConverter.GetBytes(x.SrcOwner).CopyTo(p, a + WarehouseHandlers.AtomSrcOwner);
+            BitConverter.GetBytes(x.SrcInven).CopyTo(p, a + WarehouseHandlers.AtomSrcInven);
+            BitConverter.GetBytes(x.DstOwner).CopyTo(p, a + WarehouseHandlers.AtomDstOwner);
+            BitConverter.GetBytes(x.DstInven).CopyTo(p, a + WarehouseHandlers.AtomDstInven);
+            BitConverter.GetBytes(x.DstSlot).CopyTo(p, a + WarehouseHandlers.AtomDstSlot);
+            BitConverter.GetBytes(x.Delta).CopyTo(p, a + WarehouseHandlers.AtomDelta);
+        }
+        return p;
+    }
+
+    [Test] public static void T42_transfer_reply_echoes_the_atoms_with_allocated_ids()
+    {
+        // One move of a known item and one insert that arrives with id 0 - the shape
+        // PrepareWareSendTransaction produces for "bank a partial stack".
+        var payload = T42StorePayload(
+            (WarehouseHandlers.TsWareMoveItem, 1001, 6550, 42, 0, 7, 1, 3, 0),
+            (WarehouseHandlers.TsWareInsertItem, 0, 6560, 42, 0, 7, 1, 4, 5));
+
+        int next = 5000;
+        var (atoms, parsed) = WarehouseHandlers.CloneAtomsWithIds(
+            payload, WarehouseHandlers.StoreReqBinaryRef, WarehouseHandlers.StoreRequestSize, () => next++);
+
+        Hex.True(parsed.Count == 2, $"two atoms parsed, got {parsed.Count}");
+        Hex.True(parsed[0].ItemDbId == 1001, "an atom that already has an id keeps it");
+        Hex.True(parsed[1].ItemDbId == 5000, $"the insert got the allocated id, saw {parsed[1].ItemDbId}");
+        Hex.True(next == 5001, "exactly one id was allocated");
+        Hex.True(BitConverter.ToInt64(atoms, DbProxyHandlers.ItemAtomSize + WarehouseHandlers.AtomItemDbId) == 5000,
+                 "and the echoed BYTES carry it, so World keys its item by the id we stored");
+
+        // Everything except the id must come back untouched - the 0x2769 echo rule.
+        for (int o = 0; o < DbProxyHandlers.ItemAtomSize; o++)
+            Hex.True(atoms[o] == payload[WarehouseHandlers.StoreRequestSize + o],
+                     $"atom 0 byte {o} was modified; only an insert's id may change");
+
+        var reply = WarehouseHandlers.BuildDbsTransfer(atoms, 0xABCD, ok: true, error: 0, wareCommision: 0);
+        Hex.True(reply.Length == 25 + atoms.Length, "the 25-byte header plus the atoms");
+        Hex.True(BitConverter.ToUInt32(reply, 0) == 31, "the atom list offset is frame-relative: 6 + 25");
+        Hex.True(BitConverter.ToUInt32(reply, 4) == (uint)atoms.Length, "and its length in bytes");
+        Hex.True(BitConverter.ToUInt32(reply, WarehouseHandlers.TransferRspDlmId) == 0xABCD, "the LIVE DlmId");
+        Hex.True(reply[WarehouseHandlers.TransferRspSuccess] == 1, "Success");
+        for (int i = 0; i < atoms.Length; i++)
+            Hex.True(reply[25 + i] == atoms[i], $"echoed atom byte {i}");
+    }
+
+    [Test] public static void T42_a_malformed_atom_list_still_produces_a_reply()
+    {
+        // An unanswered per-user DB item head-blocks the user's whole queue (HANDOFF.md 1), so a
+        // ref we cannot read must degrade to an empty echo, never to "send nothing".
+        var payload = new byte[WarehouseHandlers.StoreRequestSize];
+        BitConverter.GetBytes(6u).CopyTo(payload, 0);       // offset points into the header
+        BitConverter.GetBytes(999u).CopyTo(payload, 4);     // and a length that is not a multiple
+        var (atoms, parsed) = WarehouseHandlers.CloneAtomsWithIds(
+            payload, 0, WarehouseHandlers.StoreRequestSize, () => throw new Exception("must not allocate"));
+        Hex.True(atoms.Length == 0 && parsed.Count == 0, "a bad ref reads as no atoms");
+        var reply = WarehouseHandlers.BuildDbsTransfer(atoms, 7, true, 0, 0);
+        Hex.True(reply.Length == 25 && BitConverter.ToUInt32(reply, 4) == 0, "and the reply is still well formed");
+    }
+
+    [Test] public static void T42_increase_warehouse_size_is_answered_with_283E()
+    {
+        // Handler_SDB_INCREASE_WAREHOUSE_SIZE (Arb_part_063.c:8588) and
+        // Handler_SDB_INCREASE_INVENTORY_SIZE (:8490) share FUN_1407ad2e0, which writes 0x283E.
+        // Replying 0x2840 would head-block the user.
+        Hex.True(DbProxyHandlers.SDB_INCREASE_WAREHOUSE_SIZE == 0x283F, "the request");
+        Hex.True(DbProxyHandlers.DBS_INCREASE_INVENTORY_SIZE == 0x283E, "the reply the real Arbiter sends");
+        Hex.True(DbProxyHandlers.DBS_INCREASE_WAREHOUSE_SIZE_UNUSED == 0x2840,
+                 "0x2840 exists in the opcode table and is never sent");
+
+        var p = WarehouseHandlers.BuildDbsIncreaseSize(ok: true, dlmId: 0x99);
+        Hex.Eq(p, "01 99 00 00 00", "Success FIRST, then the DlmId - like 0x2892 and 0x2911");
+    }
+
+    [Test] public static void T42_move_warehouse_item_is_never_answered()
+    {
+        // FUN_1405b53c0 (Arb_part_048.c:13050) is ten lines long and sends nothing. Matching it
+        // means the opcode must be sealed one-way, and must NOT be in the allow-list.
+        Hex.True(!DbProxyHandlers.IsHandledRequest(DbProxyHandlers.SDB_MOVE_WAREHOUSE_ITEM),
+                 "0x2754 must not be answered - the real handler is a stub");
+        Hex.True(WorldReplayTable.OneWayFromWorld.Contains(DbProxyHandlers.SDB_MOVE_WAREHOUSE_ITEM),
+                 "and it must be sealed, or the replay table hands it somebody else's DBS_ reply");
+    }
+
+    [Test] public static void T42_the_eight_live_warehouse_requests_are_allow_listed()
+    {
+        foreach (ushort op in new ushort[]
+        {
+            DbProxyHandlers.SDB_VIEW_WAREHOUSE, DbProxyHandlers.SDB_STORE_WAREHOUSE,
+            DbProxyHandlers.SDB_GET_WAREHOUSE, DbProxyHandlers.SDB_CHANGE_WAREHOUSE_POS,
+            DbProxyHandlers.SDB_PAY_WAREHOUSE_COMMISION, DbProxyHandlers.SDB_CLEAR_WAREHOUSE,
+            DbProxyHandlers.SDB_WAREHOUSE_AUTO_SORT, DbProxyHandlers.SDB_INCREASE_WAREHOUSE_SIZE,
+        })
+            Hex.True(DbProxyHandlers.IsHandledRequest(op),
+                     $"0x{op:X4} must be answered or the first bank NPC head-blocks the user");
+    }
+
+    [Test] public static void T42_small_warehouse_replies_match_the_dumpers()
+    {
+        Hex.Eq(WarehouseHandlers.BuildDbsClearWarehouse(0x11223344, true),
+               "44 33 22 11 01", "DBS_CLEAR_WAREHOUSE = [u32 DlmId][u8 ok]");
+        Hex.Eq(WarehouseHandlers.BuildDbsPayCommision(0x11223344, true, 0),
+               "44 33 22 11 01 00 00 00 00", "DBS_PAY_WAREHOUSE_COMMISION = [u32 DlmId][u8 ok][u32 error]");
+
+        var sort = WarehouseHandlers.BuildDbsAutoSort(1, true, 42, 1, 0, 71, 0, 0);
+        Hex.True(sort.Length == 33, $"DBS_WAREHOUSE_AUTO_SORT is 33 payload bytes, got {sort.Length}");
+        Hex.True(BitConverter.ToUInt32(sort, 5) == 42, "UserDbId is echoed after the ok byte");
+        Hex.True(BitConverter.ToUInt32(sort, 17) == 71, "SortEnd is echoed");
+    }
+
+    [Test] public static void T42_atoms_are_applied_to_the_item_rows()
+    {
+        string dir = T37TempDir();
+        try
+        {
+            using var store = new TeraSharp.Arbiter.Persistence.CharacterStore(
+                Path.Combine(dir, "ware.db"), QuietLog());
+
+            const long charId = 42, accountId = 7;
+            const uint bank = WarehouseHandlers.InvenAccountWarehouse;
+
+            // Bank a known item, bank a new split stack, and deposit money.
+            var payload = T42StorePayload(
+                (WarehouseHandlers.TsWareMoveItem, 1001, 6550, charId, 0, accountId, bank, 3, 0),
+                (WarehouseHandlers.TsWareInsertItem, 0, 6560, charId, 0, accountId, bank, 4, 5),
+                (WarehouseHandlers.TsWareChangeMoney, 0, 0, accountId, bank, accountId, bank, 0, 250));
+
+            var (_, parsed) = WarehouseHandlers.CloneAtomsWithIds(
+                payload, WarehouseHandlers.StoreReqBinaryRef, WarehouseHandlers.StoreRequestSize, store.NextItemId);
+            var r = WarehouseHandlers.Apply(store, parsed, store.NextItemId);
+
+            Hex.True(r.Inserted == 2, $"the move of an untracked id inserts, so both items land: {r.Inserted}");
+            Hex.True(r.MoneyDelta == 250, "and the money atom is applied");
+
+            var rows = store.GetItems(accountId, (int)bank);
+            Hex.True(rows.Count == 2, $"two rows in the account bank, got {rows.Count}");
+            Hex.True(rows[0].Slot == 3 && rows[1].Slot == 4, "listed in slot order");
+            Hex.True(rows[0].ItemDbId == 1001, "the banked item kept its id");
+            Hex.True(rows[1].TemplateId == 6560 && rows[1].Amount == 5, "the split stack carries its template and count");
+            Hex.True(store.GetWarehouse(accountId, (int)bank).Money == 250, "money is stored per container");
+            Hex.True(store.GetItems(charId, 0).Count == 0,
+                     "and nothing was invented in the bag - it is not a tracked container");
+
+            // Take half the stack back out.
+            var take = T42StorePayload((WarehouseHandlers.TsWareChangeAmount, rows[1].ItemDbId, 6560,
+                                        accountId, bank, accountId, bank, 4, -3));
+            var (_, parsed2) = WarehouseHandlers.CloneAtomsWithIds(
+                take, WarehouseHandlers.StoreReqBinaryRef, WarehouseHandlers.StoreRequestSize, store.NextItemId);
+            WarehouseHandlers.Apply(store, parsed2, store.NextItemId);
+            var after = store.GetItems(accountId, (int)bank);
+            Hex.True(after.Count == 2 && after[1].Amount == 2, $"5 - 3 = 2, got {after[1].Amount}");
+
+            // Take the rest: the row must go, not sit at zero.
+            var empty = T42StorePayload((WarehouseHandlers.TsWareChangeAmount, after[1].ItemDbId, 6560,
+                                         accountId, bank, accountId, bank, 4, -2));
+            var (_, parsed3) = WarehouseHandlers.CloneAtomsWithIds(
+                empty, WarehouseHandlers.StoreReqBinaryRef, WarehouseHandlers.StoreRequestSize, store.NextItemId);
+            WarehouseHandlers.Apply(store, parsed3, store.NextItemId);
+            Hex.True(store.GetItems(accountId, (int)bank).Count == 1, "an emptied stack is deleted");
+
+            // Slots and clearing.
+            Hex.True(store.AddWarehouseSlots(accountId, (int)bank, 72) == 72, "one page of slots");
+            Hex.True(store.ClearWarehouse(accountId, (int)bank) == 1, "clear removes the remaining row");
+            Hex.True(store.GetWarehouse(accountId, (int)bank).Money == 0, "and zeroes the money");
+        }
+        finally { Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools(); Directory.Delete(dir, true); }
+    }
+
+    // ======================================================================
+    // T44 — the bag joins the items table. Until now DBS_USER_LOAD_INVENTORY
+    // (0x27A4) was rebuilt from data/starter_inventory.bin on every login and
+    // SDB_ITEM_SINGLE (0x2768) echoed its atoms without storing anything, so
+    // every relog handed the character the same six starter items. Now the bag
+    // (INVEN_TYPE 0) and the worn slots (14) are rows in the SAME table as the
+    // warehouse pockets T42 created, and T42's "skip any atom that touches no
+    // warehouse" rule is gone.
+    //
+    // The load-bearing test in this block is
+    // T44_seeded_inventory_rebuilds_byte_identical: a character who has not
+    // touched anything must still get the captured 3235-byte reply, byte for
+    // byte, after a round trip through the rows.
+    // ======================================================================
+
+    /// <summary>A synthetic atom list payload: <paramref name="header"/> bytes then packed atoms.</summary>
+    static byte[] T44AtomPayload(int header, params (uint Op, long ItemDbId, int Template,
+                                                     long SrcOwner, uint SrcInven, uint SrcSlot,
+                                                     long DstOwner, uint DstInven, uint DstSlot, long Delta)[] atoms)
+    {
+        var p = new byte[header + atoms.Length * DbProxyHandlers.ItemAtomSize];
+        BitConverter.GetBytes((uint)(6 + header)).CopyTo(p, 0);
+        BitConverter.GetBytes((uint)(atoms.Length * DbProxyHandlers.ItemAtomSize)).CopyTo(p, 4);
+        for (int i = 0; i < atoms.Length; i++)
+        {
+            int a = header + i * DbProxyHandlers.ItemAtomSize;
+            var x = atoms[i];
+            BitConverter.GetBytes(i).CopyTo(p, a);
+            BitConverter.GetBytes(x.Op).CopyTo(p, a + WarehouseHandlers.AtomOp);
+            BitConverter.GetBytes(x.ItemDbId).CopyTo(p, a + WarehouseHandlers.AtomItemDbId);
+            BitConverter.GetBytes(x.Template).CopyTo(p, a + WarehouseHandlers.AtomTemplateId);
+            BitConverter.GetBytes(x.SrcOwner).CopyTo(p, a + WarehouseHandlers.AtomSrcOwner);
+            BitConverter.GetBytes(x.SrcInven).CopyTo(p, a + WarehouseHandlers.AtomSrcInven);
+            BitConverter.GetBytes(x.SrcSlot).CopyTo(p, a + WarehouseHandlers.AtomSrcSlot);
+            BitConverter.GetBytes(x.DstOwner).CopyTo(p, a + WarehouseHandlers.AtomDstOwner);
+            BitConverter.GetBytes(x.DstInven).CopyTo(p, a + WarehouseHandlers.AtomDstInven);
+            BitConverter.GetBytes(x.DstSlot).CopyTo(p, a + WarehouseHandlers.AtomDstSlot);
+            BitConverter.GetBytes(x.Delta).CopyTo(p, a + WarehouseHandlers.AtomDelta);
+        }
+        return p;
+    }
+
+    /// <summary>Parse + apply a synthetic atom payload against a store, the way the handlers do.</summary>
+    static WarehouseHandlers.ApplyResult T44Apply(TeraSharp.Arbiter.Persistence.CharacterStore store, byte[] payload)
+        => WarehouseHandlers.Apply(store, WarehouseHandlers.ParseAtoms(payload, 0), store.NextItemId);
+
+    [Test] public static void T44_bag_and_warehouse_share_one_table()
+    {
+        string dir = T37TempDir();
+        try
+        {
+            using var store = new TeraSharp.Arbiter.Persistence.CharacterStore(
+                Path.Combine(dir, "one.db"), QuietLog());
+
+            store.UpsertItem(11, 42, BagItems.Pocket, 0, 6550, 20);
+            store.UpsertItem(7, 42, BagItems.EquippedPocket, 1, 59053, 1);
+            store.UpsertItem(1001, 7, WarehouseHandlers.InvenAccountWarehouse, 3, 6560, 5);
+
+            var inventory = store.GetInventoryItems(42);
+            Hex.True(inventory.Count == 2, $"the bag and the worn slot, and nothing else: {inventory.Count}");
+            Hex.True(inventory[0].InvenType == BagItems.Pocket && inventory[1].InvenType == BagItems.EquippedPocket,
+                     "pocket order: the bag (0) before the worn slots (14)");
+
+            Hex.True(store.GetInventoryItems(7).Count == 0,
+                     "a warehouse pocket is NOT part of the inventory load - it goes out in DBS_VIEW_WAREHOUSE");
+            Hex.True(store.GetItems(7, WarehouseHandlers.InvenAccountWarehouse).Count == 1,
+                     "and the bank still sees its own row");
+            Hex.True(store.CountInventoryItems(42) == 2, "CountInventoryItems agrees");
+        }
+        finally { Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools(); Directory.Delete(dir, true); }
+    }
+
+    [Test] public static void T44_inventory_rows_come_back_in_pocket_then_slot_order()
+    {
+        string dir = T37TempDir();
+        try
+        {
+            using var store = new TeraSharp.Arbiter.Persistence.CharacterStore(
+                Path.Combine(dir, "order.db"), QuietLog());
+
+            // Inserted out of order on purpose.
+            store.UpsertItem(9, 42, BagItems.EquippedPocket, 4, 15005, 1);
+            store.UpsertItem(12, 42, BagItems.Pocket, 1, 6560, 20);
+            store.UpsertItem(8, 42, BagItems.EquippedPocket, 3, 15004, 1);
+            store.UpsertItem(11, 42, BagItems.Pocket, 0, 6550, 20);
+
+            var got = store.GetInventoryItems(42).Select(r => (r.InvenType, r.Slot)).ToArray();
+            var want = new[] { (0, 0), (0, 1), (14, 3), (14, 4) };
+            Hex.True(got.SequenceEqual(want),
+                     "the 0x27A4 list is ordered by pocket then slot - the order the capture lists it in, got "
+                     + string.Join(", ", got));
+        }
+        finally { Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools(); Directory.Delete(dir, true); }
+    }
+
+    [Test] public static void T44_split_and_rebuild_a_payload_round_trips()
+    {
+        var t = LoadStarterInventoryOrSkip();
+        if (t == null) return;
+
+        var rows = BagItems.SplitPayload(t, 2);
+        Hex.True(rows.Count == 6, $"the captured kit is six items, got {rows.Count}");
+        Hex.True(rows.All(r => r.Record != null && r.Record.Length == BagItems.RecordSize),
+                 "every row keeps its 536-byte ItemData verbatim");
+
+        // The six named fields come out of the record.
+        Hex.True(rows[0].InvenType == BagItems.Pocket && rows[0].Slot == 0,
+                 "the first record is the bag potion in slot 0");
+        Hex.True(rows.Count(r => r.InvenType == BagItems.EquippedPocket) == 4, "four worn items");
+
+        uint reqId = BitConverter.ToUInt32(t, 8);
+        Hex.Eq(BagItems.BuildPayload(rows, reqId, 2), t,
+               "split then rebuild is the captured payload, byte for byte");
+    }
+
+    [Test] public static void T44_rebuild_rejects_a_payload_that_is_not_whole_records()
+    {
+        var t = LoadStarterInventoryOrSkip();
+        if (t == null) return;
+        var truncated = t.Take(t.Length - 7).ToArray();
+        Hex.True(BagItems.SplitPayload(truncated, 2).Count == 0,
+                 "half a record is no records - a malformed seed must not produce half an inventory");
+    }
+
+    [Test] public static void T44_seeded_inventory_rebuilds_byte_identical()
+    {
+        // THE test for this task. With a store behind the handler the reply now comes out of the
+        // item rows, not out of data/starter_inventory.bin - and for a character who has not
+        // touched anything it has to be the same 3235 bytes the real Arbiter sent (seq 137).
+        var t = LoadStarterInventoryOrSkip();
+        if (t == null) return;
+        string dir = T37TempDir();
+        DbProxyHandlers.SetStarterInventoryForTest(t);
+        try
+        {
+            using var store = new TeraSharp.Arbiter.Persistence.CharacterStore(
+                Path.Combine(dir, "seed.db"), QuietLog());
+
+            var first = RunHandler(DbProxyHandlers.SDB_USER_LOAD_INVENTORY, CapNc27A2Req, 2, store);
+            Hex.Eq(first[1].body, t, "first login: seeded from the kit and rebuilt from the rows");
+            Hex.True(store.CountInventoryItems(2) == 6, "and the six rows are now on disk");
+
+            var second = RunHandler(DbProxyHandlers.SDB_USER_LOAD_INVENTORY, CapNc27A2Req, 2, store);
+            Hex.Eq(second[1].body, t, "relog: rebuilt from the rows alone, still byte-identical");
+            Hex.True(store.CountInventoryItems(2) == 6, "and seeding did not run twice");
+        }
+        finally
+        {
+            DbProxyHandlers.SetStarterInventoryForTest(null);
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            Directory.Delete(dir, true);
+        }
+    }
+
+    [Test] public static void T44_relog_serves_what_the_character_actually_has()
+    {
+        // The whole point of the task: pick something up, log out, log back in, still have it.
+        var t = LoadStarterInventoryOrSkip();
+        if (t == null) return;
+        string dir = T37TempDir();
+        DbProxyHandlers.SetStarterInventoryForTest(t);
+        try
+        {
+            using var store = new TeraSharp.Arbiter.Persistence.CharacterStore(
+                Path.Combine(dir, "relog.db"), QuietLog());
+
+            RunHandler(DbProxyHandlers.SDB_USER_LOAD_INVENTORY, CapNc27A2Req, 2, store);
+            Hex.True(store.CountInventoryItems(2) == 6, "seeded");
+
+            // One insert into bag slot 2, the shape a pickup produces.
+            T44Apply(store, T44AtomPayload(DbProxyHandlers.ItemSingleRequestHeader,
+                (WarehouseHandlers.TsInsertItem, 0, 88123, 2, BagItems.Pocket, 2u, 2, BagItems.Pocket, 2u, 3)));
+            Hex.True(store.CountInventoryItems(2) == 7, "seven rows after the pickup");
+
+            var relog = RunHandler(DbProxyHandlers.SDB_USER_LOAD_INVENTORY, CapNc27A2Req, 2, store);
+            var body = relog[1].body;
+            Hex.True(body.Length == BagItems.PayloadHeader + 7 * BagItems.RecordSize,
+                     $"the reply grew by one record, got {body.Length} bytes");
+            Hex.True(BitConverter.ToUInt32(body, 4) == 7u * BagItems.RecordSize, "and the list length agrees");
+
+            // The new record is synthesised (it never had one) but carries the six named fields.
+            int at = BagItems.PayloadHeader + 2 * BagItems.RecordSize;   // pocket 0, slot 2 sorts third
+            Hex.True(BitConverter.ToInt32(body, at + BagItems.RecordTemplateIdOffset) == 88123, "template id");
+            Hex.True(BitConverter.ToInt32(body, at + BagItems.RecordOwnerOffset) == 2, "owner - a mismatch is SA_ENTER_WORLD_FAILED");
+            Hex.True(BitConverter.ToInt32(body, at + BagItems.RecordAmountOffset) == 3, "amount");
+            Hex.True(BitConverter.ToInt32(body, at + BagItems.RecordPocketOffset) == BagItems.Pocket, "pocket");
+            Hex.True(BitConverter.ToInt32(body, at + BagItems.RecordSlotOffset) == 2, "slot");
+        }
+        finally
+        {
+            DbProxyHandlers.SetStarterInventoryForTest(null);
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            Directory.Delete(dir, true);
+        }
+    }
+
+    [Test] public static void T44_item_single_persists_the_atoms_it_echoes()
+    {
+        // Replaces T42_bag_only_atoms_are_left_alone: a bag atom is no longer skipped.
+        var cap = LoadItemSingleCaptureOrSkip();
+        if (cap == null) return;
+        string dir = T37TempDir();
+        try
+        {
+            using var store = new TeraSharp.Arbiter.Persistence.CharacterStore(
+                Path.Combine(dir, "single.db"), QuietLog());
+            int first = TeraSharp.Arbiter.Persistence.CharacterStore.FirstItemId;
+
+            var (op, body) = RunHandler1(DbProxyHandlers.SDB_SAVE_2768, cap[2072], store);
+            Hex.True(op == DbProxyHandlers.DBS_SAVE_2769, "the reply is still 0x2769");
+
+            // The captured atom is an op-7 insert that arrived with id 0; the reply carries the
+            // id we allocated, and the row must carry THE SAME one.
+            int echoed = BitConverter.ToInt32(body,
+                DbProxyHandlers.ItemSingleReplyHeader + DbProxyHandlers.ItemAtomDbIdOffset);
+            Hex.True(echoed == first, $"the reply echoes id {first}, got {echoed}");
+
+            // Decoded from the capture: op 7, id 0, template 81251, src = dst = (owner 2,
+            // pocket 0, slot 4), delta 1. That is a pickup into the bag, and it is also the
+            // first time the atom's source/destination triples have been checked against real
+            // captured bytes rather than the World decompile alone.
+            var all = store.GetInventoryItems(
+                BitConverter.ToInt32(cap[2072], 20));     // playerId at request[20]
+            Hex.True(all.Count == 1, $"the insert produced exactly one row, got {all.Count}");
+            Hex.True(all[0].ItemDbId == echoed,
+                     "and the row's id is the one World was handed - a different id orphans World's item");
+            Hex.True(all[0].TemplateId == 81251, $"template id from the atom, got {all[0].TemplateId}");
+            Hex.True(all[0].InvenType == BagItems.Pocket && all[0].Slot == 4,
+                     $"in the bag at slot 4, got pocket {all[0].InvenType} slot {all[0].Slot}");
+            Hex.True(all[0].Amount == 1, $"one of it, got {all[0].Amount}");
+        }
+        finally { Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools(); Directory.Delete(dir, true); }
+    }
+
+    [Test] public static void T44_the_captured_combine_deletes_two_rows_and_inserts_one()
+    {
+        // cap_item_single.bin seq 2211, five atoms, decoded:
+        //   op  6 id 15 tpl 81251 (2,0,4)     op 11 id 15  -> delete
+        //   op  6 id 13 tpl 81255 (2,0,2)     op 11 id 13  -> delete
+        //   op  7 id  0 tpl 81253 (2,0,2) d=1 -> insert the combined item
+        // This is the one multi-atom message any capture contains, and it exercises the
+        // 6+11 pairing that INVENTORY-DESIGN.md section 4 describes.
+        var cap = LoadItemSingleCaptureOrSkip();
+        if (cap == null) return;
+        string dir = T37TempDir();
+        try
+        {
+            using var store = new TeraSharp.Arbiter.Persistence.CharacterStore(
+                Path.Combine(dir, "combine.db"), QuietLog());
+            store.UpsertItem(15, 2, BagItems.Pocket, 4, 81251, 1);
+            store.UpsertItem(13, 2, BagItems.Pocket, 2, 81255, 1);
+
+            var (_, body) = RunHandler1(DbProxyHandlers.SDB_SAVE_2768, cap[2211], store);
+
+            // The captured reply carries the real Arbiter's id 16 for the inserted atom; ours is
+            // the first id our own counter hands out. Everything else must be identical.
+            int insertAtom = DbProxyHandlers.ItemSingleReplyHeader + 4 * DbProxyHandlers.ItemAtomSize;
+            var expected = (byte[])cap[2213].Clone();
+            BitConverter.GetBytes(TeraSharp.Arbiter.Persistence.CharacterStore.FirstItemId)
+                        .CopyTo(expected, insertAtom + DbProxyHandlers.ItemAtomDbIdOffset);
+            Hex.Eq(body, expected, "the reply is the captured one with our own id in the insert");
+
+            var rows = store.GetInventoryItems(2);
+            Hex.True(rows.Count == 1, $"two ingredients consumed, one result: {rows.Count} row(s)");
+            Hex.True(rows[0].TemplateId == 81253, $"the combined item, got template {rows[0].TemplateId}");
+            Hex.True(rows[0].Slot == 2, $"in slot 2, got {rows[0].Slot}");
+            Hex.True(rows[0].ItemDbId == TeraSharp.Arbiter.Persistence.CharacterStore.FirstItemId,
+                     "with the id the reply handed World");
+        }
+        finally { Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools(); Directory.Delete(dir, true); }
+    }
+
+    [Test] public static void T44_a_consumed_stack_loses_its_row()
+    {
+        string dir = T37TempDir();
+        try
+        {
+            using var store = new TeraSharp.Arbiter.Persistence.CharacterStore(
+                Path.Combine(dir, "consume.db"), QuietLog());
+            store.UpsertItem(11, 42, BagItems.Pocket, 0, 6550, 2);
+
+            // Drink one: op 2 with a -1 delta.
+            T44Apply(store, T44AtomPayload(DbProxyHandlers.ItemSingleRequestHeader,
+                (WarehouseHandlers.TsChangeItemAmount, 11, 6550, 42, BagItems.Pocket, 0u, 42, BagItems.Pocket, 0u, -1)));
+            Hex.True(store.GetInventoryItems(42)[0].Amount == 1, "one potion left");
+
+            // Drink the last one: the capture always pairs op 6 (detach) with op 11 (delete).
+            T44Apply(store, T44AtomPayload(DbProxyHandlers.ItemSingleRequestHeader,
+                (WarehouseHandlers.TsChangeItemAmount, 11, 6550, 42, BagItems.Pocket, 0u, 42, BagItems.Pocket, 0u, -1),
+                (WarehouseHandlers.TsDetachStack, 11, 6550, 42, BagItems.Pocket, 0u, 42, BagItems.Pocket, 0u, 0),
+                (WarehouseHandlers.TsDeleteItem, 11, 6550, 42, BagItems.Pocket, 0u, 42, BagItems.Pocket, 0u, 0)));
+            Hex.True(store.CountInventoryItems(42) == 0, "the row is gone, not sitting at amount 0");
+        }
+        finally { Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools(); Directory.Delete(dir, true); }
+    }
+
+    [Test] public static void T44_moving_and_swapping_slots()
+    {
+        string dir = T37TempDir();
+        try
+        {
+            using var store = new TeraSharp.Arbiter.Persistence.CharacterStore(
+                Path.Combine(dir, "move.db"), QuietLog());
+            store.UpsertItem(11, 42, BagItems.Pocket, 0, 6550, 20);
+            store.UpsertItem(12, 42, BagItems.Pocket, 1, 6560, 20);
+
+            // Op 3: drag item 11 to an empty slot 5.
+            var r1 = T44Apply(store, T44AtomPayload(DbProxyHandlers.ItemSingleRequestHeader,
+                (WarehouseHandlers.TsChangeItemPos, 11, 6550, 42, BagItems.Pocket, 0u, 42, BagItems.Pocket, 5u, 0)));
+            Hex.True(r1.Moved == 1, $"one move, got {r1.Moved}");
+            Hex.True(store.FindItemAt(42, BagItems.Pocket, 5)!.ItemDbId == 11, "item 11 is in slot 5");
+            Hex.True(store.FindItemAt(42, BagItems.Pocket, 0) == null, "and slot 0 is empty");
+
+            // Op 36: drop item 12 onto item 11 - the two trade places.
+            var r2 = T44Apply(store, T44AtomPayload(DbProxyHandlers.ItemSingleRequestHeader,
+                (WarehouseHandlers.TsSwapItemPos, 12, 6560, 42, BagItems.Pocket, 1u, 42, BagItems.Pocket, 5u, 0)));
+            Hex.True(r2.Moved == 2, $"a swap moves two rows, got {r2.Moved}");
+            Hex.True(store.FindItemAt(42, BagItems.Pocket, 1)!.ItemDbId == 11, "11 is now in slot 1");
+            Hex.True(store.FindItemAt(42, BagItems.Pocket, 5)!.ItemDbId == 12, "12 is now in slot 5");
+
+            // Equipping is the same move, into pocket 14.
+            T44Apply(store, T44AtomPayload(DbProxyHandlers.ItemSingleRequestHeader,
+                (WarehouseHandlers.TsChangeItemPos, 12, 6560, 42, BagItems.Pocket, 5u, 42, (uint)BagItems.EquippedPocket, 1u, 0)));
+            Hex.True(store.FindItemAt(42, BagItems.EquippedPocket, 1)!.ItemDbId == 12,
+                     "a worn item is the same row in pocket 14");
+        }
+        finally { Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools(); Directory.Delete(dir, true); }
+    }
+
+    [Test] public static void T44_an_atom_that_names_no_item_invents_nothing()
+    {
+        string dir = T37TempDir();
+        try
+        {
+            using var store = new TeraSharp.Arbiter.Persistence.CharacterStore(
+                Path.Combine(dir, "phantom.db"), QuietLog());
+
+            // Amount change with no id and nothing at that position. Allocating an id here would
+            // put a row in the inventory under an id World has never seen.
+            var r = T44Apply(store, T44AtomPayload(DbProxyHandlers.ItemSingleRequestHeader,
+                (WarehouseHandlers.TsChangeItemAmount, 0, 6550, 42, BagItems.Pocket, 9u, 42, BagItems.Pocket, 9u, 5)));
+            Hex.True(r.Inserted == 0 && r.Ignored == 1, "dropped, not invented");
+            Hex.True(store.CountInventoryItems(42) == 0, "no phantom row");
+
+            // Character money (op 9) is not an item row either.
+            var m = T44Apply(store, T44AtomPayload(DbProxyHandlers.ItemSingleRequestHeader,
+                (WarehouseHandlers.TsChangeMoney, 0, 0, 42, BagItems.Pocket, 0u, 42, BagItems.Pocket, 0u, 84)));
+            Hex.True(m.Ignored == 1 && store.CountInventoryItems(42) == 0,
+                     "character money lives on the character row, not in items");
+
+            // An op we have never seen leaves the rows alone rather than guessing.
+            store.UpsertItem(11, 42, BagItems.Pocket, 0, 6550, 20);
+            var u = T44Apply(store, T44AtomPayload(DbProxyHandlers.ItemSingleRequestHeader,
+                (97u, 11, 6550, 42, BagItems.Pocket, 0u, 42, BagItems.Pocket, 0u, 0)));
+            Hex.True(u.Ignored == 1, "an unmodelled op is echoed, not applied");
+            Hex.True(store.GetInventoryItems(42)[0].Amount == 20, "and the row is untouched");
+        }
+        finally { Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools(); Directory.Delete(dir, true); }
+    }
+
+    [Test] public static void T44_deleting_a_character_drops_its_items()
+    {
+        string dir = T37TempDir();
+        try
+        {
+            using var store = new TeraSharp.Arbiter.Persistence.CharacterStore(
+                Path.Combine(dir, "del.db"), QuietLog());
+            var account = store.GetOrCreateAccount("t44");
+            store.UpsertItem(11, 42, BagItems.Pocket, 0, 6550, 20);
+            store.UpsertItem(1001, 42, WarehouseHandlers.InvenCharacterWarehouse, 0, 6560, 1);
+
+            store.DeleteCharacter(42);
+            Hex.True(store.CountInventoryItems(42) == 0, "the bag rows go with the character");
+            Hex.True(store.GetItems(42, WarehouseHandlers.InvenCharacterWarehouse).Count == 0,
+                     "and so does the character bank - item ids never repeat, so an orphan would "
+                     + "surface under whoever gets that id next");
+            Hex.True(account.Id > 0, "the account itself is untouched");
+        }
+        finally { Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools(); Directory.Delete(dir, true); }
+    }
+
+    [Test] public static void T44_banking_a_starter_item_moves_it_out_of_the_bag()
+    {
+        // The end-to-end shape the two tasks together are for: an item seeded into the bag by
+        // T44 is banked by T42's warehouse path and leaves the inventory load.
+        string dir = T37TempDir();
+        try
+        {
+            using var store = new TeraSharp.Arbiter.Persistence.CharacterStore(
+                Path.Combine(dir, "bank.db"), QuietLog());
+            store.UpsertItem(11, 42, BagItems.Pocket, 0, 6550, 20);
+
+            const long accountId = 7;
+            T44Apply(store, T44AtomPayload(DbProxyHandlers.ItemSingleRequestHeader,
+                (WarehouseHandlers.TsWareMoveItem, 11, 6550, 42, BagItems.Pocket, 0u,
+                 accountId, (uint)WarehouseHandlers.InvenAccountWarehouse, 3u, 0)));
+
+            Hex.True(store.CountInventoryItems(42) == 0, "it is out of the bag");
+            var bank = store.GetItems(accountId, WarehouseHandlers.InvenAccountWarehouse);
+            Hex.True(bank.Count == 1 && bank[0].ItemDbId == 11 && bank[0].Amount == 20,
+                     "and in the account bank, same row, same id, same count");
+        }
+        finally { Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools(); Directory.Delete(dir, true); }
     }
 
     /// <summary>Walks up from the test binary looking for a repo-relative file; null if not found.</summary>

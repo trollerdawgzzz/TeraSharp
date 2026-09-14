@@ -892,6 +892,74 @@ CREATE TABLE IF NOT EXISTS guild_perks (
   flag_b                INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (guild_id, perk_id)
 );
+
+-- T42: item rows. ONE table for every container, keyed by (owner_db_id, inven_type) exactly as
+-- the real server's `Items` table is - `spUpdateItemOwner` moves a row between containers and
+-- `spUpdateItemPos` moves it inside one, and there is no separate warehouse table.
+-- `inven_type` is enum INVEN_TYPE, the same pocket id the 536-byte item record carries at +28:
+-- 0 bag, 1 account warehouse, 3 guild, 9 character warehouse, 12 style, 14 equipped.
+-- status/MAIL-WAREHOUSE.md section 6.
+--
+-- Only warehouse pockets are actually written today. The bag still comes from
+-- data/starter_inventory.bin at login (T20), so a bag row here would be a second, disagreeing
+-- source of truth; WarehouseHandlers.Apply deliberately skips atoms that touch no warehouse.
+-- `record` is the 536-byte ItemData when we were given one, else null and the reply synthesises it.
+CREATE TABLE IF NOT EXISTS items (
+  item_db_id  INTEGER PRIMARY KEY,
+  owner_db_id INTEGER NOT NULL,
+  inven_type  INTEGER NOT NULL,
+  slot        INTEGER NOT NULL DEFAULT 0,
+  template_id INTEGER NOT NULL DEFAULT 0,
+  amount      INTEGER NOT NULL DEFAULT 0,
+  record      BLOB,
+  updated_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS ix_items_container ON items(owner_db_id, inven_type, slot);
+
+-- T42: per-container money and slot count. The item rows live in `items`; this is the rest of
+-- what DBS_VIEW_WAREHOUSE has to answer (CurrentMoney and MaxSlotCount), and what
+-- SDB_INCREASE_WAREHOUSE_SIZE grows. Keyed the same way as the items:
+-- account-keyed for INVEN_TYPE {1,4,5,8,12}, character-keyed otherwise
+-- (TransSQLExec::IsAccountDbIdInvenType, mask 0x1132).
+CREATE TABLE IF NOT EXISTS warehouses (
+  owner_db_id INTEGER NOT NULL,
+  inven_type  INTEGER NOT NULL,
+  slot_count  INTEGER NOT NULL DEFAULT 0,
+  money       INTEGER NOT NULL DEFAULT 0,
+  updated_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (owner_db_id, inven_type)
+);
+
+-- T42: mail. The Arbiter owns parcels in SQL - World never touches the table, it asks over
+-- SDB_LIST_PARCEL / SDB_MAKE_PARCEL / SDB_RECV_PARCEL / SDB_RETURN_PARCEL / SDB_DELETE_PARCEL.
+-- `is_read` is what C_SHOW_PARCEL_MESSAGE sets and what S_PARCEL_READ_RECV_STATUS counts;
+-- `is_recved` is set once the attachments have been claimed. status/MAIL-WAREHOUSE.md section 3.
+CREATE TABLE IF NOT EXISTS parcels (
+  parcel_id      INTEGER PRIMARY KEY,
+  sender_db_id   INTEGER NOT NULL DEFAULT 0,
+  sender_name    TEXT    NOT NULL DEFAULT '',
+  receiver_db_id INTEGER NOT NULL DEFAULT 0,
+  title          TEXT    NOT NULL DEFAULT '',
+  message        TEXT    NOT NULL DEFAULT '',
+  money          INTEGER NOT NULL DEFAULT 0,
+  parcel_type    INTEGER NOT NULL DEFAULT 0,
+  status         INTEGER NOT NULL DEFAULT 0,
+  is_read        INTEGER NOT NULL DEFAULT 0,
+  is_recved      INTEGER NOT NULL DEFAULT 0,
+  created_at     TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS ix_parcels_receiver ON parcels(receiver_db_id);
+
+-- T42: parcel attachments. Max 5 in the real server (hard-coded, five slots at
+-- ParcelData +0xd8 + i*0x1b0); we keep the cap as a check in code rather than in the schema.
+CREATE TABLE IF NOT EXISTS parcel_items (
+  parcel_id   INTEGER NOT NULL REFERENCES parcels(parcel_id),
+  slot        INTEGER NOT NULL,
+  item_db_id  INTEGER NOT NULL DEFAULT 0,
+  template_id INTEGER NOT NULL DEFAULT 0,
+  amount      INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (parcel_id, slot)
+);
 ");
         // CREATE TABLE IF NOT EXISTS does nothing to a DB that already has `characters`, so
         // columns added later need their own idempotent step. terasharp.db predates `exp`.
@@ -1871,6 +1939,15 @@ SELECT last_insert_rowid();";
     {
         lock (_lock)
         {
+            // T44: the item rows outlive the `characters` row unless they are cleared here -
+            // and item DB ids never repeat, so an orphan row would surface in a later
+            // character's warehouse view if the ids were ever reused.
+            using (var items = _db.CreateCommand())
+            {
+                items.CommandText = "DELETE FROM items WHERE owner_db_id = $id";
+                items.Parameters.AddWithValue("$id", id);
+                items.ExecuteNonQuery();
+            }
             using var cmd = _db.CreateCommand();
             cmd.CommandText = "DELETE FROM characters WHERE id = $id";
             cmd.Parameters.AddWithValue("$id", id);
@@ -3090,6 +3167,537 @@ DELETE FROM guild_members     WHERE user_db_id = $id;";
             cmd.Parameters.AddWithValue("$g", guildId);
             long n = (long)cmd.ExecuteScalar()!;
             return n <= 0 ? 1 : (int)((n + pageSize - 1) / pageSize);
+        }
+    }
+
+
+    // ================================================================= T42: items
+    // One table for every container. `inven_type` is enum INVEN_TYPE (0 bag, 1 account
+    // warehouse, 3 guild, 9 character warehouse, 12 style, 14 equipped) and it is what picks
+    // the container, exactly as it does inside the real Arbiter's TransSQLExec::GetInven.
+    // status/MAIL-WAREHOUSE.md section 6.
+
+    /// <summary>One stored item row.</summary>
+    public sealed record ItemRow(int ItemDbId, long OwnerDbId, int InvenType, int Slot,
+                                 int TemplateId, long Amount, byte[]? Record);
+
+    /// <summary>
+    /// Insert the row, or overwrite an existing one with the same id. Used for an insert atom
+    /// and for the move of an item whose id we have never seen (the bag is not tracked, so the
+    /// first thing anyone banks always lands here).
+    /// </summary>
+    public void UpsertItem(int itemDbId, long ownerDbId, int invenType, int slot,
+                           int templateId, long amount, byte[]? record = null)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "INSERT INTO items(item_db_id, owner_db_id, inven_type, slot, template_id, amount, record, updated_at) " +
+                "VALUES($id,$o,$t,$s,$tpl,$a,$r,datetime('now')) " +
+                "ON CONFLICT(item_db_id) DO UPDATE SET owner_db_id=$o, inven_type=$t, slot=$s, " +
+                "template_id=CASE WHEN $tpl <> 0 THEN $tpl ELSE template_id END, " +
+                "amount=$a, record=COALESCE($r, record), updated_at=datetime('now')";
+            cmd.Parameters.AddWithValue("$id", itemDbId);
+            cmd.Parameters.AddWithValue("$o", ownerDbId);
+            cmd.Parameters.AddWithValue("$t", invenType);
+            cmd.Parameters.AddWithValue("$s", slot);
+            cmd.Parameters.AddWithValue("$tpl", templateId);
+            cmd.Parameters.AddWithValue("$a", amount);
+            cmd.Parameters.AddWithValue("$r", (object?)record ?? DBNull.Value);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>dbo.spUpdateItemOwner. False when no row has that id.</summary>
+    public bool MoveItem(int itemDbId, long ownerDbId, int invenType, int slot)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "UPDATE items SET owner_db_id=$o, inven_type=$t, slot=$s, updated_at=datetime('now') " +
+                "WHERE item_db_id=$id";
+            cmd.Parameters.AddWithValue("$id", itemDbId);
+            cmd.Parameters.AddWithValue("$o", ownerDbId);
+            cmd.Parameters.AddWithValue("$t", invenType);
+            cmd.Parameters.AddWithValue("$s", slot);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    /// <summary>Add the atom's signed delta to a row's amount. False when no row has that id.</summary>
+    public bool AddItemAmount(int itemDbId, long delta)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "UPDATE items SET amount = amount + $d, updated_at=datetime('now') WHERE item_db_id=$id";
+            cmd.Parameters.AddWithValue("$id", itemDbId);
+            cmd.Parameters.AddWithValue("$d", delta);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    public bool DeleteItem(int itemDbId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "DELETE FROM items WHERE item_db_id=$id";
+            cmd.Parameters.AddWithValue("$id", itemDbId);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    /// <summary>
+    /// Drop rows a negative delta took to zero. The real server deletes the row in the same
+    /// transaction that empties it (DO_TS_DELETE_ITEM is always paired with the amount change);
+    /// doing it as a sweep after the batch means the order of the atoms in one message does not
+    /// matter.
+    /// </summary>
+    public int PruneEmptyItems()
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "DELETE FROM items WHERE amount <= 0";
+            return cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>Every row in one container, in slot order — the order DBS_VIEW_WAREHOUSE lists them.</summary>
+    public IReadOnlyList<ItemRow> GetItems(long ownerDbId, int invenType)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "SELECT item_db_id, owner_db_id, inven_type, slot, template_id, amount, record " +
+                "FROM items WHERE owner_db_id=$o AND inven_type=$t ORDER BY slot, item_db_id";
+            cmd.Parameters.AddWithValue("$o", ownerDbId);
+            cmd.Parameters.AddWithValue("$t", invenType);
+            var rows = new List<ItemRow>();
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+            {
+                byte[]? rec = r.IsDBNull(6) ? null : (byte[])r["record"];
+                rows.Add(new ItemRow(r.GetInt32(0), r.GetInt64(1), r.GetInt32(2), r.GetInt32(3),
+                                     r.GetInt32(4), r.GetInt64(5), rec));
+            }
+            return rows;
+        }
+    }
+
+    public int CountItems(long ownerDbId, int invenType)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT COUNT(*) FROM items WHERE owner_db_id=$o AND inven_type=$t";
+            cmd.Parameters.AddWithValue("$o", ownerDbId);
+            cmd.Parameters.AddWithValue("$t", invenType);
+            return Convert.ToInt32(cmd.ExecuteScalar()!);
+        }
+    }
+
+
+    // ==================================== T44: the bag ====================================
+    // The bag (INVEN_TYPE 0) and the worn slots (14) now live in the SAME `items` table as the
+    // warehouse pockets, keyed the same way. That is how the real server's `Items` table works -
+    // `spUpdateItemOwner` moves a row between containers and `spUpdateItemPos` moves it inside
+    // one - and it is why T42's "skip any atom that touches no warehouse" rule is gone: there is
+    // one source of truth now, so every atom lands somewhere.
+    //
+    // The warehouse pockets are excluded from the inventory load by INVEN_TYPE, using the same
+    // {1,3,9,12} set the Arbiter tests with its 0x120A mask. Anything else the character owns -
+    // bag, worn gear, and any inventory tab we have not identified - is part of DBS_USER_LOAD_
+    // INVENTORY (0x27A4) and is served in (pocket, slot) order, which is the order the capture
+    // lists them in.
+
+    /// <summary>INVEN_TYPE values that belong to a warehouse, not to the character's inventory.</summary>
+    private const string WarehouseInvenTypes = "(1, 3, 9, 12)";
+
+    /// <summary>
+    /// Everything in the character's own inventory - every pocket that is not a warehouse - in
+    /// the order DBS_USER_LOAD_INVENTORY lists them: by pocket, then slot. The capture puts the
+    /// two bag potions (pocket 0, slots 0 and 1) before the four worn items (pocket 14), which
+    /// is exactly this ordering.
+    /// </summary>
+    public IReadOnlyList<ItemRow> GetInventoryItems(long ownerDbId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "SELECT item_db_id, owner_db_id, inven_type, slot, template_id, amount, record " +
+                "FROM items WHERE owner_db_id=$o AND inven_type NOT IN " + WarehouseInvenTypes + " " +
+                "ORDER BY inven_type, slot, item_db_id";
+            cmd.Parameters.AddWithValue("$o", ownerDbId);
+            var rows = new List<ItemRow>();
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+            {
+                byte[]? rec = r.IsDBNull(6) ? null : (byte[])r["record"];
+                rows.Add(new ItemRow(r.GetInt32(0), r.GetInt64(1), r.GetInt32(2), r.GetInt32(3),
+                                     r.GetInt32(4), r.GetInt64(5), rec));
+            }
+            return rows;
+        }
+    }
+
+    /// <summary>
+    /// How many inventory rows the character has. Zero means "never seeded", which is what
+    /// DbProxyHandlers.OnLoadInventory uses to decide whether to write the starter kit out.
+    /// </summary>
+    public int CountInventoryItems(long ownerDbId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "SELECT COUNT(*) FROM items WHERE owner_db_id=$o AND inven_type NOT IN " + WarehouseInvenTypes;
+            cmd.Parameters.AddWithValue("$o", ownerDbId);
+            return Convert.ToInt32(cmd.ExecuteScalar()!);
+        }
+    }
+
+    /// <summary>
+    /// The row at one (owner, pocket, slot), or null. Needed by the atoms that identify an item
+    /// by where it is rather than by its id - a slot swap, and any amount change that arrives
+    /// with item DB id 0.
+    /// </summary>
+    public ItemRow? FindItemAt(long ownerDbId, int invenType, int slot)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "SELECT item_db_id, owner_db_id, inven_type, slot, template_id, amount, record " +
+                "FROM items WHERE owner_db_id=$o AND inven_type=$t AND slot=$s LIMIT 1";
+            cmd.Parameters.AddWithValue("$o", ownerDbId);
+            cmd.Parameters.AddWithValue("$t", invenType);
+            cmd.Parameters.AddWithValue("$s", slot);
+            using var r = cmd.ExecuteReader();
+            if (!r.Read()) return null;
+            byte[]? rec = r.IsDBNull(6) ? null : (byte[])r["record"];
+            return new ItemRow(r.GetInt32(0), r.GetInt64(1), r.GetInt32(2), r.GetInt32(3),
+                               r.GetInt32(4), r.GetInt64(5), rec);
+        }
+    }
+
+    /// <summary>
+    /// Exchange the positions of two rows (DO_TS_CHANGE_ITEM_POS with both slots occupied - the
+    /// op the client sends when you drag one item onto another). Done in one lock so a reader
+    /// can never see both items in the same slot.
+    /// </summary>
+    public bool SwapItemPositions(int itemA, int itemB)
+    {
+        if (itemA == itemB) return false;
+        lock (_lock)
+        {
+            using var read = _db.CreateCommand();
+            read.CommandText = "SELECT item_db_id, inven_type, slot FROM items WHERE item_db_id IN ($a,$b)";
+            read.Parameters.AddWithValue("$a", itemA);
+            read.Parameters.AddWithValue("$b", itemB);
+            var pos = new Dictionary<int, (int Inven, int Slot)>();
+            using (var r = read.ExecuteReader())
+                while (r.Read()) pos[r.GetInt32(0)] = (r.GetInt32(1), r.GetInt32(2));
+            if (!pos.ContainsKey(itemA) || !pos.ContainsKey(itemB)) return false;
+
+            using var w = _db.CreateCommand();
+            w.CommandText =
+                "UPDATE items SET inven_type=$ta, slot=$sa, updated_at=datetime('now') WHERE item_db_id=$a; " +
+                "UPDATE items SET inven_type=$tb, slot=$sb, updated_at=datetime('now') WHERE item_db_id=$b";
+            w.Parameters.AddWithValue("$a", itemA);
+            w.Parameters.AddWithValue("$b", itemB);
+            w.Parameters.AddWithValue("$ta", pos[itemB].Inven);
+            w.Parameters.AddWithValue("$sa", pos[itemB].Slot);
+            w.Parameters.AddWithValue("$tb", pos[itemA].Inven);
+            w.Parameters.AddWithValue("$sb", pos[itemA].Slot);
+            w.ExecuteNonQuery();
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Write a character's whole inventory in one go, replacing whatever was there. Used once
+    /// per character, to seed the starter kit into rows the first time the inventory is loaded;
+    /// the 536-byte <c>record</c> is kept verbatim so the rebuilt 0x27A4 is byte-identical to
+    /// what StarterInventory produced.
+    /// </summary>
+    public void ReplaceInventory(long ownerDbId, IReadOnlyList<ItemRow> rows)
+    {
+        ArgumentNullException.ThrowIfNull(rows);
+        lock (_lock)
+        {
+            using (var del = _db.CreateCommand())
+            {
+                del.CommandText =
+                    "DELETE FROM items WHERE owner_db_id=$o AND inven_type NOT IN " + WarehouseInvenTypes;
+                del.Parameters.AddWithValue("$o", ownerDbId);
+                del.ExecuteNonQuery();
+            }
+            // UpsertItem takes _lock itself; C# locks are re-entrant on the same thread, so
+            // this stays one atomic replace from any other thread's point of view.
+            foreach (var row in rows)
+                UpsertItem(row.ItemDbId, ownerDbId, row.InvenType, row.Slot,
+                           row.TemplateId, row.Amount, row.Record);
+        }
+    }
+
+    /// <summary>Every item the character owns, warehouse pockets included. For DeleteCharacter.</summary>
+    public int DeleteAllItems(long ownerDbId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "DELETE FROM items WHERE owner_db_id=$o";
+            cmd.Parameters.AddWithValue("$o", ownerDbId);
+            return cmd.ExecuteNonQuery();
+        }
+    }
+
+    // ============================================================ T42: warehouses
+
+    /// <summary>Money and slot count for one container. Zeroes for a container never used.</summary>
+    public (long Money, int SlotCount) GetWarehouse(long ownerDbId, int invenType)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT money, slot_count FROM warehouses WHERE owner_db_id=$o AND inven_type=$t";
+            cmd.Parameters.AddWithValue("$o", ownerDbId);
+            cmd.Parameters.AddWithValue("$t", invenType);
+            using var r = cmd.ExecuteReader();
+            return r.Read() ? (r.GetInt64(0), r.GetInt32(1)) : (0L, 0);
+        }
+    }
+
+    /// <summary>dbo.spUpdateWareMoney. The atom's delta is signed: positive stores, negative withdraws.</summary>
+    public long AddWarehouseMoney(long ownerDbId, int invenType, long delta)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "INSERT INTO warehouses(owner_db_id, inven_type, money, updated_at) VALUES($o,$t,$d,datetime('now')) " +
+                "ON CONFLICT(owner_db_id, inven_type) DO UPDATE SET money = money + $d, updated_at=datetime('now')";
+            cmd.Parameters.AddWithValue("$o", ownerDbId);
+            cmd.Parameters.AddWithValue("$t", invenType);
+            cmd.Parameters.AddWithValue("$d", delta);
+            cmd.ExecuteNonQuery();
+        }
+        return GetWarehouse(ownerDbId, invenType).Money;
+    }
+
+    /// <summary>dbo.spUpdateWarehouseSlotCount. Returns the new slot count.</summary>
+    public int AddWarehouseSlots(long ownerDbId, int invenType, int delta)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "INSERT INTO warehouses(owner_db_id, inven_type, slot_count, updated_at) VALUES($o,$t,$d,datetime('now')) " +
+                "ON CONFLICT(owner_db_id, inven_type) DO UPDATE SET slot_count = slot_count + $d, updated_at=datetime('now')";
+            cmd.Parameters.AddWithValue("$o", ownerDbId);
+            cmd.Parameters.AddWithValue("$t", invenType);
+            cmd.Parameters.AddWithValue("$d", delta);
+            cmd.ExecuteNonQuery();
+        }
+        return GetWarehouse(ownerDbId, invenType).SlotCount;
+    }
+
+    /// <summary>dbo.spClearWarehouse: drop every item in the container and zero its money.</summary>
+    public int ClearWarehouse(long ownerDbId, int invenType)
+    {
+        lock (_lock)
+        {
+            int n;
+            using (var del = _db.CreateCommand())
+            {
+                del.CommandText = "DELETE FROM items WHERE owner_db_id=$o AND inven_type=$t";
+                del.Parameters.AddWithValue("$o", ownerDbId);
+                del.Parameters.AddWithValue("$t", invenType);
+                n = del.ExecuteNonQuery();
+            }
+            using var zero = _db.CreateCommand();
+            zero.CommandText = "UPDATE warehouses SET money = 0, updated_at=datetime('now') WHERE owner_db_id=$o AND inven_type=$t";
+            zero.Parameters.AddWithValue("$o", ownerDbId);
+            zero.Parameters.AddWithValue("$t", invenType);
+            zero.ExecuteNonQuery();
+            return n;
+        }
+    }
+
+    // =============================================================== T42: parcels
+
+    /// <summary>One stored parcel, without its attachments.</summary>
+    public sealed record ParcelRow(int ParcelId, int SenderDbId, string SenderName, int ReceiverDbId,
+                                   string Title, string Message, long Money, int ParcelType,
+                                   int Status, bool IsRead, bool IsRecved);
+
+    /// <summary>The real server's hard cap: five attachment slots per parcel.</summary>
+    public const int MaxParcelAttachments = 5;
+
+    /// <summary>dbo.spCreateParcel. Returns the allocated parcel id.</summary>
+    public int CreateParcel(int senderDbId, string senderName, int receiverDbId, string title,
+                            string message, long money, int parcelType = 0)
+    {
+        ArgumentNullException.ThrowIfNull(senderName);
+        ArgumentNullException.ThrowIfNull(title);
+        ArgumentNullException.ThrowIfNull(message);
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "INSERT INTO parcels(sender_db_id, sender_name, receiver_db_id, title, message, money, parcel_type) " +
+                "VALUES($sid,$sn,$rid,$t,$m,$money,$pt); SELECT last_insert_rowid()";
+            cmd.Parameters.AddWithValue("$sid", senderDbId);
+            cmd.Parameters.AddWithValue("$sn", senderName);
+            cmd.Parameters.AddWithValue("$rid", receiverDbId);
+            cmd.Parameters.AddWithValue("$t", title);
+            cmd.Parameters.AddWithValue("$m", message);
+            cmd.Parameters.AddWithValue("$money", money);
+            cmd.Parameters.AddWithValue("$pt", parcelType);
+            return Convert.ToInt32(cmd.ExecuteScalar()!);
+        }
+    }
+
+    public ParcelRow? GetParcel(int parcelId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "SELECT parcel_id, sender_db_id, sender_name, receiver_db_id, title, message, money, " +
+                "parcel_type, status, is_read, is_recved FROM parcels WHERE parcel_id=$id";
+            cmd.Parameters.AddWithValue("$id", parcelId);
+            using var r = cmd.ExecuteReader();
+            if (!r.Read()) return null;
+            return new ParcelRow(r.GetInt32(0), r.GetInt32(1), r.GetString(2), r.GetInt32(3),
+                                 r.GetString(4), r.GetString(5), r.GetInt64(6), r.GetInt32(7),
+                                 r.GetInt32(8), r.GetInt32(9) != 0, r.GetInt32(10) != 0);
+        }
+    }
+
+    /// <summary>
+    /// ParcelManager::SetParcelRead. Only the receiver may flip the flag - the real Arbiter
+    /// applies the same test (User+0x120 == ParcelData+0x50), it just applies it after it has
+    /// already sent the body. False when the parcel is missing or belongs to someone else.
+    /// </summary>
+    public bool SetParcelRead(int parcelId, int receiverDbId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE parcels SET is_read = 1 WHERE parcel_id=$id AND receiver_db_id=$r";
+            cmd.Parameters.AddWithValue("$id", parcelId);
+            cmd.Parameters.AddWithValue("$r", receiverDbId);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    public bool SetParcelRecved(int parcelId, int receiverDbId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE parcels SET is_recved = 1 WHERE parcel_id=$id AND receiver_db_id=$r";
+            cmd.Parameters.AddWithValue("$id", parcelId);
+            cmd.Parameters.AddWithValue("$r", receiverDbId);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    /// <summary>
+    /// The two counters S_PARCEL_READ_RECV_STATUS carries: parcels never opened, and parcels
+    /// that have been opened but whose attachments are still unclaimed. The def calls them
+    /// <c>totalUnread</c> and <c>readUnclaimedParcels</c>.
+    /// </summary>
+    public (int Unread, int ReadUnclaimed) GetParcelCounts(int receiverDbId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "SELECT SUM(CASE WHEN is_read = 0 THEN 1 ELSE 0 END), " +
+                "       SUM(CASE WHEN is_read <> 0 AND is_recved = 0 THEN 1 ELSE 0 END) " +
+                "FROM parcels WHERE receiver_db_id=$r";
+            cmd.Parameters.AddWithValue("$r", receiverDbId);
+            using var r2 = cmd.ExecuteReader();
+            if (!r2.Read()) return (0, 0);
+            int unread = r2.IsDBNull(0) ? 0 : r2.GetInt32(0);
+            int unclaimed = r2.IsDBNull(1) ? 0 : r2.GetInt32(1);
+            return (unread, unclaimed);
+        }
+    }
+
+    public IReadOnlyList<ParcelRow> GetParcelsFor(int receiverDbId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "SELECT parcel_id, sender_db_id, sender_name, receiver_db_id, title, message, money, " +
+                "parcel_type, status, is_read, is_recved FROM parcels WHERE receiver_db_id=$r ORDER BY parcel_id";
+            cmd.Parameters.AddWithValue("$r", receiverDbId);
+            var rows = new List<ParcelRow>();
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                rows.Add(new ParcelRow(r.GetInt32(0), r.GetInt32(1), r.GetString(2), r.GetInt32(3),
+                                       r.GetString(4), r.GetString(5), r.GetInt64(6), r.GetInt32(7),
+                                       r.GetInt32(8), r.GetInt32(9) != 0, r.GetInt32(10) != 0));
+            return rows;
+        }
+    }
+
+    public bool DeleteParcel(int parcelId)
+    {
+        lock (_lock)
+        {
+            using (var items = _db.CreateCommand())
+            {
+                items.CommandText = "DELETE FROM parcel_items WHERE parcel_id=$id";
+                items.Parameters.AddWithValue("$id", parcelId);
+                items.ExecuteNonQuery();
+            }
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "DELETE FROM parcels WHERE parcel_id=$id";
+            cmd.Parameters.AddWithValue("$id", parcelId);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    /// <summary>Attach an item to a parcel. Slots 0..4; anything else is rejected.</summary>
+    public bool AddParcelItem(int parcelId, int slot, int itemDbId, int templateId, long amount)
+    {
+        if (slot < 0 || slot >= MaxParcelAttachments) return false;
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "INSERT INTO parcel_items(parcel_id, slot, item_db_id, template_id, amount) " +
+                "VALUES($p,$s,$i,$t,$a) ON CONFLICT(parcel_id, slot) DO UPDATE SET " +
+                "item_db_id=$i, template_id=$t, amount=$a";
+            cmd.Parameters.AddWithValue("$p", parcelId);
+            cmd.Parameters.AddWithValue("$s", slot);
+            cmd.Parameters.AddWithValue("$i", itemDbId);
+            cmd.Parameters.AddWithValue("$t", templateId);
+            cmd.Parameters.AddWithValue("$a", amount);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    public int CountParcelItems(int parcelId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT COUNT(*) FROM parcel_items WHERE parcel_id=$p";
+            cmd.Parameters.AddWithValue("$p", parcelId);
+            return Convert.ToInt32(cmd.ExecuteScalar()!);
         }
     }
 

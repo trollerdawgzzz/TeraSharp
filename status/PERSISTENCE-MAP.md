@@ -6,7 +6,7 @@ learning, item combine, tutorial dungeon enter/leave, logout). Condensed control
 `D:\packetlogs\cap_newchar_ctl.txt` (seq, dir, time, opcode, len, first 64 payload bytes).
 Names from `data/dbproxy_opcodes.txt`. All frame offsets below are payload-relative.
 
-Today TeraSharp persists ONLY the 15312-byte world blob (0x27CB). Everything in the table below is
+Today TeraSharp persists the 15312-byte world blob (0x27CB), the item rows (T42/T44) and the rows the loads below are rebuilt from. Everything in the table below is
 answered with a bare ack and forgotten, so on relog the login-time loads serve the captured "dob"
 snapshot and the character's progress is gone. Making a row persistent = store the write, serve it
 back in the matching load.
@@ -17,7 +17,7 @@ back in the matching load.
 |---------------------------------------------------|---------------|-----------------------------------------------|-------|-------|
 | 0x272E SDB_SET_QUEST_INFO (116 / 972 / 3540 B)    | 0x272F        | 29-B header + 80-B quest record + reward atoms; ok at [24], allocated quest row id at [25] | ~30 | **real (T15)** |
 | 0x273B S_UPDATE_EXP_LEVEL (46 B)                  | 0x273C        | [u32 reqId][u8 ok]                            | 12    | real (T6), writes level/exp to the row |
-| 0x2768 SDB_ITEM_SINGLE (30 / 886 / 4310 B)        | 0x2769        | 21-B header + both atom lists, insert ids filled in | 8 | real (T13) |
+| 0x2768 SDB_ITEM_SINGLE (30 / 886 / 4310 B)        | 0x2769        | 21-B header + both atom lists, insert ids filled in | 8 | **real (T44)**, the atoms are now applied to the `items` rows, not only echoed |
 | 0x278E SDB_USER_LEARN_SKILL (896 B)               | 0x278F        | 23-B header + the fee atoms + EMPTY SkillPeriodData list | 1 | **real (T15)** |
 | 0x27FA SDB_UPDATE_USER_ACHIEVEMENT (1478-1558 B)  | 0x27FB        | [u32 reqId][u8 ok], reqId at [280]            | 4     | **real (T22)**, the whole payload persisted and served back by 0x27F9 |
 | 0x2802 SDB_ACCOMPLISH_USER_ACHIEVEMENT (46 B)     | 0x2803        | 13-B header + the NEWLY accomplished records (43 B) or none (19 B) | 3 | **real (T22)**, persisted first-write-wins; the 19-B form now happens for the right reason |
@@ -131,3 +131,86 @@ NEWLY accomplished, so a repeat comes back as an empty 19-byte frame.
    is either inside the world blob or comes from a load opcode we have not identified.
 6. **Zone change / dungeon flow** (0x13BE/0x13C0/0x1499 + re-spawn) — not persistence, but the next
    live blocker once players leave Island of Dawn.
+
+## Inventory — T44, the bag is rows in the same table
+
+`SDB_USER_LOAD_INVENTORY` 0x27A2 -> `0x27A3` + `0x27A4` was served from
+`data/starter_inventory.bin` on every login until T44, so a relog handed the character the same
+six starter items whatever they had done. Now the kit is written into `items` rows the first time
+the inventory is loaded and the reply is rebuilt from those rows; for a character who has not
+touched anything it is still the captured 3235 bytes, byte for byte (`T44_seeded_inventory_
+rebuilds_byte_identical`).
+
+The bag is INVEN_TYPE 0 and the worn slots are 14, in the same table and keyed the same way as the
+warehouse pockets; the inventory load is every pocket that is not a warehouse
+(`inven_type NOT IN (1,3,9,12)`), ordered by pocket then slot - the order the capture lists them in.
+
+Four messages carry `ItemTransactionAtom`s and all four now land in those rows, always applied from
+the **reply** (the copy with the allocated item DB ids in it, so the id World is handed and the id
+the row gets are the same one):
+
+| message | atom list ref in the reply | what it does to the rows |
+|---|---|---|
+| 0x2768 SDB_ITEM_SINGLE | `[0]` and `[8]` (two lists, A then B) | pickups, drops, moves, stack changes |
+| 0x272E SDB_SET_QUEST_INFO | `[8]`, behind the quest record | quest rewards |
+| 0x278E SDB_USER_LEARN_SKILL | `[0]` | the fee and anything it consumes |
+| 0x274C/0x274E warehouse transfer | `[0]` | bag <-> bank |
+
+The five atoms in `data/cap_item_single.bin` decode cleanly against the source/destination triples
+T42 pinned from the World decompile - seq 2072 is `op 7, id 0, tpl 81251, (owner 2, pocket 0, slot 4),
+delta 1`, and seq 2211 is the 6+11 / 6+11 / 7 combine - which is the first time those offsets have
+been checked against captured bytes rather than the decompile alone.
+
+Ops modelled: 2 (amount), 3 (move to an empty slot), 6 (detach, a deliberate no-op - the paired 11
+does the delete), 7 (insert), 9 (character money, not an item row), 11 (delete), 36 (swap two
+occupied slots), and the warehouse ops 13/14/15/17. Anything else is **echoed but not applied** and
+logged; guessing at an op's semantics would corrupt the row.
+
+## Warehouse — T42, answered from the item rows
+
+The same guarded shape as the table at the top of this file; `Every_per_user_request_opcode_is_answered`
+reads both. **No capture contains a warehouse frame** — both A->W taps are one login and nobody
+opened a bank — so every offset here comes from the Arbiter's PDL dumpers cross-checked against
+the writers, and each handler's min-length guard lands exactly on the end of its last field.
+Layouts, atom parsing and the builders are in `World/WarehouseHandlers.cs`;
+`status/MAIL-WAREHOUSE.md` section 4 has the derivation.
+
+| write (W->A)                                      | reply (A->W)  | reply shape                                   | count | state |
+|---------------------------------------------------|---------------|-----------------------------------------------|-------|-------|
+| 0x274A SDB_VIEW_WAREHOUSE (34 B)                 | 0x274B        | 39-B header + N x 536-B ItemData; ViewSize is a hard-coded 0x48 | 0 | **real (T42)**, rebuilt from the `items` rows |
+| 0x274C SDB_STORE_WAREHOUSE (63 B)                | 0x274D        | 25-B header + the atoms echoed with allocated ids | 0 | **real (T42)**, atoms applied to `items` |
+| 0x274E SDB_GET_WAREHOUSE (62 B)                  | 0x274F        | same 25-B shape                               | 0     | **real (T42)** |
+| 0x277F SDB_CHANGE_WAREHOUSE_POS (34 B)           | 0x2780        | same 25-B shape                               | 0     | **real (T42)** |
+| 0x27C9 SDB_PAY_WAREHOUSE_COMMISION (26 B)        | 0x27CA        | [u32 DlmId][u8 ok][u32 error] - the fee is disabled in this build | 0 | **real (T42)** |
+| 0x27E0 SDB_CLEAR_WAREHOUSE (18 B)                | 0x27E1        | [u32 DlmId][u8 ok]                            | 0     | **real (T42)** |
+| 0x27E2 SDB_WAREHOUSE_AUTO_SORT (26 B)            | 0x27E3        | the request's four fields echoed + [u32 err][i64 commision] | 0 | **real (T42)** |
+| 0x283F SDB_INCREASE_WAREHOUSE_SIZE (34 B)        | 0x283E        | [u8 ok][u32 DlmId] - **0x283E, not 0x2840**; both handlers share the send helper FUN_1407ad2e0 | 0 | **real (T42)** |
+| 0x2754 SDB_MOVE_WAREHOUSE_ITEM (38 B)            | none          | the real handler is a ten-line stub that sends nothing; in WorldReplayTable.OneWayFromWorld | 0 | **real (T42)**, matched deliberately |
+
+Two things that will hang a user if they are ever "fixed":
+
+- **0x283F is answered with 0x283E.** `DBS_INCREASE_WAREHOUSE_SIZE` 0x2840 exists in the opcode
+  table and has a dumper, and nothing in the binary ever sends it.
+- **0x2754 must stay unanswered.** It is sealed in `WorldReplayTable.OneWayFromWorld` so the replay
+  table cannot hand it somebody else's reply.
+
+## Mail — Arbiter-owned, only the client half is implemented
+
+T42 added the three client packets the Arbiter answers itself and the `parcels` table behind them
+(`Handlers/ParcelHandlers.cs`); the six `SDB_*_PARCEL` requests World sends are **not** answered yet
+and are therefore deliberately not in a table above.
+
+- Implemented, client-side: `C_SHOW_PARCEL_MESSAGE` 0xFA59 -> `S_SHOW_PARCEL_MESSAGE` 0xABD3,
+  `C_PARCEL_READ_RECV_STATUS` 0xE292 -> `S_PARCEL_READ_RECV_STATUS` 0xF26E (byte-exact against
+  `cap_newchar_client.log` frame 312), `C_PARCEL_REPORT` 0xC09A -> `S_PARCEL_REPORT` 0x73FC.
+  The 13-byte 0xF26E frame is also pushed unprompted at `C_LOAD_TOPO_FIN`, which is what the real
+  Arbiter does from `User::OnLoadTopoFin`.
+- Still unanswered: `0x2777` LIST, `0x2779` MAKE, `0x277B` RECV, `0x277D` RECV_EX, `0x2781` RETURN,
+  `0x2811` DELETE - each answered by the next opcode up. The first mailbox a live player opens
+  produces `no replay for 0x2777` and head-blocks that user's DLM queue.
+- `C_RETURN_USER_GIFT` 0xF7FD is **not** a parcel packet - it is the returning-player reward claim
+  (-> AS 0x15C0). Return-to-sender is `C_RETURN_PARCEL` 0xF294, handled by World.
+- Warehouse moves do **not** ride `SDB_ITEM_SINGLE` 0x2768 - that handler binds only the bag
+  inventory, so an atom naming a warehouse pocket resolves to NULL. The pocket id is
+  `enum INVEN_TYPE` and is what picks the container (0 bag, 1 account bank, 3 guild, 9 character
+  bank, 12 style); `status/MAIL-WAREHOUSE.md` section 6 has the proof.

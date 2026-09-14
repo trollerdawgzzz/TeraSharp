@@ -1,4 +1,4 @@
-# Inventory persistence — design (T11, research only)
+# Inventory persistence — design (T11 research; **implemented in T44**, see §7)
 
 **Status: design note, no code.** This is the plan for replacing the starter/captured inventory
 (`DbProxyHandlers.OnLoadInventory`, `data/starter_inventory.bin`) with real per-character storage.
@@ -237,7 +237,7 @@ successfully picked an item up yet.
 
 ---
 
-## 5. Proposed storage
+## 5. Proposed storage *(superseded by §7 — the shape changed, see there)*
 
 One table, keyed by the DB id the Arbiter allocates, plus a per-owner id sequence.
 
@@ -363,3 +363,84 @@ Implementation order, smallest useful step first:
 6. **`0x2813 SDB_EQUIP_ITEM`** was never sent in this session — equipping on the Island of Dawn went
    through `0x2768` as a pocket/slot change. Whether the client's `C_EQUIP_ITEM` ever produces
    0x2813 is untested.
+
+---
+
+## 7. What T44 actually built
+
+§5 proposed a dedicated inventory table. What shipped is one table for **every** container,
+because T42 had already created it for the warehouse and two tables would have meant two answers
+to "where is item 1001".
+
+```sql
+CREATE TABLE items (
+  item_db_id  INTEGER PRIMARY KEY,   -- the id the Arbiter hands World; never reused
+  owner_db_id INTEGER NOT NULL,      -- character id, or account id for an account-keyed pocket
+  inven_type  INTEGER NOT NULL,      -- enum INVEN_TYPE = the pocket id at record+28
+  slot        INTEGER NOT NULL,
+  template_id INTEGER NOT NULL,
+  amount      INTEGER NOT NULL,
+  record      BLOB                   -- the 536-byte ItemData, when we were given one
+);
+```
+
+`inven_type` is the whole design. 0 is the bag, 14 the worn slots, 1/3/9/12 the warehouses
+(`status/MAIL-WAREHOUSE.md` §6 pins the values); the inventory load is every pocket that is **not**
+a warehouse, and the warehouse view is one pocket at a time. That is exactly how the real server's
+`Items` table works — `spUpdateItemOwner` moves a row between containers and `spUpdateItemPos`
+moves it inside one, and there is no second table.
+
+### Why the `record` blob stayed
+
+§5's "Why a blob column as well as the fields" was right, and for a sharper reason than it gave:
+keeping the exact 536 bytes is what makes the seeded `0x27A4` **byte-identical** to the captured
+one. A row that never had a record (anything that arrived as a transaction atom) gets a
+synthesised one — safe, because the bytes we leave zero are the uninitialised Arbiter heap §2
+describes, which World has to ignore.
+
+### Seeding
+
+The starter kit is written into rows the first time a character's inventory is loaded and never
+again; `CountInventoryItems(playerId) == 0` is the test. The rebuild concatenates the rows in
+(pocket, slot) order, which is the order `StarterInventory` sorts the kit into and the order the
+capture lists it in — verified: the six captured records sort back into exactly their captured
+order, and the rebuild is the original file byte for byte.
+
+### Applying, and the one rule that matters
+
+Atoms are applied **from the reply, never from the request**. The reply is the copy with the
+allocated item DB ids filled in; parsing the request would allocate a second set and store ids
+World was never given. Four messages carry atoms — 0x2768, 0x272E (quest rewards), 0x278E (skill
+fees) and the warehouse transfers — and all four go through the same code.
+
+Ops modelled: 2 amount, 3 move-to-empty-slot, 6 detach (a deliberate no-op; the paired 11 does the
+delete), 7 insert, 9 character money (not an item row), 11 delete, 36 swap two occupied slots, plus
+the warehouse ops 13/14/15/17. **Everything else is echoed but not applied**, and logged. An atom
+that names no item at all is dropped rather than given a fresh id: a row under an id World has
+never seen is worse than a missing row, because the next operation on it misses.
+
+### The atom triples, checked against captured bytes at last
+
+T42 pinned the source/destination triples from World's `PrepareWareSendTransaction`. T44 decoded
+the five atoms in `data/cap_item_single.bin` with them and they fit exactly:
+
+```
+seq 2072  op  7  id 0   tpl 81251  src=(2,0,4) dst=(2,0,4) delta 1     pick one up into bag slot 4
+seq 2211  op  6  id 15  tpl 81251  src=(2,0,4) dst=(2,0,4)   \
+          op 11  id 15                                        |  consume two,
+          op  6  id 13  tpl 81255  src=(2,0,2) dst=(2,0,2)    |  insert the result
+          op 11  id 13                                        |
+          op  7  id 0   tpl 81253  src=(2,0,2) dst=(2,0,2) delta 1   /
+```
+
+Both triples are populated and equal for an op that stays in one container, which is what §3's
+"same as 48 in every captured atom" was seeing.
+
+### Still open
+
+- **Character money** (op 9) is counted and dropped; it belongs on the `characters` row and nothing
+  reads it back yet.
+- **`0x27A3` pocket data** is still the empty form. A character who has bought bag slots would have
+  a non-empty list and we have never seen one.
+- **Expanded bag tabs.** Everything that is not a warehouse pocket is served as inventory, so an
+  unknown tab id would come back in the load; that is the safe direction, but it is untested.
