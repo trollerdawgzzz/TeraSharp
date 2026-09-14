@@ -21,8 +21,9 @@ namespace TeraSharp.Arbiter.Handlers;
 // line, and Handles(op) below is the subset T39 implements.
 //
 // NOTHING IS WIRED UP. HandlerRegistry, GameSession and WorldBridge are human-owned and
-// untouched; the exact registration diff is in status/GUILD-DESIGN.md section 10. Like
-// PartyManager, this returns ACTIONS:
+// untouched; the exact registration diff is in status/GUILD-DESIGN.md section 10, and since T41
+// it is three lines because World/ActionDispatcher.cs performs the sends. Like PartyManager,
+// this returns ACTIONS:
 //
 //   OnClientPacket(characterId, opcode, body) -> GuildActions { ToClients, ToWorld, Rejected }
 //
@@ -44,24 +45,44 @@ namespace TeraSharp.Arbiter.Handlers;
 /// </summary>
 public readonly record struct GuildClientAction(
     int CharacterId, string PacketName, IReadOnlyDictionary<string, object>? Fields, byte[]? RawBody)
+    : IArbiterClientAction
 {
     public static GuildClientAction Def(int characterId, string name, IReadOnlyDictionary<string, object> fields)
         => new(characterId, name, fields, null);
 
     /// <summary>A body GuildPackets built directly, for the packets whose .def cannot express
-    /// the layout.</summary>
+    /// the layout. ActionDispatcher frames it by packet name.</summary>
     public static GuildClientAction Raw(int characterId, string name, byte[] body)
         => new(characterId, name, null, body);
 
     public bool IsRaw => RawBody != null;
+
+    /// <summary>Guilds address clients by character db id - GameSession.PlayerId - because that
+    /// is the key the guild tables use.</summary>
+    public Recipient To => Recipient.Player(CharacterId);
+
+    /// <summary>Always null: a guild action's raw form is a BODY, not a framed packet.</summary>
+    public byte[]? RawPacket => null;
 }
 
 /// <summary>Everything one input produced. Empty is a valid answer - a window-type-1 probe on a
 /// guild that exists says nothing at all.</summary>
-public sealed class GuildActions
+public sealed class GuildActions : IArbiterActions
 {
     public List<GuildClientAction> ToClients { get; } = new();
     public List<WorldAction> ToWorld { get; } = new();
+
+    private readonly List<IArbiterAction> _ordered = new();
+
+    /// <summary>
+    /// Every client packet and World frame in the order the handlers produced them - the list
+    /// ActionDispatcher walks. The two typed lists above hold the same items and stay because
+    /// the guild tests read them; nothing writes to either directly.
+    /// </summary>
+    public IReadOnlyList<IArbiterAction> Ordered => _ordered;
+
+    /// <summary>The character whose packet caused this, so a rejection has somewhere to go.</summary>
+    public Recipient Origin { get; internal set; } = Recipient.None;
 
     /// <summary>
     /// Why nothing happened, when nothing happened for a reason worth logging. The real Arbiter
@@ -75,8 +96,15 @@ public sealed class GuildActions
     public bool IsEmpty => ToClients.Count == 0 && ToWorld.Count == 0;
 
     internal GuildActions Reject(string why) { Rejected = why; return this; }
-    internal void Client(GuildClientAction a) => ToClients.Add(a);
-    internal void World(ushort op, byte[] payload) => ToWorld.Add(new WorldAction(op, payload));
+
+    internal void Client(GuildClientAction a) { ToClients.Add(a); _ordered.Add(a); }
+
+    internal void World(ushort op, byte[] payload)
+    {
+        var w = new WorldAction(op, payload);
+        ToWorld.Add(w);
+        _ordered.Add(w);
+    }
 }
 
 public sealed class GuildHandlers
@@ -158,7 +186,7 @@ public sealed class GuildHandlers
 
     public GuildActions OnClientPacket(int characterId, ushort opcode, byte[] body)
     {
-        var a = new GuildActions();
+        var a = new GuildActions { Origin = Recipient.Player(characterId) };
         switch (opcode)
         {
             case GuildPackets.C_REQUEST_GUILD_INFO: return RequestGuildInfo(a, characterId, body);
@@ -201,6 +229,7 @@ public sealed class GuildHandlers
     public int CreateGuild(GuildActions a, int chiefId, string name,
         string masterGroupName = "Master", string memberGroupName = "Member", bool warAcceptable = false)
     {
+        if (a.Origin.Kind == RecipientKind.None) a.Origin = Recipient.Player(chiefId);
         var chief = _store.GetCharacter(chiefId);
         if (chief == null) { a.Reject($"character {chiefId} does not exist"); return 0; }
         if (_store.GetGuildIdOf(chiefId) != 0) { a.Reject("the founder is already in a guild"); return 0; }

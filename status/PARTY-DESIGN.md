@@ -553,7 +553,22 @@ Arbiter → World frames **are** bytes, from `PartyPackets` (T28), byte-exact ag
 
 ### The wiring diff — human-owned files, not applied
 
-**1. `Program.cs`** — construct it next to the other singletons and hand it to the bridge:
+Since **T41** the sends are not part of this diff: `World/ActionDispatcher.cs` walks any
+subsystem's action list and performs them. So the party wiring is the dispatcher (built once,
+shared with guilds), a resolver, and one line per call site.
+
+**0. `Program.cs`** — build the one dispatcher, next to the other singletons:
+
+```csharp
+        var actions = ActionDispatcher.ForSessions(
+            ticket   => worldBridge.SessionForTicket(ticket),      // step 3
+            playerId => GameSession.ByPlayerId(playerId),          // guilds; see GUILD-DESIGN section 10
+            (op, payload) => Program.World?.SendFrame(op, payload) ?? false,
+            loggerFactory.CreateLogger<ActionDispatcher>())
+        { ResolveDef = n => GuildHandlers.ResolveDef(null, n) };    // guilds; harmless for parties
+```
+
+**1. `Program.cs`** — the manager itself:
 
 ```csharp
         var party = new PartyManager(loggerFactory.CreateLogger<PartyManager>());
@@ -566,50 +581,37 @@ Arbiter → World frames **are** bytes, from `PartyPackets` (T28), byte-exact ag
 ```csharp
     /// <summary>Arbiter-owned party state; see status/PARTY-DESIGN.md.</summary>
     public PartyManager? Party { get; set; }
+    /// <summary>The one ActionDispatcher, built in Program.cs.</summary>
+    public ActionDispatcher? Actions { get; set; }
 ```
 
 ```csharp
             default:
                 if (Party != null && PartyPackets.MinFrameLength(op) != 0)
                 {
-                    var acts = Party.OnWorldFrame(op, payload);
-                    if (acts.Rejected != null) _log.LogWarning("party 0x{Op:X4}: {Why}", op, acts.Rejected);
-                    Dispatch(acts);
+                    Actions?.Dispatch(Party.OnWorldFrame(op, payload), "party");
                     return;
                 }
                 if (DbProxy != null && DbProxy.TryHandle(this, link, op, payload)) return;
 ```
 
 `PartyPackets.MinFrameLength(op) != 0` is true for exactly the twelve W→A party opcodes and
-nothing else, so it is a safe gate.
+nothing else, so it is a safe gate. An `OnWorldFrame` action set carries `Origin = Recipient.None`,
+so a rejection there goes to the log rather than to a client — which is right, because a World
+frame has no originating session.
 
-**3. `World/WorldBridge.cs`** — the dispatcher, next to `RouteToClient`:
-
-```csharp
-    /// <summary>Send what PartyManager produced. Def-driven packets go through the .def codec;
-    /// a raw packet is one World already framed (SA_BYPASS_TO_GROUP).</summary>
-    internal void Dispatch(PartyActions acts)
-    {
-        foreach (var w in acts.ToWorld) SendFrame(w.Opcode, w.Payload);
-        foreach (var c in acts.ToClients)
-        {
-            var s = SessionForTicket(c.Ticket);
-            if (s == null) continue;
-            if (c.IsRaw) s.Send(c.RawPacket!);
-            else s.SendByDef(c.PacketName, c.Fields!);
-        }
-    }
-```
-
-`SessionForTicket` does not exist yet. `_tunnels` is already keyed by Ticket but holds a
-delivery callback, not the session — the smallest change is a second dictionary alongside
-`_players`, filled in `RegisterPlayer` and cleared in `UnregisterPlayer`:
+**3. `World/WorldBridge.cs`** — the ticket resolver the dispatcher needs. `_tunnels` is already
+keyed by Ticket but holds a delivery callback, not the session; the smallest change is a second
+dictionary alongside `_players`, filled in `RegisterPlayer` and cleared in `UnregisterPlayer`:
 
 ```csharp
     private readonly Dictionary<uint, GameSession> _byTicket = new();
     internal GameSession? SessionForTicket(uint ticket)
     { lock (_playersLock) return _byTicket.TryGetValue(ticket, out var s) ? s : null; }
 ```
+
+Returning `null` is not an error path: the dispatcher logs and skips, which is exactly what a
+party broadcast to someone who just logged out should do.
 
 **4. `Handlers/HandlerRegistry.cs`** — the seven Arbiter-side party opcodes. They are currently
 unregistered, so `PacketDispatcher` forwards them to World, which is wrong for all seven:
@@ -625,16 +627,18 @@ unregistered, so `PacketDispatcher` forwards them to World, which is wrong for a
                      ("C_MERGE_PARTY_TO_RAID",      PartyPackets.C_MERGE_PARTY_TO_RAID),
                      ("C_REQUEST_PARTY_INFO",       PartyPackets.C_REQUEST_PARTY_INFO),
                  })
-            d.Register(op, name, 0, (s, body) =>
+            dispatcher.Register(op, name, 0, (s, body) =>
             {
                 var w = Program.WorldBridgeInstance;           // however the registry reaches it
-                if (w?.Party == null) return false;
-                var acts = w.Party.OnClientPacket(s.TunnelKey, op, body.ToArray());
-                if (acts.Rejected != null) _log.LogInformation("{Name}: {Why}", name, acts.Rejected);
-                w.Dispatch(acts);
+                if (w?.Party == null || w.Actions == null) return false;
+                w.Actions.Dispatch(w.Party.OnClientPacket(s.TunnelKey, op, body.ToArray()), "party");
                 return true;
             });
 ```
+
+That is the whole call site now: no session lookup, no raw-vs-def branch, no rejection logging.
+A rejection goes back to `s` as S_SYSTEM_MESSAGE_CUSTOM because `OnClientPacket` stamps
+`Origin = Recipient.Ticket(ticket)`.
 
 `C_LEAVE_PARTY` (0xFFB6) and `C_CHANGE_PARTY_MANAGER` (0x60D6) stay **unregistered** on purpose —
 the real Arbiter has no handler for either; they belong to World and come back as
@@ -652,7 +656,7 @@ can map a ticket to a character, and unregister on leave:
 and in `GameSession`'s leave path, next to `w.UnregisterPlayer(GameId, TunnelKey)`:
 
 ```csharp
-        if (w.Party != null) w.Dispatch(w.Party.Unregister(TunnelKey));
+        if (w.Party != null) w.Actions?.Dispatch(w.Party.Unregister(TunnelKey), "party");
 ```
 
 ### Order of operations

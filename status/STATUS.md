@@ -56,6 +56,7 @@ Deploy check: `TeraSharp.Arbiter.exe --selftest` — one PASS/FAIL line per data
 | Everything else in the 2026-09-13 relog capture | `status/RELOG-CAPTURE-NOTES.md` |
 | Guilds - the object, the SQL schema, the opcodes and the .def corrections | `status/GUILD-DESIGN.md` |
 | Guild rows, the Arbiter-side guild handlers, and the wiring they still need | `status/GUILD-DESIGN.md` section 10 |
+| How a subsystem's action list becomes sends (parties, guilds, and whatever is next) | `World/ActionDispatcher.cs`, and section 10 of both design docs |
 
 ## The three rules that cost the most to learn
 

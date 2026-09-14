@@ -11,7 +11,8 @@ namespace TeraSharp.Arbiter.World;
 // ways - so this class has no store and there is no PERSISTENCE-MAP row.
 //
 // NOTHING IS WIRED UP. This is state plus two pure entry points; WorldBridge and GameSession are
-// human-owned and untouched. status/PARTY-DESIGN.md section 10 has the exact wiring diff.
+// human-owned and untouched. status/PARTY-DESIGN.md section 10 has the exact wiring diff, and
+// since T41 it is three lines because World/ActionDispatcher.cs performs the sends.
 //
 //   OnClientPacket(ticket, opcode, body)  -> PartyActions
 //   OnWorldFrame(opcode, payload)         -> PartyActions
@@ -35,10 +36,12 @@ namespace TeraSharp.Arbiter.World;
 /// <summary>
 /// One packet for one client session. Either a def-driven packet (PacketName + Fields, for
 /// GameSession.SendByDef) or a finished client packet World built (RawPacket, for
-/// GameSession.Send).
+/// GameSession.Send). T41: also an <see cref="IArbiterClientAction"/>, so ActionDispatcher can
+/// send it without knowing it came from a party.
 /// </summary>
 public readonly record struct ClientAction(
     uint Ticket, string PacketName, IReadOnlyDictionary<string, object>? Fields, byte[]? RawPacket)
+    : IArbiterClientAction
 {
     public static ClientAction Def(uint ticket, string name, IReadOnlyDictionary<string, object> fields)
         => new(ticket, name, fields, null);
@@ -48,16 +51,35 @@ public readonly record struct ClientAction(
         => new(ticket, "(raw)", null, packet);
 
     public bool IsRaw => RawPacket != null;
+
+    /// <summary>Parties address clients by tunnel ticket - GameSession.TunnelKey.</summary>
+    public Recipient To => Recipient.Ticket(Ticket);
+
+    /// <summary>Always null: a party's raw packets come from World already framed.</summary>
+    public byte[]? RawBody => null;
 }
 
 /// <summary>One Arbiter -> World frame: an opcode and the payload PartyPackets built.</summary>
-public readonly record struct WorldAction(ushort Opcode, byte[] Payload);
+public readonly record struct WorldAction(ushort Opcode, byte[] Payload) : IArbiterWorldAction;
 
 /// <summary>Everything one input produced. Empty is a valid answer.</summary>
-public sealed class PartyActions
+public sealed class PartyActions : IArbiterActions
 {
     public List<ClientAction> ToClients { get; } = new();
     public List<WorldAction> ToWorld { get; } = new();
+
+    private readonly List<IArbiterAction> _ordered = new();
+
+    /// <summary>
+    /// Every client packet and World frame in the order the manager produced them - the list
+    /// ActionDispatcher walks. The two typed lists above hold the same items and stay because
+    /// the party tests read them; nothing writes to either directly.
+    /// </summary>
+    public IReadOnlyList<IArbiterAction> Ordered => _ordered;
+
+    /// <summary>The session that caused this. Recipient.None for an OnWorldFrame input, which is
+    /// why a rejection there goes to the log rather than to a client.</summary>
+    public Recipient Origin { get; internal set; } = Recipient.None;
 
     /// <summary>
     /// Why nothing happened, when nothing happened for a reason worth logging. The real Arbiter
@@ -71,8 +93,15 @@ public sealed class PartyActions
     public bool IsEmpty => ToClients.Count == 0 && ToWorld.Count == 0;
 
     internal PartyActions Reject(string why) { Rejected = why; return this; }
-    internal void Client(ClientAction a) => ToClients.Add(a);
-    internal void World(ushort op, byte[] payload) => ToWorld.Add(new WorldAction(op, payload));
+
+    internal void Client(ClientAction a) { ToClients.Add(a); _ordered.Add(a); }
+
+    internal void World(ushort op, byte[] payload)
+    {
+        var w = new WorldAction(op, payload);
+        ToWorld.Add(w);
+        _ordered.Add(w);
+    }
 }
 
 /// <summary>
@@ -260,7 +289,7 @@ public sealed class PartyManager
 
     public PartyActions OnClientPacket(uint ticket, ushort opcode, byte[] body)
     {
-        var a = new PartyActions();
+        var a = new PartyActions { Origin = Recipient.Ticket(ticket) };
         if (!_byTicket.TryGetValue(ticket, out var me))
             return a.Reject($"ticket {ticket} is not a registered player");
 
