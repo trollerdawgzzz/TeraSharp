@@ -7126,22 +7126,12 @@ public bool TryHandle(WorldBridge bridge, WorldLink link, ushort op, byte[] payl
     /// </summary>
     static byte[] BuildTunnelFrame(byte[] clientPkt, params (uint ticket, uint seq)[] to)
     {
-        int listBytes = to.Length * 16;
-        var p = new byte[16 + listBytes + clientPkt.Length];
-        BitConverter.GetBytes(22u).CopyTo(p, 0);
-        BitConverter.GetBytes((uint)listBytes).CopyTo(p, 4);
-        BitConverter.GetBytes((uint)(22 + listBytes)).CopyTo(p, 8);
-        BitConverter.GetBytes(clientPkt.Length).CopyTo(p, 12);
-        for (int i = 0; i < to.Length; i++)
-        {
-            int b = 16 + i * 16;
-            BitConverter.GetBytes(2800u).CopyTo(p, b);            // PlanetId; ours, or the entry is dropped
-            BitConverter.GetBytes(0u).CopyTo(p, b + 4);           // never read by the Arbiter
-            BitConverter.GetBytes(to[i].ticket).CopyTo(p, b + 8);
-            BitConverter.GetBytes(to[i].seq << 19).CopyTo(p, b + 12);
-        }
-        clientPkt.CopyTo(p, 16 + listBytes);
-        return p;
+        // T38: the layout now lives in World/TunnelFrames.cs, which round-trips all 4169
+        // captured 0x13F7 frames byte for byte. This helper stays as the tuple-shaped front
+        // end the routing tests below were written against.
+        var recipients = new TunnelRecipient[to.Length];
+        for (int i = 0; i < to.Length; i++) recipients[i] = TunnelFrames.To(to[i].ticket, to[i].seq);
+        return TunnelFrames.BuildBypassToClient(clientPkt, recipients);
     }
 
     static byte[] ClientPkt(byte tag) => new byte[] { 4, 0, tag, 0x00 };
@@ -8802,6 +8792,208 @@ some prose with `backticks` that is not a table row
 
         var burst = SelfTest.CheckHandshakeBurst(Path.Combine(dir, DbProxyHandlers.HandshakeBurstFile));
         Hex.True(burst.Pass, "data/handshake_burst.bin parses to 63 frames: " + burst.Detail);
+    }
+
+    // ================================================================================
+    // T38 - the tunnel frames, as functions (World/TunnelFrames.cs).
+    //
+    // MULTIPLAYER-DESIGN.md section 6 splits in two: the WorldBridge plumbing (human-owned) and
+    // the two layouts. This is the layouts, so the six Routing_* tests above can stop hand-rolling
+    // frames and the human's diff becomes a call-site swap.
+    //
+    // data/cap_t38.bin (TSIS) holds six real frames:
+    //   cap_newchar.log        seq 387  0x13F7  ticket 0, seq 0     seq 388  0x13F7  ticket 0, seq 1
+    //   arb_world 09-13 relog  seq 926  0x13F7  ticket 2, seq 0     seq 927  0x13F7  ticket 2, seq 1
+    //   cap_newchar.log        seq 549  0x13F6  worldClient ...0001
+    //   arb_world 09-13 relog  seq 1050 0x13F6  worldClient ...0002
+    //
+    // Beyond those six, the parser and builder were run over EVERY tunnel frame in both captures
+    // outside the build (reframed by the u32 length): 4169 x 0x13F7 and 606 x 0x13F6, all parsed,
+    // all rebuilt byte-for-byte. Every captured frame has one recipient - no capture has two
+    // players - so the N-recipient tests here are synthetic and say so.
+    // ================================================================================
+
+    static Dictionary<uint, byte[]>? LoadT38OrSkip() => LoadTsisOrSkip("cap_t38.bin");
+
+    [Test] public static void T38_parses_the_captured_bypass_to_client()
+    {
+        var cap = LoadT38OrSkip(); if (cap == null) return;
+
+        var first = TunnelFrames.ParseBypassToClient(cap[387])!;
+        Hex.True(first.Recipients.Count == 1, "cap_newchar has one player, so one recipient");
+        var r = first.Recipients[0];
+        Hex.True(r.PlanetId == TunnelFrames.DefaultPlanetId, $"planet 2800, got {r.PlanetId}");
+        Hex.True(r.Ticket == 0, $"ticket 0, got {r.Ticket}");
+        Hex.True(r.Sequence == 0, $"sequence 0, got {r.Sequence}");
+        Hex.True(r.Unread == 95, $"the field the Arbiter never reads is 95 here, not padding: {r.Unread}");
+        Hex.True(first.ClientPacket.Length == 423, $"client packet 423 B, got {first.ClientPacket.Length}");
+        Hex.True(BitConverter.ToUInt16(first.ClientPacket, 0) == first.ClientPacket.Length,
+            "and it is a real client packet: its own [u16 len] matches");
+
+        // The relog capture is the proof the ticket field is read, not assumed: it is 2 there.
+        var other = TunnelFrames.ParseBypassToClient(cap[926])!;
+        Hex.True(other.Recipients[0].Ticket == 2,
+            $"the relog frame is addressed to ticket 2, got {other.Recipients[0].Ticket}");
+
+        // ...and these two prove the >> 19.
+        Hex.True(TunnelFrames.ParseBypassToClient(cap[388])!.Recipients[0].Sequence == 1, "seq 1 (cap_newchar)");
+        Hex.True(TunnelFrames.ParseBypassToClient(cap[927])!.Recipients[0].Sequence == 1, "seq 1 (relog)");
+    }
+
+    [Test] public static void T38_rebuilds_every_captured_frame_byte_exact()
+    {
+        var cap = LoadT38OrSkip(); if (cap == null) return;
+        foreach (uint seq in new uint[] { 387, 388, 926, 927 })
+        {
+            var parsed = TunnelFrames.ParseBypassToClient(cap[seq])!;
+            var rebuilt = TunnelFrames.BuildBypassToClient(
+                parsed.ClientPacket, parsed.Recipients.ToArray());
+            Hex.Eq(rebuilt, cap[seq], $"0x13F7 seq {seq} rebuilds byte for byte");
+        }
+    }
+
+    [Test] public static void T38_parses_and_rebuilds_the_captured_bypass_to_world()
+    {
+        var cap = LoadT38OrSkip(); if (cap == null) return;
+
+        Hex.True(TunnelFrames.TryParseBypassToWorld(cap[549], out ulong wc, out ulong tick, out var pkt),
+            "cap_newchar seq 549 parses");
+        Hex.True(wc == 0x80000AF00001UL, $"worldClient is the gameId World gave us: 0x{wc:X}");
+        Hex.Eq(pkt, "04 00 83 79", "a 4-byte client packet");
+        Hex.Eq(TunnelFrames.BuildBypassToWorld(wc, pkt, tick), cap[549], "and rebuilds byte for byte");
+
+        Hex.True(TunnelFrames.TryParseBypassToWorld(cap[1050], out ulong wc2, out ulong tick2, out var pkt2),
+            "the relog frame parses");
+        Hex.True(wc2 == 0x80000AF00002UL, $"the second login has its own gameId: 0x{wc2:X}");
+        Hex.Eq(TunnelFrames.BuildBypassToWorld(wc2, pkt2, tick2), cap[1050], "rebuilds byte for byte");
+        Hex.True(tick != tick2, "sendTick is a live counter, not a constant");
+    }
+
+    [Test] public static void T38_bypass_to_world_addresses_by_gameId_not_ticket()
+    {
+        // There is no Ticket in the A->W direction at all. The header is
+        // [u32 pktOffset=30][u32 pktLen][u64 worldClient][u64 sendTick], client packet at 24.
+        var payload = TunnelFrames.BuildBypassToWorld(0x80000AF00001UL, Hex.B("04 00 83 79"), 0x4005A);
+        Hex.Eq(payload,
+            "1E 00 00 00 04 00 00 00 01 00 F0 0A 00 80 00 00 5A 00 04 00 00 00 00 00 04 00 83 79",
+            "AS_BYPASS_FROM_CLIENT, exactly as cap_newchar seq 549 has it");
+        Hex.True(BitConverter.ToInt32(payload, 0) - TunnelFrames.FrameHeaderSize
+                 == TunnelFrames.BypassToWorldHeaderSize, "the offset is frame-relative");
+
+        Hex.True(TunnelFrames.IsTunnellable(Hex.B("04 00 83 79")), "a normal packet is tunnelled");
+        Hex.True(!TunnelFrames.IsTunnellable(Array.Empty<byte>()), "an empty one is not");
+        Hex.True(!TunnelFrames.IsTunnellable(new byte[TunnelFrames.MaxTunnelledClientPacket]),
+            "0x1F41 bytes and up: the real Arbiter kicks instead of tunnelling");
+    }
+
+    [Test] public static void T38_two_recipient_frame_follows_the_same_rules()
+    {
+        // SYNTHETIC: no capture has two players. The shape is the Arbiter's own - the dumper
+        // prints a UserList and the handler refcounts one packet by recipient count.
+        var pkt = Hex.B("08 00 11 22 AA BB CC DD");
+        var frame = TunnelFrames.BuildBypassToClient(pkt,
+            TunnelFrames.To(ticket: 0, sequence: 3),
+            TunnelFrames.To(ticket: 7, sequence: 0));
+
+        Hex.True(BitConverter.ToUInt32(frame, TunnelFrames.UserListBytesField) == 32, "16 * 2");
+        Hex.True(BitConverter.ToUInt32(frame, TunnelFrames.PacketOffsetField) - TunnelFrames.FrameHeaderSize == 48,
+            "the packet starts after the list, not at a fixed 32");
+        Hex.True(BitConverter.ToUInt32(frame, TunnelFrames.UserListOffsetField) - TunnelFrames.FrameHeaderSize == 16,
+            "the list always starts right after the 16-byte header");
+
+        var parsed = TunnelFrames.ParseBypassToClient(frame)!;
+        Hex.True(parsed.Recipients.Count == 2, "two recipients");
+        Hex.True(parsed.Recipients[0].Ticket == 0 && parsed.Recipients[0].Sequence == 3, "first entry");
+        Hex.True(parsed.Recipients[1].Ticket == 7 && parsed.Recipients[1].Sequence == 0,
+            "second entry - each recipient carries its OWN sequence");
+        Hex.Eq(parsed.ClientPacket, pkt, "and one copy of the client packet for both");
+
+        // Each parse hands out a fresh array: GameSession.Send encrypts in place.
+        var again = TunnelFrames.ParseBypassToClient(frame)!;
+        Hex.True(!ReferenceEquals(parsed.ClientPacket, again.ClientPacket),
+            "two sessions must never be handed the same buffer");
+    }
+
+    [Test] public static void T38_sequence_lives_in_the_top_13_bits()
+    {
+        var frame = TunnelFrames.BuildBypassToClient(Hex.B("04 00 01 00"), TunnelFrames.To(1, sequence: 5));
+        int entry = TunnelFrames.BypassToClientHeaderSize;
+        Hex.True(BitConverter.ToUInt32(frame, entry + TunnelFrames.EntrySequenceOffset) == (5u << 19),
+            "stored shifted left 19");
+        Hex.True(TunnelFrames.ParseBypassToClient(frame)!.Recipients[0].Sequence == 5, "and read back");
+
+        var big = TunnelFrames.BuildBypassToClient(Hex.B("04 00 01 00"), TunnelFrames.To(1, sequence: 8191));
+        Hex.True(TunnelFrames.ParseBypassToClient(big)!.Recipients[0].Sequence == 8191,
+            "13 bits is the whole range the field can hold");
+    }
+
+    [Test] public static void T38_rejects_malformed_frames()
+    {
+        Hex.True(TunnelFrames.ParseBypassToClient(null) == null, "null");
+        Hex.True(TunnelFrames.ParseBypassToClient(Array.Empty<byte>()) == null, "empty");
+        Hex.True(TunnelFrames.ParseBypassToClient(new byte[15]) == null, "shorter than the header");
+        Hex.True(TunnelFrames.ParseBypassToClient(new byte[16]) == null, "a header claiming no recipients");
+
+        var good = TunnelFrames.BuildBypassToClient(Hex.B("04 00 01 00"), TunnelFrames.To(0));
+
+        var ragged = (byte[])good.Clone();
+        BitConverter.GetBytes(15).CopyTo(ragged, TunnelFrames.UserListBytesField);
+        Hex.True(TunnelFrames.ParseBypassToClient(ragged) == null, "a user list that is not a whole number of entries");
+
+        var huge = (byte[])good.Clone();
+        BitConverter.GetBytes(16 * (TunnelFrames.MaxRecipients + 1)).CopyTo(huge, TunnelFrames.UserListBytesField);
+        Hex.True(TunnelFrames.ParseBypassToClient(huge) == null, "more recipients than the cap");
+
+        var overrun = (byte[])good.Clone();
+        BitConverter.GetBytes(9999).CopyTo(overrun, TunnelFrames.PacketLengthField);
+        Hex.True(TunnelFrames.ParseBypassToClient(overrun) == null, "a packet length past the end");
+
+        var shifted = (byte[])good.Clone();
+        BitConverter.GetBytes(40).CopyTo(shifted, TunnelFrames.PacketOffsetField);
+        Hex.True(TunnelFrames.ParseBypassToClient(shifted) == null,
+            "a packet offset that is not 16 + userListBytes - the invariant 4169 captured frames hold to");
+
+        var truncated = good[..(good.Length - 1)];
+        Hex.True(TunnelFrames.ParseBypassToClient(truncated) == null, "a truncated frame");
+    }
+
+    [Test] public static void T38_ticket_allocator_never_reuses_a_live_ticket()
+    {
+        var a = new TicketAllocator();
+        uint t1 = a.Allocate(), t2 = a.Allocate(), t3 = a.Allocate();
+        Hex.True(t1 == TicketAllocator.DefaultFirstTicket, $"the first ticket stays 5, got {t1}");
+        Hex.True(t1 != t2 && t2 != t3 && t1 != t3, $"three live sessions, three tickets: {t1},{t2},{t3}");
+        Hex.True(a.LiveCount == 3 && a.IsLive(t2), "and the allocator knows they are out");
+
+        // Freeing does NOT rewind the cursor: a late 0x13F7 for the session that left must not
+        // reach whoever logs in next.
+        a.Free(t2);
+        Hex.True(!a.IsLive(t2) && a.LiveCount == 2, "freed");
+        uint t4 = a.Allocate();
+        Hex.True(t4 != t2 && t4 != t1 && t4 != t3, $"the freed ticket is not reissued immediately: {t4}");
+
+        a.Reset();
+        Hex.True(a.LiveCount == 0 && a.Allocate() == TicketAllocator.DefaultFirstTicket,
+            "a World restart starts the table over");
+    }
+
+    [Test] public static void T38_ticket_allocator_wraps_past_live_tickets()
+    {
+        // A table of 4 starting at 1, so the wrap is reachable in a test.
+        var a = new TicketAllocator(firstTicket: 1, tableSize: 4);
+        uint t1 = a.Allocate(), t2 = a.Allocate(), t3 = a.Allocate();
+        Hex.True(t1 == 1 && t2 == 2 && t3 == 3, $"linear from the cursor: {t1},{t2},{t3}");
+
+        a.Free(t2);                       // slot 2 is free, the cursor is past it
+        uint t4 = a.Allocate();           // wraps to 0
+        Hex.True(t4 == 0, $"the cursor wraps to the start of the table, got {t4}");
+        uint t5 = a.Allocate();           // 1 and 3 are live, so this must be the freed 2
+        Hex.True(t5 == 2, $"only after wrapping is a freed ticket reused, got {t5}");
+        Hex.True(a.LiveCount == 4, "the table is now full");
+
+        bool threw = false;
+        try { a.Allocate(); } catch (InvalidOperationException) { threw = true; }
+        Hex.True(threw, "a full table throws rather than handing out a live ticket");
     }
 
     /// <summary>Walks up from the test binary looking for a repo-relative file; null if not found.</summary>
