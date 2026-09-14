@@ -58,6 +58,15 @@ public sealed class AccountRecord
 {
     public long Id { get; set; }
     public string Name { get; set; } = "";
+
+    /// <summary>
+    /// GM level, 0 for a normal account. The real Arbiter keeps this per CHARACTER at
+    /// User+0x3b98, loads it from the AdminLevel column and writes it back through
+    /// dbo.spUpdateUserAdminLevel; every gate in the binary tests only >= 1, and its own
+    /// set_go command assigns 5. We keep it on the ACCOUNT so a login can read it before a
+    /// character is picked. status/GM-DESIGN.md.
+    /// </summary>
+    public int AdminLevel { get; set; }
 }
 
 /// <summary>
@@ -617,6 +626,18 @@ CREATE TABLE IF NOT EXISTS blocks (
   PRIMARY KEY (character_id, blocked_id)
 );
 
+-- T30: friend groups. The client owns the index (2..10, validated by User::UpdateFriendGroup);
+-- group 1 is the implicit ungrouped bucket and is never a row here - it only ever appears as
+-- friends.group_id. Index 2 is the sample group User::ProvideSampleFriendGroup seeds once per
+-- character. status/FRIENDS.md.
+CREATE TABLE IF NOT EXISTS friend_groups (
+  character_id INTEGER NOT NULL REFERENCES characters(id),
+  group_index  INTEGER NOT NULL,
+  name         TEXT    NOT NULL DEFAULT '',
+  updated_at   TEXT    NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (character_id, group_index)
+);
+
 CREATE TABLE IF NOT EXISTS quests (
   -- id is the questDbId the Arbiter returns on an INSERT write (sqlType 22) and that World then
   -- carries in every later write for the quest (DBStartQuestContext::SetQuestDbId). It has to be
@@ -755,6 +776,16 @@ CREATE TABLE IF NOT EXISTS account_settings (
         AddColumnIfMissing("characters", "return_z", "REAL NOT NULL DEFAULT 0");
         AddColumnIfMissing("characters", "dungeon_id", "INTEGER NOT NULL DEFAULT 0");
         AddColumnIfMissing("characters", "instance_pdid", "INTEGER NOT NULL DEFAULT 0");
+        // T30: friends carry a group and the requester's greeting; blocks carry a note; the
+        // character carries the profile message the friend panel shows and the once-only flag
+        // behind dbo.spIsProvideSampleFriendGroup.
+        AddColumnIfMissing("friends", "group_id", "INTEGER NOT NULL DEFAULT 1");
+        AddColumnIfMissing("friends", "memo", "TEXT NOT NULL DEFAULT ''");
+        AddColumnIfMissing("blocks", "memo", "TEXT NOT NULL DEFAULT ''");
+        AddColumnIfMissing("characters", "profile_message", "TEXT NOT NULL DEFAULT ''");
+        AddColumnIfMissing("characters", "sample_group_provided", "INTEGER NOT NULL DEFAULT 0");
+        // T32: GM level, per account (see AccountRecord.AdminLevel).
+        AddColumnIfMissing("accounts", "admin_level", "INTEGER NOT NULL DEFAULT 0");
     }
 
     /// <summary>ALTER TABLE ADD COLUMN, but a no-op when the column is already there.</summary>
@@ -871,6 +902,56 @@ ON CONFLICT(account_id) DO UPDATE SET blob = excluded.blob, updated_at = exclude
     }
 
     // ---- Accounts ----
+
+    /// <summary>The account row for a name, or null when it does not exist yet.</summary>
+    public AccountRecord? GetAccount(string name)
+    {
+        if (string.IsNullOrEmpty(name)) return null;
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT id, name, admin_level FROM accounts WHERE name = $n";
+            cmd.Parameters.AddWithValue("$n", name);
+            using var r = cmd.ExecuteReader();
+            if (!r.Read()) return null;
+            return new AccountRecord { Id = r.GetInt64(0), Name = r.GetString(1), AdminLevel = r.GetInt32(2) };
+        }
+    }
+
+    /// <summary>The account row by id, or null.</summary>
+    public AccountRecord? GetAccountById(long id)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT id, name, admin_level FROM accounts WHERE id = $i";
+            cmd.Parameters.AddWithValue("$i", id);
+            using var r = cmd.ExecuteReader();
+            if (!r.Read()) return null;
+            return new AccountRecord { Id = r.GetInt64(0), Name = r.GetString(1), AdminLevel = r.GetInt32(2) };
+        }
+    }
+
+    /// <summary>
+    /// The GM level for an account - what dbo.spUpdateUserAdminLevel does on the real server,
+    /// except keyed on the account rather than the character (status/GM-DESIGN.md section 3).
+    /// Negative levels are clamped to 0.
+    /// </summary>
+    public bool SetAdminLevel(long accountId, int level)
+    {
+        if (level < 0) level = 0;
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE accounts SET admin_level = $l WHERE id = $i";
+            cmd.Parameters.AddWithValue("$l", level);
+            cmd.Parameters.AddWithValue("$i", accountId);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    /// <summary>The stored GM level, 0 when the account is unknown.</summary>
+    public int GetAdminLevel(long accountId) => GetAccountById(accountId)?.AdminLevel ?? 0;
 
     public AccountRecord GetOrCreateAccount(string name)
     {
@@ -1732,20 +1813,80 @@ DELETE FROM blocks  WHERE character_id IN (SELECT id FROM characters WHERE id = 
         InstancePdId = r.GetInt32(r.GetOrdinal("instance_pdid")),
     };
 
-    // ---- Friends ----
+    // ---- Friends (T30) ----
+
+    /// <summary>
+    /// One row of the friends table. <paramref name="Type"/> is the relation the real Arbiter
+    /// keeps at UserFriendInfo+0xE8 and ships as S_FRIEND_LIST.type: 0 = mutual friend,
+    /// 1 = a request I sent, 2 = a request I received. <paramref name="GroupId"/> is 1 for
+    /// ungrouped. <paramref name="Memo"/> is my note about them (max 20 chars).
+    /// </summary>
+    public sealed record FriendRow(int FriendId, int Type, int GroupId, string Memo);
+
+    /// <summary>Every friend row for a character, oldest first - the order the real Arbiter
+    /// walks its vector, and therefore the order S_FRIEND_LIST is built in.</summary>
+    public List<FriendRow> GetFriendRows(int characterId)
+    {
+        lock (_lock)
+        {
+            var list = new List<FriendRow>();
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT friend_id, type, group_id, memo FROM friends "
+                            + "WHERE character_id = $cid ORDER BY created_at, friend_id";
+            cmd.Parameters.AddWithValue("$cid", characterId);
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                list.Add(new FriendRow(r.GetInt32(0), r.GetInt32(1), r.GetInt32(2), r.GetString(3)));
+            return list;
+        }
+    }
+
+    /// <summary>One friend row, or null when they are not on the list.</summary>
+    public FriendRow? GetFriendRow(int characterId, int friendId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT friend_id, type, group_id, memo FROM friends "
+                            + "WHERE character_id = $c AND friend_id = $f";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            cmd.Parameters.AddWithValue("$f", friendId);
+            using var r = cmd.ExecuteReader();
+            if (!r.Read()) return null;
+            return new FriendRow(r.GetInt32(0), r.GetInt32(1), r.GetInt32(2), r.GetString(3));
+        }
+    }
 
     /// <summary>Get all friends for a character (type: 0=mutual, 1=outgoing request, 2=incoming request).</summary>
     public List<(int FriendId, int Type)> GetFriends(int characterId)
     {
+        var rows = GetFriendRows(characterId);
+        var list = new List<(int, int)>(rows.Count);
+        foreach (var row in rows) list.Add((row.FriendId, row.Type));
+        return list;
+    }
+
+    /// <summary>
+    /// Insert or update one direction of a friendship. The real Arbiter has exactly this
+    /// last-write-wins shape: both AddNewFriend and the accept path end in
+    /// User::AddToFriendListNoLock, which overwrites the record it finds (memo included).
+    /// </summary>
+    public void UpsertFriend(int characterId, int friendId, int type, string memo, int groupId = 1)
+    {
+        ArgumentNullException.ThrowIfNull(memo);
         lock (_lock)
         {
-            var list = new List<(int, int)>();
             using var cmd = _db.CreateCommand();
-            cmd.CommandText = "SELECT friend_id, type FROM friends WHERE character_id = $cid";
-            cmd.Parameters.AddWithValue("$cid", characterId);
-            using var r = cmd.ExecuteReader();
-            while (r.Read()) list.Add((r.GetInt32(0), r.GetInt32(1)));
-            return list;
+            cmd.CommandText = "INSERT INTO friends(character_id, friend_id, type, group_id, memo) "
+                            + "VALUES($c,$f,$t,$g,$m) "
+                            + "ON CONFLICT(character_id, friend_id) DO UPDATE SET "
+                            + "type = $t, group_id = $g, memo = $m";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            cmd.Parameters.AddWithValue("$f", friendId);
+            cmd.Parameters.AddWithValue("$t", type);
+            cmd.Parameters.AddWithValue("$g", groupId);
+            cmd.Parameters.AddWithValue("$m", memo);
+            cmd.ExecuteNonQuery();
         }
     }
 
@@ -1774,20 +1915,166 @@ DELETE FROM blocks  WHERE character_id IN (SELECT id FROM characters WHERE id = 
         }
     }
 
-    // ---- Blocks ----
+    /// <summary>dbo.spChangeFriendMemo. Truncates to 20 chars, as wcsncpy_s(.., 0x15, ..) does.</summary>
+    public bool SetFriendMemo(int characterId, int friendId, string memo)
+    {
+        ArgumentNullException.ThrowIfNull(memo);
+        if (memo.Length > 20) memo = memo[..20];
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE friends SET memo = $m WHERE character_id = $c AND friend_id = $f";
+            cmd.Parameters.AddWithValue("$m", memo);
+            cmd.Parameters.AddWithValue("$c", characterId);
+            cmd.Parameters.AddWithValue("$f", friendId);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
 
-    public List<int> GetBlocks(int characterId)
+    /// <summary>dbo.spChangeFriendGroupId.</summary>
+    public bool SetFriendGroup(int characterId, int friendId, int groupId)
     {
         lock (_lock)
         {
-            var list = new List<int>();
             using var cmd = _db.CreateCommand();
-            cmd.CommandText = "SELECT blocked_id FROM blocks WHERE character_id = $cid";
-            cmd.Parameters.AddWithValue("$cid", characterId);
+            cmd.CommandText = "UPDATE friends SET group_id = $g WHERE character_id = $c AND friend_id = $f";
+            cmd.Parameters.AddWithValue("$g", groupId);
+            cmd.Parameters.AddWithValue("$c", characterId);
+            cmd.Parameters.AddWithValue("$f", friendId);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    // ---- Friend groups (T30) ----
+
+    /// <summary>The character's groups, by index. Group 1 (ungrouped) is never one of them.</summary>
+    public List<(int Index, string Name)> GetFriendGroups(int characterId)
+    {
+        lock (_lock)
+        {
+            var list = new List<(int, string)>();
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT group_index, name FROM friend_groups "
+                            + "WHERE character_id = $c ORDER BY group_index";
+            cmd.Parameters.AddWithValue("$c", characterId);
             using var r = cmd.ExecuteReader();
-            while (r.Read()) list.Add(r.GetInt32(0));
+            while (r.Read()) list.Add((r.GetInt32(0), r.GetString(1)));
             return list;
         }
+    }
+
+    /// <summary>dbo.spUpdateFriendGroupList - create or rename, keyed on the index the client chose.</summary>
+    public void UpsertFriendGroup(int characterId, int index, string name)
+    {
+        ArgumentNullException.ThrowIfNull(name);
+        if (name.Length > 40) name = name[..40];
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "INSERT INTO friend_groups(character_id, group_index, name) VALUES($c,$i,$n) "
+                            + "ON CONFLICT(character_id, group_index) DO UPDATE SET "
+                            + "name = $n, updated_at = datetime('now')";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            cmd.Parameters.AddWithValue("$i", index);
+            cmd.Parameters.AddWithValue("$n", name);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>
+    /// dbo.spDeleteFriendGroup. User::DeleteFriendGroup moves every member back to group 1
+    /// first, so a deleted group never leaves friends pointing at a group that is gone.
+    /// </summary>
+    public bool DeleteFriendGroup(int characterId, int index)
+    {
+        lock (_lock)
+        {
+            using (var move = _db.CreateCommand())
+            {
+                move.CommandText = "UPDATE friends SET group_id = 1 "
+                                 + "WHERE character_id = $c AND group_id = $i";
+                move.Parameters.AddWithValue("$c", characterId);
+                move.Parameters.AddWithValue("$i", index);
+                move.ExecuteNonQuery();
+            }
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "DELETE FROM friend_groups WHERE character_id = $c AND group_index = $i";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            cmd.Parameters.AddWithValue("$i", index);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    /// <summary>
+    /// The dbo.spIsProvideSampleFriendGroup guard: true exactly once per character, the first
+    /// time anything asks. The caller then seeds group 2 and the default profile message.
+    /// </summary>
+    public bool TryProvideSampleFriendGroup(int characterId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE characters SET sample_group_provided = 1 "
+                            + "WHERE id = $id AND sample_group_provided = 0";
+            cmd.Parameters.AddWithValue("$id", characterId);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    /// <summary>The profile message shown as personalNote in S_FRIEND_LIST (spLoadUserFriendProfile).</summary>
+    public string GetProfileMessage(int characterId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT profile_message FROM characters WHERE id = $id";
+            cmd.Parameters.AddWithValue("$id", characterId);
+            return cmd.ExecuteScalar() as string ?? "";
+        }
+    }
+
+    /// <summary>dbo.spUpdateUserFriendProfile. Truncated to 30 chars like the 31-wchar buffer.</summary>
+    public void SetProfileMessage(int characterId, string message)
+    {
+        ArgumentNullException.ThrowIfNull(message);
+        if (message.Length > 30) message = message[..30];
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE characters SET profile_message = $m WHERE id = $id";
+            cmd.Parameters.AddWithValue("$m", message);
+            cmd.Parameters.AddWithValue("$id", characterId);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    // ---- Blocks ----
+
+    /// <summary>One blocked character and my note about them (max 40 chars).</summary>
+    public sealed record BlockRow(int BlockedId, string Memo);
+
+    /// <summary>The block list with memos, oldest first.</summary>
+    public List<BlockRow> GetBlockRows(int characterId)
+    {
+        lock (_lock)
+        {
+            var list = new List<BlockRow>();
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT blocked_id, memo FROM blocks "
+                            + "WHERE character_id = $cid ORDER BY created_at, blocked_id";
+            cmd.Parameters.AddWithValue("$cid", characterId);
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) list.Add(new BlockRow(r.GetInt32(0), r.GetString(1)));
+            return list;
+        }
+    }
+
+    public List<int> GetBlocks(int characterId)
+    {
+        var rows = GetBlockRows(characterId);
+        var list = new List<int>(rows.Count);
+        foreach (var row in rows) list.Add(row.BlockedId);
+        return list;
     }
 
     public bool AddBlock(int characterId, int blockedId)
@@ -1808,6 +2095,22 @@ DELETE FROM blocks  WHERE character_id IN (SELECT id FROM characters WHERE id = 
         {
             using var cmd = _db.CreateCommand();
             cmd.CommandText = "DELETE FROM blocks WHERE character_id = $c AND blocked_id = $b";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            cmd.Parameters.AddWithValue("$b", blockedId);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    /// <summary>dbo.spEditBlockedUserMemo. Truncates to 40 chars (wcsncpy_s(.., 0x29, ..)).</summary>
+    public bool SetBlockMemo(int characterId, int blockedId, string memo)
+    {
+        ArgumentNullException.ThrowIfNull(memo);
+        if (memo.Length > 40) memo = memo[..40];
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE blocks SET memo = $m WHERE character_id = $c AND blocked_id = $b";
+            cmd.Parameters.AddWithValue("$m", memo);
             cmd.Parameters.AddWithValue("$c", characterId);
             cmd.Parameters.AddWithValue("$b", blockedId);
             return cmd.ExecuteNonQuery() > 0;

@@ -1,6 +1,7 @@
 ﻿using System.Collections.Concurrent;
 using System.Net.Sockets;
 using System.Reflection;
+using TeraSharp.Arbiter.Auth;
 using TeraSharp.Arbiter.Handlers;
 using TeraSharp.Arbiter.Protocol;
 using TeraSharp.Arbiter.World;
@@ -1130,32 +1131,9 @@ array groups
 - int32 index
 - string name
 ");
-        reg.RegisterFromDef("S_FRIEND_LIST", @"
-ref friends
-ref personalNote
-string personalNote
-array friends
-- ref name
-- ref myNote
-- ref theirNote
-- uint32 playerId
-- int32 group
-- int32 level
-- int32 race
-- int32 class
-- int32 gender
-- int32 worldId
-- int32 guardId
-- int32 sectionId
-- int32 dungeonGauntletDifficultyId
-- bool summonable
-- int64 lastOnline
-- uint32 type
-- int32 bonds
-- string name
-- string myNote
-- string theirNote
-");
+        // S_FRIEND_LIST is the 100.02 layout from V100Definitions - the def FILE
+        // (S_FRIEND_LIST.2) is the patch-101 one and carries an extra int32. T30.
+        V100Definitions.EnsureRegistered(reg);
         reg.RegisterFromDef("S_WHISPER", @"
 ref name
 ref recipient
@@ -6575,6 +6553,892 @@ public bool TryHandle(WorldBridge bridge, WorldLink link, ushort op, byte[] payl
         Hex.Eq(b, Hex.B("EA 07 09 00  0D 00 05 00  33 00 2D 00  00 00 00 00"),
             "2026-09-13 05:51:45 encodes exactly as the capture has it");
         Hex.True(b.Length == 16, "16 bytes");
+    }
+
+    // ================================================================================
+    // T30 - friends, friend groups, memos and the block list, from rows.
+    //
+    // Ground truth: cap_newchar_client.log (the CLIENT side of the same session as
+    // cap_newchar.log), frames 304-307 - the four social packets the real Arbiter sends
+    // after C_LOAD_TOPO_FIN for a brand-new character:
+    //
+    //   [304] S_USER_BLOCK_LIST    len=8   00 00 00 00
+    //   [305] S_FRIEND_GROUP_LIST  len=24  01 00 08 00 08 00 00 00 12 00 02 00 00 00 7D 59 CB 53 00 00
+    //   [306] S_FRIEND_LIST        len=32  00 00 00 00 0A 00 <profile message> 00 00
+    //   [307] S_UPDATE_FRIEND_INFO len=8   00 00 00 00
+    //
+    // Rules and layouts: status/FRIENDS.md (every one quoted to its Handler_C_* in Arb_part_*.c).
+    // ================================================================================
+
+    /// <summary>The four captured bodies, frame header stripped.</summary>
+    const string Cap304BlockList     = "00 00 00 00";
+    const string Cap305FriendGroups  = "01 00 08 00 08 00 00 00 12 00 02 00 00 00 7D 59 CB 53 00 00";
+    const string Cap306FriendList    = "00 00 00 00 0A 00 CA 4E 29 59 5F 4E 2F 66 09 61 EB 5F 84 76 00 4E 29 59 21 00 00 00";
+    const string Cap307UpdateFriends = "00 00 00 00";
+
+    /// <summary>
+    /// The defs the social path uses, with the two 100.02 overrides from
+    /// <see cref="V100Definitions"/> and the rest exactly as the def folder has them.
+    /// </summary>
+    static DefinitionRegistry CreateT30Defs()
+    {
+        var reg = new DefinitionRegistry(QuietLog());
+        V100Definitions.EnsureRegistered(reg);
+
+        reg.RegisterFromDef("S_FRIEND_GROUP_LIST", @"
+array    groups
+- int32  index
+- string name
+");
+        reg.RegisterFromDef("S_USER_BLOCK_LIST", @"
+array    blockList
+- uint32 id
+- int32  level
+- int32  class
+- string name
+- string myNote
+");
+        reg.RegisterFromDef("S_ADD_BLOCKED_USER", @"
+uint32 id
+int32  level
+int32  class
+string name
+string myNote
+");
+        reg.RegisterFromDef("S_REMOVE_BLOCKED_USER", "uint32 id\n");
+        reg.RegisterFromDef("S_DELETE_FRIEND", "uint32 id\n");
+        reg.RegisterFromDef("S_RESULT_CHANGE_FRIEND_MEMO", @"
+int32  friendDbId
+string newMemo
+");
+        reg.RegisterFromDef("S_CHANGE_FRIEND_STATE", @"
+uint32 playerId
+uint32 state
+");
+        reg.RegisterFromDef("C_ADD_FRIEND", @"
+string name
+string message
+");
+        reg.RegisterFromDef("C_CHANGE_FRIEND_MEMO", @"
+int32  friendDbId
+string newMemo
+");
+        reg.RegisterFromDef("C_ADD_FRIEND_GROUP", @"
+ref      friends
+ref      name
+uint32   id
+string   name
+array<uint32> friends
+");
+        reg.RegisterFromDef("C_EDIT_FRIEND_GROUP", @"
+ref      friends
+ref      name
+uint32   id
+string   name
+array    friends
+- uint32 playerId
+- uint32 id
+");
+        return reg;
+    }
+
+    /// <summary>
+    /// Two characters on DIFFERENT accounts - friends between characters of one account are
+    /// refused by the real Arbiter (User::CanAddFriendNoLock, SMT 441), so the shared
+    /// <c>StoreWithTwoCharacters</c> helper cannot exercise any of this.
+    /// </summary>
+    static TeraSharp.Arbiter.Persistence.CharacterStore StoreWithTwoAccounts()
+    {
+        var store = new TeraSharp.Arbiter.Persistence.CharacterStore(":memory:", QuietLog());
+        for (int i = 1; i <= 2; i++)
+        {
+            var acct = store.GetOrCreateAccount("acct" + i);
+            int id = store.CreateCharacter(new TeraSharp.Arbiter.Persistence.CharacterRecord
+            {
+                AccountId = acct.Id, Name = "t30_" + i, Gender = 1, Race = 4, Class = 12,
+                Level = 10 + i, TemplateId = 10101, Zone = 5, X = 1f, Y = 2f, Z = 3f,
+                Appearance = new byte[8], Details = new byte[32], Shape = new byte[64],
+                Position = i,
+            });
+            Hex.True(id == i, $"expected character id {i}, got {id}");
+        }
+        return store;
+    }
+
+    static byte[] WriteByDef(DefinitionRegistry reg, string packet, Dictionary<string, object> fields)
+        => new DefinitionWriter().Write(reg.Get(packet)!, fields);
+
+    // ---- The four login packets, byte-exact against the capture ----
+
+    [Test] public static void T30_block_list_matches_the_capture()
+    {
+        using var store = StoreWithTwoAccounts();
+        var reg = CreateT30Defs();
+        Hex.Eq(WriteByDef(reg, "S_USER_BLOCK_LIST", SocialHandlers.BuildBlockListFields(store, 1)),
+            Cap304BlockList, "S_USER_BLOCK_LIST for a character with no blocks (capture frame 304)");
+    }
+
+    [Test] public static void T30_friend_group_list_matches_the_capture()
+    {
+        using var store = StoreWithTwoAccounts();
+        var reg = CreateT30Defs();
+
+        // Before the seed there are no groups at all - the packet is 4 bytes, not the capture.
+        Hex.Eq(WriteByDef(reg, "S_FRIEND_GROUP_LIST", SocialHandlers.BuildFriendGroupListFields(store, 1)),
+            "00 00 00 00", "no groups yet");
+
+        SocialHandlers.ProvideSampleGroup(store, 1);
+        Hex.Eq(WriteByDef(reg, "S_FRIEND_GROUP_LIST", SocialHandlers.BuildFriendGroupListFields(store, 1)),
+            Cap305FriendGroups, "S_FRIEND_GROUP_LIST after the sample group (capture frame 305)");
+    }
+
+    [Test] public static void T30_friend_list_matches_the_capture()
+    {
+        using var store = StoreWithTwoAccounts();
+        var reg = CreateT30Defs();
+        SocialHandlers.ProvideSampleGroup(store, 1);       // also seeds the profile message
+        Hex.Eq(WriteByDef(reg, "S_FRIEND_LIST", SocialHandlers.BuildFriendListFields(store, 1)),
+            Cap306FriendList, "S_FRIEND_LIST for a brand-new character (capture frame 306)");
+    }
+
+    [Test] public static void T30_update_friend_info_is_empty_with_nobody_online()
+    {
+        var reg = CreateT30Defs();
+        Hex.Eq(WriteByDef(reg, "S_UPDATE_FRIEND_INFO",
+                new Dictionary<string, object> { ["friends"] = new List<object>() }),
+            Cap307UpdateFriends, "S_UPDATE_FRIEND_INFO with no online friends (capture frame 307)");
+    }
+
+    [Test] public static void T30_sample_group_name_and_profile_are_the_captured_strings()
+    {
+        // The two strings come from StrFriendDataSheet (ids 100 and 200), so they are only
+        // knowable from the capture - and they are what makes frames 305/306 reproduce.
+        Hex.Eq(System.Text.Encoding.Unicode.GetBytes(SocialHandlers.SampleGroupName),
+            "7D 59 CB 53", "the sample group name is the capture's two code units");
+        Hex.Eq(System.Text.Encoding.Unicode.GetBytes(SocialHandlers.DefaultProfileMessage),
+            "CA 4E 29 59 5F 4E 2F 66 09 61 EB 5F 84 76 00 4E 29 59 21 00",
+            "the default profile message is the capture's ten code units");
+    }
+
+    // ---- The 100.02 element sizes: the reason for V100Definitions ----
+
+    [Test] public static void T30_friend_list_element_is_63_bytes_not_67()
+    {
+        var reg = CreateT30Defs();
+        using var store = StoreWithTwoAccounts();
+        SocialHandlers.WriteFriendRequest(store, 1, 2, "hi");
+        var body = WriteByDef(reg, "S_FRIEND_LIST", SocialHandlers.BuildFriendListFields(store, 1));
+
+        // [0..1] count=1, [2..3] first element offset (packet-relative), [4..5] note offset.
+        Hex.True(BitConverter.ToUInt16(body, 0) == 1, "one friend");
+        int first = BitConverter.ToUInt16(body, 2) - 4;
+        int next = BitConverter.ToUInt16(body, first + 2) - 4;    // 0 when it is the last element
+        int nameOffset = BitConverter.ToUInt16(body, first + 4) - 4;
+        Hex.True(next == -4, "a single element has no next");
+        // The strings start right after the element, so nameOffset - first IS the stride.
+        Hex.True(nameOffset - first == 63,
+            $"User::SendFriendListNoLock advances 0x3f per element; got {nameOffset - first}. "
+            + "67 means the S_FRIEND_LIST.2 def (patch 101+) leaked back in - see V100Definitions.");
+    }
+
+    [Test] public static void T30_update_friend_info_element_is_53_bytes_not_57()
+    {
+        var reg = CreateT30Defs();
+        var body = WriteByDef(reg, "S_UPDATE_FRIEND_INFO", new Dictionary<string, object>
+        {
+            ["friends"] = new List<object>
+            {
+                new Dictionary<string, object>
+                {
+                    ["playerId"] = 2u, ["level"] = 11, ["race"] = 4, ["class"] = 12, ["gender"] = 1,
+                    ["status"] = 0, ["worldId"] = 0, ["guardId"] = 0, ["sectionId"] = 0,
+                    ["updated"] = true, ["isWorldEventTarget"] = false, ["summonable"] = false,
+                    ["lastOnline"] = 0L, ["name"] = "t30_2",
+                },
+            },
+        });
+        int first = BitConverter.ToUInt16(body, 2) - 4;
+        int nameOffset = BitConverter.ToUInt16(body, first + 4) - 4;   // here, next, then the name ref
+        Hex.True(nameOffset - first == 53,
+            $"User::SendUpdateFriendListInfo writes 53-byte elements; got {nameOffset - first}");
+    }
+
+    [Test] public static void T30_friend_list_round_trips_a_pending_request()
+    {
+        var reg = CreateT30Defs();
+        using var store = StoreWithTwoAccounts();
+        SocialHandlers.WriteFriendRequest(store, 1, 2, "add me");
+
+        var body = WriteByDef(reg, "S_FRIEND_LIST", SocialHandlers.BuildFriendListFields(store, 1));
+        var read = new DefinitionReader(body).Read(reg.Get("S_FRIEND_LIST")!);
+        var friends = (List<object>)read["friends"];
+        Hex.True(friends.Count == 1, "one friend row");
+        var f = (Dictionary<string, object>)friends[0];
+        Hex.True(Convert.ToUInt32(f["playerId"]) == 2, "playerId");
+        Hex.True(Convert.ToUInt32(f["type"]) == SocialHandlers.FriendTypeOutgoing,
+            "my side of a request I sent is type 1");
+        Hex.True(Convert.ToInt32(f["group"]) == SocialHandlers.UngroupedGroupId, "ungrouped");
+        Hex.True((string)f["name"] == "t30_2", "friend name");
+        Hex.True((string)f["myNote"] == "add me", "the greeting is stored as the memo");
+        Hex.True((string)f["theirNote"] == "add me", "and on their row too");
+
+        // The other side sees the same pair as an INCOMING request.
+        var theirs = SocialHandlers.BuildFriendListFields(store, 2);
+        var them = (Dictionary<string, object>)((List<object>)theirs["friends"])[0];
+        Hex.True(Convert.ToUInt32(them["type"]) == SocialHandlers.FriendTypeIncoming, "their side is type 2");
+    }
+
+    // ---- The rules ----
+
+    [Test] public static void T30_system_message_format_matches_the_capture()
+    {
+        // cap_newchar_client.log frame 692 decodes to exactly this.
+        Hex.True(SocialHandlers.Smt(2977, "questTemplateId", "59901", "taskId", "1")
+                 == "@2977\vquestTemplateId\v59901\vtaskId\v1", "parameterised form");
+        Hex.True(SocialHandlers.Smt(888) == "@888", "bare form (frame 311)");
+    }
+
+    [Test] public static void T30_CanAddFriend_follows_the_decompiled_order()
+    {
+        using var store = StoreWithTwoAccounts();
+        Hex.True(SocialHandlers.CanAddFriend(store, 1, 99) == SocialHandlers.AddFriendResult.TargetNotFound,
+            "unknown character");
+        Hex.True(SocialHandlers.CanAddFriend(store, 1, 1) == SocialHandlers.AddFriendResult.CannotAddSelf,
+            "myself");
+
+        // Another character on my OWN account is refused the same way (SMT 441).
+        var acct = store.GetOrCreateAccount("acct1");
+        int sibling = store.CreateCharacter(new TeraSharp.Arbiter.Persistence.CharacterRecord
+        {
+            AccountId = acct.Id, Name = "t30_sibling", Gender = 1, Race = 4, Class = 12,
+            Level = 1, TemplateId = 10101, Zone = 5,
+            Appearance = new byte[8], Details = new byte[32], Shape = new byte[64], Position = 2,
+        });
+        Hex.True(SocialHandlers.CanAddFriend(store, 1, sibling) == SocialHandlers.AddFriendResult.CannotAddSelf,
+            "same account");
+
+        Hex.True(SocialHandlers.CanAddFriend(store, 1, 2) == SocialHandlers.AddFriendResult.Ok, "clean pair");
+
+        store.AddBlock(1, 2);
+        Hex.True(SocialHandlers.CanAddFriend(store, 1, 2) == SocialHandlers.AddFriendResult.IBlockedTarget,
+            "I blocked them");
+        store.RemoveBlock(1, 2);
+        store.AddBlock(2, 1);
+        Hex.True(SocialHandlers.CanAddFriend(store, 1, 2) == SocialHandlers.AddFriendResult.TargetBlockedMe,
+            "they blocked me");
+        store.RemoveBlock(2, 1);
+
+        SocialHandlers.WriteFriendRequest(store, 1, 2, "");
+        Hex.True(SocialHandlers.CanAddFriend(store, 1, 2) == SocialHandlers.AddFriendResult.AlreadyFriend,
+            "a pending request counts as already on the list");
+    }
+
+    [Test] public static void T30_request_then_accept_flips_both_rows_and_clears_the_memos()
+    {
+        using var store = StoreWithTwoAccounts();
+        SocialHandlers.WriteFriendRequest(store, 1, 2, "hello there");
+
+        var mine = store.GetFriendRow(1, 2)!;
+        var theirs = store.GetFriendRow(2, 1)!;
+        Hex.True(mine.Type == SocialHandlers.FriendTypeOutgoing, "requester row is type 1");
+        Hex.True(theirs.Type == SocialHandlers.FriendTypeIncoming, "target row is type 2");
+        Hex.True(mine.Memo == "hello there" && theirs.Memo == "hello there",
+            "the greeting is written to BOTH rows");
+
+        Hex.True(SocialHandlers.AcceptFriendRequest(store, 2, 1), "the target can accept");
+        Hex.True(store.GetFriendRow(1, 2)!.Type == SocialHandlers.FriendTypeMutual, "requester now mutual");
+        Hex.True(store.GetFriendRow(2, 1)!.Type == SocialHandlers.FriendTypeMutual, "target now mutual");
+        Hex.True(store.GetFriendRow(1, 2)!.Memo == "" && store.GetFriendRow(2, 1)!.Memo == "",
+            "accepting clears both memos - the Arbiter re-adds with an empty one");
+    }
+
+    [Test] public static void T30_accepting_without_a_request_is_silently_ignored()
+    {
+        using var store = StoreWithTwoAccounts();
+        Hex.True(!SocialHandlers.AcceptFriendRequest(store, 2, 1), "no request at all");
+
+        SocialHandlers.WriteFriendRequest(store, 1, 2, "");
+        // The REQUESTER cannot accept their own request (their row is type 1, not 2).
+        Hex.True(!SocialHandlers.AcceptFriendRequest(store, 1, 2), "the requester cannot self-accept");
+        Hex.True(store.GetFriendRow(1, 2)!.Type == SocialHandlers.FriendTypeOutgoing, "row untouched");
+    }
+
+    [Test] public static void T30_delete_friend_removes_both_directions_and_reports_the_prior_type()
+    {
+        using var store = StoreWithTwoAccounts();
+        SocialHandlers.WriteFriendRequest(store, 1, 2, "x");
+
+        // Declining: the receiver deletes a type-2 row.
+        Hex.True(SocialHandlers.DeleteFriendPair(store, 2, 1) == SocialHandlers.FriendTypeIncoming,
+            "the prior relation selects the system message");
+        Hex.True(store.GetFriendRow(1, 2) == null && store.GetFriendRow(2, 1) == null,
+            "one delete removes both directions");
+        Hex.True(SocialHandlers.DeleteFriendPair(store, 2, 1) == null, "deleting again does nothing");
+
+        SocialHandlers.WriteFriendRequest(store, 1, 2, "");
+        SocialHandlers.AcceptFriendRequest(store, 2, 1);
+        Hex.True(SocialHandlers.DeleteFriendPair(store, 1, 2) == SocialHandlers.FriendTypeMutual,
+            "unfriending a real friend reports type 0");
+    }
+
+    [Test] public static void T30_friend_groups_follow_the_index_rules()
+    {
+        using var store = StoreWithTwoAccounts();
+        SocialHandlers.WriteFriendRequest(store, 1, 2, "");
+        Hex.True(store.GetFriendRow(1, 2)!.GroupId == SocialHandlers.UngroupedGroupId,
+            "a new friend starts in group 1");
+
+        store.UpsertFriendGroup(1, 3, "raid");
+        store.SetFriendGroup(1, 2, 3);
+        Hex.True(store.GetFriendRow(1, 2)!.GroupId == 3, "moved into group 3");
+
+        // Deleting the group moves its members back to the ungrouped bucket (User::DeleteFriendGroup).
+        Hex.True(store.DeleteFriendGroup(1, 3), "group deleted");
+        Hex.True(store.GetFriendRow(1, 2)!.GroupId == SocialHandlers.UngroupedGroupId,
+            "members fall back to group 1, never to a group that is gone");
+        Hex.True(store.GetFriendGroups(1).Count == 0, "and the group itself is gone");
+    }
+
+    [Test] public static void T30_sample_group_is_provided_exactly_once()
+    {
+        using var store = StoreWithTwoAccounts();
+        SocialHandlers.ProvideSampleGroup(store, 1);
+        store.SetProfileMessage(1, "mine now");
+        store.DeleteFriendGroup(1, SocialHandlers.SampleGroupIndex);
+
+        SocialHandlers.ProvideSampleGroup(store, 1);      // the spIsProvideSampleFriendGroup guard
+        Hex.True(store.GetFriendGroups(1).Count == 0, "a deleted sample group is not re-seeded");
+        Hex.True(store.GetProfileMessage(1) == "mine now", "and the profile message is not reset");
+    }
+
+    [Test] public static void T30_memos_truncate_at_the_decompiled_limits()
+    {
+        using var store = StoreWithTwoAccounts();
+        SocialHandlers.WriteFriendRequest(store, 1, 2, "");
+        store.SetFriendMemo(1, 2, new string('a', 40));
+        Hex.True(store.GetFriendRow(1, 2)!.Memo.Length == SocialHandlers.MaxFriendMemo,
+            "friend memo: wcsncpy_s(.., 0x15, ..) keeps 20");
+
+        store.AddBlock(1, 2);
+        store.SetBlockMemo(1, 2, new string('b', 80));
+        Hex.True(store.GetBlockRows(1)[0].Memo.Length == SocialHandlers.MaxBlockMemo,
+            "blocked-user memo: wcsncpy_s(.., 0x29, ..) keeps 40");
+
+        store.SetProfileMessage(1, new string('c', 80));
+        Hex.True(store.GetProfileMessage(1).Length == 30, "profile message keeps 30");
+    }
+
+    [Test] public static void T30_CanBlockUser_enforces_the_limits()
+    {
+        using var store = StoreWithTwoAccounts();
+        Hex.True(SocialHandlers.CanBlockUser(store, 1, 99) == SocialHandlers.BlockResult.TargetNotFound, "unknown");
+        Hex.True(SocialHandlers.CanBlockUser(store, 1, 1) == SocialHandlers.BlockResult.CannotBlock, "myself");
+        Hex.True(SocialHandlers.CanBlockUser(store, 1, 2) == SocialHandlers.BlockResult.Ok, "clean");
+        store.AddBlock(1, 2);
+        Hex.True(SocialHandlers.CanBlockUser(store, 1, 2) == SocialHandlers.BlockResult.AlreadyBlocked, "twice");
+        Hex.True(SocialHandlers.MaxBlocks == 120 && SocialHandlers.MaxFriends == 100,
+            "the two caps from User::Init (0x78 blocks, 100 friends)");
+    }
+
+    [Test] public static void T30_block_list_serialises_the_memo()
+    {
+        using var store = StoreWithTwoAccounts();
+        var reg = CreateT30Defs();
+        store.AddBlock(1, 2);
+        store.SetBlockMemo(1, 2, "spammer");
+
+        var body = WriteByDef(reg, "S_USER_BLOCK_LIST", SocialHandlers.BuildBlockListFields(store, 1));
+        var read = new DefinitionReader(body).Read(reg.Get("S_USER_BLOCK_LIST")!);
+        var rows = (List<object>)read["blockList"];
+        Hex.True(rows.Count == 1, "one blocked user");
+        var r = (Dictionary<string, object>)rows[0];
+        Hex.True(Convert.ToUInt32(r["id"]) == 2 && (string)r["name"] == "t30_2", "id and name");
+        Hex.True(Convert.ToInt32(r["level"]) == 12, "level comes from the row, not a constant");
+        Hex.True((string)r["myNote"] == "spammer", "the memo is served back");
+    }
+
+    // ---- The client packets, against the offsets in the handlers ----
+
+    [Test] public static void T30_client_packets_match_the_handler_offsets()
+    {
+        var reg = CreateT30Defs();
+
+        // Handler_C_CHANGE_FRIEND_MEMO reads [4] = u16 memo offset, [6] = int32 friendId
+        // (frame offsets; body offsets 0 and 2).
+        var memo = WriteByDef(reg, "C_CHANGE_FRIEND_MEMO", new Dictionary<string, object>
+        {
+            ["friendDbId"] = 2, ["newMemo"] = "hi",
+        });
+        Hex.True(BitConverter.ToUInt16(memo, 0) == 10, "the memo offset comes first, at packet 10");
+        Hex.True(BitConverter.ToInt32(memo, 2) == 2, "then the friend id");
+        var backMemo = new DefinitionReader(memo).Read(reg.Get("C_CHANGE_FRIEND_MEMO")!);
+        Hex.True((string)backMemo["newMemo"] == "hi", "round trip");
+
+        // Handler_C_ADD_FRIEND_GROUP: min body 14, array element 8 bytes (here/next + playerId).
+        var add = WriteByDef(reg, "C_ADD_FRIEND_GROUP", new Dictionary<string, object>
+        {
+            ["id"] = 3u, ["name"] = "raid", ["friends"] = new List<object> { 2u },
+        });
+        Hex.True(add.Length >= 10, "C_ADD_FRIEND_GROUP has the 14-byte frame the handler demands");
+        int elem = BitConverter.ToUInt16(add, 2) - 4;
+        Hex.True(BitConverter.ToUInt32(add, elem + 4) == 2, "the element is here/next then the playerId");
+        var backAdd = new DefinitionReader(add).Read(reg.Get("C_ADD_FRIEND_GROUP")!);
+        Hex.True(((List<object>)backAdd["friends"]).Count == 1 && (string)backAdd["name"] == "raid",
+            "round trip");
+
+        // Handler_C_EDIT_FRIEND_GROUP: same, but each element carries its own group id (12 bytes).
+        var edit = WriteByDef(reg, "C_EDIT_FRIEND_GROUP", new Dictionary<string, object>
+        {
+            ["id"] = 3u, ["name"] = "raid",
+            ["friends"] = new List<object>
+            {
+                new Dictionary<string, object> { ["playerId"] = 2u, ["id"] = 4u },
+            },
+        });
+        var backEdit = new DefinitionReader(edit).Read(reg.Get("C_EDIT_FRIEND_GROUP")!);
+        var one = (Dictionary<string, object>)((List<object>)backEdit["friends"])[0];
+        Hex.True(Convert.ToUInt32(one["playerId"]) == 2 && Convert.ToUInt32(one["id"]) == 4,
+            "per-element target group");
+    }
+
+    // ================================================================================
+    // T31 - real account auth.
+    //
+    // The chain, proven end to end (status/AUTH-DESIGN.md):
+    //   launcher -> tera-api GetAuthKeyAction mints a uuid v4 into account_info.authKey
+    //   client   -> C_LOGIN_ARBITER carries it as the 36-BYTE ASCII `ticket`, and the
+    //               accountDBID as the `name` string
+    //   arbiter  -> POST /authApi/GameAuthenticationLogin { authKey, clientIP, userNo }
+    //               -> { Return, ReturnCode, Msg }
+    //
+    // cap_newchar_client.log frame 2 is the ground truth for the packet half.
+    // ================================================================================
+
+    /// <summary>cap_newchar_client.log frame 2, C_LOGIN_ARBITER (23285), body only.</summary>
+    const string Cap2LoginArbiter =
+        "17 00 1B 00 24 00 00 00 00 00 00 06 00 00 00 12 27 00 00 31 00 00 00 "
+        + "34 35 38 32 34 65 34 35 2D 34 37 35 37 2D 34 63 36 64 2D 38 32 38 35 2D "
+        + "33 37 61 63 38 63 65 35 65 61 65 34";
+
+    const string Cap2Ticket = "45824e45-4757-4c6d-8285-37ac8ce5eae4";
+
+    /// <summary>An HttpClient whose every request is answered by a delegate the test owns.</summary>
+    sealed class StubHandler : System.Net.Http.HttpMessageHandler
+    {
+        private readonly Func<System.Net.Http.HttpRequestMessage, System.Net.Http.HttpResponseMessage> _reply;
+        public System.Net.Http.HttpRequestMessage? LastRequest { get; private set; }
+        public string? LastBody { get; private set; }
+        public int Calls { get; private set; }
+
+        public StubHandler(Func<System.Net.Http.HttpRequestMessage, System.Net.Http.HttpResponseMessage> reply)
+            => _reply = reply;
+
+        protected override async Task<System.Net.Http.HttpResponseMessage> SendAsync(
+            System.Net.Http.HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            Calls++;
+            LastRequest = request;
+            LastBody = request.Content == null ? null : await request.Content.ReadAsStringAsync(cancellationToken);
+            return _reply(request);
+        }
+    }
+
+    static System.Net.Http.HttpResponseMessage Json(System.Net.HttpStatusCode status, string body)
+        => new(status)
+        {
+            Content = new System.Net.Http.StringContent(body, System.Text.Encoding.UTF8, "application/json"),
+        };
+
+    [Test] public static void T31_login_packet_carries_an_ascii_ticket()
+    {
+        // The def says `bytes ticket`, and the Arbiter reads it with the byte-array reader
+        // (position AND length) - so it is ASCII on the wire, not UTF-16 like every other string.
+        var reg = new DefinitionRegistry(QuietLog());
+        reg.RegisterFromDef("C_LOGIN_ARBITER", @"
+int32  unk1
+byte   unk2
+uint32 language
+int32  patchVersion
+string name
+bytes  ticket
+");
+        var body = Hex.B(Cap2LoginArbiter);
+        var f = new DefinitionReader(body).Read(reg.Get("C_LOGIN_ARBITER")!);
+
+        Hex.True((string)f["name"] == "1", "the name field is the accountDBID in decimal");
+        Hex.True(Convert.ToUInt32(f["language"]) == 6, "language 6 = EUR");
+        Hex.True(Convert.ToInt32(f["patchVersion"]) == 10002, "build 10002");
+        Hex.True(Convert.ToInt32(f["unk1"]) == 0,
+            "unk1 is the AccountId the dumper names - 0 in every capture, which is why userNo "
+            + "has to come from the name");
+
+        var raw = (byte[])f["ticket"];
+        Hex.True(raw.Length == 36, $"36 raw bytes, got {raw.Length}");
+        Hex.True(AuthTicket.Decode(raw) == Cap2Ticket, "decoded ticket");
+        Hex.True(AuthTicket.LooksCanonical(AuthTicket.Decode(raw)), "and it is a canonical uuid");
+    }
+
+    [Test] public static void T31_ticket_decoding_is_defensive()
+    {
+        Hex.True(AuthTicket.Decode(null) == "", "null");
+        Hex.True(AuthTicket.Decode(Array.Empty<byte>()) == "", "empty");
+        Hex.True(AuthTicket.Decode(System.Text.Encoding.ASCII.GetBytes(Cap2Ticket + "\0")) == Cap2Ticket,
+            "a trailing NUL is trimmed");
+        Hex.True(AuthTicket.Decode(System.Text.Encoding.Unicode.GetBytes(Cap2Ticket)) == Cap2Ticket,
+            "a UTF-16 ticket still decodes (defensive, not observed)");
+        Hex.True(AuthTicket.Decode(Cap2Ticket) == Cap2Ticket, "a string passes through");
+        Hex.True(!AuthTicket.LooksCanonical("nope"), "shape check rejects junk");
+        Hex.True(!AuthTicket.LooksCanonical(Cap2Ticket.Replace('-', 'x')), "dashes are positional");
+    }
+
+    [Test] public static void T31_userNo_prefers_the_name_field()
+    {
+        var fromName = new AuthRequest("2800", 0, Cap2Ticket, "127.0.0.1", 6, 10002);
+        Hex.True(fromName.UserNo == 2800, "the launcher puts the accountDBID in the name");
+        var fromId = new AuthRequest("", 7, Cap2Ticket, "127.0.0.1", 6, 10002);
+        Hex.True(fromId.UserNo == 7, "fall back to the AccountId field");
+        var neither = new AuthRequest("bob", 0, Cap2Ticket, "127.0.0.1", 6, 10002);
+        Hex.True(neither.UserNo == 0, "a non-numeric name has no userNo at all");
+    }
+
+    [Test] public static void T31_request_body_is_what_tera_api_validates()
+    {
+        var body = TeraApiAuthProvider.BuildRequestBody(
+            new AuthRequest("1", 0, Cap2Ticket, "10.0.0.5", 6, 10002));
+        using var doc = System.Text.Json.JsonDocument.Parse(body);
+        var root = doc.RootElement;
+        Hex.True(root.GetProperty("authKey").GetString() == Cap2Ticket, "authKey is the ticket");
+        Hex.True(root.GetProperty("clientIP").GetString() == "10.0.0.5", "clientIP");
+        // express-validator's isNumeric() accepts a numeric STRING; body("userNo").isNumeric().
+        Hex.True(root.GetProperty("userNo").GetString() == "1", "userNo goes out as a numeric string");
+
+        var noIp = TeraApiAuthProvider.BuildRequestBody(new AuthRequest("1", 0, Cap2Ticket, "", 6, 10002));
+        using var doc2 = System.Text.Json.JsonDocument.Parse(noIp);
+        Hex.True(doc2.RootElement.GetProperty("clientIP").GetString() == "127.0.0.1",
+            "clientIP is never empty - body(...).notEmpty() would reject it");
+    }
+
+    [Test] public static void T31_response_parsing_maps_the_tera_api_codes()
+    {
+        Hex.True(TeraApiAuthProvider.ParseResponse(
+            "{\"Return\":true,\"ReturnCode\":0,\"Msg\":\"success\"}").Accepted, "success");
+
+        var mismatch = TeraApiAuthProvider.ParseResponse(
+            "{\"Return\":false,\"ReturnCode\":50011,\"Msg\":\"authkey mismatch\"}");
+        Hex.True(!mismatch.Accepted && mismatch.Code == AuthResult.CodeAuthKeyMismatch, "50011");
+
+        var banned = TeraApiAuthProvider.ParseResponse(
+            "{\"Return\":false,\"ReturnCode\":50012,\"Msg\":\"account banned\"}");
+        Hex.True(!banned.Accepted && banned.Code == AuthResult.CodeAccountBanned, "50012");
+
+        var missing = TeraApiAuthProvider.ParseResponse(
+            "{\"Return\":false,\"ReturnCode\":50000,\"Msg\":\"account not exist\"}");
+        Hex.True(!missing.Accepted && missing.Code == AuthResult.CodeAccountNotExist, "50000");
+
+        Hex.True(!TeraApiAuthProvider.ParseResponse("<html>502</html>").Accepted, "non-JSON is a rejection");
+        Hex.True(!TeraApiAuthProvider.ParseResponse("").Accepted, "an empty body is a rejection");
+        Hex.True(!TeraApiAuthProvider.ParseResponse("{\"Msg\":\"success\"}").Accepted,
+            "no Return field is a rejection - never assume success");
+    }
+
+    [Test] public static void T31_provider_selection_follows_the_environment()
+    {
+        Hex.True(AuthProviders.EnabledFromEnvironment("true"), "true");
+        Hex.True(AuthProviders.EnabledFromEnvironment("1"), "1");
+        Hex.True(!AuthProviders.EnabledFromEnvironment("0"), "0");
+        Hex.True(!AuthProviders.EnabledFromEnvironment(null), "unset means accept-all");
+        Hex.True(!AuthProviders.EnabledFromEnvironment("yes"), "anything else means accept-all");
+        Hex.True(new AcceptAllAuthProvider().Name == "accept-all", "the default provider names itself");
+        Hex.True(AuthProviders.DefaultUrl == "http://127.0.0.1:8080",
+            "the default URL is tera-api's API_ARBITER_LISTEN_PORT");
+    }
+
+    [Test] public static void T31_accept_all_accepts_anything()
+    {
+        var p = new AcceptAllAuthProvider();
+        var r = AuthProviders.Authenticate(p, new AuthRequest("whoever", 0, "", "", 6, 0));
+        Hex.True(r.Accepted && r.Code == 0, "no ticket, no account, still fine - that is the point");
+    }
+
+    [Test] public static void T31_teraapi_provider_calls_the_real_endpoint()
+    {
+        var stub = new StubHandler(_ => Json(System.Net.HttpStatusCode.OK,
+            "{\"Return\":true,\"ReturnCode\":0,\"Msg\":\"success\"}"));
+        using var http = new System.Net.Http.HttpClient(stub);
+        var provider = new TeraApiAuthProvider("http://127.0.0.1:8080/", null, http);
+
+        var result = AuthProviders.Authenticate(provider,
+            new AuthRequest("1", 0, Cap2Ticket, "127.0.0.1", 6, 10002));
+
+        Hex.True(result.Accepted, "accepted");
+        Hex.True(stub.Calls == 1, "exactly one call");
+        Hex.True(stub.LastRequest!.Method == System.Net.Http.HttpMethod.Post, "POST");
+        Hex.True(stub.LastRequest!.RequestUri!.ToString()
+                 == "http://127.0.0.1:8080/authApi/GameAuthenticationLogin",
+            "the endpoint tera-api mounts, with the trailing slash of the base URL trimmed: "
+            + stub.LastRequest!.RequestUri);
+        Hex.True(stub.LastRequest!.Content!.Headers.ContentType!.MediaType == "application/json",
+            "express.json() needs the content type");
+        Hex.True(stub.LastBody!.Contains(Cap2Ticket), "the ticket goes out as authKey");
+    }
+
+    [Test] public static void T31_teraapi_provider_rejects_what_tera_api_rejects()
+    {
+        var stub = new StubHandler(_ => Json(System.Net.HttpStatusCode.OK,
+            "{\"Return\":false,\"ReturnCode\":50012,\"Msg\":\"account banned\"}"));
+        using var http = new System.Net.Http.HttpClient(stub);
+        var provider = new TeraApiAuthProvider("http://127.0.0.1:8080", null, http);
+        var r = AuthProviders.Authenticate(provider, new AuthRequest("1", 0, Cap2Ticket, "127.0.0.1", 6, 10002));
+        Hex.True(!r.Accepted && r.Code == AuthResult.CodeAccountBanned && r.Message == "account banned",
+            "the API's own message is kept for the log line");
+    }
+
+    [Test] public static void T31_teraapi_provider_fails_closed()
+    {
+        // A transport failure.
+        var boom = new StubHandler(_ => throw new System.Net.Http.HttpRequestException("connection refused"));
+        using (var http = new System.Net.Http.HttpClient(boom))
+        {
+            var p = new TeraApiAuthProvider("http://127.0.0.1:8080", null, http);
+            var r = AuthProviders.Authenticate(p, new AuthRequest("1", 0, Cap2Ticket, "127.0.0.1", 6, 10002));
+            Hex.True(!r.Accepted && r.Code == AuthResult.CodeUnreachable, "unreachable API rejects");
+        }
+
+        // A 500 with a body that looks like success must still reject.
+        var five = new StubHandler(_ => Json(System.Net.HttpStatusCode.InternalServerError,
+            "{\"Return\":true,\"ReturnCode\":0,\"Msg\":\"success\"}"));
+        using (var http = new System.Net.Http.HttpClient(five))
+        {
+            var p = new TeraApiAuthProvider("http://127.0.0.1:8080", null, http);
+            var r = AuthProviders.Authenticate(p, new AuthRequest("1", 0, Cap2Ticket, "127.0.0.1", 6, 10002));
+            Hex.True(!r.Accepted && r.Code == AuthResult.CodeUnreachable, "HTTP 500 rejects");
+        }
+    }
+
+    [Test] public static void T31_a_missing_ticket_never_reaches_the_api()
+    {
+        var never = new StubHandler(_ => throw new Exception("the provider must not call the API"));
+        using var http = new System.Net.Http.HttpClient(never);
+        var p = new TeraApiAuthProvider("http://127.0.0.1:8080", null, http);
+
+        var noTicket = AuthProviders.Authenticate(p, new AuthRequest("1", 0, "", "127.0.0.1", 6, 10002));
+        Hex.True(!noTicket.Accepted && noTicket.Code == AuthResult.CodeNoTicket, "no ticket");
+
+        var noAccount = AuthProviders.Authenticate(p, new AuthRequest("bob", 0, Cap2Ticket, "127.0.0.1", 6, 10002));
+        Hex.True(!noAccount.Accepted && noAccount.Code == AuthResult.CodeNoTicket,
+            "a name that is not an accountDBID cannot be checked");
+        Hex.True(never.Calls == 0, "and neither case made an HTTP call");
+    }
+
+    // ================================================================================
+    // T32 - GM commands.
+    //
+    // Entry path, pinned in the decompile (status/GM-DESIGN.md): the CLIENT strips the `/@`
+    // and sends the bare line in C_ADMIN (0xA45C, CommandType 1) or C_OP_COMMAND (0xE394,
+    // CommandType 0). There is no '/' or '@' comparison anywhere in ArbiterServer.exe.
+    // Replies go out as S_SYSTEM_MESSAGE_CUSTOM (0x994C), a single wide string, always a
+    // literal - never an @id.
+    //
+    // The catalogues the human extracted are the command lists:
+    // status/GM-COMMANDS-ARBITER.md (192 the Arbiter owns) and
+    // status/GM-COMMANDS-FULL.md (416 the World owns).
+    // ================================================================================
+
+    [Test] public static void T32_parser_matches_the_arbiter_split_plus_quotes()
+    {
+        var line = GmCommandParser.Parse("/@set_admin_level bob 3")!;
+        Hex.True(line.Name == "set_admin_level", "the verb");
+        Hex.True(line.Args.Count == 2 && line.Arg(0) == "bob" && line.Arg(1) == "3", "two args");
+
+        // The bare form is what actually arrives - the client already stripped the /@.
+        var bare = GmCommandParser.Parse("set_admin_level bob 3")!;
+        Hex.True(bare.Name == line.Name && bare.Arg(1) == "3", "bare form parses the same");
+        Hex.True(GmCommandParser.Parse("@query_point")!.Name == "query_point", "a lone @ is tolerated");
+        Hex.True(GmCommandParser.Parse("/help")!.Name == "help", "a lone / is tolerated");
+
+        // Runs of whitespace collapse, exactly like the stringstream extractor.
+        var spaced = GmCommandParser.Parse("  add_exp    1000\t\t2 ")!;
+        Hex.True(spaced.Name == "add_exp" && spaced.Args.Count == 2 && spaced.Arg(1) == "2",
+            "whitespace runs collapse");
+
+        // Quoted arguments are OUR addition (the Arbiter has no quoting at all).
+        var quoted = GmCommandParser.Parse("create_user \"Two Words\"")!;
+        Hex.True(quoted.Args.Count == 1 && quoted.Arg(0) == "Two Words", "quotes group one argument");
+
+        Hex.True(GmCommandParser.Parse("") == null, "empty");
+        Hex.True(GmCommandParser.Parse("   ") == null, "whitespace only");
+        Hex.True(GmCommandParser.Parse("/@") == null, "a bare prefix is not a command");
+        Hex.True(GmCommandParser.Parse(null) == null, "null");
+    }
+
+    [Test] public static void T32_rebuilt_line_is_what_the_forward_carries()
+    {
+        // ArbiterBypassCommandHandler::HandleCommand rebuilds name + (' ' + arg)*, and THAT is
+        // the string it ships to World - quoting is not re-added because it never existed.
+        var line = GmCommandParser.Parse("/@abnormality 4000")!;
+        Hex.True(line.Rebuilt() == "abnormality 4000", "verb then space-separated args");
+        Hex.True(GmCommandParser.Parse("crash_arbiter")!.Rebuilt() == "crash_arbiter", "no args");
+        Hex.True(GmCommandParser.Parse("x \"a b\" c")!.Rebuilt() == "x a b c",
+            "a quoted argument goes out unquoted, as the Arbiter would have sent it");
+    }
+
+    [Test] public static void T32_world_forward_frame_is_byte_exact()
+    {
+        // Arb_part_067.c:6890-6903:
+        //   FUN_140350eb0(pkt,0x2829); slot=0; u32(slot); u32(userId); u32(mode);
+        //   slot = current length (18); wide string + terminator.
+        var payload = GmCommandHandlers.BuildWorldForward(2, GmCommandHandlers.BypassModeWorld,
+            "abnormality 4000");
+        Hex.Eq(payload,
+            "12 00 00 00 02 00 00 00 01 00 00 00 "
+            + "61 00 62 00 6E 00 6F 00 72 00 6D 00 61 00 6C 00 69 00 74 00 79 00 20 00 "
+            + "34 00 30 00 30 00 30 00 00 00",
+            "AS 0x2829: [u32 off=18][u32 userId][u32 mode][UTF-16 line][u16 0]");
+
+        Hex.True(GmCommandHandlers.AS_BYPASS_COMMAND == 0x2829, "the opcode has no symbolic name");
+        Hex.True(BitConverter.ToUInt32(payload, 0) == 6 + 12,
+            "the offset is frame-relative, like every other offset on this protocol");
+
+        // An empty line is still a valid frame: header plus a lone terminator.
+        Hex.Eq(GmCommandHandlers.BuildWorldForward(0, 0, ""),
+            "12 00 00 00 00 00 00 00 00 00 00 00 00 00", "empty command line");
+    }
+
+    [Test] public static void T32_gating_matches_the_real_arbiter()
+    {
+        GmCommandCatalog.Set(
+            arbiter: new[] { "set_admin_level", "crash_arbiter" },
+            world: new[] { "abnormality", "add_exp" });
+        var mine = GmCommandParser.Parse("set_admin_level bob 3");
+        var worlds = GmCommandParser.Parse("add_exp 1000");
+        var theirs = GmCommandParser.Parse("crash_arbiter");
+        var junk = GmCommandParser.Parse("not_a_command");
+
+        // No character selected -> the real Arbiter drops it (its handlers need a User).
+        Hex.True(GmCommandHandlers.Classify(false, 5, mine) == GmDispatch.NoUser, "no user");
+
+        // Level 0 -> LogAbuseCommandUser and NOTHING is sent back. That is the reply.
+        Hex.True(GmCommandHandlers.Classify(true, 0, mine) == GmDispatch.NotAuthorised,
+            "a non-GM is refused");
+        Hex.True(GmCommandHandlers.Classify(true, 0, worlds) == GmDispatch.NotAuthorised,
+            "the gate comes before the mine/World decision");
+
+        // The binary's threshold is >= 1 everywhere; there is no per-command tier.
+        Hex.True(GmCommandHandlers.Classify(true, 1, mine) == GmDispatch.Local, "level 1 is enough");
+        Hex.True(GmCommandHandlers.Classify(true, 5, worlds) == GmDispatch.ForwardToWorld,
+            "a World command is forwarded");
+        Hex.True(GmCommandHandlers.Classify(true, 5, theirs) == GmDispatch.NotImplemented,
+            "an Arbiter command we do not implement says so rather than lying to World");
+        Hex.True(GmCommandHandlers.Classify(true, 5, junk) == GmDispatch.Unknown,
+            "in neither catalogue -> Invalid QA Command");
+        Hex.True(GmCommandHandlers.Classify(true, 5, null) == GmDispatch.Empty, "nothing to do");
+
+        Hex.True(GmCommandHandlers.InvalidCommandMessage == "Invalid QA Command\n",
+            "the literal from Arb_part_085.c:12923");
+        Hex.True(GmAccounts.MinimumAdminLevel == 1, "every gate in the binary tests < 1");
+    }
+
+    [Test] public static void T32_gm_allow_list()
+    {
+        Hex.True(GmAccounts.IsListed("1", "1,2,3"), "comma separated");
+        Hex.True(GmAccounts.IsListed("admin", "admin; other"), "semicolons and spaces");
+        Hex.True(GmAccounts.IsListed("ADMIN", "admin"), "case insensitive");
+        Hex.True(!GmAccounts.IsListed("admin", "administrator"), "no prefix matching");
+        Hex.True(!GmAccounts.IsListed("admin", ""), "empty list");
+        Hex.True(!GmAccounts.IsListed("", "admin"), "empty name");
+        Hex.True(!GmAccounts.IsListed(null, "admin"), "null name");
+
+        Hex.True(GmAccounts.GmAdminLevel == 5,
+            "the top level the binary itself assigns (set_go on writes User+0x3b98 = 5)");
+    }
+
+    [Test] public static void T32_catalogue_parser_reads_the_markdown_tables()
+    {
+        const string md = @"# heading
+
+| Command | Args | Korean | English | Risk |
+|---|---|---|---|---|
+| `add_exp` | `[EXP]` | x | Add experience | A |
+| `clear_inven` | - | x | Empty inventory | B |
+
+some prose with `backticks` that is not a table row
+| not a command | x |
+";
+        var names = GmCommandCatalog.ParseMarkdown(md);
+        Hex.True(names.Count == 2, $"two command rows, got {names.Count}: {string.Join(",", names)}");
+        Hex.True(names[0] == "add_exp" && names[1] == "clear_inven", "in file order");
+        Hex.True(GmCommandCatalog.ParseMarkdown("").Count == 0, "empty input");
+    }
+
+    [Test] public static void T32_catalogues_on_disk_split_the_two_sides()
+    {
+        var arbiterFile = FindRepoFile(Path.Combine("status", "GM-COMMANDS-ARBITER.md"));
+        var worldFile = FindRepoFile(Path.Combine("status", "GM-COMMANDS-FULL.md"));
+        if (arbiterFile == null || worldFile == null)
+        { Console.WriteLine("        (skipped: GM catalogues not found)"); return; }
+
+        var arbiter = GmCommandCatalog.ParseMarkdown(File.ReadAllText(arbiterFile));
+        var world = GmCommandCatalog.ParseMarkdown(File.ReadAllText(worldFile));
+        Hex.True(arbiter.Count >= 150, $"the Arbiter catalogue has ~192 commands, parsed {arbiter.Count}");
+        Hex.True(world.Count >= 400, $"the World catalogue has 416 commands, parsed {world.Count}");
+
+        Hex.True(arbiter.Contains("set_admin_level"), "set_admin_level is the Arbiter's");
+        Hex.True(world.Contains("add_exp"), "add_exp is the World's");
+        Hex.True(!world.Contains("set_admin_level"), "and the two lists do not collide on it");
+
+        // Every command we implement must be one the Arbiter really owns.
+        foreach (var name in GmCommandHandlers.Implemented)
+            Hex.True(arbiter.Contains(name), $"{name} must be in the Arbiter catalogue");
+    }
+
+    [Test] public static void T32_command_literals_are_the_arbiters_own()
+    {
+        Hex.True(GmCommandHandlers.CreateUserUsage == "create_user [username]", "usage line");
+        Hex.True(GmCommandHandlers.AlreadyExistsMessage("Test") == "User[Test] already exists!", "exists");
+        Hex.True(GmCommandHandlers.CreatedMessage("Test") == "Create a new user[Test]!", "created");
+        Hex.True(GmCommandHandlers.CannotCreateMessage("Test") == "Cannot create a new user[Test]!", "failed");
+        // query_point has ONLY a failure branch in the real Arbiter, and no billing service here.
+        Hex.True(GmCommandHandlers.QueryPointFailureMessage == "Can't request coin", "query_point");
+    }
+
+    [Test] public static void T32_warehousegold_max_parses_like_the_arbiter()
+    {
+        Hex.True(GmCommandHandlers.TryParseWarehouseGoldMax(
+            GmCommandParser.Parse("warehousegold_max 100")!, out long v) && v == 100, "one argument");
+        Hex.True(GmCommandHandlers.TryParseWarehouseGoldMax(
+            GmCommandParser.Parse("warehousegold_max -5")!, out long neg) && neg == 0,
+            "negatives clamp to 0, as the Arbiter does");
+        Hex.True(GmCommandHandlers.TryParseWarehouseGoldMax(
+            GmCommandParser.Parse("warehousegold_max abc")!, out long bad) && bad == 0,
+            "_wtoi64 of junk is 0");
+        Hex.True(!GmCommandHandlers.TryParseWarehouseGoldMax(
+            GmCommandParser.Parse("warehousegold_max")!, out _), "no argument: the Arbiter does nothing");
+        Hex.True(!GmCommandHandlers.TryParseWarehouseGoldMax(
+            GmCommandParser.Parse("warehousegold_max 1 2")!, out _), "two arguments: same");
+    }
+
+    [Test] public static void T32_admin_level_persists_on_the_account_row()
+    {
+        using var store = StoreWithTwoAccounts();
+        var acct = store.GetAccount("acct2")!;
+        Hex.True(acct.AdminLevel == 0, "a fresh account has no GM level");
+
+        // set_admin_level names a CHARACTER; the level lands on that character's account.
+        var target = store.GetCharacterByName("t30_2")!;
+        Hex.True(store.SetAdminLevel(target.AccountId, GmAccounts.GmAdminLevel), "level written");
+        Hex.True(store.GetAccount("acct2")!.AdminLevel == GmAccounts.GmAdminLevel, "and read back");
+        Hex.True(store.GetAdminLevel(target.AccountId) == GmAccounts.GmAdminLevel, "by id too");
+
+        store.SetAdminLevel(target.AccountId, -3);
+        Hex.True(store.GetAdminLevel(target.AccountId) == 0, "negatives clamp to 0");
+
+        Hex.True(store.GetAccount("nobody") == null, "an unknown account is null, not an exception");
+        Hex.True(store.GetAdminLevel(9999) == 0, "and an unknown id is level 0");
+
+        // The allow-list is the bootstrap: it outranks whatever is stored.
+        Hex.True(GmAccounts.LevelFor("acct2", 0) == 0, "not listed -> the stored level");
+        Hex.True(GmAccounts.IsListed("acct2", "acct2") && GmAccounts.GmAdminLevel > 0,
+            "listed -> the GM level (the env-backed overload is exercised live, not here)");
     }
 
     /// <summary>Walks up from the test binary looking for a repo-relative file; null if not found.</summary>
