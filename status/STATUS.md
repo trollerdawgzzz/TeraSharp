@@ -8,7 +8,7 @@ Read order for anyone new: `CLAUDE.md` (workspace rules at the top) -> `status/H
 (every per-user W->A opcode and how it is answered) -> this file.
 
 Build: `dotnet build TeraSharp.sln` — 0 warnings, 0 errors.
-Tests: `dotnet run --project src\TeraSharp.Arbiter.Tests` — **420**.
+Tests: `dotnet run --project src\TeraSharp.Arbiter.Tests` — **429**.
 Deploy check: `TeraSharp.Arbiter.exe --selftest` — one PASS/FAIL line per data dependency (T37).
 
 ---
@@ -50,6 +50,7 @@ Deploy check: `TeraSharp.Arbiter.exe --selftest` — one PASS/FAIL line per data
 | The login ticket, and who actually checks it | `status/AUTH-DESIGN.md` |
 | How `/@` commands reach the server and who runs them | `status/GM-DESIGN.md` |
 | What to click, and which log line proves it worked | `status/LIVE-CHECKLIST.md` |
+| The two tunnel frame layouts, and the Ticket | `status/MULTIPLAYER-DESIGN.md` §6, `World/TunnelFrames.cs` |
 | Every GM command, by side and risk tier | `status/GM-COMMANDS-ARBITER.md`, `status/GM-COMMANDS-FULL.md` |
 | Dungeon cool times and entry counts | `status/DUNGEON-COOLTIME.md` |
 | Everything else in the 2026-09-13 relog capture | `status/RELOG-CAPTURE-NOTES.md` |
