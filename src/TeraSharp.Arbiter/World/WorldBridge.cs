@@ -372,6 +372,7 @@ public sealed class WorldBridge
                 return;
 
             default:
+                if (PartyWiring.TryHandleWorldFrame(op, payload)) return;   // T49: the twelve party SA_ opcodes incl. SA_BYPASS_TO_GROUP
                 if (op is not (0x138A or 0x15A8 or 0x1436 or 0x164D))
                     _log.LogInformation("W->A #{Id} 0x{Op:X4} len={Len}", link.Id, op, payload.Length + 6);
                 if (DbProxy != null && DbProxy.TryHandle(this, link, op, payload)) return;
@@ -595,7 +596,10 @@ public sealed class WorldLink
                     ushort op = BitConverter.ToUInt16(_rx, pos + 4);
                     var payload = new byte[len - 6];
                     Array.Copy(_rx, pos + 6, payload, 0, payload.Length);
-                    _bridge.HandleFrame(this, op, payload);
+                    // T48: one malformed frame must not unwind the receive loop - the finally below
+                    // closes the socket, and with 25 links that is every player disconnected.
+                    try { _bridge.HandleFrame(this, op, payload); }
+                    catch (Exception ex) { _log.LogError(ex, "Link #{Id}: handler for 0x{Op:X4} ({Len} B) threw - frame dropped", Id, op, payload.Length); }
                     pos += len;
                 }
                 if (pos > 0) { Array.Copy(_rx, pos, _rx, 0, _rxLen - pos); _rxLen -= pos; }

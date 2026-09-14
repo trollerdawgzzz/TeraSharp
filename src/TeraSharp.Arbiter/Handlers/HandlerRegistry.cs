@@ -133,6 +133,11 @@ public static class HandlerRegistry
         Reg("C_PARCEL_READ_RECV_STATUS", 0, parcels.OnParcelReadRecvStatus);
         Reg("C_PARCEL_REPORT", 10, parcels.OnParcelReport);
 
+        // --- Parties (T49, status/PARTY-DESIGN.md section 11): body lengths, not frame lengths ---
+        foreach (var (partyName, partyOp) in PartyWiring.ClientOpcodes)
+            Reg(partyName, PartyWiring.MinBodyLength(partyOp),
+                (s, body) => PartyWiring.OnClientPacket(s, partyOp, body));
+
         // --- Client settings (Arbiter-owned) ---
         Reg("C_REQUEST_CLIENT_CHAT_OPTION_SETTING", 0, ClientSettingsHandlers.OnRequestChatOption);
         Reg("C_REQUEST_CLIENT_UI_SETTING", 0, ClientSettingsHandlers.OnRequestUiSetting);
