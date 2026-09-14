@@ -7709,6 +7709,558 @@ public bool TryHandle(WorldBridge bridge, WorldLink link, ushort op, byte[] payl
         Hex.True(members.Count == 2, $"two members read back, got {members.Count}");
     }
 
+
+    // =======================================================================================
+    // T36 - the guild codec. Research: status/GUILD-DESIGN.md.
+    //
+    // No guild has ever existed on the tap, so there is exactly one byte of guild ground truth
+    // in the captures: the empty DBS_INIT_GUILD_DATA the real Arbiter answers World's
+    // SDB_INIT_GUILD with (data/cap_guild.bin). Everything else here is pinned against the
+    // Arbiter's own PDL dumper guards and writers, which is what the .def corrections rest on.
+    // =======================================================================================
+
+    /// <summary>
+    /// Two independent facts about the split: no two guild opcodes collide (a copy/paste in a
+    /// 70-constant block is otherwise invisible), and MinClientLength answers 0 for exactly the
+    /// ten guild C_ packets WorldServer owns - answering one of those in the Arbiter would
+    /// double-handle it, because World answers it too.
+    /// </summary>
+    [Test] public static void Guild_opcode_table_is_consistent_with_the_arbiter_world_split()
+    {
+        ushort[] worldSide =
+        {
+            GuildPackets.C_LEAVE_GUILD, GuildPackets.C_BANISH_GUILD_MEMBER, GuildPackets.C_DESTROY_GUILD,
+            GuildPackets.C_CHANGE_GUILD_CHIEF, GuildPackets.C_CREATE_GUILDGROUP, GuildPackets.C_CHANGE_GUILDGROUP,
+            GuildPackets.C_REMOVE_GUILDGROUP, GuildPackets.C_SET_GUILDGROUP_AUTHORITY,
+            GuildPackets.C_CHECK_NEW_GUILDNAME, GuildPackets.C_REQUEST_USABLE_GUILD_NAME,
+        };
+        foreach (var op in worldSide)
+            Hex.True(!GuildPackets.ArbiterHandlesClientPacket(op),
+                $"0x{op:X4} is a WorldServer-side guild packet - the Arbiter must tunnel it, not answer it");
+
+        ushort[] arbiterSide =
+        {
+            GuildPackets.C_APPLY_GUILD, GuildPackets.C_ACCEPT_GUILD_APPLY, GuildPackets.C_GUILD_APPLY_LIST,
+            GuildPackets.C_GUILD_APPLY_LIST_PAGE, GuildPackets.C_INVITE_USER_TO_GUILD,
+            GuildPackets.C_REJECT_INVITE_USER_TO_GUILD, GuildPackets.C_CHANGE_GUILDNAME,
+            GuildPackets.C_CHECK_CHANGE_GUILDNAME, GuildPackets.C_UPDATE_GUILD_LOGO,
+            GuildPackets.C_GET_USER_GUILD_LOGO, GuildPackets.C_UPDATE_GUILD_TITLE,
+            GuildPackets.C_REQUEST_GUILD_INFO, GuildPackets.C_REQUEST_GUILD_MEMBER_LIST,
+            GuildPackets.C_GET_GUILD_HISTORY, GuildPackets.C_SET_GUILD_JOIN_CONDITION,
+            GuildPackets.C_REQUEST_GUILD_INFO_BEFORE_APPLY_GUILD, GuildPackets.C_REQUEST_COOLTIME_TO_JOIN_GUILD,
+        };
+        foreach (var op in arbiterSide)
+            Hex.True(GuildPackets.ArbiterHandlesClientPacket(op), $"0x{op:X4} has an Arbiter handler");
+
+        var all = new List<ushort>();
+        all.AddRange(worldSide);
+        all.AddRange(arbiterSide);
+        foreach (var f in typeof(GuildPackets).GetFields(
+                     System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static))
+            if (f.IsLiteral && f.FieldType == typeof(ushort) &&
+                (f.Name.StartsWith("S_") || f.Name.StartsWith("AS_") || f.Name.StartsWith("SA_") ||
+                 f.Name.StartsWith("DBS_") || f.Name.StartsWith("SDB_")))
+                all.Add((ushort)f.GetRawConstantValue()!);
+
+        var seen = new HashSet<ushort>();
+        foreach (var op in all)
+            Hex.True(seen.Add(op), $"guild opcode 0x{op:X4} is declared twice");
+        Hex.True(all.Count >= 70, $"expected the full guild opcode table, got {all.Count}");
+    }
+
+    /// <summary>
+    /// The SA_ guild handlers kill the link on a short frame ("Arbiter &lt;-&gt; World PDL Version
+    /// Mismatch! Bye :(") exactly like the party ones, so the sizes have to be the handler's.
+    /// Our parsers return null one byte below and succeed at the documented size.
+    /// </summary>
+    [Test] public static void Guild_SA_frame_sizes_are_the_handler_guards()
+    {
+        (ushort op, int frame)[] want =
+        {
+            (GuildPackets.SA_LOAD_GUILD, 0x12), (GuildPackets.SA_DESTROY_GUILD, 0x12),
+            (GuildPackets.SA_LEAVE_GUILD, 0x1A), (GuildPackets.SA_BANISH_GUILD_MEMBER, 0x1A),
+            (GuildPackets.SA_CHANGE_GUILD_CHIEF, 0x16), (GuildPackets.SA_SET_GUILDGROUP_AUTHORITY, 0x1E),
+            (GuildPackets.SA_CREATE_GUILD_GROUP, 0x16), (GuildPackets.SA_REMOVE_GUILD_GROUP, 0x16),
+            (GuildPackets.SA_CHANGE_GUILDGROUP, 0x1A), (GuildPackets.SA_UPDATE_GUILD_MEMBER, 0x0E),
+        };
+        foreach (var (op, frame) in want)
+            Hex.True(GuildPackets.MinFrameLength(op) == frame,
+                $"0x{op:X4} min frame 0x{GuildPackets.MinFrameLength(op):X2} != 0x{frame:X2}");
+
+        // one byte short of the payload the guard implies -> null, not an exception
+        Hex.True(GuildPackets.ParseSaGuildAction(new byte[11]) == null, "SA_LOAD_GUILD short frame rejected");
+        Hex.True(GuildPackets.ParseSaGuildAction(new byte[12]) != null, "SA_LOAD_GUILD exact frame accepted");
+        Hex.True(GuildPackets.ParseSaLeaveGuild(new byte[19]) == null, "SA_LEAVE_GUILD short frame rejected");
+        Hex.True(GuildPackets.ParseSaChangeGuildChief(new byte[15]) == null, "SA_CHANGE_GUILD_CHIEF short frame rejected");
+        Hex.True(GuildPackets.ParseSaSetGuildGroupAuthority(new byte[23]) == null, "SA_SET_GUILDGROUP_AUTHORITY short frame rejected");
+        Hex.True(GuildPackets.ParseSaChangeGuildGroup(new byte[19]) == null, "SA_CHANGE_GUILDGROUP short frame rejected");
+        Hex.True(GuildPackets.ParseSaUpdateGuildMember(new byte[7]) == null, "SA_UPDATE_GUILD_MEMBER short frame rejected");
+    }
+
+    /// <summary>SA_LEAVE_GUILD / SA_BANISH_GUILD_MEMBER: the name offset comes FIRST, before the
+    /// i64 ArbiterUser, and it is frame-relative - payload index = frame offset - 6.</summary>
+    [Test] public static void Guild_SA_LEAVE_GUILD_reads_the_documented_offsets()
+    {
+        var name = "Banished";
+        var p = new byte[20 + (name.Length + 1) * 2];
+        BitConverter.GetBytes(6 + 20).CopyTo(p, 0);              // frame 0x1A
+        BitConverter.GetBytes(0x0AF0000100000002L).CopyTo(p, 4);
+        BitConverter.GetBytes(7).CopyTo(p, 12);
+        BitConverter.GetBytes(11).CopyTo(p, 16);
+        for (int i = 0; i < name.Length; i++)
+        {
+            p[20 + i * 2] = (byte)name[i];
+            p[21 + i * 2] = (byte)(name[i] >> 8);
+        }
+        var got = GuildPackets.ParseSaLeaveGuild(p);
+        Hex.True(got != null, "SA_LEAVE_GUILD parsed");
+        Hex.True(got!.Value.memberName == name, $"memberName '{got.Value.memberName}' != '{name}'");
+        Hex.True(got.Value.arbiterUser == 0x0AF0000100000002L, "arbiterUser @frame 0x0A");
+        Hex.True(got.Value.guildDbId == 7 && got.Value.memberDbId == 11, "guildDbId @0x12, memberDbId @0x16");
+    }
+
+    /// <summary>S_ADD_GUILD_GROUP and S_UPDATE_GUILD_GROUP are byte-identical: one ref slot,
+    /// two i32, fixed part 0x0E.</summary>
+    [Test] public static void Guild_S_ADD_GUILD_GROUP_body_layout()
+    {
+        var b = GuildPackets.BuildSGuildGroupBody(3, 0x7F, "Officer");
+        Hex.True(BitConverter.ToUInt16(b, 0) == 0x0E, $"name ref = 0x{BitConverter.ToUInt16(b, 0):X2}, want 0x0E");
+        Hex.True(BitConverter.ToInt32(b, 2) == 3, "GroupId @packet 0x06");
+        Hex.True(BitConverter.ToInt32(b, 6) == 0x7F, "Authority @packet 0x0A");
+        Hex.True(b.Length == 0x0E - 4 + ("Officer".Length + 1) * 2, $"body length {b.Length}");
+    }
+
+    /// <summary>
+    /// S_ADD_GUILD_MEMBER.1.def computes 0x33; the dumper guard (Arb_part_018.c:6159,
+    /// `if (0x37 &lt; param_2)`) says 0x38. The .def is missing `int32 gender` at 0x2A and the
+    /// trailing `byte cityWarCompensationStatus`. This pins both.
+    /// </summary>
+    [Test] public static void Guild_S_ADD_GUILD_MEMBER_has_gender_and_a_second_trailing_bool()
+    {
+        var m = new GuildPackets.GuildMemberWire(11, "dob", 1, 2, 3, 4, 60, 5, 6, 1, 0,
+            0x1122334455667788L, true, false, false);
+        var b = GuildPackets.BuildSAddGuildMemberBody(m);
+        Hex.True(BitConverter.ToUInt16(b, 0) == 0x38, $"fixed part 0x{BitConverter.ToUInt16(b, 0):X2}, want 0x38");
+        Hex.True(BitConverter.ToInt32(b, 0x26 - 4) == 0, "State @packet 0x26");
+        Hex.True(BitConverter.ToInt32(b, 0x2A - 4) == 1, "gender @packet 0x2A - the field the .def drops");
+        Hex.True(BitConverter.ToInt64(b, 0x2E - 4) == 0x1122334455667788L, "LastLogoutTime @packet 0x2E");
+        Hex.True(b[0x36 - 4] == 1 && b[0x37 - 4] == 0, "IsWorldEventTarget @0x36, CityWarCompensationStatus @0x37");
+        Hex.True(b.Length >= 0x38 - 4, "body reaches the documented fixed size");
+    }
+
+    /// <summary>
+    /// S_UPDATE_GUILD_MEMBER is S_ADD_GUILD_MEMBER plus `bool IsInGuildWarCombatState` in the
+    /// middle of the trailer: three bools, fixed part 0x39 (dumper guard `0x38 &lt; param_2`).
+    /// The .def has two and computes 0x38.
+    /// </summary>
+    [Test] public static void Guild_S_UPDATE_GUILD_MEMBER_has_three_trailing_bools()
+    {
+        var m = new GuildPackets.GuildMemberWire(11, "dob", 1, 2, 3, 4, 60, 5, 6, 1, 0,
+            0L, true, false, true);
+        var b = GuildPackets.BuildSUpdateGuildMemberBody(m);
+        Hex.True(b.Length + 4 == 0x39, $"fixed part 0x{b.Length + 4:X2}, want 0x39");
+        Hex.True(b[0x36 - 4] == 1, "IsWorldEventTarget @0x36");
+        Hex.True(b[0x37 - 4] == 1, "IsInGuildWarCombatState @0x37 - the byte the .def drops");
+        Hex.True(b[0x38 - 4] == 0, "CityWarCompensationStatus @0x38");
+    }
+
+    /// <summary>
+    /// A `bytes` field reserves TWO slots in the order (offset, count) - the reverse of an
+    /// array's (count, offset). S_GET_USER_GUILD_LOGO is the proof: Arb_part_046.c:12743-12744
+    /// writes the cursor into the first slot and the length into the second.
+    /// </summary>
+    [Test] public static void Guild_bytes_header_is_offset_then_count()
+    {
+        var logo = new byte[20];
+        for (int i = 0; i < logo.Length; i++) logo[i] = (byte)i;
+        var b = GuildPackets.BuildSGetUserGuildLogoBody(7, 9, logo);
+        Hex.True(BitConverter.ToUInt16(b, 0) == 0x10, $"logo offset = 0x{BitConverter.ToUInt16(b, 0):X2}, want 0x10");
+        Hex.True(BitConverter.ToUInt16(b, 2) == 20, "logo count = 20");
+        Hex.True(BitConverter.ToInt32(b, 4) == 7 && BitConverter.ToInt32(b, 8) == 9,
+            "UserDbId @packet 0x08, GuildDbId @packet 0x0C");
+        Hex.Eq(b[12..32], logo, "the logo bytes sit at the advertised offset");
+    }
+
+    /// <summary>S_GUILD_APPLY_LIST: fixed part 0x11, element stride 0x1C, and the last element's
+    /// `next` is 0. The per-element strings sit between one element and the next, which is what
+    /// makes the stride check meaningful.</summary>
+    [Test] public static void Guild_S_GUILD_APPLY_LIST_element_stride_is_0x1C()
+    {
+        var rows = new List<GuildPackets.GuildApplyRow>
+        {
+            new(101, 2, 60, 1700000000L, "alice", "hi"),
+            new(102, 3, 55, 1700000001L, "bob", "me too"),
+        };
+        var b = GuildPackets.BuildSGuildApplyListBody(true, 1, 1, rows);
+        Hex.True(BitConverter.ToUInt16(b, 0) == 2, "array count slot @packet 0x04");
+        int arr = BitConverter.ToUInt16(b, 2);
+        Hex.True(arr == 0x11, $"array offset 0x{arr:X2} == fixed part 0x11");
+        Hex.True(b[4] == 1, "InviteAuthority @packet 0x08");
+        Hex.True(BitConverter.ToInt32(b, 5) == 1 && BitConverter.ToInt32(b, 9) == 1, "CurPageNum @0x09, TotalPageCount @0x0D");
+
+        int e0 = arr - 4;
+        Hex.True(BitConverter.ToUInt16(b, e0) == arr, "element 0 self-offset");
+        int next = BitConverter.ToUInt16(b, e0 + 2);
+        int expectedSpan = 0x1C + ("alice".Length + 1) * 2 + ("hi".Length + 1) * 2;
+        Hex.True(next - arr == expectedSpan, $"element 0 spans {next - arr}, want stride 0x1C + both strings ({expectedSpan})");
+        Hex.True(BitConverter.ToInt32(b, e0 + 8) == 101, "UserDbId @element+0x08");
+        Hex.True(BitConverter.ToInt64(b, e0 + 0x14) == 1700000000L, "DateTime @element+0x14");
+        Hex.True(BitConverter.ToUInt16(b, next - 4 + 2) == 0, "the last element's next is 0");
+    }
+
+    /// <summary>S_GUILD_HISTORY: fixed part 0x10, element stride 0x14.</summary>
+    [Test] public static void Guild_S_GUILD_HISTORY_element_stride_is_0x14()
+    {
+        var rows = new List<GuildPackets.GuildHistoryRow>
+        {
+            new(5L, 11, "dob", "@guild:11"),
+            new(6L, 12, "eve", "@guild:12"),
+        };
+        var b = GuildPackets.BuildSGuildHistoryBody(1, 3, rows);
+        Hex.True(BitConverter.ToUInt16(b, 0) == 2, "array count");
+        int arr = BitConverter.ToUInt16(b, 2);
+        Hex.True(arr == 0x10, $"array offset 0x{arr:X2} == fixed part 0x10");
+        Hex.True(BitConverter.ToInt32(b, 4) == 1 && BitConverter.ToInt32(b, 8) == 3, "ViewPage @0x08, LastPage @0x0C");
+        int e0 = arr - 4;
+        int next = BitConverter.ToUInt16(b, e0 + 2);
+        int expectedSpan = 0x14 + ("dob".Length + 1) * 2 + ("@guild:11".Length + 1) * 2;
+        Hex.True(next - arr == expectedSpan, $"element 0 spans {next - arr}, want {expectedSpan}");
+        Hex.True(BitConverter.ToInt64(b, e0 + 8) == 5L && BitConverter.ToInt32(b, e0 + 0x10) == 11,
+            "LogTime @element+0x08, ActionType @element+0x10");
+    }
+
+    /// <summary>An empty array writes count 0 AND offset 0 - not a dangling offset past the end,
+    /// which is what a naive writer produces and what makes the client walk into the strings.</summary>
+    [Test] public static void Guild_empty_array_writes_count_zero_and_offset_zero()
+    {
+        var b = GuildPackets.BuildSGuildApplyListBody(false, 1, 1, new List<GuildPackets.GuildApplyRow>());
+        Hex.True(BitConverter.ToUInt16(b, 0) == 0, "count 0");
+        Hex.True(BitConverter.ToUInt16(b, 2) == 0, "offset 0");
+        Hex.True(b.Length + 4 == 0x11, $"fixed part 0x{b.Length + 4:X2}, want 0x11");
+    }
+
+    /// <summary>
+    /// Inter-server string offsets are FRAME-relative, not payload-relative. Proof is in the
+    /// capture: the DBS_INIT_GUILD_DATA in data/cap_guild.bin advertises its blob at 19 and the
+    /// blob starts at payload index 13, i.e. 19 - 6.
+    /// </summary>
+    [Test] public static void Guild_AS_frames_use_frame_relative_string_offsets()
+    {
+        var p = GuildPackets.BuildAsGuildString(42, "LOGO-7");
+        Hex.True(BitConverter.ToInt32(p, 0) == 0x0E, $"string offset 0x{BitConverter.ToInt32(p, 0):X2}, want frame 0x0E");
+        Hex.True(BitConverter.ToInt32(p, 4) == 42, "GuildDbId @frame 0x0A");
+        Hex.Eq(p[8..20], System.Text.Encoding.Unicode.GetBytes("LOGO-7"), "the wstring sits at the advertised frame offset");
+
+        var g = GuildPackets.BuildAsCreateGuildGroup(42, 3, "Officer", 0x7F);
+        Hex.True(BitConverter.ToInt32(g, 0) == 0x16, $"group name offset 0x{BitConverter.ToInt32(g, 0):X2}, want frame 0x16");
+        Hex.True(BitConverter.ToInt32(g, 8) == 3 && BitConverter.ToInt32(g, 12) == 0x7F,
+            "GuildGroupId @frame 0x0E, Authority @frame 0x12");
+    }
+
+    /// <summary>AS_ADD_GUILDMEMBER's fixed part is 0x4F: eleven i32, an i64, a bool and two more
+    /// i64 - the .def stops after logoutTime/accountDbId and misses isWorldEventTarget (0x3E)
+    /// and lastJoinGuildTime (0x47).</summary>
+    [Test] public static void Guild_AS_ADD_GUILDMEMBER_fixed_part_is_0x4F()
+    {
+        var p = GuildPackets.BuildAsAddGuildMember(42, 11, "dob", 1, 2, 3, 60, 5, 6, 1, 0, 4,
+            7L, true, 99L, 123L);
+        Hex.True(BitConverter.ToInt32(p, 0) == 0x4F, $"name offset 0x{BitConverter.ToInt32(p, 0):X2}, want frame 0x4F");
+        Hex.True(BitConverter.ToInt32(p, 0x2A - 6) == 1, "gender @frame 0x2A");
+        Hex.True(BitConverter.ToInt64(p, 0x36 - 6) == 7L, "LogoutTime @frame 0x36");
+        Hex.True(p[0x3E - 6] == 1, "IsWorldEventTarget @frame 0x3E");
+        Hex.True(BitConverter.ToInt64(p, 0x3F - 6) == 99L, "AccountDbId @frame 0x3F");
+        Hex.True(BitConverter.ToInt64(p, 0x47 - 6) == 123L, "LastJoinGuildTime @frame 0x47");
+    }
+
+    /// <summary>AS_LOAD_GUILD_DATA / AS_UPDATE_GUILD_DATA carry the raw 0x23A0-byte record, not a
+    /// wstring: the writer reserves an (offset, count) pair and calls the raw-bytes helper.</summary>
+    [Test] public static void Guild_AS_LOAD_GUILD_DATA_carries_the_raw_blob()
+    {
+        var blob = GuildPackets.BuildEmptyGuildDataBlob();
+        Hex.True(blob.Length == GuildPackets.GuildDataSize, $"GuildData is 0x{blob.Length:X4}, want 0x23A0");
+        var p = GuildPackets.BuildAsGuildData(blob);
+        Hex.True(BitConverter.ToInt32(p, 0) == 0x0E, "blob offset == frame 0x0E");
+        Hex.True(BitConverter.ToInt32(p, 4) == GuildPackets.GuildDataSize, "blob length == 0x23A0");
+        Hex.Eq(p[8..], blob, "the blob is copied through unchanged");
+    }
+
+    /// <summary>Every Arbiter-side client parser answers a short body with null instead of
+    /// throwing - the real handler logs GET_CLIENT_BUFFER_BUFSIZE_MISMATCH and drops it.</summary>
+    [Test] public static void Guild_client_parsers_reject_short_bodies()
+    {
+        Hex.True(GuildPackets.ParseCApplyGuild(new byte[3]) == null, "C_APPLY_GUILD short");
+        Hex.True(GuildPackets.ParseCAcceptGuildApply(new byte[4]) == null, "C_ACCEPT_GUILD_APPLY short");
+        Hex.True(GuildPackets.ParseCInviteUserToGuild(new byte[6]) == null, "C_INVITE_USER_TO_GUILD short");
+        Hex.True(GuildPackets.ParseCGetUserGuildLogo(new byte[7]) == null, "C_GET_USER_GUILD_LOGO short");
+        Hex.True(GuildPackets.ParseCRequestGuildInfo(new byte[7]) == null, "C_REQUEST_GUILD_INFO short");
+        Hex.True(GuildPackets.ParseCSetGuildJoinCondition(new byte[0x11]) == null, "C_SET_GUILD_JOIN_CONDITION short");
+        Hex.True(GuildPackets.ParseCRequestGuildInfoBeforeApply(new byte[5]) == null, "C_REQUEST_GUILD_INFO_BEFORE_APPLY short");
+        Hex.True(GuildPackets.ParseCUpdateGuildLogo(new byte[3]) == null, "C_UPDATE_GUILD_LOGO short");
+
+        // and the exact minimum is accepted
+        Hex.True(GuildPackets.ParseCAcceptGuildApply(new byte[5]) != null, "C_ACCEPT_GUILD_APPLY at 9 total");
+        Hex.True(GuildPackets.ParseCInviteUserToGuild(new byte[7]) != null, "C_INVITE_USER_TO_GUILD at 0x0B total");
+        Hex.True(GuildPackets.ParseCSetGuildJoinCondition(new byte[0x12]) != null, "C_SET_GUILD_JOIN_CONDITION at 0x16 total");
+    }
+
+    /// <summary>
+    /// C_UPDATE_GUILD_LOGO.1.def says `string logoImage`, which would make the packet 6 bytes.
+    /// The handler (FUN_1404f1010) demands 8 and passes `param_2[3]` - the u16 at packet 0x06 -
+    /// to Guild::UpdateGuildLogo as the byte COUNT, rejecting `8000 &lt; len`. It is a bytes field.
+    /// </summary>
+    [Test] public static void Guild_C_UPDATE_GUILD_LOGO_is_a_bytes_field_not_a_string()
+    {
+        Hex.True(GuildPackets.MinClientLength(GuildPackets.C_UPDATE_GUILD_LOGO) == 8,
+            "the handler's guard is 8, which a single string ref cannot reach");
+
+        var logo = new byte[64];
+        for (int i = 0; i < logo.Length; i++) logo[i] = (byte)(i * 3);
+        var body = new byte[4 + logo.Length];
+        BitConverter.GetBytes((ushort)(4 + 4)).CopyTo(body, 0);   // packet offset of the data
+        BitConverter.GetBytes((ushort)logo.Length).CopyTo(body, 2);
+        logo.CopyTo(body, 4);
+        var got = GuildPackets.ParseCUpdateGuildLogo(body);
+        Hex.True(got != null, "logo parsed");
+        Hex.Eq(got!, logo, "logo bytes round-trip");
+
+        // the 8000-byte cap the real handler enforces before it binds the varbinary
+        var tooBig = new byte[4];
+        BitConverter.GetBytes((ushort)8).CopyTo(tooBig, 0);
+        BitConverter.GetBytes((ushort)(GuildPackets.GuildLogoMaxBytes + 1)).CopyTo(tooBig, 2);
+        Hex.True(GuildPackets.ParseCUpdateGuildLogo(tooBig) == null, "a logo over 8000 bytes is refused");
+    }
+
+    /// <summary>C_SET_GUILD_JOIN_CONDITION carries five fields, not four: the .def's `message`
+    /// ref lands at 0x04 and the four i32 follow unaligned from 0x06.</summary>
+    [Test] public static void Guild_C_SET_GUILD_JOIN_CONDITION_reads_five_fields()
+    {
+        var intro = "LFM";
+        var body = new byte[0x12 + (intro.Length + 1) * 2];
+        BitConverter.GetBytes((ushort)(0x12 + 4)).CopyTo(body, 0);
+        BitConverter.GetBytes(20).CopyTo(body, 2);
+        BitConverter.GetBytes(65).CopyTo(body, 6);
+        BitConverter.GetBytes(2).CopyTo(body, 0x0A);
+        BitConverter.GetBytes(3).CopyTo(body, 0x0E);
+        System.Text.Encoding.Unicode.GetBytes(intro).CopyTo(body, 0x12);
+        var got = GuildPackets.ParseCSetGuildJoinCondition(body);
+        Hex.True(got != null, "parsed");
+        Hex.True(got!.Value.introduction == intro, $"introduction '{got.Value.introduction}'");
+        Hex.True(got.Value.minLevel == 20 && got.Value.maxLevel == 65, "min/max level @0x06/0x0A");
+        Hex.True(got.Value.joinType == 2 && got.Value.preference == 3, "joinType @0x0E, preference @0x12");
+    }
+
+    /// <summary>
+    /// The one piece of guild ground truth we have. Our builder reproduces the real Arbiter's
+    /// empty DBS_INIT_GUILD_DATA byte for byte EXCEPT the two alignment holes inside GuildData,
+    /// which the real one ships uninitialised - arb_world.log leaks 0xB379 at blob 0x024A.
+    /// </summary>
+    [Test] public static void Guild_DBS_INIT_GUILD_DATA_reproduces_the_capture_except_the_padding_holes()
+    {
+        var cap = LoadTsisOrSkip("cap_guild.bin");
+        if (cap == null) return;
+        Hex.True(cap.TryGetValue(2, out var capture), "cap_guild.bin seq 2 is the DBS_INIT_GUILD_DATA");
+
+        var ours = GuildPackets.BuildEmptyDbsInitGuildData();
+        Hex.True(ours.Length == capture!.Length, $"payload {ours.Length} != capture {capture.Length}");
+
+        var differ = new List<int>();
+        for (int i = 0; i < ours.Length; i++) if (ours[i] != capture[i]) differ.Add(i);
+
+        var allowed = new HashSet<int>();
+        foreach (var hole in GuildPackets.GuildDataPaddingHoles) { allowed.Add(13 + hole); allowed.Add(13 + hole + 1); }
+        foreach (var d in differ)
+            Hex.True(allowed.Contains(d),
+                $"payload byte 0x{d:X4} differs from the capture and is not one of GuildData's padding holes");
+
+        Hex.True(differ.Count == 2, $"arb_world.log leaks exactly 2 uninitialised bytes, saw {differ.Count}");
+        Hex.True(differ[0] == 13 + GuildPackets.GdPadAfterTitle,
+            $"the leak is the hole after GuildTitle (blob 0x{GuildPackets.GdPadAfterTitle:X4})");
+
+        // and the header the real Arbiter writes
+        Hex.True(BitConverter.ToInt32(capture, 0) == 19, "GuildData offset == frame 19");
+        Hex.True(BitConverter.ToInt32(capture, 4) == GuildPackets.GuildDataSize, "GuildData length == 0x23A0");
+        Hex.True(BitConverter.ToInt32(capture, 8) == 9139, "GuildLogoId offset == frame 9139");
+        Hex.True(capture[12] == 0, "Success == 0 - this is the 'no guilds' terminator");
+
+        var back = GuildPackets.ParseDbsInitGuildData(capture);
+        Hex.True(back != null && !back.Value.Success && back.Value.GuildData.Length == GuildPackets.GuildDataSize
+                 && back.Value.GuildLogoId.Length == 0, "the capture round-trips through our parser");
+    }
+
+    /// <summary>
+    /// Cross-check on the GuildData offset map: the map comes from the spLoadAllGuild column
+    /// binds in the decompile, the values come from a live capture, and they agree. The captured
+    /// blob's only meaningful non-zero bytes are GuildLevel 1, three 1970-01-01 timestamps and
+    /// the join condition 1/70/1.
+    /// </summary>
+    [Test] public static void Guild_GuildData_offsets_agree_with_the_captured_blob()
+    {
+        var cap = LoadTsisOrSkip("cap_guild.bin");
+        if (cap == null) return;
+        var blob = GuildPackets.ParseDbsInitGuildData(cap![2])!.Value.GuildData;
+
+        Hex.True(BitConverter.ToInt32(blob, GuildPackets.GdGuildLevel) == 1, "GuildLevel @0x0064 == 1");
+        Hex.True(BitConverter.ToInt32(blob, GuildPackets.GdJoinMinLevel) == 1, "JoinMinLevel @0x235C == 1");
+        Hex.True(BitConverter.ToInt32(blob, GuildPackets.GdJoinMaxLevel) == 70, "JoinMaxLevel @0x2360 == 70");
+        Hex.True(BitConverter.ToInt32(blob, GuildPackets.GdGuildJoinType) == 1, "GuildJoinType @0x2364 == 1");
+
+        var epoch = GuildPackets.BuildEpochTimestamp();
+        foreach (var at in new[] { GuildPackets.GdLastIncentiveTime, GuildPackets.GdGuildWarAcceptableToggleTime,
+                                   GuildPackets.GdUnknownTime2348 })
+            Hex.Eq(blob[at..(at + 16)], epoch, $"tagTIMESTAMP_STRUCT at blob 0x{at:X4} is the 1970-01-01 default");
+
+        Hex.True(BitConverter.ToInt32(blob, GuildPackets.GdGuildDbId) == 0, "GuildDbId @0x0000 == 0 (no guild)");
+        Hex.True(BitConverter.ToInt32(blob, GuildPackets.GdGuildLogoLength) == 0, "GuildLogoLength @0x024C == 0");
+
+        // everything else is zero apart from the fields above and the two padding holes
+        var zeroed = (byte[])blob.Clone();
+        void Clear(int at, int len) { for (int i = 0; i < len; i++) zeroed[at + i] = 0; }
+        Clear(GuildPackets.GdGuildLevel, 4);
+        Clear(GuildPackets.GdJoinMinLevel, 4); Clear(GuildPackets.GdJoinMaxLevel, 4); Clear(GuildPackets.GdGuildJoinType, 4);
+        Clear(GuildPackets.GdLastIncentiveTime, 16); Clear(GuildPackets.GdGuildWarAcceptableToggleTime, 16);
+        Clear(GuildPackets.GdUnknownTime2348, 16);
+        foreach (var hole in GuildPackets.GuildDataPaddingHoles) Clear(hole, 2);
+        foreach (var b in zeroed) Hex.True(b == 0, "the rest of the default GuildData is zero");
+    }
+
+    /// <summary>
+    /// The ten guild .def corrections, driven through the real parser and writer. Each assertion
+    /// is an offset the Arbiter's own dumper guard proves, and each one is a byte the shipped
+    /// .def gets wrong - so this test fails the day someone "fixes" the defs back.
+    /// </summary>
+    [Test] public static void Guild_corrected_defs_produce_the_decompiled_offsets()
+    {
+        static List<string> Trace(string name, Dictionary<string, object> data)
+        {
+            var def = DefinitionParser.ParseText(name, GuildPackets.CorrectedDefs[name]);
+            var w = new DefinitionWriter { Trace = new List<string>() };
+            w.Write(def, data);
+            return w.Trace!;
+        }
+        static void At(List<string> trace, string field, int packetOffset)
+            => Hex.True(trace.Contains($"{field}@{packetOffset}"),
+                $"{field} should sit at packet 0x{packetOffset:X2}; trace = {string.Join(", ", trace)}");
+
+        var member = new Dictionary<string, object>
+        {
+            ["memberDbId"] = 11, ["name"] = "dob", ["worldId"] = 1, ["guardId"] = 2, ["sectionId"] = 3,
+            ["groupId"] = 4, ["userLevel"] = 60, ["race"] = 5, ["userClass"] = 6, ["state"] = 0,
+            ["status"] = 0, ["gender"] = 1, ["lastLogoutTime"] = 0L, ["isWorldEventTarget"] = true,
+            ["isInGuildWarCombatState"] = false, ["cityWarCompensationStatus"] = false,
+        };
+
+        var add = Trace("S_ADD_GUILD_MEMBER", member);
+        At(add, "state", 0x26);
+        At(add, "gender", 0x2A);
+        At(add, "lastLogoutTime", 0x2E);
+        At(add, "isWorldEventTarget", 0x36);
+        At(add, "cityWarCompensationStatus", 0x37);
+
+        var upd = Trace("S_UPDATE_GUILD_MEMBER", member);
+        At(upd, "isWorldEventTarget", 0x36);
+        At(upd, "isInGuildWarCombatState", 0x37);
+        At(upd, "cityWarCompensationStatus", 0x38);
+
+        foreach (var name in new[] { "S_CHECK_NEW_GUILDNAME", "S_RESULT_USABLE_GUILD_NAME",
+                                     "S_CHECK_CHANGE_GUILDNAME", "S_CHANGE_GUILDNAME", "S_RESULT_RENAME_GUILD" })
+        {
+            var t = Trace(name, new Dictionary<string, object> { ["guildName"] = "Ere", ["usable"] = true });
+            At(t, "usable", 0x06);
+        }
+
+        var log = Trace("S_GUILD_LOG", new Dictionary<string, object>
+        {
+            ["menuId"] = 3,
+            ["logList"] = new List<Dictionary<string, object>>
+            {
+                new() { ["logString"] = "x", ["dateTime"] = 1L },
+            },
+        });
+        At(log, "menuId", 0x08);
+
+        var logo = DefinitionParser.ParseText("C_UPDATE_GUILD_LOGO", GuildPackets.CorrectedDefs["C_UPDATE_GUILD_LOGO"]);
+        var logoBytes = new DefinitionWriter().Write(logo,
+            new Dictionary<string, object> { ["logoImage"] = new byte[16] });
+        Hex.True(BitConverter.ToUInt16(logoBytes, 0) == 0x08, "C_UPDATE_GUILD_LOGO data starts at packet 0x08");
+        Hex.True(BitConverter.ToUInt16(logoBytes, 2) == 16, "C_UPDATE_GUILD_LOGO carries a byte count, not just an offset");
+
+        var list = Trace("S_GUILD_MEMBER_LIST", new Dictionary<string, object>
+        {
+            ["guildDbId"] = 1, ["chiefDbId"] = 2, ["guildLevel"] = 3, ["guildExp"] = 4L, ["guildNextExp"] = 5L,
+            ["guildMoney"] = 6L, ["memberCount"] = 1, ["accountCount"] = 1, ["guildSize"] = 0,
+            ["guildCreateDate"] = 7L, ["ended"] = true, ["clearCache"] = false, ["showGuildWindow"] = true,
+            ["guildName"] = "G", ["guildMaster"] = "M",
+            ["members"] = new List<Dictionary<string, object>>(),
+        });
+        At(list, "showGuildWindow", 0x46);
+    }
+
+    /// <summary>
+    /// The other side of the same coin: the guild .defs that ARE right. S_ADD_GUILD_GROUP,
+    /// S_GET_USER_GUILD_LOGO, S_GUILD_APPLY_LIST and S_GUILD_HISTORY, driven through the shipped
+    /// .def, must produce exactly what our hand-written builders produce. If they ever diverge,
+    /// one of the two is wrong and this says so before a client sees it.
+    /// </summary>
+    [Test] public static void Guild_shipped_defs_agree_with_the_hand_written_builders()
+    {
+        var defs = LoadDefinitionsOrSkip();
+        if (defs == null) return;
+
+        var group = defs.Get("S_ADD_GUILD_GROUP");
+        Hex.True(group != null, "S_ADD_GUILD_GROUP.1.def is present");
+        Hex.Eq(new DefinitionWriter().Write(group!, new Dictionary<string, object>
+               { ["id"] = 3, ["permissions"] = 0x7F, ["name"] = "Officer" }),
+               GuildPackets.BuildSGuildGroupBody(3, 0x7F, "Officer"),
+               "S_ADD_GUILD_GROUP: shipped .def == builder");
+
+        var logoDef = defs.Get("S_GET_USER_GUILD_LOGO");
+        Hex.True(logoDef != null, "S_GET_USER_GUILD_LOGO.1.def is present");
+        var logo = new byte[20];
+        for (int i = 0; i < logo.Length; i++) logo[i] = (byte)i;
+        Hex.Eq(new DefinitionWriter().Write(logoDef!, new Dictionary<string, object>
+               { ["playerId"] = 7, ["guildId"] = 9, ["logo"] = logo }),
+               GuildPackets.BuildSGetUserGuildLogoBody(7, 9, logo),
+               "S_GET_USER_GUILD_LOGO: shipped .def == builder");
+
+        var applyDef = defs.Get("S_GUILD_APPLY_LIST");
+        Hex.True(applyDef != null, "S_GUILD_APPLY_LIST.2.def is present");
+        Hex.Eq(new DefinitionWriter().Write(applyDef!, new Dictionary<string, object>
+               {
+                   ["unk"] = (byte)1, ["unk2"] = 1, ["unk3"] = 1,
+                   ["apps"] = new List<Dictionary<string, object>>
+                   {
+                       new() { ["playerId"] = 101u, ["class"] = 2u, ["level"] = 60u, ["time"] = 1700000000L,
+                               ["name"] = "alice", ["message"] = "hi" },
+                       new() { ["playerId"] = 102u, ["class"] = 3u, ["level"] = 55u, ["time"] = 1700000001L,
+                               ["name"] = "bob", ["message"] = "me too" },
+                   },
+               }),
+               GuildPackets.BuildSGuildApplyListBody(true, 1, 1, new List<GuildPackets.GuildApplyRow>
+               {
+                   new(101, 2, 60, 1700000000L, "alice", "hi"),
+                   new(102, 3, 55, 1700000001L, "bob", "me too"),
+               }),
+               "S_GUILD_APPLY_LIST: shipped .def == builder");
+
+        var histDef = defs.Get("S_GUILD_HISTORY");
+        Hex.True(histDef != null, "S_GUILD_HISTORY.1.def is present");
+        Hex.Eq(new DefinitionWriter().Write(histDef!, new Dictionary<string, object>
+               {
+                   ["page"] = 1, ["pages"] = 3,
+                   ["events"] = new List<Dictionary<string, object>>
+                   {
+                       new() { ["date"] = 5L, ["event"] = 11, ["initiator"] = "dob", ["description"] = "@guild:11" },
+                       new() { ["date"] = 6L, ["event"] = 12, ["initiator"] = "eve", ["description"] = "@guild:12" },
+                   },
+               }),
+               GuildPackets.BuildSGuildHistoryBody(1, 3, new List<GuildPackets.GuildHistoryRow>
+               {
+                   new(5L, 11, "dob", "@guild:11"),
+                   new(6L, 12, "eve", "@guild:12"),
+               }),
+               "S_GUILD_HISTORY: shipped .def == builder");
+    }
+
     /// <summary>The .def folder, or null with a printed note (the tests run where the repo is).</summary>
     static TeraSharp.Arbiter.Protocol.DefinitionRegistry? LoadDefinitionsOrSkip()
     {

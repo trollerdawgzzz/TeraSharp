@@ -1210,3 +1210,1027 @@ public static class HandshakeData
         2, 3, 4, 5, 6, 7, 11, 12, 13, 14, 15, 18, 19, 20, 21, 22, 23,
     };
 }
+
+// ===========================================================================================
+// T36 - the guild codec. Research: status/GUILD-DESIGN.md.
+//
+// Guilds are the mirror image of parties. A party lives only in Arbiter RAM and is never
+// persisted; a guild is persisted BY THE ARBITER, in direct SQL, across ~109 stored procedures,
+// and World holds only a read-only mirror that the Arbiter pushes at it (DBS_INIT_GUILD_* at
+// boot, AS_*GUILD* deltas afterwards).
+//
+// The client surface is split. 17 of the guild C_ packets are handled inside the Arbiter; the
+// other 14 are handled by WorldServer, which then asks the Arbiter to do the work with an SA_
+// frame. TeraSharp only has to build/parse the Arbiter half - the World half travels through
+// the bypass tunnel untouched. MinClientLength() / MinFrameLength() mark which is which.
+//
+// Client opcodes are from data.json maps."376012". That map is not a guess: the Arbiter
+// decompile writes the PDL id straight into the packet, and all 31 guild ids that appear in a
+// writer or a dumper guard match 376012 exactly (test Guild_client_opcodes_match_the_decompile).
+// The `opcode=NNNNN` comments inside the MASTER_FINAL .def files are from another build.
+//
+// Offsets in the comments below are PACKET-relative for client packets (so the first ref slot
+// is 0x04, after the [u16 len][u16 opcode] header) and FRAME-relative for inter-server frames
+// (so the first field is 0x06, after [u32 len][u16 opcode]) - matching how the decompile quotes
+// them. The parsers/builders here take and return the BODY / PAYLOAD, i.e. header removed.
+// ===========================================================================================
+public static class GuildPackets
+{
+    // ---- sizes the real Arbiter enforces ----
+    /// <summary>GuildData, the record at Guild+0x88 that DBS_INIT_GUILD_DATA and
+    /// AS_LOAD_GUILD_DATA carry raw. Guild::BroadcastGuildData sends exactly this many bytes
+    /// (`local_68[0] = 0x23a0;`, Arb_part_046.c:14001).</summary>
+    public const int GuildDataSize = 0x23A0;
+    /// <summary>GuildMemberData, the element of the std::map at Guild+0x58. The load loop
+    /// advances the vector by 0xF0 per row (Arb_part_069.c, LoadAllGuildMemberData).</summary>
+    public const int GuildMemberDataSize = 0xF0;
+    /// <summary>GuildGroupData = {i32 GuildGroupId, wchar Name[16], i32 Authority}.</summary>
+    public const int GuildGroupDataSize = 0x28;
+    /// <summary>Guild::UpdateGuildLogo rejects `8000 &lt; len` before it binds the varbinary.</summary>
+    public const int GuildLogoMaxBytes = 8000;
+    public const int GuildNameMaxChars = 37;
+    public const int GuildAnnounceMaxChars = 201;
+    public const int GuildPromotionMaxChars = 201;
+    public const int GuildTitleMaxChars = 15;
+    public const int GuildGroupNameMaxChars = 16;
+    public const int MemberIntroduceMaxChars = 31;
+    /// <summary>GuildJoinManager::SendGuildApplyList pages by 13 (`param_4 * 0xd`).</summary>
+    public const int ApplyListPageSize = 13;
+
+    // ---- client -> Arbiter (handled inside the Arbiter) ----
+    public const ushort C_APPLY_GUILD = 0xA0DF;
+    public const ushort C_ACCEPT_GUILD_APPLY = 0xDBE4;
+    public const ushort C_GUILD_APPLY_LIST = 0x716B;
+    public const ushort C_GUILD_APPLY_LIST_PAGE = 0xDB53;
+    public const ushort C_INVITE_USER_TO_GUILD = 0xEF92;
+    public const ushort C_REJECT_INVITE_USER_TO_GUILD = 0xDE54;
+    public const ushort C_CHANGE_GUILDNAME = 0xFC1C;
+    public const ushort C_CHECK_CHANGE_GUILDNAME = 0xB77C;
+    public const ushort C_UPDATE_GUILD_LOGO = 0x60C1;
+    public const ushort C_GET_USER_GUILD_LOGO = 0x584B;
+    public const ushort C_UPDATE_GUILD_TITLE = 0x807B;
+    public const ushort C_REQUEST_GUILD_INFO = 0x5B51;
+    public const ushort C_REQUEST_GUILD_MEMBER_LIST = 0x6657;
+    public const ushort C_GET_GUILD_HISTORY = 0xDC60;
+    public const ushort C_SET_GUILD_JOIN_CONDITION = 0xFFDB;
+    public const ushort C_REQUEST_GUILD_INFO_BEFORE_APPLY_GUILD = 0xC046;
+    public const ushort C_REQUEST_COOLTIME_TO_JOIN_GUILD = 0xC9C4;
+
+    // ---- client -> WorldServer (NO Arbiter handler; World turns these into SA_ frames) ----
+    public const ushort C_LEAVE_GUILD = 0x7C83;
+    public const ushort C_BANISH_GUILD_MEMBER = 0xE303;
+    public const ushort C_DESTROY_GUILD = 0xC4CC;
+    public const ushort C_CHANGE_GUILD_CHIEF = 0x8C0F;
+    public const ushort C_CREATE_GUILDGROUP = 0xBC8A;
+    public const ushort C_CHANGE_GUILDGROUP = 0x8148;
+    public const ushort C_REMOVE_GUILDGROUP = 0x73F1;
+    public const ushort C_SET_GUILDGROUP_AUTHORITY = 0xE885;
+    public const ushort C_CHECK_NEW_GUILDNAME = 0xA6EF;
+    public const ushort C_REQUEST_USABLE_GUILD_NAME = 0x99CC;
+
+    // ---- Arbiter -> client ----
+    public const ushort S_GUILD_INFO = 0xE8B3;
+    public const ushort S_GUILD_MEMBER_LIST = 0xE501;
+    public const ushort S_UPDATE_GUILD_MEMBER = 0xED1B;
+    public const ushort S_ADD_GUILD_MEMBER = 0xAB18;
+    public const ushort S_GUILD_APPLY_LIST = 0x8033;
+    public const ushort S_GUILD_APPLY_COUNT = 0xC89A;
+    public const ushort S_REQUEST_JOIN_GUILD_NOTICE = 0xF1DF;
+    public const ushort S_REQUEST_INVITE_GUILD_TAG = 0x7E14;
+    public const ushort S_EMPTY_GUILD_WINDOW = 0x7252;
+    public const ushort S_DESTROY_GUILD = 0xFC5C;
+    public const ushort S_ADD_GUILD_GROUP = 0xD4D5;
+    public const ushort S_UPDATE_GUILD_GROUP = 0x8A39;
+    public const ushort S_REMOVE_GUILD_GROUP = 0xF787;
+    public const ushort S_GUILD_ANNOUNCE = 0x7A76;
+    public const ushort S_UPDATE_GUILD_ANNOUNCE = 0xE9CC;
+    public const ushort S_CHANGE_GUILD_CHIEF = 0xAB7E;
+    public const ushort S_GET_USER_GUILD_LOGO = 0x7DFA;
+    public const ushort S_GUILD_HISTORY = 0x89C9;
+    public const ushort S_SET_GUILD_JOIN_CONDITION = 0xAA8B;
+    public const ushort S_CHECK_CHANGE_GUILDNAME = 0xDDAD;
+    public const ushort S_REQUEST_COOLTIME_TO_JOIN_GUILD = 0xF222;
+    public const ushort S_REQUEST_GUILD_INFO_BEFORE_APPLY_GUILD = 0x5A69;
+
+    // ---- WorldServer -> client (the Arbiter never builds these; listed so the tunnel and the
+    //      design doc agree on who owns what) ----
+    public const ushort S_LEAVE_GUILD = 0xC1D5;
+    public const ushort S_BANISH_GUILD_MEMBER = 0x8CF9;
+    public const ushort S_REMOVE_GUILD_MEMBER = 0xC24D;
+    public const ushort S_CREATE_GUILD_RESULT = 0x8A6E;
+    public const ushort S_CHECK_NEW_GUILDNAME = 0x71FD;
+    public const ushort S_RESULT_USABLE_GUILD_NAME = 0x6A53;
+    public const ushort S_CHANGE_GUILDNAME = 0x85D9;
+    public const ushort S_RESULT_RENAME_GUILD = 0x594E;
+    public const ushort S_GUILD_EMBLEM = 0xE24D;
+    public const ushort S_GUILD_NAME = 0xF741;
+    public const ushort S_GUILD_LOG = 0xD2E3;
+
+    // ---- Arbiter -> World ----
+    public const ushort AS_LOAD_GUILD = 0x13F9;             // declared, never sent in 100.02
+    public const ushort AS_DESTROY_GUILD = 0x13FD;
+    public const ushort AS_LEAVE_GUILD = 0x13FF;
+    public const ushort AS_BANISH_GUILD_MEMBER = 0x1401;    // declared, never sent in 100.02
+    public const ushort AS_CHANGE_GUILD_CHIEF = 0x1403;
+    public const ushort AS_SET_GUILDGROUP_AUTHORITY = 0x1405;
+    public const ushort AS_CREATE_GUILD_GROUP = 0x1407;
+    public const ushort AS_REMOVE_GUILD_GROUP = 0x1409;
+    public const ushort AS_ADD_GUILDMEMBER = 0x140A;
+    public const ushort AS_CHANGE_GUILDGROUP = 0x140C;
+    public const ushort AS_UPDATE_GUILD_MEMBER = 0x1410;
+    public const ushort AS_SET_GUILD_RECOMMENDATION_POINT = 0x1411;
+    public const ushort AS_UPDATE_GUILD_TITLE = 0x1412;
+    public const ushort AS_UPDATE_GUILD_LOGO = 0x1413;
+    public const ushort AS_LOAD_GUILD_DATA = 0x144D;
+    public const ushort AS_UPDATE_GUILD_DATA = 0x144E;
+    public const ushort AS_UPDATE_GUILD_QUEST_POINT_INFO = 0x1453;
+    public const ushort AS_PUSH_GUILD_BUFF = 0x145D;
+    public const ushort AS_LEARN_GUILD_PERK = 0x145E;
+    public const ushort AS_RESET_GUILD_PERK = 0x145F;
+    public const ushort AS_UPDATE_GUILD_NAME = 0x1490;
+    public const ushort AS_UPDATE_GUILD_GENERAL_COIN = 0x15A4;
+    public const ushort AS_SET_GUILD_GENERAL_COIN = 0x15A5;
+    public const ushort AS_UPDATE_GUILD_EMBLEM = 0x15AF;
+    public const ushort AS_GUILD_JOINED = 0x2866;
+
+    // ---- World -> Arbiter ----
+    public const ushort SA_LOAD_GUILD = 0x13FB;
+    public const ushort SA_DESTROY_GUILD = 0x13FC;
+    public const ushort SA_LEAVE_GUILD = 0x13FE;
+    public const ushort SA_BANISH_GUILD_MEMBER = 0x1400;
+    public const ushort SA_CHANGE_GUILD_CHIEF = 0x1402;
+    public const ushort SA_SET_GUILDGROUP_AUTHORITY = 0x1404;
+    public const ushort SA_CREATE_GUILD_GROUP = 0x1406;
+    public const ushort SA_REMOVE_GUILD_GROUP = 0x1408;
+    public const ushort SA_CHANGE_GUILDGROUP = 0x140B;
+    public const ushort SA_UPDATE_GUILD_MEMBER = 0x140F;
+    public const ushort SA_INC_GUILD_ACCOUNT_LIMIT = 0x1414;
+    public const ushort SA_PUSH_GUILD_BUFF = 0x145C;
+
+    // ---- the DB-proxy channel TeraSharp already impersonates (data/dbproxy_opcodes.txt) ----
+    public const ushort SDB_INIT_GUILD = 0x27CF;
+    public const ushort DBS_INIT_GUILD_GROUP = 0x27D0;
+    public const ushort DBS_INIT_GUILD_MEMBER = 0x27D1;
+    public const ushort DBS_INIT_GUILD_PERK_LIST = 0x27D2;
+    public const ushort DBS_LOAD_GUILD_COMPLETE = 0x27D3;
+    public const ushort SDB_CREATE_GUILD2 = 0x27D4;
+    public const ushort DBS_CREATE_GUILD2 = 0x27D5;
+    public const ushort SDB_ADD_GUILDMEMBER2 = 0x27DB;
+    public const ushort DBS_ADD_GUILDMEMBER2 = 0x27DC;
+    public const ushort DBS_INIT_GUILD_DATA = 0x27ED;
+    public const ushort SDB_CHECK_NEW_GUILD_NAME = 0x2785;
+    public const ushort DBS_CHECK_NEW_GUILD_NAME = 0x2786;
+
+    /// <summary>
+    /// Minimum FRAME length each SA_ guild handler demands. Like the party frames, a short one
+    /// is not a dropped packet on the real Arbiter - the handler logs
+    /// "Arbiter &lt;-&gt; World PDL Version Mismatch! Bye :(" and kills the link - so these have
+    /// to be exact. Our parsers return null instead, which is the safe analogue.
+    /// </summary>
+    public static int MinFrameLength(ushort op) => op switch
+    {
+        SA_LOAD_GUILD => 0x12,
+        SA_DESTROY_GUILD => 0x12,
+        SA_LEAVE_GUILD => 0x1A,
+        SA_BANISH_GUILD_MEMBER => 0x1A,
+        SA_CHANGE_GUILD_CHIEF => 0x16,
+        SA_SET_GUILDGROUP_AUTHORITY => 0x1E,
+        SA_CREATE_GUILD_GROUP => 0x16,
+        SA_REMOVE_GUILD_GROUP => 0x16,
+        SA_CHANGE_GUILDGROUP => 0x1A,
+        SA_UPDATE_GUILD_MEMBER => 0x0E,
+        _ => 0,
+    };
+
+    /// <summary>
+    /// Minimum TOTAL client packet length (including the 4-byte [u16 len][u16 opcode] header)
+    /// the real Arbiter's handler enforces before it touches the body. Returns 0 for the guild
+    /// packets the Arbiter does not handle at all - those belong to WorldServer and must be
+    /// tunnelled, not answered.
+    /// </summary>
+    public static int MinClientLength(ushort op) => op switch
+    {
+        C_APPLY_GUILD => 0x08,
+        C_ACCEPT_GUILD_APPLY => 0x09,
+        C_GUILD_APPLY_LIST => 0x04,
+        C_GUILD_APPLY_LIST_PAGE => 0x08,
+        C_INVITE_USER_TO_GUILD => 0x0B,
+        C_REJECT_INVITE_USER_TO_GUILD => 0x08,
+        C_CHANGE_GUILDNAME => 0x06,
+        C_CHECK_CHANGE_GUILDNAME => 0x06,
+        C_UPDATE_GUILD_LOGO => 0x08,
+        C_GET_USER_GUILD_LOGO => 0x0C,
+        C_UPDATE_GUILD_TITLE => 0x06,
+        C_REQUEST_GUILD_INFO => 0x0C,
+        C_REQUEST_GUILD_MEMBER_LIST => 0x04,
+        C_GET_GUILD_HISTORY => 0x08,
+        C_SET_GUILD_JOIN_CONDITION => 0x16,
+        C_REQUEST_GUILD_INFO_BEFORE_APPLY_GUILD => 0x0A,
+        C_REQUEST_COOLTIME_TO_JOIN_GUILD => 0x04,
+        _ => 0,
+    };
+
+    /// <summary>True if the Arbiter - not WorldServer - owns this guild C_ packet.</summary>
+    public static bool ArbiterHandlesClientPacket(ushort op) => MinClientLength(op) != 0;
+
+    // =======================================================================================
+    // GuildData - the 0x23A0-byte blob. Offsets are blob-relative.
+    // Names and offsets come from the spLoadAllGuild column binds and the named Guild::
+    // accessors; the five marked (capture) are additionally confirmed by the empty
+    // DBS_INIT_GUILD_DATA in data/cap_guild.bin, whose only non-zero bytes land exactly here.
+    // =======================================================================================
+    public const int GdGuildDbId = 0x0000;                      // i32
+    public const int GdGuildName = 0x0004;                      // wchar[37]
+    public const int GdChiefDbId = 0x0050;                      // i32
+    public const int GdGuildCreateDate = 0x0054;                // tagTIMESTAMP_STRUCT
+    public const int GdGuildLevel = 0x0064;                     // i32   (capture: 1)
+    public const int GdGuildExp = 0x0068;                       // i64
+    public const int GdGuildPoint = 0x0070;                     // i64
+    public const int GdGuildMoney = 0x0078;                     // i64
+    public const int GdLastIncentiveTime = 0x0080;              // TIMESTAMP (capture: 1970-01-01)
+    public const int GdGuildAnnounce = 0x0090;                  // wchar[201]
+    public const int GdPadAfterAnnounce = 0x0222;               // 2 B alignment hole - see below
+    public const int GdRecommendationPoint = 0x0224;            // i32
+    public const int GdUnknown0228 = 0x0228;                    // i32, loaded from col 11, never read
+    public const int GdGuildTitle = 0x022C;                     // wchar[15]
+    public const int GdPadAfterTitle = 0x024A;                  // 2 B alignment hole - see below
+    public const int GdGuildLogoLength = 0x024C;                // i32
+    public const int GdGuildLogoId = 0x0250;                    // i32
+    public const int GdGuildLogo = 0x0254;                      // byte[8000]
+    public const int GdGuildPromotion = 0x2194;                 // wchar[201]
+    public const int GdNeedChangeGuildName = 0x2326;            // u8
+    public const int GdIsGuildWarAcceptable = 0x2327;           // u8
+    public const int GdGuildWarAcceptableToggleTime = 0x2328;   // TIMESTAMP (capture: 1970-01-01)
+    public const int GdGuildGeneralCoin = 0x2338;               // i32
+    public const int GdForeverEmblemId = 0x2340;                // i32
+    public const int GdEmblemId = 0x2344;                       // i32
+    public const int GdUnknownTime2348 = 0x2348;                // TIMESTAMP (capture: 1970-01-01), unnamed
+    public const int GdGuildPreference = 0x2358;                // i32
+    public const int GdJoinMinLevel = 0x235C;                   // i32   (capture: 1)
+    public const int GdJoinMaxLevel = 0x2360;                   // i32   (capture: 70)
+    public const int GdGuildJoinType = 0x2364;                  // i32   (capture: 1)
+    public const int GdLastWeekPlayTime = 0x2368;               // i64
+    public const int GdThisWeekPlayTime = 0x2370;               // i64
+    public const int GdLordCandidacyParcelGeneration = 0x2388;  // i32
+    public const int GdAddAccountLimitValue = 0x238C;           // i32
+
+    /// <summary>
+    /// The two bytes of alignment padding GuildData carries after GuildAnnounce and after
+    /// GuildTitle. They are the ONLY bytes that differ between the four captures of the empty
+    /// DBS_INIT_GUILD_DATA, because the real Arbiter ships a default-constructed record without
+    /// clearing them: arb_world.log leaks 0xB379 at 0x024A, lobby_tap.log leaks 0xB7FA / 0xC9E9.
+    /// World never reads them. Our builder writes zeros.
+    /// </summary>
+    public static readonly int[] GuildDataPaddingHoles = { GdPadAfterAnnounce, GdPadAfterTitle };
+
+    /// <summary>tagTIMESTAMP_STRUCT: `i16 year; u16 month, day, hour, minute, second; u32 fraction`.
+    /// The default-constructed value is 1970-01-01, which on the wire is 00 00 -> B2 07 01 00 01 00.</summary>
+    public static byte[] BuildTimestamp(int year, int month, int day, int hour, int minute, int second, uint fraction = 0)
+    {
+        var t = new byte[16];
+        BitConverter.GetBytes((short)year).CopyTo(t, 0);
+        BitConverter.GetBytes((ushort)month).CopyTo(t, 2);
+        BitConverter.GetBytes((ushort)day).CopyTo(t, 4);
+        BitConverter.GetBytes((ushort)hour).CopyTo(t, 6);
+        BitConverter.GetBytes((ushort)minute).CopyTo(t, 8);
+        BitConverter.GetBytes((ushort)second).CopyTo(t, 10);
+        BitConverter.GetBytes(fraction).CopyTo(t, 12);
+        return t;
+    }
+
+    /// <summary>The epoch default the real Arbiter ships in every unset TIMESTAMP: 1970-01-01.</summary>
+    public static byte[] BuildEpochTimestamp() => BuildTimestamp(1970, 1, 1, 0, 0, 0);
+
+    /// <summary>
+    /// The default-constructed GuildData the real Arbiter sends when there is no guild:
+    /// GuildLevel 1, three epoch timestamps, JoinMinLevel 1, JoinMaxLevel 70, JoinType 1, and
+    /// zero everywhere else - including the two padding holes the real one leaks.
+    /// Byte-identical to data/cap_guild.bin's DBS_INIT_GUILD_DATA blob apart from those holes.
+    /// </summary>
+    public static byte[] BuildEmptyGuildDataBlob()
+    {
+        var b = new byte[GuildDataSize];
+        BitConverter.GetBytes(1).CopyTo(b, GdGuildLevel);
+        BuildEpochTimestamp().CopyTo(b, GdLastIncentiveTime);
+        BuildEpochTimestamp().CopyTo(b, GdGuildWarAcceptableToggleTime);
+        BuildEpochTimestamp().CopyTo(b, GdUnknownTime2348);
+        BitConverter.GetBytes(1).CopyTo(b, GdJoinMinLevel);
+        BitConverter.GetBytes(70).CopyTo(b, GdJoinMaxLevel);
+        BitConverter.GetBytes(1).CopyTo(b, GdGuildJoinType);
+        return b;
+    }
+
+    /// <summary>
+    /// DBS_INIT_GUILD_DATA (0x27ED) payload - the answer to World's SDB_INIT_GUILD (0x27CF).
+    /// Frame-relative: `u32 guildDataOff@06, u32 guildDataLen@0A, u32 guildLogoIdOff@0E,
+    /// u8 success@12`, then the blob, then the logo-id wstring. Payload-relative that is
+    /// 0/4/8/12 and data at 13. `success = false` is the terminator World waits for.
+    /// </summary>
+    public static byte[] BuildDbsInitGuildData(byte[] guildData, string guildLogoId, bool success)
+    {
+        var logo = guildLogoId ?? string.Empty;
+        var p = new byte[13 + guildData.Length + (logo.Length + 1) * 2];
+        BitConverter.GetBytes(6 + 13).CopyTo(p, 0);                          // frame-relative offset
+        BitConverter.GetBytes(guildData.Length).CopyTo(p, 4);
+        BitConverter.GetBytes(6 + 13 + guildData.Length).CopyTo(p, 8);
+        p[12] = (byte)(success ? 1 : 0);
+        guildData.CopyTo(p, 13);
+        int at = 13 + guildData.Length;
+        foreach (char ch in logo) { p[at++] = (byte)ch; p[at++] = (byte)(ch >> 8); }
+        return p;
+    }
+
+    /// <summary>The empty answer: one default-constructed GuildData, empty logo id, success 0.</summary>
+    public static byte[] BuildEmptyDbsInitGuildData()
+        => BuildDbsInitGuildData(BuildEmptyGuildDataBlob(), string.Empty, false);
+
+    public readonly record struct InitGuildData(int GuildDataOffset, int GuildDataLength, int GuildLogoIdOffset,
+        bool Success, byte[] GuildData, string GuildLogoId);
+
+    /// <summary>Reads a DBS_INIT_GUILD_DATA payload back. Null if it is short or self-inconsistent.</summary>
+    public static InitGuildData? ParseDbsInitGuildData(byte[] payload)
+    {
+        if (payload == null || payload.Length < 13) return null;
+        int off = BitConverter.ToInt32(payload, 0), len = BitConverter.ToInt32(payload, 4);
+        int logoOff = BitConverter.ToInt32(payload, 8);
+        bool success = payload[12] != 0;
+        if (len < 0 || off < 6 || off - 6 + len > payload.Length) return null;
+        var blob = new byte[len];
+        Array.Copy(payload, off - 6, blob, 0, len);
+        return new InitGuildData(off, len, logoOff, success, blob, ReadWStringAtPayload(payload, logoOff - 6));
+    }
+
+    // =======================================================================================
+    // GuildMemberData (0xF0) and GuildGroupData (0x28) - blob-relative offsets, from the
+    // spLoadAllGuildMemberData / spLoadGuildGroup column binds.
+    // =======================================================================================
+    public const int GmUserDbId = 0x00;                  // i32
+    public const int GmName = 0x04;                      // wchar[37]
+    public const int GmWorldId = 0x50;                   // i32
+    public const int GmGuardId = 0x54;                   // i32
+    public const int GmSectionId = 0x58;                 // i32
+    public const int GmGuildGroupId = 0x5C;              // i32
+    public const int GmUserLevel = 0x60;                 // i32
+    public const int GmRace = 0x64;                      // i32
+    public const int GmUserClass = 0x68;                 // i32
+    public const int GmGender = 0x6C;                    // i32
+    public const int GmState = 0x70;                     // i32, 0 online / 2 offline, not persisted
+    public const int GmWeeklyContributionPoint = 0x74;   // i32
+    public const int GmTotalContributionPoint = 0x78;    // i64
+    public const int GmUnknown0080 = 0x80;               // i32, col 14, -1 on load
+    public const int GmIntroduce = 0x90;                 // wchar[31]
+    public const int GmLastLogoutTime = 0xD0;            // i64 DateTime
+    public const int GmCanGuildWar = 0xD8;               // u8, not persisted
+    public const int GmAccountId = 0xE0;                 // i64
+    public const int GmGuildJoinDate = 0xE8;             // i64 DateTime
+
+    public const int GgGuildGroupId = 0x00;              // i32
+    public const int GgName = 0x04;                      // wchar[16]
+    public const int GgAuthority = 0x24;                 // i32 bitmask
+
+    // =======================================================================================
+    // client -> Arbiter parsers. Each takes the packet BODY (frame minus the 4-byte header),
+    // which is what PacketDispatcher hands a handler; a u16 field offset inside the packet is
+    // therefore `body[i] - 4`. Every one returns null rather than throwing on a short body -
+    // the real Arbiter answers a short body with GET_CLIENT_BUFFER_BUFSIZE_MISMATCH and drops it.
+    // =======================================================================================
+
+    /// <summary>C_APPLY_GUILD (0xA0DF): `[u16 guildNameOff][u16 joinMsgOff]` + strings. Handler
+    /// FUN_1404db730 needs total len &gt;= 8.</summary>
+    public static (string guildName, string joinMsg)? ParseCApplyGuild(byte[] body)
+        => body.Length < 4 ? null : (ReadWString(body, 0), ReadWString(body, 2));
+
+    /// <summary>C_ACCEPT_GUILD_APPLY (0xDBE4): `[u8 accept][u32 userDbId]` - unaligned, no
+    /// padding after the bool. Handler FUN_1404d8590 needs total len &gt;= 9.</summary>
+    public static (bool accept, int userDbId)? ParseCAcceptGuildApply(byte[] body)
+        => body.Length < 5 ? null : (body[0] != 0, BitConverter.ToInt32(body, 1));
+
+    /// <summary>C_GUILD_APPLY_LIST_PAGE (0xDB53): `[i32 pageNumber]`.</summary>
+    public static int? ParseCGuildApplyListPage(byte[] body)
+        => body.Length < 4 ? null : BitConverter.ToInt32(body, 0);
+
+    /// <summary>C_INVITE_USER_TO_GUILD (0xEF92): `[u16 nameOff][u32 userDbId][u8 fromWantedList]`.
+    /// The name is only consulted when userDbId is 0. Handler FUN_1404e1890 needs len &gt;= 0x0B.</summary>
+    public static (string name, int userDbId, bool fromWantedList)? ParseCInviteUserToGuild(byte[] body)
+        => body.Length < 7 ? null : (ReadWString(body, 0), BitConverter.ToInt32(body, 2), body[6] != 0);
+
+    /// <summary>C_REJECT_INVITE_USER_TO_GUILD (0xDE54): `[i32 guildDbId]`.</summary>
+    public static int? ParseCRejectInviteUserToGuild(byte[] body)
+        => body.Length < 4 ? null : BitConverter.ToInt32(body, 0);
+
+    /// <summary>C_CHANGE_GUILDNAME / C_CHECK_CHANGE_GUILDNAME / C_UPDATE_GUILD_TITLE: one
+    /// `[u16 off]` + wstring. Handlers need total len &gt;= 6.</summary>
+    public static string? ParseCSingleString(byte[] body)
+        => body.Length < 2 ? null : ReadWString(body, 0);
+
+    /// <summary>C_UPDATE_GUILD_LOGO (0x60C1): `[u16 logoOff][u16 logoLen]` + raw bytes.
+    /// The shipped .def calls this a `string`; the handler passes the pointer and the u16 at
+    /// body+2 straight to `Guild::UpdateGuildLogo(User*, const unsigned char*, int)` and rejects
+    /// `8000 &lt; len`, so it is a BYTES field with the (offset, count) slot order.</summary>
+    public static byte[]? ParseCUpdateGuildLogo(byte[] body)
+    {
+        if (body.Length < 4) return null;
+        int off = BitConverter.ToUInt16(body, 0) - 4, len = BitConverter.ToUInt16(body, 2);
+        if (off < 0 || len < 0 || len > GuildLogoMaxBytes || off + len > body.Length) return null;
+        var d = new byte[len];
+        Array.Copy(body, off, d, 0, len);
+        return d;
+    }
+
+    /// <summary>C_GET_USER_GUILD_LOGO (0x584B): `[i32 userDbId][i32 guildDbId]`. The handler
+    /// silently drops the request when guildDbId is 0.</summary>
+    public static (int userDbId, int guildDbId)? ParseCGetUserGuildLogo(byte[] body)
+        => body.Length < 8 ? null : (BitConverter.ToInt32(body, 0), BitConverter.ToInt32(body, 4));
+
+    /// <summary>C_REQUEST_GUILD_INFO (0x5B51): `[i32 guildDbId][i32 guildWindowType]`.
+    /// WindowType 1 = probe, 2 = info + history page 1 (members), 3 = info (non-members),
+    /// 5 = member list, 6 = guild quests, 0x0B = apply list page 1.</summary>
+    public static (int guildDbId, int windowType)? ParseCRequestGuildInfo(byte[] body)
+        => body.Length < 8 ? null : (BitConverter.ToInt32(body, 0), BitConverter.ToInt32(body, 4));
+
+    /// <summary>C_GET_GUILD_HISTORY (0xDC60): `[i32 viewPage]`.</summary>
+    public static int? ParseCGetGuildHistory(byte[] body)
+        => body.Length < 4 ? null : BitConverter.ToInt32(body, 0);
+
+    /// <summary>C_SET_GUILD_JOIN_CONDITION (0xFFDB): `[u16 introOff][i32 minLevel][i32 maxLevel]
+    /// [i32 joinType][i32 preference]` + wstring. Handler FUN_1404ed2d0 needs len &gt;= 0x16 and
+    /// rejects anyone who is not the guild chief.</summary>
+    public static (string introduction, int minLevel, int maxLevel, int joinType, int preference)?
+        ParseCSetGuildJoinCondition(byte[] body)
+        => body.Length < 0x12 ? null
+            : (ReadWString(body, 0), BitConverter.ToInt32(body, 2), BitConverter.ToInt32(body, 6),
+               BitConverter.ToInt32(body, 0x0A), BitConverter.ToInt32(body, 0x0E));
+
+    /// <summary>C_REQUEST_GUILD_INFO_BEFORE_APPLY_GUILD (0xC046): `[u16 nameOff][i32 guildDbId]`.
+    /// The name is only consulted when guildDbId is 0.</summary>
+    public static (string guildName, int guildDbId)? ParseCRequestGuildInfoBeforeApply(byte[] body)
+        => body.Length < 6 ? null : (ReadWString(body, 0), BitConverter.ToInt32(body, 2));
+
+    // =======================================================================================
+    // Arbiter -> client builders. Each returns the BODY; the transport prepends
+    // [u16 totalLen][u16 opcode]. Offsets in the doc comments are packet-relative, so a body
+    // index i is packet offset i + 4.
+    // =======================================================================================
+
+    /// <summary>S_GUILD_APPLY_COUNT (0xC89A) and S_REQUEST_INVITE_GUILD_TAG (0x7E14):
+    /// a single `i32 Count`. Both writers are one FUN_1400554e0 after the opcode.</summary>
+    public static byte[] BuildCountBody(int count) => BitConverter.GetBytes(count);
+
+    /// <summary>S_CHANGE_GUILD_CHIEF (0xAB7E): `i32 NewChiefDbId`.</summary>
+    public static byte[] BuildSChangeGuildChiefBody(int newChiefDbId) => BitConverter.GetBytes(newChiefDbId);
+
+    /// <summary>S_REMOVE_GUILD_GROUP (0xF787): `i32 GroupId`.</summary>
+    public static byte[] BuildSRemoveGuildGroupBody(int groupId) => BitConverter.GetBytes(groupId);
+
+    /// <summary>S_SET_GUILD_JOIN_CONDITION (0xAA8B): a single `bool Success`. The values
+    /// themselves come back in S_GUILD_INFO.</summary>
+    public static byte[] BuildSSetGuildJoinConditionBody(bool success) => new[] { (byte)(success ? 1 : 0) };
+
+    /// <summary>S_REQUEST_JOIN_GUILD_NOTICE (0xF1DF), S_DESTROY_GUILD (0xFC5C) and
+    /// S_EMPTY_GUILD_WINDOW (0x7252) carry nothing at all - the writers send straight after
+    /// the opcode. The client reacts to the arrival, not to a field.</summary>
+    public static byte[] BuildEmptyBody() => Array.Empty<byte>();
+
+    /// <summary>S_REQUEST_COOLTIME_TO_JOIN_GUILD (0xF222): `[u8 onCooltime][i64 endTimestamp]`.</summary>
+    public static byte[] BuildSRequestCooltimeToJoinGuildBody(bool onCooltime, long endTimestamp)
+    {
+        var b = new byte[9];
+        b[0] = (byte)(onCooltime ? 1 : 0);
+        BitConverter.GetBytes(endTimestamp).CopyTo(b, 1);
+        return b;
+    }
+
+    /// <summary>S_ADD_GUILD_GROUP (0xD4D5) and S_UPDATE_GUILD_GROUP (0x8A39) are byte-identical:
+    /// `[u16 nameOff][i32 GroupId][i32 Authority]` + wstring, fixed part 0x0E.</summary>
+    public static byte[] BuildSGuildGroupBody(int groupId, int authority, string name)
+    {
+        var w = new Body();
+        int slot = w.Reserve();
+        w.I32(groupId);
+        w.I32(authority);
+        w.Str(slot, name);
+        return w.ToArray();
+    }
+
+    /// <summary>S_GUILD_ANNOUNCE (0x7A76, field GuildNotice) and S_UPDATE_GUILD_ANNOUNCE
+    /// (0xE9CC, field GuildAnnounce): `[u16 off]` + wstring, fixed part 0x06.</summary>
+    public static byte[] BuildSingleStringBody(string text)
+    {
+        var w = new Body();
+        int slot = w.Reserve();
+        w.Str(slot, text);
+        return w.ToArray();
+    }
+
+    /// <summary>
+    /// S_GET_USER_GUILD_LOGO (0x7DFA): `[u16 logoOff][u16 logoLen][i32 UserDbId][i32 GuildDbId]`
+    /// + raw bytes, fixed part 0x10. Note the bytes header is (offset, count) - the reverse of
+    /// an array's (count, offset).
+    /// </summary>
+    public static byte[] BuildSGetUserGuildLogoBody(int userDbId, int guildDbId, byte[] logo)
+    {
+        var w = new Body();
+        int slot = w.Reserve(); w.Reserve();
+        w.I32(userDbId);
+        w.I32(guildDbId);
+        w.Bytes(slot, logo ?? Array.Empty<byte>());
+        return w.ToArray();
+    }
+
+    /// <summary>A guild member as S_ADD_GUILD_MEMBER / S_UPDATE_GUILD_MEMBER carry one.</summary>
+    public readonly record struct GuildMemberWire(
+        int MemberDbId, string Name, int WorldId, int GuardId, int SectionId, int GroupId,
+        int UserLevel, int Race, int UserClass, int Gender, int State,
+        long LastLogoutTime, bool IsWorldEventTarget, bool CityWarCompensationStatus,
+        bool IsInGuildWarCombatState);
+
+    /// <summary>
+    /// S_ADD_GUILD_MEMBER (0xAB18): `[u16 nameOff]` then ten i32, an i64 and two bools;
+    /// fixed part 0x38. The shipped .def is missing `int32 gender` (at 0x2A) and the trailing
+    /// `byte cityWarCompensationStatus`, which is why it computes 0x33.
+    /// </summary>
+    public static byte[] BuildSAddGuildMemberBody(in GuildMemberWire m)
+    {
+        var w = new Body();
+        int slot = w.Reserve();
+        w.I32(m.MemberDbId); w.I32(m.WorldId); w.I32(m.GuardId); w.I32(m.SectionId); w.I32(m.GroupId);
+        w.I32(m.UserLevel); w.I32(m.Race); w.I32(m.UserClass); w.I32(m.State); w.I32(m.Gender);
+        w.I64(m.LastLogoutTime);
+        w.Bool(m.IsWorldEventTarget);
+        w.Bool(m.CityWarCompensationStatus);
+        w.Str(slot, m.Name);
+        return w.ToArray();
+    }
+
+    /// <summary>
+    /// S_UPDATE_GUILD_MEMBER (0xED1B): the same shape plus `bool IsInGuildWarCombatState`
+    /// between IsWorldEventTarget and CityWarCompensationStatus; fixed part 0x39. The shipped
+    /// .def has only two trailing bytes and computes 0x38.
+    /// </summary>
+    public static byte[] BuildSUpdateGuildMemberBody(in GuildMemberWire m)
+    {
+        var w = new Body();
+        int slot = w.Reserve();
+        w.I32(m.MemberDbId); w.I32(m.WorldId); w.I32(m.GuardId); w.I32(m.SectionId); w.I32(m.GroupId);
+        w.I32(m.UserLevel); w.I32(m.Race); w.I32(m.UserClass); w.I32(m.State); w.I32(m.Gender);
+        w.I64(m.LastLogoutTime);
+        w.Bool(m.IsWorldEventTarget);
+        w.Bool(m.IsInGuildWarCombatState);
+        w.Bool(m.CityWarCompensationStatus);
+        return w.ToArray();
+    }
+
+    /// <summary>One row of S_GUILD_APPLY_LIST's array.</summary>
+    public readonly record struct GuildApplyRow(int UserDbId, int ClassType, int UserLevel, long DateTime,
+        string UserName, string JoinMsg);
+
+    /// <summary>
+    /// S_GUILD_APPLY_LIST (0x8033): `[u16 count][u16 offset][bool InviteAuthority]
+    /// [i32 CurPageNum][i32 TotalPageCount]`, fixed part 0x11, element stride 0x1C.
+    /// </summary>
+    public static byte[] BuildSGuildApplyListBody(bool inviteAuthority, int curPage, int totalPages,
+        IReadOnlyList<GuildApplyRow> rows)
+    {
+        var w = new Body();
+        int cnt = w.Reserve(), off = w.Reserve();
+        w.Bool(inviteAuthority);
+        w.I32(curPage);
+        w.I32(totalPages);
+        w.BeginArray(cnt, off, rows.Count);
+        foreach (var r in rows)
+        {
+            w.BeginElement();
+            int nameSlot = w.Reserve(), msgSlot = w.Reserve();
+            w.I32(r.UserDbId); w.I32(r.ClassType); w.I32(r.UserLevel); w.I64(r.DateTime);
+            w.Str(nameSlot, r.UserName);
+            w.Str(msgSlot, r.JoinMsg);
+        }
+        return w.ToArray();
+    }
+
+    /// <summary>One row of S_GUILD_HISTORY's array.</summary>
+    public readonly record struct GuildHistoryRow(long LogTime, int ActionType, string ActorName, string LogString);
+
+    /// <summary>
+    /// S_GUILD_HISTORY (0x89C9): `[u16 count][u16 offset][i32 ViewPage][i32 LastPage]`,
+    /// fixed part 0x10, element stride 0x14, 0x14 rows per page.
+    /// </summary>
+    public static byte[] BuildSGuildHistoryBody(int viewPage, int lastPage, IReadOnlyList<GuildHistoryRow> rows)
+    {
+        var w = new Body();
+        int cnt = w.Reserve(), off = w.Reserve();
+        w.I32(viewPage);
+        w.I32(lastPage);
+        w.BeginArray(cnt, off, rows.Count);
+        foreach (var r in rows)
+        {
+            w.BeginElement();
+            int actorSlot = w.Reserve(), logSlot = w.Reserve();
+            w.I64(r.LogTime); w.I32(r.ActionType);
+            w.Str(actorSlot, r.ActorName);
+            w.Str(logSlot, r.LogString);
+        }
+        return w.ToArray();
+    }
+
+    // =======================================================================================
+    // Arbiter -> World frame builders. These return the PAYLOAD (frame minus [u32 len][u16 op]),
+    // so a field the decompile quotes at frame+0x06 is payload index 0. Strings on this link
+    // are a u32 offset written BEFORE the fixed fields, and the offset is frame-relative.
+    // =======================================================================================
+    private const int FrameHeader = 6;
+
+    /// <summary>AS_GUILD_JOINED (0x2866): `i32 UserDbId`. Sent only to the joining user's own
+    /// world session, not broadcast.</summary>
+    public static byte[] BuildAsGuildJoined(int userDbId) => BitConverter.GetBytes(userDbId);
+
+    /// <summary>AS_DESTROY_GUILD (0x13FD): `i32 GuildDbId`.</summary>
+    public static byte[] BuildAsDestroyGuild(int guildDbId) => BitConverter.GetBytes(guildDbId);
+
+    /// <summary>AS_LEAVE_GUILD (0x13FF): `i32 GuildDbId, i32 MemberDbId`.</summary>
+    public static byte[] BuildAsLeaveGuild(int guildDbId, int memberDbId) => Pair(guildDbId, memberDbId);
+
+    /// <summary>AS_CHANGE_GUILD_CHIEF (0x1403): `i32 GuildDbId, i32 NewChiefDbId`.</summary>
+    public static byte[] BuildAsChangeGuildChief(int guildDbId, int newChiefDbId) => Pair(guildDbId, newChiefDbId);
+
+    /// <summary>AS_REMOVE_GUILD_GROUP (0x1409): `i32 GuildDbId, i32 GroupId`.</summary>
+    public static byte[] BuildAsRemoveGuildGroup(int guildDbId, int groupId) => Pair(guildDbId, groupId);
+
+    /// <summary>AS_BANISH_GUILD_MEMBER (0x1401): `i32 GuildDbId, i32 BanisherDbId, i32 BanisheeDbId`.
+    /// Declared but never sent in 100.02 - the kick travels as AS_LEAVE_GUILD.</summary>
+    public static byte[] BuildAsBanishGuildMember(int guildDbId, int banisherDbId, int banisheeDbId)
+    {
+        var p = new byte[12];
+        BitConverter.GetBytes(guildDbId).CopyTo(p, 0);
+        BitConverter.GetBytes(banisherDbId).CopyTo(p, 4);
+        BitConverter.GetBytes(banisheeDbId).CopyTo(p, 8);
+        return p;
+    }
+
+    /// <summary>AS_CHANGE_GUILDGROUP (0x140C): `i32 GuildDbId, i32 MemberDbId, i32 GuildGroupId`.</summary>
+    public static byte[] BuildAsChangeGuildGroup(int guildDbId, int memberDbId, int guildGroupId)
+    {
+        var p = new byte[12];
+        BitConverter.GetBytes(guildDbId).CopyTo(p, 0);
+        BitConverter.GetBytes(memberDbId).CopyTo(p, 4);
+        BitConverter.GetBytes(guildGroupId).CopyTo(p, 8);
+        return p;
+    }
+
+    /// <summary>AS_UPDATE_GUILD_MEMBER (0x1410): `i32 GuildDbId, MemberDbId, WorldId, GuardId,
+    /// SectionId, Level, State` - seven i32, no strings, fixed part 0x22.</summary>
+    public static byte[] BuildAsUpdateGuildMember(int guildDbId, int memberDbId, int worldId, int guardId,
+        int sectionId, int level, int state)
+    {
+        var p = new byte[28];
+        int[] v = { guildDbId, memberDbId, worldId, guardId, sectionId, level, state };
+        for (int i = 0; i < v.Length; i++) BitConverter.GetBytes(v[i]).CopyTo(p, i * 4);
+        return p;
+    }
+
+    /// <summary>AS_UPDATE_GUILD_EMBLEM (0x15AF): `i32 GuildDbId, u8 IsForever, i32 EmblemId` -
+    /// unaligned, fixed part 0x0F. Despite the name, no string.</summary>
+    public static byte[] BuildAsUpdateGuildEmblem(int guildDbId, bool isForever, int emblemId)
+    {
+        var p = new byte[9];
+        BitConverter.GetBytes(guildDbId).CopyTo(p, 0);
+        p[4] = (byte)(isForever ? 1 : 0);
+        BitConverter.GetBytes(emblemId).CopyTo(p, 5);
+        return p;
+    }
+
+    /// <summary>AS_UPDATE_GUILD_NAME (0x1490), AS_UPDATE_GUILD_TITLE (0x1412) and
+    /// AS_UPDATE_GUILD_LOGO (0x1413) share one shape: `u32 stringOff@06, i32 GuildDbId@0A` then
+    /// the wstring, fixed part 0x0E. AS_UPDATE_GUILD_LOGO's string is the logo ID, not the
+    /// image - the image itself never crosses this link.</summary>
+    public static byte[] BuildAsGuildString(int guildDbId, string value)
+    {
+        var s = value ?? string.Empty;
+        var p = new byte[8 + (s.Length + 1) * 2];
+        BitConverter.GetBytes(FrameHeader + 8).CopyTo(p, 0);
+        BitConverter.GetBytes(guildDbId).CopyTo(p, 4);
+        int at = 8;
+        foreach (char ch in s) { p[at++] = (byte)ch; p[at++] = (byte)(ch >> 8); }
+        return p;
+    }
+
+    /// <summary>AS_CREATE_GUILD_GROUP (0x1407): `u32 groupNameOff@06, i32 GuildDbId@0A,
+    /// i32 GuildGroupId@0E, i32 Authority@12` then the wstring, fixed part 0x16.</summary>
+    public static byte[] BuildAsCreateGuildGroup(int guildDbId, int guildGroupId, string groupName, int authority)
+        => GuildGroupFrame(guildDbId, guildGroupId, authority, groupName);
+
+    /// <summary>AS_SET_GUILDGROUP_AUTHORITY (0x1405): the same shape as AS_CREATE_GUILD_GROUP,
+    /// with the string called NewName.</summary>
+    public static byte[] BuildAsSetGuildGroupAuthority(int guildDbId, int guildGroupId, int authority, string newName)
+        => GuildGroupFrame(guildDbId, guildGroupId, authority, newName);
+
+    private static byte[] GuildGroupFrame(int guildDbId, int guildGroupId, int authority, string name)
+    {
+        var s = name ?? string.Empty;
+        var p = new byte[16 + (s.Length + 1) * 2];
+        BitConverter.GetBytes(FrameHeader + 16).CopyTo(p, 0);
+        BitConverter.GetBytes(guildDbId).CopyTo(p, 4);
+        BitConverter.GetBytes(guildGroupId).CopyTo(p, 8);
+        BitConverter.GetBytes(authority).CopyTo(p, 12);
+        int at = 16;
+        foreach (char ch in s) { p[at++] = (byte)ch; p[at++] = (byte)(ch >> 8); }
+        return p;
+    }
+
+    /// <summary>AS_LOAD_GUILD_DATA (0x144D) and AS_UPDATE_GUILD_DATA (0x144E):
+    /// `u32 blobOff@06, u32 blobLen@0A` then the raw GuildData - NOT a wstring, despite what
+    /// the .def says. AS_LOAD_GUILD_DATA hard-codes the length to 0x23A0.</summary>
+    public static byte[] BuildAsGuildData(byte[] guildData)
+    {
+        var p = new byte[8 + guildData.Length];
+        BitConverter.GetBytes(FrameHeader + 8).CopyTo(p, 0);
+        BitConverter.GetBytes(guildData.Length).CopyTo(p, 4);
+        guildData.CopyTo(p, 8);
+        return p;
+    }
+
+    /// <summary>AS_ADD_GUILDMEMBER (0x140A): `u32 nameOff@06`, nine i32, i64 LogoutTime@36,
+    /// u8 IsWorldEventTarget@3E, i64 AccountDbId@3F, i64 LastJoinGuildTime@47, then the
+    /// wstring; fixed part 0x4F. The .def is missing IsWorldEventTarget and LastJoinGuildTime.</summary>
+    public static byte[] BuildAsAddGuildMember(int guildDbId, int addeeDbId, string name, int worldId,
+        int guardId, int sectionId, int level, int race, int userClass, int gender, int state,
+        int guildGroupId, long logoutTime, bool isWorldEventTarget, long accountDbId, long lastJoinGuildTime)
+    {
+        var s = name ?? string.Empty;
+        var p = new byte[0x49 + (s.Length + 1) * 2];
+        BitConverter.GetBytes(FrameHeader + 0x49).CopyTo(p, 0);
+        int[] v = { guildDbId, addeeDbId, worldId, guardId, sectionId, level, race, userClass, gender, state, guildGroupId };
+        for (int i = 0; i < v.Length; i++) BitConverter.GetBytes(v[i]).CopyTo(p, 4 + i * 4);
+        BitConverter.GetBytes(logoutTime).CopyTo(p, 0x30);
+        p[0x38] = (byte)(isWorldEventTarget ? 1 : 0);
+        BitConverter.GetBytes(accountDbId).CopyTo(p, 0x39);
+        BitConverter.GetBytes(lastJoinGuildTime).CopyTo(p, 0x41);
+        int at = 0x49;
+        foreach (char ch in s) { p[at++] = (byte)ch; p[at++] = (byte)(ch >> 8); }
+        return p;
+    }
+
+    // =======================================================================================
+    // World -> Arbiter parsers. Each takes the frame PAYLOAD; a field the decompile quotes at
+    // frame+N is payload index N-6. Every SA_ guild frame after the opcode starts with
+    // `i64 ArbiterUser` - the handle of the user who asked - which is the routing key the
+    // Arbiter uses to find the session, exactly like the party SA_ frames' OwnerPlanetId.
+    // =======================================================================================
+
+    /// <summary>SA_LOAD_GUILD (0x13FB) and SA_DESTROY_GUILD (0x13FC): `i64 ArbiterUser@06,
+    /// i32 GuildDbId@0E`, frame 0x12.</summary>
+    public static (long arbiterUser, int guildDbId)? ParseSaGuildAction(byte[] payload)
+        => payload.Length < 12 ? null : (BitConverter.ToInt64(payload, 0), BitConverter.ToInt32(payload, 8));
+
+    /// <summary>SA_LEAVE_GUILD (0x13FE) and SA_BANISH_GUILD_MEMBER (0x1400):
+    /// `u32 memberNameOff@06, i64 ArbiterUser@0A, i32 GuildDbId@12, i32 MemberDbId@16`,
+    /// frame 0x1A.</summary>
+    public static (string memberName, long arbiterUser, int guildDbId, int memberDbId)? ParseSaLeaveGuild(byte[] payload)
+    {
+        if (payload.Length < 20) return null;
+        int nameOff = BitConverter.ToInt32(payload, 0);
+        return (ReadWStringAtPayload(payload, nameOff - FrameHeader), BitConverter.ToInt64(payload, 4),
+                BitConverter.ToInt32(payload, 12), BitConverter.ToInt32(payload, 16));
+    }
+
+    /// <summary>SA_CHANGE_GUILD_CHIEF (0x1402): `i64 ArbiterUser@06, i32 GuildDbId@0E,
+    /// i32 NewChiefDbId@12`, frame 0x16.</summary>
+    public static (long arbiterUser, int guildDbId, int newChiefDbId)? ParseSaChangeGuildChief(byte[] payload)
+        => payload.Length < 16 ? null
+            : (BitConverter.ToInt64(payload, 0), BitConverter.ToInt32(payload, 8), BitConverter.ToInt32(payload, 12));
+
+    /// <summary>SA_REMOVE_GUILD_GROUP (0x1408): `i64 ArbiterUser@06, i32 GuildDbId@0E,
+    /// i32 GroupId@12`, frame 0x16.</summary>
+    public static (long arbiterUser, int guildDbId, int groupId)? ParseSaRemoveGuildGroup(byte[] payload)
+    {
+        var v = ParseSaChangeGuildChief(payload);
+        return v == null ? null : (v.Value.arbiterUser, v.Value.guildDbId, v.Value.newChiefDbId);
+    }
+
+    /// <summary>SA_CHANGE_GUILDGROUP (0x140B): `i64 ArbiterUser@06, i32 GuildDbId@0E,
+    /// i32 MemberDbId@12, i32 GuildGroupId@16`, frame 0x1A.</summary>
+    public static (long arbiterUser, int guildDbId, int memberDbId, int guildGroupId)? ParseSaChangeGuildGroup(byte[] payload)
+        => payload.Length < 20 ? null
+            : (BitConverter.ToInt64(payload, 0), BitConverter.ToInt32(payload, 8),
+               BitConverter.ToInt32(payload, 12), BitConverter.ToInt32(payload, 16));
+
+    /// <summary>SA_CREATE_GUILD_GROUP (0x1406): `u32 groupNameOff@06, i64 ArbiterUser@0A,
+    /// i32 GuildDbId@12`, frame 0x16.</summary>
+    public static (string groupName, long arbiterUser, int guildDbId)? ParseSaCreateGuildGroup(byte[] payload)
+    {
+        if (payload.Length < 16) return null;
+        int nameOff = BitConverter.ToInt32(payload, 0);
+        return (ReadWStringAtPayload(payload, nameOff - FrameHeader), BitConverter.ToInt64(payload, 4),
+                BitConverter.ToInt32(payload, 12));
+    }
+
+    /// <summary>SA_SET_GUILDGROUP_AUTHORITY (0x1404): `u32 newNameOff@06, i64 ArbiterUser@0A,
+    /// i32 GuildDbId@12, i32 GuildGroupId@16, i32 Authority@1A`, frame 0x1E.</summary>
+    public static (string newName, long arbiterUser, int guildDbId, int guildGroupId, int authority)?
+        ParseSaSetGuildGroupAuthority(byte[] payload)
+    {
+        if (payload.Length < 24) return null;
+        int nameOff = BitConverter.ToInt32(payload, 0);
+        return (ReadWStringAtPayload(payload, nameOff - FrameHeader), BitConverter.ToInt64(payload, 4),
+                BitConverter.ToInt32(payload, 12), BitConverter.ToInt32(payload, 16), BitConverter.ToInt32(payload, 20));
+    }
+
+    /// <summary>SA_UPDATE_GUILD_MEMBER (0x140F): `i32 GuildDbId@06, i32 MemberDbId@0A`, frame 0x0E.</summary>
+    public static (int guildDbId, int memberDbId)? ParseSaUpdateGuildMember(byte[] payload)
+        => payload.Length < 8 ? null : (BitConverter.ToInt32(payload, 0), BitConverter.ToInt32(payload, 4));
+
+    // =======================================================================================
+    // Corrected .def text. The MASTER_FINAL guild defs are mostly right - S_GUILD_INFO and
+    // S_GUILD_MEMBER_LIST get every field boundary correct, which is a better record than the
+    // party set managed. These ten do not, and the tests pin each correction against the
+    // offsets the Arbiter's own PDL dumper guards prove.
+    // =======================================================================================
+    public static IReadOnlyDictionary<string, string> CorrectedDefs { get; } = new Dictionary<string, string>
+    {
+        // stride 0x48 -> 0x49: the member element ends with a bool the .def never had, and
+        // contributionCurrent/contributionTotal is i32 + i64, not i32 + i32 + i32.
+        ["S_GUILD_MEMBER_LIST"] = @"ref members
+ref guildName
+ref guildMaster
+
+int32  guildDbId
+int32  chiefDbId
+int32  guildLevel
+int64  guildExp
+int64  guildNextExp
+int64  guildMoney
+int32  memberCount
+int32  accountCount
+int32  guildSize
+int64  guildCreateDate
+bool   ended
+bool   clearCache
+bool   showGuildWindow
+string guildName
+string guildMaster
+
+array members
+- ref userName
+- ref userAnnounce
+- int32 userDbId
+- int32 memberType
+- int32 worldId
+- int32 guardId
+- int32 sectionId
+- int32 groupId
+- int32 userLevel
+- int32 race
+- int32 userClass
+- int32 gender
+- int32 state
+- int32 weeklyContributionPoint
+- int64 totalContributionPoint
+- int64 lastLogoutTime
+- bool  cityWarCompensationStatus
+- string userName
+- string userAnnounce
+",
+        // 0x33 -> 0x38: gender at 0x2A and a trailing bool.
+        ["S_ADD_GUILD_MEMBER"] = @"int32  memberDbId
+string name
+int32  worldId
+int32  guardId
+int32  sectionId
+int32  groupId
+int32  userLevel
+int32  race
+int32  userClass
+int32  state
+int32  gender
+int64  lastLogoutTime
+bool   isWorldEventTarget
+bool   cityWarCompensationStatus
+",
+        // 0x38 -> 0x39: three trailing bools, not two.
+        ["S_UPDATE_GUILD_MEMBER"] = @"int32  memberDbId
+int32  worldId
+int32  guardId
+int32  sectionId
+int32  groupId
+int32  userLevel
+int32  race
+int32  userClass
+int32  status
+int32  gender
+int64  lastLogoutTime
+bool   isWorldEventTarget
+bool   isInGuildWarCombatState
+bool   cityWarCompensationStatus
+string name
+",
+        // 0x06 -> 0x07: the usable/success flag the name-check family all carry.
+        ["S_CHECK_NEW_GUILDNAME"] = "string guildName\nbool   usable\n",
+        ["S_RESULT_USABLE_GUILD_NAME"] = "string guildName\nbool   usable\n",
+        ["S_CHECK_CHANGE_GUILDNAME"] = "string guildName\nbool   usable\n",
+        ["S_CHANGE_GUILDNAME"] = "string guildName\nbool   usable\n",
+        ["S_RESULT_RENAME_GUILD"] = "string guildName\nbool   usable\n",
+        // the .def stops at menuId and drops the list entirely.
+        ["S_GUILD_LOG"] = @"ref logList
+
+int32 menuId
+
+array logList
+- string logString
+- int64  dateTime
+",
+        // 0x06 -> 0x08: a bytes field (offset, count), not a string. The handler passes the
+        // u16 at +0x06 to Guild::UpdateGuildLogo as the byte count and rejects 8000 < len.
+        ["C_UPDATE_GUILD_LOGO"] = "bytes logoImage\n",
+    };
+
+    // ---------------------------------- private helpers ----------------------------------
+
+    /// <summary>Reads a NUL-terminated UTF-16LE string whose u16 PACKET offset sits at
+    /// body[slotIndex]. Returns "" for the 0/out-of-range offsets the real handlers fall back
+    /// on (they substitute the shared empty string at DAT_140d3e020).</summary>
+    private static string ReadWString(byte[] body, int slotIndex)
+    {
+        if (slotIndex + 2 > body.Length) return string.Empty;
+        int off = BitConverter.ToUInt16(body, slotIndex) - 4;
+        return ReadWStringAtPayload(body, off);
+    }
+
+    private static string ReadWStringAtPayload(byte[] buf, int at)
+    {
+        if (at < 0 || at >= buf.Length) return string.Empty;
+        var sb = new System.Text.StringBuilder();
+        for (int i = at; i + 1 < buf.Length; i += 2)
+        {
+            char ch = (char)(buf[i] | (buf[i + 1] << 8));
+            if (ch == '\0') break;
+            sb.Append(ch);
+        }
+        return sb.ToString();
+    }
+
+    private static byte[] Pair(int a, int b)
+    {
+        var p = new byte[8];
+        BitConverter.GetBytes(a).CopyTo(p, 0);
+        BitConverter.GetBytes(b).CopyTo(p, 4);
+        return p;
+    }
+
+    /// <summary>
+    /// The client packet body layout the Arbiter's writers produce: reserve every ref slot
+    /// first, then the fixed scalars, then the variable data, backpatching PACKET-relative
+    /// offsets. Same rules as Protocol/DefinitionWriter, small enough to keep the guild
+    /// builders readable.
+    /// </summary>
+    private sealed class Body
+    {
+        private const int Header = 4;
+        private readonly List<byte> _b = new(64);
+
+        public int PacketOffset => _b.Count + Header;
+        public int Reserve() { int p = _b.Count; U16(0); return p; }
+        public void U16(ushort v) { _b.Add((byte)v); _b.Add((byte)(v >> 8)); }
+        public void Bool(bool v) => _b.Add(v ? (byte)1 : (byte)0);
+        public void I32(int v) => _b.AddRange(BitConverter.GetBytes(v));
+        public void I64(long v) => _b.AddRange(BitConverter.GetBytes(v));
+        public void Patch(int slot, ushort v) { _b[slot] = (byte)v; _b[slot + 1] = (byte)(v >> 8); }
+
+        public void Str(int slot, string? s)
+        {
+            Patch(slot, (ushort)PacketOffset);
+            foreach (char ch in s ?? string.Empty) U16(ch);
+            U16(0);
+        }
+
+        public void Bytes(int slot, byte[] d)
+        {
+            Patch(slot, (ushort)PacketOffset);
+            Patch(slot + 2, (ushort)d.Length);
+            _b.AddRange(d);
+        }
+
+        /// <summary>Fills an array's (count, offset) header. Offset stays 0 for an empty array.</summary>
+        public void BeginArray(int countSlot, int offsetSlot, int count)
+        {
+            Patch(countSlot, (ushort)count);
+            Patch(offsetSlot, count == 0 ? (ushort)0 : (ushort)PacketOffset);
+            _prevNextSlot = -1;
+        }
+
+        /// <summary>
+        /// Starts an element: `[u16 self][u16 next]`. `next` points at the element AFTER this
+        /// one, so it is patched when the next BeginElement runs; the last element keeps 0.
+        /// </summary>
+        public void BeginElement()
+        {
+            if (_prevNextSlot >= 0) Patch(_prevNextSlot, (ushort)PacketOffset);
+            U16((ushort)PacketOffset);
+            _prevNextSlot = _b.Count;
+            U16(0);
+        }
+
+        private int _prevNextSlot = -1;
+
+        public byte[] ToArray() => _b.ToArray();
+    }
+}

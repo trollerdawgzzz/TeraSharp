@@ -54,6 +54,7 @@ Deploy check: `TeraSharp.Arbiter.exe --selftest` — one PASS/FAIL line per data
 | Every GM command, by side and risk tier | `status/GM-COMMANDS-ARBITER.md`, `status/GM-COMMANDS-FULL.md` |
 | Dungeon cool times and entry counts | `status/DUNGEON-COOLTIME.md` |
 | Everything else in the 2026-09-13 relog capture | `status/RELOG-CAPTURE-NOTES.md` |
+| Guilds - the object, the SQL schema, the opcodes and the .def corrections | `status/GUILD-DESIGN.md` |
 
 ## The three rules that cost the most to learn
 
@@ -104,3 +105,7 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   still sends 0, so the one-line diff in `status/GM-DESIGN.md` §6 is untested live.
 - `status/*.txt` (15 decompile scratch files) should be deleted; Cowork has no delete tool
   in this session, so the human runs the `git rm` in the T24 report.
+- The replayed `DBS_INIT_GUILD_DATA` (0x27ED) leaks two bytes of the real Arbiter's
+  uninitialised stack padding (`0xB379` at GuildData+0x024A). Harmless - World never reads
+  them - but `GuildPackets.BuildEmptyDbsInitGuildData()` builds the same frame with zeros, so
+  the replay entry could be swapped for it (`status/GUILD-DESIGN.md` sections 2.1 and 9).
