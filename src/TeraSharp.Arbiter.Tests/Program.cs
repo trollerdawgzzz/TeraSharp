@@ -8740,7 +8740,7 @@ some prose with `backticks` that is not a table row
                 "a freshly migrated DB has every required table and column: " + result.Detail);
             Hex.True(result.Detail.Contains("user_version"), "and reports the schema version");
         }
-        finally { Directory.Delete(dir, true); }
+        finally { Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools(); Directory.Delete(dir, true); }
     }
 
     [Test] public static void T37_database_check_spots_a_stale_db()
@@ -8768,7 +8768,7 @@ some prose with `backticks` that is not a table row
 
             Hex.True(!SelfTest.CheckDatabase(Path.Combine(dir, "nothing.db")).Pass, "no DB at all fails");
         }
-        finally { Directory.Delete(dir, true); }
+        finally { Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools(); Directory.Delete(dir, true); }
     }
 
     [Test] public static void T37_required_lists_are_not_empty_and_name_real_things()
