@@ -1,3 +1,5 @@
+using System.Text.RegularExpressions;
+
 namespace TeraSharp.Arbiter.World;
 
 /// <summary>
@@ -452,4 +454,759 @@ internal static class DbProxyStaticData
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     };
 
+}
+
+// ===========================================================================================
+// T28 — the party packet layer. Research: status/PARTY-DESIGN.md.
+//
+// Parties are ARBITER-owned: the Arbiter keeps membership in RAM, fans S_PARTY_* out to the
+// members itself, and mirrors the party to World only so World can do loot / exp / instance
+// rules. Nothing about a party is persisted (PARTY-DESIGN.md section 4 proves it), so there is
+// no store here and no PERSISTENCE-MAP row.
+//
+// NOTHING IS WIRED UP. This is the pure codec; the PartyManager and the session fan-out need
+// T27's per-session routing and a two-client capture. No capture contains a single party frame,
+// so the tests below are golden tests against the decompiled writers and the .def files, not
+// byte-exact tests against captured bytes. That is the one weakness of the task and it is
+// stated here rather than hidden.
+//
+// Frame is [u32 len][u16 opcode][payload]; every offset in the comments is FRAME-relative
+// (payload offset = frame offset - 6), matching how the decompile quotes them.
+// ===========================================================================================
+public static class PartyPackets
+{
+    /// <summary>This Arbiter's PlanetId. ServerConfig.xml planetId; DAT_140e2d020 in the
+    /// decompile; 0x0AF0 = 2800 in every capture, and the same 2800 sits inside every gameId.</summary>
+    public const int PlanetId = 2800;
+
+    /// <summary>Non-raid party capacity. Party::New_AddMember: `4 &lt; memberCount` rejects.</summary>
+    public const int MaxPartyMembers = 5;
+    /// <summary>Raid capacity, and the fixed size of Party's member table (Party+0xD8, 30 slots).</summary>
+    public const int MaxRaidMembers = 30;
+    /// <summary>PartyMemberBasicInfo, the record AS_DO_CREATE_PARTY carries N of, raw.</summary>
+    public const int MemberBasicInfoSize = 0xA0;
+
+    // ---- Arbiter -> World ----
+    public const ushort AS_DO_CREATE_PARTY = 0x139E;
+    public const ushort AS_DO_ADD_PARTY_MEMBER = 0x139F;
+    public const ushort AS_DO_REMOVE_PARTY_MEMBER = 0x13A0;
+    public const ushort AS_DO_DISMISS_PARTY = 0x13A1;
+    public const ushort AS_DO_EXTEND_PARTY = 0x13A2;
+    public const ushort AS_DO_SWAP_PARTY = 0x13A3;
+    public const ushort AS_DO_SET_PARTY_MANAGER = 0x13A4;
+    public const ushort AS_DO_CHANGE_PARTY_MEMBER_AUTHORITY = 0x13A5;
+    public const ushort AS_DO_SET_LOOTING_METHOD = 0x13A6;
+    public const ushort AS_DO_SET_PARTY_OWNER = 0x13A7;
+    public const ushort AS_DISMISS_PARTY = 0x13BA;
+    public const ushort AS_PARTY_LOOTING_METHOD = 0x13BB;
+    public const ushort AS_BAN_PARTY_MEMBER = 0x13BC;
+
+    // ---- World -> Arbiter ----
+    public const ushort SA_JOIN_PARTY = 0x1395;
+    public const ushort SA_LEAVE_PARTY = 0x1396;
+    public const ushort SA_DISMISS_PARTY = 0x1397;
+    public const ushort SA_KICK_PARTY = 0x1398;
+    public const ushort SA_EXTEND_PARTY = 0x1399;
+    public const ushort SA_SWAP_PARTY = 0x139A;
+    public const ushort SA_CHANGE_PARTY_MANAGER = 0x139B;
+    public const ushort SA_CHANGE_PARTY_MEMBER_AUTHORITY = 0x139C;
+    public const ushort SA_CHANGE_LOOTING_METHOD = 0x139D;
+    public const ushort SA_JOIN_PARTY_IN_ARBITER = 0x13AB;
+    public const ushort SA_MERGE_PARTY_TO_RAID = 0x13AC;
+    public const ushort SA_BYPASS_TO_GROUP = 0x13F8;
+
+    // ---- Client opcodes (data.json maps."376012"; the opcode= comments in the MASTER_FINAL
+    //      .def files are from another build and are WRONG) ----
+    public const ushort C_APPLY_PARTY = 0xA889;
+    public const ushort C_REPLY_INTER_PARTY_MAKE = 0xBD04;
+    public const ushort C_DISMISS_PARTY = 0xC8B9;
+    public const ushort C_BAN_PARTY_MEMBER = 0x59C1;
+    public const ushort C_PARTY_LOOTING_METHOD = 0x5D24;
+    public const ushort C_MERGE_PARTY_TO_RAID = 0xB8D0;
+    public const ushort C_REQUEST_PARTY_INFO = 0xFD35;
+    public const ushort S_PARTY_MEMBER_LIST = 0x8BC6;
+    public const ushort S_LEAVE_PARTY = 0x9A8E;
+    public const ushort S_PARTY_LOOTING_METHOD = 0x63C0;
+
+    /// <summary>
+    /// Minimum FRAME length each SA_ handler demands. A short frame is not a dropped packet on
+    /// the real Arbiter - Handler_SA_JOIN_PARTY logs
+    /// "Arbiter &lt;-&gt; World PDL Version Mismatch! Bye :(" and kills the connection - so these
+    /// sizes have to be exact. Our parsers return null instead, which is the safe analogue.
+    /// </summary>
+    public static int MinFrameLength(ushort op) => op switch
+    {
+        SA_JOIN_PARTY => 0x56,
+        SA_LEAVE_PARTY => 0x1A,
+        SA_DISMISS_PARTY => 0x12,
+        SA_KICK_PARTY => 0x1F,
+        SA_EXTEND_PARTY => 0x13,
+        SA_SWAP_PARTY => 0x1A,
+        SA_CHANGE_PARTY_MANAGER => 0x1A,
+        SA_CHANGE_PARTY_MEMBER_AUTHORITY => 0x1B,
+        SA_CHANGE_LOOTING_METHOD => 0x25,
+        SA_JOIN_PARTY_IN_ARBITER => 0x0F,
+        SA_MERGE_PARTY_TO_RAID => 0x16,
+        SA_BYPASS_TO_GROUP => 0x22,
+        _ => 0,
+    };
+
+    // ---- PDId: the cross-server player key {int PlanetId, int UserDbId}, packed into an i64
+    //      with PlanetId in the LOW dword. AS_DISMISS_PARTY / AS_PARTY_LOOTING_METHOD /
+    //      AS_BAN_PARTY_MEMBER carry it that way (dumper calls the field UserPDId). ----
+
+    public static long PackPDId(int planetId, int userDbId)
+        => (long)(((ulong)(uint)userDbId << 32) | (uint)planetId);
+
+    public static (int planetId, int userDbId) UnpackPDId(long pdId)
+        => ((int)(uint)(ulong)pdId, (int)(uint)((ulong)pdId >> 32));
+
+    // -------------------------------------------------------------------------------------
+    // PartyMemberBasicInfo - 0xA0 bytes, the wire form of a member.
+    // The first 0xA0 bytes of Party's own PartyMemberInfo (Party+0x1C8, stride 0xC0); the
+    // stride is confirmed twice in PartyManager::New_CreateParty (Arb_part_079.c) - the
+    // encoder bound check `(int)param_1[2] < *(int *)param_1[1] + 0xa0` and `puVar25 + 0x28`.
+    //   [0x00] i32 PlanetId   [0x04] i32 UserDbId   [0x08] i64 GameId (masked 0x7FFF...)
+    //   [0x10] i32 Level      [0x14] i32 Class      [0x18] i32 Race    [0x1C] i32 Gender
+    //   [0x20] i32 Role (-1)  [0x24] wchar Name[0x25]
+    //   [0x6E] u8 AuthorityAboutInvitation  [0x6F] u8 Alive  [0x70] u8 Online
+    //   [0x74] i32 AchievementGrade  [0x78] i32 UserAwakenGrade
+    // -------------------------------------------------------------------------------------
+    public const int MemberNameOffset = 0x24;
+    public const int MemberNameMaxChars = 0x25;
+
+    public readonly record struct PartyMember(
+        int PlanetId, int UserDbId, ulong GameId, int Level, int Class, int Race, int Gender,
+        int Role, string Name, bool CanInvite, bool Alive, bool Online,
+        int AchievementGrade, int AwakenGrade);
+
+    /// <summary>One 0xA0-byte PartyMemberBasicInfo. The name is UTF-16LE, NUL-terminated,
+    /// truncated to 0x24 characters so the terminator always fits the 0x25-wchar field.</summary>
+    public static byte[] BuildMemberBasicInfo(in PartyMember m)
+    {
+        var b = new byte[MemberBasicInfoSize];
+        BitConverter.GetBytes(m.PlanetId).CopyTo(b, 0x00);
+        BitConverter.GetBytes(m.UserDbId).CopyTo(b, 0x04);
+        BitConverter.GetBytes(m.GameId & 0x7FFFFFFFFFFFFFFFUL).CopyTo(b, 0x08);
+        BitConverter.GetBytes(m.Level).CopyTo(b, 0x10);
+        BitConverter.GetBytes(m.Class).CopyTo(b, 0x14);
+        BitConverter.GetBytes(m.Race).CopyTo(b, 0x18);
+        BitConverter.GetBytes(m.Gender).CopyTo(b, 0x1C);
+        BitConverter.GetBytes(m.Role).CopyTo(b, 0x20);
+        WriteName(b, MemberNameOffset, m.Name, MemberNameMaxChars);
+        b[0x6E] = (byte)(m.CanInvite ? 1 : 0);
+        b[0x6F] = (byte)(m.Alive ? 1 : 0);
+        b[0x70] = (byte)(m.Online ? 1 : 0);
+        BitConverter.GetBytes(m.AchievementGrade).CopyTo(b, 0x74);
+        BitConverter.GetBytes(m.AwakenGrade).CopyTo(b, 0x78);
+        return b;
+    }
+
+    /// <summary>Inverse of <see cref="BuildMemberBasicInfo"/>; null when the record is short.</summary>
+    public static PartyMember? ParseMemberBasicInfo(byte[] b, int off)
+    {
+        if (b.Length < off + MemberBasicInfoSize) return null;
+        return new PartyMember(
+            BitConverter.ToInt32(b, off + 0x00), BitConverter.ToInt32(b, off + 0x04),
+            BitConverter.ToUInt64(b, off + 0x08),
+            BitConverter.ToInt32(b, off + 0x10), BitConverter.ToInt32(b, off + 0x14),
+            BitConverter.ToInt32(b, off + 0x18), BitConverter.ToInt32(b, off + 0x1C),
+            BitConverter.ToInt32(b, off + 0x20),
+            ReadName(b, off + MemberNameOffset, MemberNameMaxChars),
+            b[off + 0x6E] != 0, b[off + 0x6F] != 0, b[off + 0x70] != 0,
+            BitConverter.ToInt32(b, off + 0x74), BitConverter.ToInt32(b, off + 0x78));
+    }
+
+    private static void WriteName(byte[] b, int off, string name, int maxChars)
+    {
+        if (string.IsNullOrEmpty(name)) return;
+        int n = Math.Min(name.Length, maxChars - 1);
+        for (int i = 0; i < n; i++) BitConverter.GetBytes((ushort)name[i]).CopyTo(b, off + i * 2);
+    }
+
+    private static string ReadName(byte[] b, int off, int maxChars)
+    {
+        var sb = new System.Text.StringBuilder();
+        for (int i = 0; i < maxChars && off + i * 2 + 1 < b.Length; i++)
+        {
+            ushort c = BitConverter.ToUInt16(b, off + i * 2);
+            if (c == 0) break;
+            sb.Append((char)c);
+        }
+        return sb.ToString();
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Loot settings - the seven fields that travel together in AS_DO_SET_LOOTING_METHOD,
+    // AS_PARTY_LOOTING_METHOD, SA_CHANGE_LOOTING_METHOD, C_/S_PARTY_LOOTING_METHOD and inside
+    // S_PARTY_MEMBER_LIST. Party fields +0xA8, +0xAC, +0xB0, +0xB4, +0xB5, +0xB8, +0xBC.
+    // BoundOnLootItemDistributionMethod is MISSING from AS_DO_SET_LOOTING_METHOD.1.def and
+    // SA_CHANGE_LOOTING_METHOD.1.def - see PARTY-DESIGN.md section 6.3.
+    // -------------------------------------------------------------------------------------
+    public readonly record struct LootSettings(
+        int Method, int RareGradeForDicing, int RareItemDistributionMethod,
+        bool EquipmentForDicing, bool FindClassForDicing,
+        int BoundOnLootItemDistributionMethod, bool ForbidLootingInBattle);
+
+    // ---------------------------------- A -> W builders ----------------------------------
+
+    /// <summary>
+    /// AS_DO_CREATE_PARTY (0x139E). Fixed part 0x38 frame bytes, then N x 0xA0 member records.
+    ///   [06] u32 memberListOffset (frame-rel)   [0A] u32 memberListCount
+    ///   [0E] i64 PartyId  [16] i32 OwnerPlanetId  [1A] i32 ManagerPlanetId  [1E] i32 ManagerDbId
+    ///   [22] i32 MaxMemberCount  [26] i32 PartyType  [2A] u8 DungeonClearCompensation
+    ///   [2B] i32 DungeonId  [2F] u8 Raid  [30] i32 TeamIndex  [34] i32 BattleFieldId
+    /// Writer FUN_1407aebe0 (Arb_part_066.c:18323).
+    /// </summary>
+    public static byte[] BuildDoCreateParty(
+        long partyId, int ownerPlanetId, int managerPlanetId, int managerDbId,
+        int maxMemberCount, int partyType, bool dungeonClearCompensation, int dungeonId,
+        bool raid, int teamIndex, int battleFieldId, IReadOnlyList<PartyMember> members)
+    {
+        const int fixedPayload = 0x38 - 6;                 // 0x32
+        var p = new byte[fixedPayload + members.Count * MemberBasicInfoSize];
+        BitConverter.GetBytes((uint)0x38).CopyTo(p, 0x00); // list offset, frame-relative
+        BitConverter.GetBytes((uint)members.Count).CopyTo(p, 0x04);
+        BitConverter.GetBytes(partyId).CopyTo(p, 0x08);
+        BitConverter.GetBytes(ownerPlanetId).CopyTo(p, 0x10);
+        BitConverter.GetBytes(managerPlanetId).CopyTo(p, 0x14);
+        BitConverter.GetBytes(managerDbId).CopyTo(p, 0x18);
+        BitConverter.GetBytes(maxMemberCount).CopyTo(p, 0x1C);
+        BitConverter.GetBytes(partyType).CopyTo(p, 0x20);
+        p[0x24] = (byte)(dungeonClearCompensation ? 1 : 0);
+        BitConverter.GetBytes(dungeonId).CopyTo(p, 0x25);
+        p[0x29] = (byte)(raid ? 1 : 0);
+        BitConverter.GetBytes(teamIndex).CopyTo(p, 0x2A);
+        BitConverter.GetBytes(battleFieldId).CopyTo(p, 0x2E);
+        for (int i = 0; i < members.Count; i++)
+            BuildMemberBasicInfo(members[i]).CopyTo(p, fixedPayload + i * MemberBasicInfoSize);
+        return p;
+    }
+
+    /// <summary>
+    /// AS_DO_ADD_PARTY_MEMBER (0x139F), 0x43 frame bytes plus the name.
+    ///   [06] u32 nameOffset (frame-rel)  [0A] i64 PartyId  [12] i32 MemberPlanetId
+    ///   [16] i32 MemberDbId  [1A] i64 GameId  [22] i32 Level  [26] i32 Class  [2A] i32 Race
+    ///   [2E] i32 Gender  [32] i32 Role  [36] u8 AuthorityAboutInvitation  [37] u8 Alive
+    ///   [38] u8 Online  [39] i32 AchievementGrade  [3D] i32 UserAwakenGrade
+    ///   [41] u8 SupplementCompensation  [42] u8 IsSoloMatching  [43] wstr Name
+    /// Writer FUN_1407ae450 (Arb_part_067.c:10121). The .def is missing [36] and [41].
+    /// </summary>
+    public static byte[] BuildDoAddPartyMember(
+        long partyId, in PartyMember m, bool supplementCompensation = false, bool isSoloMatching = false)
+    {
+        const int fixedPayload = 0x43 - 6;                 // 0x3D
+        var name = m.Name ?? string.Empty;
+        var p = new byte[fixedPayload + (name.Length + 1) * 2];
+        BitConverter.GetBytes((uint)0x43).CopyTo(p, 0x00); // name offset, frame-relative
+        BitConverter.GetBytes(partyId).CopyTo(p, 0x04);
+        BitConverter.GetBytes(m.PlanetId).CopyTo(p, 0x0C);
+        BitConverter.GetBytes(m.UserDbId).CopyTo(p, 0x10);
+        BitConverter.GetBytes(m.GameId & 0x7FFFFFFFFFFFFFFFUL).CopyTo(p, 0x14);
+        BitConverter.GetBytes(m.Level).CopyTo(p, 0x1C);
+        BitConverter.GetBytes(m.Class).CopyTo(p, 0x20);
+        BitConverter.GetBytes(m.Race).CopyTo(p, 0x24);
+        BitConverter.GetBytes(m.Gender).CopyTo(p, 0x28);
+        BitConverter.GetBytes(m.Role).CopyTo(p, 0x2C);
+        p[0x30] = (byte)(m.CanInvite ? 1 : 0);
+        p[0x31] = (byte)(m.Alive ? 1 : 0);
+        p[0x32] = (byte)(m.Online ? 1 : 0);
+        BitConverter.GetBytes(m.AchievementGrade).CopyTo(p, 0x33);
+        BitConverter.GetBytes(m.AwakenGrade).CopyTo(p, 0x37);
+        p[0x3B] = (byte)(supplementCompensation ? 1 : 0);
+        p[0x3C] = (byte)(isSoloMatching ? 1 : 0);
+        for (int i = 0; i < name.Length; i++)
+            BitConverter.GetBytes((ushort)name[i]).CopyTo(p, fixedPayload + i * 2);
+        return p;
+    }
+
+    /// <summary>AS_DO_REMOVE_PARTY_MEMBER (0x13A0): [i64 PartyId][i32 PlanetId][i32 UserDbId].</summary>
+    public static byte[] BuildDoRemovePartyMember(long partyId, int planetId, int userDbId)
+    {
+        var p = new byte[16];
+        BitConverter.GetBytes(partyId).CopyTo(p, 0);
+        BitConverter.GetBytes(planetId).CopyTo(p, 8);
+        BitConverter.GetBytes(userDbId).CopyTo(p, 12);
+        return p;
+    }
+
+    /// <summary>AS_DO_DISMISS_PARTY (0x13A1): [i64 PartyId].</summary>
+    public static byte[] BuildDoDismissParty(long partyId) => BitConverter.GetBytes(partyId);
+
+    /// <summary>AS_DO_EXTEND_PARTY (0x13A2): [i64 PartyId][u8 PartyToRaid].</summary>
+    public static byte[] BuildDoExtendParty(long partyId, bool partyToRaid)
+    {
+        var p = new byte[9];
+        BitConverter.GetBytes(partyId).CopyTo(p, 0);
+        p[8] = (byte)(partyToRaid ? 1 : 0);
+        return p;
+    }
+
+    /// <summary>AS_DO_SWAP_PARTY (0x13A3): [i64 PartyId][i32 SlotIndex1][i32 SlotIndex2].
+    /// Slot indices are the Party+0xD8 table indices and are wire-visible, so they must be
+    /// stable - see PARTY-DESIGN.md section 7 rule 1.</summary>
+    public static byte[] BuildDoSwapParty(long partyId, int slot1, int slot2)
+    {
+        var p = new byte[16];
+        BitConverter.GetBytes(partyId).CopyTo(p, 0);
+        BitConverter.GetBytes(slot1).CopyTo(p, 8);
+        BitConverter.GetBytes(slot2).CopyTo(p, 12);
+        return p;
+    }
+
+    /// <summary>AS_DO_SET_PARTY_MANAGER (0x13A4): [i64 PartyId][i32 PlanetId][i32 UserDbId].</summary>
+    public static byte[] BuildDoSetPartyManager(long partyId, int planetId, int userDbId)
+        => BuildDoRemovePartyMember(partyId, planetId, userDbId);   // identical shape
+
+    /// <summary>AS_DO_CHANGE_PARTY_MEMBER_AUTHORITY (0x13A5):
+    /// [i64 PartyId][i32 PlanetId][i32 UserDbId][u8 AuthorityAboutInvitation].</summary>
+    public static byte[] BuildDoChangeMemberAuthority(long partyId, int planetId, int userDbId, bool canInvite)
+    {
+        var p = new byte[17];
+        BitConverter.GetBytes(partyId).CopyTo(p, 0);
+        BitConverter.GetBytes(planetId).CopyTo(p, 8);
+        BitConverter.GetBytes(userDbId).CopyTo(p, 12);
+        p[16] = (byte)(canInvite ? 1 : 0);
+        return p;
+    }
+
+    /// <summary>
+    /// AS_DO_SET_LOOTING_METHOD (0x13A6), 0x21 frame bytes:
+    ///   [06] i64 PartyId  [0E] i32 Method  [12] i32 RareGrade  [16] i32 RareDistribution
+    ///   [1A] u8 EquipmentForDicing  [1B] u8 FindClassForDicing
+    ///   [1C] i32 BoundOnLootItemDistributionMethod  [20] u8 ForbidLootingInBattle
+    /// </summary>
+    public static byte[] BuildDoSetLootingMethod(long partyId, in LootSettings s)
+    {
+        var p = new byte[0x21 - 6];
+        BitConverter.GetBytes(partyId).CopyTo(p, 0x00);
+        BitConverter.GetBytes(s.Method).CopyTo(p, 0x08);
+        BitConverter.GetBytes(s.RareGradeForDicing).CopyTo(p, 0x0C);
+        BitConverter.GetBytes(s.RareItemDistributionMethod).CopyTo(p, 0x10);
+        p[0x14] = (byte)(s.EquipmentForDicing ? 1 : 0);
+        p[0x15] = (byte)(s.FindClassForDicing ? 1 : 0);
+        BitConverter.GetBytes(s.BoundOnLootItemDistributionMethod).CopyTo(p, 0x16);
+        p[0x1A] = (byte)(s.ForbidLootingInBattle ? 1 : 0);
+        return p;
+    }
+
+    /// <summary>AS_DO_SET_PARTY_OWNER (0x13A7): [i64 PartyId][i32 OwnerPlanetId].</summary>
+    public static byte[] BuildDoSetPartyOwner(long partyId, int ownerPlanetId)
+    {
+        var p = new byte[12];
+        BitConverter.GetBytes(partyId).CopyTo(p, 0);
+        BitConverter.GetBytes(ownerPlanetId).CopyTo(p, 8);
+        return p;
+    }
+
+    /// <summary>AS_DISMISS_PARTY (0x13BA): [i64 UserPDId][i32 PartyMemberCount].
+    /// A request, not a mirror - World runs the vote and answers with SA_DISMISS_PARTY.</summary>
+    public static byte[] BuildAsDismissParty(int planetId, int userDbId, int onlineMemberCount)
+    {
+        var p = new byte[12];
+        BitConverter.GetBytes(PackPDId(planetId, userDbId)).CopyTo(p, 0);
+        BitConverter.GetBytes(onlineMemberCount).CopyTo(p, 8);
+        return p;
+    }
+
+    /// <summary>AS_PARTY_LOOTING_METHOD (0x13BB): [i64 UserPDId] + the seven loot fields +
+    /// [i32 PartyMemberCount]. Also a request; World answers SA_CHANGE_LOOTING_METHOD.</summary>
+    public static byte[] BuildAsPartyLootingMethod(int planetId, int userDbId, in LootSettings s, int onlineMemberCount)
+    {
+        var p = new byte[0x25 - 6];
+        BitConverter.GetBytes(PackPDId(planetId, userDbId)).CopyTo(p, 0x00);
+        BitConverter.GetBytes(s.Method).CopyTo(p, 0x08);
+        BitConverter.GetBytes(s.RareGradeForDicing).CopyTo(p, 0x0C);
+        BitConverter.GetBytes(s.RareItemDistributionMethod).CopyTo(p, 0x10);
+        p[0x14] = (byte)(s.EquipmentForDicing ? 1 : 0);
+        p[0x15] = (byte)(s.FindClassForDicing ? 1 : 0);
+        BitConverter.GetBytes(s.BoundOnLootItemDistributionMethod).CopyTo(p, 0x16);
+        p[0x1A] = (byte)(s.ForbidLootingInBattle ? 1 : 0);
+        BitConverter.GetBytes(onlineMemberCount).CopyTo(p, 0x1B);
+        return p;
+    }
+
+    /// <summary>AS_BAN_PARTY_MEMBER (0x13BC):
+    /// [i64 UserPDId][i32 BanUserPlanetId][i32 BanUserDbId][i32 PartyMemberCount].</summary>
+    public static byte[] BuildAsBanPartyMember(int planetId, int userDbId, int banPlanetId, int banDbId, int onlineMemberCount)
+    {
+        var p = new byte[20];
+        BitConverter.GetBytes(PackPDId(planetId, userDbId)).CopyTo(p, 0);
+        BitConverter.GetBytes(banPlanetId).CopyTo(p, 8);
+        BitConverter.GetBytes(banDbId).CopyTo(p, 12);
+        BitConverter.GetBytes(onlineMemberCount).CopyTo(p, 16);
+        return p;
+    }
+
+    // ---------------------------------- W -> A parsers ----------------------------------
+    // Every parser takes the PAYLOAD (frame minus the 6-byte header) and returns null when it
+    // is shorter than MinFrameLength(op) - 6.
+
+    private static bool TooShort(ushort op, byte[] payload) => payload.Length < MinFrameLength(op) - 6;
+
+    public readonly record struct SaJoinParty(
+        int OwnerPlanetId, int MemberPlanetId, int MemberDbId, int InviteePlanetId, int InviteeDbId,
+        ulong InviteeGameId, int InviteeLevel, int InviteeClass, int InviteeRace, int InviteeGender,
+        int InviteeRole, bool Alive, bool Online, int AchievementGrade, int AwakenGrade,
+        long PartyId, int PartyType, bool IsAnonymous, bool Raid, int MaxMemberCount);
+
+    /// <summary>SA_JOIN_PARTY (0x1395), fixed frame 0x56. Handler FUN_140727b90 (Arb_part_062.c:8300).</summary>
+    public static SaJoinParty? ParseSaJoinParty(byte[] p)
+    {
+        if (TooShort(SA_JOIN_PARTY, p)) return null;
+        return new SaJoinParty(
+            BitConverter.ToInt32(p, 0x04), BitConverter.ToInt32(p, 0x08), BitConverter.ToInt32(p, 0x0C),
+            BitConverter.ToInt32(p, 0x10), BitConverter.ToInt32(p, 0x14), BitConverter.ToUInt64(p, 0x18),
+            BitConverter.ToInt32(p, 0x20), BitConverter.ToInt32(p, 0x24), BitConverter.ToInt32(p, 0x28),
+            BitConverter.ToInt32(p, 0x2C), BitConverter.ToInt32(p, 0x30),
+            p[0x34] != 0, p[0x35] != 0,
+            BitConverter.ToInt32(p, 0x36), BitConverter.ToInt32(p, 0x3A),
+            BitConverter.ToInt64(p, 0x3E), BitConverter.ToInt32(p, 0x46),
+            p[0x4A] != 0, p[0x4B] != 0, BitConverter.ToInt32(p, 0x4C));
+    }
+
+    public readonly record struct SaLeaveParty(int OwnerPlanetId, long PartyId, int MemberPlanetId, int MemberDbId);
+
+    /// <summary>SA_LEAVE_PARTY (0x1396): [i32 OwnerPlanetId][i64 PartyId][i32 PlanetId][i32 UserDbId].</summary>
+    public static SaLeaveParty? ParseSaLeaveParty(byte[] p)
+    {
+        if (TooShort(SA_LEAVE_PARTY, p)) return null;
+        return new SaLeaveParty(BitConverter.ToInt32(p, 0), BitConverter.ToInt64(p, 4),
+            BitConverter.ToInt32(p, 12), BitConverter.ToInt32(p, 16));
+    }
+
+    public readonly record struct SaPartyActor(int OwnerPlanetId, int MemberPlanetId, int MemberDbId);
+
+    /// <summary>SA_DISMISS_PARTY (0x1397): [i32 OwnerPlanetId][i32 PlanetId][i32 UserDbId].
+    /// The same three-int prefix opens 0x1398 / 0x1399 / 0x139A / 0x139B / 0x139D.</summary>
+    public static SaPartyActor? ParseSaPartyActor(ushort op, byte[] p)
+    {
+        if (TooShort(op, p)) return null;
+        return new SaPartyActor(BitConverter.ToInt32(p, 0), BitConverter.ToInt32(p, 4), BitConverter.ToInt32(p, 8));
+    }
+
+    public readonly record struct SaKickParty(
+        int OwnerPlanetId, int MemberPlanetId, int MemberDbId,
+        int TargetPlanetId, int TargetDbId, int AgreeCount, bool ByPlayer);
+
+    /// <summary>SA_KICK_PARTY (0x1398), fixed frame 0x1F.</summary>
+    public static SaKickParty? ParseSaKickParty(byte[] p)
+    {
+        if (TooShort(SA_KICK_PARTY, p)) return null;
+        return new SaKickParty(
+            BitConverter.ToInt32(p, 0), BitConverter.ToInt32(p, 4), BitConverter.ToInt32(p, 8),
+            BitConverter.ToInt32(p, 12), BitConverter.ToInt32(p, 16), BitConverter.ToInt32(p, 20), p[24] != 0);
+    }
+
+    public readonly record struct SaExtendParty(int OwnerPlanetId, int MemberPlanetId, int MemberDbId, bool PartyToRaid);
+
+    /// <summary>SA_EXTEND_PARTY (0x1399), fixed frame 0x13.</summary>
+    public static SaExtendParty? ParseSaExtendParty(byte[] p)
+    {
+        if (TooShort(SA_EXTEND_PARTY, p)) return null;
+        return new SaExtendParty(BitConverter.ToInt32(p, 0), BitConverter.ToInt32(p, 4),
+            BitConverter.ToInt32(p, 8), p[12] != 0);
+    }
+
+    public readonly record struct SaSwapParty(int OwnerPlanetId, int MemberPlanetId, int MemberDbId, int Slot1, int Slot2);
+
+    /// <summary>SA_SWAP_PARTY (0x139A), fixed frame 0x1A.</summary>
+    public static SaSwapParty? ParseSaSwapParty(byte[] p)
+    {
+        if (TooShort(SA_SWAP_PARTY, p)) return null;
+        return new SaSwapParty(BitConverter.ToInt32(p, 0), BitConverter.ToInt32(p, 4),
+            BitConverter.ToInt32(p, 8), BitConverter.ToInt32(p, 12), BitConverter.ToInt32(p, 16));
+    }
+
+    public readonly record struct SaChangeManager(int OwnerPlanetId, int MemberPlanetId, int MemberDbId, int NewManagerPlanetId, int NewManagerDbId);
+
+    /// <summary>SA_CHANGE_PARTY_MANAGER (0x139B), fixed frame 0x1A.</summary>
+    public static SaChangeManager? ParseSaChangeManager(byte[] p)
+    {
+        if (TooShort(SA_CHANGE_PARTY_MANAGER, p)) return null;
+        return new SaChangeManager(BitConverter.ToInt32(p, 0), BitConverter.ToInt32(p, 4),
+            BitConverter.ToInt32(p, 8), BitConverter.ToInt32(p, 12), BitConverter.ToInt32(p, 16));
+    }
+
+    public readonly record struct SaChangeAuthority(int OwnerPlanetId, int ManagerPlanetId, int ManagerDbId, int MemberPlanetId, int MemberDbId, bool CanInvite);
+
+    /// <summary>SA_CHANGE_PARTY_MEMBER_AUTHORITY (0x139C), fixed frame 0x1B.</summary>
+    public static SaChangeAuthority? ParseSaChangeAuthority(byte[] p)
+    {
+        if (TooShort(SA_CHANGE_PARTY_MEMBER_AUTHORITY, p)) return null;
+        return new SaChangeAuthority(BitConverter.ToInt32(p, 0), BitConverter.ToInt32(p, 4),
+            BitConverter.ToInt32(p, 8), BitConverter.ToInt32(p, 12), BitConverter.ToInt32(p, 16), p[20] != 0);
+    }
+
+    public readonly record struct SaChangeLooting(int OwnerPlanetId, int MemberPlanetId, int MemberDbId, LootSettings Loot);
+
+    /// <summary>SA_CHANGE_LOOTING_METHOD (0x139D), fixed frame 0x25. The .def is missing
+    /// BoundOnLootItemDistributionMethod at frame+0x20.</summary>
+    public static SaChangeLooting? ParseSaChangeLooting(byte[] p)
+    {
+        if (TooShort(SA_CHANGE_LOOTING_METHOD, p)) return null;
+        return new SaChangeLooting(
+            BitConverter.ToInt32(p, 0), BitConverter.ToInt32(p, 4), BitConverter.ToInt32(p, 8),
+            new LootSettings(
+                BitConverter.ToInt32(p, 12), BitConverter.ToInt32(p, 16), BitConverter.ToInt32(p, 20),
+                p[24] != 0, p[25] != 0, BitConverter.ToInt32(p, 26), p[30] != 0));
+    }
+
+    public readonly record struct SaBypassToGroup(int GroupType, long GroupId, int ObjectPlanetId, int ObjectId, byte[] Packet);
+
+    /// <summary>
+    /// SA_BYPASS_TO_GROUP (0x13F8), fixed frame 0x22 - World asking the ARBITER to fan a client
+    /// packet out to a party. Handler FUN_140721360 (Arb_part_062.c:3820) ->
+    /// PartyManager::BroadcastPacketToParty. TeraSharp ignores this opcode today, so a party
+    /// would silently receive nothing.
+    ///   [06] u32 PacketOffset (frame-rel)  [0A] u32 PacketLength  [0E] i32 GroupType
+    ///   [12] i64 GroupId  [1A] i32 ObjectPlanetId  [1E] i32 ObjectId  then the raw client packet
+    /// </summary>
+    public static SaBypassToGroup? ParseSaBypassToGroup(byte[] p)
+    {
+        if (TooShort(SA_BYPASS_TO_GROUP, p)) return null;
+        int start = (int)BitConverter.ToUInt32(p, 0) - 6;       // frame-relative -> payload
+        int len = (int)BitConverter.ToUInt32(p, 4);
+        if (start < 0 || len < 0 || start + len > p.Length) return null;
+        var pkt = new byte[len];
+        Array.Copy(p, start, pkt, 0, len);
+        return new SaBypassToGroup(BitConverter.ToInt32(p, 8), BitConverter.ToInt64(p, 12),
+            BitConverter.ToInt32(p, 20), BitConverter.ToInt32(p, 24), pkt);
+    }
+
+    // ------------------------------- client -> Arbiter parsers -------------------------------
+    // Hand-written rather than .def-driven: C_REPLY_INTER_PARTY_MAKE.1.def is missing its
+    // trailing bool, and the opcode= comments in every MASTER_FINAL .def are from another
+    // build. Each takes the client packet BODY (frame minus the 4-byte [len][opcode] header),
+    // which is what PacketDispatcher hands a handler.
+
+    /// <summary>C_APPLY_PARTY (0xA889): [i32 playerId]. Handler FUN_1404db920 needs len &gt;= 8.</summary>
+    public static int? ParseCApplyParty(byte[] body)
+        => body.Length < 4 ? null : BitConverter.ToInt32(body, 0);
+
+    /// <summary>C_REQUEST_PARTY_INFO (0xFD35): [i32 playerId]. Handler FUN_1404e9b50 needs len &gt;= 8.</summary>
+    public static int? ParseCRequestPartyInfo(byte[] body)
+        => body.Length < 4 ? null : BitConverter.ToInt32(body, 0);
+
+    /// <summary>C_BAN_PARTY_MEMBER (0x59C1): [u32 serverId][u32 playerId]. Handler needs len &gt;= 0xC.</summary>
+    public static (uint serverId, uint playerId)? ParseCBanPartyMember(byte[] body)
+        => body.Length < 8 ? null : (BitConverter.ToUInt32(body, 0), BitConverter.ToUInt32(body, 4));
+
+    /// <summary>
+    /// C_REPLY_INTER_PARTY_MAKE (0xBD04): [i32 partyMakingId][u8 accept].
+    /// Handler FUN_1404e5b30 (Arb_part_041.c:6228) needs len &gt;= 9 and reads body+0 and body+4;
+    /// the shipped .def stops after partyMakingId and is WRONG.
+    /// </summary>
+    public static (int partyMakingId, bool accept)? ParseCReplyInterPartyMake(byte[] body)
+        => body.Length < 5 ? null : (BitConverter.ToInt32(body, 0), body[4] != 0);
+
+    /// <summary>C_MERGE_PARTY_TO_RAID (0xB8D0): [i64 partyId][u8 accept]. Handler needs len &gt;= 0xD.</summary>
+    public static (long partyId, bool accept)? ParseCMergePartyToRaid(byte[] body)
+        => body.Length < 9 ? null : (BitConverter.ToInt64(body, 0), body[8] != 0);
+
+    /// <summary>
+    /// C_PARTY_LOOTING_METHOD (0x5D24): the seven loot fields, same order as the .def and as
+    /// S_PARTY_LOOTING_METHOD. Handler FUN_1404e40a0 needs len &gt;= 0x17 and reads body+0, +4,
+    /// +8, +0xC, +0xD, +0xE, +0x12.
+    /// </summary>
+    public static LootSettings? ParseCPartyLootingMethod(byte[] body)
+    {
+        if (body.Length < 0x13) return null;
+        return new LootSettings(
+            BitConverter.ToInt32(body, 0x00), BitConverter.ToInt32(body, 0x04), BitConverter.ToInt32(body, 0x08),
+            body[0x0C] != 0, body[0x0D] != 0, BitConverter.ToInt32(body, 0x0E), body[0x12] != 0);
+    }
+
+    /// <summary>The body of S_PARTY_LOOTING_METHOD (0x63C0) - the same seven fields, no ref
+    /// block (writer Arb_part_067.c:5317 emits u32,u32,u32,u8,u8,u32,u8 straight).</summary>
+    public static byte[] BuildSPartyLootingMethodBody(in LootSettings s)
+    {
+        var b = new byte[0x13];
+        BitConverter.GetBytes(s.Method).CopyTo(b, 0x00);
+        BitConverter.GetBytes(s.RareGradeForDicing).CopyTo(b, 0x04);
+        BitConverter.GetBytes(s.RareItemDistributionMethod).CopyTo(b, 0x08);
+        b[0x0C] = (byte)(s.EquipmentForDicing ? 1 : 0);
+        b[0x0D] = (byte)(s.FindClassForDicing ? 1 : 0);
+        BitConverter.GetBytes(s.BoundOnLootItemDistributionMethod).CopyTo(b, 0x0E);
+        b[0x12] = (byte)(s.ForbidLootingInBattle ? 1 : 0);
+        return b;
+    }
+}
+
+// ===========================================================================================
+// T29 — the two handshake lists, rebuilt from the Datasheet XMLs. Research: status/HANDSHAKE-DATA.md.
+//
+// Both lists were hardcoded from captures. Both turn out to be exactly reproducible - set AND
+// order, zero delta - from Executable\Datasheet:
+//
+//   98 dungeon ids (the 0x1581 AS_DUNGEON_TIMELINE_ON_OFF burst)
+//       = (DungeonData_<id>.xml INTERSECT ContinentData.xml)
+//         MINUS DungeonMatching.xml                       (those go to the dungeon WorldServers)
+//         INTERSECT DungeonConstraint.xml[isActive=true]  (the content switch)
+//       ascending. The intermediate 173 is independently observable as
+//       SA_WORLD_SERVER_STATUS (0x164D)'s InstanceList.
+//
+//   17 politics unit ids (the 0x1559 AS_POLITICS_UNIT_INFO reply)
+//       = PoliticsData.xml <PoliticsUnit politicsUnitId="..."/>, ascending.
+//       PolicyDataSheet::Load (Arb_part_009.c:1702) -> GetPoliticsUnitIdList (Arb_part_008.c:13003).
+//
+// NOT wired into startup: reading the sheets means depending on a folder that belongs to the
+// WorldServer install and is not in ship.ps1's payload, and the fallback list is byte-identical.
+// The captured lists below are both the fallback and the regression target - the tests assert
+// the sheets still reproduce them, so a changed sheet is caught instead of silently shipping a
+// stale reply. HANDSHAKE-DATA.md section 6 has the exact wiring if the human wants it.
+//
+// The 98 ids are ALSO not really an Arbiter-computed list: the real Arbiter echoes them back
+// one at a time from World's DSA_DUNGEON_TIMELINE_OPEN_INFO (0x13F2). See HANDSHAKE-DATA.md
+// section 0 and the recommended handler in section 6(a).
+// ===========================================================================================
+public static class HandshakeData
+{
+    /// <summary>Where Executable\Datasheet lives. TERASHARP_DATASHEET wins; then
+    /// &lt;TERASHARP_DATA&gt;\Executable\Datasheet; then the dev-box default.</summary>
+    public static string DatasheetDirectory()
+    {
+        var explicitDir = Environment.GetEnvironmentVariable("TERASHARP_DATASHEET");
+        if (!string.IsNullOrEmpty(explicitDir)) return explicitDir;
+        var root = Environment.GetEnvironmentVariable("TERASHARP_DATA") ?? @"D:\v100\TERA_SERVER.100";
+        return Path.Combine(root, "Executable", "Datasheet");
+    }
+
+    /// <summary>
+    /// The 98 dungeon ids, from the four sheets. Null when the directory or any required sheet
+    /// is missing, so a deployment without the Datasheet folder falls back to the captured list
+    /// instead of failing.
+    /// </summary>
+    public static int[]? LoadDungeonTimelineIds(string datasheetDir)
+    {
+        if (string.IsNullOrEmpty(datasheetDir) || !Directory.Exists(datasheetDir)) return null;
+
+        var templates = new HashSet<int>();
+        const string prefix = "DungeonData_";
+        foreach (var f in Directory.EnumerateFiles(datasheetDir, prefix + "*.xml"))
+        {
+            var stem = Path.GetFileNameWithoutExtension(f);
+            if (stem.Length > prefix.Length && int.TryParse(stem.Substring(prefix.Length), out int id))
+                templates.Add(id);
+        }
+        if (templates.Count == 0) return null;
+
+        var continents = ReadIds(datasheetDir, "ContinentData.xml", "Continent", "id");
+        var matching = ReadIds(datasheetDir, "DungeonMatching.xml", "Dungeon", "id");
+        var active = ReadActiveConstraints(datasheetDir);
+        if (continents == null || matching == null || active == null) return null;
+
+        templates.IntersectWith(continents);
+        templates.ExceptWith(matching);
+        templates.IntersectWith(active);
+        var ids = templates.ToArray();
+        Array.Sort(ids);                 // World iterates a std::map<int,...>, so ascending
+        return ids;
+    }
+
+    /// <summary>
+    /// The intermediate set: every dungeon world 0 actually serves, i.e. the sheets minus the
+    /// ones the dedicated dungeon WorldServers own. Observable on the wire as
+    /// SA_WORLD_SERVER_STATUS (0x164D)'s InstanceList - 173 entries in every capture - which is
+    /// what makes the four-sheet rule checkable rather than fitted.
+    /// </summary>
+    public static int[]? LoadWorldInstanceIds(string datasheetDir)
+    {
+        if (string.IsNullOrEmpty(datasheetDir) || !Directory.Exists(datasheetDir)) return null;
+        var templates = new HashSet<int>();
+        const string prefix = "DungeonData_";
+        foreach (var f in Directory.EnumerateFiles(datasheetDir, prefix + "*.xml"))
+        {
+            var stem = Path.GetFileNameWithoutExtension(f);
+            if (stem.Length > prefix.Length && int.TryParse(stem.Substring(prefix.Length), out int id))
+                templates.Add(id);
+        }
+        var continents = ReadIds(datasheetDir, "ContinentData.xml", "Continent", "id");
+        var matching = ReadIds(datasheetDir, "DungeonMatching.xml", "Dungeon", "id");
+        if (templates.Count == 0 || continents == null || matching == null) return null;
+        templates.IntersectWith(continents);
+        templates.ExceptWith(matching);
+        var ids = templates.ToArray();
+        Array.Sort(ids);
+        return ids;
+    }
+
+    /// <summary>The 17 politics unit ids from PoliticsData.xml, ascending. Null if absent.</summary>
+    public static int[]? LoadPoliticsUnitIds(string datasheetDir)
+    {
+        var set = ReadIds(datasheetDir, "PoliticsData.xml", "PoliticsUnit", "politicsUnitId");
+        if (set == null) return null;
+        var ids = set.ToArray();
+        Array.Sort(ids);
+        return ids;
+    }
+
+    /// <summary>
+    /// Every &lt;element attribute="N"&gt; in a sheet, with XML comments stripped first.
+    /// Stripping matters: DungeonConstraint.xml has 210 &lt;Constraint&gt; tokens and 41 of them
+    /// are commented out; keeping those produces the wrong set.
+    /// </summary>
+    private static HashSet<int>? ReadIds(string dir, string file, string element, string attribute)
+    {
+        var text = ReadSheet(dir, file);
+        if (text == null) return null;
+        var set = new HashSet<int>();
+        var rx = new Regex("<" + element + "\\b[^>]*\\b" + attribute + "=\"(\\d+)\"");
+        foreach (Match m in rx.Matches(text)) set.Add(int.Parse(m.Groups[1].Value));
+        return set;
+    }
+
+    /// <summary>continentIds of the DungeonConstraint.xml rows with isActive="true".</summary>
+    private static HashSet<int>? ReadActiveConstraints(string dir)
+    {
+        var text = ReadSheet(dir, "DungeonConstraint.xml");
+        if (text == null) return null;
+        var set = new HashSet<int>();
+        foreach (Match m in Regex.Matches(text, "<Constraint\\b([^>]*?)/?>"))
+        {
+            var attrs = m.Groups[1].Value;
+            var active = Regex.Match(attrs, "\\bisActive=\"([^\"]*)\"");
+            if (!active.Success || !active.Groups[1].Value.Equals("true", StringComparison.OrdinalIgnoreCase)) continue;
+            var cid = Regex.Match(attrs, "\\bcontinentId=\"(\\d+)\"");
+            if (cid.Success) set.Add(int.Parse(cid.Groups[1].Value));
+        }
+        return set;
+    }
+
+    private static string? ReadSheet(string dir, string file)
+    {
+        if (string.IsNullOrEmpty(dir)) return null;
+        var path = Path.Combine(dir, file);
+        if (!File.Exists(path)) return null;
+        try { return Regex.Replace(File.ReadAllText(path), "<!--.*?-->", string.Empty, RegexOptions.Singleline); }
+        catch (IOException) { return null; }
+    }
+
+    /// <summary>
+    /// The 98 ids as the real Arbiter sent them (lobby_tap.log seq 123-124, cap_newchar.log
+    /// seq 112-113). Identical to LoadDungeonTimelineIds(), order included; kept as the fallback
+    /// and as the regression target. Same values as DbProxyHandlers.PostHandshakeDungeonIds.
+    /// </summary>
+    public static readonly int[] CapturedDungeonTimelineIds =
+    {
+        0x834, 0x835, 0x836, 0x837, 0x839,
+        0x9C5, 0x9C6, 0x9C7, 0x9C8, 0x9E2,
+        0xBB9, 0xBBA, 0xBBB, 0xBBC, 0xBBD, 0xBBE, 0xBBF, 0xBC0, 0xBC1, 0xBC2, 0xBC3, 0xBC4,
+        0xBC8, 0xBCC, 0xBD0, 0xBD1, 0xBD4, 0xBD5, 0xBD7, 0xBD8, 0xBD9, 0xBDB, 0xBDD,
+        0xC20, 0xC84,
+        0x2327, 0x2329, 0x232A, 0x232B, 0x232D, 0x232F, 0x2330, 0x2332, 0x2333, 0x2334, 0x2335,
+        0x2336, 0x2339, 0x233A, 0x233B, 0x233C, 0x233D, 0x233E, 0x233F, 0x2344, 0x2347, 0x2348,
+        0x2349, 0x234C, 0x234D, 0x234E, 0x234F, 0x2350, 0x2351, 0x2352, 0x2356, 0x235B, 0x235C,
+        0x2365, 0x2366, 0x2367, 0x2368, 0x2369, 0x236D, 0x2372, 0x2382, 0x2383, 0x2384,
+        0x251F, 0x2521, 0x2522, 0x2523, 0x2524, 0x2525, 0x25D1,
+        0x2643, 0x264C, 0x2656, 0x265A, 0x265D, 0x265E, 0x265F, 0x2662, 0x2663, 0x2664, 0x2665,
+        0x2666, 0x2669,
+    };
+
+    /// <summary>The 17 ids in the captured 0x1559 reply (arb_world.log chunk 7,
+    /// [u32 off=14][u32 byteLen=68][int[17]]). Identical to LoadPoliticsUnitIds().</summary>
+    public static readonly int[] CapturedPoliticsUnitIds =
+    {
+        2, 3, 4, 5, 6, 7, 11, 12, 13, 14, 15, 18, 19, 20, 21, 22, 23,
+    };
 }

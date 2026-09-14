@@ -6575,6 +6575,385 @@ public bool TryHandle(WorldBridge bridge, WorldLink link, ushort op, byte[] payl
         Hex.Eq(b, Hex.B("EA 07 09 00  0D 00 05 00  33 00 2D 00  00 00 00 00"),
             "2026-09-13 05:51:45 encodes exactly as the capture has it");
         Hex.True(b.Length == 16, "16 bytes");
+    // ================= T28: the party packet layer (status/PARTY-DESIGN.md) =================
+    //
+    // No capture contains a party frame, so these are GOLDEN tests against the layouts in
+    // PARTY-DESIGN.md section 5 (from the decompiled writers and the .def files), not
+    // byte-exact tests against captured bytes. Steps 6-9 of the capture checklist in
+    // MULTIPLAYER-DESIGN.md section 8 are what would upgrade them.
+
+    static PartyPackets.PartyMember SampleMember(int dbId = 7, string name = "dob") => new(
+        PlanetId: PartyPackets.PlanetId, UserDbId: dbId, GameId: 0x80000AF00001UL,
+        Level: 65, Class: 12, Race: 4, Gender: 1, Role: -1, Name: name,
+        CanInvite: true, Alive: true, Online: true, AchievementGrade: 3, AwakenGrade: 1);
+
+    static readonly PartyPackets.LootSettings SampleLoot = new(
+        Method: 1, RareGradeForDicing: 4, RareItemDistributionMethod: 1,
+        EquipmentForDicing: true, FindClassForDicing: false,
+        BoundOnLootItemDistributionMethod: 1, ForbidLootingInBattle: true);
+
+    [Test] public static void Party_member_basic_info_is_0xA0_bytes_at_the_documented_offsets()
+    {
+        var b = PartyPackets.BuildMemberBasicInfo(SampleMember());
+        Hex.True(b.Length == PartyPackets.MemberBasicInfoSize,
+            $"PartyMemberBasicInfo is 0xA0 bytes, got 0x{b.Length:X}");
+
+        Hex.True(BitConverter.ToInt32(b, 0x00) == PartyPackets.PlanetId, "+0x00 PlanetId");
+        Hex.True(BitConverter.ToInt32(b, 0x04) == 7, "+0x04 UserDbId");
+        Hex.True(BitConverter.ToUInt64(b, 0x08) == 0x80000AF00001UL, "+0x08 GameId");
+        Hex.True(BitConverter.ToInt32(b, 0x10) == 65, "+0x10 Level");
+        Hex.True(BitConverter.ToInt32(b, 0x14) == 12, "+0x14 Class");
+        Hex.True(BitConverter.ToInt32(b, 0x18) == 4,  "+0x18 Race");
+        Hex.True(BitConverter.ToInt32(b, 0x1C) == 1,  "+0x1C Gender");
+        Hex.True(BitConverter.ToInt32(b, 0x20) == -1, "+0x20 Role defaults to -1");
+        Hex.Eq(b[0x24..0x2A], "64 00 6F 00 62 00", "+0x24 Name is UTF-16LE, NUL-terminated");
+        Hex.True(b[0x6E] == 1 && b[0x6F] == 1 && b[0x70] == 1, "+0x6E/6F/70 canInvite/alive/online");
+        Hex.True(BitConverter.ToInt32(b, 0x74) == 3 && BitConverter.ToInt32(b, 0x78) == 1,
+            "+0x74/+0x78 achievement/awaken grade");
+
+        // The top bit of GameId is masked off on the wire (User+0x5718 & 0x7FFF...).
+        var masked = PartyPackets.BuildMemberBasicInfo(SampleMember() with { GameId = 0xFFFFFFFFFFFFFFFFUL });
+        Hex.True(BitConverter.ToUInt64(masked, 0x08) == 0x7FFFFFFFFFFFFFFFUL, "GameId is masked");
+    }
+
+    [Test] public static void Party_member_basic_info_round_trips()
+    {
+        var m = SampleMember(42, "Testtwo");
+        var back = PartyPackets.ParseMemberBasicInfo(PartyPackets.BuildMemberBasicInfo(m), 0);
+        Hex.True(back != null && back.Value == m, $"round trip: {back}");
+        Hex.True(PartyPackets.ParseMemberBasicInfo(new byte[0x9F], 0) == null, "a short record parses to null");
+
+        // The name field is 0x25 wchars including the terminator, so 0x24 characters survive.
+        var longName = new string('x', 60);
+        var wide = PartyPackets.ParseMemberBasicInfo(
+            PartyPackets.BuildMemberBasicInfo(SampleMember() with { Name = longName }), 0);
+        Hex.True(wide != null && wide.Value.Name.Length == 0x24, $"name truncates to 0x24 chars, got {wide?.Name.Length}");
+    }
+
+    [Test] public static void Party_PDId_packs_planet_low_and_dbid_high()
+    {
+        long p = PartyPackets.PackPDId(2800, 7);
+        Hex.Eq(BitConverter.GetBytes(p), "F0 0A 00 00 07 00 00 00", "UserPDId = [planetId][userDbId]");
+        var (planet, db) = PartyPackets.UnpackPDId(p);
+        Hex.True(planet == 2800 && db == 7, $"unpack -> ({planet}, {db})");
+    }
+
+    [Test] public static void Party_AS_DO_CREATE_PARTY_matches_the_writer_layout()
+    {
+        var members = new List<PartyPackets.PartyMember> { SampleMember(7, "dob"), SampleMember(8, "Test") };
+        var p = PartyPackets.BuildDoCreateParty(
+            partyId: 0x0AF0000100000001L, ownerPlanetId: 2800, managerPlanetId: 2800, managerDbId: 7,
+            maxMemberCount: 5, partyType: -1, dungeonClearCompensation: false, dungeonId: 0,
+            raid: false, teamIndex: 0, battleFieldId: 0, members: members);
+
+        // Fixed part is 0x38 FRAME bytes = 0x32 payload bytes, then N x 0xA0.
+        Hex.True(p.Length == 0x32 + 2 * PartyPackets.MemberBasicInfoSize,
+            $"0x139E is 0x32 + N*0xA0, got {p.Length}");
+        Hex.True(BitConverter.ToUInt32(p, 0x00) == 0x38, "+06 memberList offset is frame-relative 0x38");
+        Hex.True(BitConverter.ToUInt32(p, 0x04) == 2, "+0A memberList count");
+        Hex.True(BitConverter.ToInt64(p, 0x08) == 0x0AF0000100000001L, "+0E PartyId");
+        Hex.True(BitConverter.ToInt32(p, 0x10) == 2800 && BitConverter.ToInt32(p, 0x14) == 2800,
+            "+16/+1A owner and manager planet");
+        Hex.True(BitConverter.ToInt32(p, 0x18) == 7, "+1E ManagerDbId");
+        Hex.True(BitConverter.ToInt32(p, 0x1C) == 5, "+22 MaxMemberCount");
+        Hex.True(BitConverter.ToInt32(p, 0x20) == -1, "+26 PartyType");
+        Hex.True(p[0x24] == 0, "+2A DungeonClearCompensation - missing from the .def");
+        Hex.True(BitConverter.ToInt32(p, 0x25) == 0, "+2B DungeonId");
+        Hex.True(p[0x29] == 0, "+2F Raid");
+        Hex.True(BitConverter.ToInt32(p, 0x2A) == 0 && BitConverter.ToInt32(p, 0x2E) == 0,
+            "+30/+34 TeamIndex, BattleFieldId");
+
+        // The member blob is the raw records, back to back, at the offset the header names.
+        var second = PartyPackets.ParseMemberBasicInfo(p, 0x32 + PartyPackets.MemberBasicInfoSize);
+        Hex.True(second != null && second.Value.UserDbId == 8 && second.Value.Name == "Test",
+            "the second record is at fixedPart + 0xA0");
+    }
+
+    [Test] public static void Party_AS_DO_ADD_PARTY_MEMBER_matches_the_writer_layout()
+    {
+        var p = PartyPackets.BuildDoAddPartyMember(0x0AF0000100000001L, SampleMember(8, "Test"));
+        Hex.True(p.Length == 0x3D + ("Test".Length + 1) * 2, $"0x139F is 0x3D + name, got {p.Length}");
+        Hex.True(BitConverter.ToUInt32(p, 0x00) == 0x43, "+06 name offset is frame-relative 0x43");
+        Hex.True(BitConverter.ToInt64(p, 0x04) == 0x0AF0000100000001L, "+0A PartyId");
+        Hex.True(BitConverter.ToInt32(p, 0x0C) == 2800 && BitConverter.ToInt32(p, 0x10) == 8, "+12/+16 member PDId");
+        Hex.True(BitConverter.ToUInt64(p, 0x14) == 0x80000AF00001UL, "+1A GameId");
+        Hex.True(BitConverter.ToInt32(p, 0x1C) == 65, "+22 Level");
+        Hex.True(BitConverter.ToInt32(p, 0x2C) == -1, "+32 Role");
+        Hex.True(p[0x30] == 1, "+36 AuthorityAboutInvitation - missing from the .def");
+        Hex.True(p[0x31] == 1 && p[0x32] == 1, "+37/+38 Alive, Online");
+        Hex.True(BitConverter.ToInt32(p, 0x33) == 3 && BitConverter.ToInt32(p, 0x37) == 1, "+39/+3D grades");
+        Hex.True(p[0x3B] == 0, "+41 SupplementCompensation - missing from the .def");
+        Hex.True(p[0x3C] == 0, "+42 IsSoloMatching");
+        Hex.Eq(p[0x3D..], "54 00 65 00 73 00 74 00 00 00", "+43 the name, UTF-16LE and NUL-terminated");
+    }
+
+    [Test] public static void Party_AS_DO_SET_LOOTING_METHOD_carries_the_field_the_def_forgot()
+    {
+        var p = PartyPackets.BuildDoSetLootingMethod(0x0AF0000100000001L, SampleLoot);
+        Hex.True(p.Length == 0x21 - 6, $"0x13A6 is 0x21 frame bytes, got payload {p.Length}");
+        Hex.Eq(p, "01 00 00 00 01 00 F0 0A  01 00 00 00  04 00 00 00  01 00 00 00  01 00  01 00 00 00  01",
+            "0x13A6 payload");
+        // The seventh field only lands at +0x20 if BoundOnLootItemDistributionMethod is present
+        // at +0x1C; AS_DO_SET_LOOTING_METHOD.1.def omits it and would put ForbidLootingInBattle
+        // four bytes early.
+        Hex.True(BitConverter.ToInt32(p, 0x16) == 1, "+1C BoundOnLootItemDistributionMethod");
+        Hex.True(p[0x1A] == 1, "+20 ForbidLootingInBattle");
+    }
+
+    [Test] public static void Party_small_AS_DO_builders_are_the_documented_sizes()
+    {
+        const long id = 0x0AF0000100000001L;
+        Hex.Eq(PartyPackets.BuildDoRemovePartyMember(id, 2800, 8),
+            "01 00 00 00 01 00 F0 0A  F0 0A 00 00  08 00 00 00", "0x13A0");
+        Hex.Eq(PartyPackets.BuildDoDismissParty(id), "01 00 00 00 01 00 F0 0A", "0x13A1");
+        Hex.Eq(PartyPackets.BuildDoExtendParty(id, true), "01 00 00 00 01 00 F0 0A 01", "0x13A2");
+        Hex.Eq(PartyPackets.BuildDoSwapParty(id, 2, 3),
+            "01 00 00 00 01 00 F0 0A  02 00 00 00  03 00 00 00", "0x13A3");
+        Hex.Eq(PartyPackets.BuildDoSetPartyManager(id, 2800, 8),
+            PartyPackets.BuildDoRemovePartyMember(id, 2800, 8), "0x13A4 has 0x13A0's shape");
+        Hex.Eq(PartyPackets.BuildDoChangeMemberAuthority(id, 2800, 8, true),
+            "01 00 00 00 01 00 F0 0A  F0 0A 00 00  08 00 00 00  01", "0x13A5");
+        Hex.Eq(PartyPackets.BuildDoSetPartyOwner(id, 2800),
+            "01 00 00 00 01 00 F0 0A  F0 0A 00 00", "0x13A7");
+    }
+
+    [Test] public static void Party_client_driven_AS_requests_carry_the_member_count()
+    {
+        // These three are REQUESTS, not mirrors: World runs the vote and answers with the
+        // authoritative SA_. PartyMemberCount is what it runs the majority rule against.
+        Hex.Eq(PartyPackets.BuildAsDismissParty(2800, 7, 3),
+            "F0 0A 00 00 07 00 00 00  03 00 00 00", "0x13BA");
+        Hex.Eq(PartyPackets.BuildAsBanPartyMember(2800, 7, 2800, 8, 3),
+            "F0 0A 00 00 07 00 00 00  F0 0A 00 00  08 00 00 00  03 00 00 00", "0x13BC");
+
+        var loot = PartyPackets.BuildAsPartyLootingMethod(2800, 7, SampleLoot, 3);
+        Hex.True(loot.Length == 0x25 - 6, $"0x13BB is 0x25 frame bytes, got payload {loot.Length}");
+        Hex.True(BitConverter.ToInt64(loot, 0) == PartyPackets.PackPDId(2800, 7), "+06 UserPDId");
+        Hex.True(BitConverter.ToInt32(loot, 0x16) == 1, "+1C BoundOnLootItemDistributionMethod");
+        Hex.True(loot[0x1A] == 1, "+20 ForbidLootingInBattle");
+        Hex.True(BitConverter.ToInt32(loot, 0x1B) == 3, "+21 PartyMemberCount");
+    }
+
+    [Test] public static void Party_SA_parsers_reject_frames_shorter_than_the_real_handler_demands()
+    {
+        // A short SA_ frame is not a dropped packet on the real Arbiter: Handler_SA_JOIN_PARTY
+        // logs "Arbiter <-> World PDL Version Mismatch! Bye :(" and kills the link. Declining is
+        // the safe analogue - never invent zeros.
+        Hex.True(PartyPackets.MinFrameLength(PartyPackets.SA_JOIN_PARTY) == 0x56, "SA_JOIN_PARTY is 0x56");
+        Hex.True(PartyPackets.ParseSaJoinParty(new byte[0x56 - 6 - 1]) == null, "short 0x1395 -> null");
+        Hex.True(PartyPackets.ParseSaJoinParty(new byte[0x56 - 6]) != null, "exactly 0x56 -> parsed");
+        Hex.True(PartyPackets.ParseSaLeaveParty(new byte[0x1A - 6 - 1]) == null, "short 0x1396 -> null");
+        Hex.True(PartyPackets.ParseSaKickParty(new byte[0x1F - 6 - 1]) == null, "short 0x1398 -> null");
+        Hex.True(PartyPackets.ParseSaChangeLooting(new byte[0x25 - 6 - 1]) == null, "short 0x139D -> null");
+        Hex.True(PartyPackets.ParseSaBypassToGroup(new byte[0x22 - 6 - 1]) == null, "short 0x13F8 -> null");
+    }
+
+    [Test] public static void Party_SA_JOIN_PARTY_reads_the_documented_offsets()
+    {
+        // Written at FRAME offsets so the test reads like PARTY-DESIGN.md section 5.2.
+        var p = new byte[0x56 - 6];
+        void U32(int frameOff, int v) => BitConverter.GetBytes(v).CopyTo(p, frameOff - 6);
+        void U64(int frameOff, ulong v) => BitConverter.GetBytes(v).CopyTo(p, frameOff - 6);
+        U32(0x06, 2800); U32(0x0A, 2800); U32(0x0E, 7); U32(0x12, 2800); U32(0x16, 8);
+        U64(0x1E, 0x80000AF00002UL);
+        U32(0x26, 65); U32(0x2A, 12); U32(0x2E, 4); U32(0x32, 1); U32(0x36, -1);
+        p[0x3A - 6] = 1; p[0x3B - 6] = 1;
+        U32(0x3C, 3); U32(0x40, 1);
+        BitConverter.GetBytes(0x0AF0000100000001L).CopyTo(p, 0x44 - 6);
+        U32(0x4C, -1);
+        p[0x50 - 6] = 0; p[0x51 - 6] = 1;
+        U32(0x52, 30);
+
+        var j = PartyPackets.ParseSaJoinParty(p);
+        Hex.True(j != null, "0x1395 parsed");
+        var v = j!.Value;
+        Hex.True(v.OwnerPlanetId == 2800 && v.MemberDbId == 7 && v.InviteeDbId == 8, "PDIds");
+        Hex.True(v.InviteeGameId == 0x80000AF00002UL, "+1E InviteeGameId");
+        Hex.True(v.InviteeLevel == 65 && v.InviteeClass == 12 && v.InviteeRace == 4 && v.InviteeGender == 1,
+            "+26..+32 level/class/race/gender");
+        Hex.True(v.InviteeRole == -1 && v.Alive && v.Online, "+36/+3A/+3B role, alive, online");
+        Hex.True(v.PartyId == 0x0AF0000100000001L && v.PartyType == -1, "+44/+4C PartyId, PartyType");
+        Hex.True(!v.IsAnonymous && v.Raid && v.MaxMemberCount == 30, "+50/+51/+52 anonymous, raid, capacity");
+    }
+
+    [Test] public static void Party_SA_CHANGE_LOOTING_METHOD_reads_the_field_the_def_forgot()
+    {
+        var p = new byte[0x25 - 6];
+        BitConverter.GetBytes(2800).CopyTo(p, 0);      // OwnerPlanetId
+        BitConverter.GetBytes(2800).CopyTo(p, 4);
+        BitConverter.GetBytes(7).CopyTo(p, 8);
+        BitConverter.GetBytes(1).CopyTo(p, 12);        // frame+12 Method
+        BitConverter.GetBytes(4).CopyTo(p, 16);
+        BitConverter.GetBytes(1).CopyTo(p, 20);
+        p[24] = 1; p[25] = 0;
+        BitConverter.GetBytes(1).CopyTo(p, 26);        // frame+20 BoundOnLoot
+        p[30] = 1;                                     // frame+24 ForbidLootingInBattle
+
+        var c = PartyPackets.ParseSaChangeLooting(p);
+        Hex.True(c != null && c.Value.Loot == SampleLoot, $"0x139D -> {c?.Loot}");
+    }
+
+    [Test] public static void Party_SA_BYPASS_TO_GROUP_extracts_the_client_packet()
+    {
+        // World asking the ARBITER to fan a client packet out to a party. TeraSharp ignores
+        // 0x13F8 today, so a party would silently receive nothing.
+        var pkt = Hex.B("08 00 6B 7D 01 02 03 04");         // an 8-byte S_CHAT stand-in
+        var p = new byte[0x22 - 6 + pkt.Length];
+        BitConverter.GetBytes((uint)0x22).CopyTo(p, 0);     // packet offset, frame-relative
+        BitConverter.GetBytes((uint)pkt.Length).CopyTo(p, 4);
+        BitConverter.GetBytes(1).CopyTo(p, 8);              // GroupType
+        BitConverter.GetBytes(0x0AF0000100000001L).CopyTo(p, 12);
+        BitConverter.GetBytes(2800).CopyTo(p, 20);
+        BitConverter.GetBytes(7).CopyTo(p, 24);
+        pkt.CopyTo(p, 0x22 - 6);
+
+        var g = PartyPackets.ParseSaBypassToGroup(p);
+        Hex.True(g != null, "0x13F8 parsed");
+        Hex.True(g!.Value.GroupType == 1 && g.Value.GroupId == 0x0AF0000100000001L, "group type and id");
+        Hex.True(g.Value.ObjectPlanetId == 2800 && g.Value.ObjectId == 7, "originator PDId");
+        Hex.Eq(g.Value.Packet, pkt, "the raw client packet");
+
+        BitConverter.GetBytes((uint)9999).CopyTo(p, 4);     // a length past the end
+        Hex.True(PartyPackets.ParseSaBypassToGroup(p) == null, "an impossible packet length -> null");
+    }
+
+    [Test] public static void Party_client_packet_parsers_match_the_handler_minimums()
+    {
+        Hex.True(PartyPackets.ParseCApplyParty(Hex.B("07 00 00 00")) == 7, "C_APPLY_PARTY");
+        Hex.True(PartyPackets.ParseCApplyParty(new byte[3]) == null, "short C_APPLY_PARTY");
+        Hex.True(PartyPackets.ParseCRequestPartyInfo(Hex.B("08 00 00 00")) == 8, "C_REQUEST_PARTY_INFO");
+
+        var ban = PartyPackets.ParseCBanPartyMember(Hex.B("F0 0A 00 00 08 00 00 00"));
+        Hex.True(ban != null && ban.Value.serverId == 2800 && ban.Value.playerId == 8, "C_BAN_PARTY_MEMBER");
+        Hex.True(PartyPackets.ParseCBanPartyMember(new byte[7]) == null, "short C_BAN_PARTY_MEMBER");
+
+        // C_REPLY_INTER_PARTY_MAKE.1.def stops after partyMakingId, but Handler FUN_1404e5b30
+        // requires len >= 9 and reads body+4 as a bool. A .def-driven codec would drop it.
+        var reply = PartyPackets.ParseCReplyInterPartyMake(Hex.B("2A 00 00 00 01"));
+        Hex.True(reply != null && reply.Value.partyMakingId == 42 && reply.Value.accept,
+            "C_REPLY_INTER_PARTY_MAKE carries the trailing accept the .def omits");
+        Hex.True(PartyPackets.ParseCReplyInterPartyMake(Hex.B("2A 00 00 00")) == null,
+            "4 bytes is the .def's idea of the packet and is too short for the real handler");
+
+        var merge = PartyPackets.ParseCMergePartyToRaid(Hex.B("01 00 00 00 01 00 F0 0A 01"));
+        Hex.True(merge != null && merge.Value.partyId == 0x0AF0000100000001L && merge.Value.accept,
+            "C_MERGE_PARTY_TO_RAID");
+        Hex.True(PartyPackets.ParseCMergePartyToRaid(new byte[8]) == null, "short C_MERGE_PARTY_TO_RAID");
+    }
+
+    [Test] public static void Party_loot_settings_round_trip_through_the_client_packets()
+    {
+        var body = PartyPackets.BuildSPartyLootingMethodBody(SampleLoot);
+        Hex.Eq(body, "01 00 00 00  04 00 00 00  01 00 00 00  01 00  01 00 00 00  01",
+            "S_PARTY_LOOTING_METHOD body - seven fields, no ref block");
+        var back = PartyPackets.ParseCPartyLootingMethod(body);
+        Hex.True(back != null && back.Value == SampleLoot,
+            "C_PARTY_LOOTING_METHOD and S_PARTY_LOOTING_METHOD are the same seven fields in the same order");
+        Hex.True(PartyPackets.ParseCPartyLootingMethod(new byte[0x12]) == null, "short C_PARTY_LOOTING_METHOD");
+    }
+
+    [Test] public static void Party_capacities_are_5_and_30()
+    {
+        // Party::Party: `uVar2 = 5; if (raid) uVar2 = 0x1e;`  and the member table is 30 slots.
+        Hex.True(PartyPackets.MaxPartyMembers == 5, "a party holds 5");
+        Hex.True(PartyPackets.MaxRaidMembers == 30, "a raid holds 30, which is also the table size");
+    }
+
+    // ================= T29: the handshake lists from the datasheets (status/HANDSHAKE-DATA.md) =================
+
+    /// <summary>
+    /// Executable\Datasheet, or null with a printed note. Walks up from the test binary the way
+    /// FindRepoFile does, then falls back to HandshakeData.DatasheetDirectory().
+    /// </summary>
+    static string? FindDatasheetDirOrSkip()
+    {
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        for (int i = 0; i < 10 && dir != null; i++, dir = dir.Parent)
+        {
+            var candidate = Path.Combine(dir.FullName, "Executable", "Datasheet");
+            if (Directory.Exists(candidate)) return candidate;
+        }
+        var configured = HandshakeData.DatasheetDirectory();
+        if (Directory.Exists(configured)) return configured;
+        Console.WriteLine("        (skipped: Executable\\Datasheet not found)");
+        return null;
+    }
+
+    [Test] public static void Handshake_datasheets_reproduce_the_98_dungeon_timeline_ids()
+    {
+        var dir = FindDatasheetDirOrSkip();
+        if (dir == null) return;
+
+        var ids = HandshakeData.LoadDungeonTimelineIds(dir);
+        Hex.True(ids != null, "the four sheets must be readable");
+        Hex.True(ids!.Length == HandshakeData.CapturedDungeonTimelineIds.Length,
+            $"98 ids expected, sheets produced {ids.Length}");
+        Hex.True(ids.SequenceEqual(HandshakeData.CapturedDungeonTimelineIds),
+            "(DungeonData n ContinentData) - DungeonMatching n Constraint[isActive] == the captured 0x1581 ids, "
+            + "in order. A mismatch means a sheet changed - check the delta before touching the captured list.");
+    }
+
+    [Test] public static void Handshake_datasheets_reproduce_the_17_politics_unit_ids()
+    {
+        var dir = FindDatasheetDirOrSkip();
+        if (dir == null) return;
+
+        var ids = HandshakeData.LoadPoliticsUnitIds(dir);
+        Hex.True(ids != null, "PoliticsData.xml must be readable");
+        Hex.True(ids!.SequenceEqual(HandshakeData.CapturedPoliticsUnitIds),
+            "PoliticsData.xml politicsUnitIds == the captured 0x1559 reply (arb_world.log chunk 7)");
+    }
+
+    [Test] public static void Handshake_intermediate_set_is_the_173_world_instances()
+    {
+        var dir = FindDatasheetDirOrSkip();
+        if (dir == null) return;
+
+        // This is the check that makes the four-sheet rule verifiable rather than fitted: the
+        // intermediate (sheets n continents) - matching is independently observable on the wire
+        // as SA_WORLD_SERVER_STATUS (0x164D)'s InstanceList, 173 entries in every capture.
+        var instances = HandshakeData.LoadWorldInstanceIds(dir);
+        Hex.True(instances != null && instances.Length == 173,
+            $"world 0 serves 173 instances, got {instances?.Length}");
+        Hex.True(HandshakeData.CapturedDungeonTimelineIds.All(instances!.Contains),
+            "every open dungeon is one world 0 actually serves");
+    }
+
+    [Test] public static void Handshake_commented_out_constraints_are_not_counted()
+    {
+        var dir = FindDatasheetDirOrSkip();
+        if (dir == null) return;
+
+        // DungeonConstraint.xml has 210 <Constraint tokens; 41 sit inside <!-- -->. Counting
+        // those produces the wrong set, so the loader strips comments first.
+        var text = File.ReadAllText(Path.Combine(dir, "DungeonConstraint.xml"));
+        int all = System.Text.RegularExpressions.Regex.Matches(text, "<Constraint\\b").Count;
+        var live = System.Text.RegularExpressions.Regex.Replace(
+            text, "<!--.*?-->", string.Empty, System.Text.RegularExpressions.RegexOptions.Singleline);
+        int uncommented = System.Text.RegularExpressions.Regex.Matches(live, "<Constraint\\b").Count;
+        Hex.True(uncommented < all,
+            $"the sheet really does have commented-out rows ({all} total, {uncommented} live) - "
+            + "if this ever stops being true the comment-stripping is untested, not unnecessary");
+    }
+
+    [Test] public static void Handshake_missing_datasheet_directory_yields_null_not_an_exception()
+    {
+        var nowhere = Path.Combine(Path.GetTempPath(), "terasharp-no-such-datasheet-dir");
+        Hex.True(HandshakeData.LoadDungeonTimelineIds(nowhere) == null, "missing dir -> null");
+        Hex.True(HandshakeData.LoadPoliticsUnitIds(nowhere) == null, "missing dir -> null");
+        Hex.True(HandshakeData.LoadWorldInstanceIds(nowhere) == null, "missing dir -> null");
+        Hex.True(HandshakeData.LoadDungeonTimelineIds("") == null, "empty dir -> null");
+    }
+
+    [Test] public static void Handshake_captured_list_still_matches_the_one_OnWorldReady_sends()
+    {
+        // HandshakeData.CapturedDungeonTimelineIds is the regression target; the burst is sent
+        // from DbProxyHandlers.PostHandshakeDungeonIds. The two must not drift.
+        Hex.True(DbProxyHandlers.PostHandshakeDungeonIds.Length == HandshakeData.CapturedDungeonTimelineIds.Length,
+            $"{DbProxyHandlers.PostHandshakeDungeonIds.Length} vs {HandshakeData.CapturedDungeonTimelineIds.Length}");
+        Hex.True(DbProxyHandlers.PostHandshakeDungeonIds
+                .Select(x => (int)x).SequenceEqual(HandshakeData.CapturedDungeonTimelineIds),
+            "PostHandshakeDungeonIds == HandshakeData.CapturedDungeonTimelineIds");
     }
 
     /// <summary>Walks up from the test binary looking for a repo-relative file; null if not found.</summary>
