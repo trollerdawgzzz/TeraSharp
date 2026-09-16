@@ -3249,18 +3249,37 @@ public sealed class DbProxyHandlers
     }
 
     /// <summary>
-    /// AS_LOAD_EXTRAPOINT_DATA (0x1555): [u32 reqId][u8 playerId_low][u8 ok=1][47 zeros] — 53 bytes.
-    /// Capture frame 319. SDB shape request (reqId at payload[0]).
+    /// SA_LOAD_EXTRAPOINT_DATA (0x1554) -&gt; AS_LOAD_EXTRAPOINT_DATA (0x1555). The EP (elite
+    /// point) panel's load. The request carries a DlmId, so an unanswered one head-blocks that
+    /// character.
+    ///
+    /// <para><b>T70 fixed the field placement.</b> The old builder wrote
+    /// <c>[u32 reqId][u8 playerId_low][u8 ok]</c>, which put the low byte of the player id where
+    /// <c>Result</c> belongs and a 1 where the four-byte <c>UserDbId</c> starts - World read back
+    /// user 1 for every character. The length (53 payload bytes, frame 0x3B) happened to be
+    /// right. Dumpers: request guard 0x0d (<c>DlmId@06, UserDbId@0A</c>), reply guard 0x3a.
+    /// cap_social3.log seq 111 -&gt; 112 and 314 -&gt; 315 are the two real pairs; every field past
+    /// UserDbId is zero in both, which is what a character with no EP looks like.</para>
+    /// <code>
+    ///   [00] i32 DlmId   [04] u8 Result   [05] i32 UserDbId   [09] i32 EpLevel
+    ///   [13] i64 EpExp   [21] i32 DailyEpExp   [25] i32 ReserveBonus
+    ///   [29] i32 DailyLimitEpExp   [33] i64 DailyEpExpResetTime
+    ///   [41] i64 GoldConsumption   [49] i32 TotalEp
+    /// </code>
     /// </summary>
+    public const int ExtrapointReplySize = 53;      // frame 0x3B
+
     public static byte[] BuildExtrapointData(byte[] request)
     {
-        uint reqId = request.Length >= 4 ? BitConverter.ToUInt32(request, 0) : 0;
-        byte pid = request.Length >= 8 ? (byte)(BitConverter.ToUInt32(request, 4) & 0xFF) : (byte)0;
-        var r = new byte[53];
-        BitConverter.GetBytes(reqId).CopyTo(r, 0);
-        r[4] = pid;
-        r[5] = 1; // ok
-        // rest zeros (no extra point data)
+        uint dlmId = request.Length >= 4 ? BitConverter.ToUInt32(request, 0) : 0;
+        int userDbId = request.Length >= 8 ? BitConverter.ToInt32(request, 4) : 0;
+        var r = new byte[ExtrapointReplySize];
+        BitConverter.GetBytes(dlmId).CopyTo(r, 0);
+        r[4] = 1;                                   // Result
+        BitConverter.GetBytes(userDbId).CopyTo(r, 5);
+        // EpLevel, EpExp, DailyEpExp, ReserveBonus, DailyLimitEpExp, DailyEpExpResetTime,
+        // GoldConsumption and TotalEp are all zero for a character with no EP, which is both
+        // captured characters. We keep no EP state, so zero is the honest answer.
         return r;
     }
 

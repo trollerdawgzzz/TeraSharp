@@ -373,6 +373,128 @@ public static class BrokerPackets
     // handler passes the request's own bytes back rather than inventing a record.
     // =========================================================================================
 
+
+    // =========================================================================================
+    // T70: the TradeData / CalcItemList record, from cap_social3.log.
+    //
+    // T53 called the broker's ref payloads "ItemData-shaped and not decoded" and T55 decoded the
+    // ItemBinary half (it is the 856-byte ItemTransactionAtom). The OTHER half - what
+    // DBS_TRADE_BROKER_UNREGISTER_ITEM calls TradeData and the two CALC replies call
+    // CalcItemList - is this 392-byte record, and cap_social3.log is the first capture that
+    // contains one.
+    //
+    // Three distinct listings appear (ids 1 and 3 populated, plus the cleared form the Step-2
+    // unregister returns). Cross-checking them is what separates a field from heap:
+    //
+    //   +0x000 i32   TradeId          1 / 3 / 0
+    //   +0x004 i32   SellerDbId       2 / 2 / 0
+    //   +0x008 wstr  SellerName       "Test", 37 wchars of room (0x4A bytes, to +0x51)
+    //   +0x052 u16   -- uninitialised Arbiter stack: 25119 / 25103, and still set in the
+    //   +0x05C u16   -- CLEARED record where every real field is zero. Not fields.
+    //   +0x060 i64   ItemDbId         10027 / 10029 / 0
+    //   +0x068 i32   TemplateId       200997 / 139093 / 0
+    //   +0x06C i32   Amount           1 / 1 / 0
+    //   +0x0B8 8xu16 RegisterTime     {year, month, day, hour, minute, second, 0, 0} -
+    //                                 2026-09-16 22:32:16 and 22:32:47
+    //   +0x0C8 i64   Price            10001 / 1 / 0
+    //
+    // Price is pinned by the other end of the trade: SDB_TRADE_BROKER_BUY_IT_NOW's
+    // TotalPriceWithTax for listing 3 is 1, and listing 3's +0xC8 is 1.
+    //
+    // THE TWO-STEP PROTOCOL. Every broker operation except REGISTER runs twice, and the Step
+    // field says which pass it is (cap_social3.log seq 1880..1883, 1946..1949, 2000..2003):
+    //
+    //   Step 1  request carries NO atoms (the ref is offset = frame length, count 0)
+    //           reply carries the TradeData record and NO atoms
+    //   Step 2  request carries the atoms World built from what Step 1 told it
+    //           reply carries the TradeData record AND those atoms echoed
+    //
+    // So Step 1 is "read me the listing" and Step 2 is "commit". A handler that answers Step 1
+    // with an empty TradeData gives World nothing to build the Step-2 atoms from, which is why
+    // T55's empty forms could never complete a purchase.
+    // =========================================================================================
+
+    /// <summary>The TradeData / CalcItemList record, 0x188 bytes.</summary>
+    public const int TradeDataSize = 0x188;
+
+    public const int TdTradeId = 0x000;
+    public const int TdSellerDbId = 0x004;
+    public const int TdSellerName = 0x008;
+    /// <summary>37 wchars including the NUL, the same width the parcel record's names use.</summary>
+    public const int TdNameMaxChars = 0x25;
+    public const int TdItemDbId = 0x060;
+    public const int TdTemplateId = 0x068;
+    public const int TdAmount = 0x06C;
+    public const int TdRegisterTime = 0x0B8;
+    public const int TdPrice = 0x0C8;
+
+    public readonly record struct TradeData(
+        int TradeId, int SellerDbId, string SellerName, long ItemDbId, int TemplateId,
+        int Amount, long Price);
+
+    /// <summary>Reads one 0x188-byte TradeData record. Null when the buffer is short.</summary>
+    public static TradeData? ParseTradeData(byte[] rec, int at = 0)
+    {
+        if (rec == null || at < 0 || at > rec.Length - TradeDataSize) return null;
+        return new TradeData(
+            BitConverter.ToInt32(rec, at + TdTradeId),
+            BitConverter.ToInt32(rec, at + TdSellerDbId),
+            TradeWString(rec, at + TdSellerName, TdNameMaxChars),
+            BitConverter.ToInt64(rec, at + TdItemDbId),
+            BitConverter.ToInt32(rec, at + TdTemplateId),
+            BitConverter.ToInt32(rec, at + TdAmount),
+            BitConverter.ToInt64(rec, at + TdPrice));
+    }
+
+    /// <summary>
+    /// Builds one TradeData record. <paramref name="registerTime"/> is written in the
+    /// {year, month, day, hour, minute, second} form the capture carries at +0xB8; pass
+    /// <c>default</c> to leave it zero. The two uninitialised u16s at +0x52 and +0x5C are left
+    /// zero on purpose - World never reads them, and re-sending another server's stack is the
+    /// leak T51 spent a task removing from the guild blob.
+    /// </summary>
+    public static byte[] BuildTradeData(int tradeId, int sellerDbId, string? sellerName,
+                                        long itemDbId, int templateId, int amount, long price,
+                                        DateTime registerTime = default)
+    {
+        var r = new byte[TradeDataSize];
+        BitConverter.GetBytes(tradeId).CopyTo(r, TdTradeId);
+        BitConverter.GetBytes(sellerDbId).CopyTo(r, TdSellerDbId);
+        WriteTradeWString(r, TdSellerName, sellerName, TdNameMaxChars);
+        BitConverter.GetBytes(itemDbId).CopyTo(r, TdItemDbId);
+        BitConverter.GetBytes(templateId).CopyTo(r, TdTemplateId);
+        BitConverter.GetBytes(amount).CopyTo(r, TdAmount);
+        BitConverter.GetBytes(price).CopyTo(r, TdPrice);
+        if (registerTime != default)
+        {
+            int at = TdRegisterTime;
+            foreach (ushort v in new[] { (ushort)registerTime.Year, (ushort)registerTime.Month,
+                                         (ushort)registerTime.Day, (ushort)registerTime.Hour,
+                                         (ushort)registerTime.Minute, (ushort)registerTime.Second })
+            { BitConverter.GetBytes(v).CopyTo(r, at); at += 2; }
+        }
+        return r;
+    }
+
+    private static string TradeWString(byte[] rec, int at, int maxChars)
+    {
+        var sb = new System.Text.StringBuilder();
+        for (int i = 0; i < maxChars && at + i * 2 + 1 < rec.Length; i++)
+        {
+            char ch = (char)(rec[at + i * 2] | (rec[at + i * 2 + 1] << 8));
+            if (ch == '\0') break;
+            sb.Append(ch);
+        }
+        return sb.ToString();
+    }
+
+    private static void WriteTradeWString(byte[] rec, int at, string? value, int maxChars)
+    {
+        if (string.IsNullOrEmpty(value)) return;
+        int n = Math.Min(value!.Length, maxChars - 1);
+        for (int i = 0; i < n; i++) BitConverter.GetBytes((ushort)value[i]).CopyTo(rec, at + i * 2);
+    }
+
     /// <summary>
     /// The size of one <c>ItemTransactionAtom</c>, which is what the broker's <c>ItemBinary</c>
     /// ref actually carries - the same 856-byte record the warehouse and item paths use

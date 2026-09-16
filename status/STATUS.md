@@ -247,3 +247,10 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   `SDB_LOAD_INVITE_FRIEND` 0x28B7 promoted out of the replay table (both echo a DlmId); warehouse
   MaxSlotCount is 0x48 and EndPos is the last index, not one past it; TS op 0x10 applied. The guild
   boot terminator and the whole warehouse request/reply layout are confirmed byte-exact.
+
+- T70 (cap_social3.log): the broker's TradeData/CalcItemList record (0x188) decoded at last, and
+  the two-step Step 1 = read / Step 2 = commit protocol pinned — BROKER-DESIGN.md says what is
+  left (the listings table). `AS_LOAD_EXTRAPOINT_DATA` 0x1555 was writing Result and UserDbId at
+  the wrong offsets, so World read back user 1 for every character; fixed and byte-exact.
+  Of the 31 opcodes in T70's item-2 list, 25 are Arbiter -> World pushes and cannot wedge; of the
+  six real requests only 0x1554 carries a DlmId.
