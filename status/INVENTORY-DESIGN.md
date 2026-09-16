@@ -543,3 +543,29 @@ set exactly the eight bytes at 448 differ.
   World's own inventory (a GM command against an offline character, a parcel payout) will not show
   up until that character relogs.
 - **`S_ITEMLIST.money`** is built by WorldServer, not by us, so there is nothing to serve there.
+
+## 9. T65 — `SDB_ITEM_TRADE` (0x276A) and the 568-byte record
+
+The DB half of a completed player trade. It arrived live on 2026-09-16 as a 2306-byte frame with
+"no replay" and, unanswered, head-blocked that character's DLM queue.
+
+| | `SDB_ITEM_SINGLE` 0x2768 | `SDB_ITEM_TRADE` 0x276A |
+| --- | --- | --- |
+| Guard / min frame | 0x1E | 0x22 |
+| Payload header | 24 B: `[offA][lenA][offB][lenB][reqId][playerId]` | 28 B: the same four slots, then `DlmId`, `OwnerDBID`, `TargetDBID` |
+| Record | `ItemTransactionAtom`, **0x358** | `ItemTransactionGiveTake`, **0x238** |
+| Reply | 0x2769, 21-B header `[offA][lenA][offB][lenB][id][ok]` | 0x276B, **the same 21-B header** |
+
+The stride is the handler's own divisor (`(len - 1) / 0x238 + 1`, Arb_part_063.c:11880) and it checks
+out against the live frame: `6 + 28 + 4 x 0x238 = 2306` exactly. The record's *head* is shared with the
+856-byte atom — `DO_TS_CHANGE_ITEM_OWNER` (Arb_part_037.c:18245) reads `+0x10` item db id,
+`+0x20`/`+0x28` src owner+inven, `+0x38`/`+0x40`/`+0x48` dst owner+inven+slot, op at `+0x04` — so one
+reader serves both and only the stride is parameterised (`WarehouseHandlers.ParseAtoms(.., recordSize)`).
+
+Echo rule is T13's: both lists copied back, with a freshly allocated item db id written into every
+insert that arrived with 0. Both lists are then applied in order, A then B, to the same `items` table.
+
+**Gap.** The op index for `TS_CHANGE_ITEM_OWNER` is not known — the dispatch is a data jump table
+(`DAT_140f02f30`) that the decompile does not spell out, and no capture of a 0x276A exists. Records
+carrying that op are echoed but change no row, which is the standing rule for an unmodelled op
+(section 4). Money (op 9) and inserts (op 7) in a trade DO apply. One live 0x276A capture closes this.

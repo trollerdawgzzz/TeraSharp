@@ -444,3 +444,10 @@ cutscene replay is `C_WATCHED_MOVIES` going unanswered. `C_FINDNAME` matches are
 log, then the guild roster, all capped at ten (`list.size() < 10`, re-tested in each pass). The one-char
 separator between matches (`DAT_140b41838`) is untyped in the decompile — `FindNameSeparator` is a comma
 and is the single guessed byte in T62.
+
+T65 adds one row to the item path: `SDB_ITEM_TRADE` (0x276A) -> `DBS_ITEM_TRADE` (0x276B) applies a
+completed player trade's `ItemTransactionGiveTake` records (0x238 each, two lists, owner then target)
+to `items` and `characters.money`, the same way 0x2768 does for a single player. Parcel gold now
+leaves `parcels.money` and lands on `characters.money` when the mail is claimed
+(`SDB_RECV_PARCEL` / `SDB_RECV_PARCEL_EX`); before T65 it was stored and never paid.
+`GetCharacterByName` is `COLLATE NOCASE`, so a mail addressed to `Two` reaches `two`.

@@ -914,3 +914,22 @@ From `cap_social_client.log`, the same session as section 13:
 The loot block matching byte for byte is the point: `S_PARTY_LOOTING_METHOD`'s `.def` is missing
 `BoundOnLootItemDistributionMethod`, and the capture shows it carrying 1 where the def would have
 read the next field.
+## 14. T65 — `SA_JOIN_PARTY_IN_ARBITER` is where a party is actually born
+
+`cap_social.log` contains **one** 0x13AB (seq 747) and **zero** `SA_JOIN_PARTY` (0x1395). World
+completes the invite dialogue and then hands us two NAMES; the AS_DO_CREATE_PARTY at seq 748 came
+straight out of it. `PartyManager.OnWorldFrame` had no case for 0x13AB, so it hit the default
+`0x{op:X4} is not a party frame` — which is exactly the line the live run logged, with the contract
+accept (0x280F/0x2810) already sent and no party formed.
+
+```
+frame [06] u32 MemberName ref   [0A] u32 InviteeName ref   [0E] u8 Raid      min frame 0x0F
+seq 747: off 0x0F -> "Test", off 0x19 -> "two", Raid 0, 33 bytes
+```
+
+Handler `FUN_140728080` (Arb_part_062.c:8534) resolves both through the by-name table lookup
+`FUN_14082dc50(userTable, name, 3)` — there are no db-ids in the frame at all — and calls the same
+join. `PartyManager.JoinPartyInArbiter` does that (`TryGetPlayerByName`, ordinal case-insensitive) and
+then runs `JoinCore`, shared with `SA_JOIN_PARTY`, so the output is the same
+`AS_DO_CREATE_PARTY, 0x15CD x N, 0x13AD x N` as seq 748..753. 0x13AB carries no PartyType and no
+anonymity flag, so a party born this way is an ordinary named one.

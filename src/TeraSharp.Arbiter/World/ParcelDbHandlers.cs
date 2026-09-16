@@ -396,6 +396,36 @@ public static class ParcelDbHandlers
     }
 
     /// <summary>
+    /// The 0x9e8 record to serve for one stored parcel: the exact bytes World gave us in
+    /// SDB_MAKE_PARCEL when we have them, with the two fields the Arbiter - not World - owns
+    /// stamped into a COPY of them.
+    ///
+    /// <para><b>T65, live bug.</b> In the MAKE record ParcelId (+0xA0) and ReceiverDbId (+0x50)
+    /// are both 0: the sending client knows neither. T61 stored that record verbatim and T61's
+    /// list served it verbatim, so every inbox row went out with parcel id 0 - the client
+    /// dropped the C_SHOW_PARCEL_MESSAGE it would have sent for it, and after a relog the whole
+    /// inbox rendered as N identical blank mails. The ParcelData comment above says it in so
+    /// many words ("0 in MAKE, 1 in LIST"); nothing was acting on it.</para>
+    /// </summary>
+    public static byte[] ServedParcelRecord(CharacterStore store, CharacterStore.ParcelRow row)
+    {
+        ArgumentNullException.ThrowIfNull(store);
+        ArgumentNullException.ThrowIfNull(row);
+        var stored = store.GetParcelRecord(row.ParcelId);
+        var rec = new byte[ParcelDataNoMsgSize];
+        if (stored is not null && stored.Length >= ParcelDataNoMsgSize)
+            Buffer.BlockCopy(stored, 0, rec, 0, ParcelDataNoMsgSize);
+        else
+            BuildParcelDataNoMsg(row.ParcelId, row.ReceiverDbId, row.SenderDbId, row.SenderName,
+                                 receiverName: null, row.Money, row.Title)
+                .CopyTo(rec, 0);
+
+        BitConverter.GetBytes(row.ParcelId).CopyTo(rec, ParcelDataParcelId);
+        BitConverter.GetBytes(row.ReceiverDbId).CopyTo(rec, ParcelDataReceiverDbId);
+        return rec;
+    }
+
+    /// <summary>
     /// The list body for one page of a character's inbox: each parcel's stored record when we
     /// have one, the synthesised form when we do not, truncated or zero-padded to the
     /// 0x9e8 stride the writer copies with.
@@ -412,14 +442,8 @@ public static class ParcelDbHandlers
         var body = new byte[rows.Count * ParcelDataNoMsgSize];
         for (int i = 0; i < rows.Count; i++)
         {
-            var stored = store.GetParcelRecord(rows[i].ParcelId);
-            var rec = stored is not null && stored.Length >= ParcelDataNoMsgSize
-                ? stored
-                : BuildParcelDataNoMsg(rows[i].ParcelId, rows[i].ReceiverDbId,
-                                       rows[i].SenderDbId, rows[i].SenderName, receiverName: null,
-                                       rows[i].Money, rows[i].Title);
-            Buffer.BlockCopy(rec, 0, body, i * ParcelDataNoMsgSize,
-                             Math.Min(rec.Length, ParcelDataNoMsgSize));
+            var rec = ServedParcelRecord(store, rows[i]);
+            Buffer.BlockCopy(rec, 0, body, i * ParcelDataNoMsgSize, ParcelDataNoMsgSize);
         }
         return body;
     }

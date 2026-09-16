@@ -939,6 +939,48 @@ public static class PartyPackets
             p[0x4A] != 0, p[0x4B] != 0, BitConverter.ToInt32(p, 0x4C));
     }
 
+    public readonly record struct SaJoinPartyInArbiter(string MemberName, string InviteeName, bool Raid);
+
+    /// <summary>
+    /// SA_JOIN_PARTY_IN_ARBITER (0x13AB), min frame 0x0F. Dumper FUN_14021bb90 (Arb_part_016.c:13076),
+    /// handler FUN_140728080 (Arb_part_062.c:8534): [u32 MemberName ref @frame 06]
+    /// [u32 InviteeName ref @frame 0A][u8 Raid @frame 0E]. The two refs are FRAME offsets to
+    /// NUL-terminated UTF-16LE, and the handler resolves BOTH BY NAME
+    /// (FUN_14082dc50(userTable, name, 3)) before calling PartyManager::JoinParty - there are no
+    /// db-ids in this frame at all.
+    ///
+    /// T65: this - not SA_JOIN_PARTY (0x1395) - is how a party is actually born. cap_social.log
+    /// holds one 0x13AB (seq 747, "Test" + "two", Raid = 0) and zero 0x1395; seq 748 is the
+    /// AS_DO_CREATE_PARTY it produced.
+    /// </summary>
+    public static SaJoinPartyInArbiter? ParseSaJoinPartyInArbiter(byte[] p)
+    {
+        if (TooShort(SA_JOIN_PARTY_IN_ARBITER, p)) return null;
+        return new SaJoinPartyInArbiter(
+            PartyWString(p, BitConverter.ToUInt32(p, 0)),
+            PartyWString(p, BitConverter.ToUInt32(p, 4)),
+            p[8] != 0);
+    }
+
+    /// <summary>Reads a NUL-terminated UTF-16LE string at a FRAME offset out of a PAYLOAD buffer.
+    /// 0 and out-of-range offsets give "", which is what the real handler does (it substitutes the
+    /// shared empty string at DAT_140d3e020). The offset is read UNSIGNED so a negative-looking
+    /// value can never index backwards.</summary>
+    private static string PartyWString(byte[] payload, uint frameOffset)
+    {
+        if (frameOffset < 6) return string.Empty;
+        long at = (long)frameOffset - 6;
+        if (at >= payload.Length) return string.Empty;
+        var sb = new System.Text.StringBuilder();
+        for (long i = at; i + 1 < payload.Length; i += 2)
+        {
+            char ch = (char)(payload[i] | (payload[i + 1] << 8));
+            if (ch == '\0') break;
+            sb.Append(ch);
+        }
+        return sb.ToString();
+    }
+
     public readonly record struct SaLeaveParty(int OwnerPlanetId, long PartyId, int MemberPlanetId, int MemberDbId);
 
     /// <summary>SA_LEAVE_PARTY (0x1396): [i32 OwnerPlanetId][i64 PartyId][i32 PlanetId][i32 UserDbId].</summary>

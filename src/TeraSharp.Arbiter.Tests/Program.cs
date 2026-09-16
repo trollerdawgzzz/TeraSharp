@@ -17031,4 +17031,209 @@ some prose with `backticks` that is not a table row
         Hex.True(ArbiterClientHandlers.ParseFindName(new byte[5]) == null, "5 B is one short of the guard");
     }
 
+    // ===================== T65: the 2026-09-16 live run =====================
+
+    /// <summary>One 568-byte ItemTransactionGiveTake record, at the offsets DO_TS_CHANGE_ITEM_OWNER
+    /// reads (Arb_part_037.c:18245) - the same head the 856-byte atom has.</summary>
+    static byte[] GiveTake(int index, uint op, long itemDbId, int templateId,
+                           long srcOwner, int srcInven, int srcSlot,
+                           long dstOwner, int dstInven, int dstSlot, long delta)
+    {
+        var r = new byte[DbProxyHandlers.ItemGiveTakeSize];
+        BitConverter.GetBytes(index).CopyTo(r, 0);
+        BitConverter.GetBytes(op).CopyTo(r, WarehouseHandlers.AtomOp);
+        BitConverter.GetBytes(itemDbId).CopyTo(r, WarehouseHandlers.AtomItemDbId);
+        BitConverter.GetBytes(templateId).CopyTo(r, WarehouseHandlers.AtomTemplateId);
+        BitConverter.GetBytes(srcOwner).CopyTo(r, WarehouseHandlers.AtomSrcOwner);
+        BitConverter.GetBytes(srcInven).CopyTo(r, WarehouseHandlers.AtomSrcInven);
+        BitConverter.GetBytes(srcSlot).CopyTo(r, WarehouseHandlers.AtomSrcSlot);
+        BitConverter.GetBytes(dstOwner).CopyTo(r, WarehouseHandlers.AtomDstOwner);
+        BitConverter.GetBytes(dstInven).CopyTo(r, WarehouseHandlers.AtomDstInven);
+        BitConverter.GetBytes(dstSlot).CopyTo(r, WarehouseHandlers.AtomDstSlot);
+        BitConverter.GetBytes(delta).CopyTo(r, WarehouseHandlers.AtomDelta);
+        return r;
+    }
+
+    /// <summary>
+    /// 0x276A SDB_ITEM_TRADE, the frame that wedged a character's DB queue on 2026-09-16 with
+    /// "no replay". It is SDB_ITEM_SINGLE's shape at a different stride: a 28-byte header (the
+    /// extra i32 is TargetDBID) and 0x238-byte records, not 0x358.
+    /// </summary>
+    [Test] public static void T65_SDB_ITEM_TRADE_is_answered_at_the_give_take_stride()
+    {
+        Hex.True(DbProxyHandlers.ItemGiveTakeSize == 0x238,
+            "Handler_SDB_ITEM_TRADE divides by 0x238, not 0x358 (Arb_part_063.c:11880)");
+        Hex.True(6 + DbProxyHandlers.ItemTradeRequestHeader + 4 * DbProxyHandlers.ItemGiveTakeSize == 2306,
+            "and that is what makes the live 2306-byte frame come out whole: 6 + 28 + 4 x 0x238");
+
+        using var store = GuildStore(2);
+        var recs = new[]
+        {
+            GiveTake(0, WarehouseHandlers.TsInsertItem, 0, 6560, 0, 0, 0, 2, BagItems.Pocket, 3, 1),
+            GiveTake(1, WarehouseHandlers.TsChangeMoney, 0, 0, 2, 0, 0, 2, 0, 0, 25),
+            GiveTake(0, WarehouseHandlers.TsInsertItem, 0, 88, 0, 0, 0, 1, BagItems.Pocket, 4, 1),
+            GiveTake(1, WarehouseHandlers.TsChangeMoney, 0, 0, 1, 0, 0, 1, 0, 0, 50),
+        };
+        const int hdr = DbProxyHandlers.ItemTradeRequestHeader;
+        var payload = new byte[hdr + 4 * DbProxyHandlers.ItemGiveTakeSize];
+        BitConverter.GetBytes((uint)(6 + hdr)).CopyTo(payload, 0);
+        BitConverter.GetBytes((uint)(2 * DbProxyHandlers.ItemGiveTakeSize)).CopyTo(payload, 4);
+        BitConverter.GetBytes((uint)(6 + hdr + 2 * DbProxyHandlers.ItemGiveTakeSize)).CopyTo(payload, 8);
+        BitConverter.GetBytes((uint)(2 * DbProxyHandlers.ItemGiveTakeSize)).CopyTo(payload, 12);
+        BitConverter.GetBytes(0x3Cu).CopyTo(payload, 16);      // DlmId
+        BitConverter.GetBytes(1).CopyTo(payload, 20);          // OwnerDBID
+        BitConverter.GetBytes(2).CopyTo(payload, 24);          // TargetDBID
+        for (int i = 0; i < recs.Length; i++)
+            recs[i].CopyTo(payload, hdr + i * DbProxyHandlers.ItemGiveTakeSize);
+
+        long before = store.GetCharacterMoney(2), beforeOwner = store.GetCharacterMoney(1);
+        var (op, body) = RunHandler1(DbProxyHandlers.SDB_ITEM_TRADE, payload, store);
+        Hex.True(op == DbProxyHandlers.DBS_ITEM_TRADE, $"replied with 0x{op:X4}, want 0x276B");
+        Hex.True(body.Length == DbProxyHandlers.ItemSingleReplyHeader + 4 * DbProxyHandlers.ItemGiveTakeSize,
+            $"both lists echoed under the 21-byte header: {body.Length} B");
+        Hex.True(BitConverter.ToUInt32(body, 0) == 27
+                 && BitConverter.ToUInt32(body, 4) == 2 * DbProxyHandlers.ItemGiveTakeSize
+                 && BitConverter.ToUInt32(body, 8) == 27 + 2 * DbProxyHandlers.ItemGiveTakeSize
+                 && BitConverter.ToUInt32(body, 12) == 2 * DbProxyHandlers.ItemGiveTakeSize,
+            "the four backpatch slots FUN_1406ece60 writes, frame-relative");
+        Hex.True(BitConverter.ToUInt32(body, 16) == 0x3C && body[20] == 1,
+            "DlmId echoed and Success = 1 - an unanswered DlmId head-blocks the character forever");
+
+        int idA = BitConverter.ToInt32(body, DbProxyHandlers.ItemSingleReplyHeader + WarehouseHandlers.AtomItemDbId);
+        int idB = BitConverter.ToInt32(body, DbProxyHandlers.ItemSingleReplyHeader
+                                            + 2 * DbProxyHandlers.ItemGiveTakeSize + WarehouseHandlers.AtomItemDbId);
+        Hex.True(idA > 0 && idB > 0 && idA != idB, $"both inserts were given ids: {idA} / {idB}");
+        Hex.True(store.GetInventoryItems(2).Any(r => r.ItemDbId == idA), "and the row exists for the target");
+        Hex.True(store.GetInventoryItems(1).Any(r => r.ItemDbId == idB), "and for the owner");
+        Hex.True(store.GetCharacterMoney(2) == before + 25 && store.GetCharacterMoney(1) == beforeOwner + 50,
+            "the op-9 records moved character money on BOTH sides - list A then list B");
+        Hex.True(DbProxyHandlers.IsHandledRequest(DbProxyHandlers.SDB_ITEM_TRADE), "0x276A is allow-listed");
+    }
+
+    /// <summary>
+    /// 0x13AB is how a party is actually born in 100.02 - cap_social.log has one (seq 747) and no
+    /// SA_JOIN_PARTY at all. PartyManager had no case for it, so it fell to the default reject
+    /// ("0x13AB is not a party frame") and the party never formed even though the contract accept
+    /// had already gone out.
+    /// </summary>
+    [Test] public static void T65_SA_JOIN_PARTY_IN_ARBITER_forms_the_party()
+    {
+        var p = Hex.B(Cap_join);
+        var j = PartyPackets.ParseSaJoinPartyInArbiter(p);
+        Hex.True(j != null && j.Value.MemberName == "Test" && j.Value.InviteeName == "two" && !j.Value.Raid,
+            $"parsed: {j?.MemberName} + {j?.InviteeName}, raid {j?.Raid}");
+        Hex.True(PartyPackets.ParseSaJoinPartyInArbiter(new byte[8]) == null, "one byte short is refused");
+
+        var pm = NewPartyManager();
+        pm.Register(P(10, 2, "Test")); pm.Register(P(11, 1002, "two"));
+        var a = pm.OnWorldFrame(PartyPackets.SA_JOIN_PARTY_IN_ARBITER, p);
+        Hex.True(a.Rejected == null, $"rejected: {a.Rejected}");
+        Hex.True(WorldOps(a) == "0x139E,0x15CD,0x15CD,0x13AD,0x13AD", WorldOps(a));
+        Hex.True(a.ToClients.Count == 2 && a.ToClients.All(c => c.PacketName == "S_PARTY_MEMBER_LIST"), Names(a));
+
+        // A name nobody is using is refused rather than half-applying the join.
+        var other = NewPartyManager();
+        other.Register(P(10, 2, "Test"));
+        Hex.True(other.OnWorldFrame(PartyPackets.SA_JOIN_PARTY_IN_ARBITER, p).Rejected != null,
+            "with the invitee offline the frame is refused, not half-applied");
+    }
+
+    /// <summary>
+    /// The inbox row carried parcel id 0, so the client dropped the C_SHOW_PARCEL_MESSAGE it
+    /// would have sent and a relog rendered every mail as a blank row. The stored bytes ARE the
+    /// SDB_MAKE_PARCEL record, and in that record both ParcelId (+0xA0) and ReceiverDbId (+0x50)
+    /// are zero: the sending client knew neither.
+    /// </summary>
+    [Test] public static void T65_the_inbox_row_carries_its_parcel_id()
+    {
+        using var store = GuildStore(2);
+
+        // A FULL 0x9e8 record, exactly as World hands it to us: ids still zero.
+        var made = new byte[ParcelDbHandlers.ParcelDataNoMsgSize];
+        Hex.B(Cap61_MakeParcelDataHead).CopyTo(made, 0);
+        Hex.True(ParcelDbHandlers.ParseParcelData(made).ParcelId == 0
+                 && ParcelDbHandlers.ParseParcelData(made).ReceiverDbId == 0,
+            "the record World sent has neither id");
+
+        int id = store.CreateParcel(2, "Test", 1, "No subject", string.Empty, 100);
+        store.SetParcelRecord(id, made);
+
+        var body = ParcelDbHandlers.BuildParcelList(store, 1, out uint count, out uint maxPage);
+        Hex.True(count == 1 && maxPage == 1 && body.Length == ParcelDbHandlers.ParcelDataNoMsgSize,
+            $"one 0x9e8 row: {count}/{maxPage}/{body.Length}");
+        var served = ParcelDbHandlers.ParseParcelData(body);
+        Hex.True(served.ParcelId == id, $"+A0 ParcelId is stamped: {served.ParcelId}");
+        Hex.True(served.ReceiverDbId == 1, $"+50 ReceiverDbId is stamped: {served.ReceiverDbId}");
+        Hex.True(served.SenderName == "Test" && served.Money == 100,
+            "and the bytes World owns are untouched");
+
+        // The empty form is unchanged: offset = frame length, count 0 (MAIL-WAREHOUSE.md 10).
+        var empty = ParcelDbHandlers.BuildEmptyDbsListParcel(0xA7, 0, 0);
+        Hex.True(empty.Length == ParcelDbHandlers.ListReplyHeader
+                 && BitConverter.ToUInt32(empty, 0) == 35 && BitConverter.ToUInt32(empty, 4) == 0,
+            "an empty inbox is still the 35-byte frame");
+
+        // And the header around a real row is the one seq 1539 shows.
+        var full = ParcelDbHandlers.BuildDbsListParcel(0xA7, true, 0, 0, maxPage, count, body);
+        Hex.True(BitConverter.ToUInt32(full, 0) == 35
+                 && BitConverter.ToUInt32(full, 4) == ParcelDbHandlers.ParcelDataNoMsgSize
+                 && BitConverter.ToUInt32(full, ParcelDbHandlers.ListRspDlmId) == 0xA7
+                 && full[ParcelDbHandlers.ListRspSuccess] == 1
+                 && BitConverter.ToUInt32(full, ParcelDbHandlers.ListRspMaxPage) == 1
+                 && BitConverter.ToUInt32(full, ParcelDbHandlers.ListRspParcelCount) == 1,
+            "cap_social.log seq 1539: [35][0x9E8][dlm][1][view][page][1][1]");
+    }
+
+    /// <summary>
+    /// parcels.money is the Arbiter's own column - World sets it in the ParcelData it sends and
+    /// never sees it again - so nothing credited it and attached gold vanished when the mail was
+    /// opened. It is paid once, and only when the request's own atoms did not already move
+    /// character money.
+    /// </summary>
+    [Test] public static void T65_attached_gold_is_paid_when_the_parcel_is_claimed()
+    {
+        using var store = GuildStore(2);
+        int id = store.CreateParcel(2, "g2", 1, "here", string.Empty, 500);
+        long before = store.GetCharacterMoney(1);
+
+        var payload = new byte[ParcelDbHandlers.RecvRequestSize];
+        BitConverter.GetBytes((uint)(6 + ParcelDbHandlers.RecvRequestSize))
+            .CopyTo(payload, ParcelDbHandlers.RecvReqTransListRef);
+        BitConverter.GetBytes(0u).CopyTo(payload, ParcelDbHandlers.RecvReqTransListRef + 4);
+        BitConverter.GetBytes(0x51u).CopyTo(payload, ParcelDbHandlers.RecvReqDlmId);
+        BitConverter.GetBytes(1u).CopyTo(payload, ParcelDbHandlers.RecvReqStep);
+        BitConverter.GetBytes((uint)id).CopyTo(payload, ParcelDbHandlers.RecvReqParcelId);
+
+        var (op, body) = RunHandler1(DbProxyHandlers.SDB_RECV_PARCEL, payload, store);
+        Hex.True(op == DbProxyHandlers.DBS_RECV_PARCEL, $"replied with 0x{op:X4}");
+        Hex.True(body[ParcelDbHandlers.RecvRspSuccess] == 1, "Success = 1 for a parcel that exists");
+        Hex.True(store.GetCharacterMoney(1) == before + 500,
+            $"the 500 gold landed on the receiver: {store.GetCharacterMoney(1)} (was {before})");
+
+        // Claimed once. A second receive of the same parcel pays nothing.
+        RunHandler1(DbProxyHandlers.SDB_RECV_PARCEL, payload, store);
+        Hex.True(store.GetCharacterMoney(1) == before + 500, "and only once");
+    }
+
+    /// <summary>
+    /// The friend-added line printed the literal "{usernames}". cap_social_client.log seq 1436 is
+    /// the real one: SMT 433 with a UserName parameter, not 432. 432 is a different string whose
+    /// own parameter is spelled differently in this client's table, which is why the placeholder
+    /// came through untouched.
+    /// </summary>
+    /// <summary>cap_social_client.log seq 1436, the S_SYSTEM_MESSAGE string block (packet + 6).</summary>
+    const string Cap65_SmtFriendAccepted =
+        "40 00 34 00 33 00 33 00 0B 00 55 00 73 00 65 00 72 00 4E 00 61 00 6D 00 65 00 "
+        + "0B 00 74 00 77 00 6F 00 00 00";
+
+    [Test] public static void T65_the_friend_accepted_message_is_smt_433()
+    {
+        var cap = Hex.B(Cap65_SmtFriendAccepted);
+        string seen = System.Text.Encoding.Unicode.GetString(cap).TrimEnd('\0');
+        Hex.True(SocialHandlers.SmtAcceptedToRequester == 433,
+            $"SMT 433, not 432: {SocialHandlers.SmtAcceptedToRequester}");
+        Hex.True(seen == SocialHandlers.Smt(SocialHandlers.SmtAcceptedToRequester, "UserName", "two"),
+            $"the captured message is '{seen}'");
+    }
+
 }

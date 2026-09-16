@@ -1287,7 +1287,7 @@ ON CONFLICT(account_id) DO UPDATE SET blob = excluded.blob, updated_at = exclude
         lock (_lock)
         {
             using var cmd = _db.CreateCommand();
-            cmd.CommandText = "SELECT * FROM characters WHERE name = $n";
+            cmd.CommandText = "SELECT * FROM characters WHERE name = $n COLLATE NOCASE";
             cmd.Parameters.AddWithValue("$n", name);
             using var r = cmd.ExecuteReader();
             return r.Read() ? Read(r) : null;

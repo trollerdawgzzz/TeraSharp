@@ -141,11 +141,12 @@ public static class BagItems
     /// (0x278F).</para>
     /// </summary>
     public static WarehouseHandlers.ApplyResult ApplyReplyAtoms(
-        CharacterStore store, byte[] reply, int refOffset, Func<int> allocateItemId, ILogger? log = null)
+        CharacterStore store, byte[] reply, int refOffset, Func<int> allocateItemId, ILogger? log = null,
+        int recordSize = 0)
     {
         ArgumentNullException.ThrowIfNull(store);
         ArgumentNullException.ThrowIfNull(reply);
-        var atoms = WarehouseHandlers.ParseAtoms(reply, refOffset);
+        var atoms = WarehouseHandlers.ParseAtoms(reply, refOffset, recordSize);
         return WarehouseHandlers.Apply(store, atoms, allocateItemId, log);
     }
 }
