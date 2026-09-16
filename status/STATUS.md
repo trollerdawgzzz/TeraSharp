@@ -260,3 +260,10 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   collects, with the three different Step-2 reply shapes pinned. All twelve captured broker frames
   reproduce byte for byte. A listed item lives in inven 6, the broker pocket, not in limbo. The
   client half (nine `C_TRADE_BROKER_*` windows) is still the empty forms.
+
+- T72: master is green again — `T71_registering_creates_a_listing_and_pockets_the_item` was the
+  test, not the code (`AddCharacterMoney` clamps at zero and the test's seller had none). The
+  broker's two client list bodies are decoded and served from the listings table:
+  `S_TRADE_BROKER_WAITING_ITEM_LIST` (92-byte elements) and `_BOUGHT_ITEM_LIST` (98-byte), plus
+  the float 469.0 `S_TRADE_BROKER_HIGHEST_ITEM_LEVEL` that T45 was answering as 0. REGISTERED and
+  SOLD stay on the empty form: the capture never shows a populated one.

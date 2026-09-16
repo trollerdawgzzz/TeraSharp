@@ -17036,6 +17036,159 @@ some prose with `backticks` that is not a table row
         Hex.True(ArbiterClientHandlers.ParseFindName(new byte[5]) == null, "5 B is one short of the guard");
     }
 
+    // ===================== T72: the broker's client windows =====================
+
+    /// <summary>cap_social3_client.log seq 1472 - the search page after listing 3 was bought.</summary>
+    const string Cap72_WaitingTwoRows =
+        "02 00 10 00 00 00 00 00 01 00 00 00 10 00 76 00 "
+        + "6C 00 02 00 00 00 2C 27 00 00 00 00 00 00 41 0D "
+        + "03 00 01 00 00 00 00 00 00 00 00 00 00 00 00 11 "
+        + "27 00 00 00 00 00 00 F9 2A 00 00 00 00 00 00 00 "
+        + "00 00 00 02 00 00 00 00 00 00 00 00 00 00 00 00 "
+        + "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+        + "00 00 00 00 00 00 00 00 54 00 65 00 73 00 74 00 "
+        + "00 00 76 00 00 00 D2 00 01 00 00 00 2B 27 00 00 "
+        + "00 00 00 00 25 11 03 00 01 00 00 00 00 00 00 00 "
+        + "00 00 00 00 00 11 27 00 00 00 00 00 00 F9 2A 00 "
+        + "00 00 00 00 00 00 00 00 00 02 00 00 00 00 00 00 "
+        + "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+        + "00 00 00 00 00 00 00 00 00 00 00 00 00 00 54 00 "
+        + "65 00 73 00 74 00 00 00";
+
+    /// <summary>cap_social3_client.log seq 1486 - one bought item, not yet collected.</summary>
+    const string Cap72_BoughtOneRow =
+        "01 00 08 00 08 00 00 00 6A 00 03 00 00 00 00 00 "
+        + "00 00 2D 27 00 00 00 00 00 00 55 1F 02 00 01 00 "
+        + "00 00 00 00 00 00 00 00 00 00 00 0F 19 AB 6A 00 "
+        + "00 00 00 01 00 00 00 00 00 00 00 02 00 00 00 01 "
+        + "1E 19 AB 6A 00 00 00 00 01 00 00 00 00 00 00 00 "
+        + "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+        + "00 00 00 00 00 00 54 00 65 00 73 00 74 00 00 00";
+
+    static (int, long, int, int, long, int, string) WaitRow(
+        int tradeId, long itemDbId, int templateId, long price)
+        => (tradeId, itemDbId, templateId, 1, price, 2, "Test");
+
+    /// <summary>
+    /// S_TRADE_BROKER_WAITING_ITEM_LIST (0xFD2C), the search result page. TERA's ordinary array
+    /// encoding with PACKET-relative offsets: the body is [count][firstOffset][page][totalPage]
+    /// and each element opens with [here][next][nameOffset].
+    /// </summary>
+    [Test] public static void T72_the_waiting_item_list_is_byte_exact()
+    {
+        // seq 1231: nothing on sale. Count and offset both 0, then page 0 of 1.
+        Hex.Eq(BrokerPackets.BuildSWaitingItemListBody(null),
+            "00 00 00 00 00 00 00 00 01 00 00 00", "seq 1231, the empty search page");
+
+        // seq 1472: two listings, both at 10001, newest first.
+        var two = BrokerPackets.BuildSWaitingItemListBody(new[]
+        {
+            WaitRow(2, 10028, 200001, 10001),
+            WaitRow(1, 10027, 200997, 10001),
+        });
+        Hex.Eq(two, Cap72_WaitingTwoRows, "seq 1472");
+
+        // and the three-row page the same window showed before the buy (seq 1419).
+        var three = BrokerPackets.BuildSWaitingItemListBody(new[]
+        {
+            WaitRow(3, 10029, 139093, 1),
+            WaitRow(2, 10028, 200001, 10001),
+            WaitRow(1, 10027, 200997, 10001),
+        });
+        Hex.True(three.Length == 318 && BitConverter.ToUInt16(three, 0) == 3
+                 && BitConverter.ToUInt16(three, 2) == 16,
+            $"seq 1419 is 322 bytes on the wire, 318 of body: {three.Length}");
+        Hex.True(BitConverter.ToUInt16(three, 12) == 16 && BitConverter.ToUInt16(three, 14) == 118
+                 && BitConverter.ToUInt16(three, 16) == 108,
+            "the first element is at 16, the next at 118 and its name at 108 - a 92-byte fixed part");
+
+        // The tax the list shows: a tenth, truncated. 10001 -> 11001 and 1 -> 1, both captured.
+        Hex.True(BrokerPackets.PriceWithTax(10001) == 11001 && BrokerPackets.PriceWithTax(1) == 1,
+            "TotalPriceWithTax at +43");
+    }
+
+    /// <summary>
+    /// S_TRADE_BROKER_BOUGHT_ITEM_LIST (0x53C0). A different element shape from the waiting
+    /// list - four more bytes before ItemDbId, and two UNIX timestamps - so the two are not
+    /// interchangeable even though most of the field names match.
+    /// </summary>
+    [Test] public static void T72_the_bought_item_list_is_byte_exact()
+    {
+        Hex.Eq(BrokerPackets.BuildSBoughtItemListBody(null), "00 00 00 00",
+            "seq 1491: this list's empty form carries no page scalars at all");
+
+        var one = BrokerPackets.BuildSBoughtItemListBody(new[]
+        {
+            (3, 10029L, 139093, 1, 1L, 2, "Test", 0x6AAB190FL, 0x6AAB191EL),
+        });
+        Hex.Eq(one, Cap72_BoughtOneRow, "seq 1486");
+        Hex.True(0x6AAB191E - 0x6AAB190F == 15,
+            "the two times are UNIX seconds 15 apart - the same gap the TradeData record's "
+            + "RegisterTime and SoldTime have");
+    }
+
+    /// <summary>
+    /// The three small ones. HIGHEST_ITEM_LEVEL is the fix: T45 answered 0 because there was no
+    /// broker, and the real Arbiter answers 469.0 both times it is asked, for both characters.
+    /// </summary>
+    [Test] public static void T72_the_small_broker_replies_are_byte_exact()
+    {
+        Hex.Eq(BrokerPackets.BuildSHighestItemLevelBody(), "00 80 EA 43",
+            "seq 134 and 3217: the float 469.0, not 0");
+        Hex.True(BrokerPackets.HighestItemLevelDefault == 469.0f, "and that is the default we send");
+        Hex.Eq(ArbiterClientHandlers.BuildTradeBrokerHighestItemLevel(BrokerPackets.HighestItemLevelDefault),
+            "08 00 53 7E 00 80 EA 43", "the whole frame T45's handler sends");
+
+        Hex.Eq(BrokerPackets.BuildSBuyItNowBody(true), "01", "seq 1469");
+        Hex.Eq(BrokerPackets.BuildSCalcNotifyBody(0, 1), "00 00 00 00 01 00 00 00",
+            "seq 1462: nothing sold waiting, one bought item waiting to be collected");
+    }
+
+    /// <summary>
+    /// The windows served from the table. The two that stay on the empty form are the point as
+    /// much as the two that do not: the capture shows REGISTERED only empty and never shows
+    /// SOLD at all, so filling them in by analogy would be a guess.
+    /// </summary>
+    [Test] public static void T72_the_broker_windows_serve_the_listings_table()
+    {
+        using var store = GuildStore(2);
+        int a = store.CreateBrokerListing(2, "Test", 10027, 200997, 1, 10001);
+        int b = store.CreateBrokerListing(2, "Test", 10028, 200001, 1, 10001);
+
+        var waiting = BrokerHandlers.ReplyFor(
+            BrokerPackets.C_TRADE_BROKER_WAITING_ITEM_LIST_NEW, store, 1);
+        Hex.True(waiting != null && BitConverter.ToUInt16(waiting, 0) == waiting.Length
+                 && BitConverter.ToUInt16(waiting, 2) == BrokerPackets.S_TRADE_BROKER_WAITING_ITEM_LIST,
+            "a whole client frame comes back");
+        Hex.Eq(waiting![4..], Cap72_WaitingTwoRows,
+            "and with two rows in the table it is seq 1472 byte for byte - newest first at equal price");
+
+        // Bought: nothing until something is sold to this character.
+        Hex.Eq(BrokerHandlers.ReplyFor(BrokerPackets.C_TRADE_BROKER_BOUGHT_ITEM_LIST, store, 1)![4..],
+            "00 00 00 00", "an empty bought list");
+        store.SellBrokerListing(a, 1);
+        var bought = BrokerHandlers.ReplyFor(BrokerPackets.C_TRADE_BROKER_BOUGHT_ITEM_LIST, store, 1)!;
+        Hex.True(BitConverter.ToUInt16(bought, 4) == 1
+                 && BitConverter.ToInt32(bought, 4 + 4 + BrokerPackets.BlTradeId) == a
+                 && BitConverter.ToInt32(bought, 4 + 4 + BrokerPackets.BlSellerDbId) == 2,
+            "and one row once it has been bought, keyed on the buyer");
+
+        // The two the capture does not justify filling in.
+        Hex.Eq(BrokerHandlers.ReplyFor(BrokerPackets.C_TRADE_BROKER_REGISTERED_ITEM_LIST, store, 2)!,
+            BrokerHandlers.ReplyFor(BrokerPackets.C_TRADE_BROKER_REGISTERED_ITEM_LIST)!,
+            "REGISTERED is the empty form either way - seq 1276 is the only one captured");
+        Hex.Eq(BrokerHandlers.ReplyFor(BrokerPackets.C_TRADE_BROKER_SOLD_ITEM_LIST, store, 2)!,
+            BrokerHandlers.ReplyFor(BrokerPackets.C_TRADE_BROKER_SOLD_ITEM_LIST)!,
+            "and SOLD never appears in the capture at all");
+
+        // The collect badge, for when a caller needs it. Not wired to a client packet: the three
+        // CALC / BUY_IT_NOW C_ opcodes are World's, not ours.
+        Hex.Eq(BrokerHandlers.CalcNotifyBodyFor(store, 1), "00 00 00 00 01 00 00 00",
+            "one bought item waiting for this character");
+        Hex.Eq(BrokerHandlers.CalcNotifyBodyFor(store, 2), "01 00 00 00 00 00 00 00",
+            "and one sold item waiting for its seller");
+    }
+
     // ===================== T71: the broker listings table =====================
 
     /// <summary>One 856-byte broker atom at the offsets the register batch uses.</summary>
@@ -17115,7 +17268,13 @@ some prose with `backticks` that is not a table row
     {
         using var store = GuildStore(2);
         store.UpsertItem(10029, 2, BagItems.Pocket, 6, 139093, 1);
+        // The seller has to be able to AFFORD the listing fee. AddCharacterMoney clamps at zero
+        // (MAX(0, money + delta)), so on a character created with no gold the -500 atom lands as
+        // a no-op and the assertion below can never hold - which is what made this test red.
+        // The real seller in cap_social3.log seq 1515 had gold; so does this one now.
+        store.AddCharacterMoney(2, 5000);
         long goldBefore = store.GetCharacterMoney(2);
+        Hex.True(goldBefore == 5000, $"the seller starts with gold: {goldBefore}");
 
         var payload = BrokerRequest(BrokerPackets.RegisterRequestHeader, 0,
             BrokerAtom(0, WarehouseHandlers.TsChangeMoney, 0, 0, -500, 2, 0, 0, 2, 0, 0),

@@ -414,6 +414,170 @@ public static class BrokerPackets
     // T55's empty forms could never complete a purchase.
     // =========================================================================================
 
+
+    // =========================================================================================
+    // T72: the S_ list bodies, decoded from cap_social3_client.log.
+    //
+    // Both lists use TERA's ordinary array encoding, with PACKET-relative offsets:
+    //   body   [u16 count][u16 firstElementOffset] then the packet's own scalars
+    //   element[u16 thisOffset][u16 nextOffset (0 on the last)][u16 nameOffset] then the fields,
+    //          then the NUL-terminated UTF-16LE seller name at nameOffset.
+    // The fixed part of an element is a constant size and the name follows it, so an element is
+    // fixedSize + (name.Length + 1) * 2 bytes long.
+    //
+    // Field offsets below were cross-checked across the three listings in seq 1419 (trade ids
+    // 1, 2 and 3, two different prices and three different templates); every one of them lands
+    // at the same element-relative offset in all three, which is what makes them fields rather
+    // than coincidences.
+    // =========================================================================================
+
+    /// <summary>Bytes of an S_TRADE_BROKER_WAITING_ITEM_LIST element before the seller name.</summary>
+    public const int WaitingElementFixedSize = 92;
+    public const int WlTradeId = 6;
+    public const int WlItemDbId = 10;
+    public const int WlTemplateId = 18;
+    public const int WlAmount = 22;
+    public const int WlPrice = 35;
+    /// <summary>+43: price plus the broker's cut. 10001 comes back 11001 and 1 comes back 1, so
+    /// the cut is <c>price / 10</c> truncated - and it is the same number
+    /// SDB_TRADE_BROKER_BUY_IT_NOW carries as TotalPriceWithTax.</summary>
+    public const int WlTotalPriceWithTax = 43;
+    public const int WlSellerDbId = 55;
+
+    /// <summary>Bytes of an S_TRADE_BROKER_BOUGHT_ITEM_LIST element before the seller name.</summary>
+    public const int BoughtElementFixedSize = 98;
+    public const int BlTradeId = 6;
+    public const int BlItemDbId = 14;
+    public const int BlTemplateId = 22;
+    public const int BlAmount = 26;
+    /// <summary>+39 and +60: UNIX seconds, 15 apart in the capture - which is exactly the gap
+    /// between the TradeData record's RegisterTime (22:32:47) and its SoldTime (22:33:02).</summary>
+    public const int BlRegisterTime = 39;
+    public const int BlPrice = 47;
+    public const int BlSellerDbId = 55;
+    public const int BlSoldFlag = 59;
+    public const int BlSoldTime = 60;
+    public const int BlTotalPaid = 68;
+
+    /// <summary>The broker's cut: a tenth, truncated.</summary>
+    public static long PriceWithTax(long price) => price + price / 10;
+
+    /// <summary>
+    /// S_TRADE_BROKER_WAITING_ITEM_LIST (0xFD2C) - the search result page. The empty form is
+    /// <c>[count 0][offset 0][page][totalPage]</c>, 12 body bytes, which is seq 1231 exactly.
+    /// </summary>
+    public static byte[] BuildSWaitingItemListBody(
+        IReadOnlyList<(int TradeId, long ItemDbId, int TemplateId, int Amount, long Price,
+                       int SellerDbId, string SellerName)>? rows,
+        uint currentPage = 0, uint totalPage = 1)
+    {
+        rows ??= Array.Empty<(int, long, int, int, long, int, string)>();
+        const int header = 12;
+        var sizes = new int[rows.Count];
+        int total = header;
+        for (int i = 0; i < rows.Count; i++)
+        {
+            sizes[i] = WaitingElementFixedSize + NameBytes(rows[i].SellerName);
+            total += sizes[i];
+        }
+
+        var p = new byte[total];
+        BitConverter.GetBytes((ushort)rows.Count).CopyTo(p, 0);
+        BitConverter.GetBytes((ushort)(rows.Count == 0 ? 0 : ClientHeaderSize + header)).CopyTo(p, 2);
+        BitConverter.GetBytes(currentPage).CopyTo(p, 4);
+        BitConverter.GetBytes(totalPage).CopyTo(p, 8);
+
+        int at = header;
+        for (int i = 0; i < rows.Count; i++)
+        {
+            var r = rows[i];
+            int here = ClientHeaderSize + at;
+            int next = i + 1 < rows.Count ? ClientHeaderSize + at + sizes[i] : 0;
+            BitConverter.GetBytes((ushort)here).CopyTo(p, at);
+            BitConverter.GetBytes((ushort)next).CopyTo(p, at + 2);
+            BitConverter.GetBytes((ushort)(here + WaitingElementFixedSize)).CopyTo(p, at + 4);
+            BitConverter.GetBytes(r.TradeId).CopyTo(p, at + WlTradeId);
+            BitConverter.GetBytes(r.ItemDbId).CopyTo(p, at + WlItemDbId);
+            BitConverter.GetBytes(r.TemplateId).CopyTo(p, at + WlTemplateId);
+            BitConverter.GetBytes(r.Amount).CopyTo(p, at + WlAmount);
+            BitConverter.GetBytes(r.Price).CopyTo(p, at + WlPrice);
+            BitConverter.GetBytes(PriceWithTax(r.Price)).CopyTo(p, at + WlTotalPriceWithTax);
+            BitConverter.GetBytes(r.SellerDbId).CopyTo(p, at + WlSellerDbId);
+            WriteName(p, at + WaitingElementFixedSize, r.SellerName);
+            at += sizes[i];
+        }
+        return p;
+    }
+
+    /// <summary>
+    /// S_TRADE_BROKER_BOUGHT_ITEM_LIST (0x53C0) - what this character has bought and not yet
+    /// collected. Its empty form is the 4-byte <c>[count 0][offset 0]</c> (seq 1491): unlike the
+    /// waiting list it carries no page scalars.
+    /// </summary>
+    public static byte[] BuildSBoughtItemListBody(
+        IReadOnlyList<(int TradeId, long ItemDbId, int TemplateId, int Amount, long Price,
+                       int SellerDbId, string SellerName, long RegisterTime, long SoldTime)>? rows)
+    {
+        rows ??= Array.Empty<(int, long, int, int, long, int, string, long, long)>();
+        const int header = 4;
+        var sizes = new int[rows.Count];
+        int total = header;
+        for (int i = 0; i < rows.Count; i++)
+        {
+            sizes[i] = BoughtElementFixedSize + NameBytes(rows[i].SellerName);
+            total += sizes[i];
+        }
+
+        var p = new byte[total];
+        BitConverter.GetBytes((ushort)rows.Count).CopyTo(p, 0);
+        BitConverter.GetBytes((ushort)(rows.Count == 0 ? 0 : ClientHeaderSize + header)).CopyTo(p, 2);
+
+        int at = header;
+        for (int i = 0; i < rows.Count; i++)
+        {
+            var r = rows[i];
+            int here = ClientHeaderSize + at;
+            int next = i + 1 < rows.Count ? ClientHeaderSize + at + sizes[i] : 0;
+            BitConverter.GetBytes((ushort)here).CopyTo(p, at);
+            BitConverter.GetBytes((ushort)next).CopyTo(p, at + 2);
+            BitConverter.GetBytes((ushort)(here + BoughtElementFixedSize)).CopyTo(p, at + 4);
+            BitConverter.GetBytes(r.TradeId).CopyTo(p, at + BlTradeId);
+            BitConverter.GetBytes(r.ItemDbId).CopyTo(p, at + BlItemDbId);
+            BitConverter.GetBytes(r.TemplateId).CopyTo(p, at + BlTemplateId);
+            BitConverter.GetBytes(r.Amount).CopyTo(p, at + BlAmount);
+            BitConverter.GetBytes(r.RegisterTime).CopyTo(p, at + BlRegisterTime);
+            BitConverter.GetBytes(r.Price).CopyTo(p, at + BlPrice);
+            BitConverter.GetBytes(r.SellerDbId).CopyTo(p, at + BlSellerDbId);
+            p[at + BlSoldFlag] = 1;
+            BitConverter.GetBytes(r.SoldTime).CopyTo(p, at + BlSoldTime);
+            BitConverter.GetBytes(r.Price).CopyTo(p, at + BlTotalPaid);
+            WriteName(p, at + BoughtElementFixedSize, r.SellerName);
+            at += sizes[i];
+        }
+        return p;
+    }
+
+    /// <summary>
+    /// S_TRADE_BROKER_HIGHEST_ITEM_LEVEL (0x7E53): one <b>float</b>, 469.0 in both captures
+    /// (seq 134 and 3217). It is the cap the search window's item-level slider runs to, which is
+    /// static server config rather than anything about this character.
+    /// </summary>
+    public const float HighestItemLevelDefault = 469.0f;
+
+    public static byte[] BuildSHighestItemLevelBody(float level = HighestItemLevelDefault)
+        => BitConverter.GetBytes(level);
+
+    /// <summary>S_TRADE_BROKER_BUY_IT_NOW (0xEC54): one byte, 1 on the captured success
+    /// (seq 1469).</summary>
+    public static byte[] BuildSBuyItNowBody(bool ok) => new[] { (byte)(ok ? 1 : 0) };
+
+    private static int NameBytes(string? name) => ((name?.Length ?? 0) + 1) * 2;
+
+    private static void WriteName(byte[] p, int at, string? name)
+    {
+        foreach (char ch in name ?? string.Empty) { p[at++] = (byte)ch; p[at++] = (byte)(ch >> 8); }
+    }
+
     /// <summary>The TradeData / CalcItemList record, 0x188 bytes.</summary>
     public const int TradeDataSize = 0x188;
 
