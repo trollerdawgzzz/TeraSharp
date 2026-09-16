@@ -569,3 +569,14 @@ insert that arrived with 0. Both lists are then applied in order, A then B, to t
 (`DAT_140f02f30`) that the decompile does not spell out, and no capture of a 0x276A exists. Records
 carrying that op are echoed but change no row, which is the standing rule for an unmodelled op
 (section 4). Money (op 9) and inserts (op 7) in a trade DO apply. One live 0x276A capture closes this.
+
+## 10. T69 — TS op 0x10
+
+`TS_WARE_GET_ITEM` (16): the whole row moves OUT of a warehouse pocket to
+`(dstOwner, dstInven, dstSlot)` — the withdraw twin of `TS_WARE_MOVE_ITEM` (0x0E). One example in
+cap_social2.log, seq 2085, alone in its list: item 10018, template 17000, (2, inven 1, slot 2) →
+(1003, inven 0, slot 2), delta 0. It is applied by the same case as 0x0E and 0x03.
+
+That brings the ops a normal session issues to: 2, 3, 6+11, 7, 9, 0x0D, 0x0E, **0x10**, 0x0F, 0x11.
+`TS_CHANGE_ITEM_OWNER` (the player-trade op behind `SDB_ITEM_TRADE`, T65 section 9) is still the one
+whose index is unknown.

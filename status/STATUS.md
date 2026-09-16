@@ -241,3 +241,9 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   head-blocking a character's DLM queue; `SA_JOIN_PARTY_IN_ARBITER` 0x13AB now reaches PartyManager,
   which is the only way a party forms in this build; parcel rows carry their parcel id and receiver
   again and attached gold is paid on claim; friend-accepted system message is SMT 433.
+
+- T69 (cap_social2.log, real Arbiter): `SDB_CREATE_GUILD2` 0x27D4 answered — guild creation was
+  unanswered and head-blocked the founder; `SDB_LOAD_REFER_A_FRIEND_LIST` 0x28B0 and
+  `SDB_LOAD_INVITE_FRIEND` 0x28B7 promoted out of the replay table (both echo a DlmId); warehouse
+  MaxSlotCount is 0x48 and EndPos is the last index, not one past it; TS op 0x10 applied. The guild
+  boot terminator and the whole warehouse request/reply layout are confirmed byte-exact.

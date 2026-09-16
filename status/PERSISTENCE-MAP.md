@@ -451,3 +451,12 @@ to `items` and `characters.money`, the same way 0x2768 does for a single player.
 leaves `parcels.money` and lands on `characters.money` when the mail is claimed
 (`SDB_RECV_PARCEL` / `SDB_RECV_PARCEL_EX`); before T65 it was stored and never paid.
 `GetCharacterByName` is `COLLATE NOCASE`, so a mail addressed to `Two` reaches `two`.
+
+T69 adds three rows. `SDB_CREATE_GUILD2` (0x27D4) → `AS_GUILD_JOINED` (0x2866) per joining member
+then `DBS_CREATE_GUILD2` (0x27D5) writes the `guilds`, `guild_members` and `guild_groups` rows for a
+new guild; before T69 it was unanswered and wedged the founder. `SDB_LOAD_REFER_A_FRIEND_LIST`
+(0x28B0 → 0x28B1) and `SDB_LOAD_INVITE_FRIEND` (0x28B7 → **0x28B6**, the reply opcode is
+request-minus-one) are per-login loads answered from nothing — we keep no refer-a-friend state —
+but both echo a DlmId, so they were promoted out of the replay table where a replayed constant
+would have handed World a stale id. Warehouse rows now also follow TS op 0x10, the withdraw twin of
+0x0E.

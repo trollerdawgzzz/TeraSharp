@@ -1403,3 +1403,65 @@ map keeping the largest id and returns `max + 1`. `CreateGuild` seeds groups 1 (
 `T57_every_gated_guild_frame_survives_a_hostile_payload` throws seven hostile payload shapes at all
 twelve: `WorldLink.ReceiveLoop` has no per-frame catch, so one exception here disconnects every
 player (`status/SECURITY-AUDIT.md`).
+
+## 14. T69 — `SDB_CREATE_GUILD2`, and the boot terminator confirmed
+
+### 14.1 The guild is born on the DB-proxy link
+
+Guild creation has no `C_` packet and no `SA_` frame. World finishes the founding contract and
+writes the guild with **`SDB_CREATE_GUILD2` (0x27D4)**. Nothing in TeraSharp answered it: it was
+not in `DbProxyHandlers.IsHandledRequest`, `GuildWiring.WorldOpcodes` does not list it, and the
+replay table has no entry because no guild was ever created in the taps it was built from. So the
+DlmId went unanswered and **the founder's DB queue head-blocked for the rest of the session**.
+
+cap_social2.log seq 1268 → 1269 → 1270: character 1003 founds "test" with member 2 ("Test") as the
+first reply; one `AS_GUILD_JOINED` (0x2866, `[i32 UserDbId]`) goes out for the joining member
+**before** the reply.
+
+`SDB_CREATE_GUILD2`, dumper Arb_part_017.c:4973, guard 0x29 → min frame 0x2A:
+
+| Frame | Field |
+| --- | --- |
+| `[06]` | GuildName offset (wstr, offset only) |
+| `[0A]` `[0E]` | GuildMasterGroupName, GuildMemberGroupName offsets |
+| `[12]` `[16]` | Member offset, bytes — one `i32 UserDbId` per founding co-signer |
+| `[1A]` `[1E]` | ItemBinary offset, bytes — 856-byte atoms, the creation fee |
+| `[22]` `[26]` | ChiefDbId, DlmId |
+
+`DBS_CREATE_GUILD2`, dumper Arb_part_015.c:4192, guard 0x3e → min frame 0x3F (header 57 bytes):
+
+| Frame | Field |
+| --- | --- |
+| `[06]` | GuildName offset |
+| `[0A]` `[0E]` | GuildGroup offset, bytes (`GuildGroupData`, 0x28 each) |
+| `[12]` `[16]` | Member offset, bytes (`GuildMemberData`, 0xF0 each) |
+| `[1A]` `[1E]` | ItemBinary offset, bytes — the fee atoms echoed |
+| `[22]` | FirstReplyName offset |
+| `[26]` `[27]` `[2B]` | Success (u8), GuildDbId, ChiefDbId |
+| `[2F]` `[37]` `[3B]` | CreateTime (i64), DlmId, ErrorNo |
+
+Blocks follow in slot order. seq 1270 reproduces exactly: 63 / (73, 80) / (153, 480) / (633, 856) /
+1489, payload 1493 B — two groups, two members, one fee atom, "Test".
+
+The two rank names are World's strings, not ours: "Guild Master" and "Recruit" arrive in the
+request. `GuildWiring.CreateGuildFromWorld` passes them straight to `GuildHandlers.CreateGuild`.
+The fee atoms are echoed, not applied — World already took the money through the `SDB_ITEM_SINGLE`
+that preceded this.
+
+**Known deviation.** `CreateGuild` emits `EmitMemberAdded` for the chief too, so we send one
+`AS_GUILD_JOINED` more than seq 1269. It is a per-user push with no reply; matching the capture
+exactly would change `CreateGuild`'s contract, which T52's tests pin.
+
+**ErrorNo** is the one invented value: the enum is not in the decompile and every captured frame
+carries 0, so a refusal sends `DbProxyHandlers.CreateGuildErrorGeneric` (1) and still echoes the
+DlmId, because a refused create must drain the queue like an accepted one.
+
+### 14.2 The boot terminator, confirmed from a second capture
+
+`SDB_INIT_GUILD` (0x27CF, zero-length) → one `DBS_INIT_GUILD_DATA` (0x27ED) with Success 0, and it
+is **9141 bytes**: a full default-constructed `GuildData`, not a short frame. cap_social2.log seq 2
+matches `GuildPackets.BuildEmptyDbsInitGuildData()` byte for byte — header `[19][0x23A0][9139][0]`,
+and exactly sixteen non-zero bytes in the blob: GuildLevel 1 at 0x64, epoch timestamps at 0x80 /
+0x2328 / 0x2348, JoinMinLevel 1 / JoinMaxLevel 70 / GuildJoinType 1 at 0x235C / 0x2360 / 0x2364.
+The two uninitialised bytes T51 recorded from `data/cap_guild.bin` are **zero** here, which
+retires that note: the leak was that one Arbiter run's stack, not part of the format.

@@ -977,6 +977,11 @@ public sealed class GuildHandlers
     /// two World frames GuildUtil::UserJoinToGuild sends - AS_ADD_GUILDMEMBER broadcast to every
     /// world, AS_GUILD_JOINED to the joiner's own world session only.
     /// </summary>
+    /// <summary>T69: the same fan-out, for the founding members SDB_CREATE_GUILD2 names. The
+    /// create path is on the DB-proxy link, not a client packet, so it has no other way in.</summary>
+    internal void EmitMemberAddedForWorld(GuildActions a, int guildId, int userDbId)
+        => EmitMemberAdded(a, guildId, userDbId);
+
     private void EmitMemberAdded(GuildActions a, int guildId, int userDbId)
     {
         var m = _store.GetGuildMember(userDbId);
