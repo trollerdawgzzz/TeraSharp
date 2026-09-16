@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Logging;
 using TeraSharp.Arbiter.Network;
+using TeraSharp.Arbiter.Persistence;
 using TeraSharp.Arbiter.World;
 
 namespace TeraSharp.Arbiter.Handlers;
@@ -121,6 +122,88 @@ public sealed class BrokerHandlers
         _ => null,       // CLOSE, DEAL_CONFIRM, DEAL_PRICE_UPDATE, REJECT_SUGGEST
     };
 
+
+    /// <summary>
+    /// T72: the same answers, but served from the listings table. Falls back to
+    /// <see cref="ReplyFor(ushort)"/> for every packet the table has nothing to say about, so the
+    /// shapes T55 pinned stay exactly as they were.
+    ///
+    /// <para>Byte-exact against cap_social3_client.log given the same rows: the three
+    /// <c>S_TRADE_BROKER_WAITING_ITEM_LIST</c> forms (seq 1231 empty, 1419 three rows, 1472 two),
+    /// <c>S_TRADE_BROKER_BOUGHT_ITEM_LIST</c> (seq 1486 and the empty 1491),
+    /// <c>S_TRADE_BROKER_HIGHEST_ITEM_LEVEL</c> (seq 134) and <c>S_TRADE_BROKER_BUY_IT_NOW</c>
+    /// (seq 1469).</para>
+    ///
+    /// <para><b>Two are deliberately left on the empty form.</b>
+    /// <c>S_TRADE_BROKER_REGISTERED_ITEM_LIST</c> appears in the capture only empty (seq 1276),
+    /// and <c>S_TRADE_BROKER_SOLD_ITEM_LIST</c> never appears at all - the client asked twice and
+    /// the real Arbiter answered neither. Filling them by analogy with the two lists we DID see
+    /// is the guess that desyncs a window; they wait for a capture that holds one.</para>
+    /// </summary>
+    public static byte[]? ReplyFor(ushort op, CharacterStore? store, int characterId)
+    {
+        if (store == null) return ReplyFor(op);
+
+        switch (op)
+        {
+            case BrokerPackets.C_TRADE_BROKER_WAITING_ITEM_LIST_NEW:
+            case BrokerPackets.C_TRADE_BROKER_WAITING_ITEM_LIST_PAGE:
+            case BrokerPackets.C_TRADE_BROKER_WAITING_ITEM_LIST_SORT:
+            {
+                var rows = store.SearchBrokerListings(0, 0, BrokerPageSize);
+                var page = new List<(int, long, int, int, long, int, string)>(rows.Count);
+                foreach (var r in rows)
+                    page.Add((r.TradeId, r.ItemDbId, r.TemplateId, r.Amount, r.Price, r.SellerDbId, r.SellerName));
+                int total = store.CountBrokerListings(0);
+                uint pages = (uint)Math.Max(1, (total + BrokerPageSize - 1) / BrokerPageSize);
+                return Frame(BrokerPackets.S_TRADE_BROKER_WAITING_ITEM_LIST,
+                    BrokerPackets.BuildSWaitingItemListBody(page, 0, pages));
+            }
+
+            case BrokerPackets.C_TRADE_BROKER_BOUGHT_ITEM_LIST:
+            {
+                var rows = store.GetBrokerPurchasesOf(characterId);
+                var page = new List<(int, long, int, int, long, int, string, long, long)>(rows.Count);
+                foreach (var r in rows)
+                    page.Add((r.TradeId, r.ItemDbId, r.TemplateId, r.Amount, r.Price, r.SellerDbId,
+                              r.SellerName, UnixSeconds(r.RegisteredAt), UnixSeconds(r.SoldAt)));
+                return Frame(BrokerPackets.S_TRADE_BROKER_BOUGHT_ITEM_LIST,
+                    BrokerPackets.BuildSBoughtItemListBody(page));
+            }
+
+            default:
+                return ReplyFor(op);
+        }
+    }
+
+    /// <summary>One page of search results. The capture never paged past the first, so this is
+    /// ours to choose; it only has to agree with the TotalPage the same reply carries.</summary>
+    public const int BrokerPageSize = 100;
+
+    /// <summary>
+    /// The counts the two collect tabs badge themselves with. Not wired to a client packet:
+    /// <c>C_TRADE_BROKER_CALC_SOLD_ITEM</c>, <c>_CALC_BOUGHT_ITEM</c> and
+    /// <c>C_TRADE_BROKER_BUY_IT_NOW</c> are WORLD's - they are not in
+    /// <see cref="ClientOpcodes"/>, and it is World sending them on to us as the DB-proxy
+    /// 0x281B / 0x281D / 0x281F that does the work. Answering them here as well would double
+    /// up on whatever World already told the client.
+    /// </summary>
+    public static byte[] CalcNotifyBodyFor(CharacterStore store, int characterId)
+    {
+        int sold = store.GetBrokerListingsOf(characterId, CharacterStore.BrokerSold).Count;
+        return BrokerPackets.BuildSCalcNotifyBody(sold, store.GetBrokerPurchasesOf(characterId).Count);
+    }
+
+    /// <summary>The two time fields in a bought-list row are UNIX seconds - 0x6AAB190F and
+    /// 0x6AAB191E in seq 1486, fifteen apart, which is the same gap the TradeData record's
+    /// RegisterTime and SoldTime have.</summary>
+    private static long UnixSeconds(string? stored)
+        => DateTime.TryParse(stored, System.Globalization.CultureInfo.InvariantCulture,
+               System.Globalization.DateTimeStyles.AssumeUniversal | System.Globalization.DateTimeStyles.AdjustToUniversal,
+               out var t)
+           ? new DateTimeOffset(t, TimeSpan.Zero).ToUnixTimeSeconds()
+           : 0;
+
     // ------------------------------------------------------------------ the handler
 
     /// <summary>
@@ -145,11 +228,11 @@ public sealed class BrokerHandlers
             return true;
         }
 
-        var reply = ReplyFor(opcode);
+        var reply = ReplyFor(opcode, global::TeraSharp.Arbiter.Program.Store, (int)s.PlayerId);
         if (reply == null)
         {
-            _log.LogDebug("0x{Op:X4} from {Id} - Arbiter-owned, nothing to answer with while the "
-                + "broker has no listings", opcode, s.Id);
+            _log.LogDebug("0x{Op:X4} from {Id} - Arbiter-owned, and the real Arbiter answers it "
+                + "with nothing either", opcode, s.Id);
             return true;
         }
 

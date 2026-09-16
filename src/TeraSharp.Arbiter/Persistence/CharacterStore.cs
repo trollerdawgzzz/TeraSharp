@@ -2238,7 +2238,7 @@ SELECT last_insert_rowid();";
             using var cmd = _db.CreateCommand();
             cmd.CommandText =
                 $"SELECT {BrokerColumns} FROM broker_listings WHERE state=$st "
-                + "AND ($t = 0 OR template_id = $t) ORDER BY price ASC, trade_id ASC LIMIT $n OFFSET $o";
+                + "AND ($t = 0 OR template_id = $t) ORDER BY price ASC, trade_id DESC LIMIT $n OFFSET $o";
             cmd.Parameters.AddWithValue("$st", BrokerListed);
             cmd.Parameters.AddWithValue("$t", templateId);
             cmd.Parameters.AddWithValue("$n", pageSize);

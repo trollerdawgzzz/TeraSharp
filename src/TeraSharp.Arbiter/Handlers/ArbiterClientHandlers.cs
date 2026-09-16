@@ -426,9 +426,11 @@ public static class ArbiterClientHandlers
 
     /// <summary>
     /// C_TRADE_BROKER_HIGHEST_ITEM_LEVEL (0xEAFB) -> S_TRADE_BROKER_HIGHEST_ITEM_LEVEL (0x7E53).
-    /// The real handler writes one value through <c>FUN_1404aa390</c> (the float writer) and we
-    /// have no broker, so 0 is the honest answer: the client uses it to pre-fill the
-    /// item-level filter in the broker search.
+    /// The real handler writes one value through <c>FUN_1404aa390</c> (the float writer). T45
+    /// sent 0 because there was no broker; cap_social3_client.log seq 134 and 3217 show the real
+    /// Arbiter sending <b>469.0</b>, both times and for both characters, so it is static config
+    /// (the cap the search window's item-level slider runs to) rather than anything about this
+    /// character or the listings. A 0 collapses that slider to nothing.
     /// </summary>
     public static byte[] BuildTradeBrokerHighestItemLevel(float level)
     {
@@ -442,7 +444,7 @@ public static class ArbiterClientHandlers
 
     public static bool OnTradeBrokerHighestItemLevel(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
     {
-        s.Send(BuildTradeBrokerHighestItemLevel(0f));
+        s.Send(BuildTradeBrokerHighestItemLevel(World.BrokerPackets.HighestItemLevelDefault));
         return true;
     }
 

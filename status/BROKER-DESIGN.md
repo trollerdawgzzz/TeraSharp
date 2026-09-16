@@ -502,3 +502,88 @@ cap_social3_client.log and still answered with the empty forms: `S_TRADE_BROKER_
 `_BOUGHT_ITEM_LIST`, `_CALC_NOTIFY` (×4) and `_HIGHEST_ITEM_LEVEL` (×2). The store side is ready —
 `SearchBrokerListings`, `CountBrokerListings`, `GetBrokerListingsOf` and `GetBrokerPurchasesOf`
 exist and are tested — so what remains is decoding the per-row body each `S_` list carries.
+
+## T72 — the client windows, and the red test
+
+### The red test first
+
+`T71_registering_creates_a_listing_and_pockets_the_item` asserted the seller lost 500 gold to the
+listing fee. The atom **did** reach `AddCharacterMoney` — the test's character simply had no gold,
+and `AddCharacterMoney` clamps (`MAX(0, money + $d)`), so −500 landed as a no-op. The test was
+wrong, not the code: the real seller in seq 1515 had gold, and so does the test's now.
+
+### The two list bodies
+
+Both use TERA's ordinary array encoding with **packet-relative** offsets:
+
+```
+body     [u16 count][u16 firstElementOffset]  then the packet's own scalars
+element  [u16 here][u16 next (0 = last)][u16 nameOffset]  fields...  name at nameOffset
+```
+
+An element is `fixedSize + (name.Length + 1) * 2` bytes.
+
+`S_TRADE_BROKER_WAITING_ITEM_LIST` (0xFD2C) — fixed part **92**, body scalars `[u32 page][u32 totalPage]`:
+
+| Offset | Field |
+| --- | --- |
+| +6 | TradeId |
+| +10 | ItemDbId (i64) |
+| +18 | TemplateId |
+| +22 | Amount |
+| +35 | Price (i64) |
+| +43 | TotalPriceWithTax (i64) |
+| +55 | SellerDbId |
+
+`S_TRADE_BROKER_BOUGHT_ITEM_LIST` (0x53C0) — fixed part **98**, and **no page scalars at all**:
+
+| Offset | Field |
+| --- | --- |
+| +6 | TradeId |
+| +14 | ItemDbId (i64) |
+| +22 | TemplateId |
+| +26 | Amount |
+| +39 | RegisterTime, UNIX seconds (i64) |
+| +47 | Price (i64) |
+| +55 | SellerDbId |
+| +59 | u8, 1 |
+| +60 | SoldTime, UNIX seconds (i64) |
+| +68 | TotalPaid (i64) |
+
+The two element shapes differ — four extra bytes before ItemDbId in the bought list — so they are
+not interchangeable despite the overlapping names. The waiting-list offsets were cross-checked
+against all three listings in seq 1419 (three templates, two prices); every one lands at the same
+element-relative offset in all three.
+
+**The broker's cut is a tenth, truncated**: 10001 comes back 11001 and 1 comes back 1, and that is
+the same number `SDB_TRADE_BROKER_BUY_IT_NOW` carries as `TotalPriceWithTax`.
+
+**Tie-break**: at equal price the capture lists the newest first (trade 2 before trade 1), so
+`SearchBrokerListings` orders `price ASC, trade_id DESC`.
+
+### The small ones
+
+| Packet | Body | Capture |
+| --- | --- | --- |
+| `S_TRADE_BROKER_HIGHEST_ITEM_LEVEL` | one **float**, 469.0 | seq 134, 3217 |
+| `S_TRADE_BROKER_BUY_IT_NOW` | one byte, 1 | seq 1469 |
+| `S_TRADE_BROKER_CALC_NOTIFY` | `[u32 soldWaiting][u32 boughtWaiting]` | seq 272 / 1462 / 1492 |
+
+T45 answered HIGHEST_ITEM_LEVEL with **0** because there was no broker; the real Arbiter answers
+469.0 both times it is asked, for both characters, so it is static config — the cap the search
+window's item-level slider runs to. A 0 collapses that slider to nothing.
+
+### What is still on the empty form, and why
+
+* `S_TRADE_BROKER_REGISTERED_ITEM_LIST` — the capture contains **one**, and it is empty (seq 1276).
+* `S_TRADE_BROKER_SOLD_ITEM_LIST` — the client asked twice and the real Arbiter answered
+  **neither**; the packet never appears.
+
+Filling either by analogy with the two lists we did see is the guess that desyncs a window. They
+wait for a capture that holds a populated one.
+
+`C_TRADE_BROKER_CALC_SOLD_ITEM`, `_CALC_BOUGHT_ITEM` and `C_TRADE_BROKER_BUY_IT_NOW` are **World's**
+client packets, not ours — they are not in `BrokerHandlers.ClientOpcodes`, and it is World relaying
+them to us as the DB-proxy 0x281B / 0x281D / 0x281F that does the work. `CalcNotifyBodyFor` exists
+for a caller that wants the badge counts, but nothing answers those three here: doing so would
+double up on what World already told the client.
