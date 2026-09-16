@@ -2140,6 +2140,8 @@ array items
             0x15F9,
             // T42: SDB_MOVE_WAREHOUSE_ITEM is a ten-line stub in the real Arbiter that sends nothing.
             0x2754,
+            // T62: SDB_ADD_PVP_USER_LOG, sent at logout, no SendToSession in its handler.
+            0x27FE,
             // T47 sealed the through-Arbiter contract family here (0x2809, 0x280C, 0x280D,
             // 0x280E). T60 UNSEALED all four: they are gated to ContractBroker off
             // WorldBridge's default arm instead, and a SEALED opcode never reaches a gate.
@@ -12857,6 +12859,7 @@ some prose with `backticks` that is not a table row
             30152, 43407, 61398, 23377, 28262, 64109, 33506, 57252, 46956,
             39349, 60155, 27265, 54263, 60477, 33239, 34411, 53135, 22631,
             58817,
+            22073, 42458, 31605,   // T62 - C_ASK_INTERACTIVE, C_WATCHED_MOVIES, C_FINDNAME
         };
         Hex.True(ArbiterClientHandlers.ArbiterOwned.Count == observed.Length,
             $"{ArbiterClientHandlers.ArbiterOwned.Count} in the set, {observed.Length} observed");
@@ -16950,6 +16953,82 @@ some prose with `backticks` that is not a table row
             "with the offset slot still written - frame 19, count 0");
         Hex.True(DbProxyHandlers.IsHandledRequest(DbProxyHandlers.SDB_LOAD_PREMIUM_SLOT_LEFT_COOLTIME),
             "and 0x28BD is allow-listed now");
+    }
+
+    // ===================== T62: three live leftovers =====================
+
+    /// <summary>
+    /// C_ASK_INTERACTIVE -&gt; S_ANSWER_INTERACTIVE. Right-clicking a friend sends the first and the
+    /// client will not open its context menu without the second, which is what put friend delete
+    /// out of reach. Request offsets are Handler_C_ASK_INTERACTIVE's own reads (guard 0x0E); the
+    /// reply field order is the writer's, and the names are the PDL dumper's.
+    /// </summary>
+    [Test] public static void T62_ask_interactive_answers_at_the_handlers_offsets()
+    {
+        var body = Hex.B("0E 00  03 00 00 00  F0 0A 00 00  64 00 6F 00 62 00 00 00");
+        var r = ArbiterClientHandlers.ParseAskInteractive(body);
+        Hex.True(r != null, "an 18-byte body (22-byte packet) parses");
+        Hex.True(r!.Value.AskType == 3 && r.Value.TargetPlanetId == 2800 && r.Value.TargetName == "dob",
+            $"type {r.Value.AskType}, planet {r.Value.TargetPlanetId}, name '{r.Value.TargetName}'");
+        Hex.True(ArbiterClientHandlers.ParseAskInteractive(new byte[9]) == null,
+            "one byte short of the guard is refused");
+
+        Hex.Eq(ArbiterClientHandlers.BuildAnswerInteractive(3, 10101, 65, true, false, 2800, "dob"),
+            "20 00  C8 85  18 00  03 00 00 00  75 27 00 00  41 00 00 00  01  00  F0 0A 00 00  "
+            + "64 00 6F 00 62 00 00 00",
+            "S_ANSWER_INTERACTIVE: [nameOff=24][AskType][TargetTemplateId][TargetLevel]"
+            + "[TargetInParty][TargetInGuild][TargetPlanetId][name]");
+        Hex.True(ArbiterClientHandlers.AskInteractivePacketSize == 0x0E
+                 && ArbiterClientHandlers.AnswerInteractivePacketSize == 0x18,
+            "the two sizes the guards compare against");
+    }
+
+    /// <summary>
+    /// S_WATCHED_MOVIES, built the way Account::SendWatchedMoviesToClient builds it: the standard
+    /// TERA list encoding, count at 0x04 and the first element's offset at 0x06, each element
+    /// carrying its own offset and the next one's (0 on the last). An empty list is the 8-byte
+    /// fixed part with both slots zero - which is the answer a character who has seen nothing
+    /// gets, and is still an answer, so the intro stops replaying.
+    /// </summary>
+    [Test] public static void T62_watched_movies_uses_the_standard_list_encoding()
+    {
+        Hex.Eq(ArbiterClientHandlers.BuildWatchedMovies(null),
+            "08 00  A4 97  00 00  00 00",
+            "nothing seen yet: count 0, offset 0");
+        Hex.Eq(ArbiterClientHandlers.BuildWatchedMovies(new[] { 1001, 1002 }),
+            "18 00  A4 97  02 00  08 00  08 00  10 00  E9 03 00 00  10 00  00 00  EA 03 00 00",
+            "two movies: each entry is [here][next][movieId], next 0 on the last");
+        Hex.True(ArbiterClientHandlers.WatchedMoviesPacketSize == 4,
+            "the request is header-only - Handler_C_WATCHED_MOVIES guards on param_3 < 4 and reads nothing");
+    }
+
+    /// <summary>
+    /// C_FINDNAME -&gt; S_FINDNAME, pinned against the REAL Arbiter's replies in
+    /// D:\packetlogs\cap_social_client_ctl.txt frames 1093 / 1096 / 1098 - three keystrokes of
+    /// "two", each answered with the query echoed and an empty result.
+    /// </summary>
+    [Test] public static void T62_findname_matches_the_real_arbiters_replies()
+    {
+        // frame 1097 C->S, verbatim
+        var req = ArbiterClientHandlers.ParseFindName(Hex.B("0A 00  01 00 00 00  74 00 77 00 6F 00 00 00"));
+        Hex.True(req != null && req.Value.FindType == 1 && req.Value.Query == "two",
+            $"C_FINDNAME parses to type {req?.FindType}, query '{req?.Query}'");
+
+        // frames 1093 / 1096 / 1098 S->C, verbatim
+        Hex.Eq(ArbiterClientHandlers.BuildFindName(1, "t", null),
+            "12 00  5D F9  0C 00  10 00  01 00 00 00  74 00 00 00  00 00", "frame 1093");
+        Hex.Eq(ArbiterClientHandlers.BuildFindName(1, "tw", Array.Empty<string>()),
+            "14 00  5D F9  0C 00  12 00  01 00 00 00  74 00 77 00 00 00  00 00", "frame 1096");
+        Hex.Eq(ArbiterClientHandlers.BuildFindName(1, "two", Array.Empty<string>()),
+            "16 00  5D F9  0C 00  14 00  01 00 00 00  74 00 77 00 6F 00 00 00  00 00", "frame 1098");
+
+        // and the shape of a hit - the separator is the one byte T62 guessed rather than read
+        Hex.Eq(ArbiterClientHandlers.BuildFindName(1, "two", new[] { "dob" }),
+            "1C 00  5D F9  0C 00  14 00  01 00 00 00  74 00 77 00 6F 00 00 00  64 00 6F 00 62 00 00 00",
+            "one match, at the second string offset");
+        Hex.True(ArbiterClientHandlers.FindNameMaxResults == 10,
+            "User::FindNameLog re-tests list.size() < 10 in each of its three passes");
+        Hex.True(ArbiterClientHandlers.ParseFindName(new byte[5]) == null, "5 B is one short of the guard");
     }
 
 }

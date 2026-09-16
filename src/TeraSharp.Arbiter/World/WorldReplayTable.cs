@@ -123,6 +123,12 @@ public sealed class WorldReplayTable
         // it here is what stops the replay table handing it somebody else's DBS_ reply.
         // status/MAIL-WAREHOUSE.md section 4.1.
         0x2754, // SDB_MOVE_WAREHOUSE_ITEM
+
+        // T62: SDB_ADD_PVP_USER_LOG, seen at every logout (14 B; the guard is param_3 < 0xE).
+        // Handler_SDB_ADD_PVP_USER_LOG (Arb_part_062.c:19349) reads the killer and victim db ids
+        // at frame 6 and 10, looks both users up and writes a log row - no SendToSession. It was
+        // briefed as the cinematic-seen flag; it is not (that is C_WATCHED_MOVIES, Arbiter-owned).
+        0x27FE, // SDB_ADD_PVP_USER_LOG
         0x15FA, // one-way push, once per session
     };
 

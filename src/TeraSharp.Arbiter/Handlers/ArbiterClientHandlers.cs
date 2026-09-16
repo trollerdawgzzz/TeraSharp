@@ -62,6 +62,16 @@ public static class ArbiterClientHandlers
     /// <summary>The frame C_ADD_TRADE_BAG becomes. 54 bytes.</summary>
     public const ushort AS_ADD_TRADE_BAG = 0x1637;
 
+    /// <summary>T62. 22073. Right-click a name; without the answer the menu never opens.</summary>
+    public const ushort C_ASK_INTERACTIVE = 0x5639;        // 22073
+    public const ushort S_ANSWER_INTERACTIVE = 0x85C8;     // 34248
+    /// <summary>T62. 42458. Which cinematics this player has already seen.</summary>
+    public const ushort C_WATCHED_MOVIES = 0xA5DA;         // 42458
+    public const ushort S_WATCHED_MOVIES = 0x97A4;         // 38820
+    /// <summary>T62. 31605. Name completion, one packet per keystroke.</summary>
+    public const ushort C_FINDNAME = 0x7B75;               // 31605
+    public const ushort S_FINDNAME = 0xF95D;               // 63837
+
     /// <summary>
     /// Every opcode above, as an explicit statement that these are the ARBITER's. The forwarding
     /// fallback in <c>PacketDispatcher</c> must never apply to one of them: forwarding produces
@@ -78,6 +88,7 @@ public static class ArbiterClientHandlers
         C_DUNGEON_COOL_TIME_LIST, C_VIEW_BATTLE_FIELD_RESULT, C_REQUEST_CANDIDATE_LIST,
         C_SHOW_AWESOMIUMWEB_SHOP, C_RESET_ALL_DUNGEON,
         C_ADD_TRADE_BAG,   // T60 - the nineteenth, found the same way (live 2026-09-15)
+        C_ASK_INTERACTIVE, C_WATCHED_MOVIES, C_FINDNAME,   // T62 - twenty, twenty-one, twenty-two
     };
 
     // =========================================================================================
@@ -545,6 +556,279 @@ public static class ArbiterClientHandlers
         return true;
     }
 
+    // =========================================================================================
+    // 10. C_ASK_INTERACTIVE -> S_ANSWER_INTERACTIVE          (T62, the right-click context menu)
+    // =========================================================================================
+
+    /// <summary>
+    /// C_ASK_INTERACTIVE (0x5639, 22073). Right-clicking a name - in the friend list, the party
+    /// window or a chat line - asks the Arbiter who that is before the client will open the
+    /// context menu. Without an answer the menu never opens, which is why friend delete was
+    /// unreachable.
+    ///
+    /// <para>Layout from <c>Handler_C_ASK_INTERACTIVE</c> (FUN_1404dba80, Arb_part_040.c:19168),
+    /// whose guard is <c>param_3 &lt; 0xE</c>:
+    /// <c>[0x04] u16 TargetName offset</c> <c>[0x06] i32 AskType</c>
+    /// <c>[0x0A] i32 TargetPlanetId</c>, then the NUL-terminated UTF-16LE name.</para>
+    /// </summary>
+    public const int AskInteractivePacketSize = 0x0E;                        // 14
+    public const int AskInteractiveBodySize = AskInteractivePacketSize - 4;  // 10
+    /// <summary>S_ANSWER_INTERACTIVE's fixed part: seven fields then the name.</summary>
+    public const int AnswerInteractivePacketSize = 0x18;                     // 24
+
+    /// <summary>C_ASK_INTERACTIVE, read at the handler's own offsets.</summary>
+    public readonly record struct AskInteractiveRequest(int AskType, int TargetPlanetId, string TargetName);
+
+    /// <summary>Parse C_ASK_INTERACTIVE from the BODY (the dispatcher strips the 4-byte header).</summary>
+    public static AskInteractiveRequest? ParseAskInteractive(ReadOnlySpan<byte> body)
+    {
+        if (body.Length < AskInteractiveBodySize) return null;
+        return new AskInteractiveRequest(
+            BitConverter.ToInt32(body[0x02..]),     // packet 0x06
+            BitConverter.ToInt32(body[0x06..]),     // packet 0x0A
+            ReadWString(body, 0x00));               // the offset slot at packet 0x04
+    }
+
+    /// <summary>
+    /// S_ANSWER_INTERACTIVE (0x85C8). Field names and order are the PDL dumper FUN_14024f7e0
+    /// (Arb_part_018.c:9818); the writer in the handler emits them in exactly this order:
+    /// <c>[0x04] u16 TargetName offset</c> <c>[0x06] i32 AskType</c> <c>[0x0A] i32 TargetTemplateId</c>
+    /// <c>[0x0E] i32 TargetLevel</c> <c>[0x12] bool TargetInParty</c> <c>[0x13] bool TargetInGuild</c>
+    /// <c>[0x14] i32 TargetPlanetId</c>, then the name at 0x18.
+    /// </summary>
+    public static byte[] BuildAnswerInteractive(int askType, int targetTemplateId, int targetLevel,
+        bool targetInParty, bool targetInGuild, int targetPlanetId, string targetName)
+    {
+        var n = WString(targetName);
+        int total = AnswerInteractivePacketSize + n.Length;
+        var p = new byte[total];
+        BitConverter.GetBytes((ushort)total).CopyTo(p, 0);
+        BitConverter.GetBytes(S_ANSWER_INTERACTIVE).CopyTo(p, 2);
+        BitConverter.GetBytes((ushort)AnswerInteractivePacketSize).CopyTo(p, 4);
+        BitConverter.GetBytes(askType).CopyTo(p, 6);
+        BitConverter.GetBytes(targetTemplateId).CopyTo(p, 10);
+        BitConverter.GetBytes(targetLevel).CopyTo(p, 14);
+        p[18] = (byte)(targetInParty ? 1 : 0);
+        p[19] = (byte)(targetInGuild ? 1 : 0);
+        BitConverter.GetBytes(targetPlanetId).CopyTo(p, 20);
+        n.CopyTo(p, AnswerInteractivePacketSize);
+        return p;
+    }
+
+    /// <summary>
+    /// Is this character in a party? Parties are in-memory Arbiter state (status/PARTY-DESIGN.md),
+    /// so nothing in CharacterStore can answer it. The human wires this to
+    /// <c>pm.FindByMember(id) != null</c> next to the other PartyManager wiring; until then the
+    /// flag is false, which only costs the client the "leave party" menu entry.
+    /// </summary>
+    public static Func<int, bool>? PartyLookup;
+
+    /// <summary>
+    /// C_ASK_INTERACTIVE. The real handler requires the target to be IN WORLD
+    /// (<c>FUN_14082dc50(userMgr, name, 2)</c> is a by-name lookup with state 2) and answers
+    /// nothing at all when the lookup misses - no packet, no error. We do the same, then fall
+    /// back to the stored character row so a right-click on an offline friend still opens a menu.
+    /// </summary>
+    public static bool OnAskInteractive(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        var req = ParseAskInteractive(body.Span);
+        if (req == null)
+        {
+            log.LogWarning("C_ASK_INTERACTIVE: {Len} B body (want {Want})", body.Length, AskInteractiveBodySize);
+            return true;
+        }
+        var r = req.Value;
+        if (r.TargetName.Length == 0) return true;
+
+        int templateId = 0, level = 0, dbId = 0;
+        var bridge = Program.World;
+        if (bridge != null)
+        {
+            foreach (var other in bridge.InWorldSessions())
+            {
+                var c = other.SelectedCharacter;
+                if (c == null || !string.Equals(c.Name, r.TargetName, StringComparison.OrdinalIgnoreCase)) continue;
+                dbId = (int)c.Id; templateId = c.TemplateId; level = c.Level;
+                break;
+            }
+        }
+        if (dbId == 0)
+        {
+            var row = Program.Store?.GetCharacterByName(r.TargetName);
+            if (row == null)
+            {
+                // The real Arbiter sends nothing for a name it cannot resolve.
+                log.LogDebug("C_ASK_INTERACTIVE: '{Name}' resolves to nobody - no answer", r.TargetName);
+                return true;
+            }
+            dbId = row.Id; templateId = row.TemplateId; level = row.Level;
+        }
+
+        bool inParty = PartyLookup != null && PartyLookup(dbId);
+        bool inGuild = (Program.Store?.GetGuildIdOf(dbId) ?? 0) != 0;
+
+        s.Send(BuildAnswerInteractive(r.AskType, templateId, level, inParty, inGuild,
+                                      TeraSharp.Arbiter.World.ContractBroker.PlanetId, r.TargetName));
+        log.LogInformation("C_ASK_INTERACTIVE: {Who} asked about {Name} (type {Type}, party {P}, guild {G})",
+            s.SelectedCharacter?.Name, r.TargetName, r.AskType, inParty, inGuild);
+        return true;
+    }
+
+    // =========================================================================================
+    // 11. C_WATCHED_MOVIES -> S_WATCHED_MOVIES               (T62, the intro cutscene replay)
+    // =========================================================================================
+
+    /// <summary>
+    /// C_WATCHED_MOVIES (0xA5DA, 42458). The client asks, once per session, which cinematics this
+    /// player has already seen; anything missing from the answer is played again. Unanswered, the
+    /// intro replays on every relog.
+    ///
+    /// <para><c>Handler_C_WATCHED_MOVIES</c> (FUN_1404f2300, Arb_part_041.c:14640) guards on
+    /// <c>param_3 &lt; 4</c> - i.e. the header only - reads no field, and calls
+    /// <c>Account::SendWatchedMoviesToClient</c>.</para>
+    /// </summary>
+    public const int WatchedMoviesPacketSize = 4;
+    public const int WatchedMoviesBodySize = 0;
+    /// <summary>S_WATCHED_MOVIES' fixed part: <c>[u16 count][u16 firstOffset]</c>.</summary>
+    public const int WatchedMoviesReplyFixedSize = 8;
+    /// <summary>One list entry: <c>[u16 here][u16 next][u32 movieId]</c>.</summary>
+    public const int WatchedMovieEntrySize = 8;
+
+    /// <summary>
+    /// S_WATCHED_MOVIES (0x97A4), built the way <c>Account::SendWatchedMoviesToClient</c>
+    /// (FUN_1407856c0, Arb_part_065.c:12231) builds it: the standard TERA list encoding, where the
+    /// count sits at 0x04, the offset of the first element at 0x06, and each element starts with
+    /// its OWN offset and the offset of the next (0 on the last).
+    /// </summary>
+    public static byte[] BuildWatchedMovies(IReadOnlyList<int>? movieIds)
+    {
+        movieIds ??= Array.Empty<int>();
+        int n = movieIds.Count;
+        int total = WatchedMoviesReplyFixedSize + n * WatchedMovieEntrySize;
+        var p = new byte[total];
+        BitConverter.GetBytes((ushort)total).CopyTo(p, 0);
+        BitConverter.GetBytes(S_WATCHED_MOVIES).CopyTo(p, 2);
+        BitConverter.GetBytes((ushort)n).CopyTo(p, 4);
+        BitConverter.GetBytes((ushort)(n == 0 ? 0 : WatchedMoviesReplyFixedSize)).CopyTo(p, 6);
+        for (int i = 0; i < n; i++)
+        {
+            int at = WatchedMoviesReplyFixedSize + i * WatchedMovieEntrySize;
+            BitConverter.GetBytes((ushort)at).CopyTo(p, at);
+            BitConverter.GetBytes((ushort)(i == n - 1 ? 0 : at + WatchedMovieEntrySize)).CopyTo(p, at + 2);
+            BitConverter.GetBytes(movieIds[i]).CopyTo(p, at + 4);
+        }
+        return p;
+    }
+
+    /// <summary>
+    /// C_WATCHED_MOVIES. Answers from the stored per-character list.
+    ///
+    /// <para><b>The real Arbiter stores this per ACCOUNT, not per character</b> -
+    /// <c>Account::CachedWatchedMoviesWithLock</c> (FUN_1407095a0) reads it with the stored
+    /// procedure <c>spLoadUserWatchedMovies</c> and merges the ReplayMovieData sheet on top.
+    /// We store it per character because that is the row TeraSharp owns; if two characters on one
+    /// account should share the flag, the store method is the one place to change.</para>
+    /// </summary>
+    public static bool OnWatchedMovies(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        var chr = s.SelectedCharacter;
+        var movies = chr != null && Program.Store != null
+            ? Program.Store.GetWatchedMovies((int)chr.Id)
+            : (IReadOnlyList<int>)Array.Empty<int>();
+        s.Send(BuildWatchedMovies(movies));
+        log.LogInformation("C_WATCHED_MOVIES: {Name} has seen {N} cinematic(s)", chr?.Name, movies.Count);
+        return true;
+    }
+
+    // =========================================================================================
+    // 12. C_FINDNAME -> S_FINDNAME                           (T62, name completion while typing)
+    // =========================================================================================
+
+    /// <summary>
+    /// C_FINDNAME (0x7B75, 31605). Sent on every keystroke while a name is being typed; the body
+    /// grows 2 bytes per character. <c>Handler_C_FINDNAME</c> (FUN_1404e0620, Arb_part_041.c:2602)
+    /// guards on <c>param_3 &lt; 10</c>:
+    /// <c>[0x04] u16 Query offset</c> <c>[0x06] i32 FindType</c>, then the NUL-terminated name.
+    /// </summary>
+    public const int FindNamePacketSize = 10;
+    public const int FindNameBodySize = FindNamePacketSize - 4;              // 6
+    /// <summary>S_FINDNAME's fixed part: two string offsets and the echoed type.</summary>
+    public const int FindNameReplyFixedSize = 12;
+    /// <summary>
+    /// <c>User::FindNameLog</c> (FUN_1403846b0, Arb_part_028.c:16187) stops at ten matches -
+    /// every one of its three passes re-tests <c>list.size() &lt; 10</c>.
+    /// </summary>
+    public const int FindNameMaxResults = 10;
+    /// <summary>
+    /// The character the real handler joins matches with. It is a single wchar from
+    /// <c>DAT_140b41838</c>, which Ghidra did not type, so this is the ONE byte in T62 that is a
+    /// guess rather than a reading. A comma is what the client's own name lists use. If completion
+    /// shows one run-together string, this is the constant to change.
+    /// </summary>
+    public const char FindNameSeparator = ',';
+    /// <summary>Only type 1 does anything; FindNameLog returns an empty list for anything else.</summary>
+    public const int FindNameTypeNameLog = 1;
+
+    /// <summary>C_FINDNAME, read at the handler's own offsets.</summary>
+    public readonly record struct FindNameRequest(int FindType, string Query);
+
+    /// <summary>Parse C_FINDNAME from the BODY.</summary>
+    public static FindNameRequest? ParseFindName(ReadOnlySpan<byte> body)
+    {
+        if (body.Length < FindNameBodySize) return null;
+        return new FindNameRequest(BitConverter.ToInt32(body[0x02..]), ReadWString(body, 0x00));
+    }
+
+    /// <summary>
+    /// S_FINDNAME (0xF95D): <c>[0x04] u16 Query offset</c> <c>[0x06] u16 Result offset</c>
+    /// <c>[0x08] i32 FindType</c>, then the echoed query and then the joined match list - both
+    /// NUL-terminated UTF-16LE, and the result is an empty string when nothing matched.
+    ///
+    /// <para>Pinned against the real Arbiter's own replies in
+    /// <c>D:\packetlogs\cap_social_client_ctl.txt</c> frames 1093 / 1096 / 1098.</para>
+    /// </summary>
+    public static byte[] BuildFindName(int findType, string query, IReadOnlyList<string>? matches)
+    {
+        var q = WString(query);
+        var joined = matches == null || matches.Count == 0
+            ? string.Empty
+            : string.Join(FindNameSeparator, matches);
+        var r = WString(joined);
+        int total = FindNameReplyFixedSize + q.Length + r.Length;
+        var p = new byte[total];
+        BitConverter.GetBytes((ushort)total).CopyTo(p, 0);
+        BitConverter.GetBytes(S_FINDNAME).CopyTo(p, 2);
+        BitConverter.GetBytes((ushort)FindNameReplyFixedSize).CopyTo(p, 4);
+        BitConverter.GetBytes((ushort)(FindNameReplyFixedSize + q.Length)).CopyTo(p, 6);
+        BitConverter.GetBytes(findType).CopyTo(p, 8);
+        q.CopyTo(p, FindNameReplyFixedSize);
+        r.CopyTo(p, FindNameReplyFixedSize + q.Length);
+        return p;
+    }
+
+    /// <summary>
+    /// C_FINDNAME. The real handler searches the friend list, then the recent-name log, then the
+    /// guild roster, stopping at ten. TeraSharp has no name log, so the brief's substitute is a
+    /// prefix match over the characters table - a superset that behaves the same for the case that
+    /// matters (typing a friend's name) and never returns more than the same ten.
+    /// </summary>
+    public static bool OnFindName(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        var req = ParseFindName(body.Span);
+        if (req == null)
+        {
+            log.LogWarning("C_FINDNAME: {Len} B body (want {Want})", body.Length, FindNameBodySize);
+            return true;
+        }
+        var r = req.Value;
+        IReadOnlyList<string> matches = Array.Empty<string>();
+        if (r.FindType == FindNameTypeNameLog && r.Query.Length > 0 && Program.Store != null)
+            matches = Program.Store.FindCharacterNamesByPrefix(r.Query, FindNameMaxResults,
+                                                              s.SelectedCharacter?.Name);
+        s.Send(BuildFindName(r.FindType, r.Query, matches));
+        return true;
+    }
+
     // ---------------------------------------------------------------- helpers
 
     /// <summary>
@@ -552,6 +836,15 @@ public static class ArbiterClientHandlers
     /// <paramref name="slotIndex"/> of the BODY. Empty for the 0 / out-of-range offsets the real
     /// handlers fall back on (<c>if ((uVar1 == 0) || (*param_2 &lt;= uVar1)) puVar6 = &amp;DAT_140d3e020;</c>).
     /// </summary>
+    /// <summary>A NUL-terminated UTF-16LE string, as the inter-server and client writers emit it.</summary>
+    public static byte[] WString(string? s)
+    {
+        s ??= string.Empty;
+        var b = new byte[s.Length * 2 + 2];
+        System.Text.Encoding.Unicode.GetBytes(s, 0, s.Length, b, 0);
+        return b;   // the two trailing zero bytes are the terminator
+    }
+
     public static string ReadWString(ReadOnlySpan<byte> body, int slotIndex)
     {
         if (slotIndex + 2 > body.Length) return string.Empty;

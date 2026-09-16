@@ -413,3 +413,34 @@ Two details the writers settle, both of which a hand-written empty form gets wro
 
 **`Step` is echoed, never invented.** Four of the five carry a multi-stage commit step whose
 values were never traced; echoing the one we were given is the only safe answer.
+
+---
+
+## T62 — three live leftovers
+
+Two client opcodes the Arbiter owns and one W→A frame that turned out not to be what it looked like.
+First cells stay backticked: none of these is a per-user DLM request, so a parseable row here would
+fail the coverage guard (`Every_per_user_request_opcode_is_answered`).
+
+| opcode | name | direction | shape | answered by |
+|---|---|---|---|---|
+| `0x5639` | C_ASK_INTERACTIVE (22073) | C→A | `[04] u16 nameOff` `[06] i32 AskType` `[0A] i32 TargetPlanetId` + wstr; guard 0x0E | `ArbiterClientHandlers.OnAskInteractive` → `0x85C8` |
+| `0x85C8` | S_ANSWER_INTERACTIVE (34248) | A→C | `[04] u16 nameOff=24` `[06] AskType` `[0A] TargetTemplateId` `[0E] TargetLevel` `[12] u8 TargetInParty` `[13] u8 TargetInGuild` `[14] TargetPlanetId` + wstr | — |
+| `0xA5DA` | C_WATCHED_MOVIES (42458) | C→A | header only; guard 4, reads nothing | `OnWatchedMovies` → `0x97A4` |
+| `0x97A4` | S_WATCHED_MOVIES (38820) | A→C | `[04] u16 count` `[06] u16 firstOff`, entries `[u16 here][u16 next][u32 movieId]` | — |
+| `0x7B75` | C_FINDNAME (31605) | C→A | `[04] u16 queryOff` `[06] i32 FindType` + wstr; guard 10, +2 B per keystroke | `OnFindName` → `0xF95D` |
+| `0xF95D` | S_FINDNAME (63837) | A→C | `[04] u16 queryOff=12` `[06] u16 resultOff` `[08] i32 FindType` + query wstr + joined-matches wstr | — |
+| `0x27FE` | SDB_ADD_PVP_USER_LOG | W→A | 14 B: `[06] u32 killerDbId` `[0A] u32 victimDbId`; guard `param_3 < 0xE` | nothing — sealed in `OneWayFromWorld` |
+
+**Persistence.** `watched_movies(character_id, movie_id)` — the list `S_WATCHED_MOVIES` serves back, so
+the intro cutscene stops replaying. The real Arbiter keeps this per ACCOUNT
+(`Account::CachedWatchedMoviesWithLock` → `spLoadUserWatchedMovies`, merged with the `ReplayMovieData`
+sheet); per character is the row TeraSharp owns, and `CharacterStore.AddWatchedMovie` is the one place
+to change if two characters on an account should share it.
+
+**Corrections to the brief.** `0x27FE` is not the cinematic flag — it is the PvP kill log, and the
+cutscene replay is `C_WATCHED_MOVIES` going unanswered. `C_FINDNAME` matches are served from the
+`characters` table by prefix; the real `User::FindNameLog` searches the friend list, then a recent-name
+log, then the guild roster, all capped at ten (`list.size() < 10`, re-tested in each pass). The one-char
+separator between matches (`DAT_140b41838`) is untyped in the decompile — `FindNameSeparator` is a comma
+and is the single guessed byte in T62.
