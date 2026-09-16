@@ -356,3 +356,71 @@ shape specifically.
   Neither carries a DlmId, so neither can head-block anyone; they are left alone until there is
   a deal to have.
 * **The `refA` payloads** (`TradeData`, `CalcItemList`) are named and sized but not decoded.
+
+## T70 — the TradeData record, and the two-step protocol
+
+cap_social3.log is the first capture with a real broker session in it: browse, search, three
+listings (one refused as unlistable), reprice, cancel, buy, collect. Every frame layout T53 and
+T55 derived from the dumpers survives it unchanged — the guards, the offsets, the 856-byte
+ItemBinary atom, the backpatch-the-offset-slot-unconditionally convention. What the capture adds
+is the thing T55 could not get: **what the other ref actually contains**.
+
+### The TradeData / CalcItemList record — 0x188 bytes
+
+`DBS_TRADE_BROKER_UNREGISTER_ITEM` calls it TradeData; the two CALC replies call it CalcItemList;
+it is one record. Three of them appear (listing 1, listing 3, and the cleared form Step 2 of an
+unregister returns), and cross-checking the three is what separates a field from heap.
+
+| Offset | Type | Field | listing 1 / 3 / cleared |
+| --- | --- | --- | --- |
+| +0x000 | i32 | TradeId | 1 / 3 / 0 |
+| +0x004 | i32 | SellerDbId | 2 / 2 / 0 |
+| +0x008 | wstr | SellerName, 0x25 wchars | "Test" / "Test" / "" |
+| +0x052 | u16 | *uninitialised stack* | 25119 / 25103 / **25119** |
+| +0x05C | u16 | *uninitialised stack* | 530 / 529 / **530** |
+| +0x060 | i64 | ItemDbId | 10027 / 10029 / 0 |
+| +0x068 | i32 | TemplateId | 200997 / 139093 / 0 |
+| +0x06C | i32 | Amount | 1 / 1 / 0 |
+| +0x0B8 | 8×u16 | RegisterTime {y,m,d,h,mi,s,0,0} | 2026-09-16 22:32:16 / 22:32:47 / zero |
+| +0x0C8 | i64 | Price | 10001 / 1 / 0 |
+
+The two u16s are stack, not fields: they hold the same values across different listings **and stay
+set in the cleared record where every real field is zero**. `BuildTradeData` writes zeros there,
+the same call T51 made for the guild blob.
+
+Price is pinned from the other end of the trade: `SDB_TRADE_BROKER_BUY_IT_NOW`'s
+`TotalPriceWithTax` for listing 3 is 1, and listing 3's +0xC8 is 1.
+
+### The two-step protocol
+
+Every broker operation except REGISTER runs **twice**, and `Step` says which pass it is
+(seq 1880..1883 buy, 1946..1949 calc-sold, 2000..2003 unregister):
+
+| | request | reply |
+| --- | --- | --- |
+| Step 1 | no atoms — the ItemBinary ref is `offset = frame length, count 0` | the TradeData record, no atoms |
+| Step 2 | the atoms World built from what Step 1 returned | the TradeData record **and** those atoms echoed |
+
+So Step 1 is "read me the listing" and Step 2 is "commit". **This is why T55's empty forms could
+never complete a purchase**: an empty Step-1 answer gives World nothing to build the Step-2 atoms
+from, so the second half never comes.
+
+REGISTER is the exception — one pass, no Step field (its reply is the odd 13-byte header), because
+World already has the item.
+
+### What is still missing
+
+The listings table. `BuildTradeData` can now produce a real record, and the two-step shape is
+known, but there is nowhere to keep a listing between Step 1 and Step 2, let alone between
+sessions. The remaining work, in order:
+
+1. `broker_listings` (trade_id, seller_db_id, seller_name, item_db_id, template_id, amount, price,
+   registered_at, state) plus the sold/bought queues the two CALC pairs drain.
+2. The five handlers applying to it: REGISTER inserts from the request's atoms; UNREGISTER Step 2
+   deletes and returns the item; BUY_IT_NOW Step 2 moves item and money; the two CALC pairs pay
+   out proceeds and hand over bought items.
+3. The client half: nine distinct `C_TRADE_BROKER_*` requests and six `S_` replies are in
+   cap_social3_client.log — `S_TRADE_BROKER_WAITING_ITEM_LIST` ×9 is the search result page,
+   `S_TRADE_BROKER_CALC_NOTIFY` ×4 the collect notifications.
+
+None of that is guesswork any more; it is bookkeeping against a decoded record.

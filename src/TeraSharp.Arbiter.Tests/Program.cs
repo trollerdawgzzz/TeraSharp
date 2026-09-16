@@ -17036,6 +17036,74 @@ some prose with `backticks` that is not a table row
         Hex.True(ArbiterClientHandlers.ParseFindName(new byte[5]) == null, "5 B is one short of the guard");
     }
 
+    // ===================== T70: cap_social3.log, broker + EP =====================
+
+    /// <summary>cap_social3.log seq 112, AS_LOAD_EXTRAPOINT_DATA for character 1003, DlmId 0x27.</summary>
+    const string Cap70_ExtrapointRsp =
+        "27 00 00 00 01 EB 03 00 00 00 00 00 00 00 00 00 "
+        + "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+        + "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+        + "00 00 00 00 00";
+
+    /// <summary>
+    /// The EP panel load. The old builder put the low byte of the player id where Result belongs
+    /// and a 1 where the four-byte UserDbId starts, so World read back user 1 for every
+    /// character. The length was right by accident; the placement was not.
+    /// </summary>
+    [Test] public static void T70_the_extrapoint_load_is_byte_exact()
+    {
+        var req = Hex.B("27 00 00 00 EB 03 00 00");          // seq 111: DlmId 0x27, user 1003
+        var rsp = DbProxyHandlers.BuildExtrapointData(req);
+        Hex.True(rsp.Length == DbProxyHandlers.ExtrapointReplySize && rsp.Length == 53,
+            $"53 payload bytes (frame 0x3B, the reply guard): {rsp.Length}");
+        Hex.Eq(rsp, Hex.B(Cap70_ExtrapointRsp), "0x1555, cap_social3.log seq 112");
+        Hex.True(rsp[4] == 1 && BitConverter.ToInt32(rsp, 5) == 1003,
+            "Result at +4 and the FULL four-byte UserDbId at +5");
+        Hex.True(DbProxyHandlers.BuildExtrapointData(Array.Empty<byte>()).Length == 53,
+            "a short request still gets a whole frame - it carries a DlmId and must be answered");
+    }
+
+    /// <summary>
+    /// The broker's TradeData / CalcItemList record, 0x188 bytes. T53 left it undecoded and T55
+    /// could only echo; cap_social3.log is the first capture that contains one. Pinned to the
+    /// record DBS_TRADE_BROKER_BUY_IT_NOW returns for listing 3 (seq 1881 and 1883, identical).
+    /// </summary>
+    [Test] public static void T70_the_broker_trade_data_record_is_byte_exact()
+    {
+        Hex.True(BrokerPackets.TradeDataSize == 0x188, "392 bytes, the length every ref slot declares");
+
+        var rec = BrokerPackets.BuildTradeData(
+            tradeId: 3, sellerDbId: 2, sellerName: "Test", itemDbId: 10029, templateId: 139093,
+            amount: 1, price: 1, registerTime: new DateTime(2026, 9, 16, 22, 32, 47));
+
+        Hex.True(rec.Length == 0x188, $"{rec.Length}");
+        Hex.True(BitConverter.ToInt32(rec, BrokerPackets.TdTradeId) == 3
+                 && BitConverter.ToInt32(rec, BrokerPackets.TdSellerDbId) == 2
+                 && BitConverter.ToInt64(rec, BrokerPackets.TdItemDbId) == 10029
+                 && BitConverter.ToInt32(rec, BrokerPackets.TdTemplateId) == 139093
+                 && BitConverter.ToInt32(rec, BrokerPackets.TdAmount) == 1
+                 && BitConverter.ToInt64(rec, BrokerPackets.TdPrice) == 1,
+            "TradeId/SellerDbId/ItemDbId/TemplateId/Amount/Price at the captured offsets");
+        Hex.Eq(rec[BrokerPackets.TdSellerName..(BrokerPackets.TdSellerName + 10)],
+            "54 00 65 00 73 00 74 00 00 00", "SellerName is a NUL-terminated wstr at +0x08");
+        Hex.Eq(rec[BrokerPackets.TdRegisterTime..(BrokerPackets.TdRegisterTime + 16)],
+            "EA 07 09 00 10 00 16 00 20 00 2F 00 00 00 00 00",
+            "RegisterTime at +0xB8: {2026, 9, 16, 22, 32, 47, 0, 0}");
+
+        // Price is pinned by the other end: BUY_IT_NOW's TotalPriceWithTax for listing 3 is 1.
+        var back = BrokerPackets.ParseTradeData(rec);
+        Hex.True(back != null && back.Value.SellerName == "Test" && back.Value.Price == 1
+                 && back.Value.TradeId == 3,
+            $"round trip: {back?.SellerName} / {back?.Price} / {back?.TradeId}");
+        Hex.True(BrokerPackets.ParseTradeData(new byte[0x187]) == null, "one byte short is refused");
+
+        // The two u16s at +0x52 and +0x5C are the real Arbiter's uninitialised stack: they hold
+        // 25119 / 25103 across listings AND stay set in the cleared record the Step-2 unregister
+        // returns, where every real field is zero. We leave them zero.
+        Hex.True(BitConverter.ToUInt16(rec, 0x52) == 0 && BitConverter.ToUInt16(rec, 0x5C) == 0,
+            "we do not re-send another server's stack");
+    }
+
     // ===================== T69: cap_social2.log, the real Arbiter =====================
 
     /// <summary>cap_social2.log seq 1980 (request) and 1982 (the empty-bank reply).</summary>
