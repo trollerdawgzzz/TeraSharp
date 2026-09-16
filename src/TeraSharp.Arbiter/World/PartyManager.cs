@@ -253,6 +253,25 @@ public sealed class PartyManager
     }
 
     public bool TryGetPlayer(uint ticket, out PartyPlayer p) => _byTicket.TryGetValue(ticket, out p);
+
+    /// <summary>
+    /// Online character by NAME. SA_JOIN_PARTY_IN_ARBITER carries no db-ids, so this is the only
+    /// way in; the real handler uses the same table lookup (FUN_14082dc50(userTable, name, 3)).
+    /// Character names are unique per server and the client upper-cases nothing, so the match is
+    /// case-insensitive and ordinal - a name that differs only in case is the same character.
+    /// </summary>
+    public bool TryGetPlayerByName(string name, out PartyPlayer found)
+    {
+        found = default;
+        if (string.IsNullOrEmpty(name)) return false;
+        foreach (var p in _byTicket.Values)
+        {
+            if (!string.Equals(p.Name, name, StringComparison.OrdinalIgnoreCase)) continue;
+            found = p;
+            return true;
+        }
+        return false;
+    }
     public bool TryGetTicket(int userDbId, out uint ticket) => _ticketByDbId.TryGetValue(userDbId, out ticket);
 
     private IEnumerable<(uint ticket, PartyPackets.PartyMember member)> OnlineMembersOf(Party p, int except = 0)
@@ -440,6 +459,7 @@ public sealed class PartyManager
         switch (opcode)
         {
             case PartyPackets.SA_JOIN_PARTY: return JoinParty(a, payload);
+            case PartyPackets.SA_JOIN_PARTY_IN_ARBITER: return JoinPartyInArbiter(a, payload);
             case PartyPackets.SA_LEAVE_PARTY: return LeaveParty(a, payload);
             case PartyPackets.SA_DISMISS_PARTY: return DismissFromWorld(a, payload);
             case PartyPackets.SA_KICK_PARTY: return KickFromWorld(a, payload);
@@ -471,12 +491,53 @@ public sealed class PartyManager
         _applications.Remove((invitee.UserDbId, inviter.UserDbId));
         _applications.Remove((inviter.UserDbId, invitee.UserDbId));
 
+        return JoinCore(a, inviter, invitee, v.Raid, v.IsAnonymous, v.PartyType);
+    }
+
+    /// <summary>
+    /// SA_JOIN_PARTY_IN_ARBITER (0x13AB) - the path TERA 100.02 actually takes. The direct-invite
+    /// dialogue is completed by World, which then names the two characters BY NAME and leaves the
+    /// party itself to us: cap_social.log has one 0x13AB (seq 747) and no SA_JOIN_PARTY at all,
+    /// and seq 748 is the AS_DO_CREATE_PARTY that came straight back out of it.
+    ///
+    /// T65: before this case existed the frame fell through to the default reject
+    /// ("0x13AB is not a party frame") and the party silently never formed even though the
+    /// contract accept (0x280F/0x2810) had already gone out.
+    /// </summary>
+    private PartyActions JoinPartyInArbiter(PartyActions a, byte[] payload)
+    {
+        var j = PartyPackets.ParseSaJoinPartyInArbiter(payload);
+        if (j == null) return a.Reject("SA_JOIN_PARTY_IN_ARBITER: frame shorter than 0x0F");
+        var v = j.Value;
+        if (!TryGetPlayerByName(v.MemberName, out var inviter))
+            return a.Reject($"SA_JOIN_PARTY_IN_ARBITER: inviter '{v.MemberName}' is not online");
+        if (!TryGetPlayerByName(v.InviteeName, out var invitee))
+            return a.Reject($"SA_JOIN_PARTY_IN_ARBITER: invitee '{v.InviteeName}' is not online");
+        if (inviter.UserDbId == invitee.UserDbId)
+            return a.Reject("SA_JOIN_PARTY_IN_ARBITER: inviter and invitee are the same character");
+        if (FindByMember(invitee.UserDbId) != null)
+            return a.Reject("SA_JOIN_PARTY_IN_ARBITER: invitee is already in a party");
+
+        _applications.Remove((invitee.UserDbId, inviter.UserDbId));
+        _applications.Remove((inviter.UserDbId, invitee.UserDbId));
+
+        // 0x13AB carries only Raid - no PartyType and no anonymity flag - so a party born this
+        // way is an ordinary named one, which is what seq 748 shows.
+        return JoinCore(a, inviter, invitee, v.Raid, isAnonymous: false, partyType: 0);
+    }
+
+    /// <summary>
+    /// The half both join paths share: create-or-extend, then the AS_ mirror World needs.
+    /// </summary>
+    private PartyActions JoinCore(PartyActions a, PartyPlayer inviter, PartyPlayer invitee,
+        bool raid, bool isAnonymous, int partyType)
+    {
         var party = FindByMember(inviter.UserDbId);
         if (party == null)
         {
             // PartyManager::New_CreateParty refuses fewer than two members, and the manager is
             // the first member in the vector - the inviter.
-            party = new Party { Id = NextPartyId(), Raid = v.Raid, IsAnonymous = v.IsAnonymous, PartyType = v.PartyType };
+            party = new Party { Id = NextPartyId(), Raid = raid, IsAnonymous = isAnonymous, PartyType = partyType };
             party.ManagerDbId = inviter.UserDbId;
             _byId[party.Id] = party;
             AddMember(a, party, inviter);

@@ -207,14 +207,15 @@ public static class WarehouseHandlers
     /// than throwing: an unanswered per-user DB item head-blocks the user's whole queue
     /// (status/HANDOFF.md section 1), so the caller must always be able to reply.
     /// </summary>
-    public static IReadOnlyList<WarehouseAtom> ParseAtoms(byte[] payload, int refOffset)
+    public static IReadOnlyList<WarehouseAtom> ParseAtoms(byte[] payload, int refOffset, int recordSize = 0)
     {
         ArgumentNullException.ThrowIfNull(payload);
-        if (!TrySliceAtoms(payload, refOffset, minStart: 0, out int start, out int bytes))
+        if (recordSize <= 0) recordSize = DbProxyHandlers.ItemAtomSize;
+        if (!TrySliceAtoms(payload, refOffset, minStart: 0, out int start, out int bytes, recordSize))
             return Array.Empty<WarehouseAtom>();
-        int n = bytes / DbProxyHandlers.ItemAtomSize;
+        int n = bytes / recordSize;
         var atoms = new WarehouseAtom[n];
-        for (int i = 0; i < n; i++) atoms[i] = ReadAtom(payload, start + i * DbProxyHandlers.ItemAtomSize);
+        for (int i = 0; i < n; i++) atoms[i] = ReadAtom(payload, start + i * recordSize);
         return atoms;
     }
 
@@ -232,44 +233,48 @@ public static class WarehouseHandlers
     /// (status/INVENTORY-DESIGN.md, "Reply echo rule").</para>
     /// </summary>
     public static (byte[] Atoms, IReadOnlyList<WarehouseAtom> Parsed) CloneAtomsWithIds(
-        byte[] payload, int refOffset, int minStart, Func<int> allocateItemId)
+        byte[] payload, int refOffset, int minStart, Func<int> allocateItemId, int recordSize = 0)
     {
         ArgumentNullException.ThrowIfNull(payload);
         ArgumentNullException.ThrowIfNull(allocateItemId);
+        if (recordSize <= 0) recordSize = DbProxyHandlers.ItemAtomSize;
 
-        if (!TrySliceAtoms(payload, refOffset, minStart, out int start, out int bytes))
+        if (!TrySliceAtoms(payload, refOffset, minStart, out int start, out int bytes, recordSize))
             return (Array.Empty<byte>(), Array.Empty<WarehouseAtom>());
 
         var atoms = new byte[bytes];
         Array.Copy(payload, start, atoms, 0, bytes);
-        for (int o = 0; o + DbProxyHandlers.ItemAtomSize <= atoms.Length; o += DbProxyHandlers.ItemAtomSize)
+        for (int o = 0; o + recordSize <= atoms.Length; o += recordSize)
         {
             uint op = BitConverter.ToUInt32(atoms, o + AtomOp);
             if (op != TsInsertItem && op != TsWareInsertItem) continue;
             if (BitConverter.ToInt64(atoms, o + AtomItemDbId) != 0) continue;
             BitConverter.GetBytes(allocateItemId()).CopyTo(atoms, o + AtomItemDbId);
         }
-        return (atoms, ParseAtomArray(atoms));
+        return (atoms, ParseAtomArray(atoms, recordSize));
     }
 
     /// <summary>A packed array of 856-byte atoms, with no ref header in front of it.</summary>
-    public static IReadOnlyList<WarehouseAtom> ParseAtomArray(byte[] atoms)
+    public static IReadOnlyList<WarehouseAtom> ParseAtomArray(byte[] atoms, int recordSize = 0)
     {
         ArgumentNullException.ThrowIfNull(atoms);
-        int n = atoms.Length / DbProxyHandlers.ItemAtomSize;
+        if (recordSize <= 0) recordSize = DbProxyHandlers.ItemAtomSize;
+        int n = atoms.Length / recordSize;
         var parsed = new WarehouseAtom[n];
-        for (int i = 0; i < n; i++) parsed[i] = ReadAtom(atoms, i * DbProxyHandlers.ItemAtomSize);
+        for (int i = 0; i < n; i++) parsed[i] = ReadAtom(atoms, i * recordSize);
         return parsed;
     }
 
-    private static bool TrySliceAtoms(byte[] payload, int refOffset, int minStart, out int start, out int bytes)
+    private static bool TrySliceAtoms(byte[] payload, int refOffset, int minStart, out int start, out int bytes,
+                                      int recordSize = 0)
     {
         start = 0; bytes = 0;
+        if (recordSize <= 0) recordSize = DbProxyHandlers.ItemAtomSize;
         if (refOffset < 0 || refOffset + 8 > payload.Length) return false;
         start = (int)BitConverter.ToUInt32(payload, refOffset) - 6;   // frame -> payload
         bytes = (int)BitConverter.ToUInt32(payload, refOffset + 4);
         return bytes > 0 && start >= minStart
-               && bytes % DbProxyHandlers.ItemAtomSize == 0
+               && bytes % recordSize == 0
                && start <= payload.Length - bytes;
     }
 

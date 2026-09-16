@@ -106,7 +106,11 @@ public sealed class SocialHandlers
     private const int SmtIBlockedTarget      = 0x531;  // 1329 [UserName]
     private const int SmtRequestSent         = 0xD7A;  // 3450 [UserName] -> requester
     private const int SmtRequestReceived     = 0xD7B;  // 3451 [UserName] -> target
-    private const int SmtAcceptedToRequester = 0x1B0;  // 432  [UserName]
+    // T65: 433, not 432. cap_social_client.log seq 1436 is the real one the Arbiter sent after
+    // "two" accepted: "@433\vUserName\vtwo". SMT 432's own parameter is spelled {usernames} in
+    // this client's string table, so sending 432 with a UserName parameter printed the
+    // placeholder literally instead of the name.
+    public const int SmtAcceptedToRequester = 0x1B1;   // 433  [UserName]
     private const int SmtAcceptedToAccepter  = 0x1B1;  // 433
     private const int SmtFriendDeleted       = 0x1B4;  // 436  [UserName] -> deleter only
     private const int SmtRequestDeclined     = 0xD7C;  // 3452 [RecvName][ReqName] -> both

@@ -673,3 +673,22 @@ Also answered here: **`SDB_LOAD_PREMIUM_SLOT_LEFT_COOLTIME` (0x28BD)**, a per-us
 carrying a DlmId that nothing answered. Request `i32 DlmId@06, i64 ArbiterUser@0A,
 i64 OwnerDbId@12`, frame 26. Reply `u32 listOff=19@06, u32 listBytes@0A, i32 DlmId@0E,
 u8 Success@12` + N x 16-byte `{i32, i32, i64}` records; we send the empty form.
+
+## 11. T65 — the two things the Arbiter owns and was not writing
+
+Live run 2026-09-16 11:25-11:30. Both bugs are in what we put in the record, not in the frame.
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Inbox rows all blank after a relog; `C_SHOW_PARCEL_MESSAGE parcel 0` ignored | The stored record IS the `SDB_MAKE_PARCEL` one, and in it `ParcelId` (+0xA0) and `ReceiverDbId` (+0x50) are **0** — the sending client knew neither. T61 stored it verbatim and served it verbatim. | `ParcelDbHandlers.ServedParcelRecord` copies the stored bytes and stamps those two fields from the row. Used by `BuildParcelList` and by `DBS_RECV_PARCEL`. |
+| Attached gold never arrived | `parcels.money` is the Arbiter's own column. World sets it in the outgoing `ParcelData` and never asks about it again, so nothing credited the receiver. | `DbProxyHandlers.ClaimParcelMoney`, called from `SDB_RECV_PARCEL` and `SDB_RECV_PARCEL_EX`, pays `row.Money` once, on the first claim — and **not** when the request's own transaction list already carried a `TS_CHANGE_MONEY` (op 9) record, so a future World that does it itself cannot double-pay. |
+
+`DBS_LIST_PARCEL` is byte-exact against cap_social.log seq 1539 in
+`T65_the_inbox_row_carries_its_parcel_id`: header `[35][0x9E8][dlm 0xA7][1][view 0][page 0][max 1][count 1]`,
+then one 0x9e8 record with sender 2 "Test", receiver 1002 "two", parcel id 1, money 100.
+The empty form (offset = frame length 35, count 0) is unchanged.
+
+Still open: a second `SDB_MAKE_PARCEL` in the same session reportedly failed. Nothing in the code
+refuses a second send, and the live Arbiter log line for it was not captured — the one thing T65
+changed that could have caused it is `GetCharacterByName`, which was case-sensitive SQL
+(`WHERE name = $n`) and is now `COLLATE NOCASE`. If it recurs, the refusal now logs which name missed.

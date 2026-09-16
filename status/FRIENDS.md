@@ -201,3 +201,10 @@ did not change — the first pair is two zeroes. So the push fires on `C_ADD_FRI
 The block pair is `(blocker, blocked)` in that order, and `0x1476` repeats it unchanged.
 
 `T64_the_friend_and_block_pushes_are_byte_exact` pins all four frames.
+## 9. T65 — the friend-accepted message is SMT **433**, not 432
+
+The live client printed the literal `{usernames}`. `cap_social_client.log` seq 1436 is the real
+frame: `@433` + `UserName` + the name, in the usual `\v`-separated form. SMT 432 is a different string
+whose own parameter is spelled differently in this client's table, which is why sending it with a
+`UserName` parameter left the placeholder untouched. `SocialHandlers.SmtAcceptedToRequester` is 0x1B1.
+For reference, seq 1416 in the same tap is `@3450` + `UserName` + name (request sent), which we had right.

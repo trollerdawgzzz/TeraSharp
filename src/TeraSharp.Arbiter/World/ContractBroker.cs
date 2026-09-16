@@ -535,7 +535,16 @@ public static class ContractBroker
             foreach (var s in bridge.InWorldSessions())
                 if (string.Equals(s.SelectedCharacter?.Name, hint.Name, StringComparison.OrdinalIgnoreCase))
                 { how = $"Param name '{hint.Name}'"; return s; }
+            // T65: inviting the GM character was refused with "this character doesn't exist"
+            // while the reverse invite worked, and nothing in the log said which name we
+            // compared against. ContractPartyFetchWork (Arb_part_084.c:5749) has no AdminLevel
+            // branch at all - its only gate is the by-name lookup FUN_14082dc50 plus
+            // "state == 2" (in world) - so a miss here is OUR session table, not a GM rule.
             how = $"Param name '{hint.Name}' (not in world)";
+            Log.LogWarning(
+                "contract: no in-world character named '{Name}'; in world right now: [{Names}]",
+                hint.Name,
+                string.Join(", ", bridge.InWorldSessions().Select(x => x.SelectedCharacter?.Name ?? "<none>")));
         }
 
         foreach (int id in hint.DbIds)

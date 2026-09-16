@@ -94,6 +94,35 @@ public sealed class DbProxyHandlers
     /// status/INVENTORY-DESIGN.md section 4 for the rest of the enum.
     /// </summary>
     public const uint TsInsertItem = 7;
+    // --- SDB_ITEM_TRADE (0x276A) -> DBS_ITEM_TRADE (0x276B), T65 ---
+    // The DB half of a completed player-to-player trade. It arrived live on 2026-09-16 (2306 B,
+    // "no replay") and, because nothing answered it, head-blocked that character's DLM queue.
+    //
+    // Dumper FUN_1402329b0 (Arb_part_017.c:9283), GUARD 0x21 -> min frame 0x22; handler
+    // FUN_1407... (Arb_part_063.c:11848). FRAME-relative:
+    //   [06] u32 OwnerBinary offset   [0A] u32 OwnerBinary bytes
+    //   [0E] u32 TargetBinary offset  [12] u32 TargetBinary bytes
+    //   [16] i32 DlmId   [1A] i32 OwnerDBID   [1E] i32 TargetDBID
+    // so the payload header is 28 bytes - SDB_ITEM_SINGLE's 24 plus the second db-id.
+    //
+    // The two lists are NOT 856-byte ItemTransactionAtoms. The handler divides by 0x238 and
+    // passes the records to TransSQLExec::CanExecTrans(vector&lt;ItemTransactionGiveTake const *&gt;),
+    // so the record is <b>ItemTransactionGiveTake, 568 bytes</b>. The head is the same as the
+    // 856-byte atom - DO_TS_CHANGE_ITEM_OWNER (Arb_part_037.c:18245) reads +0x10 item db id,
+    // +0x20/+0x28 src owner+inven, +0x38/+0x40/+0x48 dst owner+inven+slot, op at +0x04 - which
+    // is why WarehouseHandlers can parse both with one reader and only the stride differs.
+    // (2306 = 6 + 28 + 4 * 0x238 exactly, which is the check that the stride is right.)
+    //
+    // The reply writer FUN_1406ece60 (Arb_part_060.c:6123) emits four backpatch slots, the
+    // DlmId and the ok byte - the same 21-byte header as DBS_ITEM_SINGLE - then both lists
+    // copied back 0x238 bytes at a time. So the echo rule is T13's, at the other stride.
+    public const ushort SDB_ITEM_TRADE = 0x276A;
+    public const ushort DBS_ITEM_TRADE = 0x276B;
+    /// <summary>ItemTransactionGiveTake - the 568-byte record SDB_ITEM_TRADE carries.</summary>
+    public const int ItemGiveTakeSize = 0x238;          // 568
+    /// <summary>0x276A payload header: two [offset][length] pairs, DlmId, OwnerDBID, TargetDBID.</summary>
+    public const int ItemTradeRequestHeader = 28;
+
     public const ushort SDB_SAVE_2936 = 0x2936; public const ushort DBS_SAVE_2937 = 0x2937; // reqId @0
     public const ushort SDB_DAILY_QUEST = 0x2897; public const ushort DBS_DAILY_QUEST = 0x2898; // reqId @16
 
@@ -1035,6 +1064,7 @@ public sealed class DbProxyHandlers
             case SDB_SAVE_2924:
             case SDB_UPDATE_LEFT_COOLTIME_PREMIUM_SLOT:   // 0x28C1, T64
             case SDB_SAVE_2768:
+            case SDB_ITEM_TRADE:   // 0x276A, T65
             case SDB_SAVE_2936:
             case SDB_DAILY_QUEST:
             case SDB_DAILY_QUEST_SEED:
@@ -1157,6 +1187,7 @@ public sealed class DbProxyHandlers
             case SDB_UPDATE_LEFT_COOLTIME_PREMIUM_SLOT:
                 link.SendFrame(DBS_UPDATE_LEFT_COOLTIME_PREMIUM_SLOT, BuildReqIdAck(payload, 8)); return true;
             case SDB_SAVE_2768: return OnItemSingle(link, payload);
+            case SDB_ITEM_TRADE: return OnItemTrade(link, payload);
             case SDB_SAVE_2936: link.SendFrame(DBS_SAVE_2937, BuildDbs2937(payload)); return true;
             case SDB_DAILY_QUEST: link.SendFrame(DBS_DAILY_QUEST, BuildReqIdAck(payload, 16)); return true;
             case SDB_DAILY_QUEST_SEED: link.SendFrame(DBS_DAILY_QUEST_SEED, BuildReqIdAck(payload, 8)); return true;
@@ -1755,6 +1786,79 @@ public sealed class DbProxyHandlers
         return true;
     }
 
+    /// <summary>
+    /// SDB_ITEM_TRADE (0x276A) -&gt; DBS_ITEM_TRADE (0x276B). T65. See the constants above: same
+    /// echo-and-apply rule as SDB_ITEM_SINGLE, 568-byte records, two players.
+    /// </summary>
+    private bool OnItemTrade(WorldLink link, byte[] payload)
+    {
+        uint ownerId = payload.Length >= ItemTradeRequestHeader ? BitConverter.ToUInt32(payload, 20) : 0;
+        uint targetId = payload.Length >= ItemTradeRequestHeader ? BitConverter.ToUInt32(payload, 24) : 0;
+        int declaredA = DeclaredGiveTakeCount(payload, 0), declaredB = DeclaredGiveTakeCount(payload, 8);
+
+        var reply = BuildDbsItemTrade(payload, _store.NextItemId);
+        int echoedA = (int)BitConverter.ToUInt32(reply, 4) / ItemGiveTakeSize;
+        int echoedB = (int)BitConverter.ToUInt32(reply, 12) / ItemGiveTakeSize;
+        if (echoedA != declaredA || echoedB != declaredB)
+            _log.LogWarning(
+                "SDB_ITEM_TRADE: could not echo the give/take lists for {Owner} -> {Target} (declared {DA}/{DB}, "
+                + "echoed {EA}/{EB}, payload {Len} B) - the trade will not be stored",
+                ownerId, targetId, declaredA, declaredB, echoedA, echoedB, payload.Length);
+
+        // Both lists are executed, in order, on the SAME item table - a trade moves rows between
+        // two owners, so the second list must see what the first one did.
+        if (_store is not null)
+        {
+            var a = BagItems.ApplyReplyAtoms(_store, reply, 0, _store.NextItemId, _log, ItemGiveTakeSize);
+            var b = BagItems.ApplyReplyAtoms(_store, reply, 8, _store.NextItemId, _log, ItemGiveTakeSize);
+            _log.LogInformation(
+                "SDB_ITEM_TRADE: {Owner} <-> {Target}: {Ins} inserted, {Mov} moved, {Chg} amount, {Del} deleted "
+                + "({Ign} record(s) changed no row)",
+                ownerId, targetId, a.Inserted + b.Inserted, a.Moved + b.Moved,
+                a.AmountChanged + b.AmountChanged, a.Deleted + b.Deleted, a.Ignored + b.Ignored);
+        }
+
+        link.SendFrame(DBS_ITEM_TRADE, reply);
+        return true;
+    }
+
+    /// <summary>How many 568-byte give/take records the ref at <paramref name="headerOffset"/>
+    /// declares. Same rounding World uses: <c>(bytes - 1) / 0x238 + 1</c>.</summary>
+    public static int DeclaredGiveTakeCount(byte[] request, int headerOffset)
+    {
+        if (headerOffset + 8 > request.Length) return 0;
+        int length = (int)BitConverter.ToUInt32(request, headerOffset + 4);
+        return length <= 0 ? 0 : (length - 1) / ItemGiveTakeSize + 1;
+    }
+
+    /// <summary>
+    /// DBS_ITEM_TRADE (0x276B): the request's two give/take lists echoed back under the same
+    /// 21-byte header DBS_ITEM_SINGLE uses, with a freshly allocated item DB id written into
+    /// every insert record that arrived with 0.
+    /// </summary>
+    public static byte[] BuildDbsItemTrade(byte[] request, Func<int> allocateItemId)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(allocateItemId);
+        uint dlmId = request.Length >= ItemTradeRequestHeader ? BitConverter.ToUInt32(request, 16) : 0;
+
+        byte[] listA = CloneAtomList(request, 0, allocateItemId, ItemTradeRequestHeader, ItemGiveTakeSize);
+        byte[] listB = CloneAtomList(request, 8, allocateItemId, ItemTradeRequestHeader, ItemGiveTakeSize);
+
+        var r = new byte[ItemSingleReplyHeader + listA.Length + listB.Length];
+        uint offA = 6 + ItemSingleReplyHeader;                 // 27, frame-relative
+        uint offB = offA + (uint)listA.Length;
+        BitConverter.GetBytes(offA).CopyTo(r, 0);
+        BitConverter.GetBytes((uint)listA.Length).CopyTo(r, 4);
+        BitConverter.GetBytes(offB).CopyTo(r, 8);
+        BitConverter.GetBytes((uint)listB.Length).CopyTo(r, 12);
+        BitConverter.GetBytes(dlmId).CopyTo(r, 16);
+        r[20] = 1;
+        listA.CopyTo(r, ItemSingleReplyHeader);
+        listB.CopyTo(r, ItemSingleReplyHeader + listA.Length);
+        return r;
+    }
+
 
     // ================================ T42: the warehouse ================================
     // status/MAIL-WAREHOUSE.md section 4. Layouts and builders are in World/WarehouseHandlers.cs;
@@ -2151,8 +2255,9 @@ public sealed class DbProxyHandlers
     /// hence <paramref name="minStart"/>: an offset pointing inside the header is malformed.
     /// </summary>
     private static byte[] CloneAtomList(byte[] request, int headerOffset, Func<int> allocateItemId,
-                                        int minStart = ItemSingleRequestHeader)
+                                        int minStart = ItemSingleRequestHeader, int recordSize = 0)
     {
+        if (recordSize <= 0) recordSize = ItemAtomSize;
         if (headerOffset + 8 > request.Length) return Array.Empty<byte>();
         int frameOffset = (int)BitConverter.ToUInt32(request, headerOffset);
         int length = (int)BitConverter.ToUInt32(request, headerOffset + 4);
@@ -2161,12 +2266,12 @@ public sealed class DbProxyHandlers
         int start = frameOffset - 6;                            // offsets in the frame count the header
         // `length > request.Length - start` rather than `start + length > request.Length`: a
         // garbage offset can be big enough that the sum overflows int and passes the check.
-        if (start < minStart || length % ItemAtomSize != 0 || length > request.Length - start)
+        if (start < minStart || length % recordSize != 0 || length > request.Length - start)
             return Array.Empty<byte>();
 
         var atoms = new byte[length];
         Array.Copy(request, start, atoms, 0, length);
-        for (int o = 0; o + ItemAtomSize <= atoms.Length; o += ItemAtomSize)
+        for (int o = 0; o + recordSize <= atoms.Length; o += recordSize)
         {
             if (BitConverter.ToUInt32(atoms, o + ItemAtomOpOffset) != TsInsertItem) continue;
             // An insert that already carries an id is World re-stating one it knows; only a 0
@@ -4232,11 +4337,15 @@ public sealed class DbProxyHandlers
         var applied = WarehouseHandlers.Apply(_store, parsed, _store.NextItemId, _log);
 
         var row = _store.GetParcel((int)parcelId);
-        var record = _store.GetParcelRecord((int)parcelId);
+        // T65: the record is served through ServedParcelRecord for the same reason the list is -
+        // the stored SDB_MAKE_PARCEL bytes carry ParcelId 0 and ReceiverDbId 0.
+        byte[]? record = row is null ? null : ParcelDbHandlers.ServedParcelRecord(_store, row);
+        long gold = ClaimParcelMoney(row, applied);
         if (row is not null) _store.SetParcelRecved((int)parcelId, row.ReceiverDbId);
 
-        _log.LogInformation("SDB_RECV_PARCEL: parcel {Id} step {Step} -> {Ins} inserted, {Chg} amount",
-            parcelId, step, applied.Inserted, applied.AmountChanged);
+        _log.LogInformation(
+            "SDB_RECV_PARCEL: parcel {Id} step {Step} -> {Ins} inserted, {Chg} amount, {Gold} gold",
+            parcelId, step, applied.Inserted, applied.AmountChanged, gold);
         link.SendFrame(DBS_RECV_PARCEL,
             ParcelDbHandlers.BuildDbsRecvParcel(record, atoms, dlmId, step, ok: row is not null));
         return true;
@@ -4263,19 +4372,46 @@ public sealed class DbProxyHandlers
 
         var (atoms, parsed) = WarehouseHandlers.CloneAtomsWithIds(
             payload, ParcelDbHandlers.RecvExReqRefB, ParcelDbHandlers.RecvExRequestSize, _store.NextItemId);
-        WarehouseHandlers.Apply(_store, parsed, _store.NextItemId, _log);
+        var applied = WarehouseHandlers.Apply(_store, parsed, _store.NextItemId, _log);
 
         uint remaining = 0;
+        long gold = 0;
         foreach (var row in _store.GetParcelsFor((int)ownerDbId))
         {
-            if (!row.IsRecved) { _store.SetParcelRecved(row.ParcelId, row.ReceiverDbId); remaining++; }
+            if (row.IsRecved) continue;
+            gold += ClaimParcelMoney(row, applied);
+            _store.SetParcelRecved(row.ParcelId, row.ReceiverDbId);
+            remaining++;
+            // Only the first parcel of a "receive all" can be the one the atoms carried money
+            // for, so the rest are credited unconditionally.
+            applied = applied with { CharacterMoneyDelta = 0 };
         }
 
-        _log.LogInformation("SDB_RECV_PARCEL_EX: owner {Owner} step {Step} -> {N} parcel(s) claimed",
-            ownerDbId, step, remaining);
+        _log.LogInformation(
+            "SDB_RECV_PARCEL_EX: owner {Owner} step {Step} -> {N} parcel(s) claimed, {Gold} gold",
+            ownerDbId, step, remaining, gold);
         link.SendFrame(DBS_RECV_PARCEL_EX,
             ParcelDbHandlers.BuildDbsRecvParcelEx(null, atoms, dlmId, step, noParcel: 0, ok: true));
         return true;
+    }
+
+    /// <summary>
+    /// T65: pay a claimed parcel's attached gold onto the receiver's character row.
+    ///
+    /// <para><c>parcels.money</c> is the Arbiter's own column - it is set from the ParcelData
+    /// World sent with SDB_MAKE_PARCEL and World never sees it again, so nothing credited it and
+    /// attached gold simply vanished when the mail was opened. The guard is
+    /// <paramref name="applied"/>: if the request's transaction list already carried a
+    /// TS_CHANGE_MONEY atom (op 9) then World is doing the crediting and we must not do it
+    /// twice. Already-claimed parcels pay nothing.</para>
+    /// </summary>
+    private long ClaimParcelMoney(CharacterStore.ParcelRow? row, WarehouseHandlers.ApplyResult applied)
+    {
+        if (row is null || row.IsRecved || row.Money <= 0) return 0;
+        if (applied.CharacterMoneyDelta != 0) return 0;
+        if (_store is null || row.ReceiverDbId <= 0) return 0;
+        _store.AddCharacterMoney(row.ReceiverDbId, row.Money);
+        return row.Money;
     }
 
     /// <summary>SDB_RETURN_PARCEL (0x2781) -> DBS_RETURN_PARCEL (0x2782): sender and receiver

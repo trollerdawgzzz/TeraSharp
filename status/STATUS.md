@@ -237,3 +237,7 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
 - The replayed `DBS_INIT_GUILD_DATA` stack-padding leak: retired by allow-listing `0x27CF` (T51).
 - `status/*.txt` decompile scratch files: down to two (`arbiter_c_handlers.txt`,
   `arbiter_s_packets.txt`), both still referenced by the scope notes.
+- T65 (live 2026-09-16): `SDB_ITEM_TRADE` 0x276A answered (0x238 records, not 0x358) — it was
+  head-blocking a character's DLM queue; `SA_JOIN_PARTY_IN_ARBITER` 0x13AB now reaches PartyManager,
+  which is the only way a party forms in this build; parcel rows carry their parcel id and receiver
+  again and attached gold is paid on claim; friend-accepted system message is SMT 433.
