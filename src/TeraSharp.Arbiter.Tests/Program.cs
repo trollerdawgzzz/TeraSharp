@@ -17036,6 +17036,190 @@ some prose with `backticks` that is not a table row
         Hex.True(ArbiterClientHandlers.ParseFindName(new byte[5]) == null, "5 B is one short of the guard");
     }
 
+    // ===================== T69: cap_social2.log, the real Arbiter =====================
+
+    /// <summary>cap_social2.log seq 1980 (request) and 1982 (the empty-bank reply).</summary>
+    const string Cap69_ViewWarehouseReq =
+        "B3 00 00 00 02 00 00 00 00 00 00 00 20 E0 4C C8 "
+        + "10 02 00 00 01 00 00 00 00 00 00 00";
+    const string Cap69_ViewWarehouseRsp =
+        "2D 00 00 00 00 00 00 00 B3 00 00 00 01 00 00 00 "
+        + "00 48 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+        + "00 00 00 00 00 48 00";
+
+    /// <summary>cap_social2.log seq 1268, SDB_CREATE_GUILD2's 36-byte header plus the three
+    /// strings and the one-entry Member list. The 856-byte fee atom that follows is left off.</summary>
+    const string Cap69_CreateGuild2Req =
+        "2A 00 00 00 34 00 00 00 4E 00 00 00 5E 00 00 00 "
+        + "04 00 00 00 62 00 00 00 58 03 00 00 EB 03 00 00 "
+        + "A7 00 00 00 74 00 65 00 73 00 74 00 00 00 47 00 "
+        + "75 00 69 00 6C 00 64 00 20 00 4D 00 61 00 73 00 "
+        + "74 00 65 00 72 00 00 00 52 00 65 00 63 00 72 00 "
+        + "75 00 69 00 74 00 00 00 02 00 00 00";
+
+    /// <summary>
+    /// DBS_VIEW_WAREHOUSE. Two fields were wrong before T69 and both are visible in every one of
+    /// the nine captured views: MaxSlotCount is 0x48, not 0, and EndPos is the index of the LAST
+    /// item, not one past it (0 items -&gt; 0, 1 -&gt; 0, 2 -&gt; 1, 3 -&gt; 2).
+    /// </summary>
+    [Test] public static void T69_the_warehouse_view_is_byte_exact()
+    {
+        var req = Hex.B(Cap69_ViewWarehouseReq);
+        Hex.True(req.Length == WarehouseHandlers.ViewRequestSize, $"28-byte request: {req.Length}");
+        Hex.True(BitConverter.ToUInt32(req, WarehouseHandlers.ViewReqDlmId) == 0xB3
+                 && BitConverter.ToInt64(req, WarehouseHandlers.ViewReqOwnerDbId) == 2
+                 && BitConverter.ToUInt32(req, WarehouseHandlers.ViewReqInvenType) == 1
+                 && BitConverter.ToUInt32(req, WarehouseHandlers.ViewReqViewPos) == 0,
+            "seq 1980: dlm 0xB3, owner 2, inven type 1, view pos 0");
+
+        Hex.True(WarehouseHandlers.DefaultMaxSlotCount == 0x48,
+            $"MaxSlotCount is 0x48 in all nine views: {WarehouseHandlers.DefaultMaxSlotCount}");
+        Hex.Eq(WarehouseHandlers.BuildDbsViewWarehouse(0xB3, true, 0, 0, 0, 0,
+                   WarehouseHandlers.DefaultMaxSlotCount, null),
+               Hex.B(Cap69_ViewWarehouseRsp), "0x274B for an empty bank, seq 1982");
+
+        // The occupied form: header identical bar the list slot, the totals and EndPos.
+        var one = WarehouseHandlers.BuildDbsViewWarehouse(0xB5, true, 0, 0, 1, 0,
+            WarehouseHandlers.DefaultMaxSlotCount, new[] { new byte[WarehouseHandlers.ItemRecordSize] });
+        Hex.True(one.Length == WarehouseHandlers.ViewReplyHeader + WarehouseHandlers.ItemRecordSize
+                 && BitConverter.ToUInt32(one, WarehouseHandlers.ViewRspListRef) == 45
+                 && BitConverter.ToUInt32(one, WarehouseHandlers.ViewRspListRef + 4) == 0x218
+                 && BitConverter.ToUInt32(one, WarehouseHandlers.ViewRspEndPos) == 0
+                 && BitConverter.ToUInt32(one, WarehouseHandlers.ViewRspTotalItemNum) == 1,
+            "seq 2010: one 0x218 record, EndPos 0, TotalItemNum 1");
+    }
+
+    /// <summary>
+    /// The store/get pair, and the op the withdraw of a whole stack uses. 0x10 was unmodelled
+    /// before T69, so taking a full stack out of the bank left the row sitting in it.
+    /// </summary>
+    [Test] public static void T69_the_warehouse_transfer_atoms_include_the_get_op()
+    {
+        Hex.True(WarehouseHandlers.TsWareGetItem == 0x10, "cap_social2.log seq 2085 carries op 16");
+
+        using var store = GuildStore(2);
+        store.UpsertItem(10018, 2, 1, 2, 17000, 1);          // in character 2's bank, slot 2
+        var rec = GiveTake(0, WarehouseHandlers.TsWareGetItem, 10018, 17000,
+                           2, 1, 2, 1, BagItems.Pocket, 2, 0);
+
+        const int hdr = WarehouseHandlers.GetRequestSize;
+        var payload = new byte[hdr + DbProxyHandlers.ItemAtomSize];
+        BitConverter.GetBytes((uint)(6 + hdr)).CopyTo(payload, WarehouseHandlers.GetReqBinaryRef);
+        BitConverter.GetBytes((uint)DbProxyHandlers.ItemAtomSize).CopyTo(payload, WarehouseHandlers.GetReqBinaryRef + 4);
+        BitConverter.GetBytes(0xBEu).CopyTo(payload, WarehouseHandlers.GetReqDlmId);
+        var atom = new byte[DbProxyHandlers.ItemAtomSize];
+        rec.AsSpan(0, 0x58).CopyTo(atom);                     // the head is the same in both strides
+        atom.CopyTo(payload, hdr);
+
+        var (op, body) = RunHandler1(DbProxyHandlers.SDB_GET_WAREHOUSE, payload, store);
+        Hex.True(op == DbProxyHandlers.DBS_GET_WAREHOUSE, $"replied with 0x{op:X4}");
+        Hex.True(BitConverter.ToUInt32(body, WarehouseHandlers.TransferRspBinaryRef) == 31
+                 && BitConverter.ToUInt32(body, WarehouseHandlers.TransferRspBinaryRef + 4) == DbProxyHandlers.ItemAtomSize
+                 && BitConverter.ToUInt32(body, WarehouseHandlers.TransferRspDlmId) == 0xBE
+                 && body[WarehouseHandlers.TransferRspSuccess] == 1,
+            "seq 2075's header: [31][atom bytes][dlm][ok=1][error 0][commision 0]");
+
+        var moved = store.GetInventoryItems(1).FirstOrDefault(r => r.ItemDbId == 10018);
+        Hex.True(moved != null && moved.InvenType == BagItems.Pocket && moved.Slot == 2,
+            "op 16 moves the whole row out of the bank and into the bag");
+    }
+
+    /// <summary>
+    /// Two per-login loads that were still coming from the replay table. Both echo a DlmId, so a
+    /// replayed constant hands World the id of whoever was logged in when the tap was recorded
+    /// and the live user's DB queue never drains.
+    /// </summary>
+    [Test] public static void T69_the_refer_a_friend_loads_are_answered()
+    {
+        Hex.True(DbProxyHandlers.IsHandledRequest(DbProxyHandlers.SDB_LOAD_REFER_A_FRIEND)
+                 && DbProxyHandlers.IsHandledRequest(DbProxyHandlers.SDB_LOAD_28B7),
+            "0x28B0 and 0x28B7 are allow-listed now");
+
+        Hex.Eq(DbProxyHandlers.BuildDbsReferAFriendList(0x19),
+            "2F 00 00 00 00 00 00 00 2F 00 00 00 00 00 00 00 01 19 00 00 00 "
+            + "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00",
+            "0x28B1, cap_social2.log seq 125 - two empty lists at offset = frame length");
+        Hex.Eq(DbProxyHandlers.BuildDbsInviteFriend(0x1A),
+            "01 1A 00 00 00 00 00 00 00 FF FF FF FF FF FF FF FF",
+            "0x28B6 (the reply opcode is request-1), seq 127 - AddInviteTime -1");
+    }
+
+    /// <summary>
+    /// SDB_CREATE_GUILD2. Guild creation arrives on the DB-proxy link, nothing answered it, and
+    /// its DlmId went unanswered - the founder's queue head-blocked. The replay table could not
+    /// have covered it: no guild was created in any tap it was built from.
+    /// </summary>
+    [Test] public static void T69_SDB_CREATE_GUILD2_is_read_and_answered()
+    {
+        var req = Hex.B(Cap69_CreateGuild2Req);
+        var r = GuildPackets.ParseSdbCreateGuild2(req);
+        Hex.True(r != null, "the captured header parses");
+        var v = r!.Value;
+        Hex.True(v.GuildName == "test" && v.MasterGroupName == "Guild Master"
+                 && v.MemberGroupName == "Recruit",
+            $"seq 1268: '{v.GuildName}' / '{v.MasterGroupName}' / '{v.MemberGroupName}'");
+        Hex.True(v.ChiefDbId == 1003 && v.DlmId == 0xA7, $"chief {v.ChiefDbId}, dlm 0x{v.DlmId:X}");
+        Hex.True(v.MemberDbIds.Count == 1 && v.MemberDbIds[0] == 2,
+            "the Member list is the founding co-signers, one u32 each");
+        Hex.True(GuildPackets.ParseSdbCreateGuild2(new byte[35]) == null, "one byte short is refused");
+
+        // The reply's block offsets, against the ones seq 1270 carries for 2 groups (0x28 each),
+        // 2 members (0xF0 each), one 856-byte fee atom and a 4-character first-reply name.
+        var groups = new[] { new byte[GuildPackets.GuildGroupDataSize], new byte[GuildPackets.GuildGroupDataSize] };
+        var members = new[] { new byte[GuildPackets.GuildMemberDataSize], new byte[GuildPackets.GuildMemberDataSize] };
+        var reply = GuildPackets.BuildDbsCreateGuild2("test", groups, members,
+            new byte[DbProxyHandlers.ItemAtomSize], "Test",
+            success: true, guildDbId: 1, chiefDbId: 1003, createTime: 0x6AAAF28B, dlmId: 0xA7, errorNo: 0);
+
+        Hex.True(reply.Length == 1493, $"payload 1493 B, as seq 1270 is: {reply.Length}");
+        Hex.True(BitConverter.ToUInt32(reply, 0) == 63
+                 && BitConverter.ToUInt32(reply, 4) == 73 && BitConverter.ToUInt32(reply, 8) == 80
+                 && BitConverter.ToUInt32(reply, 12) == 153 && BitConverter.ToUInt32(reply, 16) == 480
+                 && BitConverter.ToUInt32(reply, 20) == 633 && BitConverter.ToUInt32(reply, 24) == 856
+                 && BitConverter.ToUInt32(reply, 28) == 1489,
+            "name 63, groups (73,80), members (153,480), itemBinary (633,856), firstReplyName 1489");
+        Hex.True(reply[32] == 1 && BitConverter.ToInt32(reply, 33) == 1
+                 && BitConverter.ToInt32(reply, 37) == 1003
+                 && BitConverter.ToInt64(reply, 41) == 0x6AAAF28B
+                 && BitConverter.ToUInt32(reply, 49) == 0xA7
+                 && BitConverter.ToInt32(reply, 53) == 0,
+            "Success/GuildDbId/ChiefDbId/CreateTime/DlmId/ErrorNo at the dumper's offsets");
+
+        // The refusal still drains the queue.
+        var no = GuildPackets.BuildDbsCreateGuild2Failure(0xA7, 1003, DbProxyHandlers.CreateGuildErrorGeneric);
+        Hex.True(no[32] == 0 && BitConverter.ToUInt32(no, 49) == 0xA7
+                 && BitConverter.ToInt32(no, 53) == DbProxyHandlers.CreateGuildErrorGeneric,
+            "a refused create still echoes the DlmId");
+        Hex.True(DbProxyHandlers.IsHandledRequest(GuildPackets.SDB_CREATE_GUILD2), "0x27D4 is allow-listed");
+    }
+
+    /// <summary>
+    /// The guild boot load with no guilds. cap_social2.log seq 2 is the real one and it is 9141
+    /// bytes: a full default-constructed GuildData with Success 0, not a short frame - and this
+    /// time the two uninitialised bytes T51 saw are zero, so ours matches it exactly.
+    /// </summary>
+    [Test] public static void T69_the_guild_boot_terminator_matches_the_capture()
+    {
+        var p = GuildPackets.BuildEmptyDbsInitGuildData();
+        Hex.True(p.Length == 9135, $"payload 9135 B (frame 9141): {p.Length}");
+        Hex.True(BitConverter.ToUInt32(p, 0) == 19 && BitConverter.ToUInt32(p, 4) == GuildPackets.GuildDataSize
+                 && BitConverter.ToUInt32(p, 8) == 9139 && p[12] == 0,
+            "[19][0x23A0][9139][Success 0] - the logo id is the empty string at the frame end");
+
+        // The six defaults the real Arbiter leaves in an otherwise zero GuildData.
+        var blob = p[13..(13 + GuildPackets.GuildDataSize)];
+        int nz = 0; foreach (byte b in blob) if (b != 0) nz++;
+        Hex.True(nz == 16, $"sixteen non-zero bytes in the blob, as seq 2 has: {nz}");
+        Hex.True(BitConverter.ToInt32(blob, 0x64) == 1
+                 && BitConverter.ToInt32(blob, 0x235C) == 1
+                 && BitConverter.ToInt32(blob, 0x2360) == 70
+                 && BitConverter.ToInt32(blob, 0x2364) == 1,
+            "GuildLevel 1, JoinMinLevel 1, JoinMaxLevel 70, GuildJoinType 1");
+        Hex.True(blob[0x80] == 0xB2 && blob[0x81] == 0x07 && blob[0x82] == 0x01 && blob[0x84] == 0x01
+                 && blob[0x2328] == 0xB2 && blob[0x2348] == 0xB2,
+            "and the three epoch timestamps at 0x80 / 0x2328 / 0x2348");
+    }
+
     // ===================== T65: the 2026-09-16 live run =====================
 
     /// <summary>One 568-byte ItemTransactionGiveTake record, at the offsets DO_TS_CHANGE_ITEM_OWNER

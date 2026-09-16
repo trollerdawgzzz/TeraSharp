@@ -345,6 +345,70 @@ public static class GuildWiring
         return (id, dispatcher.Dispatch(a, "guild-create"));
     }
 
+
+    /// <summary>
+    /// T69: the whole of guild creation, driven by <c>SDB_CREATE_GUILD2</c> (0x27D4) rather than
+    /// by a client packet. Creates the guild for <paramref name="chiefDbId"/>, adds every founding
+    /// member the request names, dispatches the client fan-out, and hands back the blobs
+    /// <c>DBS_CREATE_GUILD2</c> has to carry.
+    ///
+    /// <para>The two group names come from the request: World, not the Arbiter, owns the strings
+    /// the rank list shows ("Guild Master" / "Recruit" in cap_social2.log seq 1268).</para>
+    ///
+    /// <para><b>Known deviation.</b> <see cref="GuildHandlers.CreateGuild"/> calls
+    /// <c>EmitMemberAdded</c> for the chief as well, so we emit one AS_GUILD_JOINED (0x2866) more
+    /// than seq 1269 does - the capture sends it only for the first-reply member. It is a per-user
+    /// push with no reply, so the extra one costs nothing; matching the capture exactly would mean
+    /// changing CreateGuild's own contract, which T52's tests pin.</para>
+    /// </summary>
+    public static CreateGuildResult CreateGuildFromWorld(
+        int chiefDbId, string guildName, string masterGroupName, string memberGroupName,
+        IReadOnlyList<int>? memberDbIds)
+    {
+        var store = Store;
+        if (store == null) return new CreateGuildResult(0, 0, Array.Empty<byte[]>(), Array.Empty<byte[]>(), string.Empty);
+
+        var a = new GuildActions();
+        int guildId = Guilds.CreateGuild(a, chiefDbId, guildName,
+            string.IsNullOrEmpty(masterGroupName) ? "Master" : masterGroupName,
+            string.IsNullOrEmpty(memberGroupName) ? "Member" : memberGroupName);
+
+        string firstReplyName = string.Empty;
+        if (guildId != 0 && memberDbIds != null)
+        {
+            foreach (int id in memberDbIds)
+            {
+                if (id == 0 || id == chiefDbId) continue;
+                var who = store.GetCharacter(id);
+                if (who == null || store.GetGuildIdOf(id) != 0) continue;
+                if (store.AddGuildMember(guildId, id, who.Name, who.Race, who.Class, who.Gender,
+                                         who.Level, who.AccountId) == 0) continue;
+                store.AddGuildLog(guildId, GuildHandlers.GuildLogJoin, who.Name, actorDbId: id);
+                store.DeleteGuildAppliesOfUser(id);
+                store.DeleteGuildInvitesOfUser(id);
+                Guilds.EmitMemberAddedForWorld(a, guildId, id);
+                if (firstReplyName.Length == 0) firstReplyName = who.Name;
+            }
+        }
+
+        Dispatcher(null, GuildLog).Dispatch(a, "guild-create");
+        if (guildId == 0) return new CreateGuildResult(0, 0, Array.Empty<byte[]>(), Array.Empty<byte[]>(), string.Empty);
+
+        var groupBlobs = new List<byte[]>();
+        foreach (var gr in store.GetGuildGroups(guildId)) groupBlobs.Add(BuildGuildGroupDataBlob(gr));
+        var memberBlobs = new List<byte[]>();
+        foreach (var m in store.GetGuildMembers(guildId)) memberBlobs.Add(BuildGuildMemberDataBlob(m));
+
+        long createTime = store.GetGuild(guildId)?.CreateDate ?? 0;
+        return new CreateGuildResult(guildId, createTime, groupBlobs, memberBlobs, firstReplyName);
+    }
+
+    /// <summary>What <see cref="CreateGuildFromWorld"/> gives DBS_CREATE_GUILD2. GuildId 0 means
+    /// the create was refused - the name was taken or the founder was already in a guild.</summary>
+    public readonly record struct CreateGuildResult(
+        int GuildId, long CreateTime, IReadOnlyList<byte[]> GroupBlobs,
+        IReadOnlyList<byte[]> MemberBlobs, string FirstReplyName);
+
     // =========================================================================================
     // 6. World -> Arbiter: the twelve SA_ guild frames (T52)
     // =========================================================================================

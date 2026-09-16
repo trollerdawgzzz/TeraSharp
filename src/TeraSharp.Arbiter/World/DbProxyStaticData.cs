@@ -1497,6 +1497,159 @@ public static class GuildPackets
     public const ushort SDB_CHECK_NEW_GUILD_NAME = 0x2785;
     public const ushort DBS_CHECK_NEW_GUILD_NAME = 0x2786;
 
+
+    // =====================================================================================
+    // T69: SDB_CREATE_GUILD2 (0x27D4) -> DBS_CREATE_GUILD2 (0x27D5). THE GUILD IS BORN HERE.
+    //
+    // Guild creation has no C_ packet and no SA_ frame: World finishes the founding contract and
+    // writes the guild through the DB proxy. Nothing in TeraSharp answered 0x27D4 before T69 -
+    // it fell through to the replay table, which has no entry for it because no guild was ever
+    // created in the taps the table was built from - so the DlmId went unanswered and the
+    // founder's DB queue head-blocked for the rest of the session.
+    //
+    // Pinned to cap_social2.log seq 1268 -> 1269 -> 1270: character 1003 founds "test" with
+    // member 2 ("Test") as the first reply. The two group names come from the request, so the
+    // ranks the client shows ("Guild Master" / "Recruit") are World's strings, not ours.
+    //
+    // SDB_CREATE_GUILD2, dumper Arb_part_017.c:4973, guard 0x29 -> min frame 0x2A:
+    //   [06] u32 GuildName off            (wstr, offset only)
+    //   [0A] u32 GuildMasterGroupName off
+    //   [0E] u32 GuildMemberGroupName off
+    //   [12] u32 Member off               [16] u32 Member bytes   (i32 UserDbId each)
+    //   [1A] u32 ItemBinary off           [1E] u32 ItemBinary bytes (856-byte atoms: the fee)
+    //   [22] i32 ChiefDbId                [26] i32 DlmId
+    //
+    // DBS_CREATE_GUILD2, dumper Arb_part_015.c:4192, guard 0x3e -> min frame 0x3F:
+    //   [06] u32 GuildName off
+    //   [0A] u32 GuildGroup off           [0E] u32 GuildGroup bytes   (GuildGroupData, 0x28 each)
+    //   [12] u32 Member off               [16] u32 Member bytes       (GuildMemberData, 0xF0 each)
+    //   [1A] u32 ItemBinary off           [1E] u32 ItemBinary bytes   (the fee atoms, echoed)
+    //   [22] u32 FirstReplyName off
+    //   [26] u8  Success   [27] i32 GuildDbId   [2B] i32 ChiefDbId
+    //   [2F] i64 CreateTime  [37] i32 DlmId  [3B] i32 ErrorNo
+    // then the blocks in slot order: name, groups, members, itemBinary, firstReplyName.
+    // seq 1270 checks out exactly: 63 / (73,80) / (153,480) / (633,856) / 1489, payload 1493.
+    // =====================================================================================
+
+    /// <summary>Payload bytes before the first block in DBS_CREATE_GUILD2 (frame 0x3F).</summary>
+    public const int CreateGuild2ReplyHeader = 57;
+    /// <summary>Payload bytes before the first block in SDB_CREATE_GUILD2 (frame 0x2A).</summary>
+    public const int CreateGuild2RequestHeader = 36;
+
+    public readonly record struct SdbCreateGuild2(
+        string GuildName, string MasterGroupName, string MemberGroupName,
+        IReadOnlyList<int> MemberDbIds, byte[] ItemBinary, int ChiefDbId, uint DlmId);
+
+    /// <summary>Reads an SDB_CREATE_GUILD2 payload. Null when it is shorter than the guard.</summary>
+    public static SdbCreateGuild2? ParseSdbCreateGuild2(byte[] p)
+    {
+        if (p == null || p.Length < CreateGuild2RequestHeader) return null;
+
+        var members = new List<int>();
+        int mOff = (int)BitConverter.ToUInt32(p, 12) - FrameHeader;
+        int mLen = (int)BitConverter.ToUInt32(p, 16);
+        if (mOff >= CreateGuild2RequestHeader && mLen > 0 && mLen <= p.Length - mOff)
+            for (int at = 0; at + 4 <= mLen; at += 4) members.Add(BitConverter.ToInt32(p, mOff + at));
+
+        var fee = Array.Empty<byte>();
+        int iOff = (int)BitConverter.ToUInt32(p, 20) - FrameHeader;
+        int iLen = (int)BitConverter.ToUInt32(p, 24);
+        if (iOff >= CreateGuild2RequestHeader && iLen > 0 && iLen <= p.Length - iOff)
+        {
+            fee = new byte[iLen];
+            Array.Copy(p, iOff, fee, 0, iLen);
+        }
+
+        return new SdbCreateGuild2(
+            ReadGuildWString(p, BitConverter.ToUInt32(p, 0)),
+            ReadGuildWString(p, BitConverter.ToUInt32(p, 4)),
+            ReadGuildWString(p, BitConverter.ToUInt32(p, 8)),
+            members, fee,
+            BitConverter.ToInt32(p, 28), BitConverter.ToUInt32(p, 32));
+    }
+
+    /// <summary>
+    /// DBS_CREATE_GUILD2 (0x27D5). <paramref name="groups"/> are 0x28-byte GuildGroupData blobs
+    /// and <paramref name="members"/> 0xF0-byte GuildMemberData blobs, in the order World is to
+    /// see them; <paramref name="itemBinary"/> is the request's fee atom list, echoed.
+    /// </summary>
+    public static byte[] BuildDbsCreateGuild2(
+        string guildName, IReadOnlyList<byte[]>? groups, IReadOnlyList<byte[]>? members,
+        byte[]? itemBinary, string firstReplyName, bool success, int guildDbId, int chiefDbId,
+        long createTime, uint dlmId, int errorNo)
+    {
+        groups ??= Array.Empty<byte[]>();
+        members ??= Array.Empty<byte[]>();
+        itemBinary ??= Array.Empty<byte>();
+        guildName ??= string.Empty;
+        firstReplyName ??= string.Empty;
+
+        int nameBytes = (guildName.Length + 1) * 2;
+        int groupBytes = 0; foreach (var g in groups) groupBytes += g.Length;
+        int memberBytes = 0; foreach (var m in members) memberBytes += m.Length;
+        int replyNameBytes = (firstReplyName.Length + 1) * 2;
+
+        var p = new byte[CreateGuild2ReplyHeader + nameBytes + groupBytes + memberBytes
+                         + itemBinary.Length + replyNameBytes];
+
+        int at = CreateGuild2ReplyHeader;
+        uint nameOff = (uint)(FrameHeader + at);
+        WriteGuildWString(p, at, guildName); at += nameBytes;
+        uint groupOff = (uint)(FrameHeader + at);
+        foreach (var g in groups) { g.CopyTo(p, at); at += g.Length; }
+        uint memberOff = (uint)(FrameHeader + at);
+        foreach (var m in members) { m.CopyTo(p, at); at += m.Length; }
+        uint itemOff = (uint)(FrameHeader + at);
+        itemBinary.CopyTo(p, at); at += itemBinary.Length;
+        uint replyNameOff = (uint)(FrameHeader + at);
+        WriteGuildWString(p, at, firstReplyName);
+
+        BitConverter.GetBytes(nameOff).CopyTo(p, 0);
+        BitConverter.GetBytes(groupOff).CopyTo(p, 4);
+        BitConverter.GetBytes((uint)groupBytes).CopyTo(p, 8);
+        BitConverter.GetBytes(memberOff).CopyTo(p, 12);
+        BitConverter.GetBytes((uint)memberBytes).CopyTo(p, 16);
+        BitConverter.GetBytes(itemOff).CopyTo(p, 20);
+        BitConverter.GetBytes((uint)itemBinary.Length).CopyTo(p, 24);
+        BitConverter.GetBytes(replyNameOff).CopyTo(p, 28);
+        p[32] = (byte)(success ? 1 : 0);
+        BitConverter.GetBytes(guildDbId).CopyTo(p, 33);
+        BitConverter.GetBytes(chiefDbId).CopyTo(p, 37);
+        BitConverter.GetBytes(createTime).CopyTo(p, 41);
+        BitConverter.GetBytes(dlmId).CopyTo(p, 49);
+        BitConverter.GetBytes(errorNo).CopyTo(p, 53);
+        return p;
+    }
+
+    /// <summary>The refusal form: no blocks, Success 0 and an ErrorNo, DlmId echoed so the
+    /// founder's DB queue drains either way.</summary>
+    public static byte[] BuildDbsCreateGuild2Failure(uint dlmId, int chiefDbId, int errorNo)
+        => BuildDbsCreateGuild2(string.Empty, null, null, null, string.Empty,
+                                success: false, guildDbId: 0, chiefDbId, createTime: 0, dlmId, errorNo);
+
+    /// <summary>A NUL-terminated UTF-16LE string at a FRAME offset, read out of a payload. The
+    /// offset is read UNSIGNED so a garbage value can never index backwards.</summary>
+    private static string ReadGuildWString(byte[] payload, uint frameOffset)
+    {
+        if (frameOffset < FrameHeader) return string.Empty;
+        long at = (long)frameOffset - FrameHeader;
+        if (at >= payload.Length) return string.Empty;
+        var sb = new System.Text.StringBuilder();
+        for (long i = at; i + 1 < payload.Length; i += 2)
+        {
+            char ch = (char)(payload[i] | (payload[i + 1] << 8));
+            if (ch == '\0') break;
+            sb.Append(ch);
+        }
+        return sb.ToString();
+    }
+
+    private static void WriteGuildWString(byte[] p, int at, string value)
+    {
+        foreach (char ch in value) { p[at++] = (byte)ch; p[at++] = (byte)(ch >> 8); }
+        p[at] = 0; p[at + 1] = 0;
+    }
+
     /// <summary>
     /// Minimum FRAME length each SA_ guild handler demands. Like the party frames, a short one
     /// is not a dropped packet on the real Arbiter - the handler logs

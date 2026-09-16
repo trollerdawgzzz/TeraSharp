@@ -93,7 +93,13 @@ public static class WarehouseHandlers
     /// caps (576 account / 360 character / 288 guild) come from ServerConfig.xml, which we do
     /// not read, so the store's row wins and this is only the fallback for an owner with no row.
     /// </summary>
-    public const ushort DefaultMaxSlotCount = 0;
+    /// <summary>
+    /// MaxSlotCount in DBS_VIEW_WAREHOUSE. T69: the real Arbiter answers <b>0x48</b>, the same
+    /// number as <see cref="WarehousePageSize"/>, in all nine views in cap_social2.log
+    /// (seq 1982..2153, inven type 1, 0 to 3 items) - not 0. World sizes the bank window from
+    /// this field, so a 0 makes every slot look out of range.
+    /// </summary>
+    public const ushort DefaultMaxSlotCount = 0x48;
 
     // ------------------------------------------------- ItemTransactionAtom fields
     // Atom-relative. The first four are already in status/INVENTORY-DESIGN.md section 3; the
@@ -128,6 +134,11 @@ public static class WarehouseHandlers
     public const uint TsWareChangeMoney = 0x0D;   // src=dst=(wareOwner, wareType); +0x50 = delta
     public const uint TsWareMoveItem = 0x0E;      // whole row moves to (dstOwner, dstInven, dstSlot)
     public const uint TsWareInsertItem = 0x0F;    // new row in the warehouse (a split stack)
+    /// <summary>T69: the withdraw twin of <see cref="TsWareMoveItem"/> - the whole row moves OUT
+    /// of the warehouse to (dstOwner, dstInven, dstSlot). cap_social2.log seq 2085 is one on its
+    /// own: item 10018, template 17000, (2, inven 1, slot 2) -&gt; (1003, inven 0, slot 2). Before
+    /// T69 it was an unmodelled op, so withdrawing a full stack left the row in the bank.</summary>
+    public const uint TsWareGetItem = 0x10;
     public const uint TsWareChangeAmount = 0x11;  // +0x50 added to the row at (src triple)
 
     /// <summary>One parsed <c>ItemTransactionAtom</c>. Only the fields the warehouse path uses.</summary>
@@ -513,6 +524,7 @@ public static class WarehouseHandlers
                 // ---- move, within a container or between two ----
                 case TsChangeItemPos:
                 case TsWareMoveItem:
+                case TsWareGetItem:
                     if (a.ItemDbId == 0)
                     {
                         // Identified by position instead: find what is at the source triple.

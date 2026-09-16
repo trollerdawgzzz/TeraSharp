@@ -692,3 +692,23 @@ Still open: a second `SDB_MAKE_PARCEL` in the same session reportedly failed. No
 refuses a second send, and the live Arbiter log line for it was not captured — the one thing T65
 changed that could have caused it is `GetCharacterByName`, which was case-sensitive SQL
 (`WHERE name = $n`) and is now `COLLATE NOCASE`. If it recurs, the refusal now logs which name missed.
+
+## 12. T69 — the warehouse against cap_social2.log
+
+Nine views, three stores and three gets from a real Arbiter (seq 1980..2153, Phargo bank, inven
+type 1). Every request and reply offset in `WarehouseHandlers` checks out unchanged. Three things
+did not.
+
+| Field | Was | Capture | Why it matters |
+| --- | --- | --- | --- |
+| `DBS_VIEW_WAREHOUSE` MaxSlotCount (payload +37, u16) | 0 | **0x48** in all nine views | World sizes the bank window from it; 0 puts every slot out of range |
+| EndPos (payload +21) | `viewPos + count` | index of the **last** item — 0 items → 0, 1 → 0, 2 → 1, 3 → 2 | we ran one slot past the list |
+| TS op **0x10** | unmodelled, echoed only | seq 2085, one atom: item 10018 tpl 17000, (2, inven 1, slot 2) → (1003, inven 0, slot 2) | the withdraw twin of `TS_WARE_MOVE_ITEM` (0x0E) — taking a whole stack out left the row in the bank |
+
+Gold moves as a pair, not as a header field alone: seq 2121 (deposit) and 2149 (withdraw) carry
+`MoneyDelta = 1230000` in the request header **and** two atoms — op 9 (character money, signed and
+opposite) plus op 0x0D (warehouse money). Both were already modelled; the view's CurrentMoney at
+payload +29 then reads back 1230000 at seq 2126, which is the round trip.
+
+`SDB_INCREASE_WAREHOUSE_SIZE` (0x283F) does not appear in this capture, so the 0x283E reply-opcode
+trap stays derived from the decompile rather than confirmed from the wire.

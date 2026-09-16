@@ -429,6 +429,53 @@ public sealed class DbProxyHandlers
     public const ushort SDB_LOAD_2900 = 0x2900;            // -> 0x2901: two empty lists + [reqId][ok]
     public const ushort SDB_LOAD_28B7 = 0x28B7;            // -> 0x28B6: [ok][reqId][u32 0][u64 -1] (reply is op-1!)
     public const ushort SDB_LOAD_REFER_A_FRIEND = 0x28B0;  // -> 0x28B1: two empty lists + [ok][reqId] + 20 zeros
+
+    // --- T69: the two refer-a-friend loads, promoted out of the replay table ---
+    // Both carry a DlmId and both are per-login, so a replayed constant hands World the DlmId of
+    // whoever logged in when the tap was recorded and the live user's queue never drains. Pinned
+    // to cap_social2.log seq 124 -> 125 and 126 -> 127 (and again at 699/701 for the second
+    // character, which is what proves the DlmId and the UserDbId are the only things that move).
+    //
+    // SDB_LOAD_REFER_A_FRIEND_LIST (0x28B0), dumper FUN_... Arb_part_017.c:10497, guard 0x0d:
+    //   frame [06] i32 DlmId   [0A] i32 UserDbId                        min frame 0x0E
+    // DBS_LOAD_REFER_A_FRIEND_LIST (0x28B1), Arb_part_015.c:10627, guard 0x2e, min frame 0x2F:
+    //   payload [00] RafRefererUserDbIdList off  [04] bytes
+    //           [08] RafRefereeUserDbIdList off  [12] bytes
+    //           [16] u8 Success  [17] i32 DlmId  [21] i64 RefererAccountDbId
+    //           [29] i32 RefererUserDbId  [33] i64 ExpireDate
+    // Both lists are empty, and both empty lists use the offset = FRAME LENGTH convention.
+    public const ushort DBS_LOAD_REFER_A_FRIEND = 0x28B1;
+    public const int ReferAFriendReplySize = 41;           // frame 47
+
+    // SDB_LOAD_INVITE_FRIEND (0x28B7), Arb_part_017.c:10119, guard 0x0d: same request shape.
+    // DBS_LOAD_INVITE_FRIEND (0x28B6 - the reply opcode is REQUEST MINUS ONE), Arb_part_015.c:9836,
+    // guard 0x16, min frame 0x17:
+    //   payload [00] u8 Success  [01] i32 DlmId  [05] i32 InviteFriendDbId  [09] i64 AddInviteTime
+    // The capture answers Success 1, InviteFriendDbId 0 and AddInviteTime -1 (never invited).
+    public const ushort DBS_LOAD_28B6 = 0x28B6;
+    public const int InviteFriendReplySize = 17;           // frame 23
+
+    /// <summary>DBS_LOAD_REFER_A_FRIEND_LIST (0x28B1): nobody referred anybody.</summary>
+    public static byte[] BuildDbsReferAFriendList(uint dlmId)
+    {
+        var p = new byte[ReferAFriendReplySize];
+        uint frameLen = (uint)(6 + ReferAFriendReplySize);
+        BitConverter.GetBytes(frameLen).CopyTo(p, 0);
+        BitConverter.GetBytes(frameLen).CopyTo(p, 8);
+        p[16] = 1;
+        BitConverter.GetBytes(dlmId).CopyTo(p, 17);
+        return p;
+    }
+
+    /// <summary>DBS_LOAD_INVITE_FRIEND (0x28B6): no invite on file, AddInviteTime = -1.</summary>
+    public static byte[] BuildDbsInviteFriend(uint dlmId)
+    {
+        var p = new byte[InviteFriendReplySize];
+        p[0] = 1;
+        BitConverter.GetBytes(dlmId).CopyTo(p, 1);
+        BitConverter.GetBytes(-1L).CopyTo(p, 9);
+        return p;
+    }
     public const ushort SDB_LOAD_2975 = 0x2975;            // -> 0x2976: 16 zeros + [reqId][ok] + 20 zeros
     public const ushort SDB_LOAD_2986 = 0x2986;            // -> 0x2987: 32 zeros + [reqId][ok] + trailing (16B request)
     public const ushort SDB_LOAD_290C = 0x290C;            // -> pushes 0x15B1 + 0x2847 + 0x1440 + 0x143E, then 0x290D
@@ -1063,6 +1110,9 @@ public sealed class DbProxyHandlers
             case SDB_SAVE_27FA:
             case SDB_SAVE_2924:
             case SDB_UPDATE_LEFT_COOLTIME_PREMIUM_SLOT:   // 0x28C1, T64
+            case SDB_LOAD_REFER_A_FRIEND:   // 0x28B0, T69
+            case SDB_LOAD_28B7:             // 0x28B7, T69
+            case GuildPackets.SDB_CREATE_GUILD2:   // 0x27D4, T69
             case SDB_SAVE_2768:
             case SDB_ITEM_TRADE:   // 0x276A, T65
             case SDB_SAVE_2936:
@@ -1184,6 +1234,13 @@ public sealed class DbProxyHandlers
             // --- Logout save sequence (reqId echoed from the live request) ---
             case SDB_SAVE_27FA: return OnSaveUserAchievement(link, payload);
             case SDB_SAVE_2924: link.SendFrame(DBS_SAVE_2925, BuildReqIdAck(payload, 8)); return true;
+            case SDB_LOAD_REFER_A_FRIEND:
+                link.SendFrame(DBS_LOAD_REFER_A_FRIEND,
+                    BuildDbsReferAFriendList(payload.Length >= 8 ? U32(payload, 6) : 0)); return true;
+            case SDB_LOAD_28B7:
+                link.SendFrame(DBS_LOAD_28B6,
+                    BuildDbsInviteFriend(payload.Length >= 8 ? U32(payload, 6) : 0)); return true;
+            case GuildPackets.SDB_CREATE_GUILD2: return OnCreateGuild2(link, payload);
             case SDB_UPDATE_LEFT_COOLTIME_PREMIUM_SLOT:
                 link.SendFrame(DBS_UPDATE_LEFT_COOLTIME_PREMIUM_SLOT, BuildReqIdAck(payload, 8)); return true;
             case SDB_SAVE_2768: return OnItemSingle(link, payload);
@@ -1786,6 +1843,65 @@ public sealed class DbProxyHandlers
         return true;
     }
 
+
+    /// <summary>
+    /// SDB_CREATE_GUILD2 (0x27D4) -&gt; AS_GUILD_JOINED (0x2866) per joining member, then
+    /// DBS_CREATE_GUILD2 (0x27D5). T69.
+    ///
+    /// <para><b>This was a live wedge.</b> Guild creation has no C_ packet and no SA_ frame - it
+    /// arrives here - and nothing answered it, so the founder's DlmId went unanswered and their
+    /// DB queue head-blocked. The replay table could never have covered it either: no guild was
+    /// created in any tap it was built from.</para>
+    ///
+    /// <para>Order is the capture's (cap_social2.log seq 1268 -&gt; 1269 -&gt; 1270): the joins go
+    /// out first, the reply last. The fee atoms in ItemBinary are echoed, not applied - World
+    /// already took the money out of the founder's bag through the 0x2768 that preceded this.</para>
+    /// </summary>
+    private bool OnCreateGuild2(WorldLink link, byte[] payload)
+    {
+        var req = GuildPackets.ParseSdbCreateGuild2(payload);
+        if (req == null)
+        {
+            _log.LogWarning("SDB_CREATE_GUILD2: {Len} B payload (want >= {Want}) - refusing",
+                payload.Length, GuildPackets.CreateGuild2RequestHeader);
+            link.SendFrame(GuildPackets.DBS_CREATE_GUILD2,
+                GuildPackets.BuildDbsCreateGuild2Failure(0, 0, CreateGuildErrorGeneric));
+            return true;
+        }
+        var r = req.Value;
+
+        var made = GuildWiring.CreateGuildFromWorld(
+            r.ChiefDbId, r.GuildName, r.MasterGroupName, r.MemberGroupName, r.MemberDbIds);
+
+        if (made.GuildId == 0)
+        {
+            _log.LogWarning("SDB_CREATE_GUILD2: '{Name}' for chief {Chief} refused", r.GuildName, r.ChiefDbId);
+            link.SendFrame(GuildPackets.DBS_CREATE_GUILD2,
+                GuildPackets.BuildDbsCreateGuild2Failure(r.DlmId, r.ChiefDbId, CreateGuildErrorGeneric));
+            return true;
+        }
+
+        foreach (int id in r.MemberDbIds)
+        {
+            if (id == 0 || id == r.ChiefDbId) continue;
+            link.SendFrame(GuildPackets.AS_GUILD_JOINED, BitConverter.GetBytes(id));
+        }
+
+        _log.LogInformation(
+            "SDB_CREATE_GUILD2: guild {Id} '{Name}' founded by {Chief} with {N} other member(s), {Fee} B of fee atoms",
+            made.GuildId, r.GuildName, r.ChiefDbId, made.MemberBlobs.Count - 1, r.ItemBinary.Length);
+
+        link.SendFrame(GuildPackets.DBS_CREATE_GUILD2, GuildPackets.BuildDbsCreateGuild2(
+            r.GuildName, made.GroupBlobs, made.MemberBlobs, r.ItemBinary, made.FirstReplyName,
+            success: true, made.GuildId, r.ChiefDbId, made.CreateTime, r.DlmId, errorNo: 0));
+        return true;
+    }
+
+    /// <summary>ErrorNo in a refused DBS_CREATE_GUILD2. The enum is not in the decompile and the
+    /// capture only ever carries 0, so this is the one value we invent - World shows the client a
+    /// generic failure for anything non-zero.</summary>
+    public const int CreateGuildErrorGeneric = 1;
+
     /// <summary>
     /// SDB_ITEM_TRADE (0x276A) -&gt; DBS_ITEM_TRADE (0x276B). T65. See the constants above: same
     /// echo-and-apply rule as SDB_ITEM_SINGLE, 568-byte records, two players.
@@ -1922,15 +2038,17 @@ public sealed class DbProxyHandlers
             }
         }
 
-        // ViewPos/EndPos are the window into the page the client asked for. With one page of
-        // 0x48 slots and no paging UI of our own, the honest answer is "the whole list".
-        uint endPos = viewPos + (uint)records.Count;
+        // T69, from the nine captured views in cap_social2.log (seq 1982..2153): EndPos is the
+        // index of the LAST item served, not one past it - 0 items -> 0, 1 -> 0, 2 -> 1, 3 -> 2.
+        // We were sending one too many, so World's window ran a slot past the list.
+        uint endPos = viewPos + (records.Count > 0 ? (uint)records.Count - 1 : 0);
         _log.LogInformation("SDB_VIEW_WAREHOUSE: owner {Owner} pocket {Pocket} -> {N} item(s), {Money} money",
             ownerDbId, invenType, records.Count, money);
 
         link.SendFrame(DBS_VIEW_WAREHOUSE, WarehouseHandlers.BuildDbsViewWarehouse(
             dlmId, ok: true, viewPos, endPos, (uint)records.Count, money,
-            (ushort)Math.Clamp(slotCount, 0, ushort.MaxValue), records));
+            slotCount > 0 ? (ushort)Math.Clamp(slotCount, 0, ushort.MaxValue)
+                          : WarehouseHandlers.DefaultMaxSlotCount, records));
         return true;
     }
 
