@@ -1005,6 +1005,29 @@ CREATE TABLE IF NOT EXISTS parcels (
 );
 CREATE INDEX IF NOT EXISTS ix_parcels_receiver ON parcels(receiver_db_id);
 
+-- T71: the trade broker's listings. One row per registered item, from
+-- SDB_TRADE_BROKER_REGISTER_ITEM until the seller collects the proceeds or cancels.
+-- `trade_id` is the TradeId every broker frame keys on and the client shows; `state` is the
+-- lifecycle in status/BROKER-DESIGN.md. The item itself is NOT deleted when it is listed - it
+-- moves to inventory type 6, the broker's holding pocket, which is what the op-44 atom in the
+-- register batch does. So `items` stays the single source of truth for where a thing is.
+CREATE TABLE IF NOT EXISTS broker_listings (
+  trade_id      INTEGER PRIMARY KEY,
+  seller_db_id  INTEGER NOT NULL DEFAULT 0,
+  seller_name   TEXT    NOT NULL DEFAULT '',
+  item_db_id    INTEGER NOT NULL DEFAULT 0,
+  template_id   INTEGER NOT NULL DEFAULT 0,
+  amount        INTEGER NOT NULL DEFAULT 0,
+  price         INTEGER NOT NULL DEFAULT 0,
+  buyer_db_id   INTEGER NOT NULL DEFAULT 0,
+  state         INTEGER NOT NULL DEFAULT 0,
+  registered_at TEXT    NOT NULL DEFAULT (datetime('now')),
+  sold_at       TEXT    NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS ix_broker_seller ON broker_listings(seller_db_id);
+CREATE INDEX IF NOT EXISTS ix_broker_buyer ON broker_listings(buyer_db_id);
+CREATE INDEX IF NOT EXISTS ix_broker_template ON broker_listings(template_id);
+
 -- T42: parcel attachments. Max 5 in the real server (hard-coded, five slots at
 -- ParcelData +0xd8 + i*0x1b0); we keep the cap as a check in code rather than in the schema.
 CREATE TABLE IF NOT EXISTS parcel_items (
@@ -2108,6 +2131,193 @@ SELECT last_insert_rowid();";
     /// only has to be non-zero, distinct and monotonic.)
     /// </summary>
     public const int FirstItemId = 1000;
+
+
+    // =============================================================== T71: the trade broker
+
+    /// <summary>
+    /// One broker listing. <paramref name="State"/> is
+    /// <see cref="BrokerListed"/> / <see cref="BrokerSold"/> / <see cref="BrokerSellerPaid"/> /
+    /// <see cref="BrokerBuyerCollected"/> / <see cref="BrokerCancelled"/>.
+    /// </summary>
+    public sealed record BrokerListingRow(
+        int TradeId, int SellerDbId, string SellerName, long ItemDbId, int TemplateId,
+        int Amount, long Price, int BuyerDbId, int State, string RegisteredAt, string SoldAt);
+
+    /// <summary>On sale.</summary>
+    public const int BrokerListed = 0;
+    /// <summary>Bought, but neither side has collected.</summary>
+    public const int BrokerSold = 1;
+    /// <summary>The seller has taken the proceeds (SDB_TRADE_BROKER_CALC_SOLD_ITEM step 2).</summary>
+    public const int BrokerSellerPaid = 2;
+    /// <summary>The buyer has taken the item (SDB_TRADE_BROKER_CALC_BOUGHT_ITEM step 2).</summary>
+    public const int BrokerBuyerCollected = 3;
+    /// <summary>Withdrawn by the seller (SDB_TRADE_BROKER_UNREGISTER_ITEM step 2).</summary>
+    public const int BrokerCancelled = 4;
+
+    /// <summary>Registers a listing and returns its TradeId.</summary>
+    public int CreateBrokerListing(int sellerDbId, string sellerName, long itemDbId,
+                                   int templateId, int amount, long price)
+    {
+        ArgumentNullException.ThrowIfNull(sellerName);
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "INSERT INTO broker_listings(seller_db_id, seller_name, item_db_id, template_id, amount, price) " +
+                "VALUES($s,$sn,$i,$t,$a,$p); SELECT last_insert_rowid()";
+            cmd.Parameters.AddWithValue("$s", sellerDbId);
+            cmd.Parameters.AddWithValue("$sn", sellerName);
+            cmd.Parameters.AddWithValue("$i", itemDbId);
+            cmd.Parameters.AddWithValue("$t", templateId);
+            cmd.Parameters.AddWithValue("$a", amount);
+            cmd.Parameters.AddWithValue("$p", price);
+            return Convert.ToInt32(cmd.ExecuteScalar()!);
+        }
+    }
+
+    private const string BrokerColumns =
+        "trade_id, seller_db_id, seller_name, item_db_id, template_id, amount, price, " +
+        "buyer_db_id, state, registered_at, sold_at";
+
+    private static BrokerListingRow ReadBrokerRow(SqliteDataReader r) => new(
+        r.GetInt32(0), r.GetInt32(1), r.GetString(2), r.GetInt64(3), r.GetInt32(4),
+        r.GetInt32(5), r.GetInt64(6), r.GetInt32(7), r.GetInt32(8), r.GetString(9), r.GetString(10));
+
+    public BrokerListingRow? GetBrokerListing(int tradeId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = $"SELECT {BrokerColumns} FROM broker_listings WHERE trade_id=$id";
+            cmd.Parameters.AddWithValue("$id", tradeId);
+            using var r = cmd.ExecuteReader();
+            return r.Read() ? ReadBrokerRow(r) : null;
+        }
+    }
+
+    /// <summary>Everything this character put up, newest first - what
+    /// <c>C_TRADE_BROKER_REGISTERED_ITEM_LIST</c> shows.</summary>
+    public IReadOnlyList<BrokerListingRow> GetBrokerListingsOf(int sellerDbId, int state = BrokerListed)
+        => QueryBroker($"SELECT {BrokerColumns} FROM broker_listings WHERE seller_db_id=$k AND state=$st "
+                       + "ORDER BY trade_id DESC", sellerDbId, state);
+
+    /// <summary>Everything this character bought and has not collected -
+    /// <c>C_TRADE_BROKER_BOUGHT_ITEM_LIST</c>.</summary>
+    public IReadOnlyList<BrokerListingRow> GetBrokerPurchasesOf(int buyerDbId, int state = BrokerSold)
+        => QueryBroker($"SELECT {BrokerColumns} FROM broker_listings WHERE buyer_db_id=$k AND state=$st "
+                       + "ORDER BY trade_id DESC", buyerDbId, state);
+
+    private IReadOnlyList<BrokerListingRow> QueryBroker(string sql, int key, int state)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = sql;
+            cmd.Parameters.AddWithValue("$k", key);
+            cmd.Parameters.AddWithValue("$st", state);
+            var rows = new List<BrokerListingRow>();
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) rows.Add(ReadBrokerRow(r));
+            return rows;
+        }
+    }
+
+    /// <summary>
+    /// One page of what is on sale. <paramref name="templateId"/> 0 means "everything".
+    /// The page window is bounds-checked as UNSIGNED and against the row count, so a
+    /// packet-supplied page can never index backwards or off the end
+    /// (status/ARBITER-SECURITY-NOTES.md).
+    /// </summary>
+    public IReadOnlyList<BrokerListingRow> SearchBrokerListings(int templateId, int page, int pageSize)
+    {
+        if (pageSize <= 0 || pageSize > 500) pageSize = 100;
+        long skip = (long)(uint)page * pageSize;
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                $"SELECT {BrokerColumns} FROM broker_listings WHERE state=$st "
+                + "AND ($t = 0 OR template_id = $t) ORDER BY price ASC, trade_id ASC LIMIT $n OFFSET $o";
+            cmd.Parameters.AddWithValue("$st", BrokerListed);
+            cmd.Parameters.AddWithValue("$t", templateId);
+            cmd.Parameters.AddWithValue("$n", pageSize);
+            cmd.Parameters.AddWithValue("$o", skip);
+            var rows = new List<BrokerListingRow>();
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) rows.Add(ReadBrokerRow(r));
+            return rows;
+        }
+    }
+
+    /// <summary>How many listings a search would return - the total the paged client windows show.</summary>
+    public int CountBrokerListings(int templateId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT COUNT(*) FROM broker_listings WHERE state=$st AND ($t = 0 OR template_id = $t)";
+            cmd.Parameters.AddWithValue("$st", BrokerListed);
+            cmd.Parameters.AddWithValue("$t", templateId);
+            return Convert.ToInt32(cmd.ExecuteScalar()!);
+        }
+    }
+
+    /// <summary>Marks a listing sold. Refuses unless it is still <see cref="BrokerListed"/>, so
+    /// two buyers racing the same TradeId cannot both win.</summary>
+    public bool SellBrokerListing(int tradeId, int buyerDbId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE broker_listings SET state=$new, buyer_db_id=$b, " +
+                              "sold_at=datetime('now') WHERE trade_id=$id AND state=$old";
+            cmd.Parameters.AddWithValue("$new", BrokerSold);
+            cmd.Parameters.AddWithValue("$b", buyerDbId);
+            cmd.Parameters.AddWithValue("$id", tradeId);
+            cmd.Parameters.AddWithValue("$old", BrokerListed);
+            return cmd.ExecuteNonQuery() == 1;
+        }
+    }
+
+    /// <summary>Moves a listing to a terminal state, only from the state it is allowed to leave.</summary>
+    public bool SetBrokerListingState(int tradeId, int fromState, int toState)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE broker_listings SET state=$new WHERE trade_id=$id AND state=$old";
+            cmd.Parameters.AddWithValue("$new", toState);
+            cmd.Parameters.AddWithValue("$id", tradeId);
+            cmd.Parameters.AddWithValue("$old", fromState);
+            return cmd.ExecuteNonQuery() == 1;
+        }
+    }
+
+    /// <summary>Re-prices a listing that is still on sale.</summary>
+    public bool SetBrokerListingPrice(int tradeId, long price)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE broker_listings SET price=$p WHERE trade_id=$id AND state=$st";
+            cmd.Parameters.AddWithValue("$p", price);
+            cmd.Parameters.AddWithValue("$id", tradeId);
+            cmd.Parameters.AddWithValue("$st", BrokerListed);
+            return cmd.ExecuteNonQuery() == 1;
+        }
+    }
+
+    public bool DeleteBrokerListing(int tradeId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "DELETE FROM broker_listings WHERE trade_id=$id";
+            cmd.Parameters.AddWithValue("$id", tradeId);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
 
     /// <summary>One fresh item DB id.</summary>
     public int NextItemId() => ReserveItemIds(1);

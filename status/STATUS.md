@@ -254,3 +254,9 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   the wrong offsets, so World read back user 1 for every character; fixed and byte-exact.
   Of the 31 opcodes in T70's item-2 list, 25 are Arbiter -> World pushes and cannot wedge; of the
   six real requests only 0x1554 carries a DlmId.
+
+- T71 (cap_social3.log): the broker listings table exists and the five two-step DB-proxy handlers
+  run on it — register (price read from the op-53 atom at +0x288), cancel, buy, and the two
+  collects, with the three different Step-2 reply shapes pinned. All twelve captured broker frames
+  reproduce byte for byte. A listed item lives in inven 6, the broker pocket, not in limbo. The
+  client half (nine `C_TRADE_BROKER_*` windows) is still the empty forms.

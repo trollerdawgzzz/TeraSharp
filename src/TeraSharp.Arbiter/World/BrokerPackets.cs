@@ -417,6 +417,95 @@ public static class BrokerPackets
     /// <summary>The TradeData / CalcItemList record, 0x188 bytes.</summary>
     public const int TradeDataSize = 0x188;
 
+    // ---- T71: the payload bytes ahead of the first ref target in each request ----
+    /// <summary>SDB_TRADE_BROKER_REGISTER_ITEM, frame 0x16.</summary>
+    public const int RegisterRequestHeader = 0x16 - FrameHeaderSize;      // 16
+    /// <summary>SDB_TRADE_BROKER_UNREGISTER_ITEM, frame 0x1E.</summary>
+    public const int UnregisterRequestHeader = 0x1E - FrameHeaderSize;    // 24
+    /// <summary>SDB_TRADE_BROKER_CALC_*_ITEM, frame 0x22.</summary>
+    public const int CalcRequestHeader = 0x22 - FrameHeaderSize;          // 28
+    /// <summary>SDB_TRADE_BROKER_BUY_IT_NOW, frame 0x27.</summary>
+    public const int BuyItNowRequestHeader = 0x27 - FrameHeaderSize;      // 33
+
+    /// <summary>
+    /// The listing PRICE, inside the op-53 (<c>TS_TRADE_BROKER_REGISTER</c>) atom of a register
+    /// batch. T71: SDB_TRADE_BROKER_REGISTER_ITEM has no price field of its own - the dumper
+    /// lists only DlmId, OwnerDbId and ItemBinary - so this is the only place it arrives.
+    /// Confirmed on all three registers in cap_social3.log: listings 1 and 2 carry 10001 here
+    /// and come back with Price 10001 in their TradeData, listing 3 carries 1 and comes back 1.
+    /// </summary>
+    public const int RegisterAtomPriceOffset = 0x288;
+
+    /// <summary>
+    /// The register batch's op-53 atom, or null. Everything the listing needs is in it: the item
+    /// id, template and amount at the usual atom-head offsets, and the price at
+    /// <see cref="RegisterAtomPriceOffset"/>.
+    /// </summary>
+    public static (long ItemDbId, int TemplateId, int Amount, long Price)? ReadRegisterAtom(byte[]? atoms)
+    {
+        if (atoms == null) return null;
+        for (int o = 0; o + AtomSize <= atoms.Length; o += AtomSize)
+        {
+            if (BitConverter.ToUInt32(atoms, o + WarehouseHandlers.AtomOp) != WarehouseHandlers.TsBrokerRegister)
+                continue;
+            long amount = BitConverter.ToInt64(atoms, o + WarehouseHandlers.AtomDelta);
+            return (BitConverter.ToInt64(atoms, o + WarehouseHandlers.AtomItemDbId),
+                    BitConverter.ToInt32(atoms, o + WarehouseHandlers.AtomTemplateId),
+                    amount > 0 && amount <= int.MaxValue ? (int)amount : 1,
+                    BitConverter.ToInt64(atoms, o + RegisterAtomPriceOffset));
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// The <c>CalcList</c> of an SDB_TRADE_BROKER_CALC_* request: a packed array of i32 TradeIds
+    /// behind the ref at payload 0. Both captured calcs carry exactly one.
+    /// </summary>
+    public static IReadOnlyList<int> ParseCalcList(byte[] p)
+    {
+        if (p == null || p.Length < 8) return Array.Empty<int>();
+        int start = (int)BitConverter.ToUInt32(p, 0) - FrameHeaderSize;
+        int bytes = (int)BitConverter.ToUInt32(p, 4);
+        if (bytes <= 0 || start < CalcRequestHeader || bytes > p.Length - start) return Array.Empty<int>();
+        var ids = new int[bytes / 4];
+        for (int i = 0; i < ids.Length; i++) ids[i] = BitConverter.ToInt32(p, start + i * 4);
+        return ids;
+    }
+
+    /// <summary>The cleared TradeData a successful unregister step 2 returns: 0x188 zero bytes.
+    /// cap_social3.log seq 2003 - the record is present and every field in it is zero.</summary>
+    public static byte[] BuildClearedTradeData() => new byte[TradeDataSize];
+
+    /// <summary>
+    /// The CalcItemList form: a TradeData record with the settlement block stamped on top.
+    /// <paramref name="calcState"/> is <see cref="CalcStateSold"/> for the seller's collect and
+    /// <see cref="CalcStateBought"/> for the buyer's - the one field the two captured calc
+    /// records disagree on.
+    /// </summary>
+    public static byte[] BuildCalcItemData(byte[] tradeData, int calcState, int buyerDbId,
+                                           long soldPrice, DateTime soldAt, bool instantBuy = true)
+    {
+        ArgumentNullException.ThrowIfNull(tradeData);
+        var r = new byte[TradeDataSize];
+        Array.Copy(tradeData, r, Math.Min(tradeData.Length, TradeDataSize));
+        BitConverter.GetBytes(calcState).CopyTo(r, TdCalcState);
+        BitConverter.GetBytes(buyerDbId).CopyTo(r, TdBuyerDbId);
+        BitConverter.GetBytes(instantBuy ? 1 : 0).CopyTo(r, TdBuyerFlag);
+        WriteSystemTime(r, TdSoldTime, soldAt);
+        BitConverter.GetBytes(soldPrice).CopyTo(r, TdSoldPrice);
+        BitConverter.GetBytes(soldPrice).CopyTo(r, TdCalcMoney);
+        return r;
+    }
+
+    /// <summary>The 8xu16 {y, m, d, h, mi, s, 0, 0} both time fields use.</summary>
+    private static void WriteSystemTime(byte[] r, int at, DateTime t)
+    {
+        if (t == default) return;
+        foreach (ushort v in new[] { (ushort)t.Year, (ushort)t.Month, (ushort)t.Day,
+                                     (ushort)t.Hour, (ushort)t.Minute, (ushort)t.Second })
+        { BitConverter.GetBytes(v).CopyTo(r, at); at += 2; }
+    }
+
     public const int TdTradeId = 0x000;
     public const int TdSellerDbId = 0x004;
     public const int TdSellerName = 0x008;
@@ -427,6 +516,28 @@ public static class BrokerPackets
     public const int TdAmount = 0x06C;
     public const int TdRegisterTime = 0x0B8;
     public const int TdPrice = 0x0C8;
+
+    // ---- T71: the settlement half, set only in the CalcItemList form ----
+    // The two CALC replies carry the SAME 0x188 record as TradeData with six more fields filled
+    // in. Diffing seq 1947 and 1905 against seq 1881 - the same listing 3, one hour of the same
+    // capture - isolates them exactly, and the two calc records differ from each other in one
+    // field only (+0x58), which is the side that is collecting.
+    /// <summary>+0x58: 3 on the seller's CALC_SOLD, 2 on the buyer's CALC_BOUGHT, 0 in a plain
+    /// TradeData.</summary>
+    public const int TdCalcState = 0x058;
+    public const int TdBuyerDbId = 0x0D0;
+    /// <summary>+0xD4: 1 on both captured calcs. Instant-buy, on the evidence of the
+    /// <c>InstantBuy</c> byte the matching BUY_IT_NOW carried.</summary>
+    public const int TdBuyerFlag = 0x0D4;
+    /// <summary>+0xD8: the same 8xu16 form as RegisterTime - 2026-09-16 22:33:02 in both.</summary>
+    public const int TdSoldTime = 0x0D8;
+    public const int TdSoldPrice = 0x0E8;
+    /// <summary>+0x100: the money the collecting side actually receives. 1 in both captures,
+    /// which is also the price - this capture has no visible broker tax.</summary>
+    public const int TdCalcMoney = 0x100;
+
+    public const int CalcStateSold = 3;
+    public const int CalcStateBought = 2;
 
     public readonly record struct TradeData(
         int TradeId, int SellerDbId, string SellerName, long ItemDbId, int TemplateId,
@@ -465,14 +576,7 @@ public static class BrokerPackets
         BitConverter.GetBytes(templateId).CopyTo(r, TdTemplateId);
         BitConverter.GetBytes(amount).CopyTo(r, TdAmount);
         BitConverter.GetBytes(price).CopyTo(r, TdPrice);
-        if (registerTime != default)
-        {
-            int at = TdRegisterTime;
-            foreach (ushort v in new[] { (ushort)registerTime.Year, (ushort)registerTime.Month,
-                                         (ushort)registerTime.Day, (ushort)registerTime.Hour,
-                                         (ushort)registerTime.Minute, (ushort)registerTime.Second })
-            { BitConverter.GetBytes(v).CopyTo(r, at); at += 2; }
-        }
+        WriteSystemTime(r, TdRegisterTime, registerTime);
         return r;
     }
 

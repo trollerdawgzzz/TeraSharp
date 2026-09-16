@@ -17036,6 +17036,232 @@ some prose with `backticks` that is not a table row
         Hex.True(ArbiterClientHandlers.ParseFindName(new byte[5]) == null, "5 B is one short of the guard");
     }
 
+    // ===================== T71: the broker listings table =====================
+
+    /// <summary>One 856-byte broker atom at the offsets the register batch uses.</summary>
+    static byte[] BrokerAtom(int index, uint op, long itemDbId, int templateId, long amount,
+                             long srcOwner, int srcInven, int srcSlot,
+                             long dstOwner, int dstInven, int dstSlot, long price = 0)
+    {
+        var r = new byte[DbProxyHandlers.ItemAtomSize];
+        BitConverter.GetBytes(index).CopyTo(r, 0);
+        BitConverter.GetBytes(op).CopyTo(r, WarehouseHandlers.AtomOp);
+        BitConverter.GetBytes(itemDbId).CopyTo(r, WarehouseHandlers.AtomItemDbId);
+        BitConverter.GetBytes(templateId).CopyTo(r, WarehouseHandlers.AtomTemplateId);
+        BitConverter.GetBytes(srcOwner).CopyTo(r, WarehouseHandlers.AtomSrcOwner);
+        BitConverter.GetBytes(srcInven).CopyTo(r, WarehouseHandlers.AtomSrcInven);
+        BitConverter.GetBytes(srcSlot).CopyTo(r, WarehouseHandlers.AtomSrcSlot);
+        BitConverter.GetBytes(dstOwner).CopyTo(r, WarehouseHandlers.AtomDstOwner);
+        BitConverter.GetBytes(dstInven).CopyTo(r, WarehouseHandlers.AtomDstInven);
+        BitConverter.GetBytes(dstSlot).CopyTo(r, WarehouseHandlers.AtomDstSlot);
+        BitConverter.GetBytes(amount).CopyTo(r, WarehouseHandlers.AtomDelta);
+        BitConverter.GetBytes(price).CopyTo(r, BrokerPackets.RegisterAtomPriceOffset);
+        return r;
+    }
+
+    /// <summary>A broker request: a fixed header, then one ref's worth of atoms.</summary>
+    static byte[] BrokerRequest(int header, int atomRefOffset, params byte[][] atoms)
+    {
+        int bytes = atoms.Length * DbProxyHandlers.ItemAtomSize;
+        var p = new byte[header + bytes];
+        BitConverter.GetBytes((uint)(6 + header)).CopyTo(p, atomRefOffset);
+        BitConverter.GetBytes((uint)bytes).CopyTo(p, atomRefOffset + 4);
+        for (int i = 0; i < atoms.Length; i++) atoms[i].CopyTo(p, header + i * DbProxyHandlers.ItemAtomSize);
+        return p;
+    }
+
+    /// <summary>
+    /// The three record forms the broker replies carry, byte-exact against cap_social3.log. All
+    /// three are the same 0x188 struct: a plain TradeData (seq 1881), the CalcItemList form with
+    /// the settlement block (seq 1947 / 1905), and the cleared one a cancel returns (seq 2003).
+    /// </summary>
+    [Test] public static void T71_the_three_trade_record_forms_are_byte_exact()
+    {
+        var trade = BrokerPackets.BuildTradeData(3, 2, "Test", 10029, 139093, 1, 1,
+            new DateTime(2026, 9, 16, 22, 32, 47));
+
+        // seq 1947: the seller's collect. CalcState 3, buyer 1003, sold 22:33:02, money 1.
+        var sold = BrokerPackets.BuildCalcItemData(trade, BrokerPackets.CalcStateSold, 1003, 1,
+            new DateTime(2026, 9, 16, 22, 33, 2));
+        Hex.True(BitConverter.ToInt32(sold, BrokerPackets.TdCalcState) == 3
+                 && BitConverter.ToInt32(sold, BrokerPackets.TdBuyerDbId) == 1003
+                 && BitConverter.ToInt32(sold, BrokerPackets.TdBuyerFlag) == 1
+                 && BitConverter.ToInt64(sold, BrokerPackets.TdSoldPrice) == 1
+                 && BitConverter.ToInt64(sold, BrokerPackets.TdCalcMoney) == 1,
+            "the settlement block CALC_SOLD adds on top of TradeData");
+        Hex.Eq(sold[BrokerPackets.TdSoldTime..(BrokerPackets.TdSoldTime + 16)],
+            "EA 07 09 00 10 00 16 00 21 00 02 00 00 00 00 00", "SoldTime at +0xD8, 2026-09-16 22:33:02");
+
+        // seq 1905: the buyer's collect differs from the seller's in ONE field.
+        var bought = BrokerPackets.BuildCalcItemData(trade, BrokerPackets.CalcStateBought, 1003, 1,
+            new DateTime(2026, 9, 16, 22, 33, 2));
+        int diffs = 0;
+        for (int i = 0; i < sold.Length; i++) if (sold[i] != bought[i]) diffs++;
+        Hex.True(diffs == 1 && BitConverter.ToInt32(bought, BrokerPackets.TdCalcState) == 2,
+            $"the two calc records differ only at +0x58: {diffs} byte(s)");
+
+        // seq 2003: the cancel's record is present and entirely zero.
+        var cleared = BrokerPackets.BuildClearedTradeData();
+        Hex.True(cleared.Length == BrokerPackets.TradeDataSize && cleared.All(x => x == 0),
+            "a cancelled listing comes back as 0x188 zero bytes, not as an absent ref");
+    }
+
+    /// <summary>
+    /// SDB_TRADE_BROKER_REGISTER_ITEM. One pass, no Step. The price is in the op-53 atom at
+    /// +0x288 and nowhere else - the request has no price field at all - and the op-44 atom
+    /// moves the row into inven 6, the broker's holding pocket.
+    /// </summary>
+    [Test] public static void T71_registering_creates_a_listing_and_pockets_the_item()
+    {
+        using var store = GuildStore(2);
+        store.UpsertItem(10029, 2, BagItems.Pocket, 6, 139093, 1);
+        long goldBefore = store.GetCharacterMoney(2);
+
+        var payload = BrokerRequest(BrokerPackets.RegisterRequestHeader, 0,
+            BrokerAtom(0, WarehouseHandlers.TsChangeMoney, 0, 0, -500, 2, 0, 0, 2, 0, 0),
+            BrokerAtom(1, WarehouseHandlers.TsBrokerRegister, 10029, 139093, 1, 2, 0, 0, 2, 0, 0, price: 10001),
+            BrokerAtom(2, WarehouseHandlers.TsBrokerMoveItem, 10029, 139093, 1, 2, 0, 0, 2, WarehouseHandlers.InvenBroker, 0));
+        BitConverter.GetBytes(0xB4u).CopyTo(payload, 8);      // DlmId at payload 8
+        BitConverter.GetBytes(2).CopyTo(payload, 12);         // OwnerDbId at payload 12
+
+        var (op, body) = RunHandler1(DbProxyHandlers.SDB_TRADE_BROKER_REGISTER_ITEM, payload, store);
+        Hex.True(op == DbProxyHandlers.DBS_TRADE_BROKER_REGISTER_ITEM, $"replied 0x{op:X4}, want 0x2818");
+        Hex.True(BitConverter.ToUInt32(body, 0) == 0x13
+                 && BitConverter.ToUInt32(body, 4) == 3 * DbProxyHandlers.ItemAtomSize
+                 && BitConverter.ToUInt32(body, 8) == 0xB4 && body[12] == 1,
+            "seq 1515's header: [0x13][atom bytes][DlmId][Success 1], then the atoms echoed");
+        Hex.Eq(body[13..], payload[BrokerPackets.RegisterRequestHeader..],
+            "every atom comes back verbatim - none of them arrives with an id to allocate");
+
+        var listing = store.GetBrokerListing(1);
+        Hex.True(listing != null && listing.SellerDbId == 2 && listing.ItemDbId == 10029
+                 && listing.TemplateId == 139093 && listing.Price == 10001
+                 && listing.State == CharacterStore.BrokerListed,
+            $"the listing: {listing?.ItemDbId} for {listing?.Price}, state {listing?.State}");
+        Hex.True(store.GetCharacterMoney(2) == goldBefore - 500, "the op-9 atom took the listing fee");
+        var pocketed = store.GetItems(2, WarehouseHandlers.InvenBroker);
+        Hex.True(pocketed.Count == 1 && pocketed[0].ItemDbId == 10029,
+            "and op 44 moved the row into inven 6 rather than deleting it");
+    }
+
+    /// <summary>
+    /// The two-step commit, over all four of the Step-carrying opcodes. Step 1 reads the listing
+    /// back and moves nothing; Step 2 applies the atoms and advances the row. The three
+    /// different shapes of Step-2 reply are the point: the cancel returns a ZEROED record, the
+    /// two calcs return NO record, and the buy returns the record unchanged.
+    /// </summary>
+    [Test] public static void T71_the_two_step_commit_walks_a_listing_to_collected()
+    {
+        using var store = GuildStore(2);
+        int id = store.CreateBrokerListing(2, "Test", 10029, 139093, 1, 1);
+
+        // ---- BUY_IT_NOW step 1: read. No atoms either way. ----
+        var buy1 = new byte[BrokerPackets.BuyItNowRequestHeader];
+        BitConverter.GetBytes((uint)(6 + buy1.Length)).CopyTo(buy1, 0);
+        BitConverter.GetBytes(0xB9u).CopyTo(buy1, 8);
+        BitConverter.GetBytes(1).CopyTo(buy1, 12);            // buyer 1 (GuildStore's g1)
+        BitConverter.GetBytes(1).CopyTo(buy1, 16);            // Step 1
+        BitConverter.GetBytes(id).CopyTo(buy1, 20);
+        var (op1, b1) = RunHandler1(DbProxyHandlers.SDB_TRADE_BROKER_BUY_IT_NOW, buy1, store);
+        Hex.True(op1 == DbProxyHandlers.DBS_TRADE_BROKER_BUY_IT_NOW, $"0x{op1:X4}");
+        Hex.True(BitConverter.ToUInt32(b1, 0) == 0x1F
+                 && BitConverter.ToUInt32(b1, 4) == BrokerPackets.TradeDataSize
+                 && BitConverter.ToUInt32(b1, 12) == 0 && BitConverter.ToUInt32(b1, 20) == 1
+                 && b1[24] == 1,
+            "seq 1881: the TradeData record, no atoms, Step echoed, Success 1");
+        var read = BrokerPackets.ParseTradeData(b1, 25);
+        Hex.True(read != null && read.Value.TradeId == id && read.Value.Price == 1
+                 && read.Value.SellerName == "Test",
+            "and it is the listing, which is what World builds the step-2 atoms from");
+
+        // ---- step 2: commit ----
+        var buy2 = BrokerRequest(BrokerPackets.BuyItNowRequestHeader, 0,
+            BrokerAtom(0, WarehouseHandlers.TsChangeMoney, 0, 0, -1, 1, 0, 0, 1, 0, 0),
+            BrokerAtom(1, WarehouseHandlers.TsBrokerBuy, 0, 0, 1, 1, 0, 0, 0, 0, 0));
+        BitConverter.GetBytes(0xB9u).CopyTo(buy2, 8);
+        BitConverter.GetBytes(1).CopyTo(buy2, 12);
+        BitConverter.GetBytes(2).CopyTo(buy2, 16);
+        BitConverter.GetBytes(id).CopyTo(buy2, 20);
+        var (_, b2) = RunHandler1(DbProxyHandlers.SDB_TRADE_BROKER_BUY_IT_NOW, buy2, store);
+        Hex.True(BitConverter.ToUInt32(b2, 4) == BrokerPackets.TradeDataSize
+                 && BitConverter.ToUInt32(b2, 12) == 2 * DbProxyHandlers.ItemAtomSize
+                 && BitConverter.ToUInt32(b2, 20) == 2 && b2[24] == 1,
+            "seq 1883: the record is STILL there on a buy, plus the atoms echoed");
+        Hex.True(store.GetBrokerListing(id)!.State == CharacterStore.BrokerSold
+                 && store.GetBrokerListing(id)!.BuyerDbId == 1, "the row is sold to the buyer");
+
+        // A second buyer racing the same TradeId loses, even though step 1 said yes.
+        var (_, again) = RunHandler1(DbProxyHandlers.SDB_TRADE_BROKER_BUY_IT_NOW, buy2, store);
+        Hex.True(again[24] == 0, "the second commit is refused - and still echoes the DlmId");
+
+        // ---- CALC_SOLD step 2: the seller collects. No record in the reply at all. ----
+        // header | CalcList (one i32) | atoms - exactly the seq-1948 shape.
+        var calcAtoms = new[]
+        {
+            BrokerAtom(0, WarehouseHandlers.TsBrokerCalcSold, 0, 0, 0, 2, 0, 0, 0, 0, 0),
+            BrokerAtom(1, WarehouseHandlers.TsChangeMoney, 0, 0, 1, 2, 0, 0, 2, 0, 0),
+        };
+        const int calcHdr = BrokerPackets.CalcRequestHeader;
+        var calc = new byte[calcHdr + 4 + calcAtoms.Length * DbProxyHandlers.ItemAtomSize];
+        BitConverter.GetBytes((uint)(6 + calcHdr)).CopyTo(calc, 0);          // CalcList offset
+        BitConverter.GetBytes(4u).CopyTo(calc, 4);                           // one i32
+        BitConverter.GetBytes((uint)(6 + calcHdr + 4)).CopyTo(calc, 8);      // ItemBinary offset
+        BitConverter.GetBytes((uint)(calcAtoms.Length * DbProxyHandlers.ItemAtomSize)).CopyTo(calc, 12);
+        BitConverter.GetBytes(0xBBu).CopyTo(calc, 16);
+        BitConverter.GetBytes(2).CopyTo(calc, 20);
+        BitConverter.GetBytes(2).CopyTo(calc, 24);                           // Step 2
+        BitConverter.GetBytes(id).CopyTo(calc, calcHdr);
+        for (int i = 0; i < calcAtoms.Length; i++)
+            calcAtoms[i].CopyTo(calc, calcHdr + 4 + i * DbProxyHandlers.ItemAtomSize);
+        var (opC, bC) = RunHandler1(DbProxyHandlers.SDB_TRADE_BROKER_CALC_SOLD_ITEM, calc, store);
+        Hex.True(opC == DbProxyHandlers.DBS_TRADE_BROKER_CALC_SOLD_ITEM, $"0x{opC:X4}");
+        Hex.True(BitConverter.ToUInt32(bC, 0) == 0x1F && BitConverter.ToUInt32(bC, 4) == 0,
+            "seq 1949: a calc step 2 carries NO record - offset 0x1F, length 0");
+        Hex.True(store.GetBrokerListing(id)!.State == CharacterStore.BrokerSellerPaid,
+            "and the seller has been paid");
+
+        // ---- UNREGISTER step 2 on a fresh listing: a ZEROED record, not an absent one. ----
+        int other = store.CreateBrokerListing(2, "Test", 10027, 200997, 1, 10001);
+        var un = BrokerRequest(BrokerPackets.UnregisterRequestHeader, 0,
+            BrokerAtom(0, WarehouseHandlers.TsBrokerCancel, 0, 0, 0, 2, 0, 0, 0, 0, 0));
+        BitConverter.GetBytes(0xBCu).CopyTo(un, 8);
+        BitConverter.GetBytes(2).CopyTo(un, 12);
+        BitConverter.GetBytes(2).CopyTo(un, 16);
+        BitConverter.GetBytes(other).CopyTo(un, 20);
+        var (opU, bU) = RunHandler1(DbProxyHandlers.SDB_TRADE_BROKER_UNREGISTER_ITEM, un, store);
+        Hex.True(opU == DbProxyHandlers.DBS_TRADE_BROKER_UNREGISTER_ITEM, $"0x{opU:X4}");
+        Hex.True(BitConverter.ToUInt32(bU, 4) == BrokerPackets.TradeDataSize
+                 && bU[25..(25 + BrokerPackets.TradeDataSize)].All(x => x == 0),
+            "seq 2003: the record is present and every byte of it is zero");
+        Hex.True(store.GetBrokerListing(other)!.State == CharacterStore.BrokerCancelled, "withdrawn");
+    }
+
+    /// <summary>The store half: search paging is bounds-checked as unsigned, and the state
+    /// machine only moves in the directions the protocol allows.</summary>
+    [Test] public static void T71_the_listings_table_round_trips()
+    {
+        using var store = GuildStore(2);
+        int a = store.CreateBrokerListing(2, "Test", 101, 5000, 1, 900);
+        int b = store.CreateBrokerListing(2, "Test", 102, 5000, 1, 100);
+        Hex.True(a == 1 && b == 2, $"trade ids come off the table: {a}/{b}");
+
+        var page = store.SearchBrokerListings(5000, 0, 10);
+        Hex.True(page.Count == 2 && page[0].TradeId == b, "cheapest first");
+        Hex.True(store.CountBrokerListings(5000) == 2 && store.CountBrokerListings(0) == 2
+                 && store.CountBrokerListings(9999) == 0, "the count matches the filter");
+        Hex.True(store.SearchBrokerListings(0, -1, 10).Count == 0,
+            "a negative page is read UNSIGNED and lands past the end rather than before the start");
+
+        Hex.True(store.SetBrokerListingPrice(a, 50) && store.GetBrokerListing(a)!.Price == 50, "reprice");
+        Hex.True(store.SellBrokerListing(a, 1) && !store.SellBrokerListing(a, 1),
+            "a listing sells once");
+        Hex.True(!store.SetBrokerListingState(a, CharacterStore.BrokerListed, CharacterStore.BrokerCancelled),
+            "and a sold listing cannot then be cancelled");
+        Hex.True(store.GetBrokerListingsOf(2).Count == 1, "one still on sale");
+        Hex.True(store.GetBrokerPurchasesOf(1).Count == 1, "and one waiting for its buyer");
+        Hex.True(store.DeleteBrokerListing(b) && store.GetBrokerListing(b) == null, "delete");
+    }
+
     // ===================== T70: cap_social3.log, broker + EP =====================
 
     /// <summary>cap_social3.log seq 112, AS_LOAD_EXTRAPOINT_DATA for character 1003, DlmId 0x27.</summary>

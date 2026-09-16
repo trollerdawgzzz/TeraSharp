@@ -4645,6 +4645,7 @@ public sealed class DbProxyHandlers
         uint dlmId = 0;
         int step = 0;
         int ownerDbId = 0;
+        int tradeId = 0;
         bool parsed = true;
 
         switch (op)
@@ -4661,6 +4662,7 @@ public sealed class DbProxyHandlers
                 var r = BrokerPackets.ParseSdbUnregisterItem(payload);
                 if (r == null) { parsed = false; break; }
                 dlmId = r.Value.dlmId; ownerDbId = r.Value.ownerDbId; step = r.Value.step;
+                tradeId = r.Value.tradeId;
                 break;
             }
             case SDB_TRADE_BROKER_CALC_SOLD_ITEM:
@@ -4676,6 +4678,7 @@ public sealed class DbProxyHandlers
                 var r = BrokerPackets.ParseSdbBuyItNow(payload);
                 if (r == null) { parsed = false; break; }
                 dlmId = r.Value.dlmId; ownerDbId = r.Value.ownerDbId; step = r.Value.step;
+                tradeId = r.Value.tradeId;
                 break;
             }
         }
@@ -4691,13 +4694,183 @@ public sealed class DbProxyHandlers
             return true;
         }
 
-        var reply = BrokerPackets.BuildEmptyRefusal(op, dlmId, step);
-        if (reply == null) return false;          // unreachable: the allow-list is the same five
+        if (_store is null)
+        {
+            var none = BrokerPackets.BuildEmptyRefusal(op, dlmId, step);
+            if (none == null) return false;
+            link.SendFrame(BrokerPackets.ReplyFor(op), none);
+            _log.LogWarning("{Name}: no store open - refused for player {Owner}",
+                DbProxyOpcodeNames.Describe(op), ownerDbId);
+            return true;
+        }
 
-        link.SendFrame(BrokerPackets.ReplyFor(op), reply);
-        _log.LogInformation("{Name}: refused for player {Owner} (DlmId {Dlm}, step {Step}) - "
-            + "no broker listings table yet (status/BROKER-DESIGN.md section 7)",
-            DbProxyOpcodeNames.Describe(op), ownerDbId, dlmId, step);
+        switch (op)
+        {
+            case SDB_TRADE_BROKER_REGISTER_ITEM: return BrokerRegister(link, payload, dlmId, ownerDbId);
+            case SDB_TRADE_BROKER_UNREGISTER_ITEM: return BrokerUnregister(link, payload, dlmId, step, tradeId);
+            case SDB_TRADE_BROKER_BUY_IT_NOW: return BrokerBuyItNow(link, payload, dlmId, step, tradeId, ownerDbId);
+            default: return BrokerCalc(link, op, payload, dlmId, step, ownerDbId);
+        }
+    }
+
+    /// <summary>
+    /// SDB_TRADE_BROKER_REGISTER_ITEM (0x2817) -&gt; DBS (0x2818). One pass, no Step: World
+    /// already has the item, and the batch does the moving.
+    ///
+    /// <para>cap_social3.log seq 1514/1746/1767 are the three real registers. The batch is
+    /// op 9 (the listing fee off the seller's gold), op 53 (the marker, and the only place the
+    /// PRICE arrives), op 44 (the row moves to inven 6, the broker pocket) and an op 2 or an
+    /// op 6+11 pair taking the stack out of the bag. Every atom is echoed verbatim.</para>
+    /// </summary>
+    private bool BrokerRegister(WorldLink link, byte[] payload, uint dlmId, int ownerDbId)
+    {
+        var (atoms, parsed) = WarehouseHandlers.CloneAtomsWithIds(
+            payload, 0, BrokerPackets.RegisterRequestHeader, _store.NextItemId);
+        var applied = WarehouseHandlers.Apply(_store, parsed, _store.NextItemId, _log);
+
+        var reg = BrokerPackets.ReadRegisterAtom(atoms);
+        int tradeId = 0;
+        if (reg != null)
+        {
+            string seller = _store.GetCharacter(ownerDbId)?.Name ?? string.Empty;
+            tradeId = _store.CreateBrokerListing(ownerDbId, seller, reg.Value.ItemDbId,
+                reg.Value.TemplateId, reg.Value.Amount, reg.Value.Price);
+        }
+        else
+        {
+            _log.LogWarning("SDB_TRADE_BROKER_REGISTER_ITEM: no op-{Op} atom in {N} atom(s) for player "
+                + "{Owner} - nothing listed", WarehouseHandlers.TsBrokerRegister, parsed.Count, ownerDbId);
+        }
+
+        _log.LogInformation(
+            "SDB_TRADE_BROKER_REGISTER_ITEM: player {Owner} listed item {Item} (template {Tpl}) as trade {Id} "
+            + "for {Price}; {Mov} row(s) moved, {Del} deleted, {Gold} gold",
+            ownerDbId, reg?.ItemDbId ?? 0, reg?.TemplateId ?? 0, tradeId, reg?.Price ?? 0,
+            applied.Moved, applied.Deleted, applied.CharacterMoneyDelta);
+
+        link.SendFrame(DBS_TRADE_BROKER_REGISTER_ITEM,
+            BrokerPackets.BuildDbsRegisterItem(dlmId, success: tradeId != 0, atoms));
         return true;
+    }
+
+    /// <summary>
+    /// SDB_TRADE_BROKER_UNREGISTER_ITEM (0x2819) -&gt; DBS (0x281A). Step 1 reads the listing back,
+    /// step 2 commits the cancel. cap_social3.log seq 2000..2003: the step-2 reply carries a
+    /// TradeData record that is present and entirely ZERO - the listing is gone.
+    /// </summary>
+    private bool BrokerUnregister(WorldLink link, byte[] payload, uint dlmId, int step, int tradeId)
+    {
+        var row = _store.GetBrokerListing(tradeId);
+        if (step <= BrokerStepRead)
+        {
+            link.SendFrame(DBS_TRADE_BROKER_UNREGISTER_ITEM, BrokerPackets.BuildDbsStepAck(
+                dlmId, step, row != null, TradeDataOf(row)));
+            return true;
+        }
+
+        var (atoms, parsed) = WarehouseHandlers.CloneAtomsWithIds(
+            payload, 0, BrokerPackets.UnregisterRequestHeader, _store.NextItemId);
+        WarehouseHandlers.Apply(_store, parsed, _store.NextItemId, _log);
+        bool ok = row != null
+            && _store.SetBrokerListingState(tradeId, CharacterStore.BrokerListed, CharacterStore.BrokerCancelled);
+
+        _log.LogInformation("SDB_TRADE_BROKER_UNREGISTER_ITEM: trade {Id} withdrawn -> {Ok}", tradeId, ok);
+        link.SendFrame(DBS_TRADE_BROKER_UNREGISTER_ITEM, BrokerPackets.BuildDbsStepAck(
+            dlmId, step, ok, BrokerPackets.BuildClearedTradeData(), atoms));
+        return true;
+    }
+
+    /// <summary>
+    /// SDB_TRADE_BROKER_BUY_IT_NOW (0x281F) -&gt; DBS (0x2820). Step 1 reads the listing, step 2
+    /// takes the buyer's gold (the op-9 atom) and marks it sold. seq 1880..1883: unlike the
+    /// cancel, the step-2 reply still carries the FULL listing record - the buyer's window needs
+    /// it to show what was bought.
+    /// </summary>
+    private bool BrokerBuyItNow(WorldLink link, byte[] payload, uint dlmId, int step, int tradeId, int buyerDbId)
+    {
+        var row = _store.GetBrokerListing(tradeId);
+        if (step <= BrokerStepRead)
+        {
+            bool onSale = row != null && row.State == CharacterStore.BrokerListed;
+            link.SendFrame(DBS_TRADE_BROKER_BUY_IT_NOW, BrokerPackets.BuildDbsStepAck(
+                dlmId, step, onSale, TradeDataOf(row)));
+            return true;
+        }
+
+        var (atoms, parsed) = WarehouseHandlers.CloneAtomsWithIds(
+            payload, 0, BrokerPackets.BuyItNowRequestHeader, _store.NextItemId);
+        WarehouseHandlers.Apply(_store, parsed, _store.NextItemId, _log);
+        // SellBrokerListing refuses unless the row is still on sale, so two buyers racing the
+        // same TradeId cannot both win even though both got a step-1 yes.
+        bool ok = _store.SellBrokerListing(tradeId, buyerDbId);
+
+        _log.LogInformation("SDB_TRADE_BROKER_BUY_IT_NOW: player {Buyer} bought trade {Id} -> {Ok}",
+            buyerDbId, tradeId, ok);
+        link.SendFrame(DBS_TRADE_BROKER_BUY_IT_NOW, BrokerPackets.BuildDbsStepAck(
+            dlmId, step, ok, TradeDataOf(row), atoms));
+        return true;
+    }
+
+    /// <summary>
+    /// SDB_TRADE_BROKER_CALC_SOLD_ITEM (0x281B) and _CALC_BOUGHT_ITEM (0x281D) - the two collect
+    /// paths, one layout. The TradeIds come in the CalcList ref; both captured calcs carry one.
+    ///
+    /// <para>seq 1946..1949 and 1904..1907: the step-2 reply carries <b>no</b> TradeData at all -
+    /// refA is offset 0x1F with length 0 - unlike the cancel, which sends a zeroed record. The
+    /// difference is real and both are pinned.</para>
+    /// </summary>
+    private bool BrokerCalc(WorldLink link, ushort op, byte[] payload, uint dlmId, int step, int ownerDbId)
+    {
+        ushort reply = BrokerPackets.ReplyFor(op);
+        bool sold = op == SDB_TRADE_BROKER_CALC_SOLD_ITEM;
+        var ids = BrokerPackets.ParseCalcList(payload);
+        var row = ids.Count > 0 ? _store.GetBrokerListing(ids[0]) : null;
+
+        if (step <= BrokerStepRead)
+        {
+            // The CalcItemList form, not a plain TradeData: the same record with the settlement
+            // block stamped on. CalcState is the only field the seller's and the buyer's copies
+            // disagree on (3 vs 2).
+            byte[]? rec = TradeDataOf(row);
+            if (rec != null && row != null)
+            {
+                DateTime.TryParse(row.SoldAt, System.Globalization.CultureInfo.InvariantCulture,
+                    System.Globalization.DateTimeStyles.None, out var soldAt);
+                rec = BrokerPackets.BuildCalcItemData(rec,
+                    sold ? BrokerPackets.CalcStateSold : BrokerPackets.CalcStateBought,
+                    row.BuyerDbId, row.Price, soldAt);
+            }
+            link.SendFrame(reply, BrokerPackets.BuildDbsStepAck(dlmId, step, row != null, rec));
+            return true;
+        }
+
+        var (atoms, parsed) = WarehouseHandlers.CloneAtomsWithIds(
+            payload, 8, BrokerPackets.CalcRequestHeader, _store.NextItemId);
+        WarehouseHandlers.Apply(_store, parsed, _store.NextItemId, _log);
+
+        int done = 0;
+        foreach (int id in ids)
+        {
+            if (_store.SetBrokerListingState(id, CharacterStore.BrokerSold,
+                    sold ? CharacterStore.BrokerSellerPaid : CharacterStore.BrokerBuyerCollected)) done++;
+        }
+
+        _log.LogInformation("{Name}: player {Owner} collected {N} of {M} trade(s)",
+            DbProxyOpcodeNames.Describe(op), ownerDbId, done, ids.Count);
+        link.SendFrame(reply, BrokerPackets.BuildDbsStepAck(dlmId, step, done > 0, refA: null, atoms: atoms));
+        return true;
+    }
+
+    /// <summary>Step 1 is "read me the listing"; anything above it is the commit pass.</summary>
+    public const int BrokerStepRead = 1;
+
+    /// <summary>A listing as its 0x188-byte TradeData record, or null for no row.</summary>
+    private static byte[]? TradeDataOf(CharacterStore.BrokerListingRow? row)
+    {
+        if (row == null) return null;
+        DateTime.TryParse(row.RegisteredAt, System.Globalization.CultureInfo.InvariantCulture,
+            System.Globalization.DateTimeStyles.None, out var when);
+        return BrokerPackets.BuildTradeData(row.TradeId, row.SellerDbId, row.SellerName,
+            row.ItemDbId, row.TemplateId, row.Amount, row.Price, when);
     }
 }
