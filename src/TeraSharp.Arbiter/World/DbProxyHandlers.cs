@@ -1193,6 +1193,7 @@ public sealed class DbProxyHandlers
             case SDB_LIST_PARCEL:             return OnListParcel(link, payload);
             case SDB_MAKE_PARCEL:             return OnMakeParcel(link, payload);
             case SDB_LOAD_PREMIUM_SLOT_LEFT_COOLTIME:
+                if (payload.Length < 0x12) { _log.LogWarning("0x28BD: {Len} B payload, want >= 18 - dropped", payload.Length); return true; }
                 link.SendFrame(DBS_LOAD_PREMIUM_SLOT_LEFT_COOLTIME,
                     BuildDbsPremiumSlotCooltime(U32(payload, 0x0E))); return true;
             case SDB_RECV_PARCEL:             return OnRecvParcel(link, payload);
