@@ -12605,7 +12605,12 @@ some prose with `backticks` that is not a table row
 
         var first = new byte[ParcelDbHandlers.ParcelDataNoMsgSize];
         Array.Copy(body, 0, first, 0, first.Length);
-        Hex.Eq(first, record, "a parcel World created is listed back byte-for-byte");
+        // T65: the served copy is the stored record with ParcelId (+0xA0) and ReceiverDbId (+0x50)
+        // stamped in (the sender's client never knew them) - everything else byte-for-byte.
+        var expected = (byte[])record.Clone();
+        BitConverter.GetBytes(id1).CopyTo(expected, ParcelDbHandlers.ParcelDataParcelId);
+        BitConverter.GetBytes(1).CopyTo(expected, ParcelDbHandlers.ParcelDataReceiverDbId);
+        Hex.Eq(first, expected, "a parcel World created is listed back byte-for-byte apart from the two stamped fields");
 
         int at = ParcelDbHandlers.ParcelDataNoMsgSize;
         Hex.True(BitConverter.ToInt32(body, at) == id2, "the synthesised record carries the parcel id");
