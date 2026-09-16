@@ -217,6 +217,197 @@ public static class SelfTest
         }
     }
 
+    // ---- T58: the three wiring checks. A bad deploy is a build where the code is fine and the
+    //      DATA next to it is not, so each of these re-runs the real registration/allow-list code
+    //      against the files that shipped rather than trusting a constant. ----
+
+    /// <summary>
+    /// <c>ArbiterOwned</c> opcodes that deliberately have NO dispatcher handler. Empty on purpose:
+    /// the set exists precisely so <c>PacketDispatcher</c> never forwards one to World, and an
+    /// entry with no handler is logged and dropped - a silent dead end for the feature that sends
+    /// it. If an opcode ever should be accepted-and-ignored, put it here with the reason rather
+    /// than leaving this check red.
+    /// </summary>
+    public static readonly ushort[] ArbiterOwnedWithoutHandler = Array.Empty<ushort>();
+
+    /// <summary>
+    /// Every opcode <c>DbProxyHandlers.IsHandledRequest</c> answers. It is a switch, not a set, so
+    /// the only honest way to enumerate it is to ask it about every opcode - 65536 predicate calls,
+    /// which costs nothing once at startup and cannot drift from the switch the way a parallel
+    /// list would.
+    /// </summary>
+    public static IReadOnlyList<ushort> AllowListOpcodes()
+    {
+        var ops = new List<ushort>();
+        for (int op = 0; op <= ushort.MaxValue; op++)
+            if (DbProxyHandlers.IsHandledRequest((ushort)op)) ops.Add((ushort)op);
+        return ops;
+    }
+
+    /// <summary>
+    /// Runs the REAL <c>HandlerRegistry.RegisterAll</c> against a throwaway dispatcher and the
+    /// data.json that shipped, then reports two things:
+    /// <list type="bullet">
+    /// <item>every name the registry registers resolves in the <paramref name="versionKey"/> map -
+    /// <c>Reg</c> logs "not in opcode map" per miss, so the capture below is the whole list;</item>
+    /// <item>every <c>ArbiterOwned</c> opcode came out of that with a handler.</item>
+    /// </list>
+    /// A wrong data.json passes every other check in this file and then silently unregisters half
+    /// the login chain, which is the failure this exists to catch.
+    /// </summary>
+    public static List<SelfTestResult> CheckHandlers(string? dataJsonPath, string versionKey, string? defsFolder)
+    {
+        var results = new List<SelfTestResult>();
+        OpcodeTable table;
+        DefinitionRegistry defs;
+        try
+        {
+            if (string.IsNullOrEmpty(dataJsonPath) || !File.Exists(dataJsonPath))
+                throw new FileNotFoundException($"opcode map not found (looked at {Show(dataJsonPath)})");
+            if (string.IsNullOrEmpty(defsFolder) || !Directory.Exists(defsFolder))
+                throw new DirectoryNotFoundException($"packet defs not found (looked at {Show(defsFolder)})");
+            table = OpcodeTable.LoadFromFile(dataJsonPath, versionKey);
+            defs = DefinitionRegistry.LoadFromFolder(defsFolder,
+                Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance);
+        }
+        catch (Exception ex)
+        {
+            results.Add(new SelfTestResult("handler registry", false, $"{ex.GetType().Name}: {ex.Message}"));
+            results.Add(new SelfTestResult("Arbiter-owned", false, "not checked - the registry could not be built"));
+            return results;
+        }
+
+        var capture = new CaptureLoggerFactory();
+        var dispatcher = new TeraSharp.Arbiter.Network.PacketDispatcher(
+            Microsoft.Extensions.Logging.LoggerFactoryExtensions
+                .CreateLogger<TeraSharp.Arbiter.Network.PacketDispatcher>(capture));
+        try
+        {
+            TeraSharp.Arbiter.Handlers.HandlerRegistry.RegisterAll(dispatcher, table, defs, capture);
+        }
+        catch (Exception ex)
+        {
+            results.Add(new SelfTestResult("handler registry", false, $"RegisterAll threw {ex.GetType().Name}: {ex.Message}"));
+            results.Add(new SelfTestResult("Arbiter-owned", false, "not checked - RegisterAll threw"));
+            return results;
+        }
+
+        var unmapped = capture.Errors
+            .Where(e => e.Contains("not in opcode map", StringComparison.Ordinal))
+            .Select(e => e.Split(' ')[0])
+            .ToList();
+        results.Add(unmapped.Count == 0
+            ? new SelfTestResult("handler registry", true,
+                $"{dispatcher.RegisteredCount} opcode(s) registered, every name resolved in {versionKey}")
+            : new SelfTestResult("handler registry", false,
+                $"{unmapped.Count} name(s) not in the {versionKey} map: {Join(unmapped)}"));
+
+        var owned = TeraSharp.Arbiter.Handlers.ArbiterClientHandlers.ArbiterOwned;
+        var noHandler = owned
+            .Where(op => !dispatcher.IsRegistered(op) && Array.IndexOf(ArbiterOwnedWithoutHandler, op) < 0)
+            .Select(op => $"0x{op:X4} ({op})")
+            .ToList();
+        results.Add(noHandler.Count == 0
+            ? new SelfTestResult("Arbiter-owned", true,
+                $"all {owned.Count} opcode(s) have a handler")
+            : new SelfTestResult("Arbiter-owned", false,
+                $"{noHandler.Count} of {owned.Count} would be dropped, not forwarded: {Join(noHandler)}"));
+        return results;
+    }
+
+    /// <summary>
+    /// Every allow-list opcode has a row in status/PERSISTENCE-MAP.md.
+    ///
+    /// <para>The test project checks the other direction (documented =&gt; answered). This is the
+    /// one T54 found had drifted: 27 opcodes the code answered had no row, so the map understated
+    /// what the Arbiter owns. Optional, because a published build does not ship status/.</para>
+    /// </summary>
+    public static SelfTestResult CheckPersistenceMap(string? mapPath)
+    {
+        const string name = "persistence map";
+        if (string.IsNullOrEmpty(mapPath) || !File.Exists(mapPath))
+            return new SelfTestResult(name, false, $"not found (looked at {Show(mapPath)})", Required: false);
+        try
+        {
+            var documented = ParseDocumentedOpcodes(File.ReadAllText(mapPath));
+            var allow = AllowListOpcodes();
+            var missing = allow.Where(op => !documented.Contains(op)).Select(op => $"0x{op:X4}").ToList();
+            return missing.Count == 0
+                ? new SelfTestResult(name, true,
+                    $"{allow.Count} allow-list opcode(s), all documented ({documented.Count} row(s))  {mapPath}",
+                    Required: false)
+                : new SelfTestResult(name, false,
+                    $"{missing.Count} allow-list opcode(s) have no row: {Join(missing)}  {mapPath}",
+                    Required: false);
+        }
+        catch (Exception ex)
+        {
+            return new SelfTestResult(name, false, $"{ex.GetType().Name}: {ex.Message}  {mapPath}", Required: false);
+        }
+    }
+
+    /// <summary>
+    /// The request opcode out of every table row whose first cell is a bare <c>0x…</c> and whose
+    /// second cell names a reply (or "none"). Same shape as the test project's parser, so a row
+    /// that satisfies one satisfies the other; backticked first cells are skipped on purpose -
+    /// that is how the one-way and client-opcode tables opt out.
+    /// </summary>
+    public static HashSet<ushort> ParseDocumentedOpcodes(string markdown)
+    {
+        var found = new HashSet<ushort>();
+        foreach (var raw in (markdown ?? string.Empty).Split('\n'))
+        {
+            var line = raw.Trim();
+            if (!line.StartsWith('|')) continue;
+            var cells = line.Split('|', StringSplitOptions.RemoveEmptyEntries);
+            if (cells.Length < 2) continue;
+            var cell = cells[0].Trim();
+            if (!cell.StartsWith("0x", StringComparison.OrdinalIgnoreCase)) continue;
+            var reply = cells[1].Trim();
+            if (!reply.StartsWith("0x", StringComparison.OrdinalIgnoreCase)
+                && !reply.Equals("none", StringComparison.OrdinalIgnoreCase)) continue;
+            var bits = cell.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (bits.Length < 1) continue;
+            if (ushort.TryParse(bits[0].AsSpan(2), System.Globalization.NumberStyles.HexNumber, null, out var op))
+                found.Add(op);
+        }
+        return found;
+    }
+
+    /// <summary>Walks up from the running binary looking for a repo-relative file; null if absent.</summary>
+    public static string? FindRepoFile(string relative)
+    {
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        for (int i = 0; i < 8 && dir != null; i++, dir = dir.Parent)
+        {
+            var candidate = Path.Combine(dir.FullName, relative);
+            if (File.Exists(candidate)) return candidate;
+        }
+        return null;
+    }
+
+    /// <summary>Collects Error-level messages so RegisterAll can be run without a real log.</summary>
+    private sealed class CaptureLoggerFactory : ILoggerFactory
+    {
+        public readonly List<string> Errors = new();
+        public ILogger CreateLogger(string categoryName) => new CaptureLogger(Errors);
+        public void AddProvider(ILoggerProvider provider) { }
+        public void Dispose() { }
+
+        private sealed class CaptureLogger : ILogger
+        {
+            private readonly List<string> _sink;
+            public CaptureLogger(List<string> sink) => _sink = sink;
+            public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+            public bool IsEnabled(LogLevel logLevel) => logLevel >= LogLevel.Error;
+            public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+                                    Func<TState, Exception?, string> formatter)
+            {
+                if (logLevel >= LogLevel.Error && formatter != null) _sink.Add(formatter(state, exception));
+            }
+        }
+    }
+
     // ---- The whole set ----
 
     /// <summary>
@@ -227,7 +418,7 @@ public static class SelfTest
         ILogger log, string dataRoot, string packetLogs, string dbPath, string dataDir, string versionKey)
     {
         string Data(string name) => Path.Combine(dataDir, name);
-        return new List<SelfTestResult>
+        var results = new List<SelfTestResult>
         {
             CheckOpcodes(Path.Combine(dataRoot, "tera-server-proxy", "data", "data.json"), versionKey),
             CheckDefinitions(Path.Combine(dataRoot, "tera_v100_MASTER_FINAL"), log),
@@ -241,6 +432,15 @@ public static class SelfTest
                 "DefaultSkillSet.xml", required: false),
             CheckDatabase(dbPath),
         };
+
+        // T58: the wiring checks. These run the real registration and allow-list code against
+        // the data that shipped, so a build whose code is right and whose data.json is wrong
+        // fails here instead of at the first login.
+        results.AddRange(CheckHandlers(
+            Path.Combine(dataRoot, "tera-server-proxy", "data", "data.json"), versionKey,
+            Path.Combine(dataRoot, "tera_v100_MASTER_FINAL")));
+        results.Add(CheckPersistenceMap(FindRepoFile(Path.Combine("status", "PERSISTENCE-MAP.md"))));
+        return results;
     }
 
     /// <summary>One line per check, then a summary. Returns the number of REQUIRED failures.</summary>
@@ -248,20 +448,37 @@ public static class SelfTest
     {
         ArgumentNullException.ThrowIfNull(results);
         int failures = 0, warnings = 0;
+        var sb = new System.Text.StringBuilder();
+        sb.Append("selftest: ").Append(results.Count).Append(" check(s)").Append(Environment.NewLine);
         foreach (var r in results)
         {
-            if (r.Pass) log.LogInformation("{Line}", Format(r));
-            else if (r.Required) { failures++; log.LogError("{Line}", Format(r)); }
-            else { warnings++; log.LogWarning("{Line}", Format(r)); }
+            if (!r.Pass) { if (r.Required) failures++; else warnings++; }
+            sb.Append("  ").Append(Format(r)).Append(Environment.NewLine);
         }
-        if (failures == 0 && warnings == 0)
-            log.LogInformation("selftest: {N}/{Total} PASS - the deploy is complete", results.Count, results.Count);
-        else if (failures == 0)
-            log.LogWarning("selftest: {P}/{N} PASS, {W} optional missing - it will run",
-                results.Count - warnings, results.Count, warnings);
-        else
-            log.LogError("selftest: {F} REQUIRED dependency(ies) missing - do not start this build",
-                failures);
+
+        string summary =
+            failures > 0
+                ? $"selftest: {failures} REQUIRED dependency(ies) missing - do not start this build"
+                : warnings > 0
+                    ? $"selftest: {results.Count - warnings}/{results.Count} PASS, {warnings} optional missing - it will run"
+                    : $"selftest: {results.Count}/{results.Count} PASS - the deploy is complete";
+        sb.Append("  ").Append(summary);
+
+        // T58: ONE write. On netcup the old per-line ILogger calls interleaved with the console
+        // writer and only 4 of 10 lines survived; building the whole block first and emitting it
+        // in a single Console write plus an explicit flush is what makes it atomic. The logger
+        // still gets the same block, so a file/service sink loses nothing.
+        try
+        {
+            Console.Out.Write(sb.ToString());
+            Console.Out.Write(Environment.NewLine);
+            Console.Out.Flush();
+        }
+        catch (IOException) { /* no console (running as a service) - the log call below carries it */ }
+
+        if (failures > 0) log.LogError("{Report}", sb.ToString());
+        else if (warnings > 0) log.LogWarning("{Report}", sb.ToString());
+        else log.LogInformation("{Report}", sb.ToString());
         return failures;
     }
 

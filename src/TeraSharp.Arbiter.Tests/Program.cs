@@ -17493,4 +17493,67 @@ some prose with `backticks` that is not a table row
             $"the captured message is '{seen}'");
     }
 
+
+
+    /// <summary>
+    /// T58. The deploy-side wiring checks: the allow-list is enumerable, every opcode in it has a
+    /// PERSISTENCE-MAP row, and a missing row is reported rather than thrown. This is the direction
+    /// Every_per_user_request_opcode_is_answered does NOT cover (that one asks documented =&gt;
+    /// answered; T54 found 27 answered opcodes with no row).
+    /// </summary>
+    [Test] public static void T58_selftest_checks_the_allow_list_against_the_persistence_map()
+    {
+        var allow = SelfTest.AllowListOpcodes();
+        Hex.True(allow.Count > 0, "the allow-list enumerates");
+        Hex.True(allow.All(DbProxyHandlers.IsHandledRequest),
+            "and every opcode it yields is one IsHandledRequest answers");
+        Hex.True(allow.Contains((ushort)0x1463) == DbProxyHandlers.IsHandledRequest(0x1463),
+            "spot check: 0x1463 SA_LEARN_ALL_CREST_ACQUIRABLE agrees with the switch");
+
+        // a map that documents everything -> PASS
+        string full = Path.GetTempFileName();
+        string thin = Path.GetTempFileName();
+        try
+        {
+            var rows = new System.Text.StringBuilder();
+            rows.AppendLine("| write (W->A) | reply | shape | count | feeds |");
+            rows.AppendLine("|---|---|---|---|---|");
+            foreach (var op in allow)
+                rows.AppendLine($"| 0x{op:X4} SDB_TEST ({op} B) | 0xDEAD | [x] | 1 | nothing |");
+            File.WriteAllText(full, rows.ToString());
+            var ok = SelfTest.CheckPersistenceMap(full);
+            Hex.True(ok.Pass, $"a complete map passes: {ok.Detail}");
+            Hex.True(!ok.Required, "and it is optional - a published build does not ship status/");
+
+            // drop ONE row -> FAIL, naming exactly that opcode
+            var dropped = allow[0];
+            var kept = rows.ToString().Split('\n')
+                .Where(l => !l.TrimStart().StartsWith($"| 0x{dropped:X4} ", StringComparison.Ordinal));
+            File.WriteAllText(thin, string.Join("\n", kept));
+            var bad = SelfTest.CheckPersistenceMap(thin);
+            Hex.True(!bad.Pass, "one missing row fails the check");
+            Hex.True(bad.Detail.Contains($"0x{dropped:X4}", StringComparison.Ordinal),
+                $"and names it: {bad.Detail}");
+
+            // backticked first cells are skipped, the way the one-way tables opt out
+            Hex.True(SelfTest.ParseDocumentedOpcodes("| `0x2809` | none | x | 1 | x |").Count == 0,
+                "a backticked row documents nothing");
+        }
+        finally { File.Delete(full); File.Delete(thin); }
+
+        // an absent map warns, it does not throw and does not fail the deploy
+        var none = SelfTest.CheckPersistenceMap(null);
+        Hex.True(!none.Pass && !none.Required, "no map: WARN, not FAIL");
+
+        // the ArbiterOwned check has no exemptions - every one must reach a handler, or
+        // PacketDispatcher logs it and drops it instead of forwarding (status/CLIENT-REJECTS.md)
+        Hex.True(SelfTest.ArbiterOwnedWithoutHandler.Length == 0,
+            "no ArbiterOwned opcode is deliberately handler-less");
+
+        // and a missing data.json yields two FAIL lines rather than an exception at startup
+        var handlers = SelfTest.CheckHandlers(@"Z:\nope\data.json", "376012", @"Z:\nope\defs");
+        Hex.True(handlers.Count == 2 && handlers.All(r => !r.Pass),
+            $"a bad deploy path reports {handlers.Count} failure(s), no throw");
+    }
+
 }
