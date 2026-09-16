@@ -1,4 +1,4 @@
-using Microsoft.Extensions.Logging;
+﻿using Microsoft.Extensions.Logging;
 using TeraSharp.Arbiter.Persistence;
 
 namespace TeraSharp.Arbiter.World;
@@ -4748,7 +4748,7 @@ public sealed class DbProxyHandlers
             ownerDbId, reg?.ItemDbId ?? 0, reg?.TemplateId ?? 0, tradeId, reg?.Price ?? 0,
             applied.Moved, applied.Deleted, applied.CharacterMoneyDelta);
 
-        link.SendFrame(DBS_TRADE_BROKER_REGISTER_ITEM,
+        link.SendFrame(BrokerPackets.DBS_TRADE_BROKER_REGISTER_ITEM,
             BrokerPackets.BuildDbsRegisterItem(dlmId, success: tradeId != 0, atoms));
         return true;
     }
@@ -4763,7 +4763,7 @@ public sealed class DbProxyHandlers
         var row = _store.GetBrokerListing(tradeId);
         if (step <= BrokerStepRead)
         {
-            link.SendFrame(DBS_TRADE_BROKER_UNREGISTER_ITEM, BrokerPackets.BuildDbsStepAck(
+            link.SendFrame(BrokerPackets.DBS_TRADE_BROKER_UNREGISTER_ITEM, BrokerPackets.BuildDbsStepAck(
                 dlmId, step, row != null, TradeDataOf(row)));
             return true;
         }
@@ -4775,7 +4775,7 @@ public sealed class DbProxyHandlers
             && _store.SetBrokerListingState(tradeId, CharacterStore.BrokerListed, CharacterStore.BrokerCancelled);
 
         _log.LogInformation("SDB_TRADE_BROKER_UNREGISTER_ITEM: trade {Id} withdrawn -> {Ok}", tradeId, ok);
-        link.SendFrame(DBS_TRADE_BROKER_UNREGISTER_ITEM, BrokerPackets.BuildDbsStepAck(
+        link.SendFrame(BrokerPackets.DBS_TRADE_BROKER_UNREGISTER_ITEM, BrokerPackets.BuildDbsStepAck(
             dlmId, step, ok, BrokerPackets.BuildClearedTradeData(), atoms));
         return true;
     }
@@ -4792,7 +4792,7 @@ public sealed class DbProxyHandlers
         if (step <= BrokerStepRead)
         {
             bool onSale = row != null && row.State == CharacterStore.BrokerListed;
-            link.SendFrame(DBS_TRADE_BROKER_BUY_IT_NOW, BrokerPackets.BuildDbsStepAck(
+            link.SendFrame(BrokerPackets.DBS_TRADE_BROKER_BUY_IT_NOW, BrokerPackets.BuildDbsStepAck(
                 dlmId, step, onSale, TradeDataOf(row)));
             return true;
         }
@@ -4806,7 +4806,7 @@ public sealed class DbProxyHandlers
 
         _log.LogInformation("SDB_TRADE_BROKER_BUY_IT_NOW: player {Buyer} bought trade {Id} -> {Ok}",
             buyerDbId, tradeId, ok);
-        link.SendFrame(DBS_TRADE_BROKER_BUY_IT_NOW, BrokerPackets.BuildDbsStepAck(
+        link.SendFrame(BrokerPackets.DBS_TRADE_BROKER_BUY_IT_NOW, BrokerPackets.BuildDbsStepAck(
             dlmId, step, ok, TradeDataOf(row), atoms));
         return true;
     }

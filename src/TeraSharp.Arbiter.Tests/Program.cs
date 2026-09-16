@@ -2856,7 +2856,7 @@ array items
     // =====================================================================
     // T6 — position + level/exp on the characters row.
     //
-    // (a) CharacterStore.SaveWorldBlob mirrors zone/x/y/z out of the world blob
+    // (a) TeraSharp.Arbiter.Persistence.CharacterStore.SaveWorldBlob mirrors zone/x/y/z out of the world blob
     //     (read-only) onto the row.
     // (b) S_UPDATE_EXP_LEVEL (0x273B) -> D_UPDATE_EXP_LEVEL (0x273C) is a real
     //     handler that writes level/exp and echoes the LIVE DLM id.
@@ -15656,7 +15656,7 @@ some prose with `backticks` that is not a table row
         var chief = h.Player(1);
 
         // --- create. Guild::GenerateNewGuildGroupId is max(existing) + 1; the default group is 2
-        // (CharacterStore.DefaultGuildGroupId), so the first one created here is 3.
+        // (TeraSharp.Arbiter.Persistence.CharacterStore.DefaultGuildGroupId), so the first one created here is 3.
         var a = GuildWiring.OnWorldFrame(store, GuildPackets.SA_CREATE_GUILD_GROUP,
             SaCreateGuildGroupPayload(guildId, "Officers"));
         Hex.True(a.Rejected == null, $"rejected: {a.Rejected}");
@@ -17125,7 +17125,7 @@ some prose with `backticks` that is not a table row
         BitConverter.GetBytes(2).CopyTo(payload, 12);         // OwnerDbId at payload 12
 
         var (op, body) = RunHandler1(DbProxyHandlers.SDB_TRADE_BROKER_REGISTER_ITEM, payload, store);
-        Hex.True(op == DbProxyHandlers.DBS_TRADE_BROKER_REGISTER_ITEM, $"replied 0x{op:X4}, want 0x2818");
+        Hex.True(op == BrokerPackets.DBS_TRADE_BROKER_REGISTER_ITEM, $"replied 0x{op:X4}, want 0x2818");
         Hex.True(BitConverter.ToUInt32(body, 0) == 0x13
                  && BitConverter.ToUInt32(body, 4) == 3 * DbProxyHandlers.ItemAtomSize
                  && BitConverter.ToUInt32(body, 8) == 0xB4 && body[12] == 1,
@@ -17136,7 +17136,7 @@ some prose with `backticks` that is not a table row
         var listing = store.GetBrokerListing(1);
         Hex.True(listing != null && listing.SellerDbId == 2 && listing.ItemDbId == 10029
                  && listing.TemplateId == 139093 && listing.Price == 10001
-                 && listing.State == CharacterStore.BrokerListed,
+                 && listing.State == TeraSharp.Arbiter.Persistence.CharacterStore.BrokerListed,
             $"the listing: {listing?.ItemDbId} for {listing?.Price}, state {listing?.State}");
         Hex.True(store.GetCharacterMoney(2) == goldBefore - 500, "the op-9 atom took the listing fee");
         var pocketed = store.GetItems(2, WarehouseHandlers.InvenBroker);
@@ -17163,7 +17163,7 @@ some prose with `backticks` that is not a table row
         BitConverter.GetBytes(1).CopyTo(buy1, 16);            // Step 1
         BitConverter.GetBytes(id).CopyTo(buy1, 20);
         var (op1, b1) = RunHandler1(DbProxyHandlers.SDB_TRADE_BROKER_BUY_IT_NOW, buy1, store);
-        Hex.True(op1 == DbProxyHandlers.DBS_TRADE_BROKER_BUY_IT_NOW, $"0x{op1:X4}");
+        Hex.True(op1 == BrokerPackets.DBS_TRADE_BROKER_BUY_IT_NOW, $"0x{op1:X4}");
         Hex.True(BitConverter.ToUInt32(b1, 0) == 0x1F
                  && BitConverter.ToUInt32(b1, 4) == BrokerPackets.TradeDataSize
                  && BitConverter.ToUInt32(b1, 12) == 0 && BitConverter.ToUInt32(b1, 20) == 1
@@ -17187,7 +17187,7 @@ some prose with `backticks` that is not a table row
                  && BitConverter.ToUInt32(b2, 12) == 2 * DbProxyHandlers.ItemAtomSize
                  && BitConverter.ToUInt32(b2, 20) == 2 && b2[24] == 1,
             "seq 1883: the record is STILL there on a buy, plus the atoms echoed");
-        Hex.True(store.GetBrokerListing(id)!.State == CharacterStore.BrokerSold
+        Hex.True(store.GetBrokerListing(id)!.State == TeraSharp.Arbiter.Persistence.CharacterStore.BrokerSold
                  && store.GetBrokerListing(id)!.BuyerDbId == 1, "the row is sold to the buyer");
 
         // A second buyer racing the same TradeId loses, even though step 1 said yes.
@@ -17214,10 +17214,10 @@ some prose with `backticks` that is not a table row
         for (int i = 0; i < calcAtoms.Length; i++)
             calcAtoms[i].CopyTo(calc, calcHdr + 4 + i * DbProxyHandlers.ItemAtomSize);
         var (opC, bC) = RunHandler1(DbProxyHandlers.SDB_TRADE_BROKER_CALC_SOLD_ITEM, calc, store);
-        Hex.True(opC == DbProxyHandlers.DBS_TRADE_BROKER_CALC_SOLD_ITEM, $"0x{opC:X4}");
+        Hex.True(opC == BrokerPackets.DBS_TRADE_BROKER_CALC_SOLD_ITEM, $"0x{opC:X4}");
         Hex.True(BitConverter.ToUInt32(bC, 0) == 0x1F && BitConverter.ToUInt32(bC, 4) == 0,
             "seq 1949: a calc step 2 carries NO record - offset 0x1F, length 0");
-        Hex.True(store.GetBrokerListing(id)!.State == CharacterStore.BrokerSellerPaid,
+        Hex.True(store.GetBrokerListing(id)!.State == TeraSharp.Arbiter.Persistence.CharacterStore.BrokerSellerPaid,
             "and the seller has been paid");
 
         // ---- UNREGISTER step 2 on a fresh listing: a ZEROED record, not an absent one. ----
@@ -17229,11 +17229,11 @@ some prose with `backticks` that is not a table row
         BitConverter.GetBytes(2).CopyTo(un, 16);
         BitConverter.GetBytes(other).CopyTo(un, 20);
         var (opU, bU) = RunHandler1(DbProxyHandlers.SDB_TRADE_BROKER_UNREGISTER_ITEM, un, store);
-        Hex.True(opU == DbProxyHandlers.DBS_TRADE_BROKER_UNREGISTER_ITEM, $"0x{opU:X4}");
+        Hex.True(opU == BrokerPackets.DBS_TRADE_BROKER_UNREGISTER_ITEM, $"0x{opU:X4}");
         Hex.True(BitConverter.ToUInt32(bU, 4) == BrokerPackets.TradeDataSize
                  && bU[25..(25 + BrokerPackets.TradeDataSize)].All(x => x == 0),
             "seq 2003: the record is present and every byte of it is zero");
-        Hex.True(store.GetBrokerListing(other)!.State == CharacterStore.BrokerCancelled, "withdrawn");
+        Hex.True(store.GetBrokerListing(other)!.State == TeraSharp.Arbiter.Persistence.CharacterStore.BrokerCancelled, "withdrawn");
     }
 
     /// <summary>The store half: search paging is bounds-checked as unsigned, and the state
@@ -17255,7 +17255,7 @@ some prose with `backticks` that is not a table row
         Hex.True(store.SetBrokerListingPrice(a, 50) && store.GetBrokerListing(a)!.Price == 50, "reprice");
         Hex.True(store.SellBrokerListing(a, 1) && !store.SellBrokerListing(a, 1),
             "a listing sells once");
-        Hex.True(!store.SetBrokerListingState(a, CharacterStore.BrokerListed, CharacterStore.BrokerCancelled),
+        Hex.True(!store.SetBrokerListingState(a, TeraSharp.Arbiter.Persistence.CharacterStore.BrokerListed, TeraSharp.Arbiter.Persistence.CharacterStore.BrokerCancelled),
             "and a sold listing cannot then be cancelled");
         Hex.True(store.GetBrokerListingsOf(2).Count == 1, "one still on sale");
         Hex.True(store.GetBrokerPurchasesOf(1).Count == 1, "and one waiting for its buyer");
