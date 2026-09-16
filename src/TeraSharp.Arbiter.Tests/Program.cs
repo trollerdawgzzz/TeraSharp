@@ -16752,4 +16752,204 @@ some prose with `backticks` that is not a table row
             "0x1644 / 0x1645 are modelled - PARTY-DESIGN.md section 13.3");
     }
 
+
+    // ======================================================================
+    // T61 - mail contents from cap_social.log, and the receiver bug it found.
+    // "Test" (db id 2) sends "two" (1002) a parcel titled "No subject" with
+    // 100 money and one item; seq 1485 MAKE, 1539 LIST, 1553-1556 RECV,
+    // 1575 DELETE. Literals are frame payloads with the 6-byte header off,
+    // or ParcelData record slices where marked.
+    // ======================================================================
+
+    const string Cap61_MakeParcelDataHead =
+            "02 00 00 00 54 00 65 00 73 00 74 00 00 00 00 00 " +
+            "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 " +
+            "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 " +
+            "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 " +
+            "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 " +
+            "00 00 00 00 74 00 77 00 6F 00 00 00 00 00 00 00 " +
+            "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 " +
+            "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 " +
+            "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 " +
+            "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 " +
+            "00 00 00 00 01 00 00 00 00 00 00 00 00 00 00 00 " +
+            "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 " +
+            "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 " +
+            "64 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 " +
+            "A0 19 00 00 01 00 00 00 ";
+
+    const string Cap61_ListParcelDataHead =
+            "02 00 00 00 54 00 65 00 73 00 74 00 00 00 00 00 " +
+            "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 " +
+            "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 " +
+            "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 " +
+            "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 " +
+            "EA 03 00 00 74 00 77 00 6F 00 00 00 00 00 00 00 " +
+            "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 " +
+            "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 " +
+            "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 " +
+            "00 00 00 00 00 00 00 00 00 00 00 00 00 00 FF FF " +
+            "01 00 00 00 01 00 00 00 00 00 00 00 EA 07 09 00 " +
+            "0E 00 0D 00 36 00 30 00 00 00 00 00 00 00 00 00 " +
+            "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 " +
+            "64 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 " +
+            "A0 19 00 00 01 00 00 00 ";
+
+    const string Cap61_ParcelTitle =
+            "4E 00 6F 00 20 00 73 00 75 00 62 00 6A 00 65 00 " +
+            "63 00 74 00 00 00 00 00 ";
+
+    const string Cap61_PremiumCooltimeReply =
+            "13 00 00 00 20 00 00 00 98 00 00 00 01 15 02 00 " +
+            "00 06 00 00 00 00 00 00 00 00 00 00 00 15 02 00 " +
+            "00 07 00 00 00 00 00 00 00 00 00 00 00 ";
+
+    const string Cap61_S_CHANGE_PARTY_MANAGER =
+            "16 00 95 57 0E 00 F0 0A 00 00 EA 03 00 00 74 00 " +
+            "77 00 6F 00 00 00 ";
+
+    const string Cap61_S_PARTY_LOOTING_METHOD =
+            "17 00 C0 63 00 00 00 00 01 00 00 00 00 00 00 00 " +
+            "00 01 01 00 00 00 00 ";
+
+    const string Cap61_S_PARTY_MEMBER_LIST =
+            "68 00 C6 8B 01 00 32 00 00 00 05 00 00 00 01 00 " +
+            "00 00 14 00 F0 0A F0 0A 00 00 02 00 00 00 01 00 " +
+            "00 00 01 00 00 00 00 01 00 00 00 00 01 00 00 00 " +
+            "00 00 32 00 00 00 5E 00 F0 0A 00 00 02 00 00 00 " +
+            "03 00 00 00 0C 00 00 00 01 02 00 F0 0A 00 80 00 " +
+            "00 00 00 00 00 00 00 00 00 00 00 00 00 00 54 00 " +
+            "65 00 73 00 74 00 00 00 ";
+
+    /// <summary>
+    /// The ParcelData field map, pinned against both captured forms of the SAME parcel - the
+    /// 3544-byte record inside SDB_MAKE_PARCEL (seq 1485) and the 2536-byte NoMsg record
+    /// DBS_LIST_PARCEL returned for it (seq 1539). The two differ in exactly the way that
+    /// matters: the request carries ReceiverDbId 0 and the reply carries 1002.
+    /// </summary>
+    [Test] public static void T61_the_parcel_record_fields_are_pinned_to_both_captured_forms()
+    {
+        var make = Hex.B(Cap61_MakeParcelDataHead);
+        var list = Hex.B(Cap61_ListParcelDataHead);
+
+        var mf = ParcelDbHandlers.ParseParcelData(make);
+        Hex.True(mf.SenderDbId == 2 && mf.SenderName == "Test", $"+00/+04 sender: {mf.SenderDbId} '{mf.SenderName}'");
+        Hex.True(mf.ReceiverName == "two", $"+54 ReceiverName: '{mf.ReceiverName}'");
+        Hex.True(mf.ReceiverDbId == 0,
+            "+50 ReceiverDbId is ZERO in a MAKE request - the client only knew the name it typed");
+        Hex.True(mf.Money == 100, $"+D0 Money: {mf.Money}");
+        Hex.True(mf.ParcelId == 0, "+A0 ParcelId is unallocated on the way in");
+
+        var lf = ParcelDbHandlers.ParseParcelData(list);
+        Hex.True(lf.ReceiverDbId == 1002, $"+50 is filled in once the Arbiter has stored it: {lf.ReceiverDbId}");
+        Hex.True(lf.SenderDbId == 2 && lf.SenderName == "Test" && lf.ReceiverName == "two", "and the rest is unchanged");
+        Hex.True(lf.ParcelId == 1, $"+A0 ParcelId: {lf.ParcelId}");
+        Hex.True(lf.Money == 100, $"+D0 Money: {lf.Money}");
+
+        // The title lives past the head slice, at +0x960 in both.
+        var titled = new byte[ParcelDbHandlers.ParcelDataNoMsgSize];
+        Hex.B(Cap61_ParcelTitle).CopyTo(titled, ParcelDbHandlers.ParcelDataTitle);
+        Hex.True(ParcelDbHandlers.ParseParcelData(titled).Title == "No subject",
+            "+960 Title");
+    }
+
+    /// <summary>
+    /// The live bug, and the fix. A MAKE record names its receiver; resolving that name is what
+    /// puts the parcel in somebody's inbox instead of user 0's.
+    /// </summary>
+    [Test] public static void T61_a_parcel_round_trips_from_the_captured_record_to_the_inbox()
+    {
+        using var store = GuildStore(2);          // characters g1 (id 1) and g2 (id 2)
+        var make = Hex.B(Cap61_MakeParcelDataHead);
+
+        // Reading +0x50 straight off the request is the bug: it answers 0.
+        Hex.True(ParcelDbHandlers.ParseParcelData(make).ReceiverDbId == 0, "the raw field is 0");
+        Hex.True(ParcelDbHandlers.ResolveReceiverDbId(store, make) == 0,
+            "and 'two' is not in this store, so the resolver refuses rather than inventing a row");
+
+        // The same record addressed to somebody who exists.
+        var mine = (byte[])make.Clone();
+        Array.Clear(mine, ParcelDbHandlers.ParcelDataReceiverName, 8);
+        const string who = "g2";
+        for (int i = 0; i < who.Length; i++)
+            BitConverter.GetBytes((ushort)who[i]).CopyTo(mine, ParcelDbHandlers.ParcelDataReceiverName + i * 2);
+        int to = ParcelDbHandlers.ResolveReceiverDbId(store, mine);
+        Hex.True(to == 2, $"the name resolves to the db id: {to}");
+
+        var f = ParcelDbHandlers.ParseParcelData(mine);
+        int parcelId = store.CreateParcel(f.SenderDbId, f.SenderName, to, f.Title, string.Empty, f.Money);
+        store.SetParcelRecord(parcelId, mine);
+
+        var inbox = store.GetParcelsFor(to);
+        Hex.True(inbox.Count == 1, $"the inbox has it: {inbox.Count}");
+        Hex.True(inbox[0].SenderName == "Test" && inbox[0].Money == 100,
+            $"with the sender and money off the record: '{inbox[0].SenderName}' {inbox[0].Money}");
+        Hex.True(store.GetParcelsFor(1).Count == 0, "and nobody else's inbox moved");
+
+        var body = ParcelDbHandlers.BuildParcelList(store, to, out uint count, out uint maxPage);
+        Hex.True(count == 1 && maxPage == 1, $"one parcel, one page: {count}/{maxPage}");
+        Hex.True(body.Length == ParcelDbHandlers.ParcelDataNoMsgSize,
+            $"the list stride is 0x9e8, as the capture's 2536-byte record is: {body.Length}");
+        Hex.True(ParcelDbHandlers.ParseParcelData(body).ReceiverDbId == to,
+            "and the record we serve has the receiver FILLED IN, which is what seq 1539 shows");
+
+        Hex.True(store.DeleteParcel(parcelId), "delete removes it");
+        Hex.True(store.GetParcelsFor(to).Count == 0, "and the inbox is empty again");
+    }
+
+    /// <summary>
+    /// The three party windows, from the client half of the same session. The looting block is
+    /// the same 19 bytes the A-&gt;W frames carry (PARTY-DESIGN.md section 6.3), which is worth
+    /// pinning because the .def is missing a field of it.
+    /// </summary>
+    [Test] public static void T61_the_party_windows_are_the_captured_client_packets()
+    {
+        var mgr = Hex.B(Cap61_S_CHANGE_PARTY_MANAGER);
+        Hex.True(mgr.Length == 22 && BitConverter.ToUInt16(mgr, 0) == 22, "S_CHANGE_PARTY_MANAGER is 22 bytes");
+        Hex.True(BitConverter.ToUInt16(mgr, 4) == 0x0E, "[04] name offset, packet-relative 0x0E");
+        Hex.True(BitConverter.ToInt32(mgr, 6) == 2800 && BitConverter.ToInt32(mgr, 10) == 1002,
+            "[06] planetId 2800, [0A] the new manager's db id");
+        Hex.True(ContractBroker.ReadWString(mgr, 0x0E) == "two", "then the name");
+
+        var loot = Hex.B(Cap61_S_PARTY_LOOTING_METHOD);
+        Hex.True(loot.Length == 23, "S_PARTY_LOOTING_METHOD is 4 + the 19-byte block");
+        var s = new PartyPackets.LootSettings(
+            Method: BitConverter.ToInt32(loot, 4), RareGradeForDicing: BitConverter.ToInt32(loot, 8),
+            RareItemDistributionMethod: BitConverter.ToInt32(loot, 12),
+            EquipmentForDicing: loot[16] != 0, FindClassForDicing: loot[17] != 0,
+            BoundOnLootItemDistributionMethod: BitConverter.ToInt32(loot, 18), ForbidLootingInBattle: loot[22] != 0);
+        Hex.True(s == new PartyPackets.LootSettings(0, 1, 0, false, true, 1, false),
+            $"the client sees exactly what SA_CHANGE_LOOTING_METHOD carried: {s}");
+
+        var lst = Hex.B(Cap61_S_PARTY_MEMBER_LIST);
+        Hex.True(BitConverter.ToUInt16(lst, 4) == 1 && BitConverter.ToUInt16(lst, 6) == 0x32,
+            "[04] array count 1, [06] array offset 0x32 - the ref header comes first");
+        Hex.True(BitConverter.ToInt64(lst, 14) == 0x0AF0_0014_0000_0001L,
+            "and the PartyId is the one AS_DO_CREATE_PARTY made");
+        Hex.True(BitConverter.ToInt32(lst, 22) == 2800 && BitConverter.ToInt32(lst, 26) == 2,
+            "followed by the leader's planet and db id");
+    }
+
+    /// <summary>
+    /// SDB_LOAD_PREMIUM_SLOT_LEFT_COOLTIME (0x28BD, seq 644) is a per-user login load carrying a
+    /// DlmId, and nothing answered it - it fell through to the replay table. The reply's list
+    /// offset is written even when the list is empty.
+    /// </summary>
+    [Test] public static void T61_the_premium_slot_cooltime_load_is_answered()
+    {
+        var cap = Hex.B(Cap61_PremiumCooltimeReply);
+        Hex.True(cap.Length == 51 - 6, $"the captured reply is 51 bytes, got {cap.Length + 6}");
+        var records = cap[DbProxyHandlers.PremiumSlotReplyHeader..];
+        Hex.True(records.Length == 2 * DbProxyHandlers.PremiumSlotRecordSize, "two 16-byte records");
+        Hex.Eq(DbProxyHandlers.BuildDbsPremiumSlotCooltime(0x98, records), cap,
+            "0x28BE, cap_social.log seq 645");
+
+        var empty = DbProxyHandlers.BuildDbsPremiumSlotCooltime(0x98);
+        Hex.True(empty.Length == DbProxyHandlers.PremiumSlotReplyHeader, "an empty reply is the header alone");
+        Hex.True(BitConverter.ToUInt32(empty, 0) == 19 && BitConverter.ToUInt32(empty, 4) == 0,
+            "with the offset slot still written - frame 19, count 0");
+        Hex.True(DbProxyHandlers.IsHandledRequest(DbProxyHandlers.SDB_LOAD_PREMIUM_SLOT_LEFT_COOLTIME),
+            "and 0x28BD is allow-listed now");
+    }
+
 }

@@ -900,3 +900,17 @@ neither can be assumed. `T64_the_party_match_list_pushes_write_an_empty_list_as_
 Builders exist (`PartyPackets.BuildAsViewInterPartyMatchList`); nothing calls them yet, because
 the Arbiter half of `C_DUNGEON_CLEAR_COUNT_LIST` is not modelled and inventing a trigger would be
 a guess.
+
+### 13.4 T61 — the three client-side party windows
+
+From `cap_social_client.log`, the same session as section 13:
+
+| packet | total | layout |
+|---|---|---|
+| `S_CHANGE_PARTY_MANAGER` 0x5795 | 22 | `[04] u16 nameOff=0x0E, [06] i32 PlanetId 2800, [0A] i32 PlayerId 1002, [0E] wstr "two"` |
+| `S_PARTY_LOOTING_METHOD` 0x63C0 | 23 | 4-byte header then the same 19-byte loot block the `SA_`/`AS_` frames carry — `i32 0, i32 1, i32 0, u8 0, u8 1, u8 1, i32 0` |
+| `S_PARTY_MEMBER_LIST` 0x8BC6 | 104 / 156 | `[04] u16 count, [06] u16 arrayOff=0x32`, then `[0E] i64 PartyId`, `[16] i32 OwnerPlanetId`, `[1A] i32 OwnerDbId` |
+
+The loot block matching byte for byte is the point: `S_PARTY_LOOTING_METHOD`'s `.def` is missing
+`BoundOnLootItemDistributionMethod`, and the capture shows it carrying 1 where the def would have
+read the next field.
