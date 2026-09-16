@@ -814,6 +814,36 @@ public sealed class DbProxyHandlers
     // ParcelManager::RecvParcel), but the two replies have different layouts and different
     // opcodes, so they get separate cases here.
     public const ushort SDB_LIST_PARCEL = 0x2777;      public const ushort DBS_LIST_PARCEL = 0x2778;
+    /// <summary>
+    /// T61. SDB_LOAD_PREMIUM_SLOT_LEFT_COOLTIME (0x28BD) -&gt; DBS (0x28BE), a per-user login load
+    /// that carries a DlmId. Request: <c>i32 DlmId@06, i64 ArbiterUser@0A, i64 OwnerDbId@12</c>,
+    /// frame 26. Reply: <c>u32 listOff=19@06, u32 listBytes@0A, i32 DlmId@0E, u8 Success@12</c>
+    /// then N x 16-byte records. cap_social.log seq 644 -&gt; 645 carries two of them.
+    /// </summary>
+    public const ushort SDB_LOAD_PREMIUM_SLOT_LEFT_COOLTIME = 0x28BD;
+    public const ushort DBS_LOAD_PREMIUM_SLOT_LEFT_COOLTIME = 0x28BE;
+    /// <summary>One premium-slot cooltime record: <c>i32 SlotId, i32 Index, i64 LeftCoolTime</c>.</summary>
+    public const int PremiumSlotRecordSize = 16;
+    /// <summary>Payload bytes before the list (frame 19).</summary>
+    public const int PremiumSlotReplyHeader = 13;
+
+    /// <summary>
+    /// DBS_LOAD_PREMIUM_SLOT_LEFT_COOLTIME. <paramref name="records"/> is the concatenated
+    /// 16-byte block; empty for a character with no premium slots, which is every character we
+    /// have. The offset slot is written unconditionally, as every list writer in this protocol
+    /// does.
+    /// </summary>
+    public static byte[] BuildDbsPremiumSlotCooltime(uint dlmId, byte[]? records = null, bool ok = true)
+    {
+        records ??= Array.Empty<byte>();
+        var p = new byte[PremiumSlotReplyHeader + records.Length];
+        BitConverter.GetBytes(6 + PremiumSlotReplyHeader).CopyTo(p, 0);   // frame-relative 19
+        BitConverter.GetBytes(records.Length).CopyTo(p, 4);
+        BitConverter.GetBytes(dlmId).CopyTo(p, 8);
+        p[12] = (byte)(ok ? 1 : 0);
+        records.CopyTo(p, PremiumSlotReplyHeader);
+        return p;
+    }
     public const ushort SDB_MAKE_PARCEL = 0x2779;      public const ushort DBS_MAKE_PARCEL = 0x277A;
     public const ushort SDB_RECV_PARCEL = 0x277B;      public const ushort DBS_RECV_PARCEL = 0x277C;
     public const ushort SDB_RECV_PARCEL_EX = 0x277D;   public const ushort DBS_RECV_PARCEL_EX = 0x277E;
@@ -1078,6 +1108,7 @@ public sealed class DbProxyHandlers
             // all, and no capture has one either, so the replay table could not cover for us.
             case SDB_LIST_PARCEL:                 // 0x2778, the empty form is byte-exact
             case SDB_MAKE_PARCEL:                 // 0x277a, atoms echoed with allocated ids
+            case SDB_LOAD_PREMIUM_SLOT_LEFT_COOLTIME:   // 0x28BD, T61
             case SDB_RECV_PARCEL:                 // 0x277c, atoms applied then echoed
             case SDB_RECV_PARCEL_EX:              // 0x277e, "receive all"
             case SDB_RETURN_PARCEL:               // 0x2782 = [DlmId][ok]
@@ -1161,6 +1192,9 @@ public sealed class DbProxyHandlers
             // --- T45: parcels ---
             case SDB_LIST_PARCEL:             return OnListParcel(link, payload);
             case SDB_MAKE_PARCEL:             return OnMakeParcel(link, payload);
+            case SDB_LOAD_PREMIUM_SLOT_LEFT_COOLTIME:
+                link.SendFrame(DBS_LOAD_PREMIUM_SLOT_LEFT_COOLTIME,
+                    BuildDbsPremiumSlotCooltime(U32(payload, 0x0E))); return true;
             case SDB_RECV_PARCEL:             return OnRecvParcel(link, payload);
             case SDB_RECV_PARCEL_EX:          return OnRecvParcelEx(link, payload);
             case SDB_RETURN_PARCEL:           return OnReturnParcel(link, payload);
@@ -4138,17 +4172,24 @@ public sealed class DbProxyHandlers
             return true;
         }
 
-        // The receiver is the one field of ParcelData we have pinned (+0x50, from
-        // Handler_C_SHOW_PARCEL_MESSAGE's ownership test).
-        uint recverDbId = record.Length >= ParcelDbHandlers.ParcelDataReceiverDbId + 4
-            ? BitConverter.ToUInt32(record, ParcelDbHandlers.ParcelDataReceiverDbId)
-            : 0u;
+        // T61: the sending client only knows the NAME it typed - ParcelData arrives here with
+        // ReceiverDbId = 0 at +0x50 and the name at +0x54 (cap_social.log seq 1485). Reading
+        // +0x50 straight off the request filed every parcel under user 0.
+        var pf = ParcelDbHandlers.ParseParcelData(record);
+        int recverDbId = ParcelDbHandlers.ResolveReceiverDbId(_store, record);
+        if (recverDbId <= 0)
+        {
+            _log.LogWarning("SDB_MAKE_PARCEL: receiver '{Name}' does not exist - refusing", pf.ReceiverName);
+            link.SendFrame(DBS_MAKE_PARCEL,
+                ParcelDbHandlers.BuildDbsMakeParcel(null, dlmId, ok: false, sendParcelError: 1, recverDbId: 0));
+            return true;
+        }
 
         var (atoms, parsed) = WarehouseHandlers.CloneAtomsWithIds(
             payload, ParcelDbHandlers.MakeReqTransListRef, ParcelDbHandlers.MakeRequestSize, _store.NextItemId);
 
-        int parcelId = _store.CreateParcel(senderDbId: 0, senderName: "", receiverDbId: (int)recverDbId,
-            title: "", message: "", money: 0);
+        int parcelId = _store.CreateParcel(pf.SenderDbId, pf.SenderName, recverDbId,
+            pf.Title, message: string.Empty, pf.Money);
         if (record.Length > 0) _store.SetParcelRecord(parcelId, record);
 
         int slot = 0;
@@ -4159,10 +4200,11 @@ public sealed class DbProxyHandlers
             _store.AddParcelItem(parcelId, slot++, (int)atom.ItemDbId, atom.TemplateId, atom.Delta);
         }
 
-        _log.LogInformation("SDB_MAKE_PARCEL: parcel {Id} for user {User}, {N} attachment(s), {B} B record",
-            parcelId, recverDbId, slot, record.Length);
+        _log.LogInformation(
+            "SDB_MAKE_PARCEL: parcel {Id} from {From} to {To} ({User}) '{Title}', {Money} money, {N} attachment(s), {B} B record",
+            parcelId, pf.SenderName, pf.ReceiverName, recverDbId, pf.Title, pf.Money, slot, record.Length);
         link.SendFrame(DBS_MAKE_PARCEL,
-            ParcelDbHandlers.BuildDbsMakeParcel(atoms, dlmId, ok: true, sendParcelError: 0, recverDbId));
+            ParcelDbHandlers.BuildDbsMakeParcel(atoms, dlmId, ok: true, sendParcelError: 0, (uint)recverDbId));
         return true;
     }
 

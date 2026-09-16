@@ -634,3 +634,42 @@ Two near-misses in this task, both worth remembering:
    extractions were re-run for this task and agree on all 712 entries in `0x2700–0x29FF`; when a
    `SDB_`/`DBS_` number is wanted, that file is the answer and the Arbiter decompile is the wrong
    place to look.
+
+---
+
+## 10. T61 — ParcelData from the capture, and the receiver bug
+
+`cap_social.log` seq 1485 (SDB_MAKE_PARCEL, 3544-byte record) and seq 1539 (DBS_LIST_PARCEL,
+2536-byte NoMsg record) are the same parcel: "Test" (2) -> "two" (1002), title "No subject",
+100 money, one item (6560 x1).
+
+| off | field | MAKE | LIST |
+|---|---|---|---|
+| 0x000 | i32 SenderDbId | 2 | 2 |
+| 0x004 | wstr SenderName (0x25 chars) | Test | Test |
+| 0x050 | i32 ReceiverDbId | **0** | **1002** |
+| 0x054 | wstr ReceiverName | two | two |
+| 0x0A0 | i32 ParcelId | 0 | 1 |
+| 0x0D0 | i64 Money | 100 | 100 |
+| 0x960 | wstr Title (0x40 chars) | No subject | No subject |
+| 0x9E8.. | message region | present, empty here | absent (that is what "NoMsg" means) |
+
+**The live bug.** A ParcelData arriving in `SDB_MAKE_PARCEL` has `ReceiverDbId = 0` — the sending
+client only knew the name it typed, and resolving it is the Arbiter's job. Reading +0x50 off the
+request filed every parcel under user 0 and left the inbox empty.
+`ParcelDbHandlers.ResolveReceiverDbId` takes +0x50 when it is non-zero and otherwise looks up
++0x54 by name; `OnMakeParcel` refuses with `sendParcelError 1` when the name resolves to nobody,
+rather than creating an orphan row. Sender, title and money now reach `CreateParcel` too.
+
+0x0A4..0x0CF is timestamps and flags the Arbiter fills on the way out (zero in MAKE); 0x0B4 held
+the string "60" in the served record and is not identified.
+
+Request/reply headers were already right and the capture confirms them: LIST req
+`DlmId 0xA7, UserDbId 1002, ViewType 0, CurPage 0`; LIST reply `off 35, bytes 2536, DlmId,
+Success 1, ViewType 0, CurPage 0, MaxPage 1, ParcelCount 1`; RECV `DlmId 0xA8` steps 1 then 2;
+DELETE `DelList(4 B), DlmId 0xA9, UserDbId 1002, IsSendParcel 0`.
+
+Also answered here: **`SDB_LOAD_PREMIUM_SLOT_LEFT_COOLTIME` (0x28BD)**, a per-user login load
+carrying a DlmId that nothing answered. Request `i32 DlmId@06, i64 ArbiterUser@0A,
+i64 OwnerDbId@12`, frame 26. Reply `u32 listOff=19@06, u32 listBytes@0A, i32 DlmId@0E,
+u8 Success@12` + N x 16-byte `{i32, i32, i64}` records; we send the empty form.

@@ -289,16 +289,111 @@ public static class ParcelDbHandlers
     /// World gave us in <c>SDB_MAKE_PARCEL</c> (<see cref="CharacterStore.GetParcelRecord"/>)
     /// and this synthesised form is only ever used for a parcel that has no stored record.</para>
     /// </summary>
-    public static byte[] BuildParcelDataNoMsg(int parcelId, int receiverDbId)
+    public static byte[] BuildParcelDataNoMsg(int parcelId, int receiverDbId,
+        int senderDbId = 0, string? senderName = null, string? receiverName = null,
+        long money = 0, string? title = null)
     {
         var p = new byte[ParcelDataNoMsgSize];
-        BitConverter.GetBytes(parcelId).CopyTo(p, 0);
-        BitConverter.GetBytes(receiverDbId).CopyTo(p, 0x50);
+        BitConverter.GetBytes(senderDbId).CopyTo(p, ParcelDataSenderDbId);
+        WriteWString(p, ParcelDataSenderName, senderName, ParcelNameMaxChars);
+        BitConverter.GetBytes(receiverDbId).CopyTo(p, ParcelDataReceiverDbId);
+        WriteWString(p, ParcelDataReceiverName, receiverName, ParcelNameMaxChars);
+        BitConverter.GetBytes(parcelId).CopyTo(p, ParcelDataParcelId);
+        BitConverter.GetBytes(money).CopyTo(p, ParcelDataMoney);
+        WriteWString(p, ParcelDataTitle, title, ParcelTitleMaxChars);
         return p;
     }
 
+    private static void WriteWString(byte[] rec, int at, string? value, int maxChars)
+    {
+        if (string.IsNullOrEmpty(value)) return;
+        int n = Math.Min(value!.Length, maxChars - 1);
+        for (int i = 0; i < n; i++) BitConverter.GetBytes((ushort)value[i]).CopyTo(rec, at + i * 2);
+    }
+
+    // ---------------------------------------------------- ParcelData, T61
+    //
+    // Pinned against two real records in cap_social.log: the 3544-byte one inside
+    // SDB_MAKE_PARCEL (seq 1485) and the 2536-byte "NoMsg" one DBS_LIST_PARCEL returned for the
+    // same parcel (seq 1539). "Test" (db id 2) sent "two" (1002) a parcel titled "No subject"
+    // with 100 money and one item (template 6560 x1).
+    //
+    //   +0x000 i32   SenderDbId          2 in both
+    //   +0x004 wstr  SenderName          "Test"      (0x4C bytes of room)
+    //   +0x050 i32   ReceiverDbId        0 in MAKE, 1002 in LIST   <- see ResolveReceiverDbId
+    //   +0x054 wstr  ReceiverName        "two"
+    //   +0x0A0 i32   ParcelId            0 in MAKE, 1 in LIST      (the Arbiter allocates it)
+    //   +0x0D0 i64   Money               100 in both
+    //   +0x960 wstr  Title               "No subject"
+    //   +0x9E8 ...   message region      only in the full record; empty in this capture
+    //
+    // Everything between 0x0A4 and 0x0CF is timestamps and flags the Arbiter fills in on the way
+    // out; MAKE carries zeroes there. status/MAIL-WAREHOUSE.md section 10.
+    public const int ParcelDataSenderDbId = 0x00;
+    public const int ParcelDataSenderName = 0x04;
     /// <summary>Offset of the receiver db id inside a ParcelData record.</summary>
     public const int ParcelDataReceiverDbId = 0x50;
+    public const int ParcelDataReceiverName = 0x54;
+    public const int ParcelDataParcelId = 0xA0;
+    public const int ParcelDataMoney = 0xD0;
+    public const int ParcelDataTitle = 0x960;
+    /// <summary>Longest name either field has room for, in characters.</summary>
+    public const int ParcelNameMaxChars = 0x25;
+    /// <summary>Longest title the 0x960 field has room for, in characters.</summary>
+    public const int ParcelTitleMaxChars = 0x40;
+
+    /// <summary>The named fields of a ParcelData record.</summary>
+    public readonly record struct ParcelFields(
+        int SenderDbId, string SenderName, int ReceiverDbId, string ReceiverName,
+        int ParcelId, long Money, string Title);
+
+    /// <summary>A null-terminated UTF-16LE string inside a record, bounded by maxChars.</summary>
+    public static string WStringAt(byte[] rec, int at, int maxChars)
+    {
+        if (rec is null || at < 0) return string.Empty;
+        var sb = new System.Text.StringBuilder();
+        for (int i = 0; i < maxChars && at + i * 2 + 1 < rec.Length; i++)
+        {
+            ushort c = BitConverter.ToUInt16(rec, at + i * 2);
+            if (c == 0) break;
+            sb.Append((char)c);
+        }
+        return sb.ToString();
+    }
+
+    private static int I32(byte[] r, int at)
+        => r is not null && at >= 0 && at + 4 <= r.Length ? BitConverter.ToInt32(r, at) : 0;
+    private static long I64(byte[] r, int at)
+        => r is not null && at >= 0 && at + 8 <= r.Length ? BitConverter.ToInt64(r, at) : 0L;
+
+    /// <summary>Read the named fields out of a ParcelData record. Never throws on a short one.</summary>
+    public static ParcelFields ParseParcelData(byte[] record) => new(
+        I32(record, ParcelDataSenderDbId),
+        WStringAt(record, ParcelDataSenderName, ParcelNameMaxChars),
+        I32(record, ParcelDataReceiverDbId),
+        WStringAt(record, ParcelDataReceiverName, ParcelNameMaxChars),
+        I32(record, ParcelDataParcelId),
+        I64(record, ParcelDataMoney),
+        WStringAt(record, ParcelDataTitle, ParcelTitleMaxChars));
+
+    /// <summary>
+    /// T61 - the live bug. A ParcelData arriving in SDB_MAKE_PARCEL carries
+    /// <b>ReceiverDbId = 0</b>: the sending client only ever knew the name it typed, and
+    /// resolving it is the Arbiter's job (the same by-name lookup a party contract does).
+    /// cap_social.log seq 1485 has 0 at +0x50 and "two" at +0x54; the record the Arbiter then
+    /// stored and served back at seq 1539 has 1002 there.
+    ///
+    /// <para>Reading +0x50 straight off the request is what filed every parcel under user 0 and
+    /// left the recipient's inbox empty. Returns 0 when the name resolves to nobody, which is
+    /// the caller's cue to answer with a send error rather than create an orphan row.</para>
+    /// </summary>
+    public static int ResolveReceiverDbId(CharacterStore? store, byte[] record)
+    {
+        var f = ParseParcelData(record);
+        if (f.ReceiverDbId > 0) return f.ReceiverDbId;
+        if (store is null || f.ReceiverName.Length == 0) return 0;
+        return store.GetCharacterByName(f.ReceiverName)?.Id ?? 0;
+    }
 
     /// <summary>
     /// The list body for one page of a character's inbox: each parcel's stored record when we
@@ -320,7 +415,9 @@ public static class ParcelDbHandlers
             var stored = store.GetParcelRecord(rows[i].ParcelId);
             var rec = stored is not null && stored.Length >= ParcelDataNoMsgSize
                 ? stored
-                : BuildParcelDataNoMsg(rows[i].ParcelId, rows[i].ReceiverDbId);
+                : BuildParcelDataNoMsg(rows[i].ParcelId, rows[i].ReceiverDbId,
+                                       rows[i].SenderDbId, rows[i].SenderName, receiverName: null,
+                                       rows[i].Money, rows[i].Title);
             Buffer.BlockCopy(rec, 0, body, i * ParcelDataNoMsgSize,
                              Math.Min(rec.Length, ParcelDataNoMsgSize));
         }
