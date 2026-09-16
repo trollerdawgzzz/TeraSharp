@@ -1067,8 +1067,7 @@ public sealed class DbProxyHandlers
         SDB_LOAD_TELEPORT_TO_POS_LIST,              // 0x27A7
         SDB_LOAD_USER_RESTRICTION,                  // 0x2833
         SDB_LOAD_BATTLE_FIELD_LIST,                 // 0x2895
-        SDB_LOAD_REFER_A_FRIEND,                    // 0x28B0
-        SDB_LOAD_28B7,                              // 0x28B7
+        // 0x28B0 / 0x28B7 moved to the allow-list in T69 (byte-exact against cap_social2)
         SDB_LOAD_ACCOUNT_BENEFIT,                   // 0x28BB
         SDB_LOAD_SERVANT_PERIOD,                    // 0x28C5
         SDB_LOAD_SKILLPERIOD,                       // 0x28C9
@@ -1386,8 +1385,7 @@ public sealed class DbProxyHandlers
                 return true;
             }
             case SDB_LOAD_2900: link.SendFrame(0x2901, Build2901_TwoEmptyLists(payload)); return true;
-            case SDB_LOAD_28B7: link.SendFrame(0x28B6, Build28B6(payload)); return true; // reply opcode is op-1!
-            case SDB_LOAD_REFER_A_FRIEND: link.SendFrame(0x28B1, Build28B1_ReferAFriend(payload)); return true;
+            // 0x28B7 / 0x28B0 answered byte-exact by the T69 cases above (Build28B6 / Build28B1_ReferAFriend retired).
             case SDB_LOAD_2975: link.SendFrame(0x2976, Build2976(payload)); return true;
             case SDB_LOAD_2986: link.SendFrame(0x2987, Build2987(payload)); return true;
             case SDB_LOAD_290C:
