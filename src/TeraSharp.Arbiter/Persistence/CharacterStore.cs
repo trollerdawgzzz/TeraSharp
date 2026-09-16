@@ -1029,6 +1029,17 @@ CREATE TABLE IF NOT EXISTS visited_sections (
   PRIMARY KEY (character_id, map_id, guard_id, section_id)
 );
 CREATE INDEX IF NOT EXISTS ix_visited_character ON visited_sections(character_id);
+
+-- T62: the cinematics this character has already watched. C_WATCHED_MOVIES asks for the list
+-- once per session and the client replays anything missing from the answer, which is why the
+-- intro played again on every relog. The real Arbiter keeps this per ACCOUNT, loaded with
+-- spLoadUserWatchedMovies; we key it on the character because that is the row we own.
+CREATE TABLE IF NOT EXISTS watched_movies (
+  character_id INTEGER NOT NULL,
+  movie_id     INTEGER NOT NULL,
+  watched_at   TEXT    NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (character_id, movie_id)
+);
 ");
         // CREATE TABLE IF NOT EXISTS does nothing to a DB that already has `characters`, so
         // columns added later need their own idempotent step. terasharp.db predates `exp`.
@@ -4059,6 +4070,67 @@ DELETE FROM guild_members     WHERE user_db_id = $id;";
             var rows = new List<VisitedSection>();
             using var r = cmd.ExecuteReader();
             while (r.Read()) rows.Add(new VisitedSection(r.GetInt32(0), r.GetInt32(1), r.GetInt32(2)));
+            return rows;
+        }
+    }
+
+    // ---- T62: watched cinematics, and the name-completion lookup -------------------------
+
+    /// <summary>
+    /// Mark a cinematic as seen. Returns true the first time, like AddVisitedSection.
+    /// </summary>
+    public bool AddWatchedMovie(int characterId, int movieId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "INSERT INTO watched_movies(character_id, movie_id) VALUES($c,$m) " +
+                "ON CONFLICT(character_id, movie_id) DO NOTHING";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            cmd.Parameters.AddWithValue("$m", movieId);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    /// <summary>Every cinematic this character has seen, in the order they were seen.</summary>
+    public IReadOnlyList<int> GetWatchedMovies(int characterId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT movie_id FROM watched_movies WHERE character_id=$c ORDER BY rowid";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            var rows = new List<int>();
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) rows.Add(r.GetInt32(0));
+            return rows;
+        }
+    }
+
+    /// <summary>
+    /// Character names starting with <paramref name="prefix"/>, for C_FINDNAME. LIKE wildcards in
+    /// the typed text are escaped, so a name containing % or _ cannot turn a keystroke into a
+    /// table scan that matches everything. <paramref name="exclude"/> drops the asker's own name,
+    /// which the real handler never returns either (it searches friends, the name log and the
+    /// guild - none of which contain you).
+    /// </summary>
+    public IReadOnlyList<string> FindCharacterNamesByPrefix(string prefix, int limit, string? exclude = null)
+    {
+        if (string.IsNullOrEmpty(prefix) || limit <= 0) return Array.Empty<string>();
+        var escaped = prefix.Replace("\\", "\\\\").Replace("%", "\\%").Replace("_", "\\_");
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "SELECT name FROM characters WHERE name LIKE $p ESCAPE '\\' " +
+                "AND ($x IS NULL OR name <> $x) ORDER BY name LIMIT $n";
+            cmd.Parameters.AddWithValue("$p", escaped + "%");
+            cmd.Parameters.AddWithValue("$x", (object?)exclude ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$n", limit);
+            var rows = new List<string>();
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) rows.Add(r.GetString(0));
             return rows;
         }
     }
