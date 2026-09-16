@@ -6633,7 +6633,11 @@ public bool TryHandle(WorldBridge bridge, WorldLink link, ushort op, byte[] payl
         Hex.True(p.Length == 0x32 + 2 * PartyPackets.MemberBasicInfoSize,
             $"0x139E is 0x32 + N*0xA0, got {p.Length}");
         Hex.True(BitConverter.ToUInt32(p, 0x00) == 0x38, "+06 memberList offset is frame-relative 0x38");
-        Hex.True(BitConverter.ToUInt32(p, 0x04) == 2, "+0A memberList count");
+        // T64: the capture (cap_social.log seq 748) says this slot is a BYTE LENGTH, and
+        // Handler_AS_DO_CREATE_PARTY reads it as (n - 1) / 0xa0 + 1. It was the element
+        // count here until T64, which made World see a two-member party as one member.
+        Hex.True(BitConverter.ToUInt32(p, 0x04) == 2 * (uint)PartyPackets.MemberBasicInfoSize,
+            "+0A memberList BYTE LENGTH, not the element count");
         Hex.True(BitConverter.ToInt64(p, 0x08) == 0x0AF0000100000001L, "+0E PartyId");
         Hex.True(BitConverter.ToInt32(p, 0x10) == 2800 && BitConverter.ToInt32(p, 0x14) == 2800,
             "+16/+1A owner and manager planet");
@@ -7485,13 +7489,16 @@ public bool TryHandle(WorldBridge bridge, WorldLink link, ushort op, byte[] payl
 
         var a = pm.OnWorldFrame(PartyPackets.SA_JOIN_PARTY, SaJoinPartyPayload(1, 2));
         Hex.True(a.Rejected == null, $"rejected: {a.Rejected}");
-        Hex.True(a.ToWorld.Count == 1 && a.ToWorld[0].Opcode == PartyPackets.AS_DO_CREATE_PARTY, WorldOps(a));
+        // T64: AS_DO_CREATE_PARTY, then one 0x15CD and one 0x13AD per member - the order
+        // cap_social.log seq 748..753 has them in.
+        Hex.True(WorldOps(a) == "0x139E,0x15CD,0x15CD,0x13AD,0x13AD", WorldOps(a));
         Hex.True(a.ToClients.Count == 2 && a.ToClients.All(c => c.PacketName == "S_PARTY_MEMBER_LIST"), Names(a));
 
         // AS_DO_CREATE_PARTY: 0x32 fixed payload bytes then N x 0xA0 raw member records.
         var body = a.ToWorld[0].Payload;
         Hex.True(body.Length == 0x32 + 2 * PartyPackets.MemberBasicInfoSize, $"0x139E is 0x32+2*0xA0, got {body.Length}");
-        Hex.True(BitConverter.ToUInt32(body, 4) == 2, "two members in the list header");
+        Hex.True(BitConverter.ToUInt32(body, 4) == 2 * (uint)PartyPackets.MemberBasicInfoSize,
+            "the list header is a BYTE LENGTH - T64, cap_social.log seq 748");
         var party = pm.FindByMember(1);
         Hex.True(party != null && BitConverter.ToInt64(body, 8) == party!.Id, "the PartyId matches the manager's");
         Hex.True(BitConverter.ToInt32(body, 0x18) == 1, "+1E ManagerDbId is the inviter, not the invitee");
@@ -7660,7 +7667,7 @@ public bool TryHandle(WorldBridge bridge, WorldLink link, ushort op, byte[] payl
         var expected = new[]
         {
             "apply -> [10:S_OTHER_USER_APPLY_PARTY] []",
-            "accept -> [10:S_PARTY_MEMBER_LIST,11:S_PARTY_MEMBER_LIST] [0x139E]",
+            "accept -> [10:S_PARTY_MEMBER_LIST,11:S_PARTY_MEMBER_LIST] [0x139E,0x15CD,0x15CD,0x13AD,0x13AD]",
             "accept2 -> [10:S_PARTY_MEMBER_LIST,11:S_PARTY_MEMBER_LIST,12:S_PARTY_MEMBER_LIST] [0x139F]",
             "loot-request -> [] [0x13BB]",
             "loot-applied -> [10:S_PARTY_LOOTING_METHOD,11:S_PARTY_LOOTING_METHOD,12:S_PARTY_LOOTING_METHOD] [0x13A6]",
@@ -13046,8 +13053,10 @@ some prose with `backticks` that is not a table row
 
         Hex.True(string.Join(",", leader.Log) == "def:S_PARTY_MEMBER_LIST", string.Join(",", leader.Log));
         Hex.True(string.Join(",", joiner.Log) == "def:S_PARTY_MEMBER_LIST", string.Join(",", joiner.Log));
-        Hex.True(r2.WorldSent == 1 && h.WorldLog.Count == 1 && h.WorldLog[0].Op == PartyPackets.AS_DO_CREATE_PARTY,
-            $"World gets the whole member list as AS_DO_CREATE_PARTY (0x139E): {r2}");
+        Hex.True(r2.WorldSent == 5 && h.WorldLog.Count == 5 && h.WorldLog[0].Op == PartyPackets.AS_DO_CREATE_PARTY
+                 && h.WorldLog[1].Op == PartyPackets.AS_CHANGE_EVENT_MATCHING_STATE
+                 && h.WorldLog[3].Op == PartyPackets.AS_REQUEST_REFRESH_PARTY_INFO,
+            $"World gets the member list plus the T64 per-member pushes: {r2}");
         Hex.True(!r2.RejectionSent, "a World frame has no originating client to reject to");
 
         // ---- leave: the joiner presses the button, World answers with SA_LEAVE_PARTY ----
@@ -16129,9 +16138,9 @@ some prose with `backticks` that is not a table row
             "and the invitee is in the same party");
         Hex.True(string.Join(",", inviter.Log) == "def:S_PARTY_MEMBER_LIST", string.Join(",", inviter.Log));
         Hex.True(string.Join(",", invitee.Log) == "def:S_PARTY_MEMBER_LIST", string.Join(",", invitee.Log));
-        Hex.True(r.WorldSent == 1 && h.WorldLog.Count == 1
+        Hex.True(r.WorldSent == 5 && h.WorldLog.Count == 5
                  && h.WorldLog[0].Op == PartyPackets.AS_DO_CREATE_PARTY,
-            $"and World gets the member list back as AS_DO_CREATE_PARTY: {r}");
+            $"and World gets the member list back as AS_DO_CREATE_PARTY plus the T64 pushes: {r}");
 
         ContractBroker.Reset();
     }
@@ -16235,6 +16244,512 @@ some prose with `backticks` that is not a table row
             "the table is capped - it is fed straight off the World link");
         ContractBroker.Reset();
         Hex.True(ContractBroker.NextContractIndex() == 1, "Reset restarts the counter for the next test");
+    }
+
+
+    // ======================================================================
+    // T64 - the party and social families, byte-exact against a real-Arbiter
+    // capture at last.
+    //
+    // D:\packetlogs\cap_social.log is a two-player tap of the REAL
+    // ArbiterServer: "Test" (playerId 2) invites "two" (playerId 1002) to a
+    // party through the contract broker, they loot, swap manager, become
+    // friends, block and unblock. Every literal below is the payload of a
+    // frame in that log, quoted by its sequence number, with the 6-byte
+    // [u32 len][u16 opcode] header stripped - which is exactly what our
+    // builders return and our parsers take.
+    //
+    // These replace the golden tests that were derived from the decompiled
+    // writers alone. Where the two disagreed, the capture won and the code
+    // changed; each of those is called out at its test.
+    // ======================================================================
+
+    /// <summary>cap_social.log payload: fetch</summary>
+    const string Cap_fetch =
+            "22 00 00 00 0A 00 00 00 2C 00 00 00 00 00 00 00 " +
+            "02 00 00 00 04 00 00 00 01 00 00 00 74 00 77 00 " +
+            "6F 00 00 00 00 00 ";
+
+    /// <summary>cap_social.log payload: ask</summary>
+    const string Cap_ask =
+            "22 00 00 00 2C 00 00 00 01 00 00 00 02 00 00 00 " +
+            "04 00 00 00 01 00 00 00 EA 03 00 00 54 00 65 00 " +
+            "73 00 74 00 00 00 74 00 77 00 6F 00 00 00 ";
+
+    /// <summary>cap_social.log payload: askans</summary>
+    const string Cap_askans =
+            "01 00 00 00 02 00 00 00 04 00 00 00 01 00 00 00 " +
+            "EA 03 00 00 01 ";
+
+    /// <summary>cap_social.log payload: verdict</summary>
+    const string Cap_verdict =
+            "22 00 00 00 04 00 00 00 02 00 00 00 04 00 00 00 " +
+            "01 00 00 00 01 00 00 00 00 00 00 00 EA 03 00 00 ";
+
+    /// <summary>cap_social.log payload: begin</summary>
+    const string Cap_begin =
+            "26 00 00 00 0A 00 00 00 30 00 00 00 04 00 00 00 " +
+            "02 00 00 00 04 00 00 00 01 00 00 00 01 00 00 00 " +
+            "74 00 77 00 6F 00 00 00 00 00 EA 03 00 00 ";
+
+    /// <summary>cap_social.log payload: sendend</summary>
+    const string Cap_sendend =
+            "02 00 00 00 04 00 00 00 01 00 00 00 EA 03 00 00 ";
+
+    /// <summary>cap_social.log payload: reply</summary>
+    const string Cap_reply =
+            "02 00 00 00 EA 03 00 00 04 00 00 00 01 00 00 00 " +
+            "01 00 00 00 ";
+
+    /// <summary>cap_social.log payload: join</summary>
+    const string Cap_join =
+            "0F 00 00 00 19 00 00 00 00 54 00 65 00 73 00 74 " +
+            "00 00 00 74 00 77 00 6F 00 00 00 ";
+
+    /// <summary>cap_social.log payload: create</summary>
+    const string Cap_create =
+            "38 00 00 00 40 01 00 00 01 00 00 00 14 00 F0 0A " +
+            "F0 0A 00 00 F0 0A 00 00 02 00 00 00 05 00 00 00 " +
+            "FF FF FF FF 00 FF FF FF FF 00 00 00 00 00 00 00 " +
+            "00 00 F0 0A 00 00 02 00 00 00 02 00 F0 0A 00 80 " +
+            "00 00 03 00 00 00 0C 00 00 00 04 00 00 00 01 00 " +
+            "00 00 FF FF FF FF 54 00 65 00 73 00 74 00 00 00 " +
+            "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 " +
+            "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 " +
+            "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 " +
+            "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 " +
+            "00 01 01 00 34 00 00 00 00 00 00 00 00 00 00 00 " +
+            "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 " +
+            "00 00 00 00 09 00 30 00 09 00 00 00 00 00 00 00 " +
+            "00 00 F0 0A 00 00 EA 03 00 00 01 00 F0 0A 00 80 " +
+            "00 00 01 00 00 00 00 00 00 00 00 00 00 00 01 00 " +
+            "00 00 FF FF FF FF 74 00 77 00 6F 00 00 00 00 00 " +
+            "00 00 10 FA 4F 0D F8 00 00 00 30 E9 54 34 F6 7F " +
+            "00 00 00 00 4C 69 AC 02 00 00 05 00 00 00 F8 00 " +
+            "00 00 00 00 77 00 6F 00 00 00 00 00 D7 33 F6 7F " +
+            "00 00 00 00 00 00 00 00 00 00 07 00 00 00 00 00 " +
+            "00 01 01 00 32 00 00 00 00 00 00 00 00 00 00 00 " +
+            "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 " +
+            "00 00 00 00 3A 00 35 00 32 00 00 00 00 00 00 00 " +
+            "00 00 ";
+
+    /// <summary>cap_social.log payload: group</summary>
+    const string Cap_group =
+            "22 00 00 00 3B 00 00 00 01 00 00 00 01 00 00 00 " +
+            "14 00 F0 0A F0 0A 00 00 02 00 00 00 3B 00 B0 AC " +
+            "F0 0A 00 00 02 00 00 00 80 08 00 00 00 00 00 00 " +
+            "1C 05 00 00 88 08 00 00 00 00 00 00 1C 05 00 00 " +
+            "03 00 00 00 00 00 01 78 00 00 00 00 00 00 00 00 " +
+            "00 00 00 00 00 00 00 ";
+
+    /// <summary>cap_social.log payload: match</summary>
+    const string Cap_match =
+            "02 00 00 00 00 ";
+
+    /// <summary>cap_social.log payload: refresh</summary>
+    const string Cap_refresh =
+            "02 00 00 00 ";
+
+    /// <summary>cap_social.log payload: loot</summary>
+    const string Cap_loot =
+            "F0 0A 00 00 02 00 00 00 00 00 00 00 01 00 00 00 " +
+            "00 00 00 00 00 01 01 00 00 00 00 02 00 00 00 ";
+
+    /// <summary>cap_social.log payload: salooting</summary>
+    const string Cap_salooting =
+            "F0 0A 00 00 F0 0A 00 00 02 00 00 00 00 00 00 00 " +
+            "01 00 00 00 00 00 00 00 00 01 01 00 00 00 00 ";
+
+    /// <summary>cap_social.log payload: dolooting</summary>
+    const string Cap_dolooting =
+            "01 00 00 00 14 00 F0 0A 00 00 00 00 01 00 00 00 " +
+            "00 00 00 00 00 01 01 00 00 00 00 ";
+
+    /// <summary>cap_social.log payload: samanager</summary>
+    const string Cap_samanager =
+            "F0 0A 00 00 F0 0A 00 00 02 00 00 00 F0 0A 00 00 " +
+            "EA 03 00 00 ";
+
+    /// <summary>cap_social.log payload: domanager</summary>
+    const string Cap_domanager =
+            "01 00 00 00 14 00 F0 0A F0 0A 00 00 EA 03 00 00 ";
+
+    /// <summary>cap_social.log payload: friend0</summary>
+    const string Cap_friend0 =
+            "02 00 00 00 00 00 00 00 ";
+
+    /// <summary>cap_social.log payload: friend1</summary>
+    const string Cap_friend1 =
+            "EA 03 00 00 01 00 00 00 ";
+
+    /// <summary>cap_social.log payload: block</summary>
+    const string Cap_block =
+            "EA 03 00 00 02 00 00 00 ";
+
+    /// <summary>cap_social.log payload: unblock</summary>
+    const string Cap_unblock =
+            "EA 03 00 00 02 00 00 00 ";
+
+    /// <summary>cap_social.log payload: dungeonlist</summary>
+    const string Cap_dungeonlist =
+            "00 00 00 00 00 00 00 00 EA 03 00 00 ";
+
+    /// <summary>cap_social.log payload: bglist</summary>
+    const string Cap_bglist =
+            "00 00 00 00 00 00 00 00 EA 03 00 00 ";
+
+    /// <summary>cap_social.log payload: premium</summary>
+    const string Cap_premium =
+            "22 00 00 00 04 00 00 00 97 00 00 00 20 40 2D 4A " +
+            "AC 02 00 00 EA 03 00 00 00 00 00 00 E8 03 00 00 ";
+
+    /// <summary>cap_social.log payload: premiumack</summary>
+    const string Cap_premiumack =
+            "97 00 00 00 01 ";
+
+    // ---- the contract lifecycle -------------------------------------------------------
+
+    /// <summary>
+    /// seq 650. The one guess CONTRACT-DESIGN.md carried - where a party contract names its
+    /// target - is settled: the name is in <c>Param</c> and <c>FetchDataList</c> is EMPTY.
+    /// Before T64 ReadTargetHint tried the db-id list first, so any non-empty FetchDataList
+    /// would have shadowed the name the real Arbiter actually uses.
+    /// </summary>
+    [Test] public static void T64_the_captured_fetch_names_its_target_in_Param()
+    {
+        var p = Hex.B(Cap_fetch);
+        Hex.True(p.Length == 44 - 6, $"0x2809 is a 44-byte frame, got {p.Length + 6}");
+
+        var r = ContractBroker.ParseFetch(p);
+        Hex.True(r != null, "it parses");
+        var f = r!.Value;
+        Hex.True(f.ContractorDbId == 2, $"+16 ContractorDbId = 2 (Test), got {f.ContractorDbId}");
+        Hex.True(f.ContractType == ContractBroker.TypePartyInvite, $"+1A ContractType, got {f.ContractType}");
+        Hex.True(f.ContractId == 1, $"+1E ContractId, got {f.ContractId}");
+
+        // The two variable blocks, as the frame actually lays them out.
+        Hex.True(BitConverter.ToUInt32(p, 0) == 34 && BitConverter.ToUInt32(p, 4) == 10,
+            "Param is a 10-byte block at frame 34");
+        Hex.True(BitConverter.ToUInt32(p, 8) == 44 && BitConverter.ToUInt32(p, 12) == 0,
+            "FetchDataList is EMPTY, written as offset = frame length, count 0");
+        Hex.Eq(f.Param, "74 00 77 00 6F 00 00 00 00 00",
+            "Param is the null-terminated UTF-16LE name plus two bytes of padding");
+        Hex.True(f.FetchDataList.Length == 0, "and FetchDataList really is empty");
+
+        var hint = ContractBroker.ReadTargetHint(f);
+        Hex.True(hint.Name == "two", $"the target is named, not numbered: '{hint.Name}'");
+        Hex.True(hint.DbIds.Count == 0, "and there is no db id to prefer over it");
+    }
+
+    /// <summary>
+    /// seq 652 and 655, byte for byte. Both come out of the builders unchanged, which is the
+    /// whole point of a capture: the writer-derived layouts in CONTRACT-DESIGN.md section 3
+    /// were right, including the wstr refs that are offset-only and the empty-list convention
+    /// (offset = frame length) that 0x2809 uses in the other direction.
+    /// </summary>
+    [Test] public static void T64_the_contract_replies_are_byte_exact()
+    {
+        // 0x280B, one per opponent: contractor name first, then the opponent's.
+        Hex.Eq(ContractBroker.BuildDbsAsk(
+                   contractIndex: 1, contractorDbId: 2, contractType: ContractBroker.TypePartyInvite,
+                   contractId: 1, opponentDbId: 1002, contractorName: "Test", opponentName: "two"),
+               Hex.B(Cap_ask), "0x280B DBS_ASK, cap_social.log seq 652");
+
+        // 0x280A, the verdict, with a one-entry AskList.
+        Hex.Eq(ContractBroker.BuildDbsFetch(
+                   contractorDbId: 2, contractType: ContractBroker.TypePartyInvite, contractId: 1,
+                   contractIndex: 1, errorNo: ContractBroker.ErrorNone, askList: new[] { 1002 }),
+               Hex.B(Cap_verdict), "0x280A DBS_FETCH, cap_social.log seq 655");
+
+        // 0x280F and 0x2810, both sent when the client accepted (seq 744).
+        Hex.Eq(ContractBroker.BuildDbsSendEnd(2, ContractBroker.TypePartyInvite, 1, 1002),
+               Hex.B(Cap_sendend), "0x280F DBS_SEND_END, seq 744");
+        Hex.Eq(ContractBroker.BuildDbsReply(2, 1002, ContractBroker.TypePartyInvite, 1, 1),
+               Hex.B(Cap_reply), "0x2810 DBS_REPLY, seq 744");
+    }
+
+    /// <summary>seq 653 and 656 - the two W-&gt;A frames in the middle of the handshake.</summary>
+    [Test] public static void T64_the_contract_requests_parse_the_captured_frames()
+    {
+        var ask = ContractBroker.ParseAsk(Hex.B(Cap_askans));
+        Hex.True(ask != null, "0x280C parses");
+        var k = ask!.Value;
+        Hex.True(k.ContractIndex == 1 && k.ContractorDbId == 2 && k.ContractType == 4
+                 && k.ContractId == 1 && k.OpponentDbId == 1002 && k.CanContract,
+            $"0x280C seq 653: index 1, Test(2) -> two(1002), CanContract, got {k}");
+
+        var beg = ContractBroker.ParseSendBegin(Hex.B(Cap_begin));
+        Hex.True(beg != null, "0x280D parses");
+        var b = beg!.Value;
+        Hex.True(b.ContractorDbId == 2 && b.ContractType == 4 && b.ContractId == 1
+                 && b.ContractIndex == 1, $"0x280D seq 656 fixed fields, got {b}");
+        Hex.Eq(b.Param, "74 00 77 00 6F 00 00 00 00 00",
+            "SDB_SEND_BEGIN carries the SAME Param the 0x2809 did");
+        Hex.Eq(b.AskUserList, "EA 03 00 00", "and an AskUserList of exactly one db id");
+        Hex.True(ContractBroker.ReadIdList(b.AskUserList).Count == 1
+                 && ContractBroker.ReadIdList(b.AskUserList)[0] == 1002, "which is two");
+    }
+
+    /// <summary>
+    /// The ORDER, which no decompile reading had given us: 0x2809 (650) -&gt; 0x280B (652)
+    /// -&gt; 0x280C (653) -&gt; 0x280A (655). The opponent's World is asked first and the
+    /// initiator's World hears nothing until that answer is in. Before T64 we sent 0x280A
+    /// immediately with ErrorNo 0 and then ignored a CanContract = 0 that arrived after it.
+    /// </summary>
+    [Test] public static void T64_the_broker_asks_before_it_answers()
+    {
+        int fetchAt = -1, askAt = -1, i = 0;
+        foreach (var r in T64ContractSequence())
+        {
+            if (r == ContractBroker.DBS_FETCH_THROUGH_ARBITER_CONTRACT && fetchAt < 0) fetchAt = i;
+            if (r == ContractBroker.DBS_ASK_THROUGH_ARBITER_CONTRACT && askAt < 0) askAt = i;
+            i++;
+        }
+        Hex.True(askAt >= 0 && fetchAt >= 0, "the capture holds both replies");
+        Hex.True(askAt < fetchAt, $"0x280B comes first: ask at {askAt}, fetch at {fetchAt}");
+    }
+
+    /// <summary>The A-&gt;W contract opcodes in the order cap_social.log has them.</summary>
+    static ushort[] T64ContractSequence() => new ushort[]
+    {
+        ContractBroker.DBS_ASK_THROUGH_ARBITER_CONTRACT,      // seq 652
+        ContractBroker.DBS_FETCH_THROUGH_ARBITER_CONTRACT,    // seq 655
+        ContractBroker.DBS_SEND_END_THROUGH_ARBITER_CONTRACT, // seq 744
+        ContractBroker.DBS_REPLY_THROUGH_ARBITER_CONTRACT,    // seq 744
+    };
+
+    // ---- the party frames -------------------------------------------------------------
+
+    /// <summary>
+    /// seq 748, and the bug it found. <c>AS_DO_CREATE_PARTY</c>'s slot at +0x0A is a BYTE
+    /// LENGTH, not an element count: the captured two-member frame puts 0x140 = 2 x 0xA0
+    /// there, and <c>Handler_AS_DO_CREATE_PARTY</c> (WorldServer.exe.c:2984602) reads it as
+    /// <c>(n - 1) / 0xa0 + 1</c>. We wrote the element count, so World turned a two-member
+    /// party into a one-member party and never mirrored the second member.
+    ///
+    /// <para>The comparison is masked over the parts of each 0xA0 record that the real
+    /// Arbiter leaks rather than writes - the name buffer past its terminator is uninitialised
+    /// heap, with stack pointers and fragments of its own log timestamps in it (the same thing
+    /// INVENTORY-DESIGN.md section 2 documents for the 536-byte item record).</para>
+    /// </summary>
+    [Test] public static void T64_AS_DO_CREATE_PARTY_is_byte_exact_where_the_bytes_are_ours()
+    {
+        var cap = Hex.B(Cap_create);
+        Hex.True(cap.Length == 376 - 6, $"the captured frame is 376 bytes, got {cap.Length + 6}");
+
+        var members = new List<PartyPackets.PartyMember>
+        {
+            new(2800, 2,    0x0000_8000_0AF0_0002UL, 3, 12, 4, 1, -1, "Test", false, true, true, 0, 0),
+            new(2800, 1002, 0x0000_8000_0AF0_0001UL, 1,  0, 0, 1, -1, "two",  false, true, true, 0, 0),
+        };
+        var ours = PartyPackets.BuildDoCreateParty(
+            partyId: 0x0AF0_0014_0000_0001L, ownerPlanetId: 2800, managerPlanetId: 2800,
+            managerDbId: 2, maxMemberCount: 5, partyType: -1, dungeonClearCompensation: false,
+            dungeonId: -1, raid: false, teamIndex: 0, battleFieldId: 0, members: members);
+
+        Hex.True(ours.Length == cap.Length, $"same length: ours {ours.Length}, capture {cap.Length}");
+
+        // The 0x38-byte fixed part, byte for byte - this is the half that was wrong.
+        const int fixedPayload = 0x38 - 6;
+        Hex.Eq(ours[..fixedPayload], cap[..fixedPayload], "0x139E fixed part, cap_social.log seq 748");
+        Hex.True(BitConverter.ToUInt32(cap, 4) == 2 * PartyPackets.MemberBasicInfoSize,
+            "+0A really is count * 0xA0 and not 2");
+
+        // Each record, over the windows the Arbiter actually fills.
+        for (int m = 0; m < 2; m++)
+        {
+            int at = fixedPayload + m * PartyPackets.MemberBasicInfoSize;
+            Hex.Eq(ours[at..(at + 0x24)], cap[at..(at + 0x24)],
+                $"record {m}: PlanetId, UserDbId, GameId, Level, Class, Race, Gender, Role");
+            int nameEnd = at + PartyPackets.MemberNameOffset;
+            while (BitConverter.ToUInt16(cap, nameEnd) != 0) nameEnd += 2;
+            nameEnd += 2;
+            Hex.Eq(ours[(at + PartyPackets.MemberNameOffset)..nameEnd],
+                   cap[(at + PartyPackets.MemberNameOffset)..nameEnd], $"record {m}: the name");
+            Hex.Eq(ours[(at + 0x6E)..(at + 0x71)], cap[(at + 0x6E)..(at + 0x71)],
+                $"record {m}: CanInvite, Alive, Online");
+            Hex.Eq(ours[(at + 0x74)..(at + 0x7C)], cap[(at + 0x74)..(at + 0x7C)],
+                $"record {m}: AchievementGrade, UserAwakenGrade");
+        }
+
+        // And the field that proves the gameId is NOT derived from the db id: member 1002's
+        // gameId ends 0001 and member 2's ends 0002 - they are per-login sequence numbers,
+        // which is the open item CLAUDE.md lists against Program.cs.
+        var second = PartyPackets.ParseMemberBasicInfo(cap, fixedPayload + PartyPackets.MemberBasicInfoSize);
+        Hex.True(second != null && second.Value.UserDbId == 1002
+                 && (second.Value.GameId & 0xFFFF) == 0x0001,
+            "member 1002 carries gameId ...0001 - a login sequence, not the db id");
+    }
+
+    /// <summary>
+    /// seq 1305, 1248 and the two W-&gt;A frames that caused them. All four match the layouts
+    /// PARTY-DESIGN.md already had, including the 19-byte loot block whose
+    /// BoundOnLootItemDistributionMethod the .def forgets.
+    /// </summary>
+    [Test] public static void T64_the_party_command_frames_are_byte_exact()
+    {
+        Hex.Eq(PartyPackets.BuildDoSetPartyManager(0x0AF0_0014_0000_0001L, 2800, 1002),
+               Hex.B(Cap_domanager), "0x13A4 AS_DO_SET_PARTY_MANAGER, seq 1305");
+
+        var loot = new PartyPackets.LootSettings(
+            Method: 0, RareGradeForDicing: 1, RareItemDistributionMethod: 0,
+            EquipmentForDicing: false, FindClassForDicing: true,
+            BoundOnLootItemDistributionMethod: 1, ForbidLootingInBattle: false);
+        Hex.Eq(PartyPackets.BuildDoSetLootingMethod(0x0AF0_0014_0000_0001L, loot),
+               Hex.B(Cap_dolooting), "0x13A6 AS_DO_SET_LOOTING_METHOD, seq 1248");
+
+        var m = PartyPackets.ParseSaChangeManager(Hex.B(Cap_samanager));
+        Hex.True(m != null && m.Value.OwnerPlanetId == 2800 && m.Value.MemberPlanetId == 2800
+                 && m.Value.MemberDbId == 2 && m.Value.NewManagerPlanetId == 2800
+                 && m.Value.NewManagerDbId == 1002,
+            $"0x139B seq 1304: Test(2) hands the party to two(1002), got {m}");
+
+        var l = PartyPackets.ParseSaChangeLooting(Hex.B(Cap_salooting));
+        Hex.True(l != null, "0x139D parses");
+        Hex.True(l!.Value.Loot == loot,
+            $"0x139D seq 1245 carries the same settings the 0x13A6 echoed: {l.Value.Loot}");
+    }
+
+    /// <summary>
+    /// seq 750. SA_BYPASS_TO_GROUP's five fields, from a frame whose payload is a real
+    /// S_PARTY_MEMBER_STAT_UPDATE. The GroupId is the PartyId of the party created at seq 748,
+    /// which is what makes this frame routable at all.
+    /// </summary>
+    [Test] public static void T64_SA_BYPASS_TO_GROUP_is_the_captured_shape()
+    {
+        var g = PartyPackets.ParseSaBypassToGroup(Hex.B(Cap_group));
+        Hex.True(g != null, "0x13F8 parses");
+        var v = g!.Value;
+        Hex.True(v.GroupId == 0x0AF0_0014_0000_0001L, $"+12 GroupId is the PartyId, got 0x{v.GroupId:X}");
+        Hex.True(v.ObjectPlanetId == 2800 && v.ObjectId == 2, $"+1A/+1E the sender, got {v.ObjectPlanetId}/{v.ObjectId}");
+        Hex.True(v.GroupType == 1, $"+0E GroupType, got {v.GroupType}");
+        Hex.True(v.Packet.Length == 0x3B, $"the tunnelled packet is 0x3B bytes, got 0x{v.Packet.Length:X}");
+        Hex.True(BitConverter.ToUInt16(v.Packet, 0) == 0x3B
+                 && BitConverter.ToUInt16(v.Packet, 2) == 0xACB0,
+            "and it is a whole client packet: [u16 len][u16 S_PARTY_MEMBER_STAT_UPDATE]");
+    }
+
+    /// <summary>
+    /// seq 751-753: what the real Arbiter sends immediately after AS_DO_CREATE_PARTY. Neither
+    /// opcode existed in TeraSharp before T64, so World was never told to refresh its party UI
+    /// and never told the members had left solo matching.
+    /// </summary>
+    [Test] public static void T64_a_new_party_pushes_matching_state_and_a_refresh()
+    {
+        Hex.Eq(PartyPackets.BuildAsChangeEventMatchingState(2, isMatching: false),
+               Hex.B(Cap_match), "0x15CD AS_CHANGE_EVENT_MATCHING_STATE, seq 751");
+        Hex.Eq(PartyPackets.BuildAsRequestRefreshPartyInfo(2),
+               Hex.B(Cap_refresh), "0x13AD AS_REQUEST_REFRESH_PARTY_INFO, seq 753");
+        Hex.True(PartyPackets.MinFrameLengthArbiterPush(PartyPackets.AS_CHANGE_EVENT_MATCHING_STATE) == 0x0B
+                 && PartyPackets.MinFrameLengthArbiterPush(PartyPackets.AS_REQUEST_REFRESH_PARTY_INFO) == 0x0A,
+            "frame minimums from the dumper guards");
+    }
+
+    /// <summary>
+    /// seq 1699 / 1723. The same 12-byte payload twice, and the detail worth pinning: the empty
+    /// list is written with offset ZERO, not with offset = frame length. Both conventions exist
+    /// in this protocol - 0x2809's empty FetchDataList uses the other one - so neither can be
+    /// assumed.
+    /// </summary>
+    [Test] public static void T64_the_party_match_list_pushes_write_an_empty_list_as_offset_zero()
+    {
+        Hex.Eq(PartyPackets.BuildAsViewInterPartyMatchList(1002), Hex.B(Cap_dungeonlist),
+            "0x1644 AS_VIEW_INTER_PARTY_MATCH_DUNGEON_LIST_EXTENDED, seq 1699");
+        Hex.Eq(PartyPackets.BuildAsViewInterPartyMatchList(1002), Hex.B(Cap_bglist),
+            "0x1645 AS_VIEW_INTER_PARTY_MATCH_BATTLEFIELD_LIST_EXTENDED, seq 1723 - same shape");
+        var p = Hex.B(Cap_dungeonlist);
+        Hex.True(BitConverter.ToUInt32(p, 0) == 0 && BitConverter.ToUInt32(p, 4) == 0,
+            "the empty list is offset 0 / count 0, NOT offset = frame length");
+    }
+
+    // ---- the social frames ------------------------------------------------------------
+
+    /// <summary>
+    /// seq 1959/1960 and 1985/1986, and the two block frames at 2087/2109. All four opcodes are
+    /// the same eight-byte pair, and all four were stubs or TODOs before T64.
+    /// </summary>
+    [Test] public static void T64_the_friend_and_block_pushes_are_byte_exact()
+    {
+        Hex.Eq(SocialHandlers.BuildAsUserPair(2, 0), Hex.B(Cap_friend0),
+            "0x2862 AS_ADD_TO_FRIEND_LIST at the request, seq 1959");
+        Hex.Eq(SocialHandlers.BuildAsUserPair(1002, 1), Hex.B(Cap_friend1),
+            "0x2862 after the accept, seq 1985 - the count is mutual friends, not pending rows");
+        Hex.Eq(SocialHandlers.BuildAsUserPair(1002, 2), Hex.B(Cap_block),
+            "0x1475 AS_ADD_BLOCKED_USER, seq 2087: (blocker, blocked)");
+        Hex.Eq(SocialHandlers.BuildAsUserPair(1002, 2), Hex.B(Cap_unblock),
+            "0x1476 AS_REMOVE_BLOCKED_USER, seq 2109: the same pair, same order");
+        Hex.True(SocialHandlers.AS_ADD_TO_FRIEND_LIST == 0x2862
+                 && SocialHandlers.AS_ADD_BLOCKED_USER == 0x1475
+                 && SocialHandlers.AS_REMOVE_BLOCKED_USER == 0x1476, "the three opcodes");
+    }
+
+    /// <summary>
+    /// seq 634 -&gt; 635. SDB_UPDATE_LEFT_COOLTIME_PREMIUM_SLOT carries a DlmId at +0x0E and the
+    /// real Arbiter answers it in under a millisecond. Nothing in TeraSharp answered it before
+    /// T64: it was not in the allow-list, so it fell through to the replay table, which only
+    /// answers it if the configured tap happens to contain the pair - and a per-user request
+    /// that goes unanswered head-blocks that user's whole DB queue (HANDOFF.md section 1).
+    /// </summary>
+    [Test] public static void T64_the_premium_slot_cooltime_write_is_answered()
+    {
+        var req = Hex.B(Cap_premium);
+        Hex.True(req.Length == 38 - 6, $"the captured request is 38 bytes, got {req.Length + 6}");
+        Hex.True(BitConverter.ToUInt32(req, 8) == 0x97, "+0E DlmId = 0x97");
+        Hex.True(BitConverter.ToInt64(req, 20) == 1002, "+1A OwnerDbId is an i64 = 1002");
+
+        Hex.Eq(DbProxyHandlers.BuildReqIdAck(req, 8), Hex.B(Cap_premiumack),
+            "0x28C2 DBS_UPDATE_LEFT_COOLTIME_PREMIUM_SLOT, cap_social.log seq 635");
+        Hex.True(DbProxyHandlers.IsHandledRequest(DbProxyHandlers.SDB_UPDATE_LEFT_COOLTIME_PREMIUM_SLOT),
+            "and 0x28C1 is allow-listed, so it never reaches the replay table");
+    }
+
+    /// <summary>
+    /// seq 747. SA_JOIN_PARTY_IN_ARBITER carries the two names and nothing else - no db ids -
+    /// which is why the contract that precedes it has to have resolved them already.
+    /// </summary>
+    [Test] public static void T64_SA_JOIN_PARTY_IN_ARBITER_carries_two_names()
+    {
+        var p = Hex.B(Cap_join);
+        Hex.True(p.Length == 33 - 6, $"the captured frame is 33 bytes, got {p.Length + 6}");
+        Hex.True(PartyPackets.MinFrameLength(PartyPackets.SA_JOIN_PARTY_IN_ARBITER) == 0x0F,
+            "frame minimum 0x0F, from the dumper guard 0xe");
+        Hex.True(BitConverter.ToUInt32(p, 0) == 0x0F, "+06 MemberName offset, frame-relative 0x0F");
+        Hex.True(BitConverter.ToUInt32(p, 4) == 0x19, "+0A InviteeName offset");
+        Hex.True(p[8] == 0, "+0E Raid = 0");
+        Hex.True(ContractBroker.ReadWString(p, 0x0F - 6) == "Test", "MemberName is the inviter");
+        Hex.True(ContractBroker.ReadWString(p, 0x19 - 6) == "two", "InviteeName is the target");
+    }
+
+    /// <summary>
+    /// The six reply shapes CLIENT-REJECTS.md has been waiting on are STILL unanswered after T64,
+    /// and this test says so out loud rather than leaving it to a doc line.
+    ///
+    /// <para>cap_social.log / cap_social_client.log do not contain them. None of the six
+    /// <c>S_</c> opcodes is in the client tap, and neither are the three <c>C_</c> opcodes that
+    /// would have asked for them - the two players never opened those windows. So the
+    /// accept-silently handlers are correct as they stand; a reply invented from the .def alone
+    /// is the guess that desynced World before (HANDOFF.md section 1).</para>
+    /// </summary>
+    [Test] public static void T64_the_six_silent_windows_are_still_unanswered()
+    {
+        // The three requests the Arbiter owns and answers with nothing, still in the accept-list.
+        foreach (ushort op in new[]
+                 {
+                     ArbiterClientHandlers.C_DUNGEON_COOL_TIME_LIST,      // -> S_DUNGEON_COOL_TIME_LIST 0xD768
+                     ArbiterClientHandlers.C_REQUEST_GUILD_LIST,          // -> S_REPLY_GUILD_LIST       0x5F75
+                     ArbiterClientHandlers.C_REQUEST_PARTY_MATCH_INFO,    // -> S_SHOW_PARTY_MATCH_INFO  0xDF65
+                     ArbiterClientHandlers.C_REQUEST_MY_PARTY_MATCH_INFO, // -> S_MY_PARTY_MATCH_INFO    0xB5A3
+                     ArbiterClientHandlers.C_REQUEST_CANDIDATE_LIST,      // -> S_SHOW_CANDIDATE_LIST    0xF12D
+                     ArbiterClientHandlers.C_VIEW_BATTLE_FIELD_RESULT,    // -> S_VIEW_BATTLE_FIELD_RESULT 0xE459
+                 })
+            Hex.True(ArbiterClientHandlers.ArbiterOwned.Contains(op),
+                $"0x{op:X4} is still Arbiter-owned and answered with nothing - CLIENT-REJECTS.md, the six-shapes bullet");
+
+        // And the two pushes the same capture DID give us exist, so the next pass can tell the
+        // difference between "no evidence" and "evidence we have not used".
+        Hex.True(PartyPackets.AS_VIEW_INTER_PARTY_MATCH_DUNGEON_LIST_EXTENDED == 0x1644
+                 && PartyPackets.AS_VIEW_INTER_PARTY_MATCH_BATTLEFIELD_LIST_EXTENDED == 0x1645,
+            "0x1644 / 0x1645 are modelled - PARTY-DESIGN.md section 13.3");
     }
 
 }

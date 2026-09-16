@@ -29,6 +29,7 @@ back in the matching load.
 | 0x297B SDB_UPDATE_USER_ACTPOINT (22 B)            | 0x297C        | [u32 reqId][u8 ok]                            | 1     | real (master) |
 | 0x2910 SDB_UPDATE_FATIGABILITY_POINT (23 B)       | 0x2911        | [u8 ok][u32 reqId]                            | 2     | **real (T26)**, carries a DELTA added to the ACCOUNT total, served back by 0x2909 (const `SDB_FATIGABILITY_UPDATE`; the old `SDB_LOAD_FRIEND_INFO` name is a documented alias) |
 | 0x2924 SDB_UPDATE_PASSIVITY_COOLTIME              | 0x2925        | [u32 reqId][u8 ok]                            | logout| real |
+| 0x28C1 SDB_UPDATE_LEFT_COOLTIME_PREMIUM_SLOT      | 0x28C2        | [u32 DlmId][u8 ok]                            | play  | real |
 | 0x2936 SDB_CHECK_DAILY_ATTENDANCE                 | 0x2937        | [u32 reqId][u32 0x300][u32 0]                 | login+logout | real |
 | 0x2930 SDB_UPDATE_HOLD_CHARACTER_STATUS           | 0x2931        | [u32 reqId][u8 ok][u8 0]                      | spawn | real |
 | 0x27B3 SDB_UPDATE_DAILY_LIMIT_EP_EXP              | 0x27B4        | [u32 reqId][u8 ok]                            | spawn | real |

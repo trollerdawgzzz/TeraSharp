@@ -488,6 +488,21 @@ public sealed class PartyManager
                 party.MaxMembers, party.PartyType, dungeonClearCompensation: false, dungeonId: 0,
                 raid: party.Raid, teamIndex: 0, battleFieldId: 0,
                 members: party.Members().ToList()));
+
+            // T64, from cap_social.log seq 748 -> 751..753: the real Arbiter follows
+            // AS_DO_CREATE_PARTY with AS_CHANGE_EVENT_MATCHING_STATE(IsMatching = 0) and
+            // AS_REQUEST_REFRESH_PARTY_INFO, per member, in that order. Joining a party ends
+            // solo matching, and World will not refresh its party UI without the second one.
+            // (It sent three 0x15CD for the first member and two for the second - one per
+            // matching queue, we assume; we send one each, which is all the capture
+            // justifies for members we never put in a queue. PARTY-DESIGN.md section 13.)
+            foreach (var m in party.Members())
+                a.World(PartyPackets.AS_CHANGE_EVENT_MATCHING_STATE,
+                    PartyPackets.BuildAsChangeEventMatchingState(m.UserDbId, isMatching: false));
+            foreach (var m in party.Members())
+                a.World(PartyPackets.AS_REQUEST_REFRESH_PARTY_INFO,
+                    PartyPackets.BuildAsRequestRefreshPartyInfo(m.UserDbId));
+
             _log.LogInformation("Party 0x{Id:X} created: {A} + {B}", party.Id, inviter.Name, invitee.Name);
         }
         else

@@ -149,6 +149,9 @@ public static class ContractBroker
         public List<int> Opponents = new();
         /// <summary>Set by 0x280C. Null until the opponent's World has answered.</summary>
         public bool? CanContract;
+        /// <summary>T64: kept so 0x280A can be built when 0x280C arrives, not before.</summary>
+        public string ContractorName = string.Empty;
+        public string OpponentName = string.Empty;
     }
 
     private static readonly object Gate = new();
@@ -506,13 +509,19 @@ public static class ContractBroker
     /// <summary>
     /// The target of a party contract, read out of the request's two variable blocks.
     ///
-    /// <para><b>This is the one guess in the file.</b> ContractPartyFetchWork resolves the target
-    /// from a NAME (FUN_14082dc50 is a by-name user lookup) but no capture contains a decoded
-    /// 0x2809 - the two live frames were recorded as lengths, not bytes. So both plausible shapes
-    /// are tried: a u32 db id at the start of FetchDataList, which is how every other list in the
-    /// family is encoded, then a null-terminated UTF-16LE name in Param. A miss logs the raw
-    /// bytes. status/CAPTURE-PLAN.md A.2.1 is the step that settles it, and then one of these two
-    /// branches can be deleted.</para>
+    /// <para><b>T64 settled this from the wire.</b> cap_social.log seq 650 is a real 0x2809 for
+    /// a party invite, and it puts the target in <c>Param</c> as a name:
+    /// <c>[06] Param offset 34, [0A] Param count 10, [0E] FetchDataList offset 44,
+    /// [12] FetchDataList count 0</c>, with Param = <c>74 00 77 00 6F 00 00 00 00 00</c> - the
+    /// null-terminated UTF-16LE "two" plus two bytes of padding. <c>FetchDataList is empty</c>,
+    /// and it is empty the way this protocol writes an empty list at the end of a frame: offset
+    /// = frame length, count 0. That matches <c>ContractPartyFetchWork</c>, which resolves the
+    /// target through the by-name lookup <c>FUN_14082dc50</c>.
+    ///
+    /// <para>So the NAME is tried first and is the only route the capture supports. The db-id
+    /// list is kept as a fallback rather than deleted because <c>FetchDataList</c> is a real
+    /// field that some other contract type may well fill - but it can no longer shadow a name
+    /// that is present, which is what it did before T64.</para>
     /// </summary>
     public static GameSession? ResolveTarget(FetchRequest r, out string how)
     {
@@ -521,18 +530,18 @@ public static class ContractBroker
         if (bridge == null) return null;
         var hint = ReadTargetHint(r);
 
-        foreach (int id in hint.DbIds)
-        {
-            var s = bridge.SessionForPlayerId(id);
-            if (s != null) { how = $"FetchDataList db id {id}"; return s; }
-        }
-
         if (hint.Name.Length > 0)
         {
             foreach (var s in bridge.InWorldSessions())
                 if (string.Equals(s.SelectedCharacter?.Name, hint.Name, StringComparison.OrdinalIgnoreCase))
                 { how = $"Param name '{hint.Name}'"; return s; }
             how = $"Param name '{hint.Name}' (not in world)";
+        }
+
+        foreach (int id in hint.DbIds)
+        {
+            var s = bridge.SessionForPlayerId(id);
+            if (s != null) { how = $"FetchDataList db id {id}"; return s; }
         }
         return null;
     }
@@ -541,10 +550,10 @@ public static class ContractBroker
     public readonly record struct TargetHint(IReadOnlyList<int> DbIds, string Name);
 
     /// <summary>
-    /// The pure half of <see cref="ResolveTarget"/>: every positive db id in
-    /// <c>FetchDataList</c>, and the name <c>Param</c> decodes to. Split out so the guess can be
-    /// tested without a live WorldBridge, and so the capture that settles it
-    /// (status/CAPTURE-PLAN.md A.2.1) only has to change one method.
+    /// The pure half of <see cref="ResolveTarget"/>: the name <c>Param</c> decodes to, and every
+    /// positive db id in <c>FetchDataList</c>. Split out so it can be tested without a live
+    /// WorldBridge - <c>T64_the_captured_fetch_names_its_target_in_Param</c> runs it over the
+    /// real seq-650 bytes.
     /// </summary>
     public static TargetHint ReadTargetHint(FetchRequest r)
     {
@@ -609,22 +618,22 @@ public static class ContractBroker
         };
         Remember(contract);
 
-        // The initiator's World gets the verdict with the AskList...
-        bridge.SendFrame(DBS_FETCH_THROUGH_ARBITER_CONTRACT,
-            BuildDbsFetch(r.ContractorDbId, r.ContractType, r.ContractId, contract.Index,
-                          ErrorNone, contract.Opponents));
-
-        // ...and every opponent's World gets its own DBS_ASK. One World here, so these go down
-        // the same socket; World demultiplexes on the db ids in the frame, not on the socket.
+        // T64 - ORDER, from cap_social.log: 0x2809 (650) -> 0x280B (652) -> 0x280C (653) ->
+        // 0x280A (655). The opponent's World is asked FIRST and the initiator's World is told
+        // nothing until that answer is in. Before T64 we sent 0x280A immediately with
+        // ErrorNo 0, which told the initiator the contract was brokered before anybody had
+        // agreed to it - and then ignored a CanContract = 0 that arrived afterwards.
+        contract.ContractorName = initiator.SelectedCharacter.Name;
+        contract.OpponentName = target.SelectedCharacter.Name;
         foreach (int opponent in contract.Opponents)
             bridge.SendFrame(DBS_ASK_THROUGH_ARBITER_CONTRACT,
                 BuildDbsAsk(contract.Index, r.ContractorDbId, r.ContractType, r.ContractId, opponent,
-                            initiator.SelectedCharacter.Name, target.SelectedCharacter.Name));
+                            contract.ContractorName, contract.OpponentName));
 
         Log.LogInformation(
-            "Contract {Index}: {Type} from {A} to {B} brokered (contractId {Cid}, target via {How})",
-            contract.Index, DescribeType(r.ContractType), initiator.SelectedCharacter.Name,
-            target.SelectedCharacter.Name, r.ContractId, how);
+            "Contract {Index}: {Type} from {A} to {B} asked (contractId {Cid}, target via {How})",
+            contract.Index, DescribeType(r.ContractType), contract.ContractorName,
+            contract.OpponentName, r.ContractId, how);
     }
 
     /// <summary>
@@ -650,6 +659,24 @@ public static class ContractBroker
         c.CanContract = a.CanContract;
         Log.LogInformation("Contract {Index}: opponent {Who} CanContract = {Can}",
             a.ContractIndex, a.OpponentDbId, a.CanContract);
+
+        // T64: NOW the initiator's World gets its verdict - this is seq 655 in cap_social.log,
+        // 0.4 ms after the 0x280C at 653. A refusal keeps the empty-AskList form
+        // FetchWork::ResponseFailure writes (offset = frame length, count 0).
+        var bridge = Bridge;
+        if (bridge == null) return;
+        if (a.CanContract)
+        {
+            bridge.SendFrame(DBS_FETCH_THROUGH_ARBITER_CONTRACT,
+                BuildDbsFetch(c.ContractorDbId, c.ContractType, c.ContractId, c.Index,
+                              ErrorNone, c.Opponents));
+        }
+        else
+        {
+            bridge.SendFrame(DBS_FETCH_THROUGH_ARBITER_CONTRACT,
+                BuildDbsFetch(c.ContractorDbId, c.ContractType, c.ContractId, 0, ErrorTargetNotInWorld));
+            Forget(c.Index);
+        }
     }
 
     /// <summary>0x280D -&gt; the client packet S_BEGIN_THROUGH_ARBITER_CONTRACT, and nothing else.</summary>

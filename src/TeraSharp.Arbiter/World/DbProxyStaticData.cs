@@ -500,6 +500,14 @@ public static class PartyPackets
     public const ushort AS_DISMISS_PARTY = 0x13BA;
     public const ushort AS_PARTY_LOOTING_METHOD = 0x13BB;
     public const ushort AS_BAN_PARTY_MEMBER = 0x13BC;
+    /// <summary>T64. Sent per member right after AS_DO_CREATE_PARTY - cap_social.log seq 753.</summary>
+    public const ushort AS_REQUEST_REFRESH_PARTY_INFO = 0x13AD;
+    /// <summary>T64. Sent per member alongside it, with IsMatching = 0.</summary>
+    public const ushort AS_CHANGE_EVENT_MATCHING_STATE = 0x15CD;
+    /// <summary>T64. The dungeon half of the party-match window push - cap_social.log seq 1699.</summary>
+    public const ushort AS_VIEW_INTER_PARTY_MATCH_DUNGEON_LIST_EXTENDED = 0x1644;
+    /// <summary>T64. The battleground half - cap_social.log seq 1723.</summary>
+    public const ushort AS_VIEW_INTER_PARTY_MATCH_BATTLEFIELD_LIST_EXTENDED = 0x1645;
 
     // ---- World -> Arbiter ----
     public const ushort SA_JOIN_PARTY = 0x1395;
@@ -652,7 +660,15 @@ public static class PartyPackets
 
     /// <summary>
     /// AS_DO_CREATE_PARTY (0x139E). Fixed part 0x38 frame bytes, then N x 0xA0 member records.
-    ///   [06] u32 memberListOffset (frame-rel)   [0A] u32 memberListCount
+    ///   [06] u32 memberListOffset (frame-rel)   [0A] u32 memberListBYTES
+    ///
+    /// <para><b>T64: [0A] is a BYTE LENGTH, not an element count.</b> The 376-byte frame in
+    /// cap_social.log seq 748 carries two members and puts 0x140 = 320 = 2 x 0xA0 there, and
+    /// World reads it as a byte length: <c>Handler_AS_DO_CREATE_PARTY</c>
+    /// (WorldServer.exe.c:2984602) computes <c>(*(int *)(pkt + 10) - 1) / 0xa0 + 1</c>, the same
+    /// ceiling-divide <c>SDB_ITEM_SINGLE</c> does with 0x358. Before T64 we wrote the element
+    /// count, so World saw a two-member party as ONE member (2 -&gt; (2-1)/160+1 = 1) and the
+    /// second member was never in its mirror.</para>
     ///   [0E] i64 PartyId  [16] i32 OwnerPlanetId  [1A] i32 ManagerPlanetId  [1E] i32 ManagerDbId
     ///   [22] i32 MaxMemberCount  [26] i32 PartyType  [2A] u8 DungeonClearCompensation
     ///   [2B] i32 DungeonId  [2F] u8 Raid  [30] i32 TeamIndex  [34] i32 BattleFieldId
@@ -666,7 +682,7 @@ public static class PartyPackets
         const int fixedPayload = 0x38 - 6;                 // 0x32
         var p = new byte[fixedPayload + members.Count * MemberBasicInfoSize];
         BitConverter.GetBytes((uint)0x38).CopyTo(p, 0x00); // list offset, frame-relative
-        BitConverter.GetBytes((uint)members.Count).CopyTo(p, 0x04);
+        BitConverter.GetBytes((uint)(members.Count * MemberBasicInfoSize)).CopyTo(p, 0x04);
         BitConverter.GetBytes(partyId).CopyTo(p, 0x08);
         BitConverter.GetBytes(ownerPlanetId).CopyTo(p, 0x10);
         BitConverter.GetBytes(managerPlanetId).CopyTo(p, 0x14);
@@ -757,6 +773,64 @@ public static class PartyPackets
     /// <summary>AS_DO_SET_PARTY_MANAGER (0x13A4): [i64 PartyId][i32 PlanetId][i32 UserDbId].</summary>
     public static byte[] BuildDoSetPartyManager(long partyId, int planetId, int userDbId)
         => BuildDoRemovePartyMember(partyId, planetId, userDbId);   // identical shape
+
+    // ---------------------------------- T64: the four A->W pushes the capture added ----
+
+    /// <summary>
+    /// AS_REQUEST_REFRESH_PARTY_INFO (0x13AD): <c>i32 UserDbId@06</c>, frame 10. Dumper guard
+    /// <c>9 &lt; len</c> (Arb_part_011.c:19327). The real Arbiter sends exactly one per member
+    /// immediately after AS_DO_CREATE_PARTY - cap_social.log seq 753 carries UserDbId 2 then
+    /// 1002, the two members of the party created at seq 748.
+    /// </summary>
+    public static byte[] BuildAsRequestRefreshPartyInfo(int userDbId) => BitConverter.GetBytes(userDbId);
+
+    /// <summary>
+    /// AS_CHANGE_EVENT_MATCHING_STATE (0x15CD): <c>i32 UserDbId@06, u8 IsMatching@0A</c>,
+    /// frame 11. Dumper guard <c>10 &lt; len</c> (Arb_part_011.c:6886).
+    ///
+    /// <para>Joining a party takes you out of solo matching, which is why every one of these in
+    /// the capture carries IsMatching = 0. The real Arbiter sent <b>three</b> for member 2 and
+    /// <b>two</b> for member 1002 (seq 751-753) - one per matching queue the member was in, we
+    /// assume, since nothing else distinguishes them. We send one per member, which is the only
+    /// count the capture justifies for a member we never registered in a queue.</para>
+    /// </summary>
+    public static byte[] BuildAsChangeEventMatchingState(int userDbId, bool isMatching)
+    {
+        var p = new byte[5];
+        BitConverter.GetBytes(userDbId).CopyTo(p, 0);
+        p[4] = (byte)(isMatching ? 1 : 0);
+        return p;
+    }
+
+    /// <summary>
+    /// AS_VIEW_INTER_PARTY_MATCH_DUNGEON_LIST_EXTENDED (0x1644) and
+    /// AS_VIEW_INTER_PARTY_MATCH_BATTLEFIELD_LIST_EXTENDED (0x1645) are one shape:
+    /// <c>u32 listOffset@06, u32 listBytes@0A, i32 UserDbId@0E</c>, frame 0x12. The dumpers
+    /// (Arb_part_012.c:8657 / :8529) name only UserDbId, at +0x0E, with guard
+    /// <c>0x11 &lt; len</c>.
+    ///
+    /// <para>Both captured frames carry an <b>empty list with offset 0</b>, not offset = frame
+    /// length. That is the opposite of the <c>FetchWork::ResponseFailure</c> convention
+    /// (CONTRACT-DESIGN.md section 3.2) and is pinned by a test, because the two conventions
+    /// coexist in this protocol and guessing wrong is a silent read of the wrong bytes.</para>
+    /// </summary>
+    public static byte[] BuildAsViewInterPartyMatchList(int userDbId)
+    {
+        var p = new byte[12];
+        // [06] offset 0, [0A] count 0 - exactly what cap_social.log seq 1699/1723 put there.
+        BitConverter.GetBytes(userDbId).CopyTo(p, 8);
+        return p;
+    }
+
+    /// <summary>Frame minimums for the four T64 pushes, for the tests and the fuzz suite.</summary>
+    public static int MinFrameLengthArbiterPush(ushort op) => op switch
+    {
+        AS_REQUEST_REFRESH_PARTY_INFO => 0x0A,
+        AS_CHANGE_EVENT_MATCHING_STATE => 0x0B,
+        AS_VIEW_INTER_PARTY_MATCH_DUNGEON_LIST_EXTENDED => 0x12,
+        AS_VIEW_INTER_PARTY_MATCH_BATTLEFIELD_LIST_EXTENDED => 0x12,
+        _ => 0,
+    };
 
     /// <summary>AS_DO_CHANGE_PARTY_MEMBER_AUTHORITY (0x13A5):
     /// [i64 PartyId][i32 PlanetId][i32 UserDbId][u8 AuthorityAboutInvitation].</summary>
