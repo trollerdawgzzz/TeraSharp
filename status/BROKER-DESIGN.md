@@ -424,3 +424,81 @@ sessions. The remaining work, in order:
    `S_TRADE_BROKER_CALC_NOTIFY` ×4 the collect notifications.
 
 None of that is guesswork any more; it is bookkeeping against a decoded record.
+
+## T71 — the listings table, and the five handlers on top of it
+
+Steps 1 and 2 of the previous section are done. Step 3, the client half, is not.
+
+### The table
+
+`broker_listings`: `trade_id` (the TradeId every frame keys on), seller db id and name, item db id,
+template, amount, price, buyer db id, `state`, `registered_at`, `sold_at`. States are
+`Listed 0 → Sold 1 → SellerPaid 2 / BuyerCollected 3`, plus `Cancelled 4`.
+
+**A listed item is still a row in `items`.** The op-44 atom in every register batch moves it to
+inventory type 6 — the broker's holding pocket — and a cancel or a collect moves it back out.
+Nothing is deleted, so `items` stays the single answer to "where is this thing".
+
+### Where the price comes from
+
+`SDB_TRADE_BROKER_REGISTER_ITEM` has no price field: its dumper lists DlmId, OwnerDbId and
+ItemBinary and nothing else. The price arrives **inside the op-53 atom, at +0x288 (i64)**. All
+three registers in cap_social3.log confirm it — the two that carry 10001 there come back with
+Price 10001 in their TradeData, and the one that carries 1 comes back 1.
+
+### The register batch, decoded
+
+| op | what it does |
+| --- | --- |
+| 9 | the listing fee off the seller's gold (−500 in all three captures) |
+| **53** | the marker, and the only carrier of the price |
+| **44** | the whole row moves to `(seller, inven 6, 0)` |
+| 2, or 6+11 | the stack leaves the bag: change-amount, or detach+delete |
+
+Ops 53–57 are markers: 53 register, 54 cancel, 55 buy, 56 collect-proceeds, 57 collect-item. They
+change no row themselves and are echoed. They are **not** unmodelled-op gaps — the broker handler
+is what acts on them — so `Apply` logs them at Debug rather than as a gap.
+
+### The three shapes of Step-2 reply
+
+This is the detail a hand-written implementation would get wrong, and all three are pinned:
+
+| opcode | Step 1 refA | Step 2 refA |
+| --- | --- | --- |
+| UNREGISTER 0x281A | the listing | the record, **entirely zeroed** (seq 2003) |
+| CALC_SOLD 0x281C | the CalcItemList form | **absent** — offset 0x1F, length 0 (seq 1949) |
+| CALC_BOUGHT 0x281E | the CalcItemList form | **absent** (seq 1907) |
+| BUY_IT_NOW 0x2820 | the listing | the listing, **unchanged** (seq 1883) |
+
+### CalcItemList — TradeData plus a settlement block
+
+The two CALC replies carry the same 0x188 struct with six more fields set. Diffing seq 1947 and
+1905 against seq 1881 (the same listing 3, minutes apart) isolates them:
+
+| Offset | Field | seq 1947 / 1905 |
+| --- | --- | --- |
+| +0x058 | CalcState | **3** (seller collecting) / **2** (buyer collecting) |
+| +0x0D0 | BuyerDbId | 1003 |
+| +0x0D4 | InstantBuy | 1 |
+| +0x0D8 | SoldTime, 8×u16 | 2026-09-16 22:33:02 |
+| +0x0E8 | SoldPrice | 1 |
+| +0x100 | CalcMoney — what the collector receives | 1 |
+
+The seller's and the buyer's records differ in **one field**, +0x58. `CalcMoney` equals the price
+in this capture, so it shows no broker tax; if a later capture shows one, it goes here.
+
+### Verified
+
+All twelve captured broker frames are reproduced byte for byte by the builders — three registers,
+and step 1 and step 2 of each of unregister, calc-sold, calc-bought and buy — with two documented
+exceptions: the two uninitialised u16s at +0x52/+0x5C, and the item db id the Arbiter allocated in
+seq 1907 (ours allocates its own, which is the point).
+
+### What is still missing
+
+The client half. Nine `C_TRADE_BROKER_*` requests and six `S_` replies are in
+cap_social3_client.log and still answered with the empty forms: `S_TRADE_BROKER_WAITING_ITEM_LIST`
+(×9, the search result page), `S_TRADE_BROKER_REGISTERED_ITEM_LIST`, `_SOLD_ITEM_LIST`,
+`_BOUGHT_ITEM_LIST`, `_CALC_NOTIFY` (×4) and `_HIGHEST_ITEM_LEVEL` (×2). The store side is ready —
+`SearchBrokerListings`, `CountBrokerListings`, `GetBrokerListingsOf` and `GetBrokerPurchasesOf`
+exist and are tested — so what remains is decoding the per-row body each `S_` list carries.

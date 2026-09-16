@@ -63,6 +63,11 @@ public static class WarehouseHandlers
     public const int InvenCharacterWarehouse = 9;
     public const int InvenStyleWarehouse = 12;
     public const int InvenEquipped = 14;
+    /// <summary>INVEN_TYPE 6 - the trade broker's holding pocket. T71: the op-44 atom in every
+    /// SDB_TRADE_BROKER_REGISTER_ITEM batch moves the listed row here, and it comes back out on
+    /// a cancel or a collect. A listed item is therefore still a row in <c>items</c>, which is
+    /// what keeps one source of truth for where a thing is.</summary>
+    public const int InvenBroker = 6;
 
     /// <summary>
     /// {1, 3, 9, 12} — the warehouse family. The literal mask the Arbiter tests, at
@@ -139,6 +144,32 @@ public static class WarehouseHandlers
     /// own: item 10018, template 17000, (2, inven 1, slot 2) -&gt; (1003, inven 0, slot 2). Before
     /// T69 it was an unmodelled op, so withdrawing a full stack left the row in the bank.</summary>
     public const uint TsWareGetItem = 0x10;
+
+    // ---- T71: the broker ops, from cap_social3.log ----
+
+    /// <summary>44 (0x2C): the whole row moves to the dst triple, which for a broker register is
+    /// (seller, <see cref="InvenBroker"/>, 0). Same semantics as 0x0E and 0x10.</summary>
+    public const uint TsBrokerMoveItem = 44;
+
+    /// <summary>
+    /// 53..57: the five broker markers. They carry no row change of their own - the atom beside
+    /// them does the moving - and exist so the Arbiter knows which bookkeeping to do. Each is
+    /// echoed and deliberately changes nothing, which is NOT the same as an unmodelled op: an
+    /// unmodelled op is logged as a gap, these are understood and intentionally inert.
+    /// <list type="bullet">
+    /// <item>53 register: carries the listing PRICE at atom +0x288 (i64).</item>
+    /// <item>54 cancel, 55 buy, 56 collect-proceeds, 57 collect-item.</item>
+    /// </list>
+    /// </summary>
+    public const uint TsBrokerRegister = 53;
+    public const uint TsBrokerCancel = 54;
+    public const uint TsBrokerBuy = 55;
+    public const uint TsBrokerCalcSold = 56;
+    public const uint TsBrokerCalcBought = 57;
+
+    /// <summary>Is this one of the five inert broker markers?</summary>
+    public static bool IsBrokerMarker(uint op)
+        => op >= TsBrokerRegister && op <= TsBrokerCalcBought;
     public const uint TsWareChangeAmount = 0x11;  // +0x50 added to the row at (src triple)
 
     /// <summary>One parsed <c>ItemTransactionAtom</c>. Only the fields the warehouse path uses.</summary>
@@ -525,6 +556,7 @@ public static class WarehouseHandlers
                 case TsChangeItemPos:
                 case TsWareMoveItem:
                 case TsWareGetItem:
+                case TsBrokerMoveItem:
                     if (a.ItemDbId == 0)
                     {
                         // Identified by position instead: find what is at the source triple.
@@ -599,6 +631,18 @@ public static class WarehouseHandlers
                     // message does the delete. Modelled as a no-op on purpose - acting on it too
                     // would delete the row twice, and the second delete would miss.
                     log?.LogDebug("items: detach (op 6) for item {Id} - the paired delete does the work", a.ItemDbId);
+                    ignored++;
+                    break;
+
+                case TsBrokerRegister:
+                case TsBrokerCancel:
+                case TsBrokerBuy:
+                case TsBrokerCalcSold:
+                case TsBrokerCalcBought:
+                    // T71: understood and intentionally inert - the broker handler acts on these,
+                    // the atom beside them does the row move. Not an unmodelled-op gap.
+                    log?.LogDebug("items: broker marker op {Op} for item {Id} - handled by the broker path",
+                        a.Op, a.ItemDbId);
                     ignored++;
                     break;
 
