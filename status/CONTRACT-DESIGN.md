@@ -386,3 +386,70 @@ what the real Arbiter does for an unrestricted item.
   `ContractManager` (`FUN_14091d340`) and may be reused after a contract ends.
 - **Types 10 and 0x23** are refused, not implemented (section 7).
 - **The 8 bytes at [0x04] of both client packets.** Unread by the binary, so unread by us.
+
+---
+
+## 10. T64 — the capture, and the two things it changed
+
+`D:\packetlogs\cap_social.log` is a two-player tap of the **real** ArbiterServer. It contains one
+complete party contract: "Test" (playerId **2**, the contractor) invites "two" (playerId **1002**,
+the opponent). Sequence numbers below are that log's, as `cap_social_ctl.txt` numbers them.
+
+| seq | dir | opcode | bytes |
+|---|---|---|---|
+| 650 | W→A | `SDB_FETCH_THROUGH_ARBITER_CONTRACT` 0x2809 | 44 |
+| 652 | A→W | `DBS_ASK_THROUGH_ARBITER_CONTRACT` 0x280B | 52 |
+| 653 | W→A | `SDB_ASK_THROUGH_ARBITER_CONTRACT` 0x280C | 27 |
+| 655 | A→W | `DBS_FETCH_THROUGH_ARBITER_CONTRACT` 0x280A | 38 |
+| 656 | W→A | `SDB_SEND_BEGIN_THROUGH_ARBITER_CONTRACT` 0x280D | 52 |
+| 744 | A→W | `DBS_SEND_END` 0x280F + `DBS_REPLY` 0x2810 | 22 + 26 |
+
+**Every layout in section 3 survived contact with the wire** — the writer-derived offsets, the
+four-byte offset-only wstr refs in 0x280B, the `[u32 offset][u32 count]` bytes refs, and the
+"empty list = offset is the frame length, count 0" convention. `T64_the_contract_replies_are_byte_exact`
+rebuilds seq 652, 655, 744 and 744 from the builders and compares them byte for byte.
+
+Two things did change.
+
+### 10.1 The target is a NAME in `Param`, and `FetchDataList` is empty
+
+Section 3.1 called this "the one guess in the file". Seq 650 settles it:
+
+```
+[06] Param offset          = 34            [0E] FetchDataList offset = 44 (= frame length)
+[0A] Param count           = 10            [12] FetchDataList count  = 0
+[16] ContractorDbId = 2    [1A] ContractType = 4    [1E] ContractId = 1
+[22] Param                 = 74 00 77 00 6F 00 00 00 00 00      "two\0" + 2 bytes of padding
+```
+
+`ContractBroker.ReadTargetHint` now reads the **name first**; the db-id list is kept as a fallback
+but can no longer shadow a name that is present, which is what it did before. The same `Param`
+block comes back unchanged in the 0x280D at seq 656, alongside an `AskUserList` of exactly one
+db id — so World echoes the Arbiter's own resolution rather than re-deriving it.
+
+The two trailing zero bytes are not a second field we can name; the client's own
+`C_REQUEST_CONTRACT` (client capture seq 475) carries the name with one trailing byte, so World
+pads. `DecodeWString` stops at the terminator, so it does not matter — but a parser that trusted
+`Param count` as a character count would be wrong by one.
+
+### 10.2 The Arbiter asks **before** it answers
+
+The order is `0x2809 → 0x280B → 0x280C → 0x280A`, and the gap between 653 and 655 is 0.4 ms: the
+opponent's World is asked first, and the initiator's World hears nothing until `CanContract` is
+in. TeraSharp used to send 0x280A immediately, with `ErrorNo 0`, and then record a
+`CanContract = 0` that arrived afterwards and do nothing with it — telling the initiator a
+contract was brokered before anyone had agreed to it.
+
+`ContractBroker.OnFetch` now sends only the 0x280B fan-out and parks the contract;
+`ContractBroker.OnAsk` sends the 0x280A, with the AskList on `CanContract = 1` and the
+`ResponseFailure` empty form (offset = frame length, count 0) on 0. `T64_the_broker_asks_before_it_answers`
+pins the order.
+
+### 10.3 Two names the capture also fixed
+
+* `SA_JOIN_PARTY_IN_ARBITER` (0x13AB, seq 747) carries **two names and no db ids** —
+  `u32 MemberNameOff@06, u32 InviteeNameOff@0A, u8 Raid@0E`, frame 0x0F. That is why the contract
+  in front of it has to have resolved both sides already.
+* The brief that commissioned this pass had the two players the other way round. The capture is
+  unambiguous: seq 652 pairs `ContractorName "Test"` with `ContractorDbId 2`, and
+  `OpponentName "two"` with `OpponentDbId 1002`; the friend list in the client tap agrees.

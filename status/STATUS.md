@@ -48,7 +48,9 @@ exist, nothing routes to it.
 | The 18 client packets World rejects — tooltip reply, visited sections, client log, small acks | **wired** (T45) |
 | Mail — 3 Arbiter-owned client packets + the 6 `SDB_*_PARCEL` W<->A pairs, empty inbox byte-exact | **wired** (T42/T45) |
 | Warehouse — 8 W->A requests answered from `items`/`warehouses` rows, `0x2754` sealed | **wired** (T42) |
-| Parties — `PartyManager` via `PartyWiring`: 7 `C_` registered, 12 `SA_` gated out of the tunnel | **wired** (T35/T49) |
+| Parties — `PartyManager` via `PartyWiring`: 7 `C_` registered, 12 `SA_` gated out of the tunnel | **wired** (T35/T49), byte-exact against cap_social.log (T64) |
+| The party contract broker — the 0x2809..0x2810 handshake, target resolved by name | **wired** (T60), order and layout from the capture (T64) |
+| Friend / block pushes to World — 0x2862, 0x1475, 0x1476 | **wired** (T64) |
 | Guilds — 17 `C_` via `GuildWiring`, rows persisted, `0x27CF` boot load rebuilt from them; 10 of the 12 `SA_` answered | **wired** (T39/T51/T52/T57) |
 | GM World forward (anything not Arbiter-owned -> `AS_ADMIN_COMMAND` 0x2829) + `AS_ENTER_WORLD[111]` AdminLevel | **wired** (T46/T47) |
 | Packet-handling security — bounds, pagination, allocate-by-count, 37k-input fuzz suite | **wired** (T48/T50), 2 human-owned items open |
@@ -80,6 +82,7 @@ exist, nothing routes to it.
 | Dungeon cool times and entry counts | `status/DUNGEON-COOLTIME.md` |
 | Mail, the warehouse, and which pocket id means what | `status/MAIL-WAREHOUSE.md` |
 | Where an item is, and which atom op moved it | `status/INVENTORY-DESIGN.md` §7, `status/PERSISTENCE-MAP.md` |
+| What a real party looks like on the wire, end to end | `status/PARTY-DESIGN.md` section 13, `status/CONTRACT-DESIGN.md` section 10 |
 | Why a warehouse move is not an `SDB_ITEM_SINGLE` atom | `status/MAIL-WAREHOUSE.md` §6 |
 | Everything else in the 2026-09-13 relog capture | `status/RELOG-CAPTURE-NOTES.md` |
 | Guilds - the object, the SQL schema, the opcodes and the .def corrections | `status/GUILD-DESIGN.md` |

@@ -46,6 +46,17 @@ public sealed class DbProxyHandlers
     // captured arb_world.log and the inline reply writers in the decompile.
     public const ushort SDB_SAVE_27FA = 0x27FA; public const ushort DBS_SAVE_27FB = 0x27FB; // reqId @280
     public const ushort SDB_SAVE_2924 = 0x2924; public const ushort DBS_SAVE_2925 = 0x2925; // reqId @8
+    /// <summary>
+    /// T64. SDB_UPDATE_LEFT_COOLTIME_PREMIUM_SLOT (0x28C1) -&gt; DBS (0x28C2). A per-user DB
+    /// write that carries a DlmId, so it head-blocks the user's queue if nothing answers it.
+    /// Request (dumper Arb_part_017.c:18676, guard 0x21): <c>u32 listOff@06, u32 listBytes@0A,
+    /// i32 DlmId@0E, i64 ArbiterUser@12, i64 OwnerDbId@1A</c> then the list. Reply (dumper
+    /// Arb_part_015.c:19226, guard 10): <c>i32 DlmId@06, u8 Success@0A</c> - the plain
+    /// <see cref="BuildReqIdAck"/> shape, with DlmId at payload offset 8.
+    /// cap_social.log seq 634 -&gt; 635 and 1894 -&gt; 1895.
+    /// </summary>
+    public const ushort SDB_UPDATE_LEFT_COOLTIME_PREMIUM_SLOT = 0x28C1;
+    public const ushort DBS_UPDATE_LEFT_COOLTIME_PREMIUM_SLOT = 0x28C2;
     public const ushort SDB_SAVE_2768 = 0x2768; public const ushort DBS_SAVE_2769 = 0x2769; // reqId @16
 
     // --- SDB_ITEM_SINGLE (0x2768) -> DBS_ITEM_SINGLE (0x2769), T13 ---
@@ -992,6 +1003,7 @@ public sealed class DbProxyHandlers
             case SDB_UPDATE_USER_DATA:
             case SDB_SAVE_27FA:
             case SDB_SAVE_2924:
+            case SDB_UPDATE_LEFT_COOLTIME_PREMIUM_SLOT:   // 0x28C1, T64
             case SDB_SAVE_2768:
             case SDB_SAVE_2936:
             case SDB_DAILY_QUEST:
@@ -1111,6 +1123,8 @@ public sealed class DbProxyHandlers
             // --- Logout save sequence (reqId echoed from the live request) ---
             case SDB_SAVE_27FA: return OnSaveUserAchievement(link, payload);
             case SDB_SAVE_2924: link.SendFrame(DBS_SAVE_2925, BuildReqIdAck(payload, 8)); return true;
+            case SDB_UPDATE_LEFT_COOLTIME_PREMIUM_SLOT:
+                link.SendFrame(DBS_UPDATE_LEFT_COOLTIME_PREMIUM_SLOT, BuildReqIdAck(payload, 8)); return true;
             case SDB_SAVE_2768: return OnItemSingle(link, payload);
             case SDB_SAVE_2936: link.SendFrame(DBS_SAVE_2937, BuildDbs2937(payload)); return true;
             case SDB_DAILY_QUEST: link.SendFrame(DBS_DAILY_QUEST, BuildReqIdAck(payload, 16)); return true;

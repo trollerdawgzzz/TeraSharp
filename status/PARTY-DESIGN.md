@@ -821,3 +821,82 @@ there every time.
 3. Party matching (11.3) needs `S_PARTY_MEMBER_INFO` from a capture before it can be answered.
 4. No `PERSISTENCE-MAP.md` row is added or needed: §4 proves nothing about a party is persisted,
    and none of the twelve W→A opcodes is a DB-proxy request.
+
+---
+
+## 13. T64 — the party family against a real capture
+
+`D:\packetlogs\cap_social.log` is the first tap that contains a real party being formed, used and
+handed over, by the **real** ArbiterServer, with two players: "Test" (playerId 2) and "two"
+(playerId 1002). The frames, by that log's sequence numbers:
+
+| seq | dir | opcode | what it settled |
+|---|---|---|---|
+| 747 | W→A | `SA_JOIN_PARTY_IN_ARBITER` 0x13AB | two names, no db ids; `u8 Raid@0E`, frame 0x0F |
+| 748 | A→W | `AS_DO_CREATE_PARTY` 0x139E, **376 B** | the list slot is a byte length — §13.1 |
+| 750, 756 | W→A | `SA_BYPASS_TO_GROUP` 0x13F8 | `GroupType@0E, i64 GroupId@12, ObjectPlanetId@1A, ObjectId@1E`, ref at 06 |
+| 751-753 | A→W | `AS_CHANGE_EVENT_MATCHING_STATE` 0x15CD, `AS_REQUEST_REFRESH_PARTY_INFO` 0x13AD | two pushes we never sent — §13.2 |
+| 1232 | A→W | `AS_PARTY_LOOTING_METHOD` 0x13BB | `i64 UserPDId@06` + the 19-byte loot block + `i32 PartyMemberCount` |
+| 1245 → 1248 | W→A, A→W | `SA_CHANGE_LOOTING_METHOD` 0x139D → `AS_DO_SET_LOOTING_METHOD` 0x13A6 | the loot block, confirmed field for field |
+| 1304 → 1305 | W→A, A→W | `SA_CHANGE_PARTY_MANAGER` 0x139B → `AS_DO_SET_PARTY_MANAGER` 0x13A4 | five i32 in, `[i64 PartyId][i32 planet][i32 db]` out |
+
+Everything in sections 5 and 6 held except one field, and that one was live-breaking.
+
+### 13.1 `AS_DO_CREATE_PARTY`'s list slot is a BYTE LENGTH
+
+Seq 748 carries two members and puts **`0x140` = 320 = 2 × 0xA0** at `+0x0A`. World agrees:
+`Handler_AS_DO_CREATE_PARTY` (`WorldServer.exe.c:2984602`) guards `param_3 < 0x38` and then walks
+the list as
+
+```c
+if (0 < *(int *)(pkt + 10))
+    count = (*(int *)(pkt + 10) - 1) / 0xa0 + 1;
+```
+
+— the same ceiling-divide `SDB_ITEM_SINGLE` does with `0x358` and `DBS_INIT_GUILD_MEMBER` with
+`0xF0`. TeraSharp wrote the **element count**, so `(2 - 1) / 160 + 1 = 1`: World took a
+two-member party as one member and never mirrored the second. Fixed in
+`PartyPackets.BuildDoCreateParty`; `T64_AS_DO_CREATE_PARTY_is_byte_exact_where_the_bytes_are_ours`
+rebuilds seq 748 and compares the 0x38 fixed part byte for byte.
+
+The 0xA0 `PartyMemberBasicInfo` itself needed no change — `PlanetId@00, UserDbId@04, GameId@08,
+Level@10, Class@14, Race@18, Gender@1C, Role@20, Name@24, CanInvite@6E, Alive@6F, Online@70,
+AchievementGrade@74, UserAwakenGrade@78` all match. Everything between the name's terminator and
+`+0x6E` is uninitialised Arbiter heap — the capture leaks stack pointers and fragments of the
+server's own log timestamps there, exactly as the 536-byte item record does
+(INVENTORY-DESIGN.md §2). The test masks those windows rather than pretending to reproduce them.
+
+**`GameId` is not derived from the db id.** Member 2 carries `...0AF00002` and member 1002 carries
+`...0AF00001` — per-login sequence numbers, which is the open item CLAUDE.md lists against
+`Program.cs`. `AS_DO_CREATE_PARTY` must carry the session's real gameId, not one computed from
+the player id, or World's mirror will point at the wrong object.
+
+### 13.2 Two pushes we never sent
+
+After `AS_DO_CREATE_PARTY`, the real Arbiter sends, per member:
+
+* `AS_CHANGE_EVENT_MATCHING_STATE` (0x15CD): `i32 UserDbId@06, u8 IsMatching@0A`, frame 0x0B.
+  Every one in the capture carries `IsMatching = 0` — joining a party ends solo matching.
+* `AS_REQUEST_REFRESH_PARTY_INFO` (0x13AD): `i32 UserDbId@06`, frame 0x0A.
+
+`PartyManager` now emits one of each per member, in that order. The capture sent **three** 0x15CD
+for member 2 and **two** for member 1002 — one per matching queue the member was in, we assume,
+since nothing in the frames distinguishes them. One each is all the capture justifies for a
+member we never registered in a queue; if a live run shows World keeping a stale matching state,
+this is the first thing to look at.
+
+### 13.3 Two more pushes, same family
+
+`AS_VIEW_INTER_PARTY_MATCH_DUNGEON_LIST_EXTENDED` (0x1644, seq 1699/1706) and
+`..._BATTLEFIELD_LIST_EXTENDED` (0x1645, seq 1723/1731) are one 12-byte shape:
+`u32 listOffset@06, u32 listBytes@0A, i32 UserDbId@0E`, frame 0x12, dumpers at
+`Arb_part_012.c:8657` and `:8529`. 0x1644 follows a `C_DUNGEON_CLEAR_COUNT_LIST` (client 0x5C98,
+body `[u16 nameOff][wstr name]`) and carries the named user's db id.
+
+The detail worth pinning: **the empty list is written with offset 0**, not offset = frame length.
+Both conventions live in this protocol — 0x2809's empty `FetchDataList` uses the other one — so
+neither can be assumed. `T64_the_party_match_list_pushes_write_an_empty_list_as_offset_zero`.
+
+Builders exist (`PartyPackets.BuildAsViewInterPartyMatchList`); nothing calls them yet, because
+the Arbiter half of `C_DUNGEON_CLEAR_COUNT_LIST` is not modelled and inventing a trigger would be
+a guess.

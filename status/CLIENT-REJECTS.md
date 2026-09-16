@@ -454,6 +454,23 @@ it there and `SocialHandlers.SendFriendGroupList` reads it back.
 - **`S_DUNGEON_COOL_TIME_LIST`, `S_REPLY_GUILD_LIST`, `S_SHOW_PARTY_MATCH_INFO`,
   `S_MY_PARTY_MATCH_INFO`, `S_SHOW_CANDIDATE_LIST`, `S_VIEW_BATTLE_FIELD_RESULT`** — six reply
   shapes, all needing a capture. Their requests are accepted silently until then.
+  **T64 checked `cap_social.log` / `cap_social_client.log` for them and they are not there.**
+  Not one of the six `S_` opcodes (0xD768, 0x5F75, 0xDF65, 0xB5A3, 0xF12D, 0xE459) appears in
+  the client tap, and neither do the three `C_` opcodes that would have asked for them
+  (`C_DUNGEON_COOL_TIME_LIST` 0xD3F7, `C_REQUEST_GUILD_LIST` 0x866B,
+  `C_VIEW_BATTLE_FIELD_RESULT` 0xEC3D) — the two players never opened those windows. So the
+  accept-silently handlers stay exactly as they are; there is nothing to replace them with,
+  and a reply invented from the `.def` alone is the kind of guess that desynced World before
+  (`status/HANDOFF.md` §1). `T64_the_six_silent_windows_are_still_unanswered` pins the list so
+  the next capture pass knows exactly what it is looking for.
+
+  What the same capture DID show in that family, and what T64 built from it:
+  `C_DUNGEON_CLEAR_COUNT_LIST` (0x5C98, body `[u16 nameOff][wstr name]`) makes the Arbiter
+  push `AS_VIEW_INTER_PARTY_MATCH_DUNGEON_LIST_EXTENDED` (0x1644) to World carrying the named
+  user’s db id, and `AS_VIEW_INTER_PARTY_MATCH_BATTLEFIELD_LIST_EXTENDED` (0x1645) is the same
+  shape — `status/PARTY-DESIGN.md` §13.3. Builders exist; nothing calls them, because the
+  Arbiter half of `C_DUNGEON_CLEAR_COUNT_LIST` is not modelled and inventing a trigger would
+  be a guess of the same kind.
 - **`SDB_VISIT_ALL_SECTIONS` (0x2831)** — in the opcode table, in no capture, and nowhere in the
   Arbiter decompile. A GM/QA path.
 - **`C_LIST_CHANNEL` (0x661B)** — turned up while naming these and has no handler anywhere in the

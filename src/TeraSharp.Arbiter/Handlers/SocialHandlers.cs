@@ -17,9 +17,10 @@ namespace TeraSharp.Arbiter.Handlers;
 /// status/FRIENDS.md has the full write-up.</para>
 ///
 /// <para>The real Arbiter keeps friends in SQL (dbo.spAddFriendOnList and friends), NOT in the
-/// DB-proxy protocol, so nothing here goes near WorldServer. The one exception is the pair of
-/// AS_ pushes that tell World about the block list; those are cross-session and stubbed -
-/// status/MULTIPLAYER-DESIGN.md.</para>
+/// DB-proxy protocol, so almost nothing here goes near WorldServer. The exceptions are three
+/// A-&gt;W pushes - AS_ADD_TO_FRIEND_LIST (0x2862), AS_ADD_BLOCKED_USER (0x1475) and
+/// AS_REMOVE_BLOCKED_USER (0x1476) - which were stubs until T64 decoded them from
+/// cap_social.log. status/FRIENDS.md section 6.</para>
 /// </summary>
 public sealed class SocialHandlers
 {
@@ -697,6 +698,7 @@ public sealed class SocialHandlers
         WriteFriendRequest(store, me, target.Id, memo);
         _log.LogInformation("C_ADD_FRIEND: {Name} -> {Target} (request)", chr.Name, target.Name);
 
+        PushFriendCounts(store, (int)chr.Id, target.Id);   // T64
         SendSmt(s, SmtRequestSent, "UserName", target.Name);
         SendFriendList(s);
         SendUpdateFriendInfo(s);
@@ -738,6 +740,9 @@ public sealed class SocialHandlers
         int me = (int)chr.Id;
         if (!AcceptFriendRequest(store, me, requester.Id)) return true;   // silent, as the Arbiter
         _log.LogInformation("C_ACCEPT_FRIEND: {Name} accepted {Requester}", chr.Name, requester.Name);
+
+        // T64: the accepter first, then the requester - the order at seq 1985/1986.
+        PushFriendCounts(store, me, requester.Id);
 
         SendSmt(s, SmtAcceptedToAccepter);
         SendFriendList(s);
@@ -959,6 +964,59 @@ public sealed class SocialHandlers
     }
 
     // =====================================================================
+    // T64: the three AS_ pushes the capture finally showed us
+    //
+    // All three are frame 14 with two i32 at +06 and +0A, and all three travel A->W on the
+    // DB-proxy link. cap_social.log:
+    //   seq 1959/1960  0x2862 AS_ADD_TO_FRIEND_LIST   (2, 0) then (1002, 0)
+    //   seq 1985/1986  0x2862 AS_ADD_TO_FRIEND_LIST   (1002, 1) then (2, 1)
+    //   seq 2087       0x1475 AS_ADD_BLOCKED_USER     (1002, 2)
+    //   seq 2109       0x1476 AS_REMOVE_BLOCKED_USER  (1002, 2)
+    // =====================================================================
+
+    /// <summary>AS_ADD_TO_FRIEND_LIST (0x2862). Dumper Arb_part_011.c:4737, guard 0xd.</summary>
+    public const ushort AS_ADD_TO_FRIEND_LIST = 0x2862;
+    /// <summary>AS_ADD_BLOCKED_USER (0x1475). Dumper Arb_part_011.c:3235, guard 0xd.</summary>
+    public const ushort AS_ADD_BLOCKED_USER = 0x1475;
+    /// <summary>AS_REMOVE_BLOCKED_USER (0x1476). Dumper Arb_part_011.c:18582, guard 0xd.</summary>
+    public const ushort AS_REMOVE_BLOCKED_USER = 0x1476;
+
+    /// <summary>The payload all three share: <c>i32 a@06, i32 b@0A</c>, 8 bytes.</summary>
+    public static byte[] BuildAsUserPair(int a, int b)
+    {
+        var p = new byte[8];
+        BitConverter.GetBytes(a).CopyTo(p, 0);
+        BitConverter.GetBytes(b).CopyTo(p, 4);
+        return p;
+    }
+
+    /// <summary>
+    /// How many friends the frame reports for one character. The captured pairs are (2, 0) and
+    /// (1002, 0) when the request was made and (1002, 1) and (2, 1) once it was accepted, so
+    /// the number counts <b>mutual</b> friendships (type 0) and not pending requests - a
+    /// pending request is a row on both sides and would have made the first pair (2, 1).
+    /// </summary>
+    public static int MutualFriendCount(CharacterStore store, int characterId)
+    {
+        int n = 0;
+        foreach (var r in store.GetFriendRows(characterId)) if (r.Type == 0) n++;
+        return n;
+    }
+
+    /// <summary>
+    /// Tell World both sides' new friend count. The capture sends one frame per character,
+    /// requester first, and sends them even when the count did not change (the first pair is
+    /// two zeroes) - so this fires on the request as well as on the accept.
+    /// </summary>
+    private void PushFriendCounts(CharacterStore store, int a, int b)
+    {
+        var world = Program.World;
+        if (world == null) return;
+        world.SendFrame(AS_ADD_TO_FRIEND_LIST, BuildAsUserPair(a, MutualFriendCount(store, a)));
+        world.SendFrame(AS_ADD_TO_FRIEND_LIST, BuildAsUserPair(b, MutualFriendCount(store, b)));
+    }
+
+    // =====================================================================
     // Block list
     // =====================================================================
 
@@ -966,8 +1024,8 @@ public sealed class SocialHandlers
     /// Handler_C_BLOCK_USER (Arb_part_040.c:19304) -> User::CanBlockUserNoLock. Blocking also
     /// deletes any friendship (TryToDeleteFriend) and answers S_ADD_BLOCKED_USER with an EMPTY
     /// memo - the Arbiter writes L"" there unconditionally.
-    /// TODO(multiplayer): also push AS_ADD_BLOCKED_USER (0x1475) to World -
-    /// status/MULTIPLAYER-DESIGN.md.
+    /// T64: also pushes AS_ADD_BLOCKED_USER (0x1475) to World - cap_social.log seq 2087 is
+    /// exactly (blocker 1002, blocked 2), one frame, sent after the row is written.
     /// </summary>
     public bool OnBlockUser(GameSession s, ReadOnlyMemory<byte> body)
     {
@@ -997,6 +1055,7 @@ public sealed class SocialHandlers
         }
 
         store.AddBlock(me, target.Id);
+        Program.World?.SendFrame(AS_ADD_BLOCKED_USER, BuildAsUserPair(me, target.Id));   // T64
 
         // Blocking breaks the friendship in both directions, and both sides are told.
         if (DeleteFriendPair(store, me, target.Id) != null)
@@ -1021,7 +1080,8 @@ public sealed class SocialHandlers
     /// <summary>
     /// Handler_C_REMOVE_BLOCKED_USER (Arb_part_041.c:6174). Answers S_REMOVE_BLOCKED_USER with
     /// just the id; an unknown name is dropped silently (no system message, unlike C_BLOCK_USER).
-    /// TODO(multiplayer): also push AS_REMOVE_BLOCKED_USER (0x1476) to World.
+    /// T64: also pushes AS_REMOVE_BLOCKED_USER (0x1476) - cap_social.log seq 2109, the same
+    /// two ids in the same order as the 0x1475 that preceded it.
     /// </summary>
     public bool OnRemoveBlockedUser(GameSession s, ReadOnlyMemory<byte> body)
     {
@@ -1039,6 +1099,7 @@ public sealed class SocialHandlers
         int me = (int)chr.Id;
         if (!store.GetBlocks(me).Contains(target.Id)) return true;
         store.RemoveBlock(me, target.Id);
+        Program.World?.SendFrame(AS_REMOVE_BLOCKED_USER, BuildAsUserPair(me, target.Id));   // T64
         _log.LogInformation("C_REMOVE_BLOCKED_USER: {Name} x {Target}", chr.Name, target.Name);
         s.SendByDef("S_REMOVE_BLOCKED_USER", new Dictionary<string, object> { ["id"] = (uint)target.Id });
         return true;

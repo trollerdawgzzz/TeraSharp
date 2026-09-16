@@ -176,3 +176,28 @@ all. Everything else follows the decompile.
   `blocks.memo` / `characters.profile_message` / `characters.sample_group_provided` columns, and
   their accessors.
 * `src/TeraSharp.Arbiter.Tests/Program.cs` — the T30 block.
+
+---
+
+## 9. T64 — the three `AS_` pushes, decoded
+
+Section 7 listed the block-list pushes as stubbed. `cap_social.log` contains all three, and all
+three are the same eight-byte payload: `i32 a@06, i32 b@0A`, frame 14, dumper guard `0xd`.
+
+| opcode | name | dumper | capture |
+|---|---|---|---|
+| `0x2862` | `AS_ADD_TO_FRIEND_LIST` — `UserDbId`, `FriendListCount` | `Arb_part_011.c:4737` | seq 1959/1960 `(2, 0)` `(1002, 0)`; seq 1985/1986 `(1002, 1)` `(2, 1)` |
+| `0x1475` | `AS_ADD_BLOCKED_USER` — `UserDbId`, `TargetDbId` | `Arb_part_011.c:3235` | seq 2087 `(1002, 2)` |
+| `0x1476` | `AS_REMOVE_BLOCKED_USER` — same fields | `Arb_part_011.c:18582` | seq 2109 `(1002, 2)` |
+
+**The count is mutual friends, not rows.** Both sides got `0` when the request was made and `1`
+once it was accepted; a pending request is a row on each side, so a row count would have made the
+first pair `(2, 1)`. `SocialHandlers.MutualFriendCount` counts type 0 only.
+
+**Both sides are told, one frame each, requester first**, and they are told even when the number
+did not change — the first pair is two zeroes. So the push fires on `C_ADD_FRIEND` as well as on
+`C_ACCEPT_FRIEND`.
+
+The block pair is `(blocker, blocked)` in that order, and `0x1476` repeats it unchanged.
+
+`T64_the_friend_and_block_pushes_are_byte_exact` pins all four frames.
