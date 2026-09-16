@@ -176,6 +176,11 @@ public static class HandlerRegistry
             (s, b) => ContractBroker.OnClientReply(s, b, misc));
         Reg("C_ADD_TRADE_BAG", ArbiterClientHandlers.AddTradeBagBodySize,
             (s, b) => ArbiterClientHandlers.OnAddTradeBag(s, b, misc));
+        // T62: friend right-click menu, cutscene-seen flags, name completion
+        Reg("C_ASK_INTERACTIVE", ArbiterClientHandlers.AskInteractiveBodySize, (s, b) => ArbiterClientHandlers.OnAskInteractive(s, b, misc));
+        Reg("C_WATCHED_MOVIES",  ArbiterClientHandlers.WatchedMoviesBodySize,  (s, b) => ArbiterClientHandlers.OnWatchedMovies(s, b, misc));
+        Reg("C_FINDNAME",        ArbiterClientHandlers.FindNameBodySize,       (s, b) => ArbiterClientHandlers.OnFindName(s, b, misc));
+        ArbiterClientHandlers.PartyLookup = id => PartyWiring.Manager.FindByMember(id) != null;
         foreach (var name in new[]
         {
             "C_REQUEST_PARTY_MATCH_INFO", "C_REQUEST_MY_PARTY_MATCH_INFO", "C_PARTY_MATCH_WINDOW_CLOSED",
