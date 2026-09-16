@@ -461,3 +461,29 @@ Applies to every Cowork task. Do the work, not the theatre.
 
 For the human: batch two or three tasks per merge session, keep prompts to essentials, prefer one live session
 over speculative tasks.
+
+## Token budget (added 2026-09-15 - the week's quota was mostly spent on Cowork verification volume)
+
+These apply to every Cowork task from now on. Do the work, not the theatre.
+
+1. Read only what the task needs. Grep the decompile for the handler/writer by name, read that function
+   and its callees; never sweep Arb_part_*.c or WorldServer.exe.c for context. Never re-read a file you
+   already read in the same task; never read the whole test file - grep for the test name.
+2. Verify once, in the cheapest way. One Python check per layout/frame is enough. Do NOT transliterate
+   whole handlers or state machines into Python, do not reconstruct .NET Random, do not re-derive goldens
+   independently and diff them, do not "simulate the build guard". Brace-balance the edited files and stop.
+3. Reports: 15 lines maximum. Files touched (one line each), tests added (names only), the human-owned
+   lines to apply, and at most three findings. No narrative, no restating the brief, no "not acted on"
+   lists unless something is blocking.
+4. Docs: extend the existing design doc with a short section; do not write new 500-line documents unless
+   the task is explicitly research-only. Tables over prose. No verbatim decompile quotes longer than 5 lines.
+5. Tests: one byte-exact test per frame or layout, one round-trip per store feature, one refusal path.
+   Not one per branch. Reuse existing helpers.
+6. Scope discipline: if the brief says implement X, do not also audit Y, rename Z, or reorganise docs.
+   Note it in one line and stop.
+7. Ask before expanding: if the task turns out to need more than ~2x the obvious work (a second capture,
+   a second subsystem), report that in 3 lines and wait instead of doing it.
+8. Never rewrite STATUS.md / CLAUDE.md sections wholesale - append one row/line.
+
+For the human: batch merges (two or three tasks per merge session), keep prompts to the essentials,
+and prefer one live session over speculative tasks.
