@@ -101,6 +101,15 @@ public static class ArbiterClientHandlers
         World.PartyMatchManager.C_REGISTER_PARTY_INFO,
         World.PartyMatchManager.C_UNREGISTER_PARTY_INFO,
         World.PartyMatchManager.C_REQUEST_PARTY_MATCH_LINK,
+        // T80 - the five guild-war packets. All five were being FORWARDED, so the window,
+        // the history page, the check, the declare and the withdrawal all produced World's
+        // "handler has not been implemented yet!!!". World.GuildWarManager answers them now
+        // - status/GUILD-WAR.md.
+        World.GuildWarManager.C_OPEN_GUILD_WAR_WINDOW,
+        World.GuildWarManager.C_VIEW_GUILD_WAR,
+        World.GuildWarManager.C_CHECK_TO_DECLARE_GUILD_WAR,
+        World.GuildWarManager.C_DECLARE_GUILD_WAR,
+        World.GuildWarManager.C_WITHDRAW_GUILD_WAR,
     };
 
     // =========================================================================================

@@ -912,6 +912,35 @@ CREATE TABLE IF NOT EXISTS guilds (
   created_at            TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 
+-- T80: guild war. The real Arbiter keeps these in PlanetDB as GuildWar and
+-- GuildWarHistory, so unlike the party board this IS persisted. state is the war record s
+-- +0xcc field the S_OPEN_GUILD_WAR_WINDOW writer switches on (6/7/8 are the three it
+-- renders; 5 is the one it skips) - status/GUILD-WAR.md section 4.
+CREATE TABLE IF NOT EXISTS guild_wars (
+  war_id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  attack_guild_id  INTEGER NOT NULL,
+  defend_guild_id  INTEGER NOT NULL,
+  declared_at      INTEGER NOT NULL DEFAULT 0,
+  money            INTEGER NOT NULL DEFAULT 0,
+  state            INTEGER NOT NULL DEFAULT 6
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_guild_wars_pair
+  ON guild_wars(attack_guild_id, defend_guild_id);
+
+CREATE TABLE IF NOT EXISTS guild_war_history (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  war_id           INTEGER NOT NULL,
+  attack_guild_id  INTEGER NOT NULL,
+  defend_guild_id  INTEGER NOT NULL,
+  declared_at      INTEGER NOT NULL DEFAULT 0,
+  ended_at         INTEGER NOT NULL DEFAULT 0,
+  result           INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS ix_guild_war_history_attack
+  ON guild_war_history(attack_guild_id);
+CREATE INDEX IF NOT EXISTS ix_guild_war_history_defend
+  ON guild_war_history(defend_guild_id);
+
 -- spLoadAllGuildMemberData's 17 columns. name/level/race/class/gender are DUPLICATED from
 -- characters on purpose: the real Arbiter keeps them in GuildMemberData so an OFFLINE member
 -- still renders in S_GUILD_MEMBER_LIST. state (online/offline) and can_guild_war are runtime
@@ -3370,6 +3399,165 @@ DELETE FROM guild_members     WHERE user_db_id = $id;";
 
     /// <summary>spLoadAllGuildMemberData(int guildDbId), in join order - the order
     /// S_GUILD_MEMBER_LIST walks the map.</summary>
+    // ---------------------------------------------------------------- T80: guild war
+
+    /// <summary>One live war. <paramref name="State"/> is the war record s +0xcc field.</summary>
+    public sealed record GuildWarRow(
+        long WarId, int AttackGuildId, int DefendGuildId, long DeclaredAt, long Money, int State);
+
+    /// <summary>One finished war. <paramref name="Result"/> is S_VIEW_GUILD_WAR.result:
+    /// 0 declared, 1 withdrew, 2 surrendered.</summary>
+    public sealed record GuildWarHistoryRow(
+        long WarId, int AttackGuildId, int DefendGuildId, long DeclaredAt, long EndedAt, int Result);
+
+    /// <summary>
+    /// Declare a war. Returns the new war id, or 0 when this exact pair is already at war -
+    /// the unique index on (attacker, defender) is what makes the second declare a no-op rather
+    /// than a duplicate row.
+    /// </summary>
+    public long DeclareGuildWar(int attackGuildId, int defendGuildId, long declaredAt, long money,
+                                int state = GuildWarStateDeclared)
+    {
+        lock (_lock)
+        {
+            using (var ins = _db.CreateCommand())
+            {
+                ins.CommandText =
+                    "INSERT INTO guild_wars(attack_guild_id, defend_guild_id, declared_at, money, state) " +
+                    "VALUES($a,$d,$t,$m,$s) ON CONFLICT(attack_guild_id, defend_guild_id) DO NOTHING";
+                ins.Parameters.AddWithValue("$a", attackGuildId);
+                ins.Parameters.AddWithValue("$d", defendGuildId);
+                ins.Parameters.AddWithValue("$t", declaredAt);
+                ins.Parameters.AddWithValue("$m", money);
+                ins.Parameters.AddWithValue("$s", state);
+                if (ins.ExecuteNonQuery() != 1) return 0;   // already at war with them
+            }
+            using var get = _db.CreateCommand();
+            get.CommandText =
+                "SELECT war_id FROM guild_wars WHERE attack_guild_id=$a AND defend_guild_id=$d";
+            get.Parameters.AddWithValue("$a", attackGuildId);
+            get.Parameters.AddWithValue("$d", defendGuildId);
+            object? id = get.ExecuteScalar();
+            return id is long l ? l : 0;
+        }
+    }
+
+    /// <summary>The state a freshly declared war carries - the value the capture s window shows.</summary>
+    public const int GuildWarStateDeclared = 6;
+
+    /// <summary>Every live war this guild is on either side of, oldest first.</summary>
+    public List<GuildWarRow> GetGuildWars(int guildId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "SELECT war_id, attack_guild_id, defend_guild_id, declared_at, money, state " +
+                "FROM guild_wars WHERE attack_guild_id=$g OR defend_guild_id=$g ORDER BY war_id";
+            cmd.Parameters.AddWithValue("$g", guildId);
+            var rows = new List<GuildWarRow>();
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                rows.Add(new GuildWarRow(r.GetInt64(0), r.GetInt32(1), r.GetInt32(2),
+                                         r.GetInt64(3), r.GetInt64(4), r.GetInt32(5)));
+            return rows;
+        }
+    }
+
+    /// <summary>The live war between these two, in either direction, or null.</summary>
+    public GuildWarRow? GetGuildWarBetween(int guildA, int guildB)
+    {
+        foreach (var w in GetGuildWars(guildA))
+            if ((w.AttackGuildId == guildA && w.DefendGuildId == guildB)
+                || (w.AttackGuildId == guildB && w.DefendGuildId == guildA)) return w;
+        return null;
+    }
+
+    /// <summary>
+    /// End a war: the live row moves to guild_war_history with a result. Returns the row that
+    /// was moved, or null when there was no such war.
+    /// </summary>
+    public GuildWarHistoryRow? EndGuildWar(long warId, int result, long endedAt)
+    {
+        lock (_lock)
+        {
+            GuildWarRow? live = null;
+            using (var get = _db.CreateCommand())
+            {
+                get.CommandText =
+                    "SELECT war_id, attack_guild_id, defend_guild_id, declared_at, money, state " +
+                    "FROM guild_wars WHERE war_id=$w";
+                get.Parameters.AddWithValue("$w", warId);
+                using var r = get.ExecuteReader();
+                if (r.Read())
+                    live = new GuildWarRow(r.GetInt64(0), r.GetInt32(1), r.GetInt32(2),
+                                           r.GetInt64(3), r.GetInt64(4), r.GetInt32(5));
+            }
+            if (live == null) return null;
+
+            using (var ins = _db.CreateCommand())
+            {
+                ins.CommandText =
+                    "INSERT INTO guild_war_history(war_id, attack_guild_id, defend_guild_id, " +
+                    "declared_at, ended_at, result) VALUES($w,$a,$d,$t,$e,$r)";
+                ins.Parameters.AddWithValue("$w", live.WarId);
+                ins.Parameters.AddWithValue("$a", live.AttackGuildId);
+                ins.Parameters.AddWithValue("$d", live.DefendGuildId);
+                ins.Parameters.AddWithValue("$t", live.DeclaredAt);
+                ins.Parameters.AddWithValue("$e", endedAt);
+                ins.Parameters.AddWithValue("$r", result);
+                ins.ExecuteNonQuery();
+            }
+            using (var del = _db.CreateCommand())
+            {
+                del.CommandText = "DELETE FROM guild_wars WHERE war_id=$w";
+                del.Parameters.AddWithValue("$w", warId);
+                del.ExecuteNonQuery();
+            }
+            return new GuildWarHistoryRow(live.WarId, live.AttackGuildId, live.DefendGuildId,
+                                          live.DeclaredAt, endedAt, result);
+        }
+    }
+
+    /// <summary>Finished wars this guild was on either side of, newest first.</summary>
+    public List<GuildWarHistoryRow> GetGuildWarHistory(int guildId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "SELECT war_id, attack_guild_id, defend_guild_id, declared_at, ended_at, result " +
+                "FROM guild_war_history WHERE attack_guild_id=$g OR defend_guild_id=$g " +
+                "ORDER BY id DESC";
+            cmd.Parameters.AddWithValue("$g", guildId);
+            var rows = new List<GuildWarHistoryRow>();
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                rows.Add(new GuildWarHistoryRow(r.GetInt64(0), r.GetInt32(1), r.GetInt32(2),
+                                                r.GetInt64(3), r.GetInt64(4), r.GetInt32(5)));
+            return rows;
+        }
+    }
+
+    /// <summary>
+    /// How many wars this guild has DECLARED - live plus finished. This is what
+    /// S_OPEN_GUILD_WAR_WINDOW.thisGuildDeclareCount carries: cap_social4_client frame 3389 has
+    /// 1 right after the declare and frame 4453 still has 1 after the withdraw, so it counts
+    /// declarations made, not wars currently running.
+    /// </summary>
+    public int CountGuildWarDeclarations(int guildId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "SELECT (SELECT COUNT(*) FROM guild_wars WHERE attack_guild_id=$g) + " +
+                "(SELECT COUNT(*) FROM guild_war_history WHERE attack_guild_id=$g)";
+            cmd.Parameters.AddWithValue("$g", guildId);
+            return Convert.ToInt32(cmd.ExecuteScalar(), System.Globalization.CultureInfo.InvariantCulture);
+        }
+    }
+
     public List<GuildMemberRow> GetGuildMembers(int guildId)
     {
         lock (_lock)

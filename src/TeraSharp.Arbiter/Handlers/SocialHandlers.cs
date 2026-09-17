@@ -32,6 +32,7 @@ public sealed class SocialHandlers
         PartyWiring.UsePartyLogger(log);   // T49: and so does the party manager
         GuildWiring.UseGuildLogger(log);    // T51: and the guild handler
         PartyMatchManager.UseLogger(log);   // T78: and the party board
+        GuildWarManager.UseLogger(log);     // T80: and guild war
     }
 
     // ---- Limits and constants, all from the decompile (status/FRIENDS.md section 3) ----
@@ -194,6 +195,9 @@ public sealed class SocialHandlers
         // Riding this call rather than adding a line to the human-owned WorldEntry is the
         // same choice T49 and T51 made two lines up.
         NotifyFriendsOfState(session!, FriendStateOnline);
+        // T80: guild war pushes AS_NOTIFY_GUILD_WAR_INFO to World and S_TOTAL_GUILD_WAR_DATA
+        // to the client on this same edge - tap 5094/5846/5950 all sit at an enter-world.
+        GuildWarManager.OnEnterWorld(session);
     }
 
     internal static void UnregisterSession(string characterName)

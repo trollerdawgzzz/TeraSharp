@@ -87,6 +87,61 @@ array    friends
 ";
 
     /// <summary>
+    /// S_OPEN_GUILD_WAR_WINDOW for 100.02 - T80. The shipped def
+    /// (S_OPEN_GUILD_WAR_WINDOW.1) carries ONLY the two int32 counters and no war list at all,
+    /// so it cannot describe a window with a war in it.
+    /// <para>Proof: the writer at Arb_part_059.c:2659 advances the body by <c>0x48</c> = 72
+    /// bytes per element and writes, in order, a longlong at +12, a byte at +20, a u32 at +21,
+    /// a u64 at +25, a u32 at +33, a byte at +37, then the same six again from +38, then a u64
+    /// date at +64 - here/next 4 + four string offsets 8 + two 26-byte guild blocks + 8 = 72.
+    /// cap_social4_client frame 3389 is byte-for-byte that.</para>
+    /// </summary>
+    public const string OpenGuildWarWindow = @"
+int32    thisGuildDeclareCount
+int32    thisGuildDeclareLimit
+array    wars
+- int64  attackGuildId
+- byte   attackFlag
+- int32  attackUnk1
+- int64  attackMoney
+- int32  attackUnk2
+- byte   attackUnk3
+- int64  defendGuildId
+- byte   defendFlag
+- int32  defendUnk1
+- int64  defendMoney
+- int32  defendUnk2
+- byte   defendUnk3
+- int64  date
+- string attackName
+- string attackEmblem
+- string defendName
+- string defendEmblem
+";
+
+    /// <summary>
+    /// S_CHECK_TO_DECLARE_GUILD_WAR for 100.02 - T80. The shipped def has ONE int32 after the
+    /// three strings; the writer has THREE.
+    /// <para>Proof: the send at Arb_part_058.c:8227 is
+    /// <c>SendToSession&lt;PKT_S_CHECK_TO_DECLARE_GUILD_WAR_WRITE, bool, const wchar_t*,
+    /// const wchar_t*, const wchar_t*, int&amp;, int&amp;, int&amp;&gt;</c> and it writes a bool
+    /// then three u32 then the three strings - 19 fixed bytes, which is exactly where the
+    /// @1788 string starts in cap_social4_client frame 3382. With one int32 it would be 11 and
+    /// every string offset after it would be garbage.</para>
+    /// <para>The last two are named from their values: 0 and 10 in that frame, the same pair
+    /// S_OPEN_GUILD_WAR_WINDOW carries two frames later.</para>
+    /// </summary>
+    public const string CheckToDeclareGuildWar = @"
+byte     result
+int32    guildWarMoney
+int32    thisGuildDeclareCount
+int32    thisGuildDeclareLimit
+string   reasonSysMsgFormatted
+string   myGuildImageId
+string   opponentGuildImageId
+";
+
+    /// <summary>
     /// Register every 100.02 override on this registry, once. Safe to call on every packet -
     /// the registry is a process singleton and the second call is a dictionary probe.
     /// </summary>
@@ -98,6 +153,8 @@ array    friends
             if (Done.TryGetValue(defs, out _)) return;
             defs.Register(DefinitionParser.ParseText("S_FRIEND_LIST", FriendList, Version));
             defs.Register(DefinitionParser.ParseText("S_UPDATE_FRIEND_INFO", UpdateFriendInfo, Version));
+            defs.Register(DefinitionParser.ParseText("S_OPEN_GUILD_WAR_WINDOW", OpenGuildWarWindow, Version));
+            defs.Register(DefinitionParser.ParseText("S_CHECK_TO_DECLARE_GUILD_WAR", CheckToDeclareGuildWar, Version));
             Done.Add(defs, new object());
         }
     }

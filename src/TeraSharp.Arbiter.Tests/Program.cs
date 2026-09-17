@@ -9016,6 +9016,232 @@ array    friends
         Hex.Eq(BitConverter.GetBytes(419L), "A3 01 00 00 00 00 00 00",
             "frame 11 element +287..295 for dob: restBonusXp 419");
     }
+    // =======================================================================================
+    // T80 - GuildWarManager. Research: status/GUILD-WAR.md.
+    //
+    // Ground truth is cap_social4: one complete episode on one client (frames 1621..4453) and
+    // two A->W pushes on the tap (6023 and 7468).
+    // =======================================================================================
+
+    /// <summary>The guild-war defs: the two 100.02 corrections plus the two shipped ones that
+    /// are already right.</summary>
+    static DefinitionRegistry CreateT80Defs()
+    {
+        var reg = new DefinitionRegistry(QuietLog());
+        V100Definitions.EnsureRegistered(reg);   // S_OPEN_GUILD_WAR_WINDOW, S_CHECK_TO_DECLARE_GUILD_WAR
+        reg.RegisterFromDef("S_VIEW_GUILD_WAR", @"
+int32 page
+int32 maxPages
+array battles
+- int32 result
+- int64 date
+- string attackName
+- string attackEmblem
+- string defendName
+- string defendEmblem
+");
+        reg.RegisterFromDef("S_TOTAL_GUILD_WAR_DATA", "int32 countOfGuildWar" + "\n");
+        return reg;
+    }
+
+    /// <summary>The one war of cap_social4, as a row.</summary>
+    static TeraSharp.Arbiter.Persistence.CharacterStore.GuildWarRow T80War()
+        => new(WarId: 1, AttackGuildId: 2, DefendGuildId: 3,
+               DeclaredAt: 1789608618, Money: GuildWarManager.DeclareCost,
+               State: TeraSharp.Arbiter.Persistence.CharacterStore.GuildWarStateDeclared);
+
+    /// <summary>
+    /// T80 - every guild-war frame, byte-exact against cap_social4.
+    ///
+    /// <para>Two of these only reproduce because of a corrected def.
+    /// <b>S_OPEN_GUILD_WAR_WINDOW.1 has no war list at all</b> - two int32s and nothing else -
+    /// yet frame 3389 is 108 bytes with one war in it; the writer (Arb_part_059.c:2659) advances
+    /// 0x48 = 72 bytes per element. <b>S_CHECK_TO_DECLARE_GUILD_WAR.1 has one int32 where the
+    /// writer has three</b>: its send is templated on
+    /// <c>&lt;bool, const wchar_t*, const wchar_t*, const wchar_t*, int&amp;, int&amp;, int&amp;&gt;</c>
+    /// (Arb_part_058.c:8220), so the fixed part is 19 bytes and not 11 - which is exactly where
+    /// the @1788 string starts in frame 3382.</para>
+    /// </summary>
+    [Test] public static void T80_guild_war_frames_match_cap_social4()
+    {
+        var reg = CreateT80Defs();
+
+        // frame 1623 - the window before anything happened
+        Hex.Eq(WriteByDef(reg, "S_OPEN_GUILD_WAR_WINDOW",
+                GuildWarManager.BuildWindowFields(0, Array.Empty<object>())),
+            "00 00  00 00  00 00 00 00  0A 00 00 00",
+            "frame 1623: no wars, 0 declared, limit 10");
+
+        // frame 4453 - the window after the withdrawal: still one declaration on the counter
+        Hex.Eq(WriteByDef(reg, "S_OPEN_GUILD_WAR_WINDOW",
+                GuildWarManager.BuildWindowFields(1, Array.Empty<object>())),
+            "00 00  00 00  01 00 00 00  0A 00 00 00",
+            "frame 4453: the war is gone but thisGuildDeclareCount stays 1");
+
+        // frame 3389 - the window with the war in it, all 104 body bytes
+        var row = GuildWarManager.BuildWarRow(T80War(), "sdg", "fdh");
+        Hex.Eq(WriteByDef(reg, "S_OPEN_GUILD_WAR_WINDOW",
+                GuildWarManager.BuildWindowFields(1, new object[] { row })),
+            "01 00  10 00  01 00 00 00  0A 00 00 00  "
+            + "10 00  00 00  58 00  60 00  62 00  6A 00  "
+            + "02 00 00 00 00 00 00 00  01  00 00 00 00  DC 05 00 00 00 00 00 00  FA 00 00 00  00  "
+            + "03 00 00 00 00 00 00 00  00  00 00 00 00  00 00 00 00 00 00 00 00  FA 00 00 00  00  "
+            + "AA 42 AB 6A 00 00 00 00  "
+            + "73 00 64 00 67 00 00 00  00 00  66 00 64 00 68 00 00 00  00 00",
+            "frame 3389: 72-byte element - two 26-byte guild blocks and an int64 date");
+
+        // frame 1628 - page 1 of an empty history
+        Hex.Eq(WriteByDef(reg, "S_VIEW_GUILD_WAR",
+                GuildWarManager.BuildViewFields(1, 0, Array.Empty<object>())),
+            "00 00  00 00  01 00 00 00  00 00 00 00", "frame 1628: page 1, no pages, no battles");
+
+        // frame 3382 - may I declare on fdh?
+        Hex.Eq(WriteByDef(reg, "S_CHECK_TO_DECLARE_GUILD_WAR", GuildWarManager.BuildCheckFields(true, 0)),
+            "17 00  23 00  25 00  01  DC 05 00 00  00 00 00 00  0A 00 00 00  "
+            + "40 00 31 00 37 00 38 00 38 00 00 00  00 00  00 00",
+            "frame 3382: yes, 1500 gold, 0 of 10 declared, @1788, no emblems");
+
+        // frame 3214 - the login push
+        Hex.Eq(WriteByDef(reg, "S_TOTAL_GUILD_WAR_DATA", GuildWarManager.BuildTotalFields(0)),
+            "00 00 00 00", "frame 3214: no wars at login");
+
+        // tap 6023 / 7468 / 5846 - the three A->W pushes
+        Hex.Eq(GuildWarManager.BuildAsDeclare(1, 2, 3),
+            "01 00 00 00 00 00 00 00  02 00 00 00  03 00 00 00  00",
+            "tap 6023 AS_DECLARE_GUILD_WAR: int64 war id, then the two guild ids, then a byte");
+        Hex.Eq(GuildWarManager.BuildAsEnd(1, 2, 3, GuildWarManager.ResultWithdrew),
+            "01 00 00 00 00 00 00 00  02 00 00 00  03 00 00 00  01 00 00 00",
+            "tap 7468 AS_END_GUILD_WAR: the same pair, reason 1 = withdrew");
+        Hex.Eq(GuildWarManager.BuildAsNotify(1003, inGuild: true), "EB 03 00 00 01",
+            "tap 5846 AS_NOTIFY_GUILD_WAR_INFO for a guild member");
+        Hex.Eq(GuildWarManager.BuildAsNotify(2, inGuild: false), "02 00 00 00 00",
+            "tap 5094: the same push for a character with no guild");
+    }
+
+    /// <summary>
+    /// T80 - the element and fixed-part sizes the two corrected defs produce, so a later edit
+    /// cannot let the shipped ones leak back. Same guard T30 put on S_FRIEND_LIST.
+    /// </summary>
+    [Test] public static void T80_guild_war_defs_are_the_100_02_layouts()
+    {
+        var reg = CreateT80Defs();
+        var body = WriteByDef(reg, "S_OPEN_GUILD_WAR_WINDOW",
+            GuildWarManager.BuildWindowFields(1, new object[]
+                { GuildWarManager.BuildWarRow(T80War(), "sdg", "fdh") }));
+        int first = BitConverter.ToUInt16(body, 2) - 4;
+        int nameOffset = BitConverter.ToUInt16(body, first + 4) - 4;   // here, next, then attackName
+        Hex.True(nameOffset - first == 0x48,
+            $"the writer advances 0x48 per war element; got {nameOffset - first}. "
+            + "8 means the shipped S_OPEN_GUILD_WAR_WINDOW.1 (no array at all) leaked back.");
+
+        var check = WriteByDef(reg, "S_CHECK_TO_DECLARE_GUILD_WAR", GuildWarManager.BuildCheckFields(true, 0));
+        Hex.True(BitConverter.ToUInt16(check, 0) - 4 == 19,
+            $"the fixed part is 19 bytes - three int32, not one; got {BitConverter.ToUInt16(check, 0) - 4}");
+    }
+
+    /// <summary>
+    /// T80 - the episode, in the order cap_social4_client.log has it. Every step goes through
+    /// <see cref="GuildWarManager.Decide"/>, which is what the live handler calls.
+    /// </summary>
+    [Test] public static void T80_the_guild_war_episode_follows_the_capture()
+    {
+        using var store = StoreWithTwoAccounts();
+        GuildWarManager.Store = store;
+        try
+        {
+            // Guild 1 is a throwaway so the two that matter get the capture s own ids.
+            store.CreateGuild("filler", 1, warAcceptable: true);
+            int sdg = store.CreateGuild("sdg", 1, warAcceptable: true);
+            int fdh = store.CreateGuild("fdh", 2, warAcceptable: true);
+            Hex.True(sdg == 2 && fdh == 3, $"the capture s guild ids; got {sdg} and {fdh}");
+            store.AddGuildMember(sdg, 1, "New", 4, 12, 1, 20, 1);
+            store.AddGuildMember(fdh, 2, "Other", 4, 12, 1, 20, 1);
+
+            // 1621 -> 1623: the window is empty
+            var a = GuildWarManager.Decide(1, GuildWarManager.C_OPEN_GUILD_WAR_WINDOW, default, 0);
+            Hex.True(ChatSeq(a).Count == 1 && ChatSeq(a)[0] == (1, "S_OPEN_GUILD_WAR_WINDOW"),
+                "opening the window answers with one packet");
+            Hex.True(((List<object>)ChatFields(a, 0)["wars"]).Count == 0, "and no wars");
+
+            // 1691: checking your OWN guild gets silence - no S_CHECK_TO_DECLARE_GUILD_WAR at all
+            a = GuildWarManager.Decide(1, GuildWarManager.C_CHECK_TO_DECLARE_GUILD_WAR,
+                    Hex.B("06 00  73 00 64 00 67 00 00 00"), 0);
+            Hex.True(ChatSeq(a).Count == 0, "frame 1691 named the player s own guild and got no reply");
+
+            // 3381 -> 3382
+            a = GuildWarManager.Decide(1, GuildWarManager.C_CHECK_TO_DECLARE_GUILD_WAR,
+                    Hex.B("06 00  66 00 64 00 68 00 00 00"), 0);
+            Hex.True(ChatSeq(a).Count == 1 && ChatSeq(a)[0] == (1, "S_CHECK_TO_DECLARE_GUILD_WAR"),
+                "naming another guild does get an answer");
+            Hex.True(Convert.ToInt32(ChatFields(a, 0)["thisGuildDeclareCount"]) == 0,
+                "and it reports 0 declarations so far");
+
+            // 3384 -> 3387 + tap 6023
+            a = GuildWarManager.Decide(1, GuildWarManager.C_DECLARE_GUILD_WAR,
+                    Hex.B("06 00  66 00 64 00 68 00 00 00"), 1789608618);
+            Hex.True(ChatSeq(a).Count == 1 && ChatSeq(a)[0] == (1, "S_NOTIFY_GUILD_WAR_STATUS_CHANGE"),
+                "the declare answers the client with the empty status packet");
+            var worldFrames = new List<(ushort Op, byte[] Payload)>();
+            foreach (var item in a.Ordered)
+                if (item is IArbiterWorldAction w) worldFrames.Add((w.Opcode, w.Payload));
+            Hex.True(worldFrames.Count == 1 && worldFrames[0].Op == GuildWarManager.AS_DECLARE_GUILD_WAR,
+                "and pushes exactly one A->W frame");
+            Hex.Eq(worldFrames[0].Payload,
+                "01 00 00 00 00 00 00 00  02 00 00 00  03 00 00 00  00", "tap 6023, byte for byte");
+
+            // 3388 -> 3389: the window now has the war, and the counter moved
+            a = GuildWarManager.Decide(1, GuildWarManager.C_OPEN_GUILD_WAR_WINDOW, default, 0);
+            var wars = (List<object>)ChatFields(a, 0)["wars"];
+            Hex.True(wars.Count == 1, "one war in the window");
+            var war = (Dictionary<string, object>)wars[0];
+            Hex.True(Convert.ToInt64(war["attackGuildId"]) == 2 && Convert.ToInt64(war["defendGuildId"]) == 3
+                     && (string)war["attackName"] == "sdg" && (string)war["defendName"] == "fdh",
+                "attacker and defender, by id and by name");
+            Hex.True(Convert.ToInt64(war["date"]) == 1789608618,
+                "the date is the declare second - frame 3389 has 2026-09-17T01:30:18Z");
+            Hex.True(Convert.ToInt32(ChatFields(a, 0)["thisGuildDeclareCount"]) == 1, "one declaration");
+
+            // declaring the same war twice is refused, and does not add a second row
+            a = GuildWarManager.Decide(1, GuildWarManager.C_DECLARE_GUILD_WAR,
+                    Hex.B("06 00  66 00 64 00 68 00 00 00"), 1789608619);
+            Hex.True(a.Rejected != null && ChatSeq(a).Count == 0, "a second declare on the same guild is refused");
+            Hex.True(store.GetGuildWars(sdg).Count == 1, "and the table still holds one war");
+
+            // 4449 -> 4450 + tap 7468. The int32 is the OPPONENT s guild id, not a war id.
+            a = GuildWarManager.Decide(1, GuildWarManager.C_WITHDRAW_GUILD_WAR,
+                    Hex.B("03 00 00 00"), 1789609000);
+            Hex.True(ChatSeq(a).Count == 1 && ChatSeq(a)[0] == (1, "S_NOTIFY_GUILD_WAR_STATUS_CHANGE"),
+                "the withdrawal answers with the same empty packet");
+            worldFrames.Clear();
+            foreach (var item in a.Ordered)
+                if (item is IArbiterWorldAction w) worldFrames.Add((w.Opcode, w.Payload));
+            Hex.True(worldFrames.Count == 1 && worldFrames[0].Op == GuildWarManager.AS_END_GUILD_WAR,
+                "and pushes AS_END_GUILD_WAR");
+            Hex.Eq(worldFrames[0].Payload,
+                "01 00 00 00 00 00 00 00  02 00 00 00  03 00 00 00  01 00 00 00", "tap 7468, byte for byte");
+
+            // 4452 -> 4453: empty again, counter still 1, and the war is in the history
+            a = GuildWarManager.Decide(1, GuildWarManager.C_OPEN_GUILD_WAR_WINDOW, default, 0);
+            Hex.True(((List<object>)ChatFields(a, 0)["wars"]).Count == 0, "no live wars left");
+            Hex.True(Convert.ToInt32(ChatFields(a, 0)["thisGuildDeclareCount"]) == 1,
+                "but the declaration still counts - frame 4453 carries 1");
+            var history = store.GetGuildWarHistory(sdg);
+            Hex.True(history.Count == 1 && history[0].Result == GuildWarManager.ResultWithdrew
+                     && history[0].EndedAt == 1789609000,
+                "and GuildWarHistory has the finished war with result 1");
+
+            // the enter-world pair
+            a = GuildWarManager.OnEnterWorld(1);
+            Hex.True(ChatSeq(a).Count == 1 && ChatSeq(a)[0] == (1, "S_TOTAL_GUILD_WAR_DATA"),
+                "entering the world sends the war count to the client");
+            worldFrames.Clear();
+            foreach (var item in a.Ordered)
+                if (item is IArbiterWorldAction w) worldFrames.Add((w.Opcode, w.Payload));
+            Hex.Eq(worldFrames[0].Payload, "01 00 00 00 01",
+                "and pushes AS_NOTIFY_GUILD_WAR_INFO with the in-a-guild byte set");
+        }
+        finally { GuildWarManager.ResetForTests(); }
+    }
     // ---- The rules ----
 
     [Test] public static void T30_system_message_format_matches_the_capture()
