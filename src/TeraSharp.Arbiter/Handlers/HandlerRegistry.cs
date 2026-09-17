@@ -182,6 +182,10 @@ public static class HandlerRegistry
         Reg("C_WATCHED_MOVIES",  ArbiterClientHandlers.WatchedMoviesBodySize,  (s, b) => ArbiterClientHandlers.OnWatchedMovies(s, b, misc));
         Reg("C_FINDNAME",        ArbiterClientHandlers.FindNameBodySize,       (s, b) => ArbiterClientHandlers.OnFindName(s, b, misc));
         ArbiterClientHandlers.PartyLookup = id => PartyWiring.Manager.FindByMember(id) != null;
+        // T82: the skill-polishing panel (all-zero forms, cap_social4_client2 145/146).
+        // C_GET_USER_GUILD_LOGO is already registered by GuildWiring (T51).
+        Reg("C_RQ_SKILL_POLISHING_LIST", 0, (s, b) => ArbiterClientHandlers.OnRqSkillPolishingList(s, b, misc));
+        Reg("C_RQ_SKILL_POLISHING_EXP_INFO", 0, (s, b) => ArbiterClientHandlers.OnRqSkillPolishingExpInfo(s, b, misc));
         foreach (var name in new[]
         {
             "C_REQUEST_GUILD_LIST", "C_DUNGEON_COOL_TIME_LIST", "C_VIEW_BATTLE_FIELD_RESULT",
@@ -279,8 +283,7 @@ public static class HandlerRegistry
         RegNoop("C_SET_VISIBLE_RANGE");
         RegNoop("C_HARDWARE_INFO");
         RegNoop("C_CHANGE_USER_LOBBY_SLOT_ID");
-        RegNoop("C_RQ_SKILL_POLISHING_LIST");
-        RegNoop("C_RQ_SKILL_POLISHING_EXP_INFO");
+        // C_RQ_SKILL_POLISHING_LIST / _EXP_INFO: real replies since T82 (registered above)
         RegNoop("C_REQUEST_INGAMESTORE_PRODUCT_LIST");
         RegNoop("C_REQUEST_GUILD_PERK_LIST");
         RegNoop("C_SET_SERVANT_SEQUENCE");
