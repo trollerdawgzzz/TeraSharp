@@ -1,4 +1,4 @@
-using System.Text;
+﻿using System.Text;
 using Microsoft.Extensions.Logging;
 using TeraSharp.Arbiter.Game;
 using TeraSharp.Arbiter.Network;
@@ -654,7 +654,7 @@ public static class GmAdminTool
     /// <summary>The gate. Same level the chat commands need, resolved the same way.</summary>
     private static bool Allowed(GameSession s, ILogger log, string what)
     {
-        if (GmCommands.LevelOf(s, Program.Store) >= GmAccounts.MinimumAdminLevel) return true;
+        if (GmCommandHandlers.LevelOf(s, Program.Store) >= GmAccounts.MinimumAdminLevel) return true;
         log.LogWarning("{What}: {Name} is not a GM - dropped", what, s.SelectedCharacter?.Name);
         return false;
     }
@@ -663,7 +663,7 @@ public static class GmAdminTool
     public static bool OnRequestCustomBookmark(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
     {
         if (!Allowed(s, log, "C_ADMIN_REQUEST_CUSTOM_BOOKMARK")) return true;
-        long account = s.Account?.Id ?? 0;
+        long account = (long)(s.Account?.AccountId ?? 0);
         var rows = account > 0 ? Program.Store?.GetGmBookmarks(account) : null;
         s.Send(ArbiterClientHandlers.BuildAdminBookmarkList(
             ArbiterClientHandlers.S_ADMIN_CUSTOM_BOOKMARK_LIST, rows));
@@ -692,7 +692,7 @@ public static class GmAdminTool
     {
         if (!Allowed(s, log, "C_ADMIN_ADD_CUSTOM_BOOKMARK")) return true;
         var b = body.Span;
-        long account = s.Account?.Id ?? 0;
+        long account = (long)(s.Account?.AccountId ?? 0);
         if (b.Length >= AddBookmarkBodySize && account > 0 && Program.Store is not null)
         {
             int index = BitConverter.ToInt32(b[2..]);

@@ -1917,7 +1917,7 @@ public static class ArbiterClientHandlers
     /// (gm_client 443 / 1139, gm_client2 402 / 675). It is pushed at enter-world - a held
     /// character is one the tool has frozen.</summary>
     public static byte[] BuildAdminHoldCharacter(bool held = false)
-        => new byte[] { 0x05, 0x00, (byte)S_ADMIN_HOLD_CHARACTER, (byte)(S_ADMIN_HOLD_CHARACTER >> 8),
+        => new byte[] { 0x05, 0x00, unchecked((byte)S_ADMIN_HOLD_CHARACTER), (byte)(S_ADMIN_HOLD_CHARACTER >> 8),
                         (byte)(held ? 1 : 0) };
 
     /// <summary>

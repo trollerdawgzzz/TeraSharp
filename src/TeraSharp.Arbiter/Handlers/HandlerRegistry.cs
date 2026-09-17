@@ -79,6 +79,8 @@ public static class HandlerRegistry
                 s.Send(ArbiterClientHandlers.BuildVisitedSectionListFor(s));   // T75/T79: FIRST in the burst, as frame 257 - S_VISITED_SECTION_LIST from visited_sections (stops the intro cutscene replaying)
                 s.Send(ArbiterClientHandlers.BuildCrestInfoFor(s));            // T83: crest points + learned crests (frames 304/314)
                 s.Send(ArbiterClientHandlers.BuildChangeCardPreset());         // T83: card preset (frames 329/375)
+                s.Send(ArbiterClientHandlers.BuildAdminHoldCharacter());       // T89: frame 402
+                s.Send(ArbiterClientHandlers.BuildAdminGmSkill(0, on: true));  // T89: frame 99
                 Program.World?.SendFrame(WorldBridge.OpUpdateVisitedSection,
                     ArbiterClientHandlers.BuildUpdateVisitedSectionList(s.PlayerId,
                         Program.Store?.GetVisitedSections((int)s.SelectedCharacter!.Id)
@@ -214,6 +216,17 @@ public static class HandlerRegistry
         Reg("C_SECOND_PASSWORD_REGISTER", ArbiterClientHandlers.SecondPasswordBodySize, (s,b) => ArbiterClientHandlers.OnSecondPassword(s,b,misc));
         Reg("C_REFRESH_API_ACCESS_TOKEN", ArbiterClientHandlers.RefreshApiAccessTokenBodySize, (s,b) => ArbiterClientHandlers.OnRefreshApiAccessToken(s,b,misc));
         Reg("C_CANCEL_EXIT", 0, (s,b) => ArbiterClientHandlers.OnCancelExit(s,b,misc));
+        // T89: In-Game Operation Tool (Alt+A) - gated on the GM level inside GmAdminTool
+        Reg("C_ADMIN_REQUEST_CUSTOM_BOOKMARK", 4,  (s, b) => GmAdminTool.OnRequestCustomBookmark(s, b, misc));
+        Reg("C_ADMIN_REQUEST_DEFAULT_BOOKMARK", 4, (s, b) => GmAdminTool.OnRequestDefaultBookmark(s, b, misc));
+        Reg("C_ADMIN_ADD_CUSTOM_BOOKMARK", 22,     (s, b) => GmAdminTool.OnAddCustomBookmark(s, b, misc));
+        Reg("C_ADMIN_GMEVENT_STATUS", 0,           (s, b) => GmAdminTool.OnGmEventStatus(s, b, misc));
+        Reg("C_ADMIN_CHECK_USERNAME", 14,          (s, b) => GmAdminTool.OnCheckUsername(s, b, misc));
+        Reg("C_ADMIN_GET_USER_INFO_BY_DBID", 8,    (s, b) => GmAdminTool.OnGetUserInfoByDbId(s, b, misc));
+        Reg("C_ADMIN_GET_USER_INFO_LIST_BY_DISTANCE", 4, (s, b) => GmAdminTool.OnGetUserInfoListByDistance(s, b, misc));
+        Reg("C_ADMIN_WARNING_MESSAGE", 6,          (s, b) => GmAdminTool.OnWarningMessage(s, b, misc));
+        Reg("C_ADMIN_GM_SKILL", 12,                (s, b) => GmAdminTool.OnGmSkill(s, b, misc));
+        GmAdminTool.OnlineSessions = () => Program.World?.InWorldSessions() ?? new List<GameSession>();
         foreach (var name in new[]
         {
             "C_REQUEST_GUILD_LIST", "C_DUNGEON_COOL_TIME_LIST", "C_VIEW_BATTLE_FIELD_RESULT",
