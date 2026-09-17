@@ -1079,6 +1079,21 @@ CREATE TABLE IF NOT EXISTS parcels (
 );
 CREATE INDEX IF NOT EXISTS ix_parcels_receiver ON parcels(receiver_db_id);
 
+-- T84: the account s cash-shop packages / benefits. Two client packets read this, both in
+-- the LOBBY burst before any character is picked - S_ACCOUNT_PACKAGE_LIST
+-- (cap_social4_client frame 14, three rows) and S_ACCOUNT_BENEFIT_LIST (frames 47 and 48,
+-- one row then two). A row, not a column on accounts: the list is variable-length and the
+-- capture already shows three entries for one account.
+-- expires_at is a unix second count; value is the number the benefit list carries in the
+-- slot the shipped def calls unk1 (0x23E726 and 0x12867226 in the capture).
+CREATE TABLE IF NOT EXISTS account_benefits (
+  account_id  INTEGER NOT NULL REFERENCES accounts(id),
+  package_id  INTEGER NOT NULL,
+  expires_at  INTEGER NOT NULL DEFAULT 0,
+  value       INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (account_id, package_id)
+);
+
 -- T71: the trade broker's listings. One row per registered item, from
 -- SDB_TRADE_BROKER_REGISTER_ITEM until the seller collects the proceeds or cancels.
 -- `trade_id` is the TradeId every broker frame keys on and the client shows; `state` is the
@@ -4368,6 +4383,61 @@ DELETE FROM guild_members     WHERE user_db_id = $id;";
     }
 
     // ============================================================ T42: warehouses
+
+    // ---------------------------------------------------------------- T84: account benefits
+
+    /// <summary>One cash-shop package / benefit on an account. <c>ExpiresAt</c> is
+    /// unix seconds - the capture s three rows expire 1791961199, 2100409199 and 1786777199.</summary>
+    public sealed record AccountBenefitRow(long AccountId, int PackageId, long ExpiresAt, long Value);
+
+    /// <summary>Every benefit on this account, in package order.</summary>
+    public List<AccountBenefitRow> GetAccountBenefits(long accountId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "SELECT account_id, package_id, expires_at, value FROM account_benefits " +
+                "WHERE account_id=$a ORDER BY package_id";
+            cmd.Parameters.AddWithValue("$a", accountId);
+            var rows = new List<AccountBenefitRow>();
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                rows.Add(new AccountBenefitRow(r.GetInt64(0), r.GetInt32(1), r.GetInt64(2), r.GetInt64(3)));
+            return rows;
+        }
+    }
+
+    /// <summary>Grant or refresh one benefit. Upsert, so re-granting extends rather than duplicates.</summary>
+    public bool GrantAccountBenefit(long accountId, int packageId, long expiresAt, long value = 0)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "INSERT INTO account_benefits(account_id, package_id, expires_at, value) " +
+                "VALUES($a,$p,$e,$v) ON CONFLICT(account_id, package_id) DO UPDATE SET " +
+                "expires_at=excluded.expires_at, value=excluded.value";
+            cmd.Parameters.AddWithValue("$a", accountId);
+            cmd.Parameters.AddWithValue("$p", packageId);
+            cmd.Parameters.AddWithValue("$e", expiresAt);
+            cmd.Parameters.AddWithValue("$v", value);
+            return cmd.ExecuteNonQuery() >= 1;
+        }
+    }
+
+    /// <summary>Drop one benefit. Returns true when a row went.</summary>
+    public bool RevokeAccountBenefit(long accountId, int packageId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "DELETE FROM account_benefits WHERE account_id=$a AND package_id=$p";
+            cmd.Parameters.AddWithValue("$a", accountId);
+            cmd.Parameters.AddWithValue("$p", packageId);
+            return cmd.ExecuteNonQuery() == 1;
+        }
+    }
 
     /// <summary>Money and slot count for one container. Zeroes for a container never used.</summary>
     public (long Money, int SlotCount) GetWarehouse(long ownerDbId, int invenType)

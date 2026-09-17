@@ -1042,6 +1042,130 @@ public static class ArbiterClientHandlers
         return true;
     }
 
+    // =========================================================================================
+    // 15. The lobby account lists, play time and the sellable-item config             (T84)
+    // =========================================================================================
+
+    /// <summary>
+    /// S_ACCOUNT_PACKAGE_LIST (0xE9A9) and S_ACCOUNT_BENEFIT_LIST (0x88E0) - the two cash-shop
+    /// lists the lobby burst carries. <b>Arbiter-built:</b> cap_social4_client frames 14, 47 and
+    /// 48 all arrive BEFORE S_LOGIN at frame 50, so no character is picked and World is not in
+    /// the picture at all. LoginHandlers already sends both - with an EMPTY list, which is why
+    /// nothing the account owns ever showed.
+    ///
+    /// <para>Both shipped defs are RIGHT. <c>S_ACCOUNT_PACKAGE_LIST.3</c> is a 16-byte element
+    /// (<c>uint32 packageId</c>, <c>int64 expirationDate</c>) and frame 14 is 4 + 3 x 16 = 52;
+    /// <c>S_ACCOUNT_BENEFIT_LIST.1</c> is a 29-byte element behind a one-byte header field and
+    /// frame 47 is 5 + 29 = 34, frame 48 5 + 2 x 29 = 63. The three packages in frame 14 are
+    /// 0x215 (533), 0x216 (534) and 0x3E8 (1000), expiring 1791961199, 2100409199 and
+    /// 1786777199.</para>
+    ///
+    /// <para><b>The def name <c>timeRemaining</c> is wrong.</b> Frame 47 carries 1791961199 in
+    /// that slot, the same absolute unix second S_ACCOUNT_PACKAGE_LIST gives package 533 as its
+    /// <c>expirationDate</c> - it is an expiry, not a countdown.</para>
+    /// </summary>
+    public const ushort S_ACCOUNT_PACKAGE_LIST = 0xE9A9;   // 59817
+    /// <inheritdoc cref="S_ACCOUNT_PACKAGE_LIST"/>
+    public const ushort S_ACCOUNT_BENEFIT_LIST = 0x88E0;   // 35040
+
+    /// <summary>S_ACCOUNT_PACKAGE_LIST from the account_benefits rows.</summary>
+    public static Dictionary<string, object> BuildAccountPackageFields(
+        IReadOnlyList<Persistence.CharacterStore.AccountBenefitRow>? benefits)
+    {
+        var rows = new List<object>();
+        foreach (var b in benefits ?? Array.Empty<Persistence.CharacterStore.AccountBenefitRow>())
+            rows.Add(new Dictionary<string, object>
+            {
+                ["packageId"] = (uint)b.PackageId,
+                ["expirationDate"] = b.ExpiresAt,
+            });
+        return new Dictionary<string, object> { ["accountBenefits"] = rows };
+    }
+
+    /// <summary>
+    /// S_ACCOUNT_BENEFIT_LIST from the same rows. The five slots the shipped def calls unk2..unk5
+    /// are 0 in every captured element; <c>unk1</c> is the row s stored value.
+    /// </summary>
+    public static Dictionary<string, object> BuildAccountBenefitFields(
+        IReadOnlyList<Persistence.CharacterStore.AccountBenefitRow>? benefits)
+    {
+        var rows = new List<object>();
+        foreach (var b in benefits ?? Array.Empty<Persistence.CharacterStore.AccountBenefitRow>())
+            rows.Add(new Dictionary<string, object>
+            {
+                ["packageId"] = (uint)b.PackageId,
+                ["unk1"] = (uint)b.Value,
+                ["unk2"] = 0u,
+                ["timeRemaining"] = unchecked((int)b.ExpiresAt),
+                ["unk3"] = 0u,
+                ["unk4"] = 0u,
+                ["unk5"] = (byte)0,
+            });
+        return new Dictionary<string, object>
+        {
+            ["unk"] = (byte)1,   // 01 in frames 47 and 48
+            ["accountBenefits"] = rows,
+        };
+    }
+
+    /// <summary>
+    /// S_SEND_USER_PLAY_TIME (0xA7E0). <b>Arbiter-built.</b> The shipped
+    /// <c>S_SEND_USER_PLAY_TIME.2.def</c> is RIGHT - <c>uint32 totalPlaytime</c> then
+    /// <c>uint64 localServerTime</c>, twelve bytes, which is what cap_social4_client frames 78
+    /// and 2957 are: 237 seconds at unix 1789608265, then 1446 seconds at 1789608607. Both
+    /// numbers move with the session, so it is seconds played and the server s clock.
+    /// LoginHandlers already sends the packet with an empty field set, i.e. two zeroes.
+    /// </summary>
+    public const ushort S_SEND_USER_PLAY_TIME = 0xA7E0;    // 42976
+
+    /// <inheritdoc cref="S_SEND_USER_PLAY_TIME"/>
+    public static Dictionary<string, object> BuildUserPlayTimeFields(int totalPlaySeconds, long serverTimeUnix)
+        => new()
+        {
+            ["totalPlaytime"] = (uint)(totalPlaySeconds < 0 ? 0 : totalPlaySeconds),
+            ["localServerTime"] = (ulong)(serverTimeUnix < 0 ? 0 : serverTimeUnix),
+        };
+
+    /// <summary>
+    /// S_ENABLE_DISABLE_SELLABLE_ITEM_LIST (0x667C). <b>Arbiter-built, and we never sent it.</b>
+    /// cap_social4_client frames 441 and 442 are 39 bytes: three <c>bool</c> flags, all 1, and
+    /// three <c>array&lt;uint32&gt;</c> of which only the SECOND has anything in it - item ids
+    /// 1164, 1167 and 1170. The shipped <c>S_ENABLE_DISABLE_SELLABLE_ITEM_LIST.2.def</c> is
+    /// RIGHT: three array refs (12 bytes) then three bools is a 15-byte header, and 15 + 3 x 8
+    /// is the 39 on the wire.
+    ///
+    /// <para>It is server CONFIG, not per-character state - both captured frames are identical
+    /// and neither follows a request - so the captured values are the default here rather than a
+    /// table. They are the three items the shop may sell.</para>
+    /// </summary>
+    public const ushort S_ENABLE_DISABLE_SELLABLE_ITEM_LIST = 0x667C;   // 26236
+
+    /// <summary>The three item ids frames 441 and 442 carry in the second list.</summary>
+    public static readonly int[] DefaultSellableItems = { 1164, 1167, 1170 };
+
+    /// <inheritdoc cref="S_ENABLE_DISABLE_SELLABLE_ITEM_LIST"/>
+    public static Dictionary<string, object> BuildSellableItemListFields(
+        IReadOnlyList<int>? list1 = null, IReadOnlyList<int>? list2 = null, IReadOnlyList<int>? list3 = null)
+    {
+        // An array<uint32> element is the bare number, not a record: DefinitionWriter calls
+        // WritePrimitive on the item itself when the def gave the array an element kind.
+        static List<object> Ids(IReadOnlyList<int>? src)
+        {
+            var rows = new List<object>();
+            foreach (int id in src ?? Array.Empty<int>()) rows.Add((uint)id);
+            return rows;
+        }
+        return new Dictionary<string, object>
+        {
+            ["enabled1"] = true,
+            ["enabled2"] = true,
+            ["enabled3"] = true,
+            ["items1"] = Ids(list1),
+            ["items2"] = Ids(list2 ?? DefaultSellableItems),
+            ["items3"] = Ids(list3),
+        };
+    }
+
     /// <summary>A NUL-terminated UTF-16LE string, as the inter-server and client writers emit it.</summary>
     public static byte[] WString(string? s)
     {
