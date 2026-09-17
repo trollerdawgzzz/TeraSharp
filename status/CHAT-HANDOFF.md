@@ -124,6 +124,22 @@ and look for the next caller.
 
 ## Next steps (in order)
 
+**Checkpoint 2026-09-16 17:15 - 663 tests, T70-T73 merged.** Captures: cap_social3 (broker with
+listings, windows, guild ranks/leave/relog-in-guild, LFG create, guild war window, wanted board) - all
+reframed under D:\packetlogs. Real-Arbiter GM: gate is bit 5 of Account+0x2adc from the hub's
+UserLoginAns.ext_flag, which arb_gw_tw2 never delivers - fix is ArbiterServer_m1.exe (100.02 TW patch,
+the intended setup per the proxy's README) or qaServer=true; SQL Users.money works for gold;
+level lives in the blob. Low-mem config in tools/ (World 13.6 GB). LIVE PASS ON TERASHARP (first with
+the whole social layer): WORKS - party, trade incl. items+money, whisper, friends add/accept/menu/delete/
+block, GM forward (money, level), broker list/buy/collect server-side, bank deposit, money persists.
+BROKEN -> T74 (session 2): broker active/sold tabs empty, mail item attachment (step 2 never sent),
+bank withdraw multiplies amounts, 0x27DD/0x288C unanswered. -> T75 (session 1): friend-added SMT
+param key, friend list location/last-login, character-select location/last-login/rested xp, intro
+cutscene replays on zone 5 (visited_sections), guild founder gets no create popup (member does).
+Guild rank/announce/leave/relog and LFG are captured (cap_social2/3) and coded, pending the founder
+fix to exercise live. Web Admin Tool: WEBADMIN-DESIGN.md - it reads game data via ODBC SharedDB (not
+in shipped config); decision deferred. Both worktrees rebased on master after each merge.
+
 **CAPTURE 2026-09-15 13:52-13:56 (real Arbiter + T56 tap, two clients): D:\packetlogs\cap_social.log +
 cap_social_client.log (+ _ctl.txt/_frames.txt via tools/reframe-*.ps1).** Contains: party lifecycle
 through contracts (0x2809/0x280B/0x280C/0x280A/0x280D invite, 0x280F/0x2810 accept, 0x13AB -> 0x139E party
