@@ -3917,16 +3917,17 @@ DELETE FROM guild_members     WHERE user_db_id = $id;";
 
     /// <summary>
     /// SDB_REGISTER_CARD. Adds <paramref name="amount"/> to what this character already has of
-    /// that card, which is what "register" means: cap_social4.log seq 7032 registers card 310010
+    /// that card, which is what "register" means: cap_social4.log seq 7032 registers card 311034
     /// with amount 1 and the reply echoes both back.
     /// </summary>
     public void AddCard(int characterId, int cardTemplateId, int amount)
     {
-        // T85: the owner guard every other packet-derived write has. The character id comes
-        // straight off the wire (SDB_REGISTER_CARD payload +4), so a frame naming a character we
-        // do not have has to log rather than leave a stray row keyed on nobody.
-        if (NoSuchOwner("AddCard", characterId)) return;
-        if (cardTemplateId == 0) return;
+        // T85b: NOT NoSuchOwner. The id at SDB_REGISTER_CARD payload +4 is the dumper's
+        // `AccountDbId` (an i64 at frame 0x0A), not a character - the register frame carries no
+        // UserDbId at all, which is the protocol saying the collection is account-wide. Checking
+        // it against the characters table drops every live write whose account id is not also a
+        // character id.
+        if (characterId <= 0 || cardTemplateId == 0) return;
 
         lock (_lock)
         {

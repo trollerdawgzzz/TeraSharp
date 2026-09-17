@@ -1266,8 +1266,14 @@ public sealed class DbProxyHandlers
 
             // --- T77: collection cards. We keep no card state, so Success 1 and the ids echoed. ---
             case SDB_REGISTER_CARD:
-                // T83: UserDbId is at payload 4 in all three card writes (seq 7032 / 7107 / 7130
-                // all read 1, the character that ran them). T77 answered them and kept nothing.
+                // T85b, from the dumpers rather than from the reply echo T77 guessed at.
+                // SDB_REGISTER_CARD (Arb_part_017.c:12213, guard 0x19): DlmId@06,
+                // AccountDbId@0A (i64), CardTemplateId@12, Amount@16 - payload 0, 4, 12, 16.
+                // SDB_MOUNT_CARD / _UNMOUNT_CARD (Arb_part_017.c:11096 / 17206, guard 0x1D):
+                // DlmId@06, AccountDbId@0A (i64), UserDbId@12, PresetIndex@16, CardTemplateId@1A
+                // - payload 0, 4, 12, 16, 20. All three key on the ACCOUNT at payload 4; only
+                // the mount pair also names a character, which is the split the table does not
+                // model yet (status/STATUS.md, T85b).
                 _store?.AddCard(Ep32i(payload, 4), Ep32i(payload, 12), Ep32i(payload, 16));
                 link.SendFrame(DBS_REGISTER_CARD, BuildDbsRegisterCard(
                     Ep32(payload, 0), Ep32i(payload, 12), Ep32i(payload, 16))); return true;

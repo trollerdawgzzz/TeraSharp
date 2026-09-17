@@ -334,3 +334,19 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   `ON CONFLICT ... DO UPDATE` clause; it is an UPDATE-then-INSERT pair now, with the
   `NoSuchOwner` guard every other packet-derived write has had since T30. The card test asserts
   one field per line so the next failure names itself.
+
+- T85b: the card dumpers, read at last. `SDB_REGISTER_CARD` (Arb_part_017.c:12213, guard 0x19) is
+  `DlmId@06, AccountDbId@0A (i64), CardTemplateId@12, Amount@16`; the mount pair
+  (11096 / 17206, guard 0x1D) is `DlmId@06, AccountDbId@0A (i64), UserDbId@12, PresetIndex@16,
+  CardTemplateId@1A`. Two corrections fall out. **0x4BEFA is 311034, not 310010** - T77 read the
+  offsets off the reply echo and then mis-converted the hex, and the wrong decimal was copied into
+  three comments and a test expectation. And **the field at payload +4 is an account, not a
+  character**: the register frame carries no UserDbId at all, so T85's `NoSuchOwner` guard was
+  checking the wrong table and would have dropped every live register whose account id is not also
+  a character id.
+
+  **Still open**: the card collection is account-wide and the mount is per character - only the
+  mount pair names a `UserDbId`. The `cards` table keys on `character_id` and stores the account
+  id in it, which is right only while the two ids coincide (they do in cap_social4, both 1). The
+  fix is a schema change - `cards(account_id, card_template_id, amount)` plus a per-character
+  mount row - and it wants a capture where the two ids differ before it is worth making.
