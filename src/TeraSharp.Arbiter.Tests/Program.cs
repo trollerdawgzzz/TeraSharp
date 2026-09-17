@@ -13330,6 +13330,233 @@ some prose with `backticks` that is not a table row
         finally { PartyWiring.ResetForTests(); }
     }
 
+    // =======================================================================================
+    // T78 - PartyMatchManager, the manual party board. Research: status/PARTY-MATCH.md.
+    //
+    // Ground truth is cap_social4: the client log frames 5194..5247 (browse, publish, link,
+    // cancel) and the World<->Arbiter tap, which carries NOTHING at all across that window.
+    // =======================================================================================
+
+    /// <summary>The four .def files the board sends through, as shipped - all four are RIGHT.</summary>
+    static DefinitionRegistry CreateT78Defs()
+    {
+        var reg = new DefinitionRegistry(QuietLog());
+        reg.RegisterFromDef("S_SHOW_PARTY_MATCH_INFO", @"
+int16       pageCurrent
+int16       pageCount
+array       listings
+- int32     leaderId
+- byte      isRaid
+- int16     playerCount
+- string    message
+- string    leader
+");
+        reg.RegisterFromDef("S_MY_PARTY_MATCH_INFO", @"
+byte unk
+string message
+");
+        reg.RegisterFromDef("S_PARTY_MATCH_LINK", @"
+int32  id
+byte   unk
+byte   raid
+int32  unk2
+string name
+string message
+");
+        reg.RegisterFromDef("S_SYSTEM_MESSAGE", "string message" + "\n");
+        return reg;
+    }
+
+    /// <summary>
+    /// T78 - every packet the board sends, byte-exact against cap_social4_client.log.
+    ///
+    /// <para>The bodies below are the capture's own bytes with the four-byte
+    /// <c>[u16 len][u16 opcode]</c> header removed, which is what the def writer produces.</para>
+    ///
+    /// <para>Two of these decide a field the shipped defs only guess at.
+    /// <b>S_MY_PARTY_MATCH_INFO.unk</b> is not isRaid: its writer is
+    /// <c>PartyMatchManager::SendPartyPRText(User *, bool, const wchar_t *)</c> and its only
+    /// caller <c>RequestMyPartyInfo</c> (Arb_part_072.c:523) passes 0 with the empty string when
+    /// the player has no listing and 1 with the stored message when they do - so it is
+    /// "do I have one". <b>S_PARTY_MATCH_LINK.unk2</b> is not a level: the job behind it is
+    /// <c>PartyMatchManager::BroadcastPartyPR</c> (Arb_part_071.c:10081), which uses 0x14 as the
+    /// ChatType in all three of its branches, and 20 is the value on the wire.</para>
+    /// </summary>
+    [Test] public static void T78_party_match_frames_match_cap_social4()
+    {
+        var reg = CreateT78Defs();
+        PartyMatchManager.Reset();
+        PartyMatchManager.PartySize = null;
+
+        // frames 5197 / 5247 - the empty board, before the publish and after the cancel
+        Hex.Eq(WriteByDef(reg, "S_SHOW_PARTY_MATCH_INFO",
+                PartyMatchManager.BuildShowFields(Array.Empty<PartyMatchManager.Listing>())),
+            "00 00  00 00  00 00  00 00",
+            "frames 5197/5247: count 0, offset 0, pageCurrent 0, pageCount 0");
+
+        // frame 5222 - the one listing New published: 15-byte element, then its two strings
+        var one = new[] { new PartyMatchManager.Listing(1003, "New", IsRaid: false, Message: "321") };
+        Hex.Eq(WriteByDef(reg, "S_SHOW_PARTY_MATCH_INFO", PartyMatchManager.BuildShowFields(one)),
+            "01 00  0C 00  00 00  00 00  "
+            + "0C 00  00 00  1B 00  23 00  EB 03 00 00  00  01 00  "
+            + "33 00 32 00 31 00 00 00  4E 00 65 00 77 00 00 00",
+            "frame 5222: element at packet 12, message at 27, leader at 35, leaderId 1003, "
+            + "isRaid 0, playerCount 1");
+
+        // frames 5199 / 5216 - no listing yet
+        Hex.Eq(WriteByDef(reg, "S_MY_PARTY_MATCH_INFO", PartyMatchManager.BuildMyInfoFields(null)),
+            "07 00  00  00 00",
+            "frames 5199/5216: unk 0 and an empty message is the no-listing form");
+        Hex.Eq(WriteByDef(reg, "S_MY_PARTY_MATCH_INFO", PartyMatchManager.BuildMyInfoFields(one[0])),
+            "07 00  01  33 00 32 00 31 00 00 00",
+            "and with a listing the same packet carries 1 and the stored message");
+
+        // frames 5226 / 5229 - the chat link for that listing
+        Hex.Eq(WriteByDef(reg, "S_PARTY_MATCH_LINK", PartyMatchManager.BuildLinkFields(one[0])),
+            "12 00  1A 00  EB 03 00 00  01  00  14 00 00 00  "
+            + "4E 00 65 00 77 00 00 00  33 00 32 00 31 00 00 00",
+            "frame 5226: id 1003, unk 1, raid 0, chat channel 20, then New and 321");
+
+        // frames 5221 / 5246 / 5207 - the three system messages, bare @id form
+        Hex.Eq(WriteByDef(reg, "S_SYSTEM_MESSAGE",
+                PartyMatchManager.BuildSmtFields(PartyMatchManager.SmtRegistered)),
+            "06 00  40 00 39 00 39 00 37 00 00 00", "frame 5221: @997 after the publish");
+        Hex.Eq(WriteByDef(reg, "S_SYSTEM_MESSAGE",
+                PartyMatchManager.BuildSmtFields(PartyMatchManager.SmtUnregistered)),
+            "06 00  40 00 39 00 39 00 34 00 00 00", "frame 5246: @994 after the cancel");
+        Hex.Eq(WriteByDef(reg, "S_SYSTEM_MESSAGE",
+                PartyMatchManager.BuildSmtFields(PartyMatchManager.SmtNoListingToLink)),
+            "06 00  40 00 31 00 35 00 38 00 32 00 00 00",
+            "frames 5207/5212: @1582, the link button pressed with nothing published");
+    }
+
+    /// <summary>
+    /// T78 - the two client bodies, read at the offsets the decompiled handlers read.
+    ///
+    /// <para><b>C_UNREGISTER_PARTY_INFO.1.def is wrong</b> and must not be used.
+    /// Handler_C_UNREGISTER_PARTY_INFO (Arb_part_041.c:13507) and
+    /// Handler_C_REQUEST_PARTY_MATCH_INFO (Arb_part_041.c:8950) read the same six fields from the
+    /// same offsets and queue the same job (FUN_140837540); the shipped unregister def declares
+    /// <c>int32 unk1</c> where the packet has a two-byte string offset plus a two-byte field, and
+    /// declares no string ref at all. Both frames on the wire are the same 18 bytes, which is the
+    /// browse layout - so the browse def is the one to read either of them with. Same class of
+    /// trap as the patch-101 S_FRIEND_LIST def and the ten wrong guild defs.</para>
+    /// </summary>
+    [Test] public static void T78_party_match_client_bodies_parse_at_the_handler_offsets()
+    {
+        // frame 5219: C_REGISTER_PARTY_INFO, message offset 7, isRaid 0, message 321
+        var publish = PartyMatchManager.ParsePublish(Hex.B("07 00  00  33 00 32 00 31 00 00 00"));
+        Hex.True(publish != null && !publish.Value.IsRaid && publish.Value.Message == "321",
+            "frame 5219 is a party (not raid) listing advertising 321");
+        Hex.True(PartyMatchManager.ParsePublish(Hex.B("07 00")) == null,
+            "a body under the handler's 7-byte frame guard is refused, not read");
+
+        // frames 5194 / 5220 / 5245: the filter, and the cancel that carries the same body
+        var f = PartyMatchManager.ParseFilter(
+            Hex.B("14 00 00 00  0F 00  19 00  03 00 00 00  00 00 00 00  00 00"));
+        Hex.True(f != null, "the 18-byte filter body parses");
+        Hex.True(f!.Value.Unk1 == 0 && f.Value.MinLevel == 15 && f.Value.MaxLevel == 25
+                 && f.Value.Unk2 == 3 && f.Value.Unk3 == 0 && f.Value.Purpose.Length == 0,
+            $"levels 15..25, unk 0/3/0 and an empty purpose; got {f.Value}");
+        Hex.True(PartyMatchManager.ParseFilter(Hex.B("14 00 00 00  0F 00")) == null,
+            "and a body under the 0x14 frame guard is refused");
+
+        // the guards themselves, so a later edit cannot quietly move one
+        Hex.True(PartyMatchManager.MinFrameLength(PartyMatchManager.C_REQUEST_PARTY_MATCH_INFO) == 0x14
+                 && PartyMatchManager.MinFrameLength(PartyMatchManager.C_UNREGISTER_PARTY_INFO) == 0x14
+                 && PartyMatchManager.MinFrameLength(PartyMatchManager.C_REGISTER_PARTY_INFO) == 7,
+            "the three handlers that have a GET_CLIENT_BUFFER_BUFSIZE_MISMATCH guard");
+        Hex.True(PartyMatchManager.MinBodyLength(PartyMatchManager.C_REGISTER_PARTY_INFO) == 3
+                 && PartyMatchManager.MinBodyLength(PartyMatchManager.C_REQUEST_PARTY_MATCH_LINK) == 0,
+            "and PacketDispatcher compares BODY length, so each is its frame guard minus four");
+
+        // Three of the six were already declared in ArbiterClientHandlers, for the
+        // accept-silently list. Two copies of an opcode is one copy too many, so pin them.
+        Hex.True(PartyMatchManager.C_REQUEST_PARTY_MATCH_INFO == ArbiterClientHandlers.C_REQUEST_PARTY_MATCH_INFO
+                 && PartyMatchManager.C_REQUEST_MY_PARTY_MATCH_INFO == ArbiterClientHandlers.C_REQUEST_MY_PARTY_MATCH_INFO
+                 && PartyMatchManager.C_PARTY_MATCH_WINDOW_CLOSED == ArbiterClientHandlers.C_PARTY_MATCH_WINDOW_CLOSED,
+            "the three opcodes both classes name agree");
+        foreach (var (_, op) in PartyMatchManager.ClientOpcodes)
+            Hex.True(ArbiterClientHandlers.ArbiterOwned.Contains(op),
+                $"0x{op:X4} must be in ArbiterOwned, or PacketDispatcher can still forward it to World");
+    }
+
+    /// <summary>
+    /// T78 - the whole episode, in the order cap_social4_client.log has it: browse an empty
+    /// board, publish, browse again, link, cancel. Every step goes through
+    /// <see cref="PartyMatchManager.Decide"/>, which is what the live handler calls.
+    /// </summary>
+    [Test] public static void T78_publish_link_and_cancel_follow_the_capture()
+    {
+        PartyMatchManager.Reset();
+        PartyMatchManager.PartySize = null;
+        var browse = Hex.B("14 00 00 00  0F 00  19 00  03 00 00 00  00 00 00 00  00 00");
+        const int New = 1003;
+        try
+        {
+            // 5194 - the board is empty and the link button has nothing to offer
+            var a = PartyMatchManager.Decide(New, "New", PartyMatchManager.C_REQUEST_PARTY_MATCH_INFO, browse);
+            Hex.True(ChatSeq(a).Count == 1 && ChatSeq(a)[0] == (New, "S_SHOW_PARTY_MATCH_INFO"),
+                "a browse answers with exactly one page");
+            Hex.True(((List<object>)ChatFields(a, 0)["listings"]).Count == 0, "and it is empty");
+
+            // 5206 -> 5207
+            a = PartyMatchManager.Decide(New, "New", PartyMatchManager.C_REQUEST_PARTY_MATCH_LINK, default);
+            Hex.True(ChatSeq(a).Count == 1 && ChatSeq(a)[0] == (New, "S_SYSTEM_MESSAGE"),
+                "the link button with no listing answers with one system message");
+            Hex.True((string)ChatFields(a, 0)["message"] == "@1582", "and it is @1582");
+
+            // 5219 -> 5221: the publish answers with the SMT and NOTHING else - frame 5222 is
+            // the answer to the browse the client sent itself at 5220.
+            a = PartyMatchManager.Decide(New, "New", PartyMatchManager.C_REGISTER_PARTY_INFO,
+                    Hex.B("07 00  00  33 00 32 00 31 00 00 00"));
+            Hex.True(ChatSeq(a).Count == 1 && ChatSeq(a)[0] == (New, "S_SYSTEM_MESSAGE")
+                     && (string)ChatFields(a, 0)["message"] == "@997",
+                "the publish answers with @997 and no page");
+            Hex.True(PartyMatchManager.Count == 1, "and the board now holds it");
+
+            // 5220 -> 5222
+            a = PartyMatchManager.Decide(New, "New", PartyMatchManager.C_REQUEST_PARTY_MATCH_INFO, browse);
+            var rows = (List<object>)ChatFields(a, 0)["listings"];
+            Hex.True(rows.Count == 1, "the next browse shows it");
+            var row = (Dictionary<string, object>)rows[0];
+            Hex.True(Convert.ToInt32(row["leaderId"]) == New && (string)row["leader"] == "New"
+                     && (string)row["message"] == "321" && Convert.ToInt32(row["playerCount"]) == 1,
+                "with the leader, the message and a solo player count");
+
+            // 5225 -> 5226
+            a = PartyMatchManager.Decide(New, "New", PartyMatchManager.C_REQUEST_PARTY_MATCH_LINK, default);
+            Hex.True(ChatSeq(a)[0] == (New, "S_PARTY_MATCH_LINK"), "now the link button works");
+            Hex.True(Convert.ToInt32(ChatFields(a, 0)["unk2"]) == PartyMatchManager.PartyMatchChatChannel,
+                "and it names chat channel 20");
+
+            // 5245 -> 5246, 5247: SMT then a refreshed page, with no request in between
+            a = PartyMatchManager.Decide(New, "New", PartyMatchManager.C_UNREGISTER_PARTY_INFO, browse);
+            var seq = ChatSeq(a);
+            Hex.True(seq.Count == 2 && seq[0] == (New, "S_SYSTEM_MESSAGE")
+                     && seq[1] == (New, "S_SHOW_PARTY_MATCH_INFO"),
+                "the cancel sends @994 AND a page - the handler queues both jobs");
+            Hex.True((string)ChatFields(a, 0)["message"] == "@994", "the id is 994");
+            Hex.True(((List<object>)ChatFields(a, 1)["listings"]).Count == 0, "and the page is empty");
+            Hex.True(PartyMatchManager.Count == 0, "the board is empty again");
+
+            // 5908 - closing the window sends nothing and does not withdraw anything
+            PartyMatchManager.Decide(New, "New", PartyMatchManager.C_REGISTER_PARTY_INFO,
+                Hex.B("07 00  01  33 00 32 00 31 00 00 00"));
+            a = PartyMatchManager.Decide(New, "New", PartyMatchManager.C_PARTY_MATCH_WINDOW_CLOSED, default);
+            Hex.True(ChatSeq(a).Count == 0 && a.Rejected == null, "window-closed is silent");
+            Hex.True(PartyMatchManager.Count == 1, "closing the window is not withdrawing");
+            Hex.True(PartyMatchManager.Find(New)!.IsRaid, "and the raid flag survived the round trip");
+
+            // leaving the world does withdraw it - PartyMatchManager::OnLeaveWorld, and nothing
+            // persists the board.
+            Hex.True(PartyMatchManager.OnLeaveWorld(New), "leave-world drops the listing");
+            Hex.True(PartyMatchManager.Count == 0 && !PartyMatchManager.OnLeaveWorld(New),
+                "and doing it twice is a no-op");
+        }
+        finally { PartyMatchManager.Reset(); PartyMatchManager.PartySize = null; }
+    }
+
 
     /// <summary>Reset the recording fakes AND the World log between the steps of a scenario.
     /// FakeSink.Bodies is a separate list from FakeSink.Log, so clearing only the log leaves the

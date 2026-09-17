@@ -31,6 +31,7 @@ public sealed class SocialHandlers
         UseChatLogger(log);   // T47: the chat manager logs through the same sink
         PartyWiring.UsePartyLogger(log);   // T49: and so does the party manager
         GuildWiring.UseGuildLogger(log);    // T51: and the guild handler
+        PartyMatchManager.UseLogger(log);   // T78: and the party board
     }
 
     // ---- Limits and constants, all from the decompile (status/FRIENDS.md section 3) ----
@@ -222,6 +223,10 @@ public sealed class SocialHandlers
         // T51: the GUILD MEMBERSHIP survives a logout - only GuildMemberData+0x70 moves - so
         // this is a state flip plus a stored logout time, never a row delete.
         GuildWiring.Unregister(session);
+        // T78: the party-board listing does NOT survive - PartyMatchManager::OnLeaveWorld is a
+        // real method and nothing persists the board (status/PARTY-MATCH.md section 2).
+        if (PartyMatchManager.OnLeaveWorld((int)chr.Id))
+            ChatLog.LogDebug("party match: {Name} left world - listing withdrawn", chr.Name);
     }
 
     /// <summary>

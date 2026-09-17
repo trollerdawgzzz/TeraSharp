@@ -92,6 +92,15 @@ public static class ArbiterClientHandlers
         C_SHOW_AWESOMIUMWEB_SHOP, C_RESET_ALL_DUNGEON,
         C_ADD_TRADE_BAG,   // T60 - the nineteenth, found the same way (live 2026-09-15)
         C_ASK_INTERACTIVE, C_WATCHED_MOVIES, C_FINDNAME,   // T62 - twenty, twenty-one, twenty-two
+        // T78 - the other three packets of the party-matching window. The first three of the
+        // window (C_REQUEST_PARTY_MATCH_INFO / _MY_ / _WINDOW_CLOSED, declared above) were
+        // already here because they were on the accept-silently list; these three were still
+        // being FORWARDED, which is how the publish and the link button produced World's
+        // "handler has not been implemented yet!!!". All six are answered by
+        // World.PartyMatchManager now - status/PARTY-MATCH.md.
+        World.PartyMatchManager.C_REGISTER_PARTY_INFO,
+        World.PartyMatchManager.C_UNREGISTER_PARTY_INFO,
+        World.PartyMatchManager.C_REQUEST_PARTY_MATCH_LINK,
     };
 
     // =========================================================================================
