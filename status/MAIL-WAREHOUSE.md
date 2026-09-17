@@ -712,3 +712,47 @@ payload +29 then reads back 1230000 at seq 2126, which is the round trip.
 
 `SDB_INCREASE_WAREHOUSE_SIZE` (0x283F) does not appear in this capture, so the 0x283E reply-opcode
 trap stays derived from the decompile rather than confirmed from the wire.
+
+## 13. T74 — the receive is two-step, and the withdraw had the wrong sign
+
+### SDB_RECV_PARCEL is two-step
+
+cap_social.log seq 1553..1556, the one exchange in any capture where an attachment actually
+arrives:
+
+| seq | frame | what |
+| --- | --- | --- |
+| 1553 | 26 B | step **1**, no atoms |
+| 1554 | 3575 B | the **3544-byte FULL ParcelData**, no atoms |
+| 1555 | 1738 B | step **2**, two atoms |
+| 1556 | 5287 B | the record again **and** those atoms echoed |
+
+We ignored `Step` entirely: every receive was answered with the short **0x9e8 "NoMsg"** record —
+the list form — and the gold was paid on the first pass. The attachment slots live past 0x9e8, so
+World had nothing to build the step-2 atoms from and never sent step 2. The live symptom was
+exactly that: *"0 inserted, 10300 gold"*, and the item never arrived.
+
+Two forms, two lengths, and they are not interchangeable:
+
+| reply | record |
+| --- | --- |
+| `DBS_LIST_PARCEL` | 0x9e8 NoMsg (seq 1539) |
+| `DBS_RECV_PARCEL` | the full 3544-byte one, message and attachments included (seq 1554/1556) |
+
+`ServedParcelRecord(store, row, full: true)` keeps the stored length; the gold moved to the commit
+pass, where the attachments are.
+
+### TS op 0x11 is a magnitude, not a signed delta
+
+Withdrawing multiplied the stack because op 0x11 was being added. In cap_social2.log:
+
+| | op 2 (bag row) | op 0x11 (warehouse row) |
+| --- | --- | --- |
+| deposit, seq 2005 | **−1** | not used — a deposit is op 0x0F |
+| withdraw, seq 2096 | **+1** | **+1** |
+| withdraw, seq 2074 | op 7 insert +20 | **+20** |
+
+op 0x11 sits on the warehouse row, is positive both times, and **only ever appears on a GET**. So
+it carries the amount to REMOVE. Adding it grew the bank by whatever was being taken out of it,
+every withdraw. The money pair is the other way round and is untouched: op 0x0D really does go
+negative on a withdraw (seq 2149).

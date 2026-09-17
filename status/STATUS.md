@@ -267,3 +267,11 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   `S_TRADE_BROKER_WAITING_ITEM_LIST` (92-byte elements) and `_BOUGHT_ITEM_LIST` (98-byte), plus
   the float 469.0 `S_TRADE_BROKER_HIGHEST_ITEM_LEVEL` that T45 was answering as 0. REGISTERED and
   SOLD stay on the empty form: the capture never shows a populated one.
+
+- T74 (live 2026-09-16 economy pass): mail attachments arrive again — `SDB_RECV_PARCEL` is
+  two-step and its reply carries the full 3544-byte record, not the 0x9e8 list form, so World can
+  build the step-2 atoms; warehouse withdraw no longer multiplies the stack (TS op 0x11 is a
+  magnitude to remove, not a signed delta); an already-collected broker row answers Success 1 so
+  World stops re-asking; `SDB_ITEM_TRADE_LOG` 0x27DD and `SDB_CASH_ITEM_LOG` 0x288C named and
+  sealed as one-way. The broker's Active Listings / Sold tabs stay empty: no capture holds a
+  populated one and the shipped def is provably wrong about the list we did verify.

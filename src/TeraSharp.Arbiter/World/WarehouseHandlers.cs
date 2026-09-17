@@ -170,7 +170,9 @@ public static class WarehouseHandlers
     /// <summary>Is this one of the five inert broker markers?</summary>
     public static bool IsBrokerMarker(uint op)
         => op >= TsBrokerRegister && op <= TsBrokerCalcBought;
-    public const uint TsWareChangeAmount = 0x11;  // +0x50 added to the row at (src triple)
+    /// <summary>0x11: the amount REMOVED from the warehouse row at the src triple. Unlike op 2
+    /// the value is a magnitude, not a signed delta - see the note in <c>Apply</c>.</summary>
+    public const uint TsWareChangeAmount = 0x11;
 
     /// <summary>One parsed <c>ItemTransactionAtom</c>. Only the fields the warehouse path uses.</summary>
     public readonly record struct WarehouseAtom(
@@ -598,6 +600,20 @@ public static class WarehouseHandlers
                     int inven = (int)(a.SrcOwner != 0 ? a.SrcInven : dstInven);
                     int slot = (int)(a.SrcOwner != 0 ? a.SrcSlot : dstSlot);
 
+                    // T74: op 0x11 and op 2 do NOT share a sign convention, and reading them as
+                    // if they did is what made a withdraw multiply the stack.
+                    //
+                    // In cap_social2.log every op-2 atom is signed against the BAG row - -1 when
+                    // a stack is banked (seq 2005), +1 when it comes back (seq 2096). Every op-17
+                    // atom sits on the WAREHOUSE row and is POSITIVE both times (+20 at seq 2074,
+                    // +1 at seq 2096), and op 17 only ever appears on a GET. Adding it grew the
+                    // bank by the amount being taken out of it, every single withdraw.
+                    //
+                    // So op 17 carries a MAGNITUDE to remove, not a signed delta. (The money pair
+                    // is the other way round and is unaffected: op 13 really does go negative on
+                    // a withdraw, seq 2149.)
+                    long delta = a.Op == TsWareChangeAmount ? -Math.Abs(a.Delta) : a.Delta;
+
                     int id = (int)a.ItemDbId;
                     if (id == 0) id = store.FindItemAt(owner, inven, slot)?.ItemDbId ?? 0;
 
@@ -607,13 +623,13 @@ public static class WarehouseHandlers
                         // would put a row in the inventory under an id World has never seen, and
                         // the next operation on it would miss - strictly worse than dropping it.
                         log?.LogWarning("items: amount change of {Delta} at {Inven}:{Slot} names no item - dropped",
-                            a.Delta, inven, slot);
+                            delta, inven, slot);
                         ignored++;
                     }
-                    else if (store.AddItemAmount(id, a.Delta)) changed++;
-                    else if (a.Delta > 0)
+                    else if (store.AddItemAmount(id, delta)) changed++;
+                    else if (delta > 0)
                     {
-                        store.UpsertItem(id, owner, inven, slot, a.TemplateId, a.Delta);
+                        store.UpsertItem(id, owner, inven, slot, a.TemplateId, delta);
                         inserted++;
                     }
                     else ignored++;   // a negative delta on a row we do not have: nothing to take

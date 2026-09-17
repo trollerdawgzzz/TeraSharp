@@ -17036,6 +17036,183 @@ some prose with `backticks` that is not a table row
         Hex.True(ArbiterClientHandlers.ParseFindName(new byte[5]) == null, "5 B is one short of the guard");
     }
 
+    // ===================== T74: the 2026-09-16 economy pass =====================
+
+    /// <summary>
+    /// Withdrawing from the bank was ADDING to the bank row. op 2 and op 0x11 do not share a sign
+    /// convention: cap_social2.log has op 2 signed against the bag (-1 banking at seq 2005, +1
+    /// withdrawing at seq 2096) while op 0x11 sits on the warehouse row and is positive BOTH
+    /// times (+20 seq 2074, +1 seq 2096) and only ever appears on a GET. It is a magnitude to
+    /// remove.
+    /// </summary>
+    [Test] public static void T74_a_warehouse_withdraw_takes_the_amount_out()
+    {
+        using var store = GuildStore(2);
+        store.UpsertItem(500, 2, WarehouseHandlers.InvenAccountWarehouse, 0, 6550, 20);
+
+        // seq 2074's pair: 20 into the bag, 20 out of the bank.
+        const int hdr = WarehouseHandlers.GetRequestSize;
+        var payload = new byte[hdr + 2 * DbProxyHandlers.ItemAtomSize];
+        BitConverter.GetBytes((uint)(6 + hdr)).CopyTo(payload, WarehouseHandlers.GetReqBinaryRef);
+        BitConverter.GetBytes((uint)(2 * DbProxyHandlers.ItemAtomSize)).CopyTo(payload, WarehouseHandlers.GetReqBinaryRef + 4);
+        BitConverter.GetBytes(0xBCu).CopyTo(payload, WarehouseHandlers.GetReqDlmId);
+        BrokerAtom(0, WarehouseHandlers.TsInsertItem, 0, 6550, 20, 1, 0, 0, 1, BagItems.Pocket, 0)
+            .CopyTo(payload, hdr);
+        BrokerAtom(1, WarehouseHandlers.TsWareChangeAmount, 0, 6550, 20,
+                   2, WarehouseHandlers.InvenAccountWarehouse, 0,
+                   2, WarehouseHandlers.InvenAccountWarehouse, 0)
+            .CopyTo(payload, hdr + DbProxyHandlers.ItemAtomSize);
+
+        var (op, _) = RunHandler1(DbProxyHandlers.SDB_GET_WAREHOUSE, payload, store);
+        Hex.True(op == DbProxyHandlers.DBS_GET_WAREHOUSE, $"0x{op:X4}");
+
+        var bank = store.GetItems(2, WarehouseHandlers.InvenAccountWarehouse);
+        Hex.True(bank.Count == 0, $"the bank row is empty and pruned, not doubled: {bank.Count} row(s)");
+        var bag = store.GetInventoryItems(1);
+        Hex.True(bag.Count == 1 && bag[0].Amount == 20, $"and the 20 arrived in the bag: {bag.Count}");
+    }
+
+    /// <summary>
+    /// SDB_RECV_PARCEL is two-step, like the broker. cap_social.log seq 1553..1556: step 1 has no
+    /// atoms and is answered with the 3544-byte FULL record; step 2 brings the attachment atoms.
+    /// We answered step 1 with the short 0x9e8 list form and paid the gold there, so World had no
+    /// attachment slots to build step 2 from and never sent one.
+    /// </summary>
+    [Test] public static void T74_the_parcel_receive_is_two_step()
+    {
+        using var store = GuildStore(2);
+        int id = store.CreateParcel(2, "Test", 1, "here", string.Empty, 500);
+        // The full record World sent us, attachment region and all.
+        var full = new byte[3544];
+        Hex.B(Cap61_MakeParcelDataHead).CopyTo(full, 0);
+        full[3000] = 0x7F;                       // a byte only the full form can carry
+        store.SetParcelRecord(id, full);
+
+        byte[] Request(uint step, int atoms)
+        {
+            var p = new byte[ParcelDbHandlers.RecvRequestSize + atoms * DbProxyHandlers.ItemAtomSize];
+            BitConverter.GetBytes((uint)(6 + ParcelDbHandlers.RecvRequestSize))
+                .CopyTo(p, ParcelDbHandlers.RecvReqTransListRef);
+            BitConverter.GetBytes((uint)(atoms * DbProxyHandlers.ItemAtomSize))
+                .CopyTo(p, ParcelDbHandlers.RecvReqTransListRef + 4);
+            BitConverter.GetBytes(0xA8u).CopyTo(p, ParcelDbHandlers.RecvReqDlmId);
+            BitConverter.GetBytes(step).CopyTo(p, ParcelDbHandlers.RecvReqStep);
+            BitConverter.GetBytes((uint)id).CopyTo(p, ParcelDbHandlers.RecvReqParcelId);
+            for (int i = 0; i < atoms; i++)
+                BrokerAtom(i, WarehouseHandlers.TsInsertItem, 0, 6560, 1, 0, 0, 0, 1, BagItems.Pocket, 4)
+                    .CopyTo(p, ParcelDbHandlers.RecvRequestSize + i * DbProxyHandlers.ItemAtomSize);
+            return p;
+        }
+
+        long before = store.GetCharacterMoney(1);
+        var (op1, b1) = RunHandler1(DbProxyHandlers.SDB_RECV_PARCEL, Request(1, 0), store);
+        Hex.True(op1 == DbProxyHandlers.DBS_RECV_PARCEL, $"0x{op1:X4}");
+        Hex.True(BitConverter.ToUInt32(b1, ParcelDbHandlers.RecvRspParcelDataRef + 4) == 3544,
+            $"step 1 carries the FULL 3544-byte record, not the 0x9e8 list form: "
+            + $"{BitConverter.ToUInt32(b1, ParcelDbHandlers.RecvRspParcelDataRef + 4)}");
+        Hex.True(BitConverter.ToUInt32(b1, ParcelDbHandlers.RecvRspTransListRef + 4) == 0,
+            "and no atoms - World has not built them yet");
+        Hex.True(b1[ParcelDbHandlers.RecvRspParcelDataRef + 4 + 0] != 0
+                 && b1[ParcelDbHandlers.RecvRspSuccess] == 1, "Success 1");
+        Hex.True(store.GetCharacterMoney(1) == before,
+            "the gold is NOT paid on the read pass - that was the live bug's other half");
+
+        var (_, b2) = RunHandler1(DbProxyHandlers.SDB_RECV_PARCEL, Request(2, 1), store);
+        Hex.True(BitConverter.ToUInt32(b2, ParcelDbHandlers.RecvRspParcelDataRef + 4) == 3544
+                 && BitConverter.ToUInt32(b2, ParcelDbHandlers.RecvRspTransListRef + 4)
+                    == DbProxyHandlers.ItemAtomSize,
+            "step 2 carries the record AND the atoms echoed, as seq 1556 does");
+        Hex.True(store.GetCharacterMoney(1) == before + 500, "and the gold lands on the commit pass");
+        Hex.True(store.GetInventoryItems(1).Any(r => r.TemplateId == 6560), "with the attachment");
+    }
+
+    /// <summary>
+    /// The live "collected 1 of 2" then "0 of 2" loop. A row somebody already collected is not a
+    /// failure - the request's atoms were applied either way - and answering Success 0 made World
+    /// ask again forever. Both captured step-2 replies carry Success 1.
+    /// </summary>
+    [Test] public static void T74_an_already_collected_broker_row_is_not_a_failure()
+    {
+        using var store = GuildStore(2);
+        int id = store.CreateBrokerListing(2, "Test", 10029, 139093, 1, 1);
+        store.SellBrokerListing(id, 1);
+
+        const int hdr = BrokerPackets.CalcRequestHeader;
+        var calc = new byte[hdr + 4 + DbProxyHandlers.ItemAtomSize];
+        BitConverter.GetBytes((uint)(6 + hdr)).CopyTo(calc, 0);
+        BitConverter.GetBytes(4u).CopyTo(calc, 4);
+        BitConverter.GetBytes((uint)(6 + hdr + 4)).CopyTo(calc, 8);
+        BitConverter.GetBytes((uint)DbProxyHandlers.ItemAtomSize).CopyTo(calc, 12);
+        BitConverter.GetBytes(0xBAu).CopyTo(calc, 16);
+        BitConverter.GetBytes(1).CopyTo(calc, 20);
+        BitConverter.GetBytes(2).CopyTo(calc, 24);                 // Step 2
+        BitConverter.GetBytes(id).CopyTo(calc, hdr);
+        BrokerAtom(0, WarehouseHandlers.TsBrokerCalcBought, 0, 0, 0, 1, 0, 0, 0, 0, 0)
+            .CopyTo(calc, hdr + 4);
+
+        var (op, first) = RunHandler1(DbProxyHandlers.SDB_TRADE_BROKER_CALC_BOUGHT_ITEM, calc, store);
+        Hex.True(op == DbProxyHandlers.DBS_TRADE_BROKER_CALC_BOUGHT_ITEM, $"0x{op:X4}");
+        Hex.True(first[24] == 1 && store.GetBrokerListing(id)!.State == CharacterStore.BrokerBuyerCollected,
+            "the first commit collects it and says so");
+
+        var (_, again) = RunHandler1(DbProxyHandlers.SDB_TRADE_BROKER_CALC_BOUGHT_ITEM, calc, store);
+        Hex.True(again[24] == 1,
+            "and the second says Success 1 as well - a row already taken is not a failure, and "
+            + "Success 0 is what made World ask again");
+    }
+
+    /// <summary>
+    /// 0x27DD SDB_ITEM_TRADE_LOG and 0x288C SDB_CASH_ITEM_LOG. Both handlers run to
+    /// <c>return 1</c> with no packet writer in them at all (Arb_part_063.c:12031 for the first),
+    /// and cap_social2/3 agree: three 0x288C arrive and no A-&gt;W frame follows any of them.
+    /// 0x27DD carries a DlmId, but the real Arbiter never answers it either, so World cannot be
+    /// waiting on one. Sealing them is about the other half: an unsealed request makes the replay
+    /// table attribute the NEXT A-&gt;W frame to it as a response.
+    /// </summary>
+    [Test] public static void T74_the_two_audit_log_writes_are_sealed()
+    {
+        Hex.True(WorldReplayTable.OneWayFromWorld.Contains(0x27DD), "SDB_ITEM_TRADE_LOG");
+        Hex.True(WorldReplayTable.OneWayFromWorld.Contains(0x288C), "SDB_CASH_ITEM_LOG");
+        Hex.True(!DbProxyHandlers.IsHandledRequest(0x27DD) && !DbProxyHandlers.IsHandledRequest(0x288C),
+            "and neither is allow-listed - sealed is not the same as answered");
+    }
+
+    /// <summary>
+    /// A guard, not a feature. The broker's Active Listings and Sold tabs are still served empty
+    /// because no capture contains a populated one: cap_social3_client.log holds exactly one
+    /// S_TRADE_BROKER_REGISTERED_ITEM_LIST and it is empty (seq 1276), and
+    /// S_TRADE_BROKER_SOLD_ITEM_LIST never appears - the client asked twice and the real Arbiter
+    /// answered neither. That tap is the BUYER's client, which is why: the buyer had no listings.
+    ///
+    /// <para>The shipped .def cannot stand in for the capture. The one list layout we HAVE
+    /// verified byte for byte disagrees with its own .def: the def gives
+    /// <c>uint32 listing, uint32 unk2, int32 unk3, int32 item, int16 quantity</c> where the wire
+    /// puts TradeId at +6, an i64 ItemDbId at +10, TemplateId at +18 and a 4-byte Amount at +22.
+    /// The shipped defs are from another build (PARTY-DESIGN.md section 6 says the same of the
+    /// opcode= comments), so filling the other two tabs from theirs would be a guess dressed up
+    /// as a source.</para>
+    /// </summary>
+    [Test] public static void T74_the_broker_list_defs_disagree_with_the_wire()
+    {
+        // What the wire says, from cap_social3_client.log seq 1419 / 1472 - already pinned by
+        // T72_the_waiting_item_list_is_byte_exact. Restated here as the reason the other two tabs
+        // stay empty.
+        Hex.True(BrokerPackets.WlTradeId == 6 && BrokerPackets.WlItemDbId == 10
+                 && BrokerPackets.WlTemplateId == 18 && BrokerPackets.WlAmount == 22,
+            "the verified waiting-list offsets");
+        Hex.True(BrokerPackets.WlItemDbId - BrokerPackets.WlTradeId == 4
+                 && BrokerPackets.WlTemplateId - BrokerPackets.WlItemDbId == 8,
+            "TradeId is 4 bytes and ItemDbId is 8 - the def calls the second one a uint32");
+
+        // And the two tabs the capture does not justify filling in are still the empty form.
+        using var store = GuildStore(2);
+        store.CreateBrokerListing(2, "Test", 10027, 200997, 1, 10001);
+        Hex.Eq(BrokerHandlers.ReplyFor(BrokerPackets.C_TRADE_BROKER_REGISTERED_ITEM_LIST, store, 2)![4..],
+            "00 00 00 00", "Active Listings: seq 1276's empty body, even with a row in the table");
+        Hex.True(BrokerPackets.EmptyArraySlots == 4,
+            "and that empty body is [u16 count][u16 firstOffset], both zero");
+    }
+
     // ===================== T72: the broker's client windows =====================
 
     /// <summary>cap_social3_client.log seq 1472 - the search page after listing 3 was bought.</summary>

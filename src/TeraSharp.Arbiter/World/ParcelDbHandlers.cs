@@ -408,13 +408,30 @@ public static class ParcelDbHandlers
     /// many words ("0 in MAKE, 1 in LIST"); nothing was acting on it.</para>
     /// </summary>
     public static byte[] ServedParcelRecord(CharacterStore store, CharacterStore.ParcelRow row)
+        => ServedParcelRecord(store, row, full: false);
+
+    /// <summary>
+    /// T74. <paramref name="full"/> keeps the WHOLE stored record instead of truncating it to the
+    /// 0x9e8 "NoMsg" stride, which is what <c>DBS_RECV_PARCEL</c> has to send.
+    ///
+    /// <para>The two forms are different lengths on the wire and carry different things:
+    /// <c>DBS_LIST_PARCEL</c> lists 0x9e8-byte records (cap_social.log seq 1539) while
+    /// <c>DBS_RECV_PARCEL</c> sends the full <b>3544</b>-byte one - the same record
+    /// <c>SDB_MAKE_PARCEL</c> arrived with (seq 1485), message and attachments included, at seq
+    /// 1554 and 1556. Sending the short form to a receive is what stopped the attachment ever
+    /// arriving: the attachment slots live past 0x9e8, so World had nothing to build its step-2
+    /// atoms from and never sent step 2.</para>
+    /// </summary>
+    public static byte[] ServedParcelRecord(CharacterStore store, CharacterStore.ParcelRow row, bool full)
     {
         ArgumentNullException.ThrowIfNull(store);
         ArgumentNullException.ThrowIfNull(row);
         var stored = store.GetParcelRecord(row.ParcelId);
-        var rec = new byte[ParcelDataNoMsgSize];
+        int size = full && stored is not null && stored.Length > ParcelDataNoMsgSize
+            ? stored.Length : ParcelDataNoMsgSize;
+        var rec = new byte[size];
         if (stored is not null && stored.Length >= ParcelDataNoMsgSize)
-            Buffer.BlockCopy(stored, 0, rec, 0, ParcelDataNoMsgSize);
+            Buffer.BlockCopy(stored, 0, rec, 0, Math.Min(stored.Length, size));
         else
             BuildParcelDataNoMsg(row.ParcelId, row.ReceiverDbId, row.SenderDbId, row.SenderName,
                                  receiverName: null, row.Money, row.Title)
