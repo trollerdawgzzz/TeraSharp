@@ -381,3 +381,19 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   `S_ADMIN_WARNING_MESSAGE` is the one tool packet whose reply does not go back to the tool: the
   GM sends it at frame 1399 and the warned player receives it in the OTHER capture, at
   cap_final_gm_client frame 1424.
+
+- T89b: the mode-select screen is `S_LOGIN_ARBITER.status`, and TeraSharp has it backwards.
+  The field is an u32 at body +2 and nine captures agree: **31 for every ordinary account**
+  (cap_final_client, _client2, _gm_client, cap_social_client, cap_social2/3/4_client - eight of
+  them), **33 for the account running the In-Game Operation Tool** (cap_final_gm_client2), and
+  **0 exactly once** - cap_newchar_client, the first login of a brand-new account. TeraSharp
+  sends `GmAccounts.IsListed(account) ? 31 : 0`, i.e. the brand-new-account value to every real
+  player and the ordinary-player value to GMs. 31 is 0b11111 and 33 is 0b100001, so they are not
+  a scale - they are different bits, and a GM is not "an ordinary account plus something".
+
+  The lobby is otherwise packet-for-packet identical to cap_final_client frames 3-25, in the
+  same order and with the same sizes, except that TeraSharp sends neither `S_DECO_UI_INFO`
+  (0x57B3, frame 13, 8 B, body all zero) nor `S_CONFIRM_INVITE_CODE_BUTTON` (0xD41D, frame 15,
+  17 B); both sit between `S_LOAD_CLIENT_ACCOUNT_SETTING` and the ten content flags.
+  `SendContentFlags` already sends those ten with the right values at the right point - the T89
+  report was wrong to call that a timing bug.

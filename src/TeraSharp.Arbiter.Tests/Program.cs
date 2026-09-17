@@ -19223,8 +19223,12 @@ string message
         Hex.Eq(ArbiterClientHandlers.BuildAdminWarningMessage("warn"),
             "10 00 8B 83 06 00 77 00 61 00 72 00 6E 00 00 00",
             "cap_final_gm_client frame 1424");
+        // T89b: no capture holds an empty warning, so this is OUR convention, not a frame - the
+        // offset stays at 6 and the string is its bare terminator, which is what every other wstr
+        // builder here emits. (Handler_C_* reads it back as empty either way: the guard is
+        // `offset == 0 || packetLength <= offset`, and 6 < 8.)
         Hex.Eq(ArbiterClientHandlers.BuildAdminWarningMessage(""),
-            "06 00 8B 83 06 00 00 00", "an empty warning is still a well-formed frame");
+            "08 00 8B 83 06 00 00 00", "an empty warning is still a well-formed frame");
     }
 
     /// <summary>SDB_REGISTER_CARD's payload: <c>DlmId@0, AccountDbId@4 (i64), CardTemplateId@12,
