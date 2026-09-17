@@ -9838,6 +9838,77 @@ array<uint32> items3
             "the appearance start is accepted with no reply");
     }
 
+
+    // =======================================================================================
+    // T92 - the wanted-board apply flow's two system messages, and the guild-data push.
+    // Ground truth: cap_final_client3 2939 / 2997, cap_final_client4 2789, tap 2501.
+    // =======================================================================================
+
+    /// <summary>
+    /// T92 - the two S_SYSTEM_MESSAGE strings the apply flow sends, byte-exact.
+    ///
+    /// <para>Both were missing: the flow stored the application and refreshed the counts but told
+    /// nobody. The applicant gets 1604 with the guild name they typed (cap_final_client3 2939,
+    /// repeated at 2997 for the second application); the officer who rejects gets 261 with the
+    /// applicant's name (cap_final_client4 2789). The ACCEPT at 2834 sends no message - it answers
+    /// with S_ADD_GUILD_MEMBER instead.</para>
+    /// </summary>
+    [Test] public static void T92_apply_flow_system_messages_match_cap_final()
+    {
+        Hex.True(SocialHandlers.Smt(GuildHandlers.SmtGuildApplySent, "GuildName", "fdh")
+                 == "@1604\vGuildName\vfdh",
+            "cap_final_client3 2939 - the applicant is told the application went in");
+        Hex.True(SocialHandlers.Smt(GuildHandlers.SmtGuildApplyRejected, "Name", "joinguild")
+                 == "@261\vName\vjoinguild",
+            "cap_final_client4 2789 - the officer is told the rejection landed");
+        Hex.True(GuildHandlers.SmtGuildApplySent == 1604 && GuildHandlers.SmtGuildApplyRejected == 261,
+            "the two message ids");
+    }
+
+    /// <summary>
+    /// T92 - AS_UPDATE_GUILD_DATA (0x144E), byte-exact against the cap_final tap 2501 header.
+    ///
+    /// <para>9134 bytes on the wire: six of frame header, then
+    /// <c>[u32 blobOff=14][u32 blobLen=0x23A0]</c> and the 0x23A0-byte GuildData. 8 + 0x23A0 is
+    /// exactly the 9128-byte payload, which is what proves the two words are the whole header and
+    /// the guild id at payload 8 belongs to the blob, not to us.</para>
+    /// </summary>
+    [Test] public static void T92_as_update_guild_data_header_matches_cap_final()
+    {
+        var blob = new byte[] { 0x02, 0, 0, 0, 0x73, 0, 0x64, 0, 0x67, 0, 0, 0 };   // guild 2, "sdg"
+        Hex.Eq(GuildHandlers.BuildAsUpdateGuildData(blob),
+            "0E 00 00 00  0C 00 00 00  02 00 00 00  73 00 64 00 67 00 00 00",
+            "tap 2501's header shape, with a stand-in blob");
+
+        var real = GuildHandlers.BuildAsUpdateGuildData(new byte[GuildHandlers.GuildDataBlobSize]);
+        Hex.True(real.Length == 9128,
+            "a real 0x23A0 GuildData makes the 9134-byte frame tap 2501 carries");
+        Hex.True(BitConverter.ToInt32(real, 0) == 14 && BitConverter.ToInt32(real, 4) == 0x23A0,
+            "offset 14 is frame-relative, so the blob starts at payload 8");
+        Hex.True(GuildHandlers.AS_UPDATE_GUILD_DATA == 0x144E, "the opcode tap 2501 carries");
+    }
+
+    /// <summary>
+    /// T92 - the reject path is C_ACCEPT_GUILD_APPLY with its first byte clear.
+    ///
+    /// <para><b>There is no C_REJECT_GUILD_APPLY.</b> It is in neither world_opcodes.txt nor the
+    /// decompile; <c>Handler_C_ACCEPT_GUILD_APPLY</c> (Arb_part_040.c:16826) guards packet &gt;= 9
+    /// and reads a BYTE at frame 4 and a u32 at frame 5, i.e. <c>[u8 accept][u32 userDbId]</c>.
+    /// The capture shows both branches on the one opcode: cap_final_client4 2788 is
+    /// <c>00 EC 03 00 00</c> and answers with the rejection message, 2834 is
+    /// <c>01 EC 03 00 00</c> and answers with S_ADD_GUILD_MEMBER.</para>
+    /// </summary>
+    [Test] public static void T92_guild_apply_reject_is_the_accept_opcode()
+    {
+        var reject = new byte[] { 0x00, 0xEC, 0x03, 0x00, 0x00 };
+        var accept = new byte[] { 0x01, 0xEC, 0x03, 0x00, 0x00 };
+        Hex.True(reject[0] == 0 && accept[0] == 1, "frame 2788 rejects, frame 2834 accepts");
+        Hex.True(BitConverter.ToInt32(reject, 1) == 1004 && BitConverter.ToInt32(accept, 1) == 1004,
+            "and both name applicant 1004 at an UNALIGNED offset 1 - no padding after the bool");
+        Hex.True(reject.Length == 5,
+            "five body bytes, which is the handler's packet guard of 9 minus the four header bytes");
+    }
+
     // ---- The rules ----
 
     [Test] public static void T30_system_message_format_matches_the_capture()

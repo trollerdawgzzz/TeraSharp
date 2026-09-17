@@ -586,8 +586,54 @@ public sealed class GuildHandlers
             return a.Reject($"C_APPLY_GUILD: level {me.Level} is outside {guild.JoinMinLevel}..{guild.JoinMaxLevel}");
 
         _store.InsertGuildApply(guild.GuildId, characterId, EscapeGuildText(joinMsg));
+        // cap_final_client3 2939 / 2997: the applicant is told, with the name they typed.
+        Smt(a, characterId, SmtGuildApplySent, "GuildName", guildName);
         BroadcastApplyCount(a, guild);
         return a;
+    }
+
+    // ===================================================================================
+    // T92 - the two system messages the apply flow sends, and the guild-data push.
+    // Ground truth: cap_final_client3 2939 and 2997, cap_final_client4 2789, tap 2501.
+    // ===================================================================================
+
+    /// <summary>
+    /// Sent to the APPLICANT the moment the application lands - cap_final_client3 frame 2939
+    /// is <c>@1604\vGuildName\vfdh</c>, and 2997 repeats it for the second application. The
+    /// key is the guild NAME the client asked for, not the row s.
+    /// </summary>
+    public const int SmtGuildApplySent = 1604;
+
+    /// <summary>
+    /// Sent to the OFFICER who turned an application down - cap_final_client4 frame 2789 is
+    /// <c>@261\vName\vjoinguild</c>, the applicant s name. Only the reject branch sends it;
+    /// the accept at 2834 answers with S_ADD_GUILD_MEMBER instead.
+    /// </summary>
+    public const int SmtGuildApplyRejected = 261;
+
+    /// <summary>
+    /// AS_UPDATE_GUILD_DATA (0x144E) - the whole guild re-pushed to every World. cap_final tap
+    /// 2501 is 9134 bytes: <c>[u32 blobOff=14][u32 blobLen=0x23A0][GuildData]</c>, and 8 + 0x23A0
+    /// is exactly the 9128-byte payload. The blob is the same 0x23A0-byte GuildData the other
+    /// guild pushes carry, so this builder only puts the two-word header on it.
+    ///
+    /// <para>It follows an incentive grant (tap 2500 -&gt; 2501 -&gt; 2504) and is what makes
+    /// World send the client S_GUILD_MONEY_INFO_CHANGED.</para>
+    /// </summary>
+    public const ushort AS_UPDATE_GUILD_DATA = 0x144E;
+
+    /// <summary>The 0x23A0 GuildData length tap 2501 declares.</summary>
+    public const int GuildDataBlobSize = 0x23A0;
+
+    /// <inheritdoc cref="AS_UPDATE_GUILD_DATA"/>
+    public static byte[] BuildAsUpdateGuildData(byte[] guildDataBlob)
+    {
+        guildDataBlob ??= Array.Empty<byte>();
+        var p = new byte[8 + guildDataBlob.Length];
+        BitConverter.GetBytes(14).CopyTo(p, 0);                    // blob offset, frame-relative
+        BitConverter.GetBytes(guildDataBlob.Length).CopyTo(p, 4);
+        guildDataBlob.CopyTo(p, 8);
+        return p;
     }
 
     /// <summary>
@@ -626,7 +672,16 @@ public sealed class GuildHandlers
                 EmitMemberAdded(a, guild.GuildId, applicantId);
             }
         }
-        if (!joined) _store.DeleteGuildApply(guild.GuildId, applicantId);
+        if (!joined)
+        {
+            _store.DeleteGuildApply(guild.GuildId, applicantId);
+            // cap_final_client4 2789: only the REJECT branch answers, and it answers the
+            // officer. An accept that failed for another reason has already been rejected out
+            // of this method, so reaching here with accept still set cannot happen.
+            if (!accept)
+                Smt(a, characterId, SmtGuildApplyRejected, "Name",
+                    _store.GetCharacter(applicantId)?.Name ?? string.Empty);
+        }
 
         SendApplyListFor(a, characterId, guild, 1);
         BroadcastApplyCount(a, guild);
