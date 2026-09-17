@@ -17941,4 +17941,67 @@ some prose with `backticks` that is not a table row
             $"a bad deploy path reports {handlers.Count} failure(s), no throw");
     }
 
+    // ===================== T75: the 2026-09-16 live pass =====================
+
+    /// <summary>
+    /// T75 (1). The friend-accept notice printed its own placeholder because the accepter's copy
+    /// of SMT 433 was sent with NO parameter. Both sides get the other party's name, keyed
+    /// <c>UserName</c> - capitalised exactly like this, because the client substitutes by key and a
+    /// miss leaves the placeholder in the text. Pinned to the real Arbiter's own frame 1436 in
+    /// D:\packetlogs\cap_social_client.log.
+    /// </summary>
+    [Test] public static void T75_friend_accept_smt_names_the_other_party()
+    {
+        const string expected = "@433\vUserName\vtwo";
+        Hex.True(SocialHandlers.Smt(SocialHandlers.SmtAcceptedToRequester, "UserName", "two") == expected,
+            SocialHandlers.Smt(SocialHandlers.SmtAcceptedToRequester, "UserName", "two"));
+        Hex.True(SocialHandlers.SmtAcceptedToRequester == 0x1B1, "SMT 433");
+
+        // and the same string on the wire, byte for byte: [u16 msgOffset=6][NUL-terminated UTF-16LE]
+        var body = new byte[2 + (expected.Length + 1) * 2];
+        BitConverter.GetBytes((ushort)6).CopyTo(body, 0);
+        System.Text.Encoding.Unicode.GetBytes(expected).CopyTo(body, 2);
+        Hex.Eq(body,
+            "06 00  40 00 34 00 33 00 33 00  0B 00  "
+            + "55 00 73 00 65 00 72 00 4E 00 61 00 6D 00 65 00  0B 00  74 00 77 00 6F 00  00 00",
+            "S_SYSTEM_MESSAGE body, cap_social_client frame 1436");
+
+        // a parameterless 433 is what produced the literal placeholder - it must not come back
+        Hex.True(SocialHandlers.Smt(SocialHandlers.SmtAcceptedToRequester) == "@433",
+            "the unparameterised form still builds, and is what the bug looked like");
+    }
+
+    /// <summary>
+    /// T75 (4). The intro cinematic replayed on every relog because the client was never told what
+    /// it had already visited: T45 stored the rows and pushed them to World, but nothing sent
+    /// S_VISITED_SECTION_LIST. The real Arbiter sends it immediately after C_LOAD_TOPO_FIN -
+    /// cap_social_client frames 256 -&gt; 257, pinned here byte for byte.
+    /// </summary>
+    [Test] public static void T75_visited_section_list_matches_the_relog_capture()
+    {
+        var rows = new[]
+        {
+            new TeraSharp.Arbiter.Persistence.CharacterStore.VisitedSection(1, 25, 0x000923D9),
+            new TeraSharp.Arbiter.Persistence.CharacterStore.VisitedSection(9999, 25, 9827),
+        };
+        Hex.Eq(ArbiterClientHandlers.BuildVisitedSectionList(rows),
+            "28 00  53 A8  02 00  08 00  "
+            + "08 00 18 00  01 00 00 00  19 00 00 00  D9 23 09 00  "
+            + "18 00 00 00  0F 27 00 00  19 00 00 00  63 26 00 00",
+            "S_VISITED_SECTION_LIST, cap_social_client frame 257");
+
+        Hex.Eq(ArbiterClientHandlers.BuildVisitedSectionList(null),
+            "08 00  53 A8  00 00  00 00",
+            "nothing visited yet: count 0, offset 0 - still an answer, so no intro replays");
+        Hex.True(ArbiterClientHandlers.VisitedSectionListEntrySize == 16
+                 && ArbiterClientHandlers.VisitedSectionListFixedSize == 8,
+            "16-byte entries after an 8-byte fixed part");
+
+        // the same (mapId, guardId, sectionId) triple S_VISIT_NEW_SECTION carries, so one stored
+        // row feeds both packets - cap_social_client frame 374 is the 0x5A23 for the first entry
+        Hex.Eq(ArbiterClientHandlers.BuildVisitNewSection(false, 1, 25, 0x000923D9),
+            "11 00  23 5A  00  01 00 00 00  19 00 00 00  D9 23 09 00",
+            "S_VISIT_NEW_SECTION, cap_social_client frame 374");
+    }
+
 }
