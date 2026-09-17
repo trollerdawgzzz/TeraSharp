@@ -618,3 +618,194 @@ public sealed class GmCommandHandlers
             ["formatted"] = message ?? "",
         });
 }
+
+/// <summary>
+/// T89. The In-Game Operation Tool's own packets - the C_ADMIN_* family the GM client sends when
+/// the tool window is open, as opposed to the <c>/@</c> chat commands <see cref="GmCommands"/>
+/// handles. cap_final_gm_client2.log is a full session of it.
+///
+/// <para>Every handler here is gated on the same admin level the chat commands use. The tool is
+/// only ever opened by a client that already passed that gate, but the packets are ordinary
+/// client packets and an ordinary client can send them, so the gate is theirs too - a
+/// non-GM gets silence and a log line rather than another player's IP address.</para>
+///
+/// <para><b>Not here:</b> the three replies that are World's data, not ours -
+/// <c>S_ADMIN_GET_USERINFO_INVEN</c> (frame 724, 4439 B), <c>_WAREHOUSE</c> (747) and
+/// <c>_SKILL</c> (1428, 665 B), all answers to <c>C_ADMIN_REQUEST_USERINFO</c>; and
+/// <c>C_ADMIN_REQUEST_USERACTION</c> (786, 956), whose action ids the capture only shows two of.
+/// status/STATUS.md T89 lists them with their frame numbers.</para>
+/// </summary>
+public static class GmAdminTool
+{
+    /// <summary>
+    /// The live sessions, for the two packets that have to reach somebody other than the caller:
+    /// the warning goes to the warned player and the distance list is everyone nearby. Left null,
+    /// both fall back to the caller alone - a GM tool that can only see the GM is wrong but safe,
+    /// and silence would hang the window.
+    /// </summary>
+    public static Func<IReadOnlyList<GameSession>>? OnlineSessions { get; set; }
+
+    private static IReadOnlyList<GameSession> Online(GameSession s)
+    {
+        var all = OnlineSessions?.Invoke();
+        return all is { Count: > 0 } ? all : new[] { s };
+    }
+
+    /// <summary>The gate. Same level the chat commands need, resolved the same way.</summary>
+    private static bool Allowed(GameSession s, ILogger log, string what)
+    {
+        if (GmCommands.LevelOf(s, Program.Store) >= GmAccounts.MinimumAdminLevel) return true;
+        log.LogWarning("{What}: {Name} is not a GM - dropped", what, s.SelectedCharacter?.Name);
+        return false;
+    }
+
+    /// <summary>C_ADMIN_REQUEST_CUSTOM_BOOKMARK (0x9504), frame 524: <c>[i32 page]</c>.</summary>
+    public static bool OnRequestCustomBookmark(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        if (!Allowed(s, log, "C_ADMIN_REQUEST_CUSTOM_BOOKMARK")) return true;
+        long account = s.Account?.Id ?? 0;
+        var rows = account > 0 ? Program.Store?.GetGmBookmarks(account) : null;
+        s.Send(ArbiterClientHandlers.BuildAdminBookmarkList(
+            ArbiterClientHandlers.S_ADMIN_CUSTOM_BOOKMARK_LIST, rows));
+        return true;
+    }
+
+    /// <summary>C_ADMIN_REQUEST_DEFAULT_BOOKMARK (0x6E39), frame 525. The default list is server
+    /// configuration rather than anything of the GM's, and it is empty in the capture (frame
+    /// 528), so that is what goes out.</summary>
+    public static bool OnRequestDefaultBookmark(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        if (!Allowed(s, log, "C_ADMIN_REQUEST_DEFAULT_BOOKMARK")) return true;
+        s.Send(ArbiterClientHandlers.BuildAdminBookmarkList(
+            ArbiterClientHandlers.S_ADMIN_DEFAULT_BOOKMARK_LIST, null));
+        return true;
+    }
+
+    /// <summary>
+    /// C_ADMIN_ADD_CUSTOM_BOOKMARK (0x811A), frame 1167:
+    /// <c>[u16 nameOffset=0x1A][i32 index][i32 zone][f32 x][f32 y][f32 z][wstr name]</c>.
+    /// The tool redraws from the list that comes back, so the answer is the refreshed list.
+    /// </summary>
+    public const int AddBookmarkBodySize = 0x1A - 4;
+
+    public static bool OnAddCustomBookmark(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        if (!Allowed(s, log, "C_ADMIN_ADD_CUSTOM_BOOKMARK")) return true;
+        var b = body.Span;
+        long account = s.Account?.Id ?? 0;
+        if (b.Length >= AddBookmarkBodySize && account > 0 && Program.Store is not null)
+        {
+            int index = BitConverter.ToInt32(b[2..]);
+            int zone = BitConverter.ToInt32(b[6..]);
+            float x = BitConverter.ToSingle(b[10..]);
+            float y = BitConverter.ToSingle(b[14..]);
+            float z = BitConverter.ToSingle(b[18..]);
+            string name = ArbiterClientHandlers.ReadWString(b, 0);
+            Program.Store.AddGmBookmark(account, index, zone, x, y, z, name);
+            log.LogInformation("C_ADMIN_ADD_CUSTOM_BOOKMARK: '{Name}' at zone {Zone} ({X}, {Y}, {Z})",
+                name, zone, (int)x, (int)y, (int)z);
+        }
+        return OnRequestCustomBookmark(s, body, log);
+    }
+
+    /// <summary>C_ADMIN_GMEVENT_STATUS (0xBD39), frame 526: no body at all.</summary>
+    public static bool OnGmEventStatus(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        if (!Allowed(s, log, "C_ADMIN_GMEVENT_STATUS")) return true;
+        s.Send(ArbiterClientHandlers.BuildAdminGmEventStatus());
+        return true;
+    }
+
+    /// <summary>
+    /// C_ADMIN_CHECK_USERNAME (0x581A), frame 712:
+    /// <c>[u16 nameOffset=0x12][pdid 8][i32 0][wstr name]</c>. A name the GM typed becomes the
+    /// db id every other tool packet keys on, so an unknown name answers with id 0 rather than
+    /// with nothing - the window is waiting on the reply either way.
+    /// </summary>
+    public static bool OnCheckUsername(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        if (!Allowed(s, log, "C_ADMIN_CHECK_USERNAME")) return true;
+        string name = ArbiterClientHandlers.ReadWString(body.Span, 0);
+        var chr = Program.Store?.GetCharacterByName(name);
+        s.Send(ArbiterClientHandlers.BuildAdminCheckUsername(
+            name, chr?.Id ?? 0, chr?.TemplateId ?? 0, chr?.Id ?? 0));
+        return true;
+    }
+
+    /// <summary>C_ADMIN_GET_USER_INFO_BY_DBID (0xEFF2), frame 714:
+    /// <c>[i32 userDbId][i32 0]</c>.</summary>
+    public static bool OnGetUserInfoByDbId(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        if (!Allowed(s, log, "C_ADMIN_GET_USER_INFO_BY_DBID")) return true;
+        var b = body.Span;
+        int id = b.Length >= 4 ? BitConverter.ToInt32(b) : 0;
+        var chr = Program.Store?.GetCharacter(id);
+        bool online = false;
+        foreach (var live in Online(s)) if (live.SelectedCharacter?.Id == id) { online = true; break; }
+        s.Send(ArbiterClientHandlers.BuildAdminGetUserInfoByDbId(
+            id, online, chr?.Level ?? 0, chr?.TemplateId ?? 0, chr?.Name ?? string.Empty, LocalIp));
+        return true;
+    }
+
+    /// <summary>The address the captured replies carry for every row. We do not record the
+    /// client's remote endpoint anywhere the tool could read it, and the capture is a loopback
+    /// session, so this is what it showed.</summary>
+    public const string LocalIp = "127.0.0.1";
+
+    /// <summary>
+    /// C_ADMIN_GET_USER_INFO_LIST_BY_DISTANCE (0x5A0E), frame 1319: <c>[i32 distance]</c> - 125
+    /// in the capture. The reply (1320) is one row per player in range, and the GM's own
+    /// character is in it. Positions come from the character rows; the Arbiter does not track a
+    /// live position, so a player who has moved since their last stored point reads stale.
+    /// </summary>
+    public static bool OnGetUserInfoListByDistance(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        if (!Allowed(s, log, "C_ADMIN_GET_USER_INFO_LIST_BY_DISTANCE")) return true;
+        var rows = new List<(int, float, float, float, string, string)>();
+        foreach (var live in Online(s))
+        {
+            var chr = live.SelectedCharacter;
+            if (chr is null) continue;
+            rows.Add(((int)chr.Id, chr.X, chr.Y, chr.Z, chr.Name, LocalIp));
+        }
+        s.Send(ArbiterClientHandlers.BuildAdminUserInfoListByDistance(rows));
+        return true;
+    }
+
+    /// <summary>
+    /// C_ADMIN_WARNING_MESSAGE (0xC544), frame 1399:
+    /// <c>[u16 messageOffset=0x0A][i32 userDbId][wstr message]</c>. The reply goes to the WARNED
+    /// player (cap_final_gm_client frame 1424), not back to the tool.
+    /// </summary>
+    public static bool OnWarningMessage(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        if (!Allowed(s, log, "C_ADMIN_WARNING_MESSAGE")) return true;
+        var b = body.Span;
+        int target = b.Length >= 6 ? BitConverter.ToInt32(b[2..]) : 0;
+        string message = ArbiterClientHandlers.ReadWString(b, 0);
+
+        var frame = ArbiterClientHandlers.BuildAdminWarningMessage(message);
+        bool sent = false;
+        foreach (var live in Online(s))
+        {
+            if (live.SelectedCharacter?.Id != target) continue;
+            live.Send(frame);
+            sent = true;
+            break;
+        }
+        log.LogInformation("C_ADMIN_WARNING_MESSAGE: '{Msg}' -> player {Id}{Note}",
+            message, target, sent ? "" : " (not online - dropped)");
+        return true;
+    }
+
+    /// <summary>C_ADMIN_GM_SKILL (0x8949), frames 542 and 1210:
+    /// <c>[pdid 8][i32 value]</c>.</summary>
+    public static bool OnGmSkill(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        if (!Allowed(s, log, "C_ADMIN_GM_SKILL")) return true;
+        var b = body.Span;
+        int value = b.Length >= 12 ? BitConverter.ToInt32(b[8..]) : 0;
+        s.Send(ArbiterClientHandlers.BuildAdminGmSkill(0, value != 0));
+        return true;
+    }
+}

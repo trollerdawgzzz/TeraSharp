@@ -18993,6 +18993,129 @@ string message
             "frame 375");
     }
 
+    // ===================== T89: the In-Game Operation Tool =====================
+    //
+    // cap_final_gm_client2.log is the GM's client with the tool window open;
+    // cap_final_gm_client.log is the player being operated on, which is where the warning lands.
+
+    /// <summary>
+    /// The four packets the tool opens with, and the push that precedes them.
+    /// S_ADMIN_HOLD_CHARACTER goes out at enter-world (frames 402 / 675 there, 443 / 1139 in the
+    /// other capture); the bookmark lists and the event status answer the three requests the tool
+    /// fires the moment its window opens (frames 524 / 525 / 526).
+    /// </summary>
+    [Test] public static void T89_the_admin_tool_opening_frames_are_byte_exact()
+    {
+        Hex.Eq(ArbiterClientHandlers.BuildAdminHoldCharacter(), "05 00 0E A3 00",
+            "S_ADMIN_HOLD_CHARACTER, frame 402 - nobody is held");
+
+        Hex.Eq(ArbiterClientHandlers.BuildAdminBookmarkList(
+                ArbiterClientHandlers.S_ADMIN_CUSTOM_BOOKMARK_LIST, null),
+            "10 00 A4 E4 00 00 00 00 01 00 00 00 01 00 00 00",
+            "frame 527: an empty bookmark list is page 1 of 1, not page 0 of 0");
+        Hex.Eq(ArbiterClientHandlers.BuildAdminBookmarkList(
+                ArbiterClientHandlers.S_ADMIN_DEFAULT_BOOKMARK_LIST, null),
+            "10 00 30 E4 00 00 00 00 01 00 00 00 01 00 00 00",
+            "frame 528 - the same body under a different opcode");
+
+        Hex.Eq(ArbiterClientHandlers.BuildAdminGmEventStatus(),
+            "19 00 21 6F 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00",
+            "frame 529: no GM event running");
+
+        Hex.Eq(ArbiterClientHandlers.BuildAdminGmSkill(0, on: true), "09 00 BE 64 00 00 00 00 01",
+            "S_ADMIN_GM_SKILL, the enter-world push at frame 99");
+        Hex.Eq(ArbiterClientHandlers.BuildAdminGmSkill(0, on: false), "09 00 BE 64 00 00 00 00 00",
+            "and frame 546, the answer to the tool asking for 0");
+    }
+
+    /// <summary>
+    /// A bookmark round trip. Frame 1167 adds one at (16920.03, 1232.46, -4427.045) and frame
+    /// 1168 lists it back at (16920, 1232, -4427): the Arbiter stores the position as whole
+    /// numbers, which is the one thing about this packet no def would have told us.
+    /// </summary>
+    [Test] public static void T89_a_custom_bookmark_round_trips_with_whole_coordinates()
+    {
+        using var store = GuildStore(1);
+        long account = store.AccountOf(1);
+        store.AddGmBookmark(account, 1, 5, 16920.03f, 1232.46f, -4427.045f, "New");
+
+        var rows = store.GetGmBookmarks(account);
+        Hex.True(rows.Count == 1 && rows[0].Index == 1 && rows[0].Zone == 5
+                 && rows[0].X == 16920f && rows[0].Y == 1232f && rows[0].Z == -4427f,
+            $"the row keeps the truncated position: {rows[0].X}, {rows[0].Y}, {rows[0].Z}");
+
+        Hex.Eq(ArbiterClientHandlers.BuildAdminBookmarkList(
+                ArbiterClientHandlers.S_ADMIN_CUSTOM_BOOKMARK_LIST, rows),
+            "32 00 A4 E4 01 00 10 00 01 00 00 00 01 00 00 00 "
+            + "10 00 00 00 2A 00 01 00 00 00 05 00 00 00 00 30 "
+            + "84 46 00 00 9A 44 00 58 8A C5 4E 00 65 00 77 00 "
+            + "00 00",
+            "frame 1168");
+        Hex.True(ArbiterClientHandlers.AdminBookmarkElementSize == 26
+                 && ArbiterClientHandlers.AdminBookmarkFixedSize == 0x10,
+            "26-byte elements after a 16-byte fixed part");
+
+        // Re-adding the same index replaces it rather than making a second row.
+        store.AddGmBookmark(account, 1, 9, 1f, 2f, 3f, "again");
+        Hex.True(store.GetGmBookmarks(account).Count == 1
+                 && store.GetGmBookmarks(account)[0].Zone == 9, "one row per index");
+    }
+
+    /// <summary>
+    /// The three lookups the tool does before it can act on anybody: a typed name becomes a db
+    /// id (frames 712 -&gt; 713), the id becomes a row (714 -&gt; 715), and the list by distance
+    /// is everyone in range with their position and address (1319 -&gt; 1320).
+    /// </summary>
+    [Test] public static void T89_the_admin_lookups_are_byte_exact()
+    {
+        Hex.Eq(ArbiterClientHandlers.BuildAdminCheckUsername("New", 1003, 11013, 1),
+            "24 00 95 74 1C 00 05 2B 00 00 EB 03 00 00 01 00 "
+            + "F0 0A 00 80 00 00 00 00 00 00 00 00 4E 00 65 00 "
+            + "77 00 00 00",
+            "frame 713 - the name, its template and the db id everything else keys on");
+
+        Hex.Eq(ArbiterClientHandlers.BuildAdminGetUserInfoByDbId(1003, online: true, level: 29,
+                templateId: 11013, name: "New", ip: "127.0.0.1"),
+            "31 00 E0 C3 15 00 1D 00 EB 03 00 00 01 1D 00 00 "
+            + "00 05 2B 00 00 4E 00 65 00 77 00 00 00 31 00 32 "
+            + "00 37 00 2E 00 30 00 2E 00 30 00 2E 00 31 00 00 "
+            + "00",
+            "frame 715 - level 29, the first of the nine the capture climbs through");
+
+        // The level really is the only thing that moves: frame 1382 is the same row at 104.
+        var later = ArbiterClientHandlers.BuildAdminGetUserInfoByDbId(
+            1003, online: true, level: 104, templateId: 11013, name: "New", ip: "127.0.0.1");
+        Hex.True(later.Length == 49 && BitConverter.ToInt32(later, 13) == 104,
+            "frame 1382, byte for byte the same but for the level");
+
+        var list = ArbiterClientHandlers.BuildAdminUserInfoListByDistance(
+            new[] { (1003, BitConverter.ToSingle(Hex.B("0F 30 84 46"), 0),
+                           BitConverter.ToSingle(Hex.B("C9 0E 9A 44"), 0),
+                           BitConverter.ToSingle(Hex.B("00 58 8A C5"), 0), "New", "127.0.0.1") });
+        Hex.Eq(list,
+            "3C 00 2D B1 01 00 08 00 08 00 00 00 20 00 28 00 "
+            + "EB 03 00 00 0F 30 84 46 C9 0E 9A 44 00 58 8A C5 "
+            + "4E 00 65 00 77 00 00 00 31 00 32 00 37 00 2E 00 "
+            + "30 00 2E 00 30 00 2E 00 31 00 00 00",
+            "frame 1320 - and these coordinates are NOT truncated, unlike a bookmark's");
+        Hex.Eq(ArbiterClientHandlers.BuildAdminUserInfoListByDistance(null),
+            "08 00 2D B1 00 00 00 00", "nobody in range");
+    }
+
+    /// <summary>
+    /// The warning. cap_final_gm_client2 frame 1399 is the GM sending it and
+    /// cap_final_gm_client frame 1424 is the warned player receiving it - two captures, because
+    /// this is the one tool packet whose reply does not go back to the tool.
+    /// </summary>
+    [Test] public static void T89_the_admin_warning_reaches_the_warned_player()
+    {
+        Hex.Eq(ArbiterClientHandlers.BuildAdminWarningMessage("warn"),
+            "10 00 8B 83 06 00 77 00 61 00 72 00 6E 00 00 00",
+            "cap_final_gm_client frame 1424");
+        Hex.Eq(ArbiterClientHandlers.BuildAdminWarningMessage(""),
+            "06 00 8B 83 06 00 00 00", "an empty warning is still a well-formed frame");
+    }
+
     /// <summary>SDB_REGISTER_CARD's payload: <c>DlmId@0, AccountDbId@4 (i64), CardTemplateId@12,
     /// Amount@16</c> - 20 bytes, the length of seq 7032.</summary>
     static byte[] CardRegister(long accountId, int cardTemplateId, int amount)

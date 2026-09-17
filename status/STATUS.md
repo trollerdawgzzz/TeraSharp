@@ -367,3 +367,17 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   no captured frame has an element in it, so its stride is unknown and it stays empty. Every
   captured page is a character with nothing mounted and an empty collection, which is exactly the
   form a character with no mounts still produces, so frame 135 is still byte-exact.
+
+- T89 (cap_final_gm_client2): the In-Game Operation Tool's own packets. Nine C_ADMIN_* requests
+  and the S_ADMIN_* replies, all byte-exact against the capture and all gated on the same admin
+  level the `/@` chat commands use - the tool is only opened by a client that already passed that
+  gate, but these are ordinary client packets and an ordinary client can send them. New table
+  `gm_bookmarks`, per account, because the tool is opened from an account and not a character.
+
+  Two things the frames say that no def would have: an empty bookmark list is **page 1 of 1**,
+  not page 0 of 0 (frames 527 / 528), and a bookmark's coordinates come back **truncated to whole
+  numbers** - frame 1167 saves 16920.03 / 1232.46 / -4427.045 and frame 1168 lists 16920 / 1232 /
+  -4427, while the live positions in the by-distance list (frame 1320) keep their fractions.
+  `S_ADMIN_WARNING_MESSAGE` is the one tool packet whose reply does not go back to the tool: the
+  GM sends it at frame 1399 and the warned player receives it in the OTHER capture, at
+  cap_final_gm_client frame 1424.

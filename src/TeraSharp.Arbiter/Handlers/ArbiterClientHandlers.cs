@@ -1885,6 +1885,227 @@ public static class ArbiterClientHandlers
         return true;
     }
 
+    // =========================================================================================
+    // 15. The In-Game Operation Tool                                                    (T89)
+    //
+    // cap_final_gm_client2.log is the GM's client. Every layout below is from a frame there;
+    // the packets that need World's data (S_ADMIN_GET_USERINFO_INVEN 4439 B frame 724,
+    // _WAREHOUSE frame 747, _SKILL 665 B frame 1428) are NOT here - they are World's to answer.
+    // =========================================================================================
+
+    public const ushort C_ADMIN_REQUEST_CUSTOM_BOOKMARK = 0x9504;
+    public const ushort C_ADMIN_REQUEST_DEFAULT_BOOKMARK = 0x6E39;
+    public const ushort C_ADMIN_ADD_CUSTOM_BOOKMARK = 0x811A;
+    public const ushort C_ADMIN_GMEVENT_STATUS = 0xBD39;
+    public const ushort C_ADMIN_CHECK_USERNAME = 0x581A;
+    public const ushort C_ADMIN_GET_USER_INFO_BY_DBID = 0xEFF2;
+    public const ushort C_ADMIN_GET_USER_INFO_LIST_BY_DISTANCE = 0x5A0E;
+    public const ushort C_ADMIN_WARNING_MESSAGE = 0xC544;
+    public const ushort C_ADMIN_GM_SKILL = 0x8949;
+
+    public const ushort S_ADMIN_CUSTOM_BOOKMARK_LIST = 0xE4A4;
+    public const ushort S_ADMIN_DEFAULT_BOOKMARK_LIST = 0xE430;
+    public const ushort S_ADMIN_GMEVENT_STATUS = 0x6F21;
+    public const ushort S_ADMIN_CHECK_USERNAME = 0x7495;
+    public const ushort S_ADMIN_GET_USER_INFO_BY_DBID = 0xC3E0;
+    public const ushort S_ADMIN_GET_USER_INFO_LIST_BY_DISTANCE = 0xB12D;
+    public const ushort S_ADMIN_WARNING_MESSAGE = 0x838B;
+    public const ushort S_ADMIN_GM_SKILL = 0x64BE;
+    public const ushort S_ADMIN_HOLD_CHARACTER = 0xA30E;
+
+    /// <summary>S_ADMIN_HOLD_CHARACTER (0xA30E): one byte, 0 in all four captured frames
+    /// (gm_client 443 / 1139, gm_client2 402 / 675). It is pushed at enter-world - a held
+    /// character is one the tool has frozen.</summary>
+    public static byte[] BuildAdminHoldCharacter(bool held = false)
+        => new byte[] { 0x05, 0x00, (byte)S_ADMIN_HOLD_CHARACTER, (byte)(S_ADMIN_HOLD_CHARACTER >> 8),
+                        (byte)(held ? 1 : 0) };
+
+    /// <summary>
+    /// S_ADMIN_CUSTOM_BOOKMARK_LIST (0xE4A4) and S_ADMIN_DEFAULT_BOOKMARK_LIST (0xE430) - one
+    /// layout, two opcodes.
+    /// <code>
+    ///   +0x04 u16 count / +0x06 u16 firstOffset / +0x08 i32 page / +0x0C i32 totalPage
+    ///   element 26 B + name:
+    ///     +0 u16 here  +2 u16 next  +4 u16 nameOffset
+    ///     +6 i32 index  +10 i32 zone  +14 f32 x  +18 f32 y  +22 f32 z   then the name
+    /// </code>
+    /// Frames 527 / 528 are the empty form (page 1 of 1, which is what an empty list carries
+    /// here - not page 0) and 1168 is the one row.
+    /// </summary>
+    public const int AdminBookmarkFixedSize = 0x10;
+    public const int AdminBookmarkElementSize = 26;
+
+    public static byte[] BuildAdminBookmarkList(ushort opcode,
+        IReadOnlyList<CharacterStore.GmBookmarkRow>? rows, int page = 1, int totalPage = 1)
+    {
+        rows ??= Array.Empty<CharacterStore.GmBookmarkRow>();
+        var names = new byte[rows.Count][];
+        int total = AdminBookmarkFixedSize;
+        for (int i = 0; i < rows.Count; i++)
+        {
+            names[i] = WString(rows[i].Name);
+            total += AdminBookmarkElementSize + names[i].Length;
+        }
+
+        var p = new byte[total];
+        BitConverter.GetBytes((ushort)total).CopyTo(p, 0);
+        BitConverter.GetBytes(opcode).CopyTo(p, 2);
+        BitConverter.GetBytes((ushort)rows.Count).CopyTo(p, 4);
+        BitConverter.GetBytes((ushort)(rows.Count == 0 ? 0 : AdminBookmarkFixedSize)).CopyTo(p, 6);
+        BitConverter.GetBytes(page).CopyTo(p, 8);
+        BitConverter.GetBytes(totalPage).CopyTo(p, 12);
+
+        int at = AdminBookmarkFixedSize;
+        for (int i = 0; i < rows.Count; i++)
+        {
+            int size = AdminBookmarkElementSize + names[i].Length;
+            BitConverter.GetBytes((ushort)at).CopyTo(p, at);
+            BitConverter.GetBytes((ushort)(i + 1 < rows.Count ? at + size : 0)).CopyTo(p, at + 2);
+            BitConverter.GetBytes((ushort)(at + AdminBookmarkElementSize)).CopyTo(p, at + 4);
+            BitConverter.GetBytes(rows[i].Index).CopyTo(p, at + 6);
+            BitConverter.GetBytes(rows[i].Zone).CopyTo(p, at + 10);
+            // Whole numbers: frame 1167 sends 16920.03 and 1168 returns 16920.
+            BitConverter.GetBytes((float)(int)rows[i].X).CopyTo(p, at + 14);
+            BitConverter.GetBytes((float)(int)rows[i].Y).CopyTo(p, at + 18);
+            BitConverter.GetBytes((float)(int)rows[i].Z).CopyTo(p, at + 22);
+            names[i].CopyTo(p, at + AdminBookmarkElementSize);
+            at += size;
+        }
+        return p;
+    }
+
+    /// <summary>S_ADMIN_GMEVENT_STATUS (0x6F21), frame 529: twenty-one bytes, all zero - no
+    /// GM event is running, which is the only state either capture shows.</summary>
+    public static byte[] BuildAdminGmEventStatus()
+    {
+        var p = new byte[25];
+        BitConverter.GetBytes((ushort)25).CopyTo(p, 0);
+        BitConverter.GetBytes(S_ADMIN_GMEVENT_STATUS).CopyTo(p, 2);
+        return p;
+    }
+
+    /// <summary>
+    /// S_ADMIN_CHECK_USERNAME (0x7495), frame 713:
+    /// <c>[u16 nameOffset=0x1C][i32 templateId][i32 userDbId][pdid 8][6 reserved bytes][wstr name]</c>.
+    /// The tool asks it before anything else, to turn a typed name into a db id.
+    /// </summary>
+    public const int AdminCheckUsernameFixedSize = 0x1C;
+
+    public static byte[] BuildAdminCheckUsername(string? name, int userDbId, int templateId, int pdidSerial)
+    {
+        var n = WString(name);
+        var p = new byte[AdminCheckUsernameFixedSize + n.Length];
+        BitConverter.GetBytes((ushort)p.Length).CopyTo(p, 0);
+        BitConverter.GetBytes(S_ADMIN_CHECK_USERNAME).CopyTo(p, 2);
+        BitConverter.GetBytes((ushort)AdminCheckUsernameFixedSize).CopyTo(p, 4);
+        BitConverter.GetBytes(templateId).CopyTo(p, 6);
+        BitConverter.GetBytes(userDbId).CopyTo(p, 10);
+        WritePdid(p, 14, pdidSerial);
+        n.CopyTo(p, AdminCheckUsernameFixedSize);
+        return p;
+    }
+
+    /// <summary>
+    /// S_ADMIN_GET_USER_INFO_BY_DBID (0xC3E0), frame 715:
+    /// <c>[u16 nameOffset=21][u16 ipOffset=29][i32 userDbId][u8 online][i32 level]
+    /// [i32 templateId][wstr name][wstr ip]</c>. The level is what climbs across the capture's
+    /// nine instances (29, 33, 36, 102, 103, 104) while everything else stays put.
+    /// </summary>
+    public const int AdminUserInfoFixedSize = 21;
+
+    public static byte[] BuildAdminGetUserInfoByDbId(int userDbId, bool online, int level,
+                                                     int templateId, string? name, string? ip)
+    {
+        var n = WString(name);
+        var a = WString(ip);
+        var p = new byte[AdminUserInfoFixedSize + n.Length + a.Length];
+        BitConverter.GetBytes((ushort)p.Length).CopyTo(p, 0);
+        BitConverter.GetBytes(S_ADMIN_GET_USER_INFO_BY_DBID).CopyTo(p, 2);
+        BitConverter.GetBytes((ushort)AdminUserInfoFixedSize).CopyTo(p, 4);
+        BitConverter.GetBytes((ushort)(AdminUserInfoFixedSize + n.Length)).CopyTo(p, 6);
+        BitConverter.GetBytes(userDbId).CopyTo(p, 8);
+        p[12] = (byte)(online ? 1 : 0);
+        BitConverter.GetBytes(level).CopyTo(p, 13);
+        BitConverter.GetBytes(templateId).CopyTo(p, 17);
+        n.CopyTo(p, AdminUserInfoFixedSize);
+        a.CopyTo(p, AdminUserInfoFixedSize + n.Length);
+        return p;
+    }
+
+    /// <summary>
+    /// S_ADMIN_GET_USER_INFO_LIST_BY_DISTANCE (0xB12D), frame 1320: <c>[u16 count][u16 firstOff]</c>
+    /// then 24-byte elements <c>[u16 here][u16 next][u16 nameOff][u16 ipOff][i32 userDbId]
+    /// [f32 x][f32 y][f32 z]</c>, each followed by its name and its ip. Live coordinates, so
+    /// these are NOT truncated the way a bookmark's are.
+    /// </summary>
+    public const int AdminDistanceElementSize = 24;
+
+    public static byte[] BuildAdminUserInfoListByDistance(
+        IReadOnlyList<(int UserDbId, float X, float Y, float Z, string Name, string Ip)>? rows)
+    {
+        rows ??= Array.Empty<(int, float, float, float, string, string)>();
+        var names = new byte[rows.Count][];
+        var ips = new byte[rows.Count][];
+        int total = 8;
+        for (int i = 0; i < rows.Count; i++)
+        {
+            names[i] = WString(rows[i].Name);
+            ips[i] = WString(rows[i].Ip);
+            total += AdminDistanceElementSize + names[i].Length + ips[i].Length;
+        }
+
+        var p = new byte[total];
+        BitConverter.GetBytes((ushort)total).CopyTo(p, 0);
+        BitConverter.GetBytes(S_ADMIN_GET_USER_INFO_LIST_BY_DISTANCE).CopyTo(p, 2);
+        BitConverter.GetBytes((ushort)rows.Count).CopyTo(p, 4);
+        BitConverter.GetBytes((ushort)(rows.Count == 0 ? 0 : 8)).CopyTo(p, 6);
+
+        int at = 8;
+        for (int i = 0; i < rows.Count; i++)
+        {
+            int size = AdminDistanceElementSize + names[i].Length + ips[i].Length;
+            BitConverter.GetBytes((ushort)at).CopyTo(p, at);
+            BitConverter.GetBytes((ushort)(i + 1 < rows.Count ? at + size : 0)).CopyTo(p, at + 2);
+            BitConverter.GetBytes((ushort)(at + AdminDistanceElementSize)).CopyTo(p, at + 4);
+            BitConverter.GetBytes((ushort)(at + AdminDistanceElementSize + names[i].Length)).CopyTo(p, at + 6);
+            BitConverter.GetBytes(rows[i].UserDbId).CopyTo(p, at + 8);
+            BitConverter.GetBytes(rows[i].X).CopyTo(p, at + 12);
+            BitConverter.GetBytes(rows[i].Y).CopyTo(p, at + 16);
+            BitConverter.GetBytes(rows[i].Z).CopyTo(p, at + 20);
+            names[i].CopyTo(p, at + AdminDistanceElementSize);
+            ips[i].CopyTo(p, at + AdminDistanceElementSize + names[i].Length);
+            at += size;
+        }
+        return p;
+    }
+
+    /// <summary>S_ADMIN_WARNING_MESSAGE (0x838B), cap_final_gm_client frame 1424:
+    /// <c>[u16 messageOffset=6][wstr message]</c>. It goes to the WARNED player's client, not to
+    /// the tool's - which is why it is in the other capture.</summary>
+    public static byte[] BuildAdminWarningMessage(string? message)
+    {
+        var m = WString(message);
+        var p = new byte[6 + m.Length];
+        BitConverter.GetBytes((ushort)p.Length).CopyTo(p, 0);
+        BitConverter.GetBytes(S_ADMIN_WARNING_MESSAGE).CopyTo(p, 2);
+        BitConverter.GetBytes((ushort)6).CopyTo(p, 4);
+        m.CopyTo(p, 6);
+        return p;
+    }
+
+    /// <summary>S_ADMIN_GM_SKILL (0x64BE), frames 99 and 546: <c>[i32][u8]</c>. The push at
+    /// enter-world carries 0 / 1 and the reply to the tool's request carries 0 / 0 for a
+    /// requested value of 0 - two samples, so the reply mirrors "did you ask for something".</summary>
+    public static byte[] BuildAdminGmSkill(int value = 0, bool on = false)
+    {
+        var p = new byte[9];
+        BitConverter.GetBytes((ushort)9).CopyTo(p, 0);
+        BitConverter.GetBytes(S_ADMIN_GM_SKILL).CopyTo(p, 2);
+        BitConverter.GetBytes(value).CopyTo(p, 4);
+        p[8] = (byte)(on ? 1 : 0);
+        return p;
+    }
+
     /// <summary>A NUL-terminated UTF-16LE string, as the inter-server and client writers emit it.</summary>
     public static byte[] WString(string? s)
     {
