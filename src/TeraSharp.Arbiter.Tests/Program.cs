@@ -9542,6 +9542,116 @@ array<uint32> items3
             "cap_social4_client2 frame 5643 - an empty parcel note, built by the Arbiter");
     }
 
+
+    // =======================================================================================
+    // T87 - telemetry, acks and the lobby's housekeeping packets.
+    //
+    // Only C_PONG is in any capture (cap_social4_client 32 and 4390, answering S_PING at 31).
+    // Everything else is pinned against the decompiled writer, so these tests are what stops
+    // the layouts drifting.
+    // =======================================================================================
+
+    /// <summary>
+    /// T87 - the three bare four-byte frames. S_PING / C_PONG are in the capture verbatim, and
+    /// S_CHECK_RTT is the same shape because <c>Handler_C_CHECK_RTT</c> writes the opcode and
+    /// sends with no payload write after it.
+    /// </summary>
+    [Test] public static void T87_ping_pong_and_rtt_are_bare_four_byte_frames()
+    {
+        Hex.True(ArbiterClientHandlers.S_PING == 0x9611 && ArbiterClientHandlers.C_PONG == 0x8091,
+            "cap_social4_client frame 31 is 04 00 11 96 and frame 32 is 04 00 91 80");
+        Hex.Eq(ArbiterClientHandlers.BuildCheckRttAck(), "04 00 B0 52",
+            "S_CHECK_RTT: opcode only, nothing written after it");
+    }
+
+    /// <summary>
+    /// T87 - S_PLAY_TIME and S_GET_MY_IP. The first is one u32 scalar; the second is the
+    /// reserve-slot / backpatch-to-length / append-wide-string shape S_SHOW_PARCEL_MESSAGE uses,
+    /// so its offset is always 6.
+    /// </summary>
+    [Test] public static void T87_play_time_and_my_ip_match_the_writers()
+    {
+        Hex.Eq(ArbiterClientHandlers.BuildPlayTime(237), "08 00 BE A2  ED 00 00 00",
+            "S_PLAY_TIME: [len=8][op][u32 seconds]");
+
+        Hex.Eq(ArbiterClientHandlers.BuildMyIp("10.0.2.15"),
+            "1A 00 DF A9  06 00  31 00 30 00 2E 00 30 00 2E 00 32 00 2E 00 31 00 35 00  00 00",
+            "S_GET_MY_IP: [len][op][u16 offset=6][wchar ip][NUL]");
+        Hex.Eq(ArbiterClientHandlers.BuildMyIp(null),
+            "1A 00 DF A9  06 00  31 00 32 00 37 00 2E 00 30 00 2E 00 30 00 2E 00 31 00  00 00",
+            "no lookup wired yet means the loopback, not an empty string");
+    }
+
+    /// <summary>
+    /// T87 - S_ANNOUNCE_UPDATE_NOTIFICATION and S_REFRESH_API_ACCESS_TOKEN.
+    ///
+    /// <para>The notification is the one packet here with TWO string slots, and both are
+    /// reserved before the u32 id - headers first, then scalars - so the first string starts at
+    /// 12 whatever the id is, and the second at 12 plus the first string's bytes.</para>
+    /// </summary>
+    [Test] public static void T87_update_notification_and_api_token_match_the_writers()
+    {
+        Hex.Eq(ArbiterClientHandlers.BuildAnnounceUpdateNotification(7, "v1", "hi"),
+            "18 00 2E 5C  0C 00  12 00  07 00 00 00  76 00 31 00 00 00  68 00 69 00 00 00",
+            "S_ANNOUNCE_UPDATE_NOTIFICATION: two slots, then the id, then both strings");
+        Hex.Eq(ArbiterClientHandlers.BuildAnnounceUpdateNotification(0, null, null),
+            "10 00 2E 5C  0C 00  0E 00  00 00 00 00  00 00  00 00",
+            "the empty form we actually send - both offsets are real, only the text is absent");
+
+        Hex.Eq(ArbiterClientHandlers.BuildRefreshApiAccessToken("abc"),
+            "0E 00 E4 55  06 00  61 00 62 00 63 00  00 00",
+            "S_REFRESH_API_ACCESS_TOKEN is S_GET_MY_IP's shape with a different opcode");
+    }
+
+    /// <summary>
+    /// T87 - the one rejection path in the group. <c>Handler_C_SEND_UI_LOG</c> returns FALSE for
+    /// a selector that is not 1, 2 or 3; every other handler here returns TRUE whatever it got.
+    /// </summary>
+    [Test] public static void T87_ui_log_rejects_a_kind_outside_one_to_three()
+    {
+        static ReadOnlyMemory<byte> Kind(int k) => BitConverter.GetBytes(k);
+        for (int k = 1; k <= 3; k++)
+            Hex.True(ArbiterClientHandlers.OnSendUiLog(null!, Kind(k), QuietLog()),
+                $"kind {k} is one of the three counters");
+        Hex.True(!ArbiterClientHandlers.OnSendUiLog(null!, Kind(0), QuietLog()), "kind 0 is rejected");
+        Hex.True(!ArbiterClientHandlers.OnSendUiLog(null!, Kind(4), QuietLog()), "kind 4 is rejected");
+        Hex.True(!ArbiterClientHandlers.OnSendUiLog(null!, new byte[3], QuietLog()),
+            "and a body shorter than the guard is rejected before the read");
+    }
+
+    /// <summary>
+    /// T87 - every opcode in the group is Arbiter-owned, so PacketDispatcher drops it rather
+    /// than forwarding. C_CANCEL_RETURN_TO_LOBBY is the deliberate exception: the registry has
+    /// answered it since T33 and it DOES forward to World.
+    /// </summary>
+    [Test] public static void T87_telemetry_opcodes_are_arbiter_owned()
+    {
+        var group = new (ushort Op, string Name)[]
+        {
+            (ArbiterClientHandlers.C_PONG, "C_PONG"),
+            (ArbiterClientHandlers.C_CHECK_RTT, "C_CHECK_RTT"),
+            (ArbiterClientHandlers.C_PLAY_TIME, "C_PLAY_TIME"),
+            (ArbiterClientHandlers.C_REQUEST_PLAYTIME, "C_REQUEST_PLAYTIME"),
+            (ArbiterClientHandlers.C_REQUEST_PERF, "C_REQUEST_PERF"),
+            (ArbiterClientHandlers.C_SEND_UI_LOG, "C_SEND_UI_LOG"),
+            (ArbiterClientHandlers.C_GET_MY_IP, "C_GET_MY_IP"),
+            (ArbiterClientHandlers.C_XIGNCODE_SECURITY_DATA, "C_XIGNCODE_SECURITY_DATA"),
+            (ArbiterClientHandlers.C_INVALID_BUILD_VERSION, "C_INVALID_BUILD_VERSION"),
+            (ArbiterClientHandlers.C_REQUEST_LATEST_UPDATE_NOTIFICATION, "C_REQUEST_LATEST_UPDATE_NOTIFICATION"),
+            (ArbiterClientHandlers.C_CONFIRM_UPDATE_NOTIFICATION, "C_CONFIRM_UPDATE_NOTIFICATION"),
+            (ArbiterClientHandlers.C_SECOND_PASSWORD_AUTH, "C_SECOND_PASSWORD_AUTH"),
+            (ArbiterClientHandlers.C_SECOND_PASSWORD_REGISTER, "C_SECOND_PASSWORD_REGISTER"),
+            (ArbiterClientHandlers.C_REFRESH_API_ACCESS_TOKEN, "C_REFRESH_API_ACCESS_TOKEN"),
+            (ArbiterClientHandlers.C_CANCEL_EXIT, "C_CANCEL_EXIT"),
+        };
+        foreach (var (op, name) in group)
+            Hex.True(ArbiterClientHandlers.ArbiterOwned.Contains(op),
+                $"{name} (0x{op:X4}) must never be forwarded to World");
+        Hex.True(group.Length == 15, "fifteen of the sixteen - the sixteenth already had a handler");
+        Hex.True(!ArbiterClientHandlers.ArbiterOwned.Contains((ushort)0xEB4D),
+            "C_CANCEL_RETURN_TO_LOBBY stays out: the registry answers AND forwards it");
+    }
+
     // ---- The rules ----
 
     [Test] public static void T30_system_message_format_matches_the_capture()

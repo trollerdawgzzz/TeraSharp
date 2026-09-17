@@ -609,3 +609,57 @@ Three findings worth keeping:
 
 The three expiries in frame 14 are 1791961199, 2100409199 and 1786777199; the brief quoted
 1791165551, which does not round-trip to the capture hex.
+
+## 12. T87 — telemetry, acks and the lobby’s housekeeping
+
+Sixteen client packets, each with a real `Handler_C_*` in ArbiterServer.exe and none with a
+World handler. **Only `C_PONG` appears in any capture** (`cap_social4_client` 32 and 4390,
+answering `S_PING` at 31; both are bare four-byte frames), so the rest is decompile-derived.
+
+The handlers’ length guards are **packet** lengths. `PacketDispatcher`’s `minLen` is a **body**
+length, so every registry number below is the guard minus four.
+
+| opcode | packet | guard | what the real handler does | ours |
+|---|---|---|---|---|
+| 0x8091 | `C_PONG` | none | nothing — the handler takes no arguments and returns 1 | noop |
+| 0xF290 | `C_CHECK_RTT` | ≥4 | writes `S_CHECK_RTT` 0x52B0 and sends, with no payload write | reply `04 00 B0 52` |
+| 0x7CFE | `C_PLAY_TIME` | none | `S_PLAY_TIME` 0xA2BE + the u32 at User+0x1E4 | reply, seconds from a hook |
+| 0xBC06 | `C_REQUEST_PLAYTIME` | ≥4 | stamps now onto the account tracker (Account+0x30F0); **no reply** | noop |
+| 0xD71E | `C_REQUEST_PERF` | ≥8 | asks every World (`AS_REQUEST_PERF` 0x1446) and reports to the **admin tool**; the client gets nothing | noop |
+| 0xACE5 | `C_SEND_UI_LOG` | ≥8 | body word 0 selects one of three counters (1/2/3); **returns FALSE otherwise** | noop + that rejection |
+| 0xAD47 | `C_GET_MY_IP` | ≥4 | `%d.%d.%d.%d` of the peer into `S_GET_MY_IP` 0xA9DF | reply |
+| 0x9219 | `C_XIGNCODE_SECURITY_DATA` | ≥8 | wraps the blob as `AX_PONG_SECURITY_DATA` 0x426B **to the anti-cheat server**, not the client | noop |
+| 0x7F08 | `C_INVALID_BUILD_VERSION` | ≥4 | logs and disconnects unconditionally | log + `Close()` |
+| 0x779E | `C_REQUEST_LATEST_UPDATE_NOTIFICATION` | ≥4 | `S_ANNOUNCE_UPDATE_NOTIFICATION` 0x5C2E | reply, empty form |
+| 0xFE00 | `C_CONFIRM_UPDATE_NOTIFICATION` | ≥8 | compares the id with the account’s; **no reply** | noop |
+| 0x871F | `C_SECOND_PASSWORD_AUTH` | ≥6 | string ref → second-password manager, async result | noop |
+| 0x761E | `C_SECOND_PASSWORD_REGISTER` | ≥6 | same, register path | noop |
+| 0xC2BA | `C_REFRESH_API_ACCESS_TOKEN` | ≥4 | mints a token, `S_REFRESH_API_ACCESS_TOKEN` 0x55E4; **no packet at all on failure** | reply, empty token |
+| 0xE488 | `C_CANCEL_EXIT` | none | queues the cancel job; **there is no `S_CANCEL_EXIT` opcode** | cancel, no reply |
+| 0xEB4D | `C_CANCEL_RETURN_TO_LOBBY` | none | queues the cancel; the job sends 0x5E0E + one byte | **already done** (T33) |
+
+### 12.1 The three reply layouts
+
+None of the sixteen has a shipped `.def` — all are raw writers.
+
+```
+S_CHECK_RTT      [u16 len=4][u16 op]
+S_PLAY_TIME      [u16 len=8][u16 op][u32 seconds]
+S_GET_MY_IP      [u16 len][u16 op][u16 offset=6][wchar ip][u16 0]
+S_REFRESH_API_ACCESS_TOKEN   same shape as S_GET_MY_IP
+S_ANNOUNCE_UPDATE_NOTIFICATION
+                 [u16 len][u16 op][u16 offTitle=12][u16 offBody][u32 id][wchar][wchar]
+```
+
+Both string slots of `S_ANNOUNCE_UPDATE_NOTIFICATION` are reserved **before** the u32 — headers
+first, then scalars, the same order the def codec uses — so the first string always starts at 12.
+
+Three findings worth keeping:
+
+* **`C_REQUEST_PERF` and `C_XIGNCODE_SECURITY_DATA` are not client replies at all.** One talks to
+  the admin tool, the other to the anti-cheat server. A future task that "implements" them by
+  answering the client would be wrong.
+* **`C_CANCEL_EXIT` has no reply**, while its lobby twin does — there is no `S_CANCEL_EXIT`
+  opcode in the table. The asymmetry is real, not a gap in the capture.
+* **`RegNoop` is the wrong helper for every one of these.** It forwards to World when in-world,
+  which is the §7 bug all over again; they are registered with `Reg` and listed in `ArbiterOwned`.

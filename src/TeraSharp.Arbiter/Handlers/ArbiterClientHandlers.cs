@@ -146,6 +146,15 @@ public static class ArbiterClientHandlers
         // T83 - cards + guild perks
         C_REQUEST_MY_ACTIVATE_CARD_COMBINE_LIST_DATA, C_REQUEST_OTHERS_ACTIVATE_CARD_COMBINE_LIST_DATA_WITH_GAMEID,
         C_REQUEST_OTHERS_CARD_DATA_WITH_GAMEID, C_REQUEST_GUILD_PERK_LIST,
+        // T87 - the telemetry and housekeeping group. Every one has a Handler_C_* in the
+        // Arbiter and none has a World handler, so a forward can only produce World s
+        // "handler has not been implemented yet!!!". C_CANCEL_RETURN_TO_LOBBY is deliberately
+        // absent: the registry has answered it since T33 and it does forward to World.
+        C_PONG, C_CHECK_RTT, C_PLAY_TIME, C_REQUEST_PLAYTIME, C_REQUEST_PERF, C_SEND_UI_LOG,
+        C_GET_MY_IP, C_XIGNCODE_SECURITY_DATA, C_INVALID_BUILD_VERSION,
+        C_REQUEST_LATEST_UPDATE_NOTIFICATION, C_CONFIRM_UPDATE_NOTIFICATION,
+        C_SECOND_PASSWORD_AUTH, C_SECOND_PASSWORD_REGISTER, C_REFRESH_API_ACCESS_TOKEN,
+        C_CANCEL_EXIT,
     };
 
     // =========================================================================================
@@ -1577,6 +1586,303 @@ public static class ArbiterClientHandlers
             ["items2"] = Ids(list2 ?? DefaultSellableItems),
             ["items3"] = Ids(list3),
         };
+    }
+
+    // =========================================================================================
+    // 16. Telemetry, acks and the lobby's housekeeping packets                        (T87)
+    //
+    // Sixteen client packets that all have a real Handler_C_* in ArbiterServer.exe and none of
+    // which World can answer. Only C_PONG appears in any capture (cap_social4_client frames 32
+    // and 4390, answering S_PING frame 31 - both bare four-byte frames), so the layouts below
+    // come from the decompiled handlers and their writers, not from bytes on the wire.
+    //
+    // The decompile's length guards are PACKET lengths; the dispatcher's minLen is a BODY
+    // length, so every constant here is the guard minus four.
+    // =========================================================================================
+
+    public const ushort C_PONG = 0x8091;                               // 32913
+    public const ushort S_PING = 0x9611;                               // 38417
+    public const ushort C_CHECK_RTT = 0xF290;                          // 62096
+    public const ushort S_CHECK_RTT = 0x52B0;                          // 21168
+    public const ushort C_PLAY_TIME = 0x7CFE;                          // 31998
+    public const ushort S_PLAY_TIME = 0xA2BE;                          // 41662
+    public const ushort C_REQUEST_PLAYTIME = 0xBC06;                   // 48134
+    public const ushort C_REQUEST_PERF = 0xD71E;                       // 55070
+    public const ushort C_SEND_UI_LOG = 0xACE5;                        // 44261
+    public const ushort C_GET_MY_IP = 0xAD47;                          // 44359
+    public const ushort S_GET_MY_IP = 0xA9DF;                          // 43487
+    public const ushort C_XIGNCODE_SECURITY_DATA = 0x9219;             // 37401
+    public const ushort C_INVALID_BUILD_VERSION = 0x7F08;              // 32520
+    public const ushort C_REQUEST_LATEST_UPDATE_NOTIFICATION = 0x779E; // 30622
+    public const ushort S_ANNOUNCE_UPDATE_NOTIFICATION = 0x5C2E;       // 23598
+    public const ushort C_CONFIRM_UPDATE_NOTIFICATION = 0xFE00;        // 65024
+    public const ushort C_SECOND_PASSWORD_AUTH = 0x871F;               // 34591
+    public const ushort C_SECOND_PASSWORD_REGISTER = 0x761E;           // 30238
+    public const ushort C_REFRESH_API_ACCESS_TOKEN = 0xC2BA;           // 49850
+    public const ushort S_REFRESH_API_ACCESS_TOKEN = 0x55E4;           // 22004
+    public const ushort C_CANCEL_EXIT = 0xE488;                        // 58504
+
+    // Body minimums, i.e. the decompiled packet guard minus the four header bytes. A guard of
+    // 4 therefore admits an empty body - C_PONG and the bare S_CHECK_RTT prove that is real.
+    public const int CheckRttBodySize = 0;                 // Handler guard: packet >= 4
+    public const int RequestPlaytimeBodySize = 0;          // packet >= 4
+    public const int GetMyIpBodySize = 0;                  // packet >= 4
+    public const int InvalidBuildVersionBodySize = 0;      // packet >= 4
+    public const int LatestUpdateNotificationBodySize = 0; // packet >= 4
+    public const int RefreshApiAccessTokenBodySize = 0;    // packet >= 4
+    public const int SecondPasswordBodySize = 2;           // packet >= 6
+    public const int RequestPerfBodySize = 4;              // packet >= 8
+    public const int SendUiLogBodySize = 4;                // packet >= 8
+    public const int XignCodeSecurityDataBodySize = 4;     // packet >= 8
+    public const int ConfirmUpdateNotificationBodySize = 4;// packet >= 8
+
+    /// <summary>The peer address S_GET_MY_IP reports. Set from the registry once the session
+    /// exposes its socket endpoint; until then every client is told the loopback.</summary>
+    public static Func<GameSession, string>? RemoteIpLookup { get; set; }
+
+    /// <summary>Seconds played this session, for S_PLAY_TIME. Unset means zero, which is what
+    /// LoginHandlers already passes S_SEND_USER_PLAY_TIME.</summary>
+    public static Func<GameSession, int>? PlayTimeLookup { get; set; }
+
+    /// <summary>Loopback, used when <see cref="RemoteIpLookup"/> is unset.</summary>
+    public const string DefaultMyIp = "127.0.0.1";
+
+    /// <summary>
+    /// S_CHECK_RTT (0x52B0) - opcode and nothing else. <c>Handler_C_CHECK_RTT</c> opens the
+    /// writer, calls the u16 opcode write and sends: no payload write follows, so the whole
+    /// frame is four bytes, the same shape as the S_PING / C_PONG pair in the capture.
+    /// </summary>
+    public static byte[] BuildCheckRttAck()
+        => new byte[] { 0x04, 0x00, unchecked((byte)S_CHECK_RTT), (byte)(S_CHECK_RTT >> 8) };
+
+    /// <summary>
+    /// S_PLAY_TIME (0xA2BE): <c>[u16 len=8][u16 op][u32 seconds]</c>. The real handler reads the
+    /// counter at User+0x1E4 and writes it with the u32 primitive - one scalar, no refs.
+    /// </summary>
+    public static byte[] BuildPlayTime(uint seconds)
+    {
+        var p = new byte[8];
+        p[0] = 8; p[1] = 0;
+        p[2] = unchecked((byte)S_PLAY_TIME); p[3] = (byte)(S_PLAY_TIME >> 8);
+        BitConverter.GetBytes(seconds).CopyTo(p, 4);
+        return p;
+    }
+
+    /// <summary>
+    /// S_GET_MY_IP (0xA9DF): <c>[u16 len][u16 op][u16 offset=6][wchar ip][u16 0]</c>.
+    ///
+    /// <para>Same writer shape as S_SHOW_PARCEL_MESSAGE - reserve the u16 string slot, backpatch
+    /// it to the running frame length (always 6, because nothing else precedes the data), then
+    /// append the wide string with its terminator. The real handler formats the peer address
+    /// with <c>%d.%d.%d.%d</c> into a 24-wchar buffer first.</para>
+    /// </summary>
+    public static byte[] BuildMyIp(string? ip)
+    {
+        var text = WString(string.IsNullOrEmpty(ip) ? DefaultMyIp : ip);
+        var p = new byte[6 + text.Length];
+        p[0] = (byte)p.Length; p[1] = (byte)(p.Length >> 8);
+        p[2] = unchecked((byte)S_GET_MY_IP); p[3] = (byte)(S_GET_MY_IP >> 8);
+        p[4] = 6; p[5] = 0;
+        text.CopyTo(p, 6);
+        return p;
+    }
+
+    /// <summary>
+    /// S_REFRESH_API_ACCESS_TOKEN (0x55E4) - byte-identical in shape to S_GET_MY_IP:
+    /// <c>[u16 len][u16 op][u16 offset=6][wchar token][u16 0]</c>.
+    ///
+    /// <para>The real handler mints the token from the account db id and the planet id and, when
+    /// that fails, logs and answers NOTHING - it returns 0 with no packet written. We have no
+    /// web API, so the token is whatever the caller passes.</para>
+    /// </summary>
+    public static byte[] BuildRefreshApiAccessToken(string? token)
+    {
+        var text = WString(token);
+        var p = new byte[6 + text.Length];
+        p[0] = (byte)p.Length; p[1] = (byte)(p.Length >> 8);
+        p[2] = unchecked((byte)S_REFRESH_API_ACCESS_TOKEN); p[3] = (byte)(S_REFRESH_API_ACCESS_TOKEN >> 8);
+        p[4] = 6; p[5] = 0;
+        text.CopyTo(p, 6);
+        return p;
+    }
+
+    /// <summary>
+    /// S_ANNOUNCE_UPDATE_NOTIFICATION (0x5C2E):
+    /// <c>[u16 len][u16 op][u16 offTitle][u16 offBody][u32 id][wchar title][wchar body]</c>.
+    ///
+    /// <para>Two string slots are reserved BEFORE the u32 - headers first, then scalars, the
+    /// same ordering the def codec uses - so the first string always starts at 12 and the
+    /// second at 12 plus the first string's bytes. The id is the notification's sequence
+    /// number, which C_CONFIRM_UPDATE_NOTIFICATION echoes back.</para>
+    /// </summary>
+    public static byte[] BuildAnnounceUpdateNotification(uint id, string? title, string? message)
+    {
+        var a = WString(title);
+        var b = WString(message);
+        var p = new byte[12 + a.Length + b.Length];
+        p[0] = (byte)p.Length; p[1] = (byte)(p.Length >> 8);
+        p[2] = unchecked((byte)S_ANNOUNCE_UPDATE_NOTIFICATION); p[3] = (byte)(S_ANNOUNCE_UPDATE_NOTIFICATION >> 8);
+        BitConverter.GetBytes((ushort)12).CopyTo(p, 4);
+        BitConverter.GetBytes((ushort)(12 + a.Length)).CopyTo(p, 6);
+        BitConverter.GetBytes(id).CopyTo(p, 8);
+        a.CopyTo(p, 12);
+        b.CopyTo(p, 12 + a.Length);
+        return p;
+    }
+
+    // ---------------------------------------------------------------------------- handlers
+
+    /// <summary>C_PONG (0x8091). The real handler is the empty one - it takes no arguments at
+    /// all and returns 1. The client sends it unprompted after S_PING; nothing answers it.</summary>
+    public static bool OnPong(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        _ = s; _ = body; log.LogTrace("C_PONG");
+        return true;
+    }
+
+    /// <summary>C_CHECK_RTT (0xF290) -> S_CHECK_RTT. The client's round-trip probe.</summary>
+    public static bool OnCheckRtt(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        _ = body; _ = log;
+        s.Send(BuildCheckRttAck());
+        return true;
+    }
+
+    /// <summary>C_PLAY_TIME (0x7CFE) -> S_PLAY_TIME. No length guard in the real handler at
+    /// all - it only checks that the session has a user.</summary>
+    public static bool OnPlayTime(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        _ = body; _ = log;
+        int seconds = PlayTimeLookup?.Invoke(s) ?? 0;
+        s.Send(BuildPlayTime(seconds < 0 ? 0u : (uint)seconds));
+        return true;
+    }
+
+    /// <summary>C_REQUEST_PLAYTIME (0xBC06). <b>Store, no reply.</b> The real handler stamps the
+    /// current time onto the account's play-time tracker (Account+0x30F0) through two setters
+    /// and writes no packet. We have no such tracker, so this is an accept.</summary>
+    public static bool OnRequestPlaytime(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        _ = s; _ = body; log.LogTrace("C_REQUEST_PLAYTIME");
+        return true;
+    }
+
+    /// <summary>C_REQUEST_PERF (0xD71E). <b>Not a client reply at all.</b> The real handler
+    /// broadcasts AS_REQUEST_PERF (0x1446) to every World and reports the answers to the admin
+    /// tool channel; the requesting client gets nothing back. Accept and drop.</summary>
+    public static bool OnRequestPerf(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        _ = s; _ = body; log.LogDebug("C_REQUEST_PERF - admin-tool path, not modelled");
+        return true;
+    }
+
+    /// <summary>The three UI-log counters C_SEND_UI_LOG selects between. The decompile gives
+    /// them no names - three adjacent setters on the user object.</summary>
+    public const int UiLogMinKind = 1, UiLogMaxKind = 3;
+
+    /// <summary>C_SEND_UI_LOG (0xACE5). <b>Store, no reply.</b> Body word 0 is a selector of
+    /// 1, 2 or 3 picking one of three counters on the user; anything else makes the real
+    /// handler return FALSE, which is the only rejection path in this whole group.</summary>
+    public static bool OnSendUiLog(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        _ = s;
+        if (body.Length < SendUiLogBodySize) return false;
+        int kind = BitConverter.ToInt32(body.Span[..4]);
+        if (kind < UiLogMinKind || kind > UiLogMaxKind)
+        {
+            log.LogDebug("C_SEND_UI_LOG kind {Kind} is outside 1..3 - rejected, as the real handler does", kind);
+            return false;
+        }
+        log.LogTrace("C_SEND_UI_LOG kind {Kind}", kind);
+        return true;
+    }
+
+    /// <summary>C_GET_MY_IP (0xAD47) -> S_GET_MY_IP.</summary>
+    public static bool OnGetMyIp(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        _ = body; _ = log;
+        s.Send(BuildMyIp(RemoteIpLookup?.Invoke(s)));
+        return true;
+    }
+
+    /// <summary>C_XIGNCODE_SECURITY_DATA (0x9219). <b>A forward, not a reply.</b> The real
+    /// handler wraps the client's blob as AX_PONG_SECURITY_DATA (0x426B) and sends it to the
+    /// anti-cheat server's session, never to the client. With no such server the blob is
+    /// accepted and dropped - and it must not be forwarded to World either.</summary>
+    public static bool OnXignCodeSecurityData(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        _ = s; log.LogTrace("C_XIGNCODE_SECURITY_DATA ({Len} bytes) - no anti-cheat server", body.Length);
+        return true;
+    }
+
+    /// <summary>C_INVALID_BUILD_VERSION (0x7F08). The client telling us its PDL build does not
+    /// match. The real handler logs the mismatch and disconnects the session unconditionally -
+    /// the length check only decides whether a second line is logged first.</summary>
+    public static bool OnInvalidBuildVersion(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        _ = body;
+        log.LogWarning("C_INVALID_BUILD_VERSION from {Id} - protocol version mismatch, closing", s.Id);
+        s.Close();
+        return true;
+    }
+
+    /// <summary>C_REQUEST_LATEST_UPDATE_NOTIFICATION (0x779E) -> S_ANNOUNCE_UPDATE_NOTIFICATION.
+    /// The patch-note banner. We have no notification source, so the reply is the empty one:
+    /// id 0 and two empty strings, twelve bytes of header plus two terminators.</summary>
+    public static bool OnRequestLatestUpdateNotification(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        _ = body; _ = log;
+        s.Send(BuildAnnounceUpdateNotification(0, null, null));
+        return true;
+    }
+
+    /// <summary>C_CONFIRM_UPDATE_NOTIFICATION (0xFE00). <b>Store, no reply.</b> Body word 0 is
+    /// the id the client is acknowledging; the real handler compares it with the one held on
+    /// the account and only acts when they differ.</summary>
+    public static bool OnConfirmUpdateNotification(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        _ = s;
+        if (body.Length < ConfirmUpdateNotificationBodySize) return false;
+        log.LogTrace("C_CONFIRM_UPDATE_NOTIFICATION id {Id}", BitConverter.ToInt32(body.Span[..4]));
+        return true;
+    }
+
+    /// <summary>C_SECOND_PASSWORD_AUTH (0x871F) and C_SECOND_PASSWORD_REGISTER (0x761E).
+    /// <b>Accept, no reply.</b> Both read a string ref at body offset 0 and hand it to the
+    /// second-password manager, which answers asynchronously with S_SECOND_PASSWORD_AUTH_RESULT
+    /// or S_SECOND_PASSWORD_REGISTER_RESULT. The client only sends either after the server has
+    /// prompted with S_REQUEST_SECOND_PASSWORD_AUTH / _REGISTER, which we never send - so this
+    /// path is unreachable in practice and is registered to keep it off the World link.</summary>
+    public static bool OnSecondPassword(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        _ = s;
+        if (body.Length < SecondPasswordBodySize) return false;
+        log.LogInformation("second-password packet received but the feature is not modelled - ignored");
+        return true;
+    }
+
+    /// <summary>C_REFRESH_API_ACCESS_TOKEN (0xC2BA) -> S_REFRESH_API_ACCESS_TOKEN, with an
+    /// empty token: we mint nothing, and an empty string is what the real writer would produce
+    /// for an empty token rather than the no-packet failure path.</summary>
+    public static bool OnRefreshApiAccessToken(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        _ = body; _ = log;
+        s.Send(BuildRefreshApiAccessToken(null));
+        return true;
+    }
+
+    /// <summary>C_CANCEL_EXIT (0xE488). The twin of C_CANCEL_RETURN_TO_LOBBY, which the registry
+    /// already handles - but with <b>no reply</b>: there is no S_CANCEL_EXIT opcode, and the
+    /// real handler only queues the cancel job. So this cancels the countdown and tells World,
+    /// exactly as the lobby twin does, and sends the client nothing.</summary>
+    public static bool OnCancelExit(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        _ = body;
+        log.LogInformation("C_CANCEL_EXIT from {Id}", s.Id);
+        s.PendingLobbyReturn?.Cancel();
+        s.PendingLobbyReturn = null;
+        if (s.InWorld) Program.World?.SendUserCancelRequestExit(s.PlayerId);
+        return true;
     }
 
     /// <summary>A NUL-terminated UTF-16LE string, as the inter-server and client writers emit it.</summary>
