@@ -581,3 +581,19 @@ the name the character already has is not counted as a collision.
 Name rules the capture can pin: **four characters minimum** (tap 6094 refuses the three-letter
 "Dob", 6119 accepts "dobb"). The ceiling and the per-reason codes are not observable here, so
 every refusal answers code 1 - the only refusal code in the capture.
+
+## T90 - `guilds.last_incentive_at`
+
+```sql
+ALTER TABLE guilds ADD COLUMN last_incentive_at INTEGER NOT NULL DEFAULT 0;  -- unix seconds
+```
+
+`GetGuildIncentiveTime(guildId)` / `SetGuildIncentiveTime(guildId, when)`. Read by
+`SDB_GIVE_GUILD_MONEY_INCENTIVE` (0x27A0) to reproduce the cooldown
+`Guild::CanGiveGuildMoneyIncentive` checks. The cooldown LENGTH is not observable - the capture
+has a single grant - so `DbProxyHandlers.GuildIncentiveCooldownSeconds` is a 23 h floor, marked
+as our choice rather than an observed value.
+
+**No appearance column was added.** cap_final shows the appearance change reaching the row
+through the ordinary user save, not through any appearance-specific write - see
+`status/CLIENT-REJECTS.md` section 14.1.

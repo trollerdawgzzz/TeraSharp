@@ -1210,6 +1210,8 @@ CREATE TABLE IF NOT EXISTS watched_movies (
         // T88: the scheduled-delete stamp C_CANCEL_DELETE_USER clears. 0 = no delete pending,
         // which is what every row had before this column existed.
         AddColumnIfMissing("characters", "delete_at", "INTEGER NOT NULL DEFAULT 0");
+        // T90: the guild-incentive cooldown Guild::CanGiveGuildMoneyIncentive checks.
+        AddColumnIfMissing("guilds", "last_incentive_at", "INTEGER NOT NULL DEFAULT 0");
         AddColumnIfMissing("characters", "return_zone", "INTEGER NOT NULL DEFAULT 0");
         AddColumnIfMissing("characters", "return_x", "REAL NOT NULL DEFAULT 0");
         AddColumnIfMissing("characters", "return_y", "REAL NOT NULL DEFAULT 0");
@@ -3802,6 +3804,32 @@ DELETE FROM guild_members     WHERE user_db_id = $id;";
 
     /// <summary>The guild a character belongs to, or 0. User+0x1b54 in the real Arbiter.</summary>
     public int GetGuildIdOf(int userDbId) => GetGuildMember(userDbId)?.GuildId ?? 0;
+
+    /// <summary>Unix second of this guild s last money incentive, 0 when it has never had one.</summary>
+    public long GetGuildIncentiveTime(int guildId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT last_incentive_at FROM guilds WHERE guild_id=$g";
+            cmd.Parameters.AddWithValue("$g", guildId);
+            var v = cmd.ExecuteScalar();
+            return v == null || v is DBNull ? 0L : Convert.ToInt64(v);
+        }
+    }
+
+    /// <summary>Stamp the incentive cooldown. False when the guild row is gone.</summary>
+    public bool SetGuildIncentiveTime(int guildId, long whenUnix)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE guilds SET last_incentive_at=$t WHERE guild_id=$g";
+            cmd.Parameters.AddWithValue("$t", whenUnix);
+            cmd.Parameters.AddWithValue("$g", guildId);
+            return cmd.ExecuteNonQuery() == 1;
+        }
+    }
 
     /// <summary>
     /// spAddGuildMember(int userDbId, int guildDbId, int guildGroupId) -> OUT rows, OUT joinDate.

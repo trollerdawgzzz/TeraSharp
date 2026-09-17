@@ -9763,6 +9763,81 @@ array<uint32> items3
         Hex.True(!store.RenameCharacter(999, "ghost"), "a missing row is a false, not an exception");
     }
 
+
+    // =======================================================================================
+    // T90 - the three inter-server frames cap_final left unhandled.
+    // Research: status/CLIENT-REJECTS.md sections 13.2 and 14.
+    // =======================================================================================
+
+    /// <summary>
+    /// T90 - SDB_GIVE_GUILD_MONEY_INCENTIVE, byte-exact against cap_final tap 2500 -&gt; 2504.
+    ///
+    /// <para>World-routed: the client sends C_REQUEST_GUILD_INCENTIVE (cap_final_gm_client 2269)
+    /// and World asks us. The reply is five bytes; the 9134-byte AS_UPDATE_GUILD_DATA at tap 2501
+    /// is a separate guild-wiring push.</para>
+    ///
+    /// <para><b>The payout is not modelled.</b> The capture has one grant and shows the guild
+    /// money only AFTER it, so the amount cannot be derived. We gate, stamp the cooldown and
+    /// answer ok - inventing an amount would silently drain guild funds.</para>
+    /// </summary>
+    [Test] public static void T90_guild_money_incentive_matches_cap_final()
+    {
+        Hex.Eq(DbProxyHandlers.BuildDbsGiveGuildMoneyIncentive(0xBB, true), "BB 00 00 00 01",
+            "tap 2504 - request 187 granted");
+        Hex.Eq(DbProxyHandlers.BuildDbsGiveGuildMoneyIncentive(0xBB, false), "BB 00 00 00 00",
+            "and the refusal form, which the cooldown and the not-a-member branch send");
+
+        Hex.True(DbProxyHandlers.SDB_GIVE_GUILD_MONEY_INCENTIVE == 0x27A0
+                 && DbProxyHandlers.DBS_GIVE_GUILD_MONEY_INCENTIVE == 0x27A1
+                 && DbProxyHandlers.AS_UPDATE_GUILD_DATA == 0x144E,
+            "the three opcodes of tap 2500 / 2501 / 2504");
+
+        // Tap 2500 verbatim: [u32 reqId][u32 playerId][u32 guildId][float 0.11].
+        var req = new byte[] { 0xBB,0,0,0, 0xEB,0x03,0,0, 0x02,0,0,0, 0xAE,0x47,0xE1,0x3D };
+        Hex.True(BitConverter.ToSingle(req, 12) == 0.11f, "AE 47 E1 3D is 0.11f, the incentive rate");
+        Hex.True(HandlerAccepts(DbProxyHandlers.SDB_GIVE_GUILD_MONEY_INCENTIVE, req),
+            "the request is answered, not replayed");
+    }
+
+    /// <summary>T90 - the guild-incentive cooldown round trip.</summary>
+    [Test] public static void T90_guild_incentive_cooldown_round_trips()
+    {
+        using var store = StoreWithTwoAccounts();
+        Hex.True(store.GetGuildIncentiveTime(1) == 0, "a guild that has never granted one reads 0");
+        Hex.True(!store.SetGuildIncentiveTime(999, 1789620000L), "a missing guild row is a false");
+        Hex.True(DbProxyHandlers.GuildIncentiveCooldownSeconds > 0,
+            "the cooldown is a real floor, not zero - Guild::CanGiveGuildMoneyIncentive has one");
+    }
+
+    /// <summary>
+    /// T90 - the two one-way pushes are sealed, so neither falls through to the replay table.
+    ///
+    /// <para>SA_UPDATE_RANK_USERNAME (tap 6129) is the third leg of the rename and re-applies the
+    /// name, which is idempotent after SDB_DO_CHANGE_CHAR_NAME. SA_START_CHANGE_APPEARANCE
+    /// (tap 6145) is the ONLY frame the whole appearance flow puts on the World link - the new
+    /// customize blob reaches the row through the ordinary user save at the next hand-off.</para>
+    /// </summary>
+    [Test] public static void T90_rank_username_and_appearance_pushes_are_sealed()
+    {
+        Hex.True(DbProxyHandlers.SA_UPDATE_RANK_USERNAME == 0x161C
+                 && DbProxyHandlers.SA_START_CHANGE_APPEARANCE == 0x1498,
+            "tap 6129 and tap 6145");
+        Hex.True(DbProxyHandlers.IsHandledRequest(DbProxyHandlers.SA_UPDATE_RANK_USERNAME)
+                 && DbProxyHandlers.IsHandledRequest(DbProxyHandlers.SA_START_CHANGE_APPEARANCE),
+            "both are on the allow-list");
+
+        // Tap 6129 verbatim: [u32 nameOff=14][u32 charId][wchar "dobb"].
+        var rank = new byte[] { 0x0E,0,0,0, 0x01,0,0,0, 0x64,0, 0x6F,0, 0x62,0, 0x62,0, 0,0 };
+        Hex.True(HandlerAccepts(DbProxyHandlers.SA_UPDATE_RANK_USERNAME, rank),
+            "the rename echo is accepted with no reply");
+
+        // Tap 6145 verbatim: 32 payload bytes, gameId first, nothing we store.
+        var appear = new byte[] { 0x20,0x40,0xBF,0x45,0xD9,0x01,0,0, 0x01,0,0,0, 0x4B,0x90,0x02,0,
+                                  0x3D,0x27,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0 };
+        Hex.True(HandlerAccepts(DbProxyHandlers.SA_START_CHANGE_APPEARANCE, appear),
+            "the appearance start is accepted with no reply");
+    }
+
     // ---- The rules ----
 
     [Test] public static void T30_system_message_format_matches_the_capture()
