@@ -130,6 +130,24 @@ public static class WorldEntry
         //          the character moves (live 2026-09-14 22:59: relog sent zone 5 with 9827
         //          coordinates -> spawned in the void + cheat flag).
         int zone = worldBlob != null && worldBlob.Length >= 240 ? BitConverter.ToInt32(worldBlob, 236) : chr.Zone;
+        // Live 2026-09-16: while World still holds the instance it ACCEPTS a re-entry and the player is
+        // trapped inside with no portal. The real Arbiter always re-enters at the stored return point
+        // (Stepstone start) and World supplies the portal back in - so prefer the return point whenever
+        // the saved zone is an instance and we have one; the 0x138D retry stays as the fallback.
+        var savedReturn = Program.Store?.GetDungeonReturn((int)chr.Id);
+        bool returnFromInstance = savedReturn != null && savedReturn.DungeonId == zone && savedReturn.Zone > 0;
+        if (returnFromInstance)
+        {
+            zone = savedReturn!.Zone;
+            if (worldBlob != null && worldBlob.Length >= 232)
+            {
+                worldBlob = (byte[])worldBlob.Clone();
+                BitConverter.GetBytes(savedReturn.X).CopyTo(worldBlob, 220);
+                BitConverter.GetBytes(savedReturn.Y).CopyTo(worldBlob, 224);
+                BitConverter.GetBytes(savedReturn.Z).CopyTo(worldBlob, 228);
+                BitConverter.GetBytes(zone).CopyTo(worldBlob, 236);
+            }
+        }
         w.U32((uint)zone);
 
         // [52..55] param_9 = ChannelInstanceId (User+0x1a0). -1 for the open world (live-verified,
@@ -138,8 +156,7 @@ public static class WorldEntry
         //          Arbiter sends 0x0AF00001 for exactly this case (arb_world_2026-09-13 seq 835); World
         //          then answers SA_ENTER_WORLD_FAIL and we retry at the return point
         //          (status/ENTER-WORLD-FALLBACK.md).
-        var savedReturn = Program.Store?.GetDungeonReturn((int)chr.Id);
-        w.U32(savedReturn != null && savedReturn.DungeonId == zone && savedReturn.InstancePdId != 0
+        w.U32(!returnFromInstance && savedReturn != null && savedReturn.DungeonId == zone && savedReturn.InstancePdId != 0
             ? (uint)savedReturn.InstancePdId
             : 0xFFFFFFFF);
 
