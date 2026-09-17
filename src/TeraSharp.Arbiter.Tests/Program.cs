@@ -9242,6 +9242,108 @@ array battles
         }
         finally { GuildWarManager.ResetForTests(); }
     }
+    // =======================================================================================
+    // T82 - the Arbiter-owned UI packets still going unanswered. Research: status/CLIENT-REJECTS.md.
+    //
+    // Ground truth: cap_social4_client frames 145, 146 and 2910/2911.
+    // =======================================================================================
+
+    /// <summary>The three shipped defs T82 serves through. All three are RIGHT as shipped.</summary>
+    static DefinitionRegistry CreateT82Defs()
+    {
+        var reg = new DefinitionRegistry(QuietLog());
+        reg.RegisterFromDef("S_GET_USER_GUILD_LOGO", @"
+int32  playerId
+int32  guildId
+bytes  logo
+");
+        reg.RegisterFromDef("S_RP_SKILL_POLISHING_LIST", @"
+array optionEffects
+- uint32 group
+- uint32 id
+- bool active
+
+array levelEffects
+- uint32 group
+- uint32 id
+");
+        reg.RegisterFromDef("S_RP_SKILL_POLISHING_EXP_INFO", @"
+int32    currentPoint
+int32    totalPoint
+int32    level
+int64    currentExp
+int64    prevLevelMaxExp
+int64    currentLevelMaxExp
+");
+        return reg;
+    }
+
+    /// <summary>
+    /// T82 - the guild crest, byte-exact against cap_social4_client frame 2911.
+    ///
+    /// <para><b>Arbiter-built.</b> The crest is a column on the guilds row and the Arbiter owns
+    /// guild storage outright, so nothing about this request crosses the World link - frame 2910
+    /// asks and 2911 answers with no tap traffic in between.</para>
+    ///
+    /// <para>The interesting byte is the offset. A <c>bytes</c> ref is
+    /// <c>[u16 offset][u16 count]</c>, and an EMPTY blob still gets a REAL offset - 16, the
+    /// packet length - because the writer patches the slot to the current end whether or not
+    /// there is data to follow. A reader that assumed 0/0 for an empty blob would have written
+    /// the wrong two bytes here.</para>
+    /// </summary>
+    [Test] public static void T82_guild_crest_matches_cap_social4()
+    {
+        var reg = CreateT82Defs();
+        Hex.Eq(WriteByDef(reg, "S_GET_USER_GUILD_LOGO",
+                ArbiterClientHandlers.BuildGuildLogoFields(1003, 2, null)),
+            "10 00  00 00  EB 03 00 00  02 00 00 00",
+            "frame 2911: player 1003, guild 2, no crest - offset 16, count 0");
+
+        Hex.Eq(WriteByDef(reg, "S_GET_USER_GUILD_LOGO",
+                ArbiterClientHandlers.BuildGuildLogoFields(1003, 2, new byte[] { 0xAA, 0xBB, 0xCC })),
+            "10 00  03 00  EB 03 00 00  02 00 00 00  AA BB CC",
+            "and a stored crest goes out at the same offset with its real length");
+
+        Hex.True(ArbiterClientHandlers.C_GET_USER_GUILD_LOGO == 0x584B
+                 && ArbiterClientHandlers.S_GET_USER_GUILD_LOGO == 0x7DFA,
+            "the two opcodes cap_social4_client frames 2910/2911 carry");
+        Hex.True(ArbiterClientHandlers.ArbiterOwned.Contains(ArbiterClientHandlers.C_GET_USER_GUILD_LOGO),
+            "and the request must never be forwarded to World");
+    }
+
+    /// <summary>
+    /// T82 - the skill-polishing window, byte-exact against cap_social4_client frames 145 and 146.
+    ///
+    /// <para><b>Both were being dropped.</b> C_RQ_SKILL_POLISHING_LIST and
+    /// C_RQ_SKILL_POLISHING_EXP_INFO were on HandlerRegistry s RegNoop list, which registers the
+    /// opcode so it is not forwarded but sends nothing back - so the panel stayed empty forever.
+    /// The real Arbiter answers both in the LOBBY burst, frames 145 and 146, before the world
+    /// hand-off, and both answers are the all-zero form.</para>
+    /// </summary>
+    [Test] public static void T82_skill_polishing_window_matches_cap_social4()
+    {
+        var reg = CreateT82Defs();
+        Hex.Eq(WriteByDef(reg, "S_RP_SKILL_POLISHING_LIST",
+                ArbiterClientHandlers.BuildSkillPolishingListFields()),
+            "00 00 00 00  00 00 00 00",
+            "frame 145: two empty arrays, eight zero bytes");
+
+        Hex.Eq(WriteByDef(reg, "S_RP_SKILL_POLISHING_EXP_INFO",
+                ArbiterClientHandlers.BuildSkillPolishingExpFields()),
+            "00 00 00 00  00 00 00 00  00 00 00 00  "
+            + "00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00",
+            "frame 146: three int32 and three int64, all zero - 36 bytes");
+
+        Hex.True(ArbiterClientHandlers.C_RQ_SKILL_POLISHING_LIST == 0x7983
+                 && ArbiterClientHandlers.S_RP_SKILL_POLISHING_LIST == 0xDA7E
+                 && ArbiterClientHandlers.C_RQ_SKILL_POLISHING_EXP_INFO == 0xAD37
+                 && ArbiterClientHandlers.S_RP_SKILL_POLISHING_EXP_INFO == 0xEA50,
+            "the four opcodes of the two exchanges");
+        foreach (ushort op in new[] { ArbiterClientHandlers.C_RQ_SKILL_POLISHING_LIST,
+                                      ArbiterClientHandlers.C_RQ_SKILL_POLISHING_EXP_INFO })
+            Hex.True(ArbiterClientHandlers.ArbiterOwned.Contains(op),
+                $"0x{op:X4} is the Arbiter s to answer, not World s to reject");
+    }
     // ---- The rules ----
 
     [Test] public static void T30_system_message_format_matches_the_capture()

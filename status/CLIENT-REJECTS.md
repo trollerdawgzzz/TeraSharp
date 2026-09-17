@@ -475,3 +475,71 @@ it there and `SocialHandlers.SendFriendGroupList` reads it back.
   Arbiter decompile. A GM/QA path.
 - **`C_LIST_CHANNEL` (0x661B)** — turned up while naming these and has no handler anywhere in the
   binary, so it is dead in 100.02 and not in the eighteen.
+
+---
+
+## 10. T82 — the UI packets cap_social4 still shows unanswered
+
+Two client captures of the same session: `cap_social4_client_ctl.txt` (character `New`) and
+`cap_social4_client2_ctl.txt` (the second client, already reframed — 8773 frames, and the only one
+of the two that opens the mailbox or the warehouse). `S_LOGIN` is frame **50** in client1, so
+frames 1–49 are pure lobby.
+
+### 10.1 Built in this pass
+
+| packet | frames | verdict |
+|---|---|---|
+| `C_GET_USER_GUILD_LOGO` 0x584B → `S_GET_USER_GUILD_LOGO` 0x7DFA | 2910 / 2911 | **Arbiter** — the crest is a `guilds` column and the Arbiter owns guild storage outright; no tap traffic at all |
+| `C_RQ_SKILL_POLISHING_LIST` 0x7983 → `S_RP_SKILL_POLISHING_LIST` 0xDA7E | 145 | **Arbiter** — answered in the lobby burst |
+| `C_RQ_SKILL_POLISHING_EXP_INFO` 0xAD37 → `S_RP_SKILL_POLISHING_EXP_INFO` 0xEA50 | 146 | **Arbiter** — same burst, next frame |
+
+All three shipped defs are RIGHT, so no `V100Definitions` override is needed. The skill-polishing
+pair was on the **`RegNoop` list**, which is not the same as being handled: a noop registers the
+opcode so it is not forwarded, then sends **nothing**, and the panel never populates. Both real
+answers are the all-zero form (8 bytes and 36 bytes), which is what every TeraSharp character
+would produce anyway, so serving the zeros is the whole fix.
+
+The crest answer has one byte worth naming: a `bytes` ref is `[u16 offset][u16 count]`, and an
+**empty** blob still gets a real offset — 16, the packet length — because the writer patches the
+slot to the current end whether or not data follows. Frame 2911 is `10 00 00 00 …`, not `00 00 00 00`.
+
+### 10.2 Already correct — verified against the capture, not changed
+
+| packet | frame | ours |
+|---|---|---|
+| `S_REMAIN_PLAY_TIME` | 6 | `06 00 00 00 00 00 00 00` = `accountType 6, minutesLeft 0` — exactly what `LoginHandlers` sends |
+| `S_RESPONSE_SERVER_ADMINTOOL_AWESOMIUM_URL` | 404 | `08 00 0A 00 00 00 00 00` — the raw body `LoginHandlers` already writes |
+| `S_FESTIVAL_LIST` | 74 | `00 00 00 00`, one empty array — our empty field set produces the same four bytes |
+| `S_REQUEST_SERVANT_INFO_LIST` | 263 | `00 00 00 00 01 0A 00 00 00` = count 0, `hidden 1`, `slots 10` — matches `RegEmptyReply`'s dictionary exactly |
+| `S_RESPONSE_SERVANT_ADVENTURE_LIST` | 264 | `00 00 00 00 01 FF FF FF FF 03 00 00 00 00 00 00 00` = count 0, `unk1 1`, `unk2 -1`, `maxSlots 3` — matches too |
+
+`C_SET_SERVANT_SEQUENCE` (frame 2888, body `01 00 08 00 08 00 00 00` + eight `FF`) is already on
+the `RegNoop` list and the capture shows **no reply to it**, so a noop is the right shape — the
+T80 report listed it as unregistered, which was wrong.
+
+### 10.3 Gaps, with frame numbers — not built
+
+| packet | frames | what the real one carries | why not now |
+|---|---|---|---|
+| `S_ACCOUNT_PACKAGE_LIST` 0xE9A9 | 14, 2894 | **three** entries: ids 0x215/0x216/…, each with an expiry `6F 28 CF 6A` (unix 1791165551) | we send an empty list; the entries are account-benefit state nothing in the tree models |
+| `S_ACCOUNT_BENEFIT_LIST` 0x88E0 | 47, 48 (12 in client1, 8 in client2) | 1–2 entries with a benefit id, a value `0x23E726` and the same expiry | same |
+| `S_SEND_USER_PLAY_TIME` 0xA7E0 | 78, 2957 | `ED 00 00 00` + an int64 unix time (1789608777) — seconds played and when | we send an empty field set (zeros); harmless but not exact |
+| `S_ENABLE_DISABLE_SELLABLE_ITEM_LIST` 0x667C | 441, 442 | 39-byte body, **3 entries**, each `[u16 here][u16 next][i32 id]` + flags | we send it not at all |
+| `S_DARK_RIFT_JOIN_LIST` 0x9DE2 | 2881, 5984 | `00 00 00 00` — one empty array | post-world-entry both times, so Arbiter vs World is not settled by position alone |
+| `S_START_COOLTIME_SERVANT_SKILL` 0x9128 | 71, 2950 | `00 00 00 00` | in the enter-world burst; almost certainly Arbiter, but nothing in the capture ties it to a request |
+| `S_INGAMESHOP_*` | 147 onward | `CATEGORY_BEGIN` ×6, `CATEGORY_DATA` ×36, `PRODUCT_BEGIN` ×6, **`PRODUCT_DATA` ×636**, two `_END` | the shop catalogue — a whole subsystem, not a UI packet |
+
+### 10.4 Deliberately left to their own tasks
+
+* **Mail UI** — `cap_social4_client2` frames **5360–5670**: `C_LIST_PARCEL` → `S_LIST_PARCEL_EX`
+  (5361 empty 20-byte body, 5620/5670 a 159-byte one with a parcel in it),
+  `C_SET_SEND_PARCEL_TYPE` → `S_SET_SEND_PARCEL_ITEM` + `S_SET_SEND_PARCEL_MONEY` (5370–5372),
+  `S_SEND_PARCEL_TAX` (5377, 5426, 5440, 5458 — the tax moves 0x32 → 0xFA → 0x12C as money and an
+  item are added), `C_SEND_PARCEL` → `S_SEND_PARCEL` (5464/5466),
+  `C_SHOW_PARCEL_MESSAGE` → `S_SHOW_PARCEL_MESSAGE` (5642/5643, body `0A 00 04 00 00 00 00 00`).
+  All Arbiter-built — this is `ParcelHandlers`/`MAIL-WAREHOUSE.md` territory and wants that task's
+  tables, not a bolt-on here.
+* **Warehouse UI** — `cap_social4_client2` frames **6761–6877**: `S_VIEW_WARE_EX` 0x9F9A, 18
+  occurrences, 42-byte empty body and 133-byte with two slots, driven by `C_PUT_WARE_ITEM` /
+  `C_GET_WARE_ITEM`. `World/WarehouseHandlers.cs` was being edited while T82 ran, so it is hands-off.
+
