@@ -17411,6 +17411,239 @@ some prose with `backticks` that is not a table row
             "and that empty body is [u16 count][u16 firstOffset], both zero");
     }
 
+    // ===================== T77: the cap_social4 DB-proxy pairs =====================
+
+    /// <summary>
+    /// The four EP writes. All four requests and all four replies are cap_social4.log frames;
+    /// three of the replies are the plain 5-byte ack, which is the point - the DlmId each one
+    /// carries sits at a DIFFERENT payload offset (0 for three of them, 8 for LEARN_EP_PERK,
+    /// whose EpPerkList ref comes first), and acking the wrong four bytes wedges the character
+    /// just as surely as not acking at all.
+    /// </summary>
+    [Test] public static void T77_the_four_ep_writes_are_byte_exact()
+    {
+        using var store = GuildStore(2);
+
+        void Pair(ushort op, ushort reply, string request, string expect, string where)
+        {
+            var (got, body) = RunHandler1(op, Hex.B(request), store);
+            Hex.True(got == reply, $"0x{op:X4} must answer 0x{reply:X4}, got 0x{got:X4}");
+            Hex.Eq(body, expect, where);
+        }
+
+        // SDB_UPDATE_EXTRA_POINT -> DBS (seq 2929 -> 2930).
+        Pair(DbProxyHandlers.SDB_UPDATE_EXTRA_POINT, DbProxyHandlers.DBS_UPDATE_EXTRA_POINT,
+            "F2 01 00 00 01 00 00 00 9C CA 16 00 00 00 00 00 0A 01 00 00 "
+            + "2C 01 00 00 9C CA 16 00 00 00 00 00 21 23 00 00",
+            "F2 01 00 00 01", "cap_social4 seq 2930");
+
+        // SDB_UPDATE_PRE_EP_INFO -> DBS (seq 4042 -> 4043): level and point only.
+        Pair(DbProxyHandlers.SDB_UPDATE_PRE_EP_INFO, DbProxyHandlers.DBS_UPDATE_PRE_EP_INFO,
+            "CB 03 00 00 01 00 00 00 0A 01 00 00 2C 01 00 00",
+            "CB 03 00 00 01", "seq 4043");
+
+        // SDB_UPDATE_DAILY_EXTRA_POINT -> DBS (seq 3052 -> 3053).
+        Pair(DbProxyHandlers.SDB_UPDATE_DAILY_EXTRA_POINT, DbProxyHandlers.DBS_UPDATE_DAILY_EXTRA_POINT,
+            "67 02 00 00 01 00 00 00 66 A4 04 00 C0 84 AA 6A 00 00 00 00",
+            "67 02 00 00 01", "seq 3053");
+
+        // SDB_USER_LEARN_EP_PERK -> DBS (seq 4064 -> 4066). DlmId at payload 8, not 0.
+        Pair(DbProxyHandlers.SDB_USER_LEARN_EP_PERK, DbProxyHandlers.DBS_USER_LEARN_EP_PERK,
+            "1A 00 00 00 08 00 00 00 CC 03 00 00 01 00 00 00 10 00 00 00 98 B1 01 00 07 00 00 00",
+            "CC 03 00 00 01", "seq 4066 - the ack is the EpPerkList's DlmId, not its ref");
+    }
+
+    /// <summary>
+    /// The EP panel survives a relog. Before T77 the Arbiter stored no EP at all, so
+    /// AS_LOAD_EXTRAPOINT_DATA (0x1555) answered 53 zero bytes on every login and the panel
+    /// reset itself; the six numbers SDB_UPDATE_EXTRA_POINT writes and the daily pair
+    /// SDB_UPDATE_DAILY_EXTRA_POINT writes now come back in it.
+    /// </summary>
+    [Test] public static void T77_ep_round_trips_into_the_login_reply()
+    {
+        using var store = GuildStore(2);
+        var handlers = FreshHandlers(store);
+
+        RunHandler1(DbProxyHandlers.SDB_UPDATE_EXTRA_POINT, Hex.B(
+            "F2 01 00 00 01 00 00 00 9C CA 16 00 00 00 00 00 0A 01 00 00 "
+            + "2C 01 00 00 9C CA 16 00 00 00 00 00 21 23 00 00"), store, handlers);
+        RunHandler1(DbProxyHandlers.SDB_UPDATE_DAILY_EXTRA_POINT, Hex.B(
+            "67 02 00 00 01 00 00 00 66 A4 04 00 C0 84 AA 6A 00 00 00 00"), store, handlers);
+
+        var ep = store.GetCharacterEp(1);
+        Hex.True(ep is not null && ep.EpExp == 1493660 && ep.EpLevel == 266 && ep.EpPoint == 300
+                 && ep.DailyEpExp == 1493660 && ep.DailyLimit == 8993,
+            "the six numbers seq 2929 carries are stored in the order its dumper names them");
+        Hex.True(ep!.ReserveBonus == 304230 && ep.ResetTime == 0x6AAA84C0,
+            "and the daily write overwrites ReserveBonus and adds the reset stamp");
+
+        // The login reply, byte for byte. GoldConsumption (+41) and TotalEp (+49) stay zero:
+        // no W->A frame in any capture carries either, so there is nothing to fill them from.
+        var req = new byte[8];
+        BitConverter.GetBytes(0x77u).CopyTo(req, 0);
+        BitConverter.GetBytes(1).CopyTo(req, 4);
+        var (op, body) = RunHandler1(DbProxyHandlers.SA_LOAD_EXTRAPOINT_DATA, req, store, handlers);
+        Hex.True(op == 0x1555, $"0x{op:X4}");
+        Hex.Eq(body,
+            "77 00 00 00 01 01 00 00 00 0A 01 00 00 9C CA 16 "
+            + "00 00 00 00 00 9C CA 16 00 66 A4 04 00 21 23 00 "
+            + "00 C0 84 AA 6A 00 00 00 00 00 00 00 00 00 00 00 "
+            + "00 00 00 00 00",
+            "AS_LOAD_EXTRAPOINT_DATA with the stored panel in it");
+
+        // A character with no EP is still the all-zero form both captured characters send.
+        BitConverter.GetBytes(2).CopyTo(req, 4);
+        var (_, empty) = RunHandler1(DbProxyHandlers.SA_LOAD_EXTRAPOINT_DATA, req, store, handlers);
+        Hex.True(empty.Length == DbProxyHandlers.ExtrapointReplySize
+                 && empty[4] == 1 && BitConverter.ToInt32(empty, 9) == 0,
+            "and an untouched character reads back zeros, not a refusal");
+    }
+
+    /// <summary>
+    /// SDB_USER_RESET_EP_PERK (0x27BD) -&gt; DBS (0x27BE): unlearning the tree refunds the perk
+    /// items, so the request carries ItemTransactionAtoms and the reply echoes them - the same
+    /// rule SDB_ITEM_SINGLE follows. The two headers differ by the request's IsByItem byte and
+    /// its alignment, which is the whole of the captured 879 vs 875.
+    /// </summary>
+    [Test] public static void T77_the_perk_reset_echoes_its_refund_atoms()
+    {
+        using var store = GuildStore(2);
+        const int head = DbProxyHandlers.ResetEpPerkRequestHeader;   // 17
+        var req = new byte[head + DbProxyHandlers.ItemAtomSize];
+        BitConverter.GetBytes((uint)(6 + head)).CopyTo(req, 0);          // ItemBinary ref: 0x17
+        BitConverter.GetBytes((uint)DbProxyHandlers.ItemAtomSize).CopyTo(req, 4);
+        BitConverter.GetBytes(0x3DDu).CopyTo(req, 8);                    // DlmId
+        BitConverter.GetBytes(1).CopyTo(req, 12);                        // UserDbId
+        req[16] = 1;                                                     // IsByItem
+        BrokerAtom(0, WarehouseHandlers.TsInsertItem, 0, 201612, 1, 0, 0, 0, 1, BagItems.Pocket, 4)
+            .CopyTo(req, head);
+
+        var (op, body) = RunHandler1(DbProxyHandlers.SDB_USER_RESET_EP_PERK, req, store);
+        Hex.True(op == DbProxyHandlers.DBS_USER_RESET_EP_PERK, $"0x{op:X4}");
+        Hex.Eq(body[..13], "13 00 00 00 58 03 00 00 DD 03 00 00 01",
+            "seq 4707's header: ref 0x13, 856 bytes of atoms, the request's DlmId, Success 1");
+        Hex.True(body.Length == 13 + DbProxyHandlers.ItemAtomSize
+                 && (req.Length + 6) - (body.Length + 6) == 4,
+            $"and 879 - 875 = 4, the IsByItem the reply has no room for: {body.Length}");
+        Hex.True(store.FindItemAt(1, BagItems.Pocket, 4) is not null,
+            "the refunded item is inserted, not just echoed");
+    }
+
+    /// <summary>
+    /// The card, reputation, feudal-lord and battle-pass replies. The last two are the oddity
+    /// worth a test of its own: both arrive as BARE 6-byte frames - shorter than their own
+    /// handler's guard - in every captured run, and the real Arbiter answers them anyway.
+    /// </summary>
+    [Test] public static void T77_the_card_and_reputation_replies_are_byte_exact()
+    {
+        using var store = GuildStore(2);
+
+        void Pair(ushort op, ushort reply, string request, string expect, string where)
+        {
+            var (got, body) = RunHandler1(op, Hex.B(request), store);
+            Hex.True(got == reply, $"0x{op:X4} must answer 0x{reply:X4}, got 0x{got:X4}");
+            Hex.Eq(body, expect, where);
+        }
+
+        // DBS_INIT_LIMIT_REMAIN_REPUTATION is the one reply in the batch whose Success comes
+        // FIRST, ahead of the DlmId. Reading it as DlmId-first puts 0x01 where the id belongs.
+        Pair(DbProxyHandlers.SDB_INIT_LIMIT_REMAIN_REPUTATION,
+            DbProxyHandlers.DBS_INIT_LIMIT_REMAIN_REPUTATION,
+            "C5 03 00 00 01 00 00 00 5E 02 00 00 E0 B7 A2 6A 00 00 00 00",
+            "01 C5 03 00 00 30 75 00 00 00 00 00 00", "seq 3588 - RemainPoint 30000");
+
+        Pair(DbProxyHandlers.SDB_REGISTER_CARD, DbProxyHandlers.DBS_REGISTER_CARD,
+            "DC 04 00 00 01 00 00 00 00 00 00 00 FA BE 04 00 01 00 00 00",
+            "DC 04 00 00 01 FA BE 04 00 01 00 00 00", "seq 7033 - card then amount");
+
+        // MOUNT and UNMOUNT share a layout, and it is the MIRROR of the register reply's:
+        // preset index first, card second.
+        Pair(DbProxyHandlers.SDB_MOUNT_CARD, DbProxyHandlers.DBS_MOUNT_CARD,
+            "E0 04 00 00 01 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00 FA BE 04 00",
+            "E0 04 00 00 01 00 00 00 00 FA BE 04 00", "seq 7108");
+        Pair(DbProxyHandlers.SDB_UNMOUNT_CARD, DbProxyHandlers.DBS_UNMOUNT_CARD,
+            "E1 04 00 00 01 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00 FA BE 04 00",
+            "E1 04 00 00 01 00 00 00 00 FA BE 04 00", "seq 7131");
+
+        // The two bare ones. Payload is EMPTY - the frame is 6 bytes, header only.
+        var (fl, flBody) = RunHandler1(DbProxyHandlers.SDB_LOAD_FEUDAL_LORD_FLAG,
+            Array.Empty<byte>(), store);
+        Hex.True(fl == DbProxyHandlers.DBS_LOAD_FEUDAL_LORD_FLAG, $"0x{fl:X4}");
+        Hex.Eq(flBody, "0E 00 00 00 00 00 00 00",
+            "seq 10: an empty MemberList, offset = frame length");
+
+        var (bp, bpBody) = RunHandler1(DbProxyHandlers.SDB_TBA_REQUEST_BATTLEPASS_SEASONDATA,
+            Array.Empty<byte>(), store);
+        Hex.True(bp == DbProxyHandlers.DBS_TBA_UPDATE_BATTLEPASS_SEASONDATA, $"0x{bp:X4}");
+        Hex.Eq(bpBody,
+            "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00",
+            "seq 27: no season running");
+    }
+
+    /// <summary>
+    /// The two inter-server pairs. SA_MAKE_SYS_PARCEL is the level-up reward mail, and it goes
+    /// through the same parcels table a player parcel does.
+    /// </summary>
+    [Test] public static void T77_the_crest_and_system_parcel_replies_are_byte_exact()
+    {
+        using var store = GuildStore(2);
+
+        var (crest, crestBody) = RunHandler1(DbProxyHandlers.SA_CREST_POINT, Hex.B(
+            "22 00 00 00 00 00 00 00 20 00 86 C5 CF 02 00 00 DC 01 00 00 37 00 00 00 00 00 00 00"),
+            store);
+        Hex.True(crest == DbProxyHandlers.AS_CREST_POINT, $"0x{crest:X4}");
+        Hex.Eq(crestBody, "13 00 00 00 00 00 00 00 DC 01 00 00 01",
+            "seq 2817 - the DlmId is at payload 16, past the ref and the ArbiterUser handle");
+
+        // seq 2962's head. The strings and the two-item attachment list past payload 37 are not
+        // needed to answer it: DlmId, ReceiverDbId and SendMoney are all in the first 36 bytes.
+        var req = new byte[37];
+        BitConverter.GetBytes(0x264u).CopyTo(req, 20);
+        BitConverter.GetBytes(1).CopyTo(req, 24);
+        BitConverter.GetBytes(500L).CopyTo(req, 28);
+        var (op, body) = RunHandler1(DbProxyHandlers.SA_MAKE_SYS_PARCEL, req, store);
+        Hex.True(op == DbProxyHandlers.AS_MAKE_SYS_PARCEL, $"0x{op:X4}");
+        Hex.Eq(body, "64 02 00 00 00 00 00 00", "seq 2968 - ParcelErrorNo 0 is 'sent'");
+
+        var inbox = store.GetParcelsFor(1);
+        Hex.True(inbox.Count == 1 && inbox[0].Money == 500
+                 && inbox[0].SenderName == DbProxyHandlers.SystemParcelSender,
+            "and the parcel is in the inbox, not just acknowledged");
+
+        // The refusal path: no receiver, so nothing is filed and the error is non-zero.
+        BitConverter.GetBytes(0).CopyTo(req, 24);
+        var (_, bad) = RunHandler1(DbProxyHandlers.SA_MAKE_SYS_PARCEL, req, store);
+        Hex.True(bad[4] != 0 && store.GetParcelsFor(1).Count == 1,
+            "a parcel addressed to nobody is refused rather than filed under player 0");
+    }
+
+    /// <summary>
+    /// Coverage. Thirteen previously unanswered pairs, each carrying a DlmId that head-blocks
+    /// its user's DB queue; two W-&gt;A writes the real Arbiter never answers, which have to be
+    /// sealed so the replay table does not hand them the NEXT A-&gt;W frame as a response.
+    /// </summary>
+    [Test] public static void T77_every_new_pair_is_answered_or_sealed()
+    {
+        ushort[] answered =
+        {
+            DbProxyHandlers.SDB_UPDATE_DAILY_EXTRA_POINT, DbProxyHandlers.SDB_UPDATE_EXTRA_POINT,
+            DbProxyHandlers.SDB_USER_LEARN_EP_PERK, DbProxyHandlers.SDB_USER_RESET_EP_PERK,
+            DbProxyHandlers.SDB_UPDATE_PRE_EP_INFO, DbProxyHandlers.SDB_INIT_LIMIT_REMAIN_REPUTATION,
+            DbProxyHandlers.SDB_LOAD_FEUDAL_LORD_FLAG, DbProxyHandlers.SDB_REGISTER_CARD,
+            DbProxyHandlers.SDB_MOUNT_CARD, DbProxyHandlers.SDB_UNMOUNT_CARD,
+            DbProxyHandlers.SDB_TBA_REQUEST_BATTLEPASS_SEASONDATA,
+            DbProxyHandlers.SA_CREST_POINT, DbProxyHandlers.SA_MAKE_SYS_PARCEL,
+        };
+        foreach (var op in answered)
+            Hex.True(DbProxyHandlers.IsHandledRequest(op), $"0x{op:X4} must be allow-listed");
+        Hex.True(answered.Length == 13, "thirteen of them");
+
+        Hex.True(WorldReplayTable.OneWayFromWorld.Contains((ushort)0x28B8),
+            "SDB_PUBLISH_INVITE_CODE gets no reply in any captured run");
+        Hex.True(WorldReplayTable.OneWayFromWorld.Contains((ushort)0x14CE),
+            "nor does SA_DARK_RIFT_EVENT_OPEN");
+    }
+
     // ===================== T72: the broker's client windows =====================
 
     /// <summary>cap_social3_client.log seq 1472 - the search page after listing 3 was bought.</summary>
