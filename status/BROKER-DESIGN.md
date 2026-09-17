@@ -597,18 +597,51 @@ double up on what World already told the client.
 request's atoms are applied either way, and both captured step-2 replies carry Success 1
 (seq 1907, 1949). Success is now "the commit was well-formed"; the count goes to the log.
 
-### Active Listings and Sold are still empty, and the .def cannot fix that
+### Active Listings and Sold — the seller's capture, T81
 
-No capture contains a populated one. `cap_social3_client.log` holds exactly one
-`S_TRADE_BROKER_REGISTERED_ITEM_LIST` and it is empty (seq 1276), and
-`S_TRADE_BROKER_SOLD_ITEM_LIST` never appears at all — the client asked twice and the real
-Arbiter answered neither. The reason is that **that tap is the buyer's client**: the buyer had no
-listings, so empty was the correct answer. Searching every S->C packet in the log for the three
-listed template ids (139093, 200997, 200001) finds them in only three packets — `S_ITEMLIST`,
-`S_TRADE_BROKER_WAITING_ITEM_LIST` and `S_TRADE_BROKER_BOUGHT_ITEM_LIST`, all already decoded.
+T74 left both tabs empty and said what would settle it: *one capture of a seller's client opening
+Active Listings with rows*. `cap_social3_client2.log` is exactly that — the **seller's** tap of the
+same cap_social3 session that `cap_social3_client.log` recorded from the buyer's side. Both tabs
+have rows in it, and neither layout could have been derived from the other two lists or from the
+shipped def.
 
-The shipped `.def` cannot stand in for the capture, and there is now proof rather than a hunch:
-the one broker list we HAVE verified byte for byte **disagrees with its own def**.
+**`S_TRADE_BROKER_REGISTERED_ITEM_LIST` (0xCDEA)** — fixed part `[u16 count][u16 firstOffset]`,
+4 bytes. Element **66 bytes, and no name**: the seller is looking at his own rows, so the element
+opens with two u16s rather than the three every other broker list uses.
+
+| offset | field | frame 1258 |
+| --- | --- | --- |
+| +0 / +2 | `here` / `next` (0 = last) | 8 / 0 |
+| +4 | TradeId, i32 | 1 |
+| +8 | reserved, i32 | 0 |
+| +12 | ItemDbId, i64 | 10027 |
+| +20 | TemplateId, i32 | 200997 |
+| +24 | Amount, i32 | 1 |
+| +28 | reserved, i32 | 0 |
+| +32 | RegisterTime, i64 unix | 0x6AAB18F0 |
+| +40 | Price, i64 | 10001 |
+| +48..+65 | zero | |
+
+Rows come out **oldest first** — frames 1436 and 1457 chain trade 1 → 2 → 3 at 8 → 0x4A → 0x8C —
+which is the opposite of the search list's newest-first ordering.
+
+**`S_TRADE_BROKER_SOLD_ITEM_LIST` (0x5587)** — fixed part 20 bytes:
+`[u16 count][u16 firstOffset][i64 TotalCalcMoney][i64 TotalCalcTCatMoney]`, exactly the shape
+section 5 already corrected the def to. `TotalCalcMoney` is what is waiting to be collected: 1 in
+frame 1572, and trade 3 went for 1.
+
+Its element is **the bought-list element with one more i64 on the end** — 98 bytes of fixed part
+become 106, and every field from +0 to +75 is at the same offset with the same value as the
+buyer's view of the same trade (frame 1572 against `cap_social3_client.log` seq 1486, both
+trade 3). The new i64 at +76 reads 1, the same as `TotalPaid` at +68: the seller's proceeds. One
+captured row, but seq 1486 is an independent witness for everything before +76.
+
+The tab's lifecycle is the state column: frame 1572 has the row while it is `BrokerSold`, and
+1586 is back to the empty 24-byte form once the seller has taken the proceeds and it has moved to
+`BrokerSellerPaid`.
+
+The shipped `.def` still cannot stand in for a capture, and the proof from T74 stands: the one
+broker list we had verified byte for byte **disagrees with its own def**.
 
 | | `S_TRADE_BROKER_WAITING_ITEM_LIST.def` | the wire (seq 1419 / 1472) |
 | --- | --- | --- |
@@ -618,7 +651,6 @@ the one broker list we HAVE verified byte for byte **disagrees with its own def*
 | +22 | `int16 quantity` | Amount, 4 bytes |
 
 The shipped defs are from another build — the same conclusion PARTY-DESIGN.md reached about their
-`opcode=` comments. Filling the other two tabs from them would be a guess wearing a source's
-clothes. `T74_the_broker_list_defs_disagree_with_the_wire` is the guard that says so out loud.
-
-What would settle it: one capture of a **seller's** client opening Active Listings with rows.
+`opcode=` comments. `T74_the_broker_list_defs_disagree_with_the_wire` is the guard that says so
+out loud; `T81_the_registered_item_list_is_byte_exact` and
+`T81_the_sold_item_list_is_byte_exact` are what replaced the guessing with frames.

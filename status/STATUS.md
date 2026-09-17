@@ -298,3 +298,14 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   does not); the list is built from the stored rows and is byte-exact, but we send it **eighth**
   in the C_LOAD_TOPO_FIN burst where the real Arbiter sends it **first** (frame 257, ahead of
   S_REQUEST_INVITE_GUILD_TAG).
+
+- T81 (cap_social3_client2.log): the broker's last two tabs are real. That log is the **seller's**
+  client of the cap_social3 session — the one T71/T72/T74 worked from was the buyer's, which is
+  why both tabs were empty there and stayed on the empty form for three tasks.
+  `S_TRADE_BROKER_REGISTERED_ITEM_LIST` has a 66-byte element that carries **no name at all** and
+  opens with two u16s rather than three (frames 1258 / 1436 / 1457, one, two and three rows,
+  oldest first); `S_TRADE_BROKER_SOLD_ITEM_LIST` has a 20-byte fixed part and an element that is
+  the bought-list element **plus one i64** at +76 (frame 1572, with seq 1486 as an independent
+  witness for everything before it). Both are served from the listings table — Active Listings
+  from `BrokerListed`, Sold from `BrokerSold` until the proceeds are taken. T74's "the defs
+  disagree, so these two wait for a capture" note in BROKER-DESIGN.md is replaced by the layouts.

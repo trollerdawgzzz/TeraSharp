@@ -134,11 +134,13 @@ public sealed class BrokerHandlers
     /// <c>S_TRADE_BROKER_HIGHEST_ITEM_LEVEL</c> (seq 134) and <c>S_TRADE_BROKER_BUY_IT_NOW</c>
     /// (seq 1469).</para>
     ///
-    /// <para><b>Two are deliberately left on the empty form.</b>
-    /// <c>S_TRADE_BROKER_REGISTERED_ITEM_LIST</c> appears in the capture only empty (seq 1276),
-    /// and <c>S_TRADE_BROKER_SOLD_ITEM_LIST</c> never appears at all - the client asked twice and
-    /// the real Arbiter answered neither. Filling them by analogy with the two lists we DID see
-    /// is the guess that desyncs a window; they wait for a capture that holds one.</para>
+    /// <para>T81 filled in the last two. They were left on the empty form because the buyer's
+    /// client never saw a populated one; <c>cap_social3_client2.log</c> is the SELLER's client of
+    /// the same session and has both - <c>S_TRADE_BROKER_REGISTERED_ITEM_LIST</c> with one, two
+    /// and three rows (frames 1258 / 1436 / 1457) and <c>S_TRADE_BROKER_SOLD_ITEM_LIST</c> with
+    /// one (frame 1572). Neither layout was guessable from the shipped def or from the lists we
+    /// already had: the registered element is 66 bytes with no name at all, and the sold element
+    /// is the bought element plus one i64.</para>
     /// </summary>
     public static byte[]? ReplyFor(ushort op, CharacterStore? store, int characterId)
     {
@@ -171,9 +173,49 @@ public sealed class BrokerHandlers
                     BrokerPackets.BuildSBoughtItemListBody(page));
             }
 
+            case BrokerPackets.C_TRADE_BROKER_REGISTERED_ITEM_LIST:
+            {
+                // T81: Active Listings, oldest first - cap_social3_client2.log frames 1436/1457
+                // list trade 1, then 2, then 3, where the search list is newest-first.
+                var rows = OldestFirst(store.GetBrokerListingsOf(characterId, CharacterStore.BrokerListed));
+                var page = new List<(int, long, int, int, long, long)>(rows.Count);
+                foreach (var r in rows)
+                    page.Add((r.TradeId, r.ItemDbId, r.TemplateId, r.Amount, r.Price,
+                              UnixSeconds(r.RegisteredAt)));
+                return Frame(BrokerPackets.S_TRADE_BROKER_REGISTERED_ITEM_LIST,
+                    BrokerPackets.BuildSRegisteredItemListBody(page));
+            }
+
+            case BrokerPackets.C_TRADE_BROKER_SOLD_ITEM_LIST:
+            {
+                // T81: what has sold and is waiting to be collected. The tab empties the moment
+                // the seller takes the proceeds and the row moves to BrokerSellerPaid - frame
+                // 1572 has the row, 1586 is back to the empty 24-byte form.
+                var rows = OldestFirst(store.GetBrokerListingsOf(characterId, CharacterStore.BrokerSold));
+                var page = new List<(int, long, int, int, long, int, string, long, long)>(rows.Count);
+                foreach (var r in rows)
+                    page.Add((r.TradeId, r.ItemDbId, r.TemplateId, r.Amount, r.Price, r.SellerDbId,
+                              r.SellerName, UnixSeconds(r.RegisteredAt), UnixSeconds(r.SoldAt)));
+                return Frame(BrokerPackets.S_TRADE_BROKER_SOLD_ITEM_LIST,
+                    BrokerPackets.BuildSSoldItemListBody(page));
+            }
+
             default:
                 return ReplyFor(op);
         }
+    }
+
+    /// <summary>
+    /// T81. <c>GetBrokerListingsOf</c> answers newest-first because the search list wants it that
+    /// way; the seller's own two tabs are the other way round. Copied rather than sorted in SQL so
+    /// the one query keeps serving both callers.
+    /// </summary>
+    private static List<CharacterStore.BrokerListingRow> OldestFirst(
+        IReadOnlyList<CharacterStore.BrokerListingRow> rows)
+    {
+        var list = new List<CharacterStore.BrokerListingRow>(rows);
+        list.Sort((a, b) => a.TradeId.CompareTo(b.TradeId));
+        return list;
     }
 
     /// <summary>One page of search results. The capture never paged past the first, so this is
