@@ -1465,3 +1465,62 @@ and exactly sixteen non-zero bytes in the blob: GuildLevel 1 at 0x64, epoch time
 0x2328 / 0x2348, JoinMinLevel 1 / JoinMaxLevel 70 / GuildJoinType 1 at 0x235C / 0x2360 / 0x2364.
 The two uninitialised bytes T51 recorded from `data/cap_guild.bin` are **zero** here, which
 retires that note: the leak was that one Arbiter run's stack, not part of the format.
+
+## T92 — the wanted-board apply flow against cap_final
+
+The flow was built in T39/T52 from the decompile alone. cap_final is the first capture that runs
+it end to end, and it corrects two things and fills one gap.
+
+### T92.1 There is no `C_REJECT_GUILD_APPLY`
+
+It is in neither `world_opcodes.txt` nor the decompile — no opcode, no `Handler_C_*`. The T90
+report listed it as "the one member of the family with no handler"; that was wrong.
+
+`Handler_C_ACCEPT_GUILD_APPLY` (Arb_part_040.c:16826) guards packet ≥ 9 and reads a **byte** at
+frame 4 and a u32 at frame 5 — `[u8 accept][u32 userDbId]`, unaligned, no padding after the bool.
+Both branches ride the one opcode, and the capture shows both:
+
+```
+c4 2788  C_ACCEPT_GUILD_APPLY  00 EC 03 00 00   -> S_SYSTEM_MESSAGE @261\vName\vjoinguild
+c4 2834  C_ACCEPT_GUILD_APPLY  01 EC 03 00 00   -> S_ADD_GUILD_MEMBER
+```
+
+`GuildHandlers.AcceptGuildApply` already parsed that byte, so the reject path was implemented all
+along — nothing to add.
+
+### T92.2 The gap: the flow told nobody
+
+It stored the application and refreshed the counts, but sent neither system message. Both are now
+emitted:
+
+| frame | message | to | when |
+|---|---|---|---|
+| c3 2939, 2997 | `@1604\vGuildName\v<name>` | the applicant | `C_APPLY_GUILD` succeeded |
+| c4 2789 | `@261\vName\v<applicant>` | the officer | `C_ACCEPT_GUILD_APPLY` with accept = 0 |
+
+Both frames are 46 bytes: `[u16 len][u16 op][u16 off=6][wchar message]`. The 1604 key carries the
+guild name **the client typed**, not the stored row’s, which is why the applicant sees the name
+they searched for. The accept branch sends no message at all.
+
+### T92.3 `AS_UPDATE_GUILD_DATA` (0x144E)
+
+Tap 2501, 9134 bytes, pushed after an incentive grant (2500 → 2501 → 2504) and what makes World
+send the client `S_GUILD_MONEY_INFO_CHANGED`.
+
+```
+[u32 blobOff=14][u32 blobLen=0x23A0][GuildData]        8 + 0x23A0 = 9128 = the payload
+```
+
+The two words are the whole header: 8 + 0x23A0 accounts for every payload byte, which is what
+proves the `02 00 00 00` at payload 8 is the blob’s own guild id and not a third header word.
+`GuildHandlers.BuildAsUpdateGuildData(blob)` puts the header on; the blob is the same 0x23A0
+GuildData the other guild pushes already build.
+
+### T92.4 Still open
+
+Byte-exact pins for the def-driven replies (`S_GUILD_APPLY_LIST` c4 2781/2822, `S_ADD_GUILD_MEMBER`
+c3 3014 / c4 2835, `S_REQUEST_GUILD_INFO_BEFORE_APPLY_GUILD` c3 2920, `S_GUILD_APPLY_COUNT` c3 3016,
+`S_REQUEST_JOIN_GUILD_NOTICE` c3 3019) need the def text, which lives in `GuildPackets.NamedDefs`.
+**`GuildPackets` is not in the worktree** — no `GuildPackets.cs` under `src/TeraSharp.Arbiter`
+anywhere, though `GuildWiring` and `GuildHandlers` both reference it and the project builds. Until
+that file is visible those five frames cannot be pinned from here.
