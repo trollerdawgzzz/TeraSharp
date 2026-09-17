@@ -124,6 +124,17 @@ and look for the next caller.
 
 ## Next steps (in order)
 
+**Checkpoint 2026-09-17 - 696 tests, T74-T82 merged.** Captures cap_social3_client2 (seller) and
+cap_social4 (+client2) consumed: broker complete end to end (T71/T72/T74/T81), EP stored/served (T77),
+party-matching board (T78), guild war persisted (T80), guild crest + skill polishing (T82), 0x2792
+forget-skill answered (was the guild-create wedge), bank withdraw by template (was the dup), parcel send
+date, S_VISITED_SECTION_LIST first in the topo-fin burst (T79), enter-world prefers the stored return
+point whenever the saved zone is an instance (WorldEntry, untested). In flight: T83 cards/perks/crest,
+T84 mail UI / S_VIEW_WARE_EX / account lists. Then LIVE PASS #3 (10 points, see chat) - first with the
+full social layer. Real-Arbiter GM: qaServer=true works (m1 patch not needed); both proxy clients log
+to separate capture_*.log files - always take both. Remaining after: multi-World servers, web admin
+decision (SharedDB), go-live (auth on, ports, backups).
+
 **Checkpoint 2026-09-16 17:15 - 663 tests, T70-T73 merged.** Captures: cap_social3 (broker with
 listings, windows, guild ranks/leave/relog-in-guild, LFG create, guild war window, wanted board) - all
 reframed under D:\packetlogs. Real-Arbiter GM: gate is bit 5 of Account+0x2adc from the hub's
