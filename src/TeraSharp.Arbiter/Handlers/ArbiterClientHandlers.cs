@@ -1006,6 +1006,8 @@ public static class ArbiterClientHandlers
         log.LogDebug("C_GET_USER_GUILD_LOGO: player {Pid} guild {Gid} -> {N} B crest",
             playerId, guildId, logo?.Length ?? 0);
         s.SendByDef("S_GET_USER_GUILD_LOGO", BuildGuildLogoFields(playerId, guildId, logo));
+        return true;
+    }
 
     // =========================================================================================
     // 14. Cards, crests and guild perks                                              (T83)
