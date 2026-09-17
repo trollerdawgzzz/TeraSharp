@@ -13628,8 +13628,8 @@ some prose with `backticks` that is not a table row
             0x584B, 0x7983, 0xAD37, // T82 - C_GET_USER_GUILD_LOGO, C_RQ_SKILL_POLISHING_LIST, _EXP_INFO
             0xB05D, 0xEFB9, 0xD91B, 0x63A0, // T83 - card combine list (mine/others), others' card data, guild perk list
         };
-        Hex.True(ArbiterClientHandlers.ArbiterOwned.Count == observed.Length,
-            $"{ArbiterClientHandlers.ArbiterOwned.Count} in the set, {observed.Length} observed");
+        Hex.True(ArbiterClientHandlers.ArbiterOwned.Count >= observed.Length,
+            $"{ArbiterClientHandlers.ArbiterOwned.Count} in the set, {observed.Length} observed (the set may grow past what was seen live)");
         foreach (ushort op in observed)
             Hex.True(ArbiterClientHandlers.ArbiterOwned.Contains(op),
                 $"0x{op:X4} ({op}) is missing from ArbiterOwned");

@@ -198,6 +198,22 @@ public static class HandlerRegistry
         Reg("C_REQUEST_GUILD_PERK_LIST", 0,
             (s, b) => ArbiterClientHandlers.OnRequestGuildPerkList(s, b, misc));
         ArbiterClientHandlers.PlayerIdForGameId = gameId => (int)(Program.World?.PlayerForGameId(gameId)?.SelectedCharacter?.Id ?? 0);
+        // T87: telemetry / acks. All Arbiter-owned; never forward (RegNoop would forward in-world).
+        Reg("C_PONG", 0, (s,b) => ArbiterClientHandlers.OnPong(s,b,misc));
+        Reg("C_CHECK_RTT", ArbiterClientHandlers.CheckRttBodySize, (s,b) => ArbiterClientHandlers.OnCheckRtt(s,b,misc));
+        Reg("C_PLAY_TIME", 0, (s,b) => ArbiterClientHandlers.OnPlayTime(s,b,misc));
+        Reg("C_REQUEST_PLAYTIME", ArbiterClientHandlers.RequestPlaytimeBodySize, (s,b) => ArbiterClientHandlers.OnRequestPlaytime(s,b,misc));
+        Reg("C_REQUEST_PERF", ArbiterClientHandlers.RequestPerfBodySize, (s,b) => ArbiterClientHandlers.OnRequestPerf(s,b,misc));
+        Reg("C_SEND_UI_LOG", ArbiterClientHandlers.SendUiLogBodySize, (s,b) => ArbiterClientHandlers.OnSendUiLog(s,b,misc));
+        Reg("C_GET_MY_IP", ArbiterClientHandlers.GetMyIpBodySize, (s,b) => ArbiterClientHandlers.OnGetMyIp(s,b,misc));
+        Reg("C_XIGNCODE_SECURITY_DATA", ArbiterClientHandlers.XignCodeSecurityDataBodySize, (s,b) => ArbiterClientHandlers.OnXignCodeSecurityData(s,b,misc));
+        Reg("C_INVALID_BUILD_VERSION", ArbiterClientHandlers.InvalidBuildVersionBodySize, (s,b) => ArbiterClientHandlers.OnInvalidBuildVersion(s,b,misc));
+        Reg("C_REQUEST_LATEST_UPDATE_NOTIFICATION", ArbiterClientHandlers.LatestUpdateNotificationBodySize, (s,b) => ArbiterClientHandlers.OnRequestLatestUpdateNotification(s,b,misc));
+        Reg("C_CONFIRM_UPDATE_NOTIFICATION", ArbiterClientHandlers.ConfirmUpdateNotificationBodySize, (s,b) => ArbiterClientHandlers.OnConfirmUpdateNotification(s,b,misc));
+        Reg("C_SECOND_PASSWORD_AUTH", ArbiterClientHandlers.SecondPasswordBodySize, (s,b) => ArbiterClientHandlers.OnSecondPassword(s,b,misc));
+        Reg("C_SECOND_PASSWORD_REGISTER", ArbiterClientHandlers.SecondPasswordBodySize, (s,b) => ArbiterClientHandlers.OnSecondPassword(s,b,misc));
+        Reg("C_REFRESH_API_ACCESS_TOKEN", ArbiterClientHandlers.RefreshApiAccessTokenBodySize, (s,b) => ArbiterClientHandlers.OnRefreshApiAccessToken(s,b,misc));
+        Reg("C_CANCEL_EXIT", 0, (s,b) => ArbiterClientHandlers.OnCancelExit(s,b,misc));
         foreach (var name in new[]
         {
             "C_REQUEST_GUILD_LIST", "C_DUNGEON_COOL_TIME_LIST", "C_VIEW_BATTLE_FIELD_RESULT",
