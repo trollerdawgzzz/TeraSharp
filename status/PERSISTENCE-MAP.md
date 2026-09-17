@@ -512,3 +512,39 @@ packets carry different fields (`status/FRIENDS.md` section 10).
   leaves the existing constant 419 alone rather than guessing a formula from two samples.
 - **`position` is 0 in both captured elements**, while we send the lobby slot (1, 2), and
   **`appearance2` is 1 and 2** where we send 100. Observed, not acted on.
+
+## EP (Extra Point) — T77
+
+Seven columns on `characters`, written by three different messages and read by one. Before T77
+nothing stored EP at all, so `AS_LOAD_EXTRAPOINT_DATA` answered 53 zero bytes on every login and
+the panel reset itself each time.
+
+| column | written by | request payload offset | read back at |
+|---|---|---|---|
+| `ep_exp` | `SDB_UPDATE_EXTRA_POINT` 0x27B1 | +8 (i64) | reply +13 (i64) |
+| `ep_level` | 0x27B1, and `SDB_UPDATE_PRE_EP_INFO` 0x27C1 +8 | +16 | +9 |
+| `ep_point` | 0x27B1, and 0x27C1 +12 | +20 | — |
+| `ep_daily_exp` | 0x27B1 | +24 | +21 |
+| `ep_reserve_bonus` | 0x27B1, and `SDB_UPDATE_DAILY_EXTRA_POINT` 0x27AF +8 | +28 | +25 |
+| `ep_daily_limit` | 0x27B1 | +32 | +29 |
+| `ep_reset_time` | 0x27AF | +12 (i64) | +33 (i64) |
+
+`ep_point` has no slot in the load reply — the client derives the spendable points from the level
+and the learned perks. `GoldConsumption` (+41) and `TotalEp` (+49) still go out as zero: no W->A
+frame in any capture carries either, and both captured characters have them zero, so there is
+nothing to see which write would set them.
+
+`SDB_UPDATE_PRE_EP_INFO` is deliberately a two-column write. World sends it first and the full
+0x27B1 second, so a crash between the two leaves the level and point right rather than stale.
+
+### Still open (T77)
+
+- **System-parcel attachments.** `SA_MAKE_SYS_PARCEL` (0x1479) carries an attachment list —
+  payload +0 count, +4 first element offset, 43-byte elements with TemplateId at +16 and Amount at
+  +20 (seq 2962: 201577 x1, 201726 x1). The money is filed; the items are not, because a parcel
+  only hands its items over when `SDB_RECV_PARCEL` step 1 returns the ParcelData record, and a
+  system parcel has no `SDB_MAKE_PARCEL` to have stored one from. Synthesising it means inventing
+  the 0x9e8+ interior no capture pins.
+- **EP perks themselves.** `SDB_USER_LEARN_EP_PERK` (0x27BB) is acked and its perk list is not
+  stored; `SDB_USER_RESET_EP_PERK` (0x27BD) refunds its atoms correctly but the tree it clears is
+  likewise unmodelled. Both are answered, so neither wedges.

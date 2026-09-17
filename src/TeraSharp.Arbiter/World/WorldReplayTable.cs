@@ -83,6 +83,12 @@ public sealed class WorldReplayTable
         0x27DD, // SDB_ITEM_TRADE_LOG  - written after a completed player trade (122 B live)
         0x288C, // SDB_CASH_ITEM_LOG
 
+        // --- T77, cap_social4.log. Neither carries a DlmId and neither draws a reply: two
+        // SDB_PUBLISH_INVITE_CODE and three SA_DARK_RIFT_EVENT_OPEN arrive and no A->W frame
+        // follows any of them. ---
+        0x28B8, // SDB_PUBLISH_INVITE_CODE  - `UserDbId@06`, nothing else
+        0x14CE, // SA_DARK_RIFT_EVENT_OPEN  - five i32s of event config
+
         // --- T15: proven one-way in D:\packetlogs\cap_newchar.log (a real ArbiterServer
         // playing for five minutes). Each was checked frame by frame: no A->W frame follows
         // any occurrence, and the Arbiter's handler has no SendToSession at all. ---

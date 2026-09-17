@@ -1110,6 +1110,20 @@ public sealed class DbProxyHandlers
             case SDB_SAVE_2924:
             case SDB_UPDATE_LEFT_COOLTIME_PREMIUM_SLOT:   // 0x28C1, T64
             case SDB_LOAD_REFER_A_FRIEND:   // 0x28B0, T69
+            // --- T77: cap_social4's fifteen ---
+            case SDB_UPDATE_DAILY_EXTRA_POINT:
+            case SDB_UPDATE_EXTRA_POINT:
+            case SDB_USER_LEARN_EP_PERK:
+            case SDB_USER_RESET_EP_PERK:
+            case SDB_UPDATE_PRE_EP_INFO:
+            case SDB_REGISTER_CARD:
+            case SDB_MOUNT_CARD:
+            case SDB_UNMOUNT_CARD:
+            case SDB_INIT_LIMIT_REMAIN_REPUTATION:
+            case SDB_LOAD_FEUDAL_LORD_FLAG:
+            case SDB_TBA_REQUEST_BATTLEPASS_SEASONDATA:
+            case SA_CREST_POINT:
+            case SA_MAKE_SYS_PARCEL:
             case SDB_LOAD_28B7:             // 0x28B7, T69
             case GuildPackets.SDB_CREATE_GUILD2:   // 0x27D4, T69
             case SDB_SAVE_2768:
@@ -1236,6 +1250,38 @@ public sealed class DbProxyHandlers
             case SDB_LOAD_REFER_A_FRIEND:
                 link.SendFrame(DBS_LOAD_REFER_A_FRIEND,
                     BuildDbsReferAFriendList(payload.Length >= 8 ? U32(payload, 6) : 0)); return true;
+
+            // --- T77: EP. The four plain acks, then the reset, which echoes its atoms. ---
+            case SDB_UPDATE_DAILY_EXTRA_POINT: return OnUpdateDailyExtraPoint(link, payload);
+            case SDB_UPDATE_EXTRA_POINT:       return OnUpdateExtraPoint(link, payload);
+            case SDB_UPDATE_PRE_EP_INFO:       return OnUpdatePreEpInfo(link, payload);
+            case SDB_USER_LEARN_EP_PERK:
+                link.SendFrame(DBS_USER_LEARN_EP_PERK, BuildReqIdAck(payload, 8)); return true;
+            case SDB_USER_RESET_EP_PERK:       return OnResetEpPerk(link, payload);
+
+            // --- T77: collection cards. We keep no card state, so Success 1 and the ids echoed. ---
+            case SDB_REGISTER_CARD:
+                link.SendFrame(DBS_REGISTER_CARD, BuildDbsRegisterCard(
+                    Ep32(payload, 0), Ep32i(payload, 12), Ep32i(payload, 16))); return true;
+            case SDB_MOUNT_CARD:
+                link.SendFrame(DBS_MOUNT_CARD, BuildDbsMountCard(
+                    Ep32(payload, 0), Ep32i(payload, 16), Ep32i(payload, 20))); return true;
+            case SDB_UNMOUNT_CARD:
+                link.SendFrame(DBS_UNMOUNT_CARD, BuildDbsMountCard(
+                    Ep32(payload, 0), Ep32i(payload, 16), Ep32i(payload, 20))); return true;
+
+            // --- T77: the rest ---
+            case SDB_INIT_LIMIT_REMAIN_REPUTATION:
+                link.SendFrame(DBS_INIT_LIMIT_REMAIN_REPUTATION, BuildDbsInitLimitRemainReputation(
+                    Ep32(payload, 0), DefaultRemainReputation, 0)); return true;
+            case SDB_LOAD_FEUDAL_LORD_FLAG:
+                link.SendFrame(DBS_LOAD_FEUDAL_LORD_FLAG, BuildDbsFeudalLordFlag()); return true;
+            case SDB_TBA_REQUEST_BATTLEPASS_SEASONDATA:
+                link.SendFrame(DBS_TBA_UPDATE_BATTLEPASS_SEASONDATA, BuildDbsBattlePassSeasonData());
+                return true;
+            case SA_CREST_POINT:
+                link.SendFrame(AS_CREST_POINT, BuildAsCrestPoint(Ep32(payload, 16))); return true;
+            case SA_MAKE_SYS_PARCEL: return OnMakeSysParcel(link, payload);
             case SDB_LOAD_28B7:
                 link.SendFrame(DBS_LOAD_28B6,
                     BuildDbsInviteFriend(payload.Length >= 8 ? U32(payload, 6) : 0)); return true;
@@ -1361,7 +1407,8 @@ public sealed class DbProxyHandlers
             case SA_LOAD_SERVANT_AUTO_POTION_DATA: link.SendFrame(0x1530, BuildServantAutoPotionData(payload)); return true;
             case SA_LOAD_SERVANT_AUTO_FEED_DATA:   link.SendFrame(0x1534, BuildServantAutoFeedData(payload)); return true;
             case SA_PET_LOAD:                      link.SendFrame(0x1416, BuildPetLoad(payload)); return true;
-            case SA_LOAD_EXTRAPOINT_DATA:           link.SendFrame(0x1555, BuildExtrapointData(payload)); return true;
+            case SA_LOAD_EXTRAPOINT_DATA:           link.SendFrame(0x1555, BuildExtrapointData(
+                payload, _store?.GetCharacterEp(Ep32i(payload, 4)))); return true;
 
             // --- Other login-time handlers ---
             case SDB_LOAD_QUEST_PROGRESS: link.SendFrame(0x2903, BuildQuestProgress(payload)); return true;
@@ -1427,6 +1474,283 @@ public sealed class DbProxyHandlers
     // ---- Pure reply builders (unit-tested against captured bytes) ----
 
     /// <summary>Generic "[u32 reqId][u8 ok]" ack (DBS_SAVE_27FB, DBS_SAVE_2925, DBS_DAILY_QUEST).</summary>
+
+    // =====================================================================================
+    // T77: cap_social4.log. Fifteen request/reply pairs the replay table was carrying and two
+    // one-way writes. Every one of the fifteen is a per-user DLMItem unless noted, so an
+    // unanswered one head-blocks that character (status/HANDOFF.md section 1); the replay table
+    // could only ever hand them the DlmId of whoever was logged in when the tap was recorded.
+    //
+    // Layouts are the PDL dumpers', cross-checked against the captured bytes. Eight of the
+    // replies are the plain [i32 DlmId][u8 Success] ack; the other seven are listed below.
+    // =====================================================================================
+
+    // ---- EP (elite points). /@perfect_level walks the whole family in one go. ----
+    /// <summary>0x27AF, guard 0x19: `DlmId@06, OwnerDBID@0A, ReserveBonus@0E, ResetTime@12 (i64)`.</summary>
+    public const ushort SDB_UPDATE_DAILY_EXTRA_POINT = 0x27AF;
+    public const ushort DBS_UPDATE_DAILY_EXTRA_POINT = 0x27B0;
+    /// <summary>0x27B1, guard 0x29: `DlmId@06, OwnerDBID@0A, NewEpExp@0E (i64), NewEpLevel@16,
+    /// NewEpPoint@1A, NewDailyEpExp@1E, NewReserveBonus@22, NewDailyLimit@26`. This is the one
+    /// that carries the numbers the EP panel shows.</summary>
+    public const ushort SDB_UPDATE_EXTRA_POINT = 0x27B1;
+    public const ushort DBS_UPDATE_EXTRA_POINT = 0x27B2;
+    /// <summary>0x27BB, guard 0x19: `EpPerkList ref@06, DlmId@0E, UserDbId@12, UseEpPoint@16`.</summary>
+    public const ushort SDB_USER_LEARN_EP_PERK = 0x27BB;
+    public const ushort DBS_USER_LEARN_EP_PERK = 0x27BC;
+    /// <summary>0x27BD, guard 0x16: `ItemBinary ref@06, DlmId@0E, UserDbId@12, IsByItem@16 (u8)`.
+    /// Its reply is NOT the plain ack - see <see cref="BuildDbsResetEpPerk"/>.</summary>
+    public const ushort SDB_USER_RESET_EP_PERK = 0x27BD;
+    public const ushort DBS_USER_RESET_EP_PERK = 0x27BE;
+    /// <summary>0x27C1, guard 0x15: `DlmId@06, UserDbId@0A, EpLevel@0E, EpPoint@12`.</summary>
+    public const ushort SDB_UPDATE_PRE_EP_INFO = 0x27C1;
+    public const ushort DBS_UPDATE_PRE_EP_INFO = 0x27C2;
+
+    /// <summary>Payload bytes before the atom list in SDB_USER_RESET_EP_PERK (frame 0x17).</summary>
+    public const int ResetEpPerkRequestHeader = 17;
+    /// <summary>...and in its reply (frame 0x13).</summary>
+    public const int ResetEpPerkReplyHeader = 13;
+
+    // ---- collection cards ----
+    /// <summary>0x2988, guard 0x19: `DlmId@06, AccountDbId@0A (i64), CardTemplateId@12, Amount@16`.</summary>
+    public const ushort SDB_REGISTER_CARD = 0x2988;
+    public const ushort DBS_REGISTER_CARD = 0x2989;
+    /// <summary>0x298A / 0x298C, guard 0x1D: `DlmId@06, AccountDbId@0A (i64), UserDbId@12,
+    /// PresetIndex@16, CardTemplateId@1A`.</summary>
+    public const ushort SDB_MOUNT_CARD = 0x298A;
+    public const ushort DBS_MOUNT_CARD = 0x298B;
+    public const ushort SDB_UNMOUNT_CARD = 0x298C;
+    public const ushort DBS_UNMOUNT_CARD = 0x298D;
+
+    // ---- the rest ----
+    /// <summary>0x2893, guard 0x19: `DlmId@06, NpcGuildId@0E, InitTime@12 (i64)`.</summary>
+    public const ushort SDB_INIT_LIMIT_REMAIN_REPUTATION = 0x2893;
+    public const ushort DBS_INIT_LIMIT_REMAIN_REPUTATION = 0x2894;
+    /// <summary>0x28A9, guard 0x0D. World sends it SHORT - six bytes, no payload at all, in both
+    /// captured runs - and the real Arbiter answers anyway. Its reply carries no DlmId.</summary>
+    public const ushort SDB_LOAD_FEUDAL_LORD_FLAG = 0x28A9;
+    public const ushort DBS_LOAD_FEUDAL_LORD_FLAG = 0x28AA;
+    /// <summary>0x29C0, guard 0x11. Also arrives six bytes short of its own guard; its reply
+    /// carries no DlmId either, only the season window.</summary>
+    public const ushort SDB_TBA_REQUEST_BATTLEPASS_SEASONDATA = 0x29C0;
+    public const ushort DBS_TBA_UPDATE_BATTLEPASS_SEASONDATA = 0x29C1;
+    /// <summary>0x1465, guard 0x21: `OwnerBinary ref@06, ArbiterUser@0E (i64), DlmId@16,
+    /// NewPoint@1A, NewExPoint@1E`. The guild crest point write.</summary>
+    public const ushort SA_CREST_POINT = 0x1465;
+    public const ushort AS_CREST_POINT = 0x1466;
+    /// <summary>0x1479, guard 0x2A: two wstr refs (Writer, Title) then `DlmId@1A,
+    /// ReceiverDbId@1E, SendMoney@22 (i64), ForceNotShowMessage@2A (u8)`. System mail - the
+    /// levelling rewards in this capture.</summary>
+    public const ushort SA_MAKE_SYS_PARCEL = 0x1479;
+    public const ushort AS_MAKE_SYS_PARCEL = 0x147A;
+
+    /// <summary>DBS_INIT_LIMIT_REMAIN_REPUTATION (0x2894), frame 0x13. Success comes FIRST here,
+    /// ahead of the DlmId - the one reply in this batch that does.
+    /// `Success@06 (u8), DlmId@07, RemainPoint@0B, HuntingRemainPoint@0F`.</summary>
+    public static byte[] BuildDbsInitLimitRemainReputation(uint dlmId, int remainPoint, int huntingRemainPoint)
+    {
+        var p = new byte[13];
+        p[0] = 1;
+        BitConverter.GetBytes(dlmId).CopyTo(p, 1);
+        BitConverter.GetBytes(remainPoint).CopyTo(p, 5);
+        BitConverter.GetBytes(huntingRemainPoint).CopyTo(p, 9);
+        return p;
+    }
+
+    /// <summary>The captured RemainPoint: 30000, with HuntingRemainPoint 0 (cap_social4.log).</summary>
+    public const int DefaultRemainReputation = 30000;
+
+    /// <summary>DBS_LOAD_FEUDAL_LORD_FLAG (0x28AA), frame 0x0E: one empty MemberList, written with
+    /// the offset = frame length convention.</summary>
+    public static byte[] BuildDbsFeudalLordFlag()
+    {
+        var p = new byte[8];
+        BitConverter.GetBytes(14u).CopyTo(p, 0);
+        return p;
+    }
+
+    /// <summary>DBS_TBA_UPDATE_BATTLEPASS_SEASONDATA (0x29C1), frame 0x21:
+    /// `SeasonId@06, SeasonStartDate@0A (i64), SeasonEndDate@12 (i64), ShopOffDate@1A (i64)`.
+    /// No season is running, which is the all-zero form the capture carries.</summary>
+    public static byte[] BuildDbsBattlePassSeasonData(int seasonId = 0, long start = 0, long end = 0, long shopOff = 0)
+    {
+        var p = new byte[28];
+        BitConverter.GetBytes(seasonId).CopyTo(p, 0);
+        BitConverter.GetBytes(start).CopyTo(p, 4);
+        BitConverter.GetBytes(end).CopyTo(p, 12);
+        BitConverter.GetBytes(shopOff).CopyTo(p, 20);
+        return p;
+    }
+
+    /// <summary>DBS_REGISTER_CARD (0x2989), frame 0x12:
+    /// `DlmId@06, Success@0A (u8), CardTemplateId@0B, Amount@0F`.</summary>
+    public static byte[] BuildDbsRegisterCard(uint dlmId, int cardTemplateId, int amount)
+        => CardReply(dlmId, cardTemplateId, amount);
+
+    /// <summary>DBS_MOUNT_CARD (0x298B) and DBS_UNMOUNT_CARD (0x298D), same frame 0x12:
+    /// `DlmId@06, Success@0A (u8), PresetIndex@0B, CardTemplateId@0F`. Note the order is the
+    /// mirror of the register reply's - preset first, card second.</summary>
+    public static byte[] BuildDbsMountCard(uint dlmId, int presetIndex, int cardTemplateId)
+        => CardReply(dlmId, presetIndex, cardTemplateId);
+
+    private static byte[] CardReply(uint dlmId, int first, int second)
+    {
+        var p = new byte[13];
+        BitConverter.GetBytes(dlmId).CopyTo(p, 0);
+        p[4] = 1;
+        BitConverter.GetBytes(first).CopyTo(p, 5);
+        BitConverter.GetBytes(second).CopyTo(p, 9);
+        return p;
+    }
+
+    /// <summary>AS_CREST_POINT (0x1466), frame 0x13:
+    /// `OwnerBinary ref@06, DlmId@0E, Success@12 (u8)`. The binary comes back empty.</summary>
+    public static byte[] BuildAsCrestPoint(uint dlmId)
+    {
+        var p = new byte[13];
+        BitConverter.GetBytes(19u).CopyTo(p, 0);        // offset = frame length, count 0
+        BitConverter.GetBytes(dlmId).CopyTo(p, 8);
+        p[12] = 1;
+        return p;
+    }
+
+    /// <summary>AS_MAKE_SYS_PARCEL (0x147A), frame 0x0E: `DlmId@06, ParcelErrorNo@0A`.
+    /// Zero is "sent".</summary>
+    public static byte[] BuildAsMakeSysParcel(uint dlmId, int errorNo = 0)
+    {
+        var p = new byte[8];
+        BitConverter.GetBytes(dlmId).CopyTo(p, 0);
+        BitConverter.GetBytes(errorNo).CopyTo(p, 4);
+        return p;
+    }
+
+    /// <summary>DBS_USER_RESET_EP_PERK (0x27BE), frame 0x13:
+    /// `ItemBinary ref@06, DlmId@0E, Success@12 (u8)`, then the request's atoms echoed. The
+    /// request's own header is four bytes longer (it has IsByItem), which is why the reply is
+    /// four bytes shorter than the request in the capture: 875 against 879.</summary>
+    public static byte[] BuildDbsResetEpPerk(uint dlmId, bool ok, byte[]? atoms)
+    {
+        var body = atoms ?? Array.Empty<byte>();
+        var p = new byte[ResetEpPerkReplyHeader + body.Length];
+        BitConverter.GetBytes((uint)(6 + ResetEpPerkReplyHeader)).CopyTo(p, 0);
+        BitConverter.GetBytes((uint)body.Length).CopyTo(p, 4);
+        BitConverter.GetBytes(dlmId).CopyTo(p, 8);
+        p[12] = (byte)(ok ? 1 : 0);
+        body.CopyTo(p, ResetEpPerkReplyHeader);
+        return p;
+    }
+
+
+    /// <summary>A u32 at a PAYLOAD offset, 0 when the frame is short. The T77 family arrives
+    /// short often enough - two of the fifteen are shorter than their own handler's guard in
+    /// every captured run - that reading past the end has to be impossible rather than unlikely.</summary>
+    private static uint Ep32(byte[] p, int at)
+        => at >= 0 && at + 4 <= p.Length ? BitConverter.ToUInt32(p, at) : 0u;
+
+    private static int Ep32i(byte[] p, int at)
+        => at >= 0 && at + 4 <= p.Length ? BitConverter.ToInt32(p, at) : 0;
+
+    private static long Ep64(byte[] p, int at)
+        => at >= 0 && at + 8 <= p.Length ? BitConverter.ToInt64(p, at) : 0L;
+
+    /// <summary>
+    /// SDB_UPDATE_EXTRA_POINT (0x27B1) -&gt; DBS (0x27B2). The EP panel's numbers, and the one
+    /// frame in the family worth persisting: T70 made AS_LOAD_EXTRAPOINT_DATA (0x1555) send the
+    /// character's EP back on login, and until now it had nothing but zeros to send.
+    /// </summary>
+    private bool OnUpdateExtraPoint(WorldLink link, byte[] payload)
+    {
+        int owner = Ep32i(payload, 4);
+        var ep = new CharacterStore.EpRow(
+            Ep64(payload, 8), Ep32i(payload, 16), Ep32i(payload, 20),
+            Ep32i(payload, 24), Ep32i(payload, 28), Ep32i(payload, 32));
+        _store?.SetCharacterEp(owner, ep);
+        _log.LogInformation("SDB_UPDATE_EXTRA_POINT: player {Owner} -> level {Lv}, {Exp} exp, {Pt} point(s)",
+            owner, ep.EpLevel, ep.EpExp, ep.EpPoint);
+        link.SendFrame(DBS_UPDATE_EXTRA_POINT, BuildReqIdAck(payload, 0));
+        return true;
+    }
+
+    /// <summary>SDB_UPDATE_PRE_EP_INFO (0x27C1) -&gt; DBS (0x27C2): the level and point alone,
+    /// written before the full update. Stored so a crash between the two does not lose it.</summary>
+    private bool OnUpdatePreEpInfo(WorldLink link, byte[] payload)
+    {
+        int owner = Ep32i(payload, 4);
+        _store?.SetCharacterEpLevel(owner, Ep32i(payload, 8), Ep32i(payload, 12));
+        link.SendFrame(DBS_UPDATE_PRE_EP_INFO, BuildReqIdAck(payload, 0));
+        return true;
+    }
+
+    /// <summary>SDB_UPDATE_DAILY_EXTRA_POINT (0x27AF) -&gt; DBS (0x27B0): the daily reserve bonus
+    /// and the time it resets.</summary>
+    private bool OnUpdateDailyExtraPoint(WorldLink link, byte[] payload)
+    {
+        int owner = Ep32i(payload, 4);
+        _store?.SetCharacterEpDaily(owner, Ep32i(payload, 8), Ep64(payload, 12));
+        link.SendFrame(DBS_UPDATE_DAILY_EXTRA_POINT, BuildReqIdAck(payload, 0));
+        return true;
+    }
+
+    /// <summary>
+    /// SDB_USER_RESET_EP_PERK (0x27BD) -&gt; DBS (0x27BE). Unlearning the whole perk tree: the
+    /// request carries the refund as ItemTransactionAtoms and the reply echoes them, the same
+    /// rule SDB_ITEM_SINGLE follows. Request header 17 bytes, reply header 13 - which is exactly
+    /// the four-byte difference between the captured 879 and 875.
+    /// </summary>
+    private bool OnResetEpPerk(WorldLink link, byte[] payload)
+    {
+        uint dlmId = Ep32(payload, 8);
+        int owner = Ep32i(payload, 12);
+        byte[] atoms = Array.Empty<byte>();
+        if (_store is not null)
+        {
+            var cloned = WarehouseHandlers.CloneAtomsWithIds(
+                payload, 0, ResetEpPerkRequestHeader, _store.NextItemId);
+            atoms = cloned.Atoms;
+            WarehouseHandlers.Apply(_store, cloned.Parsed, _store.NextItemId, _log);
+        }
+        _log.LogInformation("SDB_USER_RESET_EP_PERK: player {Owner} reset their perks ({N} atom(s))",
+            owner, atoms.Length / ItemAtomSize);
+        link.SendFrame(DBS_USER_RESET_EP_PERK, BuildDbsResetEpPerk(dlmId, ok: true, atoms));
+        return true;
+    }
+
+    /// <summary>
+    /// SA_MAKE_SYS_PARCEL (0x1479) -&gt; AS_MAKE_SYS_PARCEL (0x147A). System mail - in this
+    /// capture the level-up reward parcels. It goes through the same parcels table a player
+    /// parcel does, so it survives a relog and shows up in the inbox T61 fixed.
+    /// </summary>
+    private bool OnMakeSysParcel(WorldLink link, byte[] payload)
+    {
+        uint dlmId = Ep32(payload, 20);
+        int receiver = Ep32i(payload, 24);
+        long money = Ep64(payload, 28);
+
+        // The attachments are NOT delivered yet, and this is the honest reason. seq 2962 carries
+        // them as an ordinary [here][next] list: payload 0 = element count (2), payload 4 = the
+        // first element's frame offset (0xAB), each element 43 bytes with TemplateId at +16 and
+        // Amount at +20 (201577 x1 and 201726 x1 in that frame). Decoding them is easy; filing
+        // them is not, because a parcel only hands its items over when SDB_RECV_PARCEL step 1
+        // returns the ParcelData record World built the atoms from - and for a SYSTEM parcel
+        // there is no SDB_MAKE_PARCEL to have stored that record from. Synthesising one means
+        // inventing the 0x9e8+ interior no capture pins. The gold arrives; the items wait for a
+        // capture of a system parcel being collected.
+        int errorNo = 0;
+        if (_store is null || receiver <= 0) errorNo = 1;
+        else
+        {
+            int id = _store.CreateParcel(0, SystemParcelSender, receiver,
+                string.Empty, string.Empty, money);
+            _log.LogInformation("SA_MAKE_SYS_PARCEL: parcel {Id} to player {To}, {Money} money",
+                id, receiver, money);
+        }
+        link.SendFrame(AS_MAKE_SYS_PARCEL, BuildAsMakeSysParcel(dlmId, errorNo));
+        return true;
+    }
+
+    /// <summary>The sender name a system parcel is filed under. The capture's Writer string is a
+    /// localisation key the client resolves, so ours is a plain marker rather than a guess at it.</summary>
+    public const string SystemParcelSender = "System";
+
     public static byte[] BuildReqIdAck(byte[] request, int reqIdPayloadOffset)
     {
         uint reqId = reqIdPayloadOffset + 4 <= request.Length
@@ -3269,7 +3593,19 @@ public sealed class DbProxyHandlers
     /// </summary>
     public const int ExtrapointReplySize = 53;      // frame 0x3B
 
-    public static byte[] BuildExtrapointData(byte[] request)
+    public static byte[] BuildExtrapointData(byte[] request) => BuildExtrapointData(request, null);
+
+    /// <summary>
+    /// T77: the same reply, filled in from what SDB_UPDATE_EXTRA_POINT last stored. Before T77
+    /// the Arbiter kept no EP at all, so every login answered zeros and the panel reset itself
+    /// each time; the six numbers now round-trip through <c>characters.ep_*</c>.
+    ///
+    /// <para>Two of the eleven fields still go out as zero because nothing we receive carries
+    /// them: <c>GoldConsumption</c> and <c>TotalEp</c> appear in no W-&gt;A frame in any capture.
+    /// Both captured characters have them zero, so we cannot even see which write would set
+    /// them - guessing a derivation (TotalEp = level * something) would be invention.</para>
+    /// </summary>
+    public static byte[] BuildExtrapointData(byte[] request, CharacterStore.EpRow? ep)
     {
         uint dlmId = request.Length >= 4 ? BitConverter.ToUInt32(request, 0) : 0;
         int userDbId = request.Length >= 8 ? BitConverter.ToInt32(request, 4) : 0;
@@ -3277,9 +3613,13 @@ public sealed class DbProxyHandlers
         BitConverter.GetBytes(dlmId).CopyTo(r, 0);
         r[4] = 1;                                   // Result
         BitConverter.GetBytes(userDbId).CopyTo(r, 5);
-        // EpLevel, EpExp, DailyEpExp, ReserveBonus, DailyLimitEpExp, DailyEpExpResetTime,
-        // GoldConsumption and TotalEp are all zero for a character with no EP, which is both
-        // captured characters. We keep no EP state, so zero is the honest answer.
+        if (ep is null) return r;                   // no character, or no EP yet: all zeros
+        BitConverter.GetBytes(ep.EpLevel).CopyTo(r, 9);
+        BitConverter.GetBytes(ep.EpExp).CopyTo(r, 13);
+        BitConverter.GetBytes(ep.DailyEpExp).CopyTo(r, 21);
+        BitConverter.GetBytes(ep.ReserveBonus).CopyTo(r, 25);
+        BitConverter.GetBytes(ep.DailyLimit).CopyTo(r, 29);
+        BitConverter.GetBytes(ep.ResetTime).CopyTo(r, 33);
         return r;
     }
 

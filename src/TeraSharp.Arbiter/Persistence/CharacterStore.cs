@@ -683,6 +683,16 @@ CREATE TABLE IF NOT EXISTS characters (
   last_guard INTEGER NOT NULL DEFAULT 0,
   last_section INTEGER NOT NULL DEFAULT 0,
   rest_bonus INTEGER NOT NULL DEFAULT 0,
+  -- T77: the EP (Extra Point) panel. Six numbers World writes with SDB_UPDATE_EXTRA_POINT
+  -- (0x27B1) and reads back through AS_LOAD_EXTRAPOINT_DATA (0x1555) at enter-world; the
+  -- seventh is the daily reset stamp SDB_UPDATE_DAILY_EXTRA_POINT (0x27AF) carries.
+  ep_exp INTEGER NOT NULL DEFAULT 0,
+  ep_level INTEGER NOT NULL DEFAULT 0,
+  ep_point INTEGER NOT NULL DEFAULT 0,
+  ep_daily_exp INTEGER NOT NULL DEFAULT 0,
+  ep_reserve_bonus INTEGER NOT NULL DEFAULT 0,
+  ep_daily_limit INTEGER NOT NULL DEFAULT 0,
+  ep_reset_time INTEGER NOT NULL DEFAULT 0,
   world_blob BLOB,
   -- T59: character money (gold). Not in the blob World saves - it is stamped into the blob at
   -- StarterBlob.MoneyOffset when a character is read, exactly as the real Arbiter binds its own
@@ -1133,6 +1143,16 @@ CREATE TABLE IF NOT EXISTS watched_movies (
         AddColumnIfMissing("characters", "last_guard", "INTEGER NOT NULL DEFAULT 0");
         AddColumnIfMissing("characters", "last_section", "INTEGER NOT NULL DEFAULT 0");
         AddColumnIfMissing("characters", "rest_bonus", "INTEGER NOT NULL DEFAULT 0");
+
+        // T77: EP. Seven columns rather than one blob because World writes them from three
+        // different messages and never sends all seven together.
+        AddColumnIfMissing("characters", "ep_exp", "INTEGER NOT NULL DEFAULT 0");
+        AddColumnIfMissing("characters", "ep_level", "INTEGER NOT NULL DEFAULT 0");
+        AddColumnIfMissing("characters", "ep_point", "INTEGER NOT NULL DEFAULT 0");
+        AddColumnIfMissing("characters", "ep_daily_exp", "INTEGER NOT NULL DEFAULT 0");
+        AddColumnIfMissing("characters", "ep_reserve_bonus", "INTEGER NOT NULL DEFAULT 0");
+        AddColumnIfMissing("characters", "ep_daily_limit", "INTEGER NOT NULL DEFAULT 0");
+        AddColumnIfMissing("characters", "ep_reset_time", "INTEGER NOT NULL DEFAULT 0");
     }
 
     /// <summary>ALTER TABLE ADD COLUMN, but a no-op when the column is already there.</summary>
@@ -1636,6 +1656,91 @@ SELECT last_insert_rowid();";
             cmd.Parameters.AddWithValue("$r", restBonus);
             cmd.Parameters.AddWithValue("$id", characterId);
             return cmd.ExecuteNonQuery() == 1;
+        }
+    }
+
+    // ============================================================ T77: EP (Extra Point)
+
+    /// <summary>
+    /// A character's EP panel. The six numbers come from SDB_UPDATE_EXTRA_POINT (0x27B1) in
+    /// this order, which is the order its dumper names them:
+    /// <c>NewEpExp@0E i64, NewEpLevel@16, NewEpPoint@1A, NewDailyEpExp@1E, NewReserveBonus@22,
+    /// NewDailyLimit@26</c>. <see cref="ResetTime"/> is the seventh and arrives separately, on
+    /// SDB_UPDATE_DAILY_EXTRA_POINT (0x27AF), so it is defaulted rather than positional.
+    /// </summary>
+    public sealed record EpRow(
+        long EpExp, int EpLevel, int EpPoint, int DailyEpExp,
+        int ReserveBonus, int DailyLimit, long ResetTime = 0);
+
+    /// <summary>The whole panel, from SDB_UPDATE_EXTRA_POINT. ResetTime is left alone: that
+    /// frame does not carry it.</summary>
+    public bool SetCharacterEp(long characterId, EpRow ep)
+    {
+        ArgumentNullException.ThrowIfNull(ep);
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE characters SET ep_exp = $e, ep_level = $l, ep_point = $p, "
+                            + "ep_daily_exp = $d, ep_reserve_bonus = $r, ep_daily_limit = $m "
+                            + "WHERE id = $id";
+            cmd.Parameters.AddWithValue("$e", ep.EpExp);
+            cmd.Parameters.AddWithValue("$l", ep.EpLevel);
+            cmd.Parameters.AddWithValue("$p", ep.EpPoint);
+            cmd.Parameters.AddWithValue("$d", ep.DailyEpExp);
+            cmd.Parameters.AddWithValue("$r", ep.ReserveBonus);
+            cmd.Parameters.AddWithValue("$m", ep.DailyLimit);
+            cmd.Parameters.AddWithValue("$id", characterId);
+            return cmd.ExecuteNonQuery() == 1;
+        }
+    }
+
+    /// <summary>Level and point alone, from SDB_UPDATE_PRE_EP_INFO (0x27C1). World sends this
+    /// first and the full update second, so writing only these two is deliberate.</summary>
+    public bool SetCharacterEpLevel(long characterId, int epLevel, int epPoint)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE characters SET ep_level = $l, ep_point = $p WHERE id = $id";
+            cmd.Parameters.AddWithValue("$l", epLevel);
+            cmd.Parameters.AddWithValue("$p", epPoint);
+            cmd.Parameters.AddWithValue("$id", characterId);
+            return cmd.ExecuteNonQuery() == 1;
+        }
+    }
+
+    /// <summary>The daily reserve bonus and the stamp it resets on, from
+    /// SDB_UPDATE_DAILY_EXTRA_POINT (0x27AF).</summary>
+    public bool SetCharacterEpDaily(long characterId, int reserveBonus, long resetTime)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE characters SET ep_reserve_bonus = $r, ep_reset_time = $t "
+                            + "WHERE id = $id";
+            cmd.Parameters.AddWithValue("$r", reserveBonus);
+            cmd.Parameters.AddWithValue("$t", resetTime);
+            cmd.Parameters.AddWithValue("$id", characterId);
+            return cmd.ExecuteNonQuery() == 1;
+        }
+    }
+
+    /// <summary>What AS_LOAD_EXTRAPOINT_DATA has to answer with, or null for a character that
+    /// does not exist. A character who has never touched EP reads back all zeros, which is
+    /// exactly what both captured characters send.</summary>
+    public EpRow? GetCharacterEp(long characterId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT ep_exp, ep_level, ep_point, ep_daily_exp, "
+                            + "ep_reserve_bonus, ep_daily_limit, ep_reset_time "
+                            + "FROM characters WHERE id = $id";
+            cmd.Parameters.AddWithValue("$id", characterId);
+            using var r = cmd.ExecuteReader();
+            if (!r.Read()) return null;
+            return new EpRow(r.GetInt64(0), r.GetInt32(1), r.GetInt32(2), r.GetInt32(3),
+                             r.GetInt32(4), r.GetInt32(5), r.GetInt64(6));
         }
     }
 

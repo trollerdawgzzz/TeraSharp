@@ -275,3 +275,12 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   World stops re-asking; `SDB_ITEM_TRADE_LOG` 0x27DD and `SDB_CASH_ITEM_LOG` 0x288C named and
   sealed as one-way. The broker's Active Listings / Sold tabs stay empty: no capture holds a
   populated one and the shipped def is provably wrong about the list we did verify.
+
+- T77 (cap_social4.log): thirteen previously unanswered W->A request/reply pairs are named,
+  decoded and answered, and two one-way writes are sealed — the DB-proxy half of EP, character
+  cards, crest points, limit reputation, the feudal-lord flag, the battle-pass season and system
+  mail. EP is now **persisted**: the six numbers `SDB_UPDATE_EXTRA_POINT` writes survive a relog
+  and come back in `AS_LOAD_EXTRAPOINT_DATA`, which answered 53 zero bytes on every login before.
+  Guild war, LFG/party matching, servants, the wanted board and the guild logo are **A->W pushes
+  only** in this capture (0x14A3/0x14AC/0x14AF/0x14B3, 0x1413, 0x14E1/0x14E2/0x14E6/0x14E9, ...) —
+  nothing to pin a handler against, so they are reported rather than built.
