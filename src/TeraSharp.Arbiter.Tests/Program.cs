@@ -13318,6 +13318,7 @@ some prose with `backticks` that is not a table row
             0xD902, 0xD3D9, 0xA7DF, // T78 - C_REGISTER_PARTY_INFO, C_UNREGISTER_PARTY_INFO, C_REQUEST_PARTY_MATCH_LINK
             0x94F7, 0x74C5, 0x787A, 0xD366, 0xFD66, // T80 - guild war window/view/check/declare/withdraw
             0x584B, 0x7983, 0xAD37, // T82 - C_GET_USER_GUILD_LOGO, C_RQ_SKILL_POLISHING_LIST, _EXP_INFO
+            0xB05D, 0xEFB9, 0xD91B, 0x63A0, // T83 - card combine list (mine/others), others' card data, guild perk list
         };
         Hex.True(ArbiterClientHandlers.ArbiterOwned.Count == observed.Length,
             $"{ArbiterClientHandlers.ArbiterOwned.Count} in the set, {observed.Length} observed");

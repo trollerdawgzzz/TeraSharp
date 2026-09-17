@@ -143,6 +143,9 @@ public static class ArbiterClientHandlers
         // opcode (so it is not forwarded) but sends NOTHING, and the real Arbiter answers both
         // in the lobby burst - cap_social4_client frames 145 and 146.
         C_GET_USER_GUILD_LOGO, C_RQ_SKILL_POLISHING_LIST, C_RQ_SKILL_POLISHING_EXP_INFO,
+        // T83 - cards + guild perks
+        C_REQUEST_MY_ACTIVATE_CARD_COMBINE_LIST_DATA, C_REQUEST_OTHERS_ACTIVATE_CARD_COMBINE_LIST_DATA_WITH_GAMEID,
+        C_REQUEST_OTHERS_CARD_DATA_WITH_GAMEID, C_REQUEST_GUILD_PERK_LIST,
     };
 
     // =========================================================================================
@@ -1248,7 +1251,7 @@ public static class ArbiterClientHandlers
     /// <summary>S_SHOW_CREST_LEARN (0xEBD1): a bare four-byte push, no body at all
     /// (frame 5109). It opens the crest-learning window.</summary>
     public static byte[] BuildShowCrestLearn()
-        => new byte[] { 0x04, 0x00, (byte)S_SHOW_CREST_LEARN, (byte)(S_SHOW_CREST_LEARN >> 8) };
+        => new byte[] { 0x04, 0x00, unchecked((byte)S_SHOW_CREST_LEARN), (byte)(S_SHOW_CREST_LEARN >> 8) };
 
     /// <summary>S_GUILD_APPLY_COUNT (0xC89A): one i32, how many applications are waiting
     /// (frame 3143, a guild with none).</summary>

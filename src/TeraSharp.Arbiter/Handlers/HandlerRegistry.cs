@@ -77,6 +77,8 @@ public static class HandlerRegistry
                 // C_LOAD_TOPO_FIN (first spawn AND after a zone change). T45: built from the visited_sections
                 // rows - the hard-coded empty list told World "nothing explored" on every relog.
                 s.Send(ArbiterClientHandlers.BuildVisitedSectionListFor(s));   // T75/T79: FIRST in the burst, as frame 257 - S_VISITED_SECTION_LIST from visited_sections (stops the intro cutscene replaying)
+                s.Send(ArbiterClientHandlers.BuildCrestInfoFor(s));            // T83: crest points + learned crests (frames 304/314)
+                s.Send(ArbiterClientHandlers.BuildChangeCardPreset());         // T83: card preset (frames 329/375)
                 Program.World?.SendFrame(WorldBridge.OpUpdateVisitedSection,
                     ArbiterClientHandlers.BuildUpdateVisitedSectionList(s.PlayerId,
                         Program.Store?.GetVisitedSections((int)s.SelectedCharacter!.Id)
@@ -186,6 +188,16 @@ public static class HandlerRegistry
         // C_GET_USER_GUILD_LOGO is already registered by GuildWiring (T51).
         Reg("C_RQ_SKILL_POLISHING_LIST", 0, (s, b) => ArbiterClientHandlers.OnRqSkillPolishingList(s, b, misc));
         Reg("C_RQ_SKILL_POLISHING_EXP_INFO", 0, (s, b) => ArbiterClientHandlers.OnRqSkillPolishingExpInfo(s, b, misc));
+        // T83: cards + guild perks
+        Reg("C_REQUEST_MY_ACTIVATE_CARD_COMBINE_LIST_DATA", 0,
+            (s, b) => ArbiterClientHandlers.OnRequestMyActivateCardCombineList(s, b, misc));
+        Reg("C_REQUEST_OTHERS_ACTIVATE_CARD_COMBINE_LIST_DATA_WITH_GAMEID", 8,
+            (s, b) => ArbiterClientHandlers.OnRequestOthersActivateCardCombineList(s, b, misc));
+        Reg("C_REQUEST_OTHERS_CARD_DATA_WITH_GAMEID", 8,
+            (s, b) => ArbiterClientHandlers.OnRequestOthersCardData(s, b, misc));
+        Reg("C_REQUEST_GUILD_PERK_LIST", 0,
+            (s, b) => ArbiterClientHandlers.OnRequestGuildPerkList(s, b, misc));
+        ArbiterClientHandlers.PlayerIdForGameId = gameId => (int)(Program.World?.PlayerForGameId(gameId)?.SelectedCharacter?.Id ?? 0);
         foreach (var name in new[]
         {
             "C_REQUEST_GUILD_LIST", "C_DUNGEON_COOL_TIME_LIST", "C_VIEW_BATTLE_FIELD_RESULT",
@@ -285,7 +297,7 @@ public static class HandlerRegistry
         RegNoop("C_CHANGE_USER_LOBBY_SLOT_ID");
         // C_RQ_SKILL_POLISHING_LIST / _EXP_INFO: real replies since T82 (registered above)
         RegNoop("C_REQUEST_INGAMESTORE_PRODUCT_LIST");
-        RegNoop("C_REQUEST_GUILD_PERK_LIST");
+        // C_REQUEST_GUILD_PERK_LIST: real reply since T83 (registered above)
         RegNoop("C_SET_SERVANT_SEQUENCE");
         RegNoop("C_PLAYER_LOCATION");
         RegNoop("C_PLAYER_FLYING_LOCATION");
