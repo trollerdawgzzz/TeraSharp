@@ -495,4 +495,61 @@ public sealed class CharacterHandlers
         SendDeleteResult(s, true);
         return true;
     }
+
+    // =====================================================================================
+    // T76: the five S_GET_USER_LIST fields the character-select screen was drawing empty
+    // =====================================================================================
+
+    /// <summary>
+    /// Overwrite the location / last-played / rested-xp slots of one S_GET_USER_LIST element
+    /// with what the characters row actually holds.
+    ///
+    /// <para><b>Measured against cap_social_client frame 11</b>, a real S_GET_USER_LIST of
+    /// 1169 bytes with two characters. Element stride is 472 bytes (the def
+    /// S_GET_USER_LIST.18, whose header reads majorPatchVersion &gt;= 95 &amp;&amp; &lt; 101 -
+    /// this client), and the two elements read:</para>
+    /// <list type="bullet">
+    /// <item>dob: worldId 1, guardId 1, sectionId 1, lastLogoutTime 1789387775,
+    ///   restBonusXp 419, maxRestBonusXp 419</item>
+    /// <item>Test: worldId 1, guardId 25, sectionId 599001, lastLogoutTime 1789393881,
+    ///   restBonusXp 0, maxRestBonusXp 1523</item>
+    /// </list>
+    /// <para>Three things fall out of that. (1) The location trio is the same
+    /// (worldId, guardId, sectionId) C_VISIT_NEW_SECTION reports and S_FRIEND_LIST carries -
+    /// Test reads (1, 25, 599001) in BOTH packets. (2) lastLogoutTime is an ABSOLUTE unix
+    /// second count, not an elapsed one: the same frame carries deleteRemainSec and
+    /// banRemainSec = -1789393912, i.e. 0 minus the current time, which pins the capture at
+    /// unix 1789393912 and makes Test s logout 31 seconds old. (3) restBonusXp is per
+    /// character and maxRestBonusXp is per LEVEL (419 at level 1, 1523 at level 3).</para>
+    ///
+    /// <para><b>maxRestBonusXp is deliberately not touched here.</b> It comes from
+    /// <c>RestBonusDataSheet</c> (RestBonusDataSheet::Load, Arb_part_006.c:5206; the packet
+    /// writer reads a field called MaxRestBonusPoint, Arb_part_021.c:4532), which TeraSharp
+    /// does not load - so guessing a formula from two samples would be worse than the constant
+    /// already there.</para>
+    /// </summary>
+    public static void FillLobbyFields(
+        Dictionary<string, object> element, CharacterStore? store, int characterId)
+    {
+        ArgumentNullException.ThrowIfNull(element);
+        var r = store?.GetCharacter(characterId);
+        if (r == null) return;
+        element["worldId"] = r.LastWorld;
+        element["guardId"] = r.LastGuard;
+        element["sectionId"] = r.LastSection;
+        element["lastLogoutTime"] = UnixSeconds(r.LastLogout);
+        element["restBonusXp"] = r.RestBonus;
+    }
+
+    /// <summary>
+    /// A stored UTC timestamp as the unix seconds S_GET_USER_LIST wants, 0 when never set.
+    /// The column is written with SQLite datetime(now), which is UTC text, so the subtraction
+    /// needs no kind conversion.
+    /// </summary>
+    public static long UnixSeconds(DateTime when)
+    {
+        if (when == default) return 0L;
+        long secs = (long)(when - DateTime.UnixEpoch).TotalSeconds;
+        return secs < 0 ? 0L : secs;
+    }
 }

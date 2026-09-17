@@ -187,6 +187,12 @@ public sealed class SocialHandlers
         // with a guild gets S_UPDATE_GUILD_MEMBER(status = online) fanned out to the rest of it
         // and AS_UPDATE_GUILD_MEMBER sent to World, so its read-only mirror agrees.
         GuildWiring.Register(session);
+        // T76: and so does the friend panel. NotifyFriendsOfState existed since T30 and was
+        // never called by anything, so friends never saw each other come online and
+        // last_login was never stamped - which is why S_FRIEND_LIST.lastOnline was always 0.
+        // Riding this call rather than adding a line to the human-owned WorldEntry is the
+        // same choice T49 and T51 made two lines up.
+        NotifyFriendsOfState(session!, FriendStateOnline);
     }
 
     internal static void UnregisterSession(string characterName)
@@ -203,6 +209,9 @@ public sealed class SocialHandlers
     {
         var chr = session?.SelectedCharacter;
         if (chr == null) return;
+        // T76: the other half of the ping, before the roster is torn down so the peers can
+        // still be found. State 2 is offline (S_CHANGE_FRIEND_STATE.1.def).
+        NotifyFriendsOfState(session!, FriendStateOffline);
         Sessions.TryRemove(chr.Name, out _);
         var actions = Chat.Unregister((int)chr.Id);
         if (!actions.IsEmpty) ChatDispatcher(session!, ChatLog).Dispatch(actions, "chat-leave");
@@ -318,8 +327,12 @@ public sealed class SocialHandlers
     }
 
     /// <summary>
-    /// The S_FRIEND_LIST field set for one character, straight from rows. Pure: the only thing
-    /// it needs from the live server is which friends are online, which decides lastOnline.
+    /// The S_FRIEND_LIST field set for one character, straight from rows.
+    ///
+    /// <para>T76: every field now comes from the row, <paramref name="isOnline"/> included -
+    /// lastOnline is seconds since last_login whether or not the friend is logged in, so the
+    /// callback is no longer consulted. It stays on the signature because the caller passes it
+    /// and a later field (status, say) will want it.</para>
     /// </summary>
     public static Dictionary<string, object> BuildFriendListFields(
         CharacterStore store, int characterId, Func<int, bool>? isOnline = null)
@@ -331,7 +344,6 @@ public sealed class SocialHandlers
         {
             var f = store.GetCharacter(row.FriendId);
             if (f == null) continue;
-            bool online = isOnline != null && isOnline(row.FriendId);
             friends.Add(new Dictionary<string, object>
             {
                 ["playerId"] = (uint)f.Id,
@@ -340,13 +352,21 @@ public sealed class SocialHandlers
                 ["race"] = f.Race,
                 ["class"] = f.Class,
                 ["gender"] = f.Gender,
-                ["worldId"] = 0,
-                ["guardId"] = 0,
-                ["sectionId"] = 0,
+                // T76: the last known section, from the characters row. cap_social_client
+                // frames 1417/1437 carry (1, 25, 599001) for the friend two - the same trio
+                // S_GET_USER_LIST frame 11 carries for that character, and the same one
+                // C_VISIT_NEW_SECTION reports. Before T76 all three went out as 0 and the
+                // friend panel had a blank location column.
+                ["worldId"] = f.LastWorld,
+                ["guardId"] = f.LastGuard,
+                ["sectionId"] = f.LastSection,
                 ["summonable"] = false,
-                // The real Arbiter sends seconds-since-logout for offline friends and 0 for
-                // online ones (it diffs two timestamps); we have last_logout on the row.
-                ["lastOnline"] = online ? 0L : SecondsSince(f.LastLogout),
+                // T76: seconds since the friend last entered the world, which is what
+                // User::SendFriendListNoLock computes - now minus a stored time, and 0 when
+                // that time is unset. NOT zero-for-online: in frames 1417/1437 the friend is
+                // online (they accept the request between the two) and the field still reads
+                // 582 then 585.
+                ["lastOnline"] = SecondsSince(f.LastLogin),
                 ["type"] = (uint)row.Type,
                 ["bonds"] = 0,
                 ["name"] = f.Name,
@@ -463,6 +483,10 @@ public sealed class SocialHandlers
                 var online = SessionForCharacter(row.FriendId);
                 var f = online?.SelectedCharacter;
                 if (f == null) continue;
+                // T76: FakeCharacter carries no location - its WorldId/GuardId/SectionId are
+                // init-only and nothing ever sets them, so this packet shipped 0/0/0 too.
+                // The row has the same trio the friend list now uses.
+                var stored = store.GetCharacter(row.FriendId);
                 friends.Add(new Dictionary<string, object>
                 {
                     ["playerId"] = (uint)f.Id,
@@ -471,13 +495,13 @@ public sealed class SocialHandlers
                     ["class"] = f.Class,
                     ["gender"] = f.Gender,
                     ["status"] = 0,
-                    ["worldId"] = f.WorldId,
-                    ["guardId"] = f.GuardId,
-                    ["sectionId"] = f.SectionId,
+                    ["worldId"] = stored?.LastWorld ?? f.WorldId,
+                    ["guardId"] = stored?.LastGuard ?? f.GuardId,
+                    ["sectionId"] = stored?.LastSection ?? f.SectionId,
                     ["updated"] = true,
                     ["isWorldEventTarget"] = false,
                     ["summonable"] = false,
-                    ["lastOnline"] = 0L,
+                    ["lastOnline"] = stored == null ? 0L : SecondsSince(stored.LastLogin),
                     ["name"] = f.Name,
                 });
             }
@@ -506,15 +530,26 @@ public sealed class SocialHandlers
             store.SetProfileMessage(characterId, greeting);
     }
 
+    /// <summary>S_CHANGE_FRIEND_STATE.state 0 - this character just entered the world.</summary>
+    public const uint FriendStateOnline = 0;
+    /// <summary>S_CHANGE_FRIEND_STATE.state 2 - left world or dropped the connection.</summary>
+    public const uint FriendStateOffline = 2;
+
     /// <summary>
     /// S_CHANGE_FRIEND_STATE (0xE887) to every online MUTUAL friend - the login/logout ping.
     /// User::ChangeFriendStateWithLock only notifies rows whose type is 0.
+    ///
+    /// <para>T76: the online ping is also where <c>last_login</c> gets stamped. The packet
+    /// itself has only playerId and state (S_CHANGE_FRIEND_STATE.1.def is two uint32s and
+    /// nothing else), so there is no location or last-login field to fill here - those are
+    /// S_FRIEND_LIST and S_UPDATE_FRIEND_INFO, and both read the value this stamp writes.</para>
     /// </summary>
     public static void NotifyFriendsOfState(GameSession s, uint state)
     {
         var chr = s.SelectedCharacter;
         var store = Program.Store;
         if (chr == null || store == null) return;
+        if (state == FriendStateOnline) store.StampLogin((int)chr.Id);
         foreach (var row in store.GetFriendRows((int)chr.Id))
         {
             if (row.Type != FriendTypeMutual) continue;

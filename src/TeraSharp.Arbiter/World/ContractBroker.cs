@@ -81,7 +81,7 @@ public static class ContractBroker
     public const int TypePartyInvite = 4;
     /// <summary>Party apply - "let me join yours". <c>ContractPartyApplyFetchWork</c>.</summary>
     public const int TypePartyApply = 5;
-    /// <summary>Guild creation. <c>CreateGuildFetchWork</c>. Refused - see <see cref="Broker"/>.</summary>
+    /// <summary>Guild creation. <c>CreateGuildFetchWork</c>. Brokered since T76.</summary>
     public const int TypeCreateGuild = 10;
     /// <summary>Trade broker open deal. <c>TradeBrokerOpenDealFetchWork</c>. Refused.</summary>
     public const int TypeTradeBrokerOpenDeal = 0x23;
@@ -122,13 +122,23 @@ public static class ContractBroker
     public const int MaxLiveContracts = 4096;
 
     /// <summary>
-    /// The contract types this broker actually brokers. Types 10 (guild creation) and 0x23
-    /// (trade broker deal) are deliberately NOT here - both need state the Arbiter side does
-    /// not have, and a made-up verdict would tell World a contract was brokered that never
-    /// was. status/CONTRACT-DESIGN.md section 7.
+    /// The contract types this broker actually brokers.
+    ///
+    /// <para><b>T76 added type 10.</b> T60 left guild creation out on the theory that
+    /// <c>CreateGuildFetchWork</c> runs a guild-name restriction check the Arbiter side cannot
+    /// do. The wire says otherwise: in cap_social2 the whole of what the real Arbiter does for
+    /// a guild create is broker it, and every frame it sends is one this file already builds -
+    /// tap 1181 is the 0x2809 (type 10, contractId 4, Param = the guild name), 1182 the 0x280B,
+    /// 1183 the World answer 0x280C, 1185 the 0x280A with AskList [2], 1186 the 0x280D that becomes the
+    /// members S_BEGIN (cap_social2_client 896). No name check crosses the link. Refusing it
+    /// was what left the founder with a dead Create button.</para>
+    ///
+    /// <para>0x23 (trade broker deal) stays out: it needs broker state this class does not
+    /// have, and a made-up verdict would tell World a contract was brokered that never was.
+    /// status/CONTRACT-DESIGN.md section 7.</para>
     /// </summary>
     public static bool IsBrokeredType(int contractType) =>
-        contractType is TypePartyInvite or TypePartyApply;
+        contractType is TypePartyInvite or TypePartyApply or TypeCreateGuild;
 
     /// <summary>The four opcodes this broker takes off WorldBridge's default arm.</summary>
     public static bool HandlesWorldFrame(ushort op) =>
@@ -152,6 +162,12 @@ public static class ContractBroker
         /// <summary>T64: kept so 0x280A can be built when 0x280C arrives, not before.</summary>
         public string ContractorName = string.Empty;
         public string OpponentName = string.Empty;
+        /// <summary>
+        /// T76: the opponents whose World has answered 0x280C. A party invite has exactly one
+        /// opponent, but guild creation asks the whole party, so 0x280A must not go out until
+        /// every one of them has answered.
+        /// </summary>
+        public readonly HashSet<int> Answered = new();
     }
 
     private static readonly object Gate = new();
@@ -572,12 +588,50 @@ public static class ContractBroker
     }
 
     /// <summary>
+    /// Everybody a 0x2809 has to ask. One session for a party contract; for guild creation, the
+    /// whole party.
+    ///
+    /// <para><b>Guild creation must not take the by-name route.</b> Its <c>Param</c> is the GUILD
+    /// NAME, not a character name - tap 1181 carries a 138-byte Param whose first characters are
+    /// the typed name (test), and the founders own C_REQUEST_CONTRACT (cap_social3_client 2388)
+    /// shows the client sending that name and contract type 10 in one packet. The party comes in
+    /// FetchDataList instead: 4 bytes at frame offset 0xAC, one db id, and the 0x280B the real
+    /// Arbiter answered with named opponent 2 - the other party member. Feeding the guild name to
+    /// the name lookup would find nobody and refuse the contract.</para>
+    /// </summary>
+    public static List<GameSession> ResolveOpponents(FetchRequest r, out string how)
+    {
+        var found = new List<GameSession>();
+        how = "nothing";
+        var bridge = Bridge;
+        if (bridge == null) return found;
+
+        if (r.ContractType != TypeCreateGuild)
+        {
+            var one = ResolveTarget(r, out how);
+            if (one?.SelectedCharacter != null) found.Add(one);
+            return found;
+        }
+
+        foreach (int id in ReadIdList(r.FetchDataList))
+        {
+            if (id <= 0 || id == r.ContractorDbId) continue;
+            var s = bridge.SessionForPlayerId(id);
+            if (s?.SelectedCharacter != null && !found.Contains(s)) found.Add(s);
+        }
+        how = found.Count == 0
+            ? "FetchDataList named no in-world party member"
+            : "FetchDataList party [" + string.Join(", ", found.Select(x => x.SelectedCharacter!.Name)) + "]";
+        return found;
+    }
+
+    /// <summary>
     /// 0x2809. Broker the contract, or refuse it with ErrorNo 2.
     ///
-    /// <para>Types 10 (guild creation) and 0x23 (trade broker) are refused on purpose: both need
-    /// state this broker does not have - CreateGuildFetchWork runs the guild-name restriction
-    /// check before anything else - and inventing a verdict would tell World a contract was
-    /// brokered that never was. status/CONTRACT-DESIGN.md section 7.</para>
+    /// <para>Type 0x23 (trade broker) is still refused on purpose: it needs state this broker
+    /// does not have, and inventing a verdict would tell World a contract was brokered that never
+    /// was. Type 10 (guild creation) IS brokered since T76 - see <see cref="IsBrokeredType"/>.
+    /// status/CONTRACT-DESIGN.md section 7.</para>
     /// </summary>
     private static void OnFetch(byte[] payload)
     {
@@ -603,8 +657,8 @@ public static class ContractBroker
         }
 
         var initiator = bridge.SessionForPlayerId(r.ContractorDbId);
-        var target = ResolveTarget(r, out string how);
-        if (target?.SelectedCharacter == null || initiator?.SelectedCharacter == null)
+        var opponents = ResolveOpponents(r, out string how);
+        if (opponents.Count == 0 || initiator?.SelectedCharacter == null)
         {
             // What the real Arbiter does when the by-name lookup misses or the target's state is
             // not 2: ErrorNo keeps its initial value and ResponseFailure sends an empty AskList.
@@ -616,14 +670,13 @@ public static class ContractBroker
             return;
         }
 
-        int targetDbId = (int)target.SelectedCharacter.Id;
         var contract = new Contract
         {
             Index = NextContractIndex(),
             ContractorDbId = r.ContractorDbId,
             ContractType = r.ContractType,
             ContractId = r.ContractId,
-            Opponents = new List<int> { targetDbId },
+            Opponents = opponents.Select(x => (int)x.SelectedCharacter!.Id).ToList(),
         };
         Remember(contract);
 
@@ -633,11 +686,14 @@ public static class ContractBroker
         // ErrorNo 0, which told the initiator the contract was brokered before anybody had
         // agreed to it - and then ignored a CanContract = 0 that arrived afterwards.
         contract.ContractorName = initiator.SelectedCharacter.Name;
-        contract.OpponentName = target.SelectedCharacter.Name;
-        foreach (int opponent in contract.Opponents)
+        contract.OpponentName = opponents[0].SelectedCharacter!.Name;
+        // T76: one 0x280B per opponent, each naming THAT opponent - tap 1182 for the guild
+        // create carries New + Test, the founder and the single other party member.
+        foreach (var opp in opponents)
             bridge.SendFrame(DBS_ASK_THROUGH_ARBITER_CONTRACT,
-                BuildDbsAsk(contract.Index, r.ContractorDbId, r.ContractType, r.ContractId, opponent,
-                            contract.ContractorName, contract.OpponentName));
+                BuildDbsAsk(contract.Index, r.ContractorDbId, r.ContractType, r.ContractId,
+                            (int)opp.SelectedCharacter!.Id,
+                            contract.ContractorName, opp.SelectedCharacter!.Name));
 
         Log.LogInformation(
             "Contract {Index}: {Type} from {A} to {B} asked (contractId {Cid}, target via {How})",
@@ -666,8 +722,10 @@ public static class ContractBroker
             return;
         }
         c.CanContract = a.CanContract;
-        Log.LogInformation("Contract {Index}: opponent {Who} CanContract = {Can}",
-            a.ContractIndex, a.OpponentDbId, a.CanContract);
+        int answered;
+        lock (Gate) { c.Answered.Add(a.OpponentDbId); answered = c.Answered.Count; }
+        Log.LogInformation("Contract {Index}: opponent {Who} CanContract = {Can} ({A}/{N} answered)",
+            a.ContractIndex, a.OpponentDbId, a.CanContract, answered, c.Opponents.Count);
 
         // T64: NOW the initiator's World gets its verdict - this is seq 655 in cap_social.log,
         // 0.4 ms after the 0x280C at 653. A refusal keeps the empty-AskList form
@@ -676,6 +734,14 @@ public static class ContractBroker
         if (bridge == null) return;
         if (a.CanContract)
         {
+            // T76: a guild create asks the whole party. Sending 0x280A on the first yes would
+            // tell the founders World the contract was brokered before the rest had answered.
+            if (answered < c.Opponents.Count)
+            {
+                Log.LogInformation("Contract {Index}: holding 0x280A until all {N} opponents answer",
+                    a.ContractIndex, c.Opponents.Count);
+                return;
+            }
             bridge.SendFrame(DBS_FETCH_THROUGH_ARBITER_CONTRACT,
                 BuildDbsFetch(c.ContractorDbId, c.ContractType, c.ContractId, c.Index,
                               ErrorNone, c.Opponents));

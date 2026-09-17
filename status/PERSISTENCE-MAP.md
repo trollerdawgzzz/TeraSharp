@@ -16,7 +16,7 @@ back in the matching load.
 | write (W->A)                                      | reply (A->W)  | reply shape                                   | count | state |
 |---------------------------------------------------|---------------|-----------------------------------------------|-------|-------|
 | 0x272E SDB_SET_QUEST_INFO (116 / 972 / 3540 B)    | 0x272F        | 29-B header + 80-B quest record + reward atoms; ok at [24], allocated quest row id at [25] | ~30 | **real (T15)** |
-| 0x273B S_UPDATE_EXP_LEVEL (46 B)                  | 0x273C        | [u32 reqId][u8 ok]                            | 12    | real (T6), writes level/exp to the row |
+| 0x273B S_UPDATE_EXP_LEVEL (46 B)                  | 0x273C        | [u32 reqId][u8 ok]                            | 12    | real (T6), writes level/exp and (T76) rest bonus to the row |
 | 0x2768 SDB_ITEM_SINGLE (30 / 886 / 4310 B)        | 0x2769        | 21-B header + both atom lists, insert ids filled in | 8 | **real (T44)**, the atoms are now applied to the `items` rows, not only echoed |
 | 0x278E SDB_USER_LEARN_SKILL (896 B)               | 0x278F        | 23-B header + the fee atoms + EMPTY SkillPeriodData list | 1 | **real (T15)** |
 | 0x27FA SDB_UPDATE_USER_ACHIEVEMENT (1478-1558 B)  | 0x27FB        | [u32 reqId][u8 ok], reqId at [280]            | 4     | **real (T22)**, the whole payload persisted and served back by 0x27F9 |
@@ -460,3 +460,55 @@ request-minus-one) are per-login loads answered from nothing — we keep no refe
 but both echo a DlmId, so they were promoted out of the replay table where a replayed constant
 would have handed World a stale id. Warehouse rows now also follow TS op 0x10, the withdraw twin of
 0x0E.
+
+---
+
+## T76 - five columns the lobby and the friend panel were reading as zero
+
+No new opcode. Three packets were shipping real fields as zeroes because nothing stored the
+values; `characters` gained five columns (`AddColumnIfMissing`, so an existing db migrates).
+
+| column | written by | read by |
+|---|---|---|
+| `last_login` | `SocialHandlers.RegisterChat` -> `NotifyFriendsOfState(state 0)` -> `CharacterStore.StampLogin` | `S_FRIEND_LIST.lastOnline`, `S_UPDATE_FRIEND_INFO.lastOnline` (both = now - this, in seconds) |
+| `last_world`, `last_guard`, `last_section` | `ArbiterClientHandlers.OnVisitNewSection` -> `CharacterStore.SetLastSection` | `S_FRIEND_LIST`, `S_UPDATE_FRIEND_INFO`, `S_GET_USER_LIST` (worldId/guardId/sectionId) |
+| `rest_bonus` | `DbProxyHandlers.OnUpdateExpLevel` -> `CharacterStore.SetRestBonus` | `S_GET_USER_LIST.restBonusXp` |
+
+### Rest bonus: 0x273B frame offset 26 is the only source
+
+`SDB_UPDATE_EXP_LEVEL` (0x273B) carries `[26] i64 restBonusPoint`, and the real Arbiter feeds it
+to `User::UpdateUserExpAndRestBonusPoint` (level < 1) or `User::UpdateUserLevel` (level >= 1),
+both of which persist it through `dbo.spSetRestBonusPoint` / `spUpdateRestBonusPoint`. Nothing
+else on the link mentions rested xp - there is no `SDB_*REST*` opcode at all. Before T76 the
+handler read the field and only logged it.
+
+### `S_GET_USER_LIST`, decoded against cap_social_client frame 11
+
+A real 1169-byte list of two characters. The def is `S_GET_USER_LIST.18` (header:
+`majorPatchVersion >= 95 && majorPatchVersion < 101`) and its element stride is 472 bytes, which
+the frame confirms - element one at packet 35, element two at 601.
+
+| element offset | field | dob | Test |
+|---|---|---|---|
+| +52 / +56 / +60 | worldId, guardId, sectionId | 1, 1, 1 | 1, 25, 599001 |
+| +64 | lastLogoutTime (int64) | 1789387775 | 1789393881 |
+| +81, +155 | deleteRemainSec, banRemainSec | -1789393912 | -1789393912 |
+| +287 | restBonusXp (int64) | 419 | 0 |
+| +295 | maxRestBonusXp (int64) | 419 | 1523 |
+
+`lastLogoutTime` is **absolute unix seconds**, not an elapsed count: the two remain-seconds fields
+are `0 - now`, which pins the capture at unix 1789393912 and makes `Test`'s logout 31 seconds old.
+That is also what distinguishes it from `S_FRIEND_LIST.lastOnline`, which IS elapsed - the two
+packets carry different fields (`status/FRIENDS.md` section 10).
+
+`Test`'s `(1, 25, 599001)` here is byte-identical to the same character's location in
+`S_FRIEND_LIST` frames 1417/1437, which is what ties the three packets to one stored trio.
+
+### Still open
+
+- **`maxRestBonusXp` is per LEVEL** (419 at level 1, 1523 at level 3) and comes from
+  `RestBonusDataSheet` (`RestBonusDataSheet::Load`, Arb_part_006.c:5206; the writer reads a field
+  named `MaxRestBonusPoint`, Arb_part_021.c:4532). TeraSharp does not load that sheet, so T76
+  leaves the existing constant 419 alone rather than guessing a formula from two samples.
+- **`position` is 0 in both captured elements**, while we send the lobby slot (1, 2), and
+  **`appearance2` is 1 and 2** where we send 100. Observed, not acted on.

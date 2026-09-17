@@ -8898,6 +8898,122 @@ array    friends
         Hex.True(Convert.ToUInt32(them["type"]) == SocialHandlers.FriendTypeIncoming, "their side is type 2");
     }
 
+    /// <summary>
+    /// T76 (2) - the friend panel drew a blank location column and no last-login.
+    ///
+    /// <para><b>The brief said frame 1437 shows two online friends; it does not.</b>
+    /// cap_social_client has exactly two non-empty S_FRIEND_LIST frames, 1417 and 1437, and both
+    /// are 127 bytes with ONE entry - the friend named <c>two</c>. What changes between them is
+    /// the acceptance: 1417 has type 1 (outgoing request) with the greeting in myNote, and 1437,
+    /// twenty frames later, has type 0. That pair is still enough, because the two frames
+    /// disagree in exactly the places that identify the fields.</para>
+    ///
+    /// <para><b>The element is 63 bytes</b> (User::SendFriendListNoLock advances 0x3f -
+    /// see T30_friend_list_element_is_63_bytes_not_67), so the def minus
+    /// dungeonGauntletDifficultyId leaves exactly one place for each field:</para>
+    /// <list type="bullet">
+    /// <item>+34/+38/+42 worldId, guardId, sectionId = 1, 25, 599001 in BOTH frames - and the
+    ///   identical trio is what S_GET_USER_LIST frame 11 carries for that character, and what
+    ///   C_VISIT_NEW_SECTION reports.</item>
+    /// <item>+46 summonable, one byte, 0.</item>
+    /// <item>+47 lastOnline, int64: 582 in 1417 and 585 in 1437. Three seconds apart, so it is
+    ///   an elapsed count from a fixed origin - it cannot be an absolute timestamp, and it is
+    ///   not zeroed for an online friend, because <c>two</c> IS online (they accept the request
+    ///   between the two frames, and frame 1436 is the @433 accepted message). Seconds since
+    ///   that character last entered the world is the only reading that fits.</item>
+    /// <item>+55 type, 1 then 0; +59 bonds, 0. The two remaining int32s.</item>
+    /// </list>
+    /// </summary>
+    [Test] public static void T76_friend_list_location_and_last_login_match_frame_1437()
+    {
+        var reg = CreateT30Defs();
+        using var store = StoreWithTwoAccounts();
+        SocialHandlers.WriteFriendRequest(store, 1, 2, "");
+        Hex.True(SocialHandlers.AcceptFriendRequest(store, 2, 1),
+            "the request is accepted, so the row type is 0 as in frame 1437");
+
+        Hex.True(store.SetLastSection(2, 1, 25, 599001), "where the friend was");
+        Hex.True(store.StampLogin(2, DateTime.UtcNow.AddSeconds(-585)), "and when they logged in");
+
+        var fields = SocialHandlers.BuildFriendListFields(store, 1);
+        var one = (Dictionary<string, object>)((List<object>)fields["friends"])[0];
+        Hex.True(Convert.ToInt32(one["worldId"]) == 1 && Convert.ToInt32(one["guardId"]) == 25
+                 && Convert.ToInt32(one["sectionId"]) == 599001,
+            "the row s location goes on the wire - before T76 all three were hard zeroes");
+        long elapsed = Convert.ToInt64(one["lastOnline"]);
+        Hex.True(elapsed >= 584 && elapsed <= 586,
+            $"lastOnline is seconds since last_login; wanted about 585, got {elapsed}");
+        // Pin the capture s exact second, so the bytes below are frame 1437 s own bytes and not
+        // whatever the clock said while the test ran. The line above is what proves we compute it.
+        one["lastOnline"] = 585L;
+
+        var body = WriteByDef(reg, "S_FRIEND_LIST", fields);
+        int first = BitConverter.ToUInt16(body, 2) - 4;
+        Hex.Eq(body[(first + 34)..(first + 63)],
+            "01 00 00 00  19 00 00 00  D9 23 09 00  00  49 02 00 00 00 00 00 00  "
+            + "00 00 00 00  00 00 00 00",
+            "frame 1437 packet 66..94: worldId 1, guardId 25, sectionId 599001, summonable 0, "
+            + "lastOnline 585 as an int64, type 0, bonds 0");
+    }
+
+    /// <summary>
+    /// T76 (3) - the character-select screen showed no location, no last-played time and 0% rested xp.
+    ///
+    /// <para>Pinned to cap_social_client frame 11, a real S_GET_USER_LIST of 1169 bytes carrying
+    /// two characters. The def is S_GET_USER_LIST.18 (its header reads majorPatchVersion &gt;= 95
+    /// &amp;&amp; &lt; 101, i.e. this client) and the element stride it produces is 472 bytes, which
+    /// is what the frame has: element one at packet 35, element two at 601, 601 - 35 = 566 with
+    /// its strings. Reading the two elements at the def s own offsets gives:</para>
+    /// <list type="bullet">
+    /// <item>dob: worldId/guardId/sectionId 1/1/1 at +52, lastLogoutTime 1789387775 at +64,
+    ///   restBonusXp 419 at +287, maxRestBonusXp 419 at +295.</item>
+    /// <item>Test: 1/25/599001, lastLogoutTime 1789393881, restBonusXp 0, maxRestBonusXp 1523.</item>
+    /// </list>
+    /// <para><b>lastLogoutTime is absolute, not elapsed.</b> The same elements carry
+    /// deleteRemainSec and banRemainSec = -1789393912 - a remaining-seconds field computed as
+    /// 0 minus the current time - which pins the capture at unix 1789393912 and makes Test s
+    /// logout 31 seconds old. That is also why this is the LOGOUT time and the friend list s
+    /// lastOnline is not: the two packets carry different fields.</para>
+    /// </summary>
+    [Test] public static void T76_lobby_fields_match_the_captured_user_list()
+    {
+        using var store = StoreWithTwoAccounts();
+        Hex.True(store.SetLastSection(1, 1, 1, 1) && store.SetLastSection(2, 1, 25, 599001),
+            "the two locations of frame 11");
+        Hex.True(store.SetRestBonus(1, 419) && store.SetRestBonus(2, 0),
+            "and the two rested-xp values - SDB_UPDATE_EXP_LEVEL frame offset 26 is where they come from");
+
+        foreach (var (id, wire) in new[]
+                 {
+                     (1, "01 00 00 00  01 00 00 00  01 00 00 00"),
+                     (2, "01 00 00 00  19 00 00 00  D9 23 09 00"),
+                 })
+        {
+            var element = new Dictionary<string, object>
+            {
+                ["worldId"] = 0, ["guardId"] = 0, ["sectionId"] = 0, ["lastLogoutTime"] = 0L,
+                ["restBonusXp"] = 0L, ["maxRestBonusXp"] = 419L, ["level"] = 1,
+            };
+            CharacterHandlers.FillLobbyFields(element, store, id);
+            var loc = new byte[12];
+            BitConverter.GetBytes(Convert.ToInt32(element["worldId"])).CopyTo(loc, 0);
+            BitConverter.GetBytes(Convert.ToInt32(element["guardId"])).CopyTo(loc, 4);
+            BitConverter.GetBytes(Convert.ToInt32(element["sectionId"])).CopyTo(loc, 8);
+            Hex.Eq(loc, wire, $"frame 11 element +52..64 for character {id}");
+            Hex.True(Convert.ToInt64(element["maxRestBonusXp"]) == 419L,
+                "maxRestBonusXp is left alone - it comes from RestBonusDataSheet, which we do not load");
+            Hex.True(Convert.ToInt32(element["level"]) == 1, "and no other field is touched");
+        }
+
+        Hex.Eq(BitConverter.GetBytes(CharacterHandlers.UnixSeconds(
+                   DateTime.UnixEpoch.AddSeconds(1789387775))),
+            "FF E3 A7 6A 00 00 00 00",
+            "frame 11 element +64..72 for dob: lastLogoutTime is absolute unix seconds, int64");
+        Hex.Eq(BitConverter.GetBytes(CharacterHandlers.UnixSeconds(default)),
+            "00 00 00 00 00 00 00 00", "a character that never logged out sends 0, not a negative");
+        Hex.Eq(BitConverter.GetBytes(419L), "A3 01 00 00 00 00 00 00",
+            "frame 11 element +287..295 for dob: restBonusXp 419");
+    }
     // ---- The rules ----
 
     [Test] public static void T30_system_message_format_matches_the_capture()
@@ -16040,19 +16156,23 @@ some prose with `backticks` that is not a table row
     }
 
     /// <summary>
-    /// Guild creation (type 10) and the trade broker deal (type 0x23) are refused ON PURPOSE.
-    /// <c>CreateGuildFetchWork</c> runs the guild-name restriction check before anything else and
-    /// <c>TradeBrokerOpenDealFetchWork</c> needs the broker's own deal state; we have neither, and
-    /// a made-up verdict would tell World a contract was brokered that never was.
+    /// The trade broker deal (type 0x23) is refused ON PURPOSE: <c>TradeBrokerOpenDealFetchWork</c>
+    /// needs the broker's own deal state, which this class does not have, and a made-up verdict
+    /// would tell World a contract was brokered that never was.
+    ///
+    /// <para><b>T76 moved guild creation to the other side of this line.</b> T60 refused type 10
+    /// on the theory that <c>CreateGuildFetchWork</c> runs a guild-name restriction check first.
+    /// The capture says no such check crosses the link - see
+    /// <see cref="T76_the_guild_create_contract_matches_cap_social2"/>.</para>
     /// </summary>
-    [Test] public static void T60_guild_and_trade_broker_contracts_are_not_brokered()
+    [Test] public static void T60_the_trade_broker_contract_is_not_brokered()
     {
         Hex.True(ContractBroker.IsBrokeredType(ContractBroker.TypePartyInvite)
-                 && ContractBroker.IsBrokeredType(ContractBroker.TypePartyApply),
-            "the two party types are brokered");
-        Hex.True(!ContractBroker.IsBrokeredType(ContractBroker.TypeCreateGuild)
-                 && !ContractBroker.IsBrokeredType(ContractBroker.TypeTradeBrokerOpenDeal),
-            "guild creation and the trade broker deal are not");
+                 && ContractBroker.IsBrokeredType(ContractBroker.TypePartyApply)
+                 && ContractBroker.IsBrokeredType(ContractBroker.TypeCreateGuild),
+            "the two party types and guild creation are brokered");
+        Hex.True(!ContractBroker.IsBrokeredType(ContractBroker.TypeTradeBrokerOpenDeal),
+            "the trade broker deal is not");
         Hex.True(!ContractBroker.IsBrokeredType(0) && !ContractBroker.IsBrokeredType(99),
             "and an unknown type is refused rather than guessed at");
 
@@ -16065,6 +16185,82 @@ some prose with `backticks` that is not a table row
             "the log line names the type it knows and prints the number it does not");
     }
 
+    /// <summary>
+    /// T76 (1) - the founder&apos;s Create button did nothing, and the members never got a popup.
+    ///
+    /// <para>The trace, end to end. The founder types the guild name in a client-side dialog and
+    /// clicks Create; the client sends <c>C_REQUEST_CONTRACT</c> carrying contract type 10 and
+    /// that name (cap_social3_client frame 2388, 174 B: type 10 at packet offset 18, a 138-byte
+    /// Param block holding sdg). <b>That packet never reaches the Arbiter</b> - World owns it, and
+    /// the whole of what crosses the link is the contract handshake: tap 1181 W-&gt;A 0x2809 (type
+    /// 10, contractId 4, contractor 1003, Param = the guild name, FetchDataList = the party),
+    /// 1182 A-&gt;W 0x280B, 1183 W-&gt;A 0x280C CanContract 1, 1185 A-&gt;W 0x280A, 1186 W-&gt;A
+    /// 0x280D - which becomes the member&apos;s S_BEGIN_THROUGH_ARBITER_CONTRACT, cap_social2_client
+    /// frame 896. Nothing else. There is no guild-name check on the wire, so the missing reply was
+    /// simply the 0x280B/0x280A pair T60 refused to send.</para>
+    ///
+    /// <para>Every A-&gt;W frame below is the capture&apos;s own bytes, and the builders were already
+    /// right - only <see cref="ContractBroker.IsBrokeredType"/> was wrong.</para>
+    /// </summary>
+    [Test] public static void T76_the_guild_create_contract_matches_cap_social2()
+    {
+        // tap 1181, W->A 0x2809 len=176. Param is a 138-byte block at frame 34 holding the GUILD
+        // name; FetchDataList is FOUR BYTES - one db id - at frame 0xAC, right after it.
+        var fetch = new byte[176 - 6];
+        BitConverter.GetBytes((uint)0x22).CopyTo(fetch, 0);     // Param offset
+        BitConverter.GetBytes((uint)0x8A).CopyTo(fetch, 4);     // Param count, in BYTES
+        BitConverter.GetBytes((uint)0xAC).CopyTo(fetch, 8);     // FetchDataList offset
+        BitConverter.GetBytes((uint)4).CopyTo(fetch, 12);       // ...count, also in bytes = one id
+        BitConverter.GetBytes(1003).CopyTo(fetch, 16);          // ContractorDbId, the founder New
+        BitConverter.GetBytes(10).CopyTo(fetch, 20);            // ContractType
+        BitConverter.GetBytes(4).CopyTo(fetch, 24);             // ContractId
+        System.Text.Encoding.Unicode.GetBytes("test").CopyTo(fetch, 28);
+        BitConverter.GetBytes(2).CopyTo(fetch, 166);            // the other party member
+
+        var parsed = ContractBroker.ParseFetch(fetch);
+        Hex.True(parsed != null && parsed.Value.ContractorDbId == 1003
+                 && parsed.Value.ContractType == ContractBroker.TypeCreateGuild
+                 && parsed.Value.ContractId == 4,
+            "tap 1181 parses as guild creation, contractId 4, from db id 1003");
+        Hex.True(ContractBroker.IsBrokeredType(parsed!.Value.ContractType),
+            "T76: type 10 is brokered - T60 refused it, which is what killed the Create button");
+        Hex.True(ContractBroker.DecodeWString(parsed.Value.Param) == "test",
+            "Param is the guild name the founder typed, NOT a character name");
+        var ids = ContractBroker.ReadIdList(parsed.Value.FetchDataList);
+        Hex.True(ids.Count == 1 && ids[0] == 2,
+            "FetchDataList is four bytes: the one other party member, db id 2");
+
+        // tap 1182, A->W 0x280B len=52 - byte for byte, contractor name then opponent name
+        Hex.Eq(ContractBroker.BuildDbsAsk(2, 1003, ContractBroker.TypeCreateGuild, 4, 2, "New", "Test"),
+            "22 00 00 00  2A 00 00 00  02 00 00 00  EB 03 00 00  0A 00 00 00  04 00 00 00  "
+            + "02 00 00 00  4E 00 65 00 77 00 00 00  54 00 65 00 73 00 74 00 00 00",
+            "tap 1182: the 0x280B the real Arbiter sent for the guild create");
+
+        // tap 1185, A->W 0x280A len=38 - the verdict, AskList [2], ErrorNo 0
+        Hex.Eq(ContractBroker.BuildDbsFetch(1003, ContractBroker.TypeCreateGuild, 4, 2,
+                   ContractBroker.ErrorNone, new[] { 2 }),
+            "22 00 00 00  04 00 00 00  EB 03 00 00  0A 00 00 00  04 00 00 00  02 00 00 00  "
+            + "00 00 00 00  02 00 00 00",
+            "tap 1185: the 0x280A verdict for contract index 2");
+
+        // cap_social2_client frame 896 - what the 0x280D at tap 1186 becomes on the member client
+        var param = new byte[0x8A];
+        System.Text.Encoding.Unicode.GetBytes("test").CopyTo(param, 0);
+        var begin = ContractBroker.BuildSBegin("New", ContractBroker.TypeCreateGuild, 4, 2, param);
+        Hex.True(begin.Length == 168, "S_BEGIN is 168 bytes, exactly client frame 896");
+        Hex.Eq(begin[..40],
+            "A8 00  3F 7E  16 00  1E 00  8A 00  0A 00 00 00  04 00 00 00  02 00 00 00  "
+            + "4E 00 65 00 77 00 00 00  74 00 65 00 73 00 74 00 00 00",
+            "client frame 896: name at 22, the guild name Param at 30, count 138");
+
+        // tap 1265 - the member accepts and both Worlds are told. Reply 1 = accept.
+        Hex.Eq(ContractBroker.BuildDbsSendEnd(1003, ContractBroker.TypeCreateGuild, 4, 2),
+            "EB 03 00 00  0A 00 00 00  04 00 00 00  02 00 00 00",
+            "tap 1265: 0x280F to the replier's World");
+        Hex.Eq(ContractBroker.BuildDbsReply(1003, 2, ContractBroker.TypeCreateGuild, 4, 1),
+            "EB 03 00 00  02 00 00 00  0A 00 00 00  04 00 00 00  01 00 00 00",
+            "tap 1265: 0x2810 to the founder's World - World then sends S_CREATE_GUILD_RESULT");
+    }
     /// <summary>
     /// The whole point of T60: a party invite that used to die at the seal now travels
     /// initiator -&gt; Arbiter -&gt; target -&gt; accept -&gt; party.

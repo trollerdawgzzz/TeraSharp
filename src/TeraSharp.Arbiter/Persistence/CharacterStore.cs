@@ -34,6 +34,35 @@ public sealed class CharacterRecord
     public int Feet { get; set; }
     public int Position { get; set; } = 1;
     public DateTime LastLogout { get; set; }
+
+    // ---- T76: the lobby / friend-panel fields that were shipping as zero ----
+    /// <summary>
+    /// When this character last entered the world. S_FRIEND_LIST.lastOnline is
+    /// <c>now - this</c> in seconds, which is what User::SendFriendListNoLock computes
+    /// (Arb_part_030.c: <c>lVar15 = now - storedTime</c>, and 0 when the stored time is
+    /// unset). In cap_social_client frames 1417/1437 the friend <c>two</c> is ONLINE and the
+    /// field still carries 582 then 585 - three seconds apart - so it is an elapsed count
+    /// from a fixed origin, not zero-for-online.
+    /// </summary>
+    public DateTime LastLogin { get; set; }
+    /// <summary>
+    /// Last known section, the (worldId, guardId, sectionId) trio C_VISIT_NEW_SECTION
+    /// carries. The same three numbers appear in S_FRIEND_LIST and in S_GET_USER_LIST:
+    /// cap_social_client frame 11 gives the character Test (1, 25, 599001) and frames
+    /// 1417/1437 give the friend two the identical (1, 25, 0x000923D9 = 599001).
+    /// </summary>
+    public int LastWorld { get; set; }
+    /// <inheritdoc cref="LastWorld"/>
+    public int LastGuard { get; set; }
+    /// <inheritdoc cref="LastWorld"/>
+    public int LastSection { get; set; }
+    /// <summary>
+    /// Rested-xp points, the <c>i64 restBonusPoint</c> at frame offset 26 of
+    /// SDB_UPDATE_EXP_LEVEL (0x273B) - the only place World reports it. The real Arbiter
+    /// feeds it to User::UpdateUserExpAndRestBonusPoint / UpdateUserLevel and serves it back
+    /// as S_GET_USER_LIST.restBonusXp: 419 for dob and 0 for Test in cap_social_client frame 11.
+    /// </summary>
+    public long RestBonus { get; set; }
     /// <summary>Opaque WorldServer state (15312 bytes). Null for never-entered characters.</summary>
     public byte[]? WorldBlob { get; set; }
 
@@ -648,6 +677,12 @@ CREATE TABLE IF NOT EXISTS characters (
   hand INTEGER NOT NULL DEFAULT 0, feet INTEGER NOT NULL DEFAULT 0,
   position INTEGER NOT NULL DEFAULT 1,
   last_logout TEXT,
+  -- T76: last enter-world, last known section and rested xp. See CharacterRecord.
+  last_login TEXT,
+  last_world INTEGER NOT NULL DEFAULT 0,
+  last_guard INTEGER NOT NULL DEFAULT 0,
+  last_section INTEGER NOT NULL DEFAULT 0,
+  rest_bonus INTEGER NOT NULL DEFAULT 0,
   world_blob BLOB,
   -- T59: character money (gold). Not in the blob World saves - it is stamped into the blob at
   -- StarterBlob.MoneyOffset when a character is read, exactly as the real Arbiter binds its own
@@ -1091,6 +1126,13 @@ CREATE TABLE IF NOT EXISTS watched_movies (
         // T59: character money. terasharp.db predates it, and every existing character starts
         // at 0 - which is what they had, since nothing was storing it.
         AddColumnIfMissing("characters", "money", "INTEGER NOT NULL DEFAULT 0");
+
+        // T76: the lobby / friend-panel fields.
+        AddColumnIfMissing("characters", "last_login", "TEXT");
+        AddColumnIfMissing("characters", "last_world", "INTEGER NOT NULL DEFAULT 0");
+        AddColumnIfMissing("characters", "last_guard", "INTEGER NOT NULL DEFAULT 0");
+        AddColumnIfMissing("characters", "last_section", "INTEGER NOT NULL DEFAULT 0");
+        AddColumnIfMissing("characters", "rest_bonus", "INTEGER NOT NULL DEFAULT 0");
     }
 
     /// <summary>ALTER TABLE ADD COLUMN, but a no-op when the column is already there.</summary>
@@ -1531,6 +1573,69 @@ SELECT last_insert_rowid();";
             if (!ok) _log.LogWarning("UpdateLevelAndExp: character {Id} not found", characterId);
             else if (level.HasValue) _log.LogInformation("Character {Id} reached level {L} (exp {E})", characterId, level.Value, exp);
             return ok;
+        }
+    }
+
+    /// <summary>
+    /// Stamp <c>last_login</c> - T76. Called when the character actually enters the world,
+    /// which is the origin S_FRIEND_LIST.lastOnline counts from.
+    /// </summary>
+    public bool StampLogin(int characterId) => StampLogin(characterId, DateTime.UtcNow);
+
+    /// <summary>
+    /// <see cref="StampLogin(int)"/> with an explicit instant, so a test can place a login in
+    /// the past. Written in the same text shape SQLite datetime(now) produces, which is what
+    /// the reader parses.
+    /// </summary>
+    public bool StampLogin(int characterId, DateTime whenUtc)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE characters SET last_login = $t WHERE id = $id";
+            cmd.Parameters.AddWithValue("$t", whenUtc.ToString("yyyy-MM-dd HH:mm:ss",
+                System.Globalization.CultureInfo.InvariantCulture));
+            cmd.Parameters.AddWithValue("$id", characterId);
+            return cmd.ExecuteNonQuery() == 1;
+        }
+    }
+
+    /// <summary>
+    /// Remember where the character is - T76. C_VISIT_NEW_SECTION is the only packet that
+    /// carries the trio, and it only fires on a section the character has not seen before, so
+    /// this is a last-KNOWN section rather than a live one. That is still what the two list
+    /// packets want: S_GET_USER_LIST is drawn at the character-select screen and
+    /// S_FRIEND_LIST for a friend who may be offline.
+    /// </summary>
+    public bool SetLastSection(int characterId, int worldId, int guardId, int sectionId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE characters SET last_world = $w, last_guard = $g, " +
+                              "last_section = $s WHERE id = $id";
+            cmd.Parameters.AddWithValue("$w", worldId);
+            cmd.Parameters.AddWithValue("$g", guardId);
+            cmd.Parameters.AddWithValue("$s", sectionId);
+            cmd.Parameters.AddWithValue("$id", characterId);
+            return cmd.ExecuteNonQuery() == 1;
+        }
+    }
+
+    /// <summary>
+    /// Store rested xp - T76. The value is <c>i64 restBonusPoint</c> at frame offset 26 of
+    /// SDB_UPDATE_EXP_LEVEL (0x273B); before T76 the handler read it and only logged it, so
+    /// the character-select screen always drew 0%.
+    /// </summary>
+    public bool SetRestBonus(int characterId, long restBonus)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE characters SET rest_bonus = $r WHERE id = $id";
+            cmd.Parameters.AddWithValue("$r", restBonus);
+            cmd.Parameters.AddWithValue("$id", characterId);
+            return cmd.ExecuteNonQuery() == 1;
         }
     }
 
@@ -2460,6 +2565,11 @@ DELETE FROM guild_members     WHERE user_db_id = $id;";
             Feet = r.GetInt32(r.GetOrdinal("feet")),
             Position = r.GetInt32(r.GetOrdinal("position")),
             LastLogout = r["last_logout"] is string s ? DateTime.Parse(s) : DateTime.MinValue,
+            LastLogin = r["last_login"] is string li ? DateTime.Parse(li) : DateTime.MinValue,
+            LastWorld = r.GetInt32(r.GetOrdinal("last_world")),
+            LastGuard = r.GetInt32(r.GetOrdinal("last_guard")),
+            LastSection = r.GetInt32(r.GetOrdinal("last_section")),
+            RestBonus = r.GetInt64(r.GetOrdinal("rest_bonus")),
             WorldBlob = r["world_blob"] is byte[] b ? b : null,
             ReturnZone = r.GetInt32(r.GetOrdinal("return_zone")),
             ReturnX = (float)r.GetDouble(r.GetOrdinal("return_x")),

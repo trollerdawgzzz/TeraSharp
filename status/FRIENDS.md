@@ -208,3 +208,75 @@ frame: `@433` + `UserName` + the name, in the usual `\v`-separated form. SMT 432
 whose own parameter is spelled differently in this client's table, which is why sending it with a
 `UserName` parameter left the placeholder untouched. `SocialHandlers.SmtAcceptedToRequester` is 0x1B1.
 For reference, seq 1416 in the same tap is `@3450` + `UserName` + name (request sent), which we had right.
+
+---
+
+## 10. T76 - the location column and the last-login field
+
+Live report: the friends list showed no location and no last-login. Both are real fields of the
+63-byte element (section 2); before T76 `BuildFriendListFields` sent `worldId`, `guardId`,
+`sectionId` as hard zeroes and `lastOnline` as seconds-since-`last_logout`, a column that is only
+written when a world blob is saved.
+
+### 10.1 The two samples
+
+`cap_social_client.log` has exactly **two** non-empty `S_FRIEND_LIST` frames, **1417** and **1437**.
+Both are 127 bytes with **one** entry, the friend `two` - the brief that commissioned this pass
+described 1437 as two online friends, which it is not. What makes the pair decisive is that the
+friend request is ACCEPTED between them, so the fields that identify the relation move:
+
+| element offset | field | 1417 | 1437 |
+|---|---|---|---|
+| +4 / +6 / +8 | name, myNote, theirNote offsets | 95, 103, 125 | 95, 103, 105 |
+| +10 | playerId | 1002 | 1002 |
+| +14 | group | 1 | 1 |
+| +34 / +38 / +42 | worldId, guardId, sectionId | 1, 25, 599001 | 1, 25, 599001 |
+| +46 | summonable | 0 | 0 |
+| +47 | lastOnline (int64) | **582** | **585** |
+| +55 | type | **1** (outgoing) | **0** (mutual) |
+| +59 | bonds | 0 | 0 |
+
+The strings move with `type`: in 1417 `myNote` is the request greeting `Friend me?` and `theirNote`
+is empty; in 1437 `myNote` is empty and `theirNote` carries the friend's own profile message.
+
+### 10.2 Why `lastOnline` is seconds since LOGIN
+
+`User::SendFriendListNoLock` (Arb_part_030.c) computes it as a subtraction, not a stored value:
+
+```
+lVar15 = 0;
+FUN_140034490(&local_c0, puVar19 + 0x3b);   // a time_t at UserFriendInfo+0xEC
+if (local_c0 != local_78) {                 // != the default/unset time
+  lVar14 = FUN_1400346a0(&local_c0);
+  lVar15 = FUN_1400346a0(local_70) - lVar14;  // now - that time
+}
+...
+*(longlong *)((longlong)puVar18 + 0x2f) = lVar15;   // element +47, eight bytes
+```
+
+So the wire value is an **elapsed second count from a fixed origin**, and 0 when the origin is
+unset. Three facts pick login over logout: the two frames differ by 3 (they are seconds apart);
+the friend is **online** at 1437 (they accept the request between the frames - frame 1436 is the
+`@433` accepted message), so a zero-for-online rule is ruled out; and 582 s is a session-length
+magnitude, whereas a previous session's logout would be larger. `characters.last_login` is the
+new column, stamped where the character enters the world.
+
+The same subtraction is what `S_UPDATE_FRIEND_INFO` carries, so both packets read the one column.
+`S_GET_USER_LIST` is different: its field is called `lastLogoutTime` and it is an ABSOLUTE unix
+second count - see `status/PERSISTENCE-MAP.md`.
+
+### 10.3 The location trio is the visited-section trio
+
+`(worldId, guardId, sectionId) = (1, 25, 599001)` is byte-identical to what `C_VISIT_NEW_SECTION`
+reports, to the `S_VISITED_SECTION_LIST` entry T75 pinned, and to the same character's element in
+`S_GET_USER_LIST` frame 11. `visited_sections` cannot answer it - it only records a section the
+first time - so `characters.last_world / last_guard / last_section` keep the latest.
+
+### 10.4 `S_CHANGE_FRIEND_STATE` had no fields to fill, and no caller
+
+`S_CHANGE_FRIEND_STATE.1.def` is two `uint32`s, `playerId` and `state` (0 online, 1 busy, 2
+offline) - there is no location or last-login field in it. The real bug there was that
+`NotifyFriendsOfState` had existed since T30 and **nothing ever called it**, so friends never saw
+each other come online and `last_login` would never have been stamped. It now rides
+`SocialHandlers.RegisterChat` / `UnregisterChat`, the same enter-world and leave edges T49 (party)
+and T51 (guild) ride, so no line in the human-owned `WorldEntry` or `GameSession` changes.
