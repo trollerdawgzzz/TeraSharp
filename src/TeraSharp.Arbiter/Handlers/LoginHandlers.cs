@@ -69,7 +69,7 @@ public sealed class LoginHandlers
         var characters = new List<object>();
         foreach (var c in s.Account.Characters)
         {
-            characters.Add(new Dictionary<string, object>
+            var entry = new Dictionary<string, object>
             {
                 ["id"] = c.Id, ["gender"] = c.Gender, ["race"] = c.Race, ["class"] = c.Class,
                 ["level"] = c.Level, ["hp"] = c.Hp, ["mp"] = c.Mp,
@@ -103,7 +103,9 @@ public sealed class LoginHandlers
                 ["hasBrokerSales"] = false, ["petAdventureStatus"] = 0u,
                 ["name"] = c.Name, ["details"] = c.Details, ["shape"] = c.Shape,
                 ["guildName"] = "", ["customStrings"] = new List<object>(),
-            });
+            };
+            CharacterHandlers.FillLobbyFields(entry, Program.Store, (int)c.Id);   // T76: location, last login, rest bonus
+            characters.Add(entry);
         }
 
         s.SendByDef("S_GET_USER_LIST", new Dictionary<string, object>
