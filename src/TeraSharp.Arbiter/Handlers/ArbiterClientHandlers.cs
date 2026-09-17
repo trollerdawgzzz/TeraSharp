@@ -75,6 +75,17 @@ public static class ArbiterClientHandlers
     /// <summary>T75. The sections the client already knows it has seen. Server-&gt;client only.</summary>
     public const ushort S_VISITED_SECTION_LIST = 0xA853;   // 43091
 
+    /// <summary>T82. 22603. Show me that player s guild crest.</summary>
+    public const ushort C_GET_USER_GUILD_LOGO = 0x584B;    // 22603
+    /// <summary>T82. 32250.</summary>
+    public const ushort S_GET_USER_GUILD_LOGO = 0x7DFA;    // 32250
+    /// <summary>T82. 31107. The skill-polishing window s two loads.</summary>
+    public const ushort C_RQ_SKILL_POLISHING_LIST = 0x7983;      // 31107
+    public const ushort S_RP_SKILL_POLISHING_LIST = 0xDA7E;      // 55934
+    /// <summary>T82. 44343 -&gt; 59984.</summary>
+    public const ushort C_RQ_SKILL_POLISHING_EXP_INFO = 0xAD37;  // 44343
+    public const ushort S_RP_SKILL_POLISHING_EXP_INFO = 0xEA50;  // 59984
+
     /// <summary>
     /// Every opcode above, as an explicit statement that these are the ARBITER's. The forwarding
     /// fallback in <c>PacketDispatcher</c> must never apply to one of them: forwarding produces
@@ -110,6 +121,11 @@ public static class ArbiterClientHandlers
         World.GuildWarManager.C_CHECK_TO_DECLARE_GUILD_WAR,
         World.GuildWarManager.C_DECLARE_GUILD_WAR,
         World.GuildWarManager.C_WITHDRAW_GUILD_WAR,
+        // T82 - three more the Arbiter answers from its own tables. The two skill-polishing
+        // loads were on the RegNoop list, which is not the same thing: a noop registers the
+        // opcode (so it is not forwarded) but sends NOTHING, and the real Arbiter answers both
+        // in the lobby burst - cap_social4_client frames 145 and 146.
+        C_GET_USER_GUILD_LOGO, C_RQ_SKILL_POLISHING_LIST, C_RQ_SKILL_POLISHING_EXP_INFO,
     };
 
     // =========================================================================================
@@ -931,6 +947,101 @@ public static class ArbiterClientHandlers
     /// <paramref name="slotIndex"/> of the BODY. Empty for the 0 / out-of-range offsets the real
     /// handlers fall back on (<c>if ((uVar1 == 0) || (*param_2 &lt;= uVar1)) puVar6 = &amp;DAT_140d3e020;</c>).
     /// </summary>
+    // =========================================================================================
+    // 14. Guild crest and the skill-polishing window                                     (T82)
+    // =========================================================================================
+
+    /// <summary>
+    /// C_GET_USER_GUILD_LOGO (0x584B) -&gt; S_GET_USER_GUILD_LOGO (0x7DFA). Right-clicking a
+    /// player whose name carries a guild tag asks for that guild s crest.
+    ///
+    /// <para><b>Arbiter-built.</b> The crest is a column on the guilds row - the Arbiter owns
+    /// guild storage outright (status/GUILD-DESIGN.md section 0) and World only ever gets a
+    /// read-only mirror, so nothing about this request crosses the link. cap_social4_client
+    /// frame 2910 is the request, <c>EB 03 00 00  02 00 00 00</c> = player 1003, guild 2, and
+    /// 2911 is the answer, <c>10 00 00 00  EB 03 00 00  02 00 00 00</c>.</para>
+    ///
+    /// <para>The shipped <c>S_GET_USER_GUILD_LOGO.1.def</c> is RIGHT: a <c>bytes</c> ref is
+    /// <c>[u16 offset][u16 count]</c>, and an EMPTY blob still gets a real offset - 16, the
+    /// packet length - because DefinitionWriter patches the slot to the current end whether or
+    /// not there is data. That is exactly the 10 00 00 00 the capture carries, so a guild with
+    /// no uploaded crest reproduces byte for byte.</para>
+    /// </summary>
+    public const int GetUserGuildLogoBodySize = 8;
+
+    /// <summary>The field set for one crest. A null or empty blob is the no-crest form.</summary>
+    public static Dictionary<string, object> BuildGuildLogoFields(int playerId, int guildId, byte[]? logo)
+        => new()
+        {
+            ["playerId"] = playerId,
+            ["guildId"] = guildId,
+            ["logo"] = logo ?? Array.Empty<byte>(),
+        };
+
+    /// <summary>Handler for C_GET_USER_GUILD_LOGO. Body is <c>[i32 playerId][i32 guildId]</c>.</summary>
+    public static bool OnGetUserGuildLogo(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        if (body.Length < GetUserGuildLogoBodySize) return true;
+        var b = body.Span;
+        int playerId = BitConverter.ToInt32(b);
+        int guildId = BitConverter.ToInt32(b[4..]);
+        var logo = Program.Store?.GetGuildLogo(guildId);
+        log.LogDebug("C_GET_USER_GUILD_LOGO: player {Pid} guild {Gid} -> {N} B crest",
+            playerId, guildId, logo?.Length ?? 0);
+        s.SendByDef("S_GET_USER_GUILD_LOGO", BuildGuildLogoFields(playerId, guildId, logo));
+        return true;
+    }
+
+    /// <summary>
+    /// C_RQ_SKILL_POLISHING_LIST -&gt; S_RP_SKILL_POLISHING_LIST, and
+    /// C_RQ_SKILL_POLISHING_EXP_INFO -&gt; S_RP_SKILL_POLISHING_EXP_INFO.
+    ///
+    /// <para><b>Arbiter-built, and both were silently dropped.</b> Both C_ packets were on
+    /// HandlerRegistry s RegNoop list, which stops them reaching World but sends nothing back -
+    /// so the skill-polishing panel never populated. The real Arbiter answers both in the lobby
+    /// burst, before the world hand-off: cap_social4_client frame 145 is an
+    /// S_RP_SKILL_POLISHING_LIST of eight zero bytes (two empty arrays) and 146 is an
+    /// S_RP_SKILL_POLISHING_EXP_INFO of thirty-six (three int32 and three int64, all zero).</para>
+    ///
+    /// <para>Both shipped defs are right, and both frames are the empty form for a character
+    /// that has polished nothing - which is every character TeraSharp has, because nothing in
+    /// the tree grants polishing points. Serving the zeros is the whole fix.</para>
+    /// </summary>
+    public static Dictionary<string, object> BuildSkillPolishingListFields()
+        => new()
+        {
+            ["optionEffects"] = new List<object>(),
+            ["levelEffects"] = new List<object>(),
+        };
+
+    /// <inheritdoc cref="BuildSkillPolishingListFields"/>
+    public static Dictionary<string, object> BuildSkillPolishingExpFields()
+        => new()
+        {
+            ["currentPoint"] = 0,
+            ["totalPoint"] = 0,
+            ["level"] = 0,
+            ["currentExp"] = 0L,
+            ["prevLevelMaxExp"] = 0L,
+            ["currentLevelMaxExp"] = 0L,
+        };
+
+    /// <summary>Handler for C_RQ_SKILL_POLISHING_LIST.</summary>
+    public static bool OnRqSkillPolishingList(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        _ = body; _ = log;
+        s.SendByDef("S_RP_SKILL_POLISHING_LIST", BuildSkillPolishingListFields());
+        return true;
+    }
+
+    /// <summary>Handler for C_RQ_SKILL_POLISHING_EXP_INFO.</summary>
+    public static bool OnRqSkillPolishingExpInfo(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        _ = body; _ = log;
+        s.SendByDef("S_RP_SKILL_POLISHING_EXP_INFO", BuildSkillPolishingExpFields());
+        return true;
+    }
+
     /// <summary>A NUL-terminated UTF-16LE string, as the inter-server and client writers emit it.</summary>
     public static byte[] WString(string? s)
     {
