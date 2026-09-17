@@ -898,6 +898,80 @@ public static class BrokerPackets
     /// (0xCDEA), min total 8: one array and nothing else.</summary>
     public static byte[] BuildSEmptyItemListBody() => new byte[EmptyArraySlots];
 
+    // ===================================================================================
+    // T81: the seller's two tabs, from cap_social3_client2.log - the SELLER's client of the
+    // same session cap_social3_client.log was the buyer's. Both were empty in the buyer's
+    // capture, which is why T72 and T74 left them on the empty form; here they have rows.
+    // ===================================================================================
+
+    /// <summary>
+    /// One row of S_TRADE_BROKER_REGISTERED_ITEM_LIST - Active Listings. <b>66 bytes, and no
+    /// name</b>: this is the seller's own list, so it repeats neither his name nor a buyer's,
+    /// and the element opens with two u16s rather than the three the search list uses.
+    /// <code>
+    ///   +0  u16 here     +2  u16 next (0 = last)
+    ///   +4  i32 TradeId          +8  i32 reserved (0)
+    ///   +12 i64 ItemDbId         +20 i32 TemplateId    +24 i32 Amount
+    ///   +28 i32 reserved (0)     +32 i64 RegisterTime  +40 i64 Price
+    ///   +48 .. +65 zero
+    /// </code>
+    /// Pinned by six rows across frames 1258 (1 row, 74 B), 1436 (2, 140 B), 1457 (3, 206 B),
+    /// 1620 (2) and 1627 (1) - the same three listings T71 put in the table, trade 1 / 2 / 3.
+    /// </summary>
+    public const int RegisteredElementSize = 66;
+    public const int RlTradeId = 4;
+    public const int RlItemDbId = 12;
+    public const int RlTemplateId = 20;
+    public const int RlAmount = 24;
+    public const int RlRegisterTime = 32;
+    public const int RlPrice = 40;
+
+    /// <summary>
+    /// S_TRADE_BROKER_REGISTERED_ITEM_LIST (0xCDEA). Rows come out <b>oldest first</b> - frames
+    /// 1436 and 1457 list trade 1, then 2, then 3 - which is the opposite of the search list's
+    /// newest-first ordering.
+    /// </summary>
+    public static byte[] BuildSRegisteredItemListBody(
+        IReadOnlyList<(int TradeId, long ItemDbId, int TemplateId, int Amount, long Price,
+                       long RegisterTime)>? rows)
+    {
+        rows ??= Array.Empty<(int, long, int, int, long, long)>();
+        const int header = EmptyArraySlots;
+        var p = new byte[header + rows.Count * RegisteredElementSize];
+        BitConverter.GetBytes((ushort)rows.Count).CopyTo(p, 0);
+        BitConverter.GetBytes((ushort)(rows.Count == 0 ? 0 : ClientHeaderSize + header)).CopyTo(p, 2);
+
+        int at = header;
+        for (int i = 0; i < rows.Count; i++)
+        {
+            var r = rows[i];
+            int here = ClientHeaderSize + at;
+            int next = i + 1 < rows.Count ? here + RegisteredElementSize : 0;
+            BitConverter.GetBytes((ushort)here).CopyTo(p, at);
+            BitConverter.GetBytes((ushort)next).CopyTo(p, at + 2);
+            BitConverter.GetBytes(r.TradeId).CopyTo(p, at + RlTradeId);
+            BitConverter.GetBytes(r.ItemDbId).CopyTo(p, at + RlItemDbId);
+            BitConverter.GetBytes(r.TemplateId).CopyTo(p, at + RlTemplateId);
+            BitConverter.GetBytes(r.Amount).CopyTo(p, at + RlAmount);
+            BitConverter.GetBytes(r.RegisterTime).CopyTo(p, at + RlRegisterTime);
+            BitConverter.GetBytes(r.Price).CopyTo(p, at + RlPrice);
+            at += RegisteredElementSize;
+        }
+        return p;
+    }
+
+    /// <summary>
+    /// One row of S_TRADE_BROKER_SOLD_ITEM_LIST. It is the <b>bought-list element with one more
+    /// i64 on the end</b>: every field from +0 to +75 is at the same offset and carries the same
+    /// value as the buyer's view of the same trade (cap_social3_client.log seq 1486 against
+    /// cap_social3_client2.log frame 1572, both trade 3), and the seller's row then adds an i64
+    /// at +76 that reads 1 - the same number as TotalPaid, i.e. what the seller is owed.
+    /// 98 -&gt; 106 bytes fixed, plus the name.
+    /// </summary>
+    public const int SoldElementFixedSize = 106;
+    /// <summary>+76, i64: the seller's proceeds. One captured row, where it equals the price.</summary>
+    public const int SlSellerProceeds = 76;
+
     /// <summary>S_TRADE_BROKER_SOLD_ITEM_LIST (0x5587), min total 0x18:
     /// `[u16 count][u16 off][i64 TotalCalcMoney][i64 TotalCalcTCatMoney]`. The second i64 is the
     /// one the shipped .def drops (section 5).</summary>
@@ -906,6 +980,63 @@ public static class BrokerPackets
         var p = new byte[0x18 - ClientHeaderSize];
         BitConverter.GetBytes(totalCalcMoney).CopyTo(p, 4);
         BitConverter.GetBytes(totalCalcTCatMoney).CopyTo(p, 12);
+        return p;
+    }
+
+    /// <summary>The 20-byte fixed part of S_TRADE_BROKER_SOLD_ITEM_LIST.</summary>
+    public const int SoldListFixedSize = 0x18 - ClientHeaderSize;
+
+    /// <summary>
+    /// S_TRADE_BROKER_SOLD_ITEM_LIST with rows - cap_social3_client2.log frame 1572, against the
+    /// all-zero 24-byte form at 1402 / 1586 / 1641. <c>TotalCalcMoney</c> is the sum of what is
+    /// waiting to be collected: 1 in that frame, and trade 3's price was 1, which is also why it
+    /// cannot be told apart from a post-tax figure here. <c>TotalCalcTCatMoney</c> stays 0 - no
+    /// captured row has ever carried a second currency.
+    /// </summary>
+    public static byte[] BuildSSoldItemListBody(
+        IReadOnlyList<(int TradeId, long ItemDbId, int TemplateId, int Amount, long Price,
+                       int SellerDbId, string SellerName, long RegisterTime, long SoldTime)>? rows)
+    {
+        rows ??= Array.Empty<(int, long, int, int, long, int, string, long, long)>();
+        var sizes = new int[rows.Count];
+        int total = SoldListFixedSize;
+        long money = 0;
+        for (int i = 0; i < rows.Count; i++)
+        {
+            sizes[i] = SoldElementFixedSize + NameBytes(rows[i].SellerName);
+            total += sizes[i];
+            money += rows[i].Price;
+        }
+
+        var p = new byte[total];
+        BitConverter.GetBytes((ushort)rows.Count).CopyTo(p, 0);
+        BitConverter.GetBytes((ushort)(rows.Count == 0 ? 0 : ClientHeaderSize + SoldListFixedSize))
+            .CopyTo(p, 2);
+        BitConverter.GetBytes(money).CopyTo(p, 4);
+
+        int at = SoldListFixedSize;
+        for (int i = 0; i < rows.Count; i++)
+        {
+            var r = rows[i];
+            int here = ClientHeaderSize + at;
+            int next = i + 1 < rows.Count ? ClientHeaderSize + at + sizes[i] : 0;
+            BitConverter.GetBytes((ushort)here).CopyTo(p, at);
+            BitConverter.GetBytes((ushort)next).CopyTo(p, at + 2);
+            BitConverter.GetBytes((ushort)(here + SoldElementFixedSize)).CopyTo(p, at + 4);
+            BitConverter.GetBytes(r.TradeId).CopyTo(p, at + BlTradeId);
+            BitConverter.GetBytes(r.ItemDbId).CopyTo(p, at + BlItemDbId);
+            BitConverter.GetBytes(r.TemplateId).CopyTo(p, at + BlTemplateId);
+            BitConverter.GetBytes(r.Amount).CopyTo(p, at + BlAmount);
+            BitConverter.GetBytes(r.RegisterTime).CopyTo(p, at + BlRegisterTime);
+            BitConverter.GetBytes(r.Price).CopyTo(p, at + BlPrice);
+            BitConverter.GetBytes(r.SellerDbId).CopyTo(p, at + BlSellerDbId);
+            p[at + BlSoldFlag] = 1;
+            BitConverter.GetBytes(r.SoldTime).CopyTo(p, at + BlSoldTime);
+            BitConverter.GetBytes(r.Price).CopyTo(p, at + BlTotalPaid);
+            BitConverter.GetBytes(r.Price).CopyTo(p, at + SlSellerProceeds);
+            WriteName(p, at + SoldElementFixedSize, r.SellerName);
+            at += sizes[i];
+        }
         return p;
     }
 

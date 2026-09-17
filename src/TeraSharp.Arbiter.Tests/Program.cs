@@ -17861,13 +17861,17 @@ string message
                  && BrokerPackets.WlTemplateId - BrokerPackets.WlItemDbId == 8,
             "TradeId is 4 bytes and ItemDbId is 8 - the def calls the second one a uint32");
 
-        // And the two tabs the capture does not justify filling in are still the empty form.
+        // T81: and the two tabs this note used to leave empty now have a capture of their own -
+        // cap_social3_client2.log, the SELLER's client. The def is wrong about those too: it has
+        // no idea the registered element carries no name, or that the sold element is eight bytes
+        // longer than the bought one. See T81_the_registered_item_list_is_byte_exact.
         using var store = GuildStore(2);
         store.CreateBrokerListing(2, "Test", 10027, 200997, 1, 10001);
-        Hex.Eq(BrokerHandlers.ReplyFor(BrokerPackets.C_TRADE_BROKER_REGISTERED_ITEM_LIST, store, 2)![4..],
-            "00 00 00 00", "Active Listings: seq 1276's empty body, even with a row in the table");
+        var listed = BrokerHandlers.ReplyFor(BrokerPackets.C_TRADE_BROKER_REGISTERED_ITEM_LIST, store, 2)!;
+        Hex.True(listed.Length == 4 + BrokerPackets.EmptyArraySlots + BrokerPackets.RegisteredElementSize,
+            $"Active Listings serves the row now, it does not answer the empty form: {listed.Length}");
         Hex.True(BrokerPackets.EmptyArraySlots == 4,
-            "and that empty body is [u16 count][u16 firstOffset], both zero");
+            "and the empty body is still [u16 count][u16 firstOffset], both zero");
     }
 
     // ===================== T77: the cap_social4 DB-proxy pairs =====================
@@ -18244,6 +18248,182 @@ string message
             "08 00  53 A8  00 00  00 00", "character 2 has visited nothing");
     }
 
+    // ===================== T81: the seller's two broker tabs =====================
+    //
+    // cap_social3_client2.log is the SELLER's client of the cap_social3 session -
+    // cap_social3_client.log, which T71/T72/T74 worked from, was the buyer's. Both tabs are
+    // empty in the buyer's capture, which is why they stayed on the empty form for three tasks.
+
+    /// <summary>cap_social3_client2.log frame 1258 - one listing.</summary>
+    const string Cap81_RegisteredOneRow =
+        "01 00 08 00 08 00 00 00 01 00 00 00 00 00 00 00 "
+        + "2B 27 00 00 00 00 00 00 25 11 03 00 01 00 00 00 "
+        + "00 00 00 00 F0 18 AB 6A 00 00 00 00 11 27 00 00 "
+        + "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+        + "00 00 00 00 00 00";
+
+    /// <summary>frame 1436 - two, chained.</summary>
+    const string Cap81_RegisteredTwoRows =
+        "02 00 08 00 08 00 4A 00 01 00 00 00 00 00 00 00 "
+        + "2B 27 00 00 00 00 00 00 25 11 03 00 01 00 00 00 "
+        + "00 00 00 00 F0 18 AB 6A 00 00 00 00 11 27 00 00 "
+        + "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+        + "00 00 00 00 00 00 4A 00 00 00 02 00 00 00 00 00 "
+        + "00 00 2C 27 00 00 00 00 00 00 41 0D 03 00 01 00 "
+        + "00 00 00 00 00 00 0D 19 AB 6A 00 00 00 00 11 27 "
+        + "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+        + "00 00 00 00 00 00 00 00";
+
+    /// <summary>frame 1572 - trade 3 sold, waiting to be collected.</summary>
+    const string Cap81_SoldOneRow =
+        "01 00 18 00 01 00 00 00 00 00 00 00 00 00 00 00 "
+        + "00 00 00 00 18 00 00 00 82 00 03 00 00 00 00 00 "
+        + "00 00 2D 27 00 00 00 00 00 00 55 1F 02 00 01 00 "
+        + "00 00 00 00 00 00 00 00 00 00 00 0F 19 AB 6A 00 "
+        + "00 00 00 01 00 00 00 00 00 00 00 02 00 00 00 01 "
+        + "1E 19 AB 6A 00 00 00 00 01 00 00 00 00 00 00 00 "
+        + "01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+        + "00 00 00 00 00 00 00 00 00 00 00 00 00 00 54 00 "
+        + "65 00 73 00 74 00 00 00";
+
+    static (int, long, int, int, long, long) RegRow(int tradeId, long itemDbId, int templateId,
+                                                    long price, long registerTime)
+        => (tradeId, itemDbId, templateId, 1, price, registerTime);
+
+    /// <summary>
+    /// S_TRADE_BROKER_REGISTERED_ITEM_LIST (0xCDEA), Active Listings. The element is <b>66 bytes
+    /// and carries no name at all</b> - two u16s, not the three the search list opens with,
+    /// because the seller is looking at his own rows. Rows come out oldest first.
+    /// </summary>
+    [Test] public static void T81_the_registered_item_list_is_byte_exact()
+    {
+        Hex.Eq(BrokerPackets.BuildSRegisteredItemListBody(null), "00 00 00 00",
+            "frame 1229, nothing listed: count and offset both 0");
+
+        var one = BrokerPackets.BuildSRegisteredItemListBody(new[]
+            { RegRow(1, 10027, 200997, 10001, 0x6AAB18F0) });
+        Hex.Eq(one, Cap81_RegisteredOneRow, "frame 1258");
+
+        var two = BrokerPackets.BuildSRegisteredItemListBody(new[]
+        {
+            RegRow(1, 10027, 200997, 10001, 0x6AAB18F0),
+            RegRow(2, 10028, 200001, 10001, 0x6AAB190D),
+        });
+        Hex.Eq(two, Cap81_RegisteredTwoRows, "frame 1436 - trade 1 first, then 2");
+
+        // Three rows: the chain, without 200 bytes of literal. 8 -> 0x4A -> 0x8C -> 0.
+        var three = BrokerPackets.BuildSRegisteredItemListBody(new[]
+        {
+            RegRow(1, 10027, 200997, 10001, 0x6AAB18F0),
+            RegRow(2, 10028, 200001, 10001, 0x6AAB190D),
+            RegRow(3, 10029, 139093, 1, 0x6AAB190F),
+        });
+        Hex.True(three.Length == 202 && BitConverter.ToUInt16(three, 0) == 3,
+            $"frame 1457 is 206 bytes on the wire, 202 of body: {three.Length}");
+        Hex.True(BitConverter.ToUInt16(three, 2) == 8
+                 && BitConverter.ToUInt16(three, 4 + 66) == 0x4A
+                 && BitConverter.ToUInt16(three, 4 + 132) == 0x8C
+                 && BitConverter.ToUInt16(three, 4 + 132 + 2) == 0,
+            "the three elements sit at 8, 0x4A and 0x8C and the last one's next is 0");
+        Hex.True(BitConverter.ToInt32(three, 4 + 132 + BrokerPackets.RlTradeId) == 3
+                 && BitConverter.ToInt64(three, 4 + 132 + BrokerPackets.RlPrice) == 1,
+            "and the third row is trade 3 at price 1 - the one the buyer bought");
+        Hex.True(BrokerPackets.RegisteredElementSize == 66
+                 && BrokerPackets.RlItemDbId == 12 && BrokerPackets.RlTemplateId == 20
+                 && BrokerPackets.RlRegisterTime == 32 && BrokerPackets.RlPrice == 40,
+            "the verified registered-element offsets");
+    }
+
+    /// <summary>
+    /// S_TRADE_BROKER_SOLD_ITEM_LIST (0x5587). Its element is the BOUGHT element with one more
+    /// i64 on the end: frame 1572 and cap_social3_client.log seq 1486 are the two sides of the
+    /// same trade, and every field from +0 to +75 matches. The 20-byte fixed part carries
+    /// TotalCalcMoney - what is waiting to be collected.
+    /// </summary>
+    [Test] public static void T81_the_sold_item_list_is_byte_exact()
+    {
+        var empty = BrokerPackets.BuildSSoldItemListBody();
+        Hex.Eq(empty, "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00",
+            "frames 1402 / 1586 / 1641: nothing sold, and the fixed part is 20 bytes, not 4");
+
+        var one = BrokerPackets.BuildSSoldItemListBody(new[]
+        {
+            (3, 10029L, 139093, 1, 1L, 2, "Test", 0x6AAB190FL, 0x6AAB191EL),
+        });
+        Hex.Eq(one, Cap81_SoldOneRow, "frame 1572");
+        Hex.True(BitConverter.ToInt64(one, 4) == 1,
+            "TotalCalcMoney is the sum waiting to be collected - trade 3 went for 1");
+
+        // The element really is the bought one plus eight bytes, which is the only reason a
+        // single captured row is enough: seq 1486 is an independent witness for +0..+75.
+        Hex.True(BrokerPackets.SoldElementFixedSize - BrokerPackets.BoughtElementFixedSize == 8
+                 && BrokerPackets.SlSellerProceeds == 76,
+            "98 -> 106, and the extra i64 sits at +76");
+        var bought = BrokerPackets.BuildSBoughtItemListBody(new[]
+        {
+            (3, 10029L, 139093, 1, 1L, 2, "Test", 0x6AAB190FL, 0x6AAB191EL),
+        });
+        for (int i = 0; i < 6; i++)
+            Hex.True(one[BrokerPackets.SoldListFixedSize + 6 + i] == bought[4 + 6 + i],
+                $"byte {i} past the element head matches the buyer's view of the same trade");
+        Hex.True(BitConverter.ToInt64(one, BrokerPackets.SoldListFixedSize + BrokerPackets.SlSellerProceeds) == 1,
+            "and the seller's proceeds read 1, the same as TotalPaid");
+    }
+
+    /// <summary>
+    /// Both tabs served from the listings table. Byte-exact is checked above against the frames;
+    /// here it is the rows, the ordering and the lifecycle - Active Listings holds what is on
+    /// sale, Sold holds what has been bought and not yet collected, and taking the proceeds
+    /// empties it (frame 1572 has the row, 1586 is back to the empty form).
+    /// </summary>
+    [Test] public static void T81_the_seller_tabs_serve_the_listings_table()
+    {
+        using var store = GuildStore(2);
+        int a = store.CreateBrokerListing(2, "Test", 10027, 200997, 1, 10001);
+        int b = store.CreateBrokerListing(2, "Test", 10028, 200001, 1, 10001);
+        int c = store.CreateBrokerListing(2, "Test", 10029, 139093, 1, 1);
+
+        var listed = BrokerHandlers.ReplyFor(BrokerPackets.C_TRADE_BROKER_REGISTERED_ITEM_LIST, store, 2)!;
+        Hex.True(BitConverter.ToUInt16(listed, 0) == listed.Length
+                 && BitConverter.ToUInt16(listed, 2) == BrokerPackets.S_TRADE_BROKER_REGISTERED_ITEM_LIST,
+            "a whole client frame comes back");
+        Hex.True(listed.Length == 206 && BitConverter.ToUInt16(listed, 4) == 3,
+            $"three rows, the same 206 bytes frame 1457 carries: {listed.Length}");
+        int e0 = 4 + BrokerPackets.EmptyArraySlots;
+        Hex.True(BitConverter.ToInt32(listed, e0 + BrokerPackets.RlTradeId) == a
+                 && BitConverter.ToInt32(listed, e0 + 66 + BrokerPackets.RlTradeId) == b
+                 && BitConverter.ToInt32(listed, e0 + 132 + BrokerPackets.RlTradeId) == c,
+            "oldest first, which is the opposite of the search list");
+        Hex.True(BitConverter.ToInt64(listed, e0 + BrokerPackets.RlItemDbId) == 10027
+                 && BitConverter.ToInt64(listed, e0 + 132 + BrokerPackets.RlPrice) == 1,
+            "and the rows carry the table's item ids and prices");
+
+        // Nothing sold yet.
+        Hex.Eq(BrokerHandlers.ReplyFor(BrokerPackets.C_TRADE_BROKER_SOLD_ITEM_LIST, store, 2)![4..],
+            "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00",
+            "the Sold tab is the 20-byte empty form until something sells");
+
+        store.SellBrokerListing(c, 1);
+        var sold = BrokerHandlers.ReplyFor(BrokerPackets.C_TRADE_BROKER_SOLD_ITEM_LIST, store, 2)!;
+        int s0 = 4 + BrokerPackets.SoldListFixedSize;
+        Hex.True(BitConverter.ToUInt16(sold, 4) == 1
+                 && BitConverter.ToInt32(sold, s0 + BrokerPackets.BlTradeId) == c
+                 && BitConverter.ToInt64(sold, s0 + BrokerPackets.BlPrice) == 1
+                 && BitConverter.ToInt64(sold, 4 + 4) == 1,
+            "the sold row shows up with its price, and TotalCalcMoney is that price");
+        Hex.True(BitConverter.ToUInt16(listed, 4) == 3
+                 && BitConverter.ToUInt16(
+                        BrokerHandlers.ReplyFor(BrokerPackets.C_TRADE_BROKER_REGISTERED_ITEM_LIST, store, 2)!, 4) == 2,
+            "and it has left Active Listings - frame 1620 is two rows for the same reason");
+
+        // Collecting empties the tab.
+        store.SetBrokerListingState(c, TeraSharp.Arbiter.Persistence.CharacterStore.BrokerSold,
+                                    TeraSharp.Arbiter.Persistence.CharacterStore.BrokerSellerPaid);
+        Hex.Eq(BrokerHandlers.ReplyFor(BrokerPackets.C_TRADE_BROKER_SOLD_ITEM_LIST, store, 2)![4..],
+            "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00",
+            "frame 1586: once the proceeds are taken the tab is empty again");
+    }
+
     // ===================== T72: the broker's client windows =====================
 
     /// <summary>cap_social3_client.log seq 1472 - the search page after listing 3 was bought.</summary>
@@ -18381,13 +18561,15 @@ string message
                  && BitConverter.ToInt32(bought, 4 + 4 + BrokerPackets.BlSellerDbId) == 2,
             "and one row once it has been bought, keyed on the buyer");
 
-        // The two the capture does not justify filling in.
-        Hex.Eq(BrokerHandlers.ReplyFor(BrokerPackets.C_TRADE_BROKER_REGISTERED_ITEM_LIST, store, 2)!,
+        // T81: both of these used to be the empty form whatever the table held. Character 1 has
+        // nothing listed and nothing sold, so for HIM they still are - which is the part of the
+        // old assertion that was actually about the code and not about the missing capture.
+        Hex.Eq(BrokerHandlers.ReplyFor(BrokerPackets.C_TRADE_BROKER_REGISTERED_ITEM_LIST, store, 1)!,
             BrokerHandlers.ReplyFor(BrokerPackets.C_TRADE_BROKER_REGISTERED_ITEM_LIST)!,
-            "REGISTERED is the empty form either way - seq 1276 is the only one captured");
-        Hex.Eq(BrokerHandlers.ReplyFor(BrokerPackets.C_TRADE_BROKER_SOLD_ITEM_LIST, store, 2)!,
+            "a seller with nothing listed gets the empty REGISTERED form");
+        Hex.Eq(BrokerHandlers.ReplyFor(BrokerPackets.C_TRADE_BROKER_SOLD_ITEM_LIST, store, 1)!,
             BrokerHandlers.ReplyFor(BrokerPackets.C_TRADE_BROKER_SOLD_ITEM_LIST)!,
-            "and SOLD never appears in the capture at all");
+            "and the empty SOLD form, which is 24 bytes rather than 8");
 
         // The collect badge, for when a caller needs it. Not wired to a client packet: the three
         // CALC / BUY_IT_NOW C_ opcodes are World's, not ours.
