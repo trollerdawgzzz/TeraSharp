@@ -1019,13 +1019,25 @@ CREATE INDEX IF NOT EXISTS ix_guild_log_guild_time ON guild_log(guild_id, log_ti
 -- UserDbId at payload 4 and the card's template id, and until T83 we acked them and threw the
 -- contents away. preset is -1 while the card is owned but not mounted.
 CREATE TABLE IF NOT EXISTS cards (
-  character_id     INTEGER NOT NULL,
+  account_id       INTEGER NOT NULL,
   card_template_id INTEGER NOT NULL,
   amount           INTEGER NOT NULL DEFAULT 1,
-  preset           INTEGER NOT NULL DEFAULT -1,
-  PRIMARY KEY (character_id, card_template_id)
+  PRIMARY KEY (account_id, card_template_id)
 );
-CREATE INDEX IF NOT EXISTS ix_cards_character ON cards(character_id);
+-- ix_cards_account is created by MigrateCardsToAccount, not here: on an upgrade `cards` still
+-- has T83's character_id shape when this block runs and the index would fail on a column that
+-- does not exist yet.
+
+-- T86: and the per-CHARACTER half. SDB_MOUNT_CARD is the only card frame that names a
+-- character (UserDbId at frame 0x12), and it names a preset with it, so a mount is one card in
+-- one slot of one character's preset - not a column on the account-wide collection.
+CREATE TABLE IF NOT EXISTS card_mounts (
+  character_id     INTEGER NOT NULL,
+  preset_index     INTEGER NOT NULL,
+  card_template_id INTEGER NOT NULL,
+  PRIMARY KEY (character_id, preset_index, card_template_id)
+);
+CREATE INDEX IF NOT EXISTS ix_card_mounts_character ON card_mounts(character_id);
 
 -- T83: learned crests (glyphs). SA_LEARN_ALL_CREST_ACQUIRABLE (0x1463) is the only frame in any
 -- capture that names them - T50 answered it correctly and then discarded the ids. S_CREST_INFO
@@ -1225,6 +1237,53 @@ CREATE TABLE IF NOT EXISTS watched_movies (
         // neither, so S_CREST_INFO had nothing but zeros to show.
         AddColumnIfMissing("characters", "crest_point", "INTEGER NOT NULL DEFAULT 0");
         AddColumnIfMissing("characters", "crest_ex_point", "INTEGER NOT NULL DEFAULT 0");
+
+        MigrateCardsToAccount();
+    }
+
+    /// <summary>
+    /// T86. T83 keyed <c>cards</c> on <c>character_id</c> with a <c>preset</c> column, which was
+    /// the wrong shape twice over: SDB_REGISTER_CARD carries an <c>AccountDbId</c> and no
+    /// character at all, and SDB_MOUNT_CARD carries a character AND a preset index, so one card
+    /// can sit in several characters' presets at once. The collection is account-wide and the
+    /// mounts are per character.
+    ///
+    /// <para>The DDL's <c>CREATE TABLE IF NOT EXISTS</c> is a no-op against an existing old
+    /// table, so this rebuilds it: the id in the old <c>character_id</c> column is read as the
+    /// account it always was (T85b - the dispatch was passing the AccountDbId through a parameter
+    /// named characterId), and any row with a preset other than -1 becomes a mount for the
+    /// character of that name, when one exists.</para>
+    /// </summary>
+    private void MigrateCardsToAccount()
+    {
+        bool old;
+        using (var probe = _db.CreateCommand())
+        {
+            probe.CommandText =
+                "SELECT COUNT(*) FROM pragma_table_info('cards') WHERE name = 'character_id'";
+            old = Convert.ToInt64(probe.ExecuteScalar() ?? 0L) > 0;
+        }
+        if (old)
+        {
+            _log.LogInformation("cards: migrating to the account-wide shape (T86)");
+            Exec(@"
+ALTER TABLE cards RENAME TO cards_v1;
+DROP INDEX IF EXISTS ix_cards_character;
+CREATE TABLE cards (
+  account_id       INTEGER NOT NULL,
+  card_template_id INTEGER NOT NULL,
+  amount           INTEGER NOT NULL DEFAULT 1,
+  PRIMARY KEY (account_id, card_template_id)
+);
+INSERT INTO cards(account_id, card_template_id, amount)
+  SELECT character_id, card_template_id, SUM(amount) FROM cards_v1
+  GROUP BY character_id, card_template_id;
+INSERT OR IGNORE INTO card_mounts(character_id, preset_index, card_template_id)
+  SELECT character_id, preset, card_template_id FROM cards_v1 WHERE preset >= 0;
+DROP TABLE cards_v1;");
+        }
+
+        Exec("CREATE INDEX IF NOT EXISTS ix_cards_account ON cards(account_id);");
     }
 
     /// <summary>ALTER TABLE ADD COLUMN, but a no-op when the column is already there.</summary>
@@ -3910,24 +3969,35 @@ DELETE FROM guild_members     WHERE user_db_id = $id;";
         }
     }
 
-    // ============================================================ T83: cards
+    // ============================================================ T83/T86: cards
+    //
+    // Two tables, because the three card frames name two different owners. The dumpers
+    // (Arb_part_017.c:12213 / 11096 / 17206):
+    //
+    //   SDB_REGISTER_CARD  guard 0x19  DlmId@06, AccountDbId@0A (i64), CardTemplateId@12, Amount@16
+    //   SDB_MOUNT_CARD     guard 0x1D  DlmId@06, AccountDbId@0A (i64), UserDbId@12,
+    //                                  PresetIndex@16, CardTemplateId@1A
+    //   SDB_UNMOUNT_CARD   guard 0x1D  the same as the mount
+    //
+    // The register frame has no character in it at all and the mount frame has both plus a preset
+    // index, so the collection belongs to the account and each character arranges its own presets
+    // out of it. In cap_social4 both ids read 1, which is exactly why T83 could key the whole
+    // thing on the character and nothing complained.
 
-    /// <summary>One owned card. <paramref name="Preset"/> is -1 when it is not mounted.</summary>
-    public sealed record CardRow(int CardTemplateId, int Amount, int Preset);
+    /// <summary>One owned card, account-wide.</summary>
+    public sealed record CardRow(int CardTemplateId, int Amount);
+
+    /// <summary>One mounted card: which slot of which character's preset it sits in.</summary>
+    public sealed record CardMountRow(int PresetIndex, int CardTemplateId);
 
     /// <summary>
-    /// SDB_REGISTER_CARD. Adds <paramref name="amount"/> to what this character already has of
+    /// SDB_REGISTER_CARD. Adds <paramref name="amount"/> to what this ACCOUNT already has of
     /// that card, which is what "register" means: cap_social4.log seq 7032 registers card 311034
-    /// with amount 1 and the reply echoes both back.
+    /// with amount 1 for AccountDbId 1, and seq 7078 adds 19 more of the same one.
     /// </summary>
-    public void AddCard(int characterId, int cardTemplateId, int amount)
+    public void AddCard(long accountId, int cardTemplateId, int amount)
     {
-        // T85b: NOT NoSuchOwner. The id at SDB_REGISTER_CARD payload +4 is the dumper's
-        // `AccountDbId` (an i64 at frame 0x0A), not a character - the register frame carries no
-        // UserDbId at all, which is the protocol saying the collection is account-wide. Checking
-        // it against the characters table drops every live write whose account id is not also a
-        // character id.
-        if (characterId <= 0 || cardTemplateId == 0) return;
+        if (accountId <= 0 || cardTemplateId == 0) return;
 
         lock (_lock)
         {
@@ -3938,53 +4008,122 @@ DELETE FROM guild_members     WHERE user_db_id = $id;";
             using (var up = _db.CreateCommand())
             {
                 up.CommandText =
-                    "UPDATE cards SET amount = amount + $a WHERE character_id=$c AND card_template_id=$t";
+                    "UPDATE cards SET amount = amount + $a WHERE account_id=$k AND card_template_id=$t";
                 up.Parameters.AddWithValue("$a", amount);
-                up.Parameters.AddWithValue("$c", characterId);
+                up.Parameters.AddWithValue("$k", accountId);
                 up.Parameters.AddWithValue("$t", cardTemplateId);
                 if (up.ExecuteNonQuery() > 0) return;
             }
 
             using var ins = _db.CreateCommand();
             ins.CommandText =
-                "INSERT INTO cards(character_id, card_template_id, amount) VALUES($c,$t,$a)";
-            ins.Parameters.AddWithValue("$c", characterId);
+                "INSERT INTO cards(account_id, card_template_id, amount) VALUES($k,$t,$a)";
+            ins.Parameters.AddWithValue("$k", accountId);
             ins.Parameters.AddWithValue("$t", cardTemplateId);
             ins.Parameters.AddWithValue("$a", amount);
-            ins.ExecuteNonQuery();      // preset takes the column default, -1
+            ins.ExecuteNonQuery();
         }
     }
 
-    /// <summary>SDB_MOUNT_CARD / SDB_UNMOUNT_CARD. <paramref name="preset"/> -1 unmounts. A card
-    /// the character does not own is not created here - the mount would be for a row World has
-    /// and we do not, and inventing it hides the disagreement.</summary>
-    public bool SetCardPreset(int characterId, int cardTemplateId, int preset)
-    {
-        lock (_lock)
-        {
-            using var cmd = _db.CreateCommand();
-            cmd.CommandText = "UPDATE cards SET preset=$p WHERE character_id=$c AND card_template_id=$t";
-            cmd.Parameters.AddWithValue("$p", preset);
-            cmd.Parameters.AddWithValue("$c", characterId);
-            cmd.Parameters.AddWithValue("$t", cardTemplateId);
-            return cmd.ExecuteNonQuery() > 0;
-        }
-    }
-
-    /// <summary>Every card this character owns, lowest template first.</summary>
-    public IReadOnlyList<CardRow> GetCards(int characterId)
+    /// <summary>Every card on this account, lowest template first.</summary>
+    public IReadOnlyList<CardRow> GetAccountCards(long accountId)
     {
         lock (_lock)
         {
             using var cmd = _db.CreateCommand();
             cmd.CommandText =
-                "SELECT card_template_id, amount, preset FROM cards WHERE character_id=$c " +
-                "ORDER BY card_template_id";
-            cmd.Parameters.AddWithValue("$c", characterId);
+                "SELECT card_template_id, amount FROM cards WHERE account_id=$k ORDER BY card_template_id";
+            cmd.Parameters.AddWithValue("$k", accountId);
             var rows = new List<CardRow>();
             using var r = cmd.ExecuteReader();
-            while (r.Read()) rows.Add(new CardRow(r.GetInt32(0), r.GetInt32(1), r.GetInt32(2)));
+            while (r.Read()) rows.Add(new CardRow(r.GetInt32(0), r.GetInt32(1)));
             return rows;
+        }
+    }
+
+    /// <summary>
+    /// SDB_MOUNT_CARD. The character has to own the card through its account - a mount for a card
+    /// the collection does not hold is World and us disagreeing, and writing it would hide that.
+    /// </summary>
+    public bool MountCard(int characterId, int presetIndex, int cardTemplateId)
+    {
+        if (NoSuchOwner("MountCard", characterId)) return false;
+        if (presetIndex < 0 || cardTemplateId == 0) return false;
+        if (!AccountHasCard(AccountOf(characterId), cardTemplateId))
+        {
+            _log.LogWarning("MountCard: character {Id} has no card {Card} on its account - not mounted",
+                characterId, cardTemplateId);
+            return false;
+        }
+
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "INSERT OR IGNORE INTO card_mounts(character_id, preset_index, card_template_id) " +
+                "VALUES($c,$p,$t)";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            cmd.Parameters.AddWithValue("$p", presetIndex);
+            cmd.Parameters.AddWithValue("$t", cardTemplateId);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    /// <summary>SDB_UNMOUNT_CARD. It repeats the preset index the mount used rather than sending
+    /// a sentinel, so the row is identified the same way it was created.</summary>
+    public bool UnmountCard(int characterId, int presetIndex, int cardTemplateId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "DELETE FROM card_mounts WHERE character_id=$c AND preset_index=$p AND card_template_id=$t";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            cmd.Parameters.AddWithValue("$p", presetIndex);
+            cmd.Parameters.AddWithValue("$t", cardTemplateId);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    /// <summary>This character's mounts, by preset then template.</summary>
+    public IReadOnlyList<CardMountRow> GetCardMounts(int characterId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "SELECT preset_index, card_template_id FROM card_mounts WHERE character_id=$c " +
+                "ORDER BY preset_index, card_template_id";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            var rows = new List<CardMountRow>();
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) rows.Add(new CardMountRow(r.GetInt32(0), r.GetInt32(1)));
+            return rows;
+        }
+    }
+
+    /// <summary>The account a character belongs to, or 0. The card page needs it for every
+    /// character it draws, its own and anybody else's.</summary>
+    public long AccountOf(long characterId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT account_id FROM characters WHERE id=$id";
+            cmd.Parameters.AddWithValue("$id", characterId);
+            return Convert.ToInt64(cmd.ExecuteScalar() ?? 0L);
+        }
+    }
+
+    private bool AccountHasCard(long accountId, int cardTemplateId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT COUNT(*) FROM cards WHERE account_id=$k AND card_template_id=$t";
+            cmd.Parameters.AddWithValue("$k", accountId);
+            cmd.Parameters.AddWithValue("$t", cardTemplateId);
+            return Convert.ToInt64(cmd.ExecuteScalar() ?? 0L) > 0;
         }
     }
 

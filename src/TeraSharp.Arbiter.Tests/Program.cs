@@ -18803,44 +18803,109 @@ string message
     }
 
     /// <summary>
-    /// The three card writes now reach the cards table. T77 answered them byte-exactly and threw
-    /// the contents away; cap_social4.log seq 7032 / 7107 / 7130 register card 311034 (0x4BEFA)
-    /// for AccountDbId 1, mount it in preset 0, then unmount it.
+    /// T86. The three card writes, re-keyed. The dumpers say the collection belongs to the
+    /// ACCOUNT - SDB_REGISTER_CARD carries an <c>AccountDbId</c> at frame 0x0A and no character
+    /// at all - while a mount is one card in one slot of ONE character's preset
+    /// (<c>UserDbId@12, PresetIndex@16, CardTemplateId@1A</c>). cap_social4.log seq 7032 / 7078
+    /// register card 311034 (0x4BEFA) twice for AccountDbId 1, and seq 7107 / 7130 mount and
+    /// unmount it in preset 0.
+    ///
+    /// <para>Both ids read 1 in that capture, which is exactly why T83 could key the whole thing
+    /// on the character and nothing complained. Here they are deliberately different.</para>
     /// </summary>
-    [Test] public static void T83_the_card_writes_land_in_the_cards_table()
+    [Test] public static void T86_the_card_collection_is_account_wide_and_the_mounts_are_not()
     {
         using var store = GuildStore(2);
         var handlers = FreshHandlers(store);
-        Hex.True(store.GetCards(1).Count == 0, "the cards table exists and starts empty");
+        long account = store.AccountOf(1);
+        Hex.True(account > 0 && store.AccountOf(2) == account,
+            $"GuildStore gives two characters on one account: {account}");
+        Hex.True(store.GetAccountCards(account).Count == 0, "the collection starts empty");
 
-        RunHandler1(DbProxyHandlers.SDB_REGISTER_CARD,
-            Hex.B("DC 04 00 00 01 00 00 00 00 00 00 00 FA BE 04 00 01 00 00 00"), store, handlers);
-        var cards = store.GetCards(1);
-        // T85: one assertion per field, so the next time this goes red it says which part did.
-        Hex.True(cards.Count == 1, $"seq 7032 leaves exactly one row: {cards.Count}");
-        Hex.True(cards[0].CardTemplateId == 311034, $"card 311034: {cards[0].CardTemplateId}");
-        Hex.True(cards[0].Amount == 1, $"amount 1: {cards[0].Amount}");
-        Hex.True(cards[0].Preset == DbProxyHandlers.CardNotMounted,
-            $"and not yet in a preset: {cards[0].Preset}");
+        // seq 7032's own bytes, in a store of its own: the account id baked into that frame is
+        // 1, which may or may not be this test's account, and the two must not share a row.
+        using (var cap = GuildStore(1))
+        {
+            var (op, body) = RunHandler1(DbProxyHandlers.SDB_REGISTER_CARD,
+                Hex.B("DC 04 00 00 01 00 00 00 00 00 00 00 FA BE 04 00 01 00 00 00"), cap);
+            Hex.True(op == DbProxyHandlers.DBS_REGISTER_CARD, $"0x{op:X4}");
+            Hex.Eq(body, "DC 04 00 00 01 FA BE 04 00 01 00 00 00", "seq 7033, unchanged by the re-key");
+            Hex.True(cap.GetAccountCards(1).Count == 1
+                     && cap.GetAccountCards(1)[0].CardTemplateId == 311034
+                     && cap.GetAccountCards(1)[0].Amount == 1,
+                "and the frame's own AccountDbId (1) is what the row is keyed on");
+        }
 
-        RunHandler1(DbProxyHandlers.SDB_MOUNT_CARD,
-            Hex.B("E0 04 00 00 01 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00 FA BE 04 00"),
-            store, handlers);
-        Hex.True(store.GetCards(1)[0].Preset == 0, "seq 7107 mounts it in preset 0");
+        // Now the scenario, on this store's real account: register once, mount differently on
+        // each of the two characters.
+        RunHandler1(DbProxyHandlers.SDB_REGISTER_CARD, CardRegister(account, 311034, 1), store, handlers);
+        RunHandler1(DbProxyHandlers.SDB_REGISTER_CARD, CardRegister(account, 311034, 19), store, handlers);
+        var owned = store.GetAccountCards(account);
+        Hex.True(owned.Count == 1 && owned[0].CardTemplateId == 311034 && owned[0].Amount == 20,
+            $"one row for the account, 1 + 19 = 20 (seq 7032 then 7078): {owned.Count}");
 
-        RunHandler1(DbProxyHandlers.SDB_UNMOUNT_CARD,
-            Hex.B("E1 04 00 00 01 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00 FA BE 04 00"),
-            store, handlers);
-        Hex.True(store.GetCards(1)[0].Preset == DbProxyHandlers.CardNotMounted,
-            "seq 7130 takes it out again - the unmount repeats the mount's preset index, so the "
-            + "-1 is ours");
+        RunHandler1(DbProxyHandlers.SDB_MOUNT_CARD, CardMount(account, 1, 0, 311034), store, handlers);
+        RunHandler1(DbProxyHandlers.SDB_MOUNT_CARD, CardMount(account, 2, 2, 311034), store, handlers);
+        var m1 = store.GetCardMounts(1);
+        var m2 = store.GetCardMounts(2);
+        Hex.True(m1.Count == 1 && m1[0].PresetIndex == 0 && m1[0].CardTemplateId == 311034,
+            "character 1 has it in preset 0");
+        Hex.True(m2.Count == 1 && m2[0].PresetIndex == 2,
+            "character 2 has the SAME card in preset 2 - one collection, two arrangements");
+        Hex.True(store.GetAccountCards(account)[0].Amount == 20,
+            "and mounting took nothing out of the collection");
 
-        // Registering the same card again adds to the stack rather than making a second row.
-        RunHandler1(DbProxyHandlers.SDB_REGISTER_CARD,
-            Hex.B("DC 04 00 00 01 00 00 00 00 00 00 00 FA BE 04 00 02 00 00 00"), store, handlers);
-        Hex.True(store.GetCards(1).Count == 1 && store.GetCards(1)[0].Amount == 3,
-            "1 + 2 in one row");
-        Hex.True(store.GetCards(2).Count == 0, "and none of it landed on the other character");
+        // The two reply builders follow the character, not the account.
+        var p1 = ArbiterClientHandlers.BuildCardDataFor(store, 1, "one", 1);
+        var p2 = ArbiterClientHandlers.BuildCardDataFor(store, 2, "two", 2);
+        int slot1 = ArbiterClientHandlers.CardDataFixedSize + 8;   // past "one\0"
+        Hex.True(BitConverter.ToUInt16(p1, 8) == 1 && BitConverter.ToUInt16(p2, 8) == 1,
+            "one element each");
+        Hex.True(BitConverter.ToInt32(p1, slot1 + 4) == 0
+                 && BitConverter.ToInt32(p1, slot1 + 8) == 311034,
+            "character 1's element is preset 0, card 311034");
+        Hex.True(BitConverter.ToInt32(p2, slot1 + 4) == 2,
+            "character 2's is preset 2 - the same account, a different page");
+        Hex.Eq(ArbiterClientHandlers.BuildChangeCardPresetFor(store, 2), "08 00 BA DC 02 00 00 00",
+            "and S_CHANGE_CARD_PRESET names the preset that character actually uses");
+
+        // seq 7130 unmounts, and only for the character that sent it.
+        RunHandler1(DbProxyHandlers.SDB_UNMOUNT_CARD, CardMount(account, 1, 0, 311034), store, handlers);
+        Hex.True(store.GetCardMounts(1).Count == 0 && store.GetCardMounts(2).Count == 1,
+            "character 1's preset is empty, character 2's is untouched");
+        Hex.True(store.GetAccountCards(account)[0].Amount == 20,
+            "and the card is still in the collection - unmounting is not losing it");
+
+        // A character with nothing mounted is still the captured frame, byte for byte.
+        Hex.Eq(ArbiterClientHandlers.BuildCardDataFor(store, 1, "two", 2), Cap83_CardDataTwo,
+            "cap_social4_client frame 135 - the empty form is what the captures all show");
+        Hex.Eq(ArbiterClientHandlers.BuildChangeCardPresetFor(store, 1), "08 00 BA DC 00 00 00 00",
+            "frame 375");
+    }
+
+    /// <summary>SDB_REGISTER_CARD's payload: <c>DlmId@0, AccountDbId@4 (i64), CardTemplateId@12,
+    /// Amount@16</c> - 20 bytes, the length of seq 7032.</summary>
+    static byte[] CardRegister(long accountId, int cardTemplateId, int amount)
+    {
+        var p = new byte[20];
+        BitConverter.GetBytes(0x4DCu).CopyTo(p, 0);
+        BitConverter.GetBytes(accountId).CopyTo(p, 4);
+        BitConverter.GetBytes(cardTemplateId).CopyTo(p, 12);
+        BitConverter.GetBytes(amount).CopyTo(p, 16);
+        return p;
+    }
+
+    /// <summary>SDB_MOUNT_CARD / _UNMOUNT_CARD: the same head plus <c>UserDbId@12,
+    /// PresetIndex@16, CardTemplateId@20</c> - 24 bytes, the length of seq 7107.</summary>
+    static byte[] CardMount(long accountId, int characterId, int preset, int cardTemplateId)
+    {
+        var p = new byte[24];
+        BitConverter.GetBytes(0x4E0u).CopyTo(p, 0);
+        BitConverter.GetBytes(accountId).CopyTo(p, 4);
+        BitConverter.GetBytes(characterId).CopyTo(p, 12);
+        BitConverter.GetBytes(preset).CopyTo(p, 16);
+        BitConverter.GetBytes(cardTemplateId).CopyTo(p, 20);
+        return p;
     }
 
     /// <summary>
