@@ -325,3 +325,12 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   `{int perkId, tinyint, tinyint}`, i.e. the existing `guild_perks` table row for row; its
   fourteen scalars have two instances each, enough to say they are real and not enough to name
   them, so they stay parameters with the captured defaults.
+
+- T85: the two T83 tests that went red when they were actually run. `guild_perks.guild_id`
+  REFERENCES `guilds(guild_id)` and the test hung its perk row off guild 7, which was nobody's -
+  it creates the guild now, and `UpsertGuildPerk` drops a row for a guild it does not have with a
+  warning instead of throwing FOREIGN KEY out of the store. `AddCard` was the one write in T83
+  that never landed, and the only one in the class that reuses a bound parameter inside an
+  `ON CONFLICT ... DO UPDATE` clause; it is an UPDATE-then-INSERT pair now, with the
+  `NoSuchOwner` guard every other packet-derived write has had since T30. The card test asserts
+  one field per line so the next failure names itself.

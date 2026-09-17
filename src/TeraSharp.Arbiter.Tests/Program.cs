@@ -18811,13 +18811,17 @@ string message
     {
         using var store = GuildStore(2);
         var handlers = FreshHandlers(store);
+        Hex.True(store.GetCards(1).Count == 0, "the cards table exists and starts empty");
 
         RunHandler1(DbProxyHandlers.SDB_REGISTER_CARD,
             Hex.B("DC 04 00 00 01 00 00 00 00 00 00 00 FA BE 04 00 01 00 00 00"), store, handlers);
         var cards = store.GetCards(1);
-        Hex.True(cards.Count == 1 && cards[0].CardTemplateId == 310010 && cards[0].Amount == 1
-                 && cards[0].Preset == DbProxyHandlers.CardNotMounted,
-            "seq 7032 registers card 310010 x1, not yet in a preset");
+        // T85: one assertion per field, so the next time this goes red it says which part did.
+        Hex.True(cards.Count == 1, $"seq 7032 leaves exactly one row: {cards.Count}");
+        Hex.True(cards[0].CardTemplateId == 310010, $"card 310010: {cards[0].CardTemplateId}");
+        Hex.True(cards[0].Amount == 1, $"amount 1: {cards[0].Amount}");
+        Hex.True(cards[0].Preset == DbProxyHandlers.CardNotMounted,
+            $"and not yet in a preset: {cards[0].Preset}");
 
         RunHandler1(DbProxyHandlers.SDB_MOUNT_CARD,
             Hex.B("E0 04 00 00 01 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00 FA BE 04 00"),
@@ -18866,10 +18870,13 @@ string message
             "the two name offsets are computed, not the 0x4C / 0x54 the capture happens to show "
             + "because both guilds and both masters have three-letter names");
 
-        // Served from the table.
+        // Served from the table. T85: guild_perks.guild_id REFERENCES guilds(guild_id), so the
+        // row needs a guild that exists - the id 7 this used to pass was nobody's.
         using var store = GuildStore(2);
-        store.UpsertGuildPerk(7, 0x879309);
-        var perks = store.GetGuildPerks(7);
+        int guildId = store.CreateGuild("sdg", 1, warAcceptable: true);
+        Hex.True(guildId > 0, "the guild the perk row hangs off");
+        store.UpsertGuildPerk(guildId, 0x879309);
+        var perks = store.GetGuildPerks(guildId);
         Hex.True(perks.Count == 1 && perks[0].PerkId == 0x879309 && perks[0].FlagA == 0,
             "guild_perks round-trips the three fields the element carries");
         Hex.Eq(ArbiterClientHandlers.BuildGuildApplyCount(0), "08 00 9A C8 00 00 00 00",
