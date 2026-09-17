@@ -106,6 +106,7 @@ public static class HandlerRegistry
         Reg("C_CHECK_USERNAME", 0, character.OnCheckUsername);
         Reg("C_CREATE_USER", 0, character.OnCreateUser);
         Reg("C_DELETE_USER", 0, character.OnDeleteUser);
+        Reg("C_CANCEL_DELETE_USER", CharacterHandlers.CancelDeleteUserBodySize, character.OnCancelDeleteUser);   // T88
 
         // --- Chat: Arbiter-owned in both modes (real Arbiter handles chat too) ---
         var chat = new ChatHandlers(loggerFactory.CreateLogger<ChatHandlers>());
