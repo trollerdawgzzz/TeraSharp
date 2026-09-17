@@ -2142,6 +2142,8 @@ array items
             0x2754,
             // T62: SDB_ADD_PVP_USER_LOG, sent at logout, no SendToSession in its handler.
             0x27FE,
+            // T74: SDB_ITEM_TRADE_LOG / SDB_CASH_ITEM_LOG - audit writes, handlers end at return 1, no writer.
+            0x27DD, 0x288C,
             // T47 sealed the through-Arbiter contract family here (0x2809, 0x280C, 0x280D,
             // 0x280E). T60 UNSEALED all four: they are gated to ContractBroker off
             // WorldBridge's default arm instead, and a SEALED opcode never reaches a gate.
@@ -17151,8 +17153,8 @@ some prose with `backticks` that is not a table row
             .CopyTo(calc, hdr + 4);
 
         var (op, first) = RunHandler1(DbProxyHandlers.SDB_TRADE_BROKER_CALC_BOUGHT_ITEM, calc, store);
-        Hex.True(op == DbProxyHandlers.DBS_TRADE_BROKER_CALC_BOUGHT_ITEM, $"0x{op:X4}");
-        Hex.True(first[24] == 1 && store.GetBrokerListing(id)!.State == CharacterStore.BrokerBuyerCollected,
+        Hex.True(op == BrokerPackets.DBS_TRADE_BROKER_CALC_BOUGHT_ITEM, $"0x{op:X4}");
+        Hex.True(first[24] == 1 && store.GetBrokerListing(id)!.State == TeraSharp.Arbiter.Persistence.CharacterStore.BrokerBuyerCollected,
             "the first commit collects it and says so");
 
         var (_, again) = RunHandler1(DbProxyHandlers.SDB_TRADE_BROKER_CALC_BOUGHT_ITEM, calc, store);
@@ -18026,8 +18028,12 @@ some prose with `backticks` that is not a table row
         var (op, body) = RunHandler1(DbProxyHandlers.SDB_RECV_PARCEL, payload, store);
         Hex.True(op == DbProxyHandlers.DBS_RECV_PARCEL, $"replied with 0x{op:X4}");
         Hex.True(body[ParcelDbHandlers.RecvRspSuccess] == 1, "Success = 1 for a parcel that exists");
+        // T74: step 1 is the read (full record back, nothing paid); step 2 is the commit that pays.
+        Hex.True(store.GetCharacterMoney(1) == before, "step 1 pays nothing");
+        BitConverter.GetBytes(2u).CopyTo(payload, ParcelDbHandlers.RecvReqStep);
+        RunHandler1(DbProxyHandlers.SDB_RECV_PARCEL, payload, store);
         Hex.True(store.GetCharacterMoney(1) == before + 500,
-            $"the 500 gold landed on the receiver: {store.GetCharacterMoney(1)} (was {before})");
+            $"the 500 gold landed on the receiver at step 2: {store.GetCharacterMoney(1)} (was {before})");
 
         // Claimed once. A second receive of the same parcel pays nothing.
         RunHandler1(DbProxyHandlers.SDB_RECV_PARCEL, payload, store);

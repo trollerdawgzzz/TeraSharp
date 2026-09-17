@@ -91,6 +91,7 @@ public static class HandlerRegistry
                 ClientSettingsHandlers.SendAccountSetting(s);
                 ClientSettingsHandlers.SendUserSetting(s);
                 ParcelHandlers.SendReadRecvStatus(s);        // T42: 13-byte S_PARCEL_READ_RECV_STATUS (cap frame 312)
+                s.Send(ArbiterClientHandlers.BuildVisitedSectionListFor(s));   // T75: S_VISITED_SECTION_LIST from visited_sections (stops the intro cutscene replaying)
                 return true;
             }
             return login.OnLoadTopoFin(s, body);
