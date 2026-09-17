@@ -3527,7 +3527,7 @@ public sealed class DbProxyHandlers
         int charId   = payload.Length >= 20 ? (int)BitConverter.ToUInt32(payload, 16) : 0;
         string name  = ReadName(payload, nameOff);
 
-        if (blobOff < 0 || blobLen < 0 || blobOff + blobLen > payload.Length) { blobOff = 0; blobLen = 0; }
+        if (blobOff < 0 || blobLen < 0 || blobOff > payload.Length || blobLen > payload.Length - blobOff) { blobOff = 0; blobLen = 0; }
 
         int code = CheckCharacterName(name, charId);
         if (code == 0 && _store is not null && !_store.RenameCharacter(charId, name))

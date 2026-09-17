@@ -49,9 +49,11 @@ public sealed class LoginHandlers
         s.SendByDef("S_REMAIN_PLAY_TIME", new Dictionary<string, object> { ["accountType"] = 6, ["minutesLeft"] = 0 });
         s.SendByDef("S_LOGIN_ARBITER", new Dictionary<string, object>
         {
-            // status 31/33 is what makes the client offer /@ GM commands (status/GM-COMMANDS-FULL.md note);
-            // untested live - accounts in TERASHARP_GM_ACCOUNTS get 31, everyone else 0.
-            ["success"] = true, ["loginQueue"] = false, ["status"] = GmAccounts.IsListed(s.Account.Name) ? 31u : 0u, ["unk"] = 0u,
+            // T89b: status is the tera-api privilege passthrough - every ordinary account in nine captures
+            // got 31 (0b11111) and only a brand-new account got 0; 33 is the In-Game Operation Tool
+            // account. Sending 0 tells the client it is a fresh account, which is what draws the
+            // TERA / Battle Arena mode-select screen before character select.
+            ["success"] = true, ["loginQueue"] = false, ["status"] = GmAccounts.IsListed(s.Account.Name) ? 33u : 31u, ["unk"] = 0u,
             ["language"] = language, ["pvpDisabled"] = false, ["unk1"] = (ushort)0, ["unk2"] = (ushort)0,
         });
         s.SendByDef("S_LOGIN_ACCOUNT_INFO", new Dictionary<string, object>
@@ -116,6 +118,16 @@ public sealed class LoginHandlers
         });
 
         s.SendByDef("S_LOAD_CLIENT_ACCOUNT_SETTING", new Dictionary<string, object> { ["data"] = Array.Empty<byte>() });
+        // T89b: two lobby packets the real Arbiter sends here (cap_final_client frames 13 and 15).
+        s.Send(new byte[] { 0x08, 0x00, 0xB3, 0x57, 0x00, 0x00, 0x00, 0x00 });                      // S_DECO_UI_INFO, body all zero
+        {
+            var inv = new byte[17];
+            inv[0] = 0x11; inv[1] = 0x00; inv[2] = 0x1D; inv[3] = 0xD4;                                 // S_CONFIRM_INVITE_CODE_BUTTON
+            inv[4] = 0x0F; inv[5] = 0x00; inv[6] = 0x01;                                               // [u16 off=0x0F][u8 1]
+            BitConverter.GetBytes(DateTimeOffset.UtcNow.ToUnixTimeSeconds()).CopyTo(inv, 7);           // [i64 unix]
+            inv[15] = 0x00; inv[16] = 0x00;
+            s.Send(inv);
+        }
         s.SendByDef("S_ACCOUNT_PACKAGE_LIST", ArbiterClientHandlers.BuildAccountPackageFields(
             Program.Store?.GetAccountBenefits((int)s.Account.AccountId) ?? new List<TeraSharp.Arbiter.Persistence.CharacterStore.AccountBenefitRow>()));   // T84
         SendContentFlags(s);
