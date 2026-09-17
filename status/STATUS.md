@@ -309,3 +309,19 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   witness for everything before it). Both are served from the listings table — Active Listings
   from `BrokerListed`, Sold from `BrokerSold` until the proceeds are taken. T74's "the defs
   disagree, so these two wait for a capture" note in BROKER-DESIGN.md is replaced by the layouts.
+
+- T83 (cap_social4_client + cap_social4_client2): the card page and the guild perk / crest
+  windows. Seven client packets decoded and byte-exact - `S_CARD_DATA`,
+  `S_ACTIVATE_CARD_COMBINE_LIST_DATA`, `S_CHANGE_CARD_PRESET`, `S_GUILD_PERK_LIST`,
+  `S_CREST_INFO`, `S_SHOW_CREST_LEARN`, `S_GUILD_APPLY_COUNT` - across fifteen captured frames
+  from two accounts. The eight bytes in the middle of both card packets are a **pdid**: the
+  world half (`0x80000AF0`) is the same in all five captures, and the u16 in front of it is a
+  per-enter-world serial, not a character id - cap_social4 gives the same character 1 on its
+  first login and 5 on its second. Three writes that were being answered and discarded now
+  persist: `SDB_REGISTER_CARD` / `_MOUNT_` / `_UNMOUNT_CARD` into a new `cards` table,
+  `SA_CREST_POINT`'s NewPoint/NewExPoint into `characters.crest_point/crest_ex_point`, and
+  `SA_LEARN_ALL_CREST_ACQUIRABLE`'s ids into a new `crests` table - which is exactly what
+  `S_CREST_INFO` reads back. `S_GUILD_PERK_LIST`'s 10-byte element is `spLoadGuildPerkList`'s
+  `{int perkId, tinyint, tinyint}`, i.e. the existing `guild_perks` table row for row; its
+  fourteen scalars have two instances each, enough to say they are real and not enough to name
+  them, so they stay parameters with the captured defaults.
