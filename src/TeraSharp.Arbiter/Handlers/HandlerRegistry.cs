@@ -76,6 +76,7 @@ public static class HandlerRegistry
                 // Real Arbiter sends AS_UPDATE_VISITED_SECTION_LIST (0x1439) before 0x1390/0x138F on every
                 // C_LOAD_TOPO_FIN (first spawn AND after a zone change). T45: built from the visited_sections
                 // rows - the hard-coded empty list told World "nothing explored" on every relog.
+                s.Send(ArbiterClientHandlers.BuildVisitedSectionListFor(s));   // T75/T79: FIRST in the burst, as frame 257 - S_VISITED_SECTION_LIST from visited_sections (stops the intro cutscene replaying)
                 Program.World?.SendFrame(WorldBridge.OpUpdateVisitedSection,
                     ArbiterClientHandlers.BuildUpdateVisitedSectionList(s.PlayerId,
                         Program.Store?.GetVisitedSections((int)s.SelectedCharacter!.Id)
@@ -91,7 +92,6 @@ public static class HandlerRegistry
                 ClientSettingsHandlers.SendAccountSetting(s);
                 ClientSettingsHandlers.SendUserSetting(s);
                 ParcelHandlers.SendReadRecvStatus(s);        // T42: 13-byte S_PARCEL_READ_RECV_STATUS (cap frame 312)
-                s.Send(ArbiterClientHandlers.BuildVisitedSectionListFor(s));   // T75: S_VISITED_SECTION_LIST from visited_sections (stops the intro cutscene replaying)
                 return true;
             }
             return login.OnLoadTopoFin(s, body);

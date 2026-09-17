@@ -12725,12 +12725,14 @@ some prose with `backticks` that is not a table row
 
         var first = new byte[ParcelDbHandlers.ParcelDataNoMsgSize];
         Array.Copy(body, 0, first, 0, first.Length);
-        // T65: the served copy is the stored record with ParcelId (+0xA0) and ReceiverDbId (+0x50)
-        // stamped in (the sender's client never knew them) - everything else byte-for-byte.
+        // T65/T79: the served copy is the stored record with ReceiverDbId (+0x50) and the
+        // Arbiter-owned block at +0xA0..+0xB7 (ParcelId, type, read flag, send date) stamped in -
+        // everything else byte-for-byte.
         var expected = (byte[])record.Clone();
-        BitConverter.GetBytes(id1).CopyTo(expected, ParcelDbHandlers.ParcelDataParcelId);
-        BitConverter.GetBytes(1).CopyTo(expected, ParcelDbHandlers.ParcelDataReceiverDbId);
-        Hex.Eq(first, expected, "a parcel World created is listed back byte-for-byte apart from the two stamped fields");
+        var got = (byte[])first.Clone();
+        Array.Clear(expected, ParcelDbHandlers.ParcelDataReceiverDbId, 4); Array.Clear(got, ParcelDbHandlers.ParcelDataReceiverDbId, 4);
+        Array.Clear(expected, 0xA0, 0x18); Array.Clear(got, 0xA0, 0x18);
+        Hex.Eq(got, expected, "a parcel World created is listed back byte-for-byte apart from the stamped fields");
 
         int at = ParcelDbHandlers.ParcelDataNoMsgSize;
         Hex.True(BitConverter.ToInt32(body, at) == id2, "the synthesised record carries the parcel id");
