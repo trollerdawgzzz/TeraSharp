@@ -4329,6 +4329,12 @@ public sealed class DbProxyHandlers
         long restBonus = I64(p, 26);
 
         bool ok = _store.UpdateLevelAndExp(playerId, level >= 1 ? level : null, exp);
+        // T76: restBonusPoint is the only rested-xp number that ever crosses the link, and
+        // before T76 this handler read it and threw it away - so S_GET_USER_LIST always drew
+        // 0%. The real Arbiter hands the same value to User::UpdateUserExpAndRestBonusPoint
+        // (level < 1) or User::UpdateUserLevel (level >= 1), both of which persist it through
+        // dbo.spSetRestBonusPoint. cap_social_client frame 11 reads it back: dob 419, Test 0.
+        _store.SetRestBonus(playerId, restBonus);
         if (level >= 1)
             _log.LogInformation("S_UPDATE_EXP_LEVEL: player {Pid} level {Lvl}, exp {Exp} (rest {Rest})", playerId, level, exp, restBonus);
         else

@@ -306,8 +306,9 @@ counter starting at 1, the same way `TicketAllocator` and the quest-row ids work
 
 **Implemented** (`World/ContractBroker.cs`):
 
-- 0x2809 for **ContractType 4 (party invite)** and **5 (party apply)**: resolve the target, and
-  answer 0x280A + fan 0x280B out, or 0x280A with ErrorNo 2.
+- 0x2809 for **ContractType 4 (party invite)**, **5 (party apply)** and, since T76,
+  **10 (guild creation)**: resolve the opponents, and answer 0x280A + fan 0x280B out, or
+  0x280A with ErrorNo 2.
 - 0x280C: record `CanContract`; no frame out, matching the real handler.
 - 0x280D: build and send `S_BEGIN_THROUGH_ARBITER_CONTRACT` to the opponents.
 - 0x280E: build and send `S_END_THROUGH_ARBITER_CONTRACT`, then fan 0x280F out.
@@ -315,11 +316,14 @@ counter starting at 1, the same way `TicketAllocator` and the quest-row ids work
 
 **Refused, with ErrorNo 2 and a log line, rather than half-done:**
 
-- **ContractType 10 (guild creation)** and **0x23 (trade broker)**. Both need state the broker does
-  not have — `CreateGuildFetchWork` runs the guild-name restriction check
-  (`InputRestrictionHelper::CheckGuildName`, Arb_part_083.c:5846) before anything else, and the
-  broker cannot invent a verdict for it. Guild creation through a party is a T61 task; refusing is
-  honest and the client shows "cannot create" rather than hanging.
+- **ContractType 0x23 (trade broker open deal)**. It needs the broker's own deal state, which
+  this class does not have, and a made-up verdict would tell World a contract was brokered that
+  never was.
+
+> **T76 corrected the type-10 half of this paragraph.** It used to say guild creation was
+> refused because `CreateGuildFetchWork` runs `InputRestrictionHelper::CheckGuildName`
+> (Arb_part_083.c:5846) first and the broker cannot invent a verdict for it. That check exists,
+> but it runs entirely inside World: nothing of it crosses the link. Section 11 has the frames.
 
 **The target-by-name problem.** `ContractPartyFetchWork` resolves the target from a **name** inside
 `Param`/`FetchDataList`, and no capture contains a decoded one — the two live 0x2809 frames were
@@ -384,7 +388,10 @@ what the real Arbiter does for an unrestricted item.
   Recorded as observed; not relied on — `ContractBroker` passes `Reply` through untouched.
 - **`ContractIndex` allocation.** Ours is a per-process counter. The real Arbiter's comes from
   `ContractManager` (`FUN_14091d340`) and may be reused after a contract ends.
-- **Types 10 and 0x23** are refused, not implemented (section 7).
+- **Type 0x23** is refused, not implemented (section 7). Type 10 was, until T76 (section 11).
+- **maxRestBonusXp and the rest-bonus datasheet** are not a contract question, but they came out
+  of the same T76 pass - see `status/PERSISTENCE-MAP.md` and `RestBonusDataSheet::Load`
+  (Arb_part_006.c:5206).
 - **The 8 bytes at [0x04] of both client packets.** Unread by the binary, so unread by us.
 
 ---
@@ -453,3 +460,67 @@ pins the order.
 * The brief that commissioned this pass had the two players the other way round. The capture is
   unambiguous: seq 652 pairs `ContractorName "Test"` with `ContractorDbId 2`, and
   `OpponentName "two"` with `OpponentDbId 1002`; the friend list in the client tap agrees.
+
+---
+
+## 11. T76 - guild creation is brokered after all
+
+Live report: the founder clicked **Create** on the guild-name dialog and nothing happened, while
+the party member never got an accept/decline popup. T60 had refused ContractType 10 on the
+reasoning quoted in section 7. Two captures settle it.
+
+### 11.1 What the founder sends
+
+`cap_social3_client.log` is the **founder's** client (character `New`; frame 611 is an
+`S_BEGIN_THROUGH_ARBITER_CONTRACT` naming `Test` as the requestor, so this client is the one being
+invited by `Test` and the one that later creates the guild). Frame **2388** is the click:
+
+```
+2388 C->S 0x8853 C_REQUEST_CONTRACT len=174
+  [08] u16 0x22   name offset   -> empty string
+  [0C] u16 0x24   Param offset
+  [0E] u16 0x8A   Param count = 138
+  [10] i32 10     ContractType
+  Param = "sdg" in a 138-byte block - the guild name typed in the dialog
+```
+
+The dialog itself is client-side; the server's only answer is `S_REPLY_REQUEST_CONTRACT` (frame
+2390, `0A 00 00 00`) and then `S_ACCEPT_CONTRACT` (2396) and `S_CREATE_GUILD_RESULT` (2402).
+
+### 11.2 What reaches the Arbiter
+
+`cap_social2_ctl.txt` is the World<->Arbiter tap for a second guild create (guild `test`, founder
+`New` db id 1003, one member `Test` db id 2). Between the click at 19:48:19.375 and the popup, the
+ONLY frames on the link are the contract handshake - `C_REQUEST_CONTRACT` never crosses it:
+
+| tap | dir | opcode | payload |
+|---|---|---|---|
+| 1181 | W->A | `SDB_FETCH` 0x2809 | ParamOff 0x22, ParamCount 0x8A, ListOff 0xAC, ListCount 4, contractor 1003, type 10, contractId 4; Param = `"test"` |
+| 1182 | A->W | `DBS_ASK` 0x280B | nameOffs 0x22 / 0x2A, index 2, 1003, type 10, contractId 4, opponent 2, `"New"` `"Test"` |
+| 1183 | W->A | `SDB_ASK` 0x280C | index 2, 1003, type 10, contractId 4, opponent 2, CanContract 1 |
+| 1185 | A->W | `DBS_FETCH` 0x280A | listOff 0x22, listCount 4, 1003, type 10, contractId 4, index 2, ErrorNo 0, AskList [2] |
+| 1186 | W->A | `SDB_SEND_BEGIN` 0x280D | ParamOff 0x26, ParamCount 0x8A, ListOff 0xB0, ListCount 4, 1003, type 10, contractId 4, index 2; Param = `"test"` |
+| 1265 | A->W | `0x280F` + `0x2810` | after the member replies |
+
+Frames 1182, 1185, 1265 are **byte-for-byte** what `BuildDbsAsk` / `BuildDbsFetch` /
+`BuildDbsSendEnd` / `BuildDbsReply` already produced, and 1186 becomes
+`cap_social2_client.log` frame **896**, a 168-byte `S_BEGIN_THROUGH_ARBITER_CONTRACT` that
+`BuildSBegin("New", 10, 4, 2, param)` reproduces exactly. So the whole fix was one predicate.
+
+### 11.3 Two things the type-10 frame does differently
+
+1. **`Param` is the GUILD NAME, not a target name.** Feeding it to the by-name lookup finds
+   nobody, so `ResolveOpponents` skips that route for type 10 and reads `FetchDataList` instead.
+2. **`FetchDataList` is a party, not a single target.** Its count is a BYTE count (4 bytes = one
+   db id here), and the 0x280B the real Arbiter sent names opponent 2 - the other member. A larger
+   party is asked one 0x280B per member, and 0x280A is held back until every 0x280C is in
+   (`Contract.Answered`); for a party invite, where there is exactly one opponent, that is the same
+   behaviour T64 pinned.
+
+### 11.4 Not settled
+
+- The 138-byte `Param` block is a fixed-size buffer; only the leading null-terminated name is read
+  here and the rest is passed through untouched to `S_BEGIN`.
+- Whether the real Arbiter derives the opponent list from `FetchDataList` or from the contractor's
+  party is not visible: the capture's list already holds exactly the one member. Reading the list
+  is the narrower assumption and is what T76 implements.

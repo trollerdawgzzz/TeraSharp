@@ -334,6 +334,11 @@ public static class ArbiterClientHandlers
         var store = Program.Store;
         bool first = chr != null && store != null
                      && store.AddVisitedSection((int)chr.Id, mapId, guardId, sectionId);
+        // T76: AddVisitedSection only records a section the FIRST time, so it cannot answer
+        // where the character is now. S_FRIEND_LIST and S_GET_USER_LIST both carry this trio -
+        // cap_social_client frame 11 has Test at (1, 25, 599001) and frames 1417/1437 have the
+        // friend two at the same one - so the row keeps the latest, first visit or not.
+        if (chr != null && store != null) store.SetLastSection((int)chr.Id, mapId, guardId, sectionId);
         if (first)
             log.LogInformation("C_VISIT_NEW_SECTION: {Name} discovered map {Map} guard {Guard} section {Section}",
                 chr!.Name, mapId, guardId, sectionId);
