@@ -18804,8 +18804,8 @@ string message
 
     /// <summary>
     /// The three card writes now reach the cards table. T77 answered them byte-exactly and threw
-    /// the contents away; cap_social4.log seq 7032 / 7107 / 7130 register card 310010 for
-    /// UserDbId 1, mount it in preset 0, then unmount it.
+    /// the contents away; cap_social4.log seq 7032 / 7107 / 7130 register card 311034 (0x4BEFA)
+    /// for AccountDbId 1, mount it in preset 0, then unmount it.
     /// </summary>
     [Test] public static void T83_the_card_writes_land_in_the_cards_table()
     {
@@ -18818,7 +18818,7 @@ string message
         var cards = store.GetCards(1);
         // T85: one assertion per field, so the next time this goes red it says which part did.
         Hex.True(cards.Count == 1, $"seq 7032 leaves exactly one row: {cards.Count}");
-        Hex.True(cards[0].CardTemplateId == 310010, $"card 310010: {cards[0].CardTemplateId}");
+        Hex.True(cards[0].CardTemplateId == 311034, $"card 311034: {cards[0].CardTemplateId}");
         Hex.True(cards[0].Amount == 1, $"amount 1: {cards[0].Amount}");
         Hex.True(cards[0].Preset == DbProxyHandlers.CardNotMounted,
             $"and not yet in a preset: {cards[0].Preset}");
