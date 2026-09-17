@@ -3922,16 +3922,35 @@ DELETE FROM guild_members     WHERE user_db_id = $id;";
     /// </summary>
     public void AddCard(int characterId, int cardTemplateId, int amount)
     {
+        // T85: the owner guard every other packet-derived write has. The character id comes
+        // straight off the wire (SDB_REGISTER_CARD payload +4), so a frame naming a character we
+        // do not have has to log rather than leave a stray row keyed on nobody.
+        if (NoSuchOwner("AddCard", characterId)) return;
+        if (cardTemplateId == 0) return;
+
         lock (_lock)
         {
-            using var cmd = _db.CreateCommand();
-            cmd.CommandText =
-                "INSERT INTO cards(character_id, card_template_id, amount) VALUES($c,$t,$a) " +
-                "ON CONFLICT(character_id, card_template_id) DO UPDATE SET amount = amount + $a";
-            cmd.Parameters.AddWithValue("$c", characterId);
-            cmd.Parameters.AddWithValue("$t", cardTemplateId);
-            cmd.Parameters.AddWithValue("$a", amount);
-            cmd.ExecuteNonQuery();
+            // T85: an UPDATE then a conditional INSERT rather than ON CONFLICT DO UPDATE. The
+            // upsert form was the one write in T83 that never landed, and it is the only one in
+            // the class that reuses a bound parameter inside its DO UPDATE clause; two plain
+            // statements under the same lock do the same job with nothing to be clever about.
+            using (var up = _db.CreateCommand())
+            {
+                up.CommandText =
+                    "UPDATE cards SET amount = amount + $a WHERE character_id=$c AND card_template_id=$t";
+                up.Parameters.AddWithValue("$a", amount);
+                up.Parameters.AddWithValue("$c", characterId);
+                up.Parameters.AddWithValue("$t", cardTemplateId);
+                if (up.ExecuteNonQuery() > 0) return;
+            }
+
+            using var ins = _db.CreateCommand();
+            ins.CommandText =
+                "INSERT INTO cards(character_id, card_template_id, amount) VALUES($c,$t,$a)";
+            ins.Parameters.AddWithValue("$c", characterId);
+            ins.Parameters.AddWithValue("$t", cardTemplateId);
+            ins.Parameters.AddWithValue("$a", amount);
+            ins.ExecuteNonQuery();      // preset takes the column default, -1
         }
     }
 
@@ -4056,6 +4075,14 @@ DELETE FROM guild_members     WHERE user_db_id = $id;";
     /// <summary>Add or replace one perk row.</summary>
     public void UpsertGuildPerk(int guildId, int perkId, int flagA = 0, int flagB = 0)
     {
+        // T85: guild_perks.guild_id REFERENCES guilds(guild_id), so a row for a guild we do not
+        // have throws FOREIGN KEY constraint failed out of the store and takes the link with it.
+        // The same shape as NoSuchOwner, which the character-keyed writes have had since T30.
+        if (GetGuild(guildId) is null)
+        {
+            _log.LogWarning("UpsertGuildPerk: no guild row for id {Id} - write dropped", guildId);
+            return;
+        }
         lock (_lock)
         {
             using var cmd = _db.CreateCommand();
