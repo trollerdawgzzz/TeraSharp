@@ -587,3 +587,38 @@ client packets, not ours — they are not in `BrokerHandlers.ClientOpcodes`, and
 them to us as the DB-proxy 0x281B / 0x281D / 0x281F that does the work. `CalcNotifyBodyFor` exists
 for a caller that wants the badge counts, but nothing answers those three here: doing so would
 double up on what World already told the client.
+
+## T74 — the collect retry loop, and why the other two tabs stay empty
+
+### "collected 1 of 2" then "0 of 2"
+
+`BrokerCalc` was answering `Success = done > 0`. A row somebody had already collected made
+`done` fall to 0 and World asked again — forever. A row already taken is not a failure: the
+request's atoms are applied either way, and both captured step-2 replies carry Success 1
+(seq 1907, 1949). Success is now "the commit was well-formed"; the count goes to the log.
+
+### Active Listings and Sold are still empty, and the .def cannot fix that
+
+No capture contains a populated one. `cap_social3_client.log` holds exactly one
+`S_TRADE_BROKER_REGISTERED_ITEM_LIST` and it is empty (seq 1276), and
+`S_TRADE_BROKER_SOLD_ITEM_LIST` never appears at all — the client asked twice and the real
+Arbiter answered neither. The reason is that **that tap is the buyer's client**: the buyer had no
+listings, so empty was the correct answer. Searching every S->C packet in the log for the three
+listed template ids (139093, 200997, 200001) finds them in only three packets — `S_ITEMLIST`,
+`S_TRADE_BROKER_WAITING_ITEM_LIST` and `S_TRADE_BROKER_BOUGHT_ITEM_LIST`, all already decoded.
+
+The shipped `.def` cannot stand in for the capture, and there is now proof rather than a hunch:
+the one broker list we HAVE verified byte for byte **disagrees with its own def**.
+
+| | `S_TRADE_BROKER_WAITING_ITEM_LIST.def` | the wire (seq 1419 / 1472) |
+| --- | --- | --- |
+| +6 | `uint32 listing` | TradeId (i32) |
+| +10 | `uint32 unk2` then `int32 unk3` | **ItemDbId, i64** |
+| +18 | `int32 item` | TemplateId |
+| +22 | `int16 quantity` | Amount, 4 bytes |
+
+The shipped defs are from another build — the same conclusion PARTY-DESIGN.md reached about their
+`opcode=` comments. Filling the other two tabs from them would be a guess wearing a source's
+clothes. `T74_the_broker_list_defs_disagree_with_the_wire` is the guard that says so out loud.
+
+What would settle it: one capture of a **seller's** client opening Active Listings with rows.

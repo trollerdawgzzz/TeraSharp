@@ -4467,14 +4467,35 @@ public sealed class DbProxyHandlers
             return true;
         }
 
+        var row = _store.GetParcel((int)parcelId);
+        // T65: the record is served through ServedParcelRecord for the same reason the list is -
+        // the stored SDB_MAKE_PARCEL bytes carry ParcelId 0 and ReceiverDbId 0.
+        // T74: and it is the FULL record, not the 0x9e8 list form - see below.
+        byte[]? record = row is null
+            ? null : ParcelDbHandlers.ServedParcelRecord(_store, row, full: true);
+
+        // T74: SDB_RECV_PARCEL is two-step, exactly like the broker. cap_social.log seq
+        // 1553..1556: step 1 arrives with NO atoms and is answered with the parcel record alone;
+        // World builds the attachment atoms from that record and sends them as step 2, which is
+        // answered with the record AND those atoms echoed.
+        //
+        // We were ignoring Step: the step-1 reply carried the short 0x9e8 record (no attachment
+        // slots in it) and the gold was paid immediately. World had nothing to build step 2 from,
+        // so it never sent one - "0 inserted, 10300 gold" and the item never arrived.
+        if (step <= ParcelStepRead)
+        {
+            _log.LogInformation("SDB_RECV_PARCEL: parcel {Id} step {Step} -> {Len} B record, no atoms yet",
+                parcelId, step, record?.Length ?? 0);
+            link.SendFrame(DBS_RECV_PARCEL,
+                ParcelDbHandlers.BuildDbsRecvParcel(record, null, dlmId, step, ok: row is not null));
+            return true;
+        }
+
         var (atoms, parsed) = WarehouseHandlers.CloneAtomsWithIds(
             payload, ParcelDbHandlers.RecvReqTransListRef, ParcelDbHandlers.RecvRequestSize, _store.NextItemId);
         var applied = WarehouseHandlers.Apply(_store, parsed, _store.NextItemId, _log);
 
-        var row = _store.GetParcel((int)parcelId);
-        // T65: the record is served through ServedParcelRecord for the same reason the list is -
-        // the stored SDB_MAKE_PARCEL bytes carry ParcelId 0 and ReceiverDbId 0.
-        byte[]? record = row is null ? null : ParcelDbHandlers.ServedParcelRecord(_store, row);
+        // The gold is paid on the COMMIT pass, with the attachments - not on the read.
         long gold = ClaimParcelMoney(row, applied);
         if (row is not null) _store.SetParcelRecved((int)parcelId, row.ReceiverDbId);
 
@@ -4855,14 +4876,28 @@ public sealed class DbProxyHandlers
                     sold ? CharacterStore.BrokerSellerPaid : CharacterStore.BrokerBuyerCollected)) done++;
         }
 
-        _log.LogInformation("{Name}: player {Owner} collected {N} of {M} trade(s)",
-            DbProxyOpcodeNames.Describe(op), ownerDbId, done, ids.Count);
-        link.SendFrame(reply, BrokerPackets.BuildDbsStepAck(dlmId, step, done > 0, refA: null, atoms: atoms));
+        // T74: Success is NOT "how many rows moved". A row that was already collected is not a
+        // failure - the atoms in this request have been applied either way - and answering 0 made
+        // World ask again, which is what produced the live "collected 1 of 2" then "0 of 2" loop.
+        // The captured step-2 reply carries Success 1 (seq 1907, 1949), so a well-formed commit
+        // gets Success 1 and the retry stops.
+        bool ok = ids.Count > 0;
+        if (done < ids.Count)
+            _log.LogInformation("{Name}: {N} of {M} trade(s) were still uncollected for player {Owner}; "
+                + "the rest had already been taken", DbProxyOpcodeNames.Describe(op), done, ids.Count, ownerDbId);
+        else
+            _log.LogInformation("{Name}: player {Owner} collected {N} trade(s)",
+                DbProxyOpcodeNames.Describe(op), ownerDbId, done);
+        link.SendFrame(reply, BrokerPackets.BuildDbsStepAck(dlmId, step, ok, refA: null, atoms: atoms));
         return true;
     }
 
     /// <summary>Step 1 is "read me the listing"; anything above it is the commit pass.</summary>
     public const int BrokerStepRead = 1;
+
+    /// <summary>The same thing for SDB_RECV_PARCEL, which turns out to share the shape: step 1
+    /// reads the parcel, step 2 arrives with the attachment atoms and commits.</summary>
+    public const uint ParcelStepRead = 1;
 
     /// <summary>A listing as its 0x188-byte TradeData record, or null for no row.</summary>
     private static byte[]? TradeDataOf(CharacterStore.BrokerListingRow? row)

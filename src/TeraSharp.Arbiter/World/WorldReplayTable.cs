@@ -70,6 +70,19 @@ public sealed class WorldReplayTable
         0x13E5, // BSA_REQUEST_BOUNTY_HUNT_SEASON_INFO (periodic heartbeat)
         0x164D, // SA_WORLD_SERVER_STATUS              (periodic)
 
+        // --- T74: the two audit-log writes. Both are fire-and-forget: Handler_SDB_ITEM_TRADE_LOG
+        // (Arb_part_063.c:12031) and Handler_SDB_CASH_ITEM_LOG run to `return 1` with no packet
+        // writer in them at all - no FUN_140350eb0, no send - and cap_social2/3 confirm it: three
+        // 0x288C arrive and not one A->W frame follows any of them.
+        //
+        // 0x27DD carries what its dumper calls a DlmId (at frame +0x26), which normally means
+        // "answer this or the character wedges". It does not here, because the real Arbiter never
+        // answers it either, so World cannot be waiting on it. What sealing them actually buys is
+        // the other half: an unsealed request makes the replay table attribute the NEXT A->W frame
+        // to it as a response, which is how 0x156F nearly stole 0x273B's reply (see above).
+        0x27DD, // SDB_ITEM_TRADE_LOG  - written after a completed player trade (122 B live)
+        0x288C, // SDB_CASH_ITEM_LOG
+
         // --- T15: proven one-way in D:\packetlogs\cap_newchar.log (a real ArbiterServer
         // playing for five minutes). Each was checked frame by frame: no A->W frame follows
         // any occurrence, and the Arbiter's handler has no SendToSession at all. ---
