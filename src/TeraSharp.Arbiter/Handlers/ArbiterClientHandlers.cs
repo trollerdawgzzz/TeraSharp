@@ -1,4 +1,4 @@
-using Microsoft.Extensions.Logging;
+﻿using Microsoft.Extensions.Logging;
 using TeraSharp.Arbiter.Game;
 using TeraSharp.Arbiter.Network;
 using TeraSharp.Arbiter.Persistence;
@@ -85,6 +85,23 @@ public static class ArbiterClientHandlers
     /// <summary>T82. 44343 -&gt; 59984.</summary>
     public const ushort C_RQ_SKILL_POLISHING_EXP_INFO = 0xAD37;  // 44343
     public const ushort S_RP_SKILL_POLISHING_EXP_INFO = 0xEA50;  // 59984
+    // ---- T83: the card page and the guild perk / crest windows ----
+    /// <summary>T83. 45149. "Show me my own card page."</summary>
+    public const ushort C_REQUEST_MY_ACTIVATE_CARD_COMBINE_LIST_DATA = 0xB05D;
+    /// <summary>T83. 61369. The same for another player, addressed by gameId.</summary>
+    public const ushort C_REQUEST_OTHERS_ACTIVATE_CARD_COMBINE_LIST_DATA_WITH_GAMEID = 0xEFB9;
+    /// <summary>T83. 55579. Another player's card data, addressed by gameId.</summary>
+    public const ushort C_REQUEST_OTHERS_CARD_DATA_WITH_GAMEID = 0xD91B;
+    /// <summary>T83. 25504. The guild window's perk tab.</summary>
+    public const ushort C_REQUEST_GUILD_PERK_LIST = 0x63A0;
+
+    public const ushort S_CARD_DATA = 0x507C;              // 20604
+    public const ushort S_ACTIVATE_CARD_COMBINE_LIST_DATA = 0x6D12;   // 27922
+    public const ushort S_CHANGE_CARD_PRESET = 0xDCBA;     // 56506
+    public const ushort S_GUILD_PERK_LIST = 0xE9FC;        // 59900
+    public const ushort S_CREST_INFO = 0xB04B;             // 45131
+    public const ushort S_SHOW_CREST_LEARN = 0xEBD1;       // 60369
+    public const ushort S_GUILD_APPLY_COUNT = 0xC89A;      // 51354
 
     /// <summary>
     /// Every opcode above, as an explicit statement that these are the ARBITER's. The forwarding
@@ -992,6 +1009,276 @@ public static class ArbiterClientHandlers
         return true;
     }
 
+    // =========================================================================================
+    // 14. Cards, crests and guild perks                                              (T83)
+    //
+    // From cap_social4_client.log (client 1) and cap_social4_client2.log (client 2). Two
+    // accounts, five characters between them, so every layout below has at least three
+    // independent instances.
+    // =========================================================================================
+
+    /// <summary>
+    /// The four bytes every one of these packets carries in the middle of its owner block.
+    /// <c>SA_ENTER_WORLD</c> (0x138C) puts the same eight bytes at payload +24 for every
+    /// character in every capture - cap_social, cap_social2, cap_social3, cap_social4 and
+    /// cap_newchar all read <c>01 00 F0 0A 00 80 00 00</c> for the first character to enter -
+    /// so this is the world half of a pdid and the u16 in front of it is a per-enter-world
+    /// serial, not a character id. cap_social4 counts 1 (dob), 2 (two), 4 (New), 5 (dob again):
+    /// the same character gets a different number on its second login.
+    /// </summary>
+    public const uint PdidWorldWord = 0x80000AF0;
+
+    /// <summary>The eight bytes: <c>[u16 serial][u32 PdidWorldWord][u16 0]</c>.</summary>
+    public const int PdidSize = 8;
+
+    private static void WritePdid(byte[] p, int at, int serial)
+    {
+        BitConverter.GetBytes((ushort)serial).CopyTo(p, at);
+        BitConverter.GetBytes(PdidWorldWord).CopyTo(p, at + 2);
+        // the trailing u16 is zero in every captured frame
+    }
+
+    /// <summary>
+    /// S_CARD_DATA (0x507C). Pushed at enter-world for your own character and sent in reply to
+    /// <c>C_REQUEST_OTHERS_CARD_DATA_WITH_GAMEID</c> for somebody else's.
+    /// <code>
+    ///   +0x04 u16 count / +0x06 u16 off    array A - empty in all six captured frames
+    ///   +0x08 u16 count / +0x0A u16 off    array B - one 12-byte element in all six
+    ///   +0x0C i32 0
+    ///   +0x10 u16 nameOffset (0x2A)
+    ///   +0x12 pdid (8 B)
+    ///   +0x1A i32 1   +0x1E i32 0   +0x22 i32 1   +0x26 i32 0
+    ///   +0x2A wstr ownerName
+    ///   element: [u16 here][u16 next][i32 0][i32 0]
+    /// </code>
+    /// <para>Every captured frame shows array A empty and array B holding exactly one all-zero
+    /// element, on characters that owned no cards. The account that DID register one (card
+    /// 310010, cap_social4.log seq 7032) never reopened the page in the tap, so what a populated
+    /// row looks like is not pinned by anything - which is why <paramref name="slots"/> defaults
+    /// to the captured single empty slot rather than being filled from the cards table.</para>
+    /// </summary>
+    public const int CardDataFixedSize = 0x2A;
+    public const int CardDataSlotSize = 12;
+
+    public static byte[] BuildCardData(string? ownerName, int pdidSerial,
+                                       IReadOnlyList<(int A, int B)>? slots = null)
+    {
+        slots ??= new[] { (0, 0) };
+        var name = WString(ownerName);
+        int nameAt = CardDataFixedSize;
+        int slotsAt = nameAt + name.Length;
+        int total = slotsAt + slots.Count * CardDataSlotSize;
+
+        var p = new byte[total];
+        BitConverter.GetBytes((ushort)total).CopyTo(p, 0);
+        BitConverter.GetBytes(S_CARD_DATA).CopyTo(p, 2);
+        // array A stays [0][0]; array B points past the name
+        BitConverter.GetBytes((ushort)slots.Count).CopyTo(p, 8);
+        BitConverter.GetBytes((ushort)(slots.Count == 0 ? 0 : slotsAt)).CopyTo(p, 10);
+        BitConverter.GetBytes((ushort)nameAt).CopyTo(p, 0x10);
+        WritePdid(p, 0x12, pdidSerial);
+        BitConverter.GetBytes(1).CopyTo(p, 0x1A);
+        BitConverter.GetBytes(1).CopyTo(p, 0x22);
+        name.CopyTo(p, nameAt);
+        for (int i = 0; i < slots.Count; i++)
+        {
+            int at = slotsAt + i * CardDataSlotSize;
+            BitConverter.GetBytes((ushort)at).CopyTo(p, at);
+            BitConverter.GetBytes((ushort)(i == slots.Count - 1 ? 0 : at + CardDataSlotSize)).CopyTo(p, at + 2);
+            BitConverter.GetBytes(slots[i].A).CopyTo(p, at + 4);
+            BitConverter.GetBytes(slots[i].B).CopyTo(p, at + 8);
+        }
+        return p;
+    }
+
+    /// <summary>
+    /// S_ACTIVATE_CARD_COMBINE_LIST_DATA (0x6D12) - the answer to both
+    /// <c>C_REQUEST_MY_ACTIVATE_CARD_COMBINE_LIST_DATA</c> and the WITH_GAMEID form.
+    /// <code>
+    ///   +0x04 u16 count / +0x06 u16 off    empty in all six captured frames
+    ///   +0x08 u16 nameOffset (0x12)
+    ///   +0x0A pdid (8 B)
+    ///   +0x12 wstr ownerName
+    /// </code>
+    /// The array is the list of ACTIVE card combinations; nobody in either tap had one.
+    /// </summary>
+    public const int ActivateCardListFixedSize = 0x12;
+
+    public static byte[] BuildActivateCardCombineList(string? ownerName, int pdidSerial)
+    {
+        var name = WString(ownerName);
+        var p = new byte[ActivateCardListFixedSize + name.Length];
+        BitConverter.GetBytes((ushort)p.Length).CopyTo(p, 0);
+        BitConverter.GetBytes(S_ACTIVATE_CARD_COMBINE_LIST_DATA).CopyTo(p, 2);
+        BitConverter.GetBytes((ushort)ActivateCardListFixedSize).CopyTo(p, 8);
+        WritePdid(p, 0x0A, pdidSerial);
+        name.CopyTo(p, ActivateCardListFixedSize);
+        return p;
+    }
+
+    /// <summary>S_CHANGE_CARD_PRESET (0xDCBA): one i32, the preset now active. All seventy-two
+    /// captured frames across the two clients carry 0.</summary>
+    public static byte[] BuildChangeCardPreset(int preset = 0)
+    {
+        var p = new byte[8];
+        BitConverter.GetBytes((ushort)8).CopyTo(p, 0);
+        BitConverter.GetBytes(S_CHANGE_CARD_PRESET).CopyTo(p, 2);
+        BitConverter.GetBytes(preset).CopyTo(p, 4);
+        return p;
+    }
+
+    /// <summary>
+    /// The scalars of S_GUILD_PERK_LIST that no store column is provably behind. Both captured
+    /// guilds, side by side - <c>fdh</c> (frame 1611) and <c>sdg</c> (3136 and 3247):
+    /// <code>
+    ///   +0x0C  3 / 2          +0x10  1 / 1003     +0x14  1 / 1       +0x18  1 / 0
+    ///   +0x1C  0 / 0          +0x20  0 / 0        +0x24  0 / 0       +0x28  100 / 100
+    ///   +0x2C  0 / 0          +0x30  i64 0 / 10000000                +0x38  2 / 2
+    ///   +0x3C  2 / 2          +0x40  0 / 0        +0x44  i64 0x6AAB41B1 / 0x6AAB19B2
+    /// </code>
+    /// Two instances is enough to say these are real fields rather than uninitialised stack, and
+    /// not enough to name them: the obvious readings all break on one of the pair. (+0x44 looks
+    /// like a creation time until you notice the guild whose window opened FIRST has the LATER
+    /// stamp.) They are parameters with the captured defaults until a third guild turns up.
+    /// </summary>
+    public sealed record GuildPerkScalars
+    {
+        public int A { get; init; } = 3;
+        public int B { get; init; } = 1;
+        public int C { get; init; } = 1;
+        public int D { get; init; } = 1;
+        public int E { get; init; }
+        public int F { get; init; }
+        public int G { get; init; }
+        public int MaxPoint { get; init; } = 100;
+        public int I { get; init; }
+        public long Money { get; init; }
+        public int K { get; init; } = 2;
+        public int L { get; init; } = 2;
+        public int M { get; init; }
+        public long Timestamp { get; init; }
+    }
+
+    /// <summary>
+    /// S_GUILD_PERK_LIST (0xE9FC). Fixed part 0x4C, then the guild name, the master's name and
+    /// the perk array. The element is ten bytes - <c>[u16 here][u16 next][i32 perkId][u8][u8]</c>
+    /// - which is exactly <c>spLoadGuildPerkList</c>'s <c>{int perkId, tinyint, tinyint}</c>
+    /// behind the usual pair, i.e. the <c>guild_perks</c> table row for row.
+    /// </summary>
+    public const int GuildPerkListFixedSize = 0x4C;
+    public const int GuildPerkEntrySize = 10;
+
+    public static byte[] BuildGuildPerkList(string? guildName, string? masterName,
+        IReadOnlyList<CharacterStore.GuildPerkRow>? perks = null, GuildPerkScalars? scalars = null)
+    {
+        perks ??= Array.Empty<CharacterStore.GuildPerkRow>();
+        var s = scalars ?? new GuildPerkScalars();
+        var gn = WString(guildName);
+        var mn = WString(masterName);
+        int gnAt = GuildPerkListFixedSize, mnAt = gnAt + gn.Length, perksAt = mnAt + mn.Length;
+        var p = new byte[perksAt + perks.Count * GuildPerkEntrySize];
+
+        BitConverter.GetBytes((ushort)p.Length).CopyTo(p, 0);
+        BitConverter.GetBytes(S_GUILD_PERK_LIST).CopyTo(p, 2);
+        BitConverter.GetBytes((ushort)perks.Count).CopyTo(p, 4);
+        BitConverter.GetBytes((ushort)(perks.Count == 0 ? 0 : perksAt)).CopyTo(p, 6);
+        BitConverter.GetBytes((ushort)gnAt).CopyTo(p, 8);
+        BitConverter.GetBytes((ushort)mnAt).CopyTo(p, 10);
+        BitConverter.GetBytes(s.A).CopyTo(p, 0x0C);
+        BitConverter.GetBytes(s.B).CopyTo(p, 0x10);
+        BitConverter.GetBytes(s.C).CopyTo(p, 0x14);
+        BitConverter.GetBytes(s.D).CopyTo(p, 0x18);
+        BitConverter.GetBytes(s.E).CopyTo(p, 0x1C);
+        BitConverter.GetBytes(s.F).CopyTo(p, 0x20);
+        BitConverter.GetBytes(s.G).CopyTo(p, 0x24);
+        BitConverter.GetBytes(s.MaxPoint).CopyTo(p, 0x28);
+        BitConverter.GetBytes(s.I).CopyTo(p, 0x2C);
+        BitConverter.GetBytes(s.Money).CopyTo(p, 0x30);
+        BitConverter.GetBytes(s.K).CopyTo(p, 0x38);
+        BitConverter.GetBytes(s.L).CopyTo(p, 0x3C);
+        BitConverter.GetBytes(s.M).CopyTo(p, 0x40);
+        BitConverter.GetBytes(s.Timestamp).CopyTo(p, 0x44);
+        gn.CopyTo(p, gnAt);
+        mn.CopyTo(p, mnAt);
+        for (int i = 0; i < perks.Count; i++)
+        {
+            int at = perksAt + i * GuildPerkEntrySize;
+            BitConverter.GetBytes((ushort)at).CopyTo(p, at);
+            BitConverter.GetBytes((ushort)(i == perks.Count - 1 ? 0 : at + GuildPerkEntrySize)).CopyTo(p, at + 2);
+            BitConverter.GetBytes(perks[i].PerkId).CopyTo(p, at + 4);
+            p[at + 8] = (byte)perks[i].FlagA;
+            p[at + 9] = (byte)perks[i].FlagB;
+        }
+        return p;
+    }
+
+    /// <summary>
+    /// S_CREST_INFO (0xB04B): <c>[u16 count][u16 firstOffset][i32 CrestPoint][i32 CrestExPoint]</c>
+    /// then nine-byte elements <c>[u16 here][u16 next][i32 crestId][u8 flag]</c>.
+    ///
+    /// <para>The two i32s are SA_CREST_POINT's <c>NewPoint</c> and <c>NewExPoint</c> - frames
+    /// 5105 and 5108 both read 10 at +0x08 right after the crest-point write, and the frames
+    /// before the write read 0. The element ids at frame 5108 (33000, 33008, 33012, 33018,
+    /// 33020, 33029, 33031, 33033, 33034, 33038, 33041) are exactly the ids
+    /// SA_LEARN_ALL_CREST_ACQUIRABLE grants, which is where the <c>crests</c> table gets them.</para>
+    /// </summary>
+    public const int CrestInfoFixedSize = 0x10;
+    public const int CrestInfoEntrySize = 9;
+
+    public static byte[] BuildCrestInfo(IReadOnlyList<int>? crestIds, int point = 0, int exPoint = 0)
+    {
+        crestIds ??= Array.Empty<int>();
+        var p = new byte[CrestInfoFixedSize + crestIds.Count * CrestInfoEntrySize];
+        BitConverter.GetBytes((ushort)p.Length).CopyTo(p, 0);
+        BitConverter.GetBytes(S_CREST_INFO).CopyTo(p, 2);
+        BitConverter.GetBytes((ushort)crestIds.Count).CopyTo(p, 4);
+        BitConverter.GetBytes((ushort)(crestIds.Count == 0 ? 0 : CrestInfoFixedSize)).CopyTo(p, 6);
+        BitConverter.GetBytes(point).CopyTo(p, 8);
+        BitConverter.GetBytes(exPoint).CopyTo(p, 0x0C);
+        for (int i = 0; i < crestIds.Count; i++)
+        {
+            int at = CrestInfoFixedSize + i * CrestInfoEntrySize;
+            BitConverter.GetBytes((ushort)at).CopyTo(p, at);
+            BitConverter.GetBytes((ushort)(i == crestIds.Count - 1 ? 0 : at + CrestInfoEntrySize)).CopyTo(p, at + 2);
+            BitConverter.GetBytes(crestIds[i]).CopyTo(p, at + 4);
+        }
+        return p;
+    }
+
+    /// <summary>S_SHOW_CREST_LEARN (0xEBD1): a bare four-byte push, no body at all
+    /// (frame 5109). It opens the crest-learning window.</summary>
+    public static byte[] BuildShowCrestLearn()
+        => new byte[] { 0x04, 0x00, (byte)S_SHOW_CREST_LEARN, (byte)(S_SHOW_CREST_LEARN >> 8) };
+
+    /// <summary>S_GUILD_APPLY_COUNT (0xC89A): one i32, how many applications are waiting
+    /// (frame 3143, a guild with none).</summary>
+    public static byte[] BuildGuildApplyCount(int count)
+    {
+        var p = new byte[8];
+        BitConverter.GetBytes((ushort)8).CopyTo(p, 0);
+        BitConverter.GetBytes(S_GUILD_APPLY_COUNT).CopyTo(p, 2);
+        BitConverter.GetBytes(count).CopyTo(p, 4);
+        return p;
+    }
+
+    // ---- the four client requests -----------------------------------------------------
+
+    /// <summary>The pdid serial we send. TeraSharp has no enter-world counter, and the client
+    /// only uses the value to tell one owner's page from another's, so the player's own id is
+    /// both stable and unique - which the captured serial is not (the same character got 1 and
+    /// then 5 on its second login).</summary>
+    private static int PdidSerialFor(GameSession s) => (int)s.PlayerId;
+
+    /// <summary>The name shown on a card page: the requested character's, or the caller's.</summary>
+    private static string OwnerName(GameSession s) => s.SelectedCharacter?.Name ?? string.Empty;
+
+    /// <summary>C_REQUEST_MY_ACTIVATE_CARD_COMBINE_LIST_DATA (0xB05D), body empty.</summary>
+    public static bool OnRequestMyActivateCardCombineList(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        s.Send(BuildActivateCardCombineList(OwnerName(s), PdidSerialFor(s)));
+        return true;
+    }
+
     /// <summary>
     /// C_RQ_SKILL_POLISHING_LIST -&gt; S_RP_SKILL_POLISHING_LIST, and
     /// C_RQ_SKILL_POLISHING_EXP_INFO -&gt; S_RP_SKILL_POLISHING_EXP_INFO.
@@ -1040,6 +1327,80 @@ public static class ArbiterClientHandlers
         _ = body; _ = log;
         s.SendByDef("S_RP_SKILL_POLISHING_EXP_INFO", BuildSkillPolishingExpFields());
         return true;
+    }
+
+    /// C_REQUEST_OTHERS_ACTIVATE_CARD_COMBINE_LIST_DATA_WITH_GAMEID (0xEFB9), body
+    /// <c>[u64 gameId]</c>. We answer for whoever that gameId belongs to when a live session
+    /// owns it, and for the asker otherwise - an unanswered request leaves the window spinning.
+    /// </summary>
+    public static bool OnRequestOthersActivateCardCombineList(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        var (name, serial) = OtherOwner(s, body);
+        s.Send(BuildActivateCardCombineList(name, serial));
+        return true;
+    }
+
+    /// <summary>C_REQUEST_OTHERS_CARD_DATA_WITH_GAMEID (0xD91B), body <c>[u64 gameId]</c>.</summary>
+    public static bool OnRequestOthersCardData(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        var (name, serial) = OtherOwner(s, body);
+        s.Send(BuildCardData(name, serial));
+        return true;
+    }
+
+    /// <summary>
+    /// Resolves an inter-server gameId to one of our character ids. Left null, the two
+    /// WITH_GAMEID requests answer for the CALLER rather than going unanswered - a card page
+    /// showing the wrong name is a cosmetic bug; an unanswered request is a window that never
+    /// opens. <c>DbProxyHandlers</c> has the same hook and the same default.
+    /// </summary>
+    public static Func<ulong, int>? PlayerIdForGameId { get; set; }
+
+    /// <summary>The card-page owner an 8-byte gameId body names, or the caller.</summary>
+    private static (string Name, int Serial) OtherOwner(GameSession s, ReadOnlyMemory<byte> body)
+    {
+        if (body.Length >= 8 && Program.Store is not null)
+        {
+            ulong gameId = BitConverter.ToUInt64(body.Span);
+            int playerId = PlayerIdForGameId?.Invoke(gameId) ?? 0;
+            if (playerId > 0)
+            {
+                var chr = Program.Store.GetCharacter(playerId);
+                if (chr is not null) return (chr.Name, playerId);
+            }
+        }
+        return (OwnerName(s), PdidSerialFor(s));
+    }
+
+    /// <summary>
+    /// C_REQUEST_GUILD_PERK_LIST (0x63A0), body empty. A player with no guild gets the empty
+    /// form rather than silence - the tab is opened from the guild window, which a guildless
+    /// player can still open.
+    /// </summary>
+    public static bool OnRequestGuildPerkList(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        var store = Program.Store;
+        var chr = s.SelectedCharacter;
+        if (store is null || chr is null) { s.Send(BuildGuildPerkList(null, null)); return true; }
+
+        int guildId = store.GetGuildIdOf((int)chr.Id);
+        var guild = guildId > 0 ? store.GetGuild(guildId) : null;
+        if (guild is null) { s.Send(BuildGuildPerkList(null, null)); return true; }
+
+        string master = store.GetCharacter(guild.ChiefDbId)?.Name ?? string.Empty;
+        s.Send(BuildGuildPerkList(guild.Name, master, store.GetGuildPerks(guildId)));
+        s.Send(BuildGuildApplyCount(store.GetGuildApplies(guildId).Count));
+        return true;
+    }
+
+    /// <summary>The crest window, from the character's own rows. Sent at enter-world and again
+    /// whenever the points change.</summary>
+    public static byte[] BuildCrestInfoFor(GameSession s)
+    {
+        var chr = s?.SelectedCharacter;
+        if (chr is null || Program.Store is null) return BuildCrestInfo(null);
+        var (point, exPoint) = Program.Store.GetCrestPoints((int)chr.Id);
+        return BuildCrestInfo(Program.Store.GetCrests((int)chr.Id), point, exPoint);
     }
 
     /// <summary>A NUL-terminated UTF-16LE string, as the inter-server and client writers emit it.</summary>

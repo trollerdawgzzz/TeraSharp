@@ -1266,12 +1266,19 @@ public sealed class DbProxyHandlers
 
             // --- T77: collection cards. We keep no card state, so Success 1 and the ids echoed. ---
             case SDB_REGISTER_CARD:
+                // T83: UserDbId is at payload 4 in all three card writes (seq 7032 / 7107 / 7130
+                // all read 1, the character that ran them). T77 answered them and kept nothing.
+                _store?.AddCard(Ep32i(payload, 4), Ep32i(payload, 12), Ep32i(payload, 16));
                 link.SendFrame(DBS_REGISTER_CARD, BuildDbsRegisterCard(
                     Ep32(payload, 0), Ep32i(payload, 12), Ep32i(payload, 16))); return true;
             case SDB_MOUNT_CARD:
+                _store?.SetCardPreset(Ep32i(payload, 4), Ep32i(payload, 20), Ep32i(payload, 16));
                 link.SendFrame(DBS_MOUNT_CARD, BuildDbsMountCard(
                     Ep32(payload, 0), Ep32i(payload, 16), Ep32i(payload, 20))); return true;
             case SDB_UNMOUNT_CARD:
+                // The unmount carries the SAME preset index the mount did; -1 is ours, not the
+                // wire's, and it is what "owned but not in a preset" is stored as.
+                _store?.SetCardPreset(Ep32i(payload, 4), Ep32i(payload, 20), CardNotMounted);
                 link.SendFrame(DBS_UNMOUNT_CARD, BuildDbsMountCard(
                     Ep32(payload, 0), Ep32i(payload, 16), Ep32i(payload, 20))); return true;
 
@@ -1285,6 +1292,10 @@ public sealed class DbProxyHandlers
                 link.SendFrame(DBS_TBA_UPDATE_BATTLEPASS_SEASONDATA, BuildDbsBattlePassSeasonData());
                 return true;
             case SA_CREST_POINT:
+                // T83: NewPoint@20 / NewExPoint@24 are what S_CREST_INFO shows at +0x08 and
+                // +0x0C (cap_social4_client frames 5105 and 5108 both read 10 there). T77
+                // answered the frame and dropped both numbers.
+                StoreCrestPoints(payload);
                 link.SendFrame(AS_CREST_POINT, BuildAsCrestPoint(Ep32(payload, 16))); return true;
             case SA_MAKE_SYS_PARCEL: return OnMakeSysParcel(link, payload);
             case SDB_LOAD_28B7:
@@ -1359,6 +1370,7 @@ public sealed class DbProxyHandlers
                 var r = BuildLearnAllCrest(payload);
                 if (r == null) return false;
                 _log.LogInformation("SA_LEARN_ALL_CREST_ACQUIRABLE: learned {N} crest(s)", BitConverter.ToUInt32(r, 0));
+                StoreLearnedCrests(payload, r);
                 link.SendFrame(AS_LEARN_ALL_CREST_ACQUIRABLE, r);
                 return true;
             }
@@ -1675,6 +1687,70 @@ public sealed class DbProxyHandlers
         return p;
     }
 
+
+    /// <summary>The preset a card is in when it is owned but not mounted. Ours, not the wire's:
+    /// SDB_UNMOUNT_CARD repeats the preset index the mount used rather than sending a sentinel.</summary>
+    public const int CardNotMounted = -1;
+
+    /// <summary>
+    /// T83. SA_CREST_POINT (0x1465), guard 0x21: <c>OwnerBinary ref@06, ArbiterUser@0E (i64),
+    /// DlmId@16, NewPoint@1A, NewExPoint@1E</c> - payload 16, 20 and 24. The owner is the live
+    /// session behind the ArbiterUser handle, the same lookup the dungeon writes use.
+    /// </summary>
+    private void StoreCrestPoints(byte[] payload)
+    {
+        if (_store is null || payload.Length < 28) return;
+        ulong gameId = BitConverter.ToUInt64(payload, 8);
+        int playerId = PlayerIdForGameId?.Invoke(gameId) ?? 0;
+        if (playerId <= 0)
+        {
+            _log.LogWarning("SA_CREST_POINT: no live session owns gameId 0x{G:X} - points not stored", gameId);
+            return;
+        }
+        int point = Ep32i(payload, 20), exPoint = Ep32i(payload, 24);
+        _store.SetCrestPoints(playerId, point, exPoint);
+        _log.LogInformation("SA_CREST_POINT: player {Pid} -> {P} point(s), {E} ex", playerId, point, exPoint);
+    }
+
+    /// <summary>
+    /// T83. The learned-crest ids, read back out of the reply <see cref="BuildLearnAllCrest"/>
+    /// just built - that reply IS the list of crests we granted, in the 16-byte
+    /// <c>[u32 thisOff][u32 nextOff][i32 crestId][i32 value]</c> shape, so parsing it needs no
+    /// second copy of the request walk. Reply header:
+    /// <c>[u32 count][u32 firstOff][u32 reqId][u8 ok]</c>, offsets frame-relative.
+    /// </summary>
+    private void StoreLearnedCrests(byte[] request, byte[] reply)
+    {
+        if (_store is null || request.Length < 16 || reply.Length < 17) return;
+        ulong gameId = BitConverter.ToUInt64(request, 8);
+        int playerId = PlayerIdForGameId?.Invoke(gameId) ?? 0;
+        if (playerId <= 0)
+        {
+            _log.LogWarning("SA_LEARN_ALL_CREST_ACQUIRABLE: no live session owns gameId 0x{G:X} - "
+                + "the crests are not stored", gameId);
+            return;
+        }
+
+        int at = (int)BitConverter.ToUInt32(reply, 4) - 6;      // frame-relative -> payload
+        int stored = 0, guard = 0;
+        while (at >= 0 && at + CrestEntrySize <= reply.Length && guard++ < CrestEntryMax)
+        {
+            int crestId = BitConverter.ToInt32(reply, at + 8);
+            int value = BitConverter.ToInt32(reply, at + 12);
+            if (crestId != 0 && _store.AddCrest(playerId, crestId, value)) stored++;
+            int next = (int)BitConverter.ToUInt32(reply, at + 4);
+            if (next == 0) break;
+            at = next - 6;
+        }
+        if (stored > 0)
+            _log.LogInformation("SA_LEARN_ALL_CREST_ACQUIRABLE: player {Pid} learned {N} new crest(s)",
+                playerId, stored);
+    }
+
+    /// <summary>The 16-byte entry SA_/AS_LEARN_ALL_CREST_ACQUIRABLE chains.</summary>
+    public const int CrestEntrySize = 16;
+    /// <summary>A walk bound, so a malformed next-pointer cannot loop.</summary>
+    public const int CrestEntryMax = 512;
 
     /// <summary>A u32 at a PAYLOAD offset, 0 when the frame is short. The T77 family arrives
     /// short often enough - two of the fifteen are shorter than their own handler's guard in

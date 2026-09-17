@@ -18527,6 +18527,231 @@ string message
             "frame 1586: once the proceeds are taken the tab is empty again");
     }
 
+    // ===================== T83: cards, crests and guild perks =====================
+    //
+    // cap_social4_client.log (client 1) and cap_social4_client2.log (client 2) - two accounts,
+    // five characters, so every layout below has at least three independent instances.
+
+    /// <summary>cap_social4_client frame 135 - the card page of "two".</summary>
+    const string Cap83_CardDataTwo =
+        "3E 00 7C 50 00 00 00 00 01 00 32 00 00 00 00 00 "
+        + "2A 00 02 00 F0 0A 00 80 00 00 01 00 00 00 00 00 "
+        + "00 00 01 00 00 00 00 00 00 00 74 00 77 00 6F 00 "
+        + "00 00 32 00 00 00 00 00 00 00 00 00 00 00";
+
+    /// <summary>frame 267 - the same character's active-combine list.</summary>
+    const string Cap83_ActivateTwo =
+        "1A 00 12 6D 00 00 00 00 12 00 02 00 F0 0A 00 80 "
+        + "00 00 74 00 77 00 6F 00 00 00";
+
+    /// <summary>frames 3136 and 3247 - guild "sdg", master "New", one perk.</summary>
+    const string Cap83_GuildPerkSdg =
+        "66 00 FC E9 01 00 5C 00 4C 00 54 00 02 00 00 00 "
+        + "EB 03 00 00 01 00 00 00 00 00 00 00 00 00 00 00 "
+        + "00 00 00 00 00 00 00 00 64 00 00 00 00 00 00 00 "
+        + "80 96 98 00 00 00 00 00 02 00 00 00 02 00 00 00 "
+        + "00 00 00 00 B2 19 AB 6A 00 00 00 00 73 00 64 00 "
+        + "67 00 00 00 4E 00 65 00 77 00 00 00 5C 00 00 00 "
+        + "09 93 87 00 00 00";
+
+    /// <summary>frame 314 - two crests, no points yet.</summary>
+    const string Cap83_CrestTwoIds =
+        "22 00 4B B0 02 00 10 00 00 00 00 00 00 00 00 00 "
+        + "10 00 19 00 38 52 00 00 00 19 00 00 00 39 52 00 "
+        + "00 00";
+
+    /// <summary>
+    /// S_CARD_DATA (0x507C) and S_CHANGE_CARD_PRESET (0xDCBA). Six card-data frames across the
+    /// two clients, and the eight bytes in the middle of each are a pdid whose world half is the
+    /// same constant SA_ENTER_WORLD carries in every capture we hold.
+    /// </summary>
+    [Test] public static void T83_the_card_data_packet_is_byte_exact()
+    {
+        Hex.Eq(ArbiterClientHandlers.BuildCardData("two", 2), Cap83_CardDataTwo,
+            "cap_social4_client frame 135");
+
+        // The other five. Only the name and the pdid serial differ, which is the claim.
+        Hex.True(ArbiterClientHandlers.BuildCardData("dob", 1).Length == 62
+                 && ArbiterClientHandlers.BuildCardData("New", 4).Length == 62
+                 && ArbiterClientHandlers.BuildCardData("warrior", 4).Length == 70
+                 && ArbiterClientHandlers.BuildCardData("accountonetest", 2).Length == 84,
+            "frames 2264 / 3005 / 7965 / 128 are 62, 62, 70 and 84 bytes");
+        var dob5 = ArbiterClientHandlers.BuildCardData("dob", 5);
+        Hex.True(BitConverter.ToUInt16(dob5, 0x12) == 5
+                 && BitConverter.ToUInt32(dob5, 0x14) == ArbiterClientHandlers.PdidWorldWord,
+            "client2 frame 8403 is the SAME character as client1's frame 2264 with a different "
+            + "serial - which is how we know the u16 is an enter-world counter, not an id");
+
+        Hex.True(ArbiterClientHandlers.PdidWorldWord == 0x80000AF0,
+            "SA_ENTER_WORLD payload +24 reads 01 00 F0 0A 00 80 00 00 in all five captures");
+        Hex.Eq(ArbiterClientHandlers.BuildChangeCardPreset(), "08 00 BA DC 00 00 00 00",
+            "S_CHANGE_CARD_PRESET, frame 375 - and all seventy-two of them carry preset 0");
+    }
+
+    /// <summary>S_ACTIVATE_CARD_COMBINE_LIST_DATA (0x6D12) - the same owner block, a shorter
+    /// fixed part and no second array.</summary>
+    [Test] public static void T83_the_activate_card_combine_list_is_byte_exact()
+    {
+        Hex.Eq(ArbiterClientHandlers.BuildActivateCardCombineList("two", 2), Cap83_ActivateTwo,
+            "frame 267");
+        Hex.True(ArbiterClientHandlers.BuildActivateCardCombineList("accountonetest", 2).Length == 48
+                 && ArbiterClientHandlers.BuildActivateCardCombineList("dob", 5).Length == 26,
+            "client2 frames 261 and 8537");
+        var p = ArbiterClientHandlers.BuildActivateCardCombineList("two", 2);
+        Hex.True(BitConverter.ToUInt16(p, 4) == 0 && BitConverter.ToUInt16(p, 6) == 0
+                 && BitConverter.ToUInt16(p, 8) == ArbiterClientHandlers.ActivateCardListFixedSize,
+            "the combine array is empty in all six captured frames and the name follows it");
+    }
+
+    /// <summary>
+    /// The three card writes now reach the cards table. T77 answered them byte-exactly and threw
+    /// the contents away; cap_social4.log seq 7032 / 7107 / 7130 register card 310010 for
+    /// UserDbId 1, mount it in preset 0, then unmount it.
+    /// </summary>
+    [Test] public static void T83_the_card_writes_land_in_the_cards_table()
+    {
+        using var store = GuildStore(2);
+        var handlers = FreshHandlers(store);
+
+        RunHandler1(DbProxyHandlers.SDB_REGISTER_CARD,
+            Hex.B("DC 04 00 00 01 00 00 00 00 00 00 00 FA BE 04 00 01 00 00 00"), store, handlers);
+        var cards = store.GetCards(1);
+        Hex.True(cards.Count == 1 && cards[0].CardTemplateId == 310010 && cards[0].Amount == 1
+                 && cards[0].Preset == DbProxyHandlers.CardNotMounted,
+            "seq 7032 registers card 310010 x1, not yet in a preset");
+
+        RunHandler1(DbProxyHandlers.SDB_MOUNT_CARD,
+            Hex.B("E0 04 00 00 01 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00 FA BE 04 00"),
+            store, handlers);
+        Hex.True(store.GetCards(1)[0].Preset == 0, "seq 7107 mounts it in preset 0");
+
+        RunHandler1(DbProxyHandlers.SDB_UNMOUNT_CARD,
+            Hex.B("E1 04 00 00 01 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00 FA BE 04 00"),
+            store, handlers);
+        Hex.True(store.GetCards(1)[0].Preset == DbProxyHandlers.CardNotMounted,
+            "seq 7130 takes it out again - the unmount repeats the mount's preset index, so the "
+            + "-1 is ours");
+
+        // Registering the same card again adds to the stack rather than making a second row.
+        RunHandler1(DbProxyHandlers.SDB_REGISTER_CARD,
+            Hex.B("DC 04 00 00 01 00 00 00 00 00 00 00 FA BE 04 00 02 00 00 00"), store, handlers);
+        Hex.True(store.GetCards(1).Count == 1 && store.GetCards(1)[0].Amount == 3,
+            "1 + 2 in one row");
+        Hex.True(store.GetCards(2).Count == 0, "and none of it landed on the other character");
+    }
+
+    /// <summary>
+    /// S_GUILD_PERK_LIST (0xE9FC) and S_GUILD_APPLY_COUNT (0xC89A). The ten-byte element is
+    /// <c>spLoadGuildPerkList</c>'s <c>{int perkId, tinyint, tinyint}</c> behind the usual
+    /// [here][next] pair, which is the <c>guild_perks</c> table row for row.
+    /// </summary>
+    [Test] public static void T83_the_guild_perk_list_is_byte_exact()
+    {
+        var sdg = new ArbiterClientHandlers.GuildPerkScalars
+        {
+            A = 2, B = 1003, C = 1, D = 0, MaxPoint = 100, Money = 10000000,
+            K = 2, L = 2, Timestamp = 0x6AAB19B2,
+        };
+        Hex.Eq(ArbiterClientHandlers.BuildGuildPerkList("sdg", "New",
+                new[] { new TeraSharp.Arbiter.Persistence.CharacterStore.GuildPerkRow(0x879309, 0, 0) }, sdg),
+            Cap83_GuildPerkSdg, "frames 3136 and 3247");
+
+        // The other guild: no perks, and the defaults are its scalars.
+        var fdh = ArbiterClientHandlers.BuildGuildPerkList("fdh", "dob", null,
+            new ArbiterClientHandlers.GuildPerkScalars { Timestamp = 0x6AAB41B1 });
+        Hex.True(fdh.Length == 92 && BitConverter.ToUInt16(fdh, 4) == 0
+                 && BitConverter.ToUInt16(fdh, 6) == 0,
+            $"frame 1611 is 92 bytes with an empty perk array: {fdh.Length}");
+        Hex.True(BitConverter.ToUInt16(fdh, 8) == ArbiterClientHandlers.GuildPerkListFixedSize
+                 && BitConverter.ToUInt16(fdh, 10) == ArbiterClientHandlers.GuildPerkListFixedSize + 8,
+            "the two name offsets are computed, not the 0x4C / 0x54 the capture happens to show "
+            + "because both guilds and both masters have three-letter names");
+
+        // Served from the table.
+        using var store = GuildStore(2);
+        store.UpsertGuildPerk(7, 0x879309);
+        var perks = store.GetGuildPerks(7);
+        Hex.True(perks.Count == 1 && perks[0].PerkId == 0x879309 && perks[0].FlagA == 0,
+            "guild_perks round-trips the three fields the element carries");
+        Hex.Eq(ArbiterClientHandlers.BuildGuildApplyCount(0), "08 00 9A C8 00 00 00 00",
+            "S_GUILD_APPLY_COUNT, frame 3143 - a guild with nobody waiting");
+    }
+
+    /// <summary>
+    /// S_CREST_INFO (0xB04B) and S_SHOW_CREST_LEARN (0xEBD1). The two i32s in the fixed part are
+    /// SA_CREST_POINT's NewPoint and NewExPoint, and the nine-byte elements are the ids
+    /// SA_LEARN_ALL_CREST_ACQUIRABLE granted.
+    /// </summary>
+    [Test] public static void T83_the_crest_info_packet_is_byte_exact()
+    {
+        Hex.Eq(ArbiterClientHandlers.BuildCrestInfo(null),
+            "10 00 4B B0 00 00 00 00 00 00 00 00 00 00 00 00",
+            "frames 3193 / 5104: nothing learned, no points");
+        Hex.Eq(ArbiterClientHandlers.BuildCrestInfo(null, 10),
+            "10 00 4B B0 00 00 00 00 0A 00 00 00 00 00 00 00",
+            "frame 5105: the point arrives before the list does");
+        Hex.Eq(ArbiterClientHandlers.BuildCrestInfo(new[] { 21048, 21049 }), Cap83_CrestTwoIds,
+            "frame 314");
+
+        var eleven = ArbiterClientHandlers.BuildCrestInfo(
+            new[] { 33000, 33008, 33012, 33018, 33020, 33029, 33031, 33033, 33034, 33038, 33041 }, 10);
+        Hex.True(eleven.Length == 115 && BitConverter.ToUInt16(eleven, 4) == 11
+                 && BitConverter.ToInt32(eleven, 8) == 10,
+            $"frame 5108 is 115 bytes, eleven crests and ten points: {eleven.Length}");
+        Hex.True(BitConverter.ToUInt16(eleven, 0x10 + 2) == 0x19
+                 && BitConverter.ToUInt16(eleven, 0x10 + 10 * 9 + 2) == 0,
+            "the nine-byte chain runs 0x10, 0x19, ... and the last next is 0");
+        Hex.Eq(ArbiterClientHandlers.BuildShowCrestLearn(), "04 00 D1 EB",
+            "S_SHOW_CREST_LEARN, frame 5109 - a push with no body at all");
+    }
+
+    /// <summary>
+    /// The crest window's two inputs, end to end. SA_CREST_POINT (0x1465) carried NewPoint and
+    /// NewExPoint and T77 dropped both; SA_LEARN_ALL_CREST_ACQUIRABLE (0x1463) named the crest
+    /// ids and T50 answered it and dropped those. Both now reach the store, which is what
+    /// S_CREST_INFO reads.
+    /// </summary>
+    [Test] public static void T83_crest_points_and_learned_crests_are_stored()
+    {
+        using var store = GuildStore(2);
+        var handlers = FreshHandlers(store);
+        const ulong gameId = 0x02CFC5860020UL;
+        handlers.PlayerIdForGameId = g => g == gameId ? 1 : 0;
+
+        // cap_social4.log seq 2816: NewPoint 0x37, NewExPoint 0.
+        RunHandler1(DbProxyHandlers.SA_CREST_POINT, Hex.B(
+            "22 00 00 00 00 00 00 00 20 00 86 C5 CF 02 00 00 DC 01 00 00 37 00 00 00 00 00 00 00"),
+            store, handlers);
+        Hex.True(store.GetCrestPoints(1) == (55, 0), $"the points are stored: {store.GetCrestPoints(1)}");
+
+        // A synthesised SA_LEARN_ALL_CREST_ACQUIRABLE: no capture holds one (the captured
+        // characters were classes with no level-1 crests), so this is the request shape T50
+        // pinned from Handler_SA_LEARN_ALL_CREST_ACQUIRABLE, with two entries.
+        int[] ids = { 21048, 21049 };
+        var req = new byte[20 + ids.Length * DbProxyHandlers.CrestEntrySize];
+        BitConverter.GetBytes(ids.Length).CopyTo(req, 0);
+        BitConverter.GetBytes(26u).CopyTo(req, 4);                 // frame-relative: 6 + 20
+        BitConverter.GetBytes(gameId).CopyTo(req, 8);
+        BitConverter.GetBytes(0x99u).CopyTo(req, 16);
+        for (int i = 0; i < ids.Length; i++)
+        {
+            int at = 20 + i * DbProxyHandlers.CrestEntrySize;
+            BitConverter.GetBytes((uint)(at + 6)).CopyTo(req, at);
+            BitConverter.GetBytes((uint)(i + 1 < ids.Length ? at + 6 + DbProxyHandlers.CrestEntrySize : 0))
+                .CopyTo(req, at + 4);
+            BitConverter.GetBytes(ids[i]).CopyTo(req, at + 8);
+        }
+        var (op, _) = RunHandler1(DbProxyHandlers.SA_LEARN_ALL_CREST_ACQUIRABLE, req, store, handlers);
+        Hex.True(op == DbProxyHandlers.AS_LEARN_ALL_CREST_ACQUIRABLE, $"0x{op:X4}");
+        Hex.True(store.GetCrests(1).Count == 2 && store.GetCrests(1)[0] == 21048,
+            $"and both crests are stored: {store.GetCrests(1).Count}");
+
+        // Which is frame 314 again, now built from rows rather than a literal.
+        Hex.Eq(ArbiterClientHandlers.BuildCrestInfo(store.GetCrests(1)), Cap83_CrestTwoIds,
+            "frame 314, served from the crests table");
+        Hex.True(!store.AddCrest(1, 21048), "learning the same crest twice is not a second row");
+    }
+
     // ===================== T72: the broker's client windows =====================
 
     /// <summary>cap_social3_client.log seq 1472 - the search page after listing 3 was bought.</summary>

@@ -1014,6 +1014,29 @@ CREATE INDEX IF NOT EXISTS ix_guild_log_guild_time ON guild_log(guild_id, log_ti
 
 -- spLoadGuildPerkList returns {int perkId, tinyint, tinyint}. Stored so DBS_INIT_GUILD_PERK_LIST
 -- has rows to build from; nothing reads them yet.
+-- T83: the card collection. SDB_REGISTER_CARD (0x2988) adds one, SDB_MOUNT_CARD (0x298A) puts
+-- it in a preset slot and SDB_UNMOUNT_CARD (0x298C) takes it out again; all three carry
+-- UserDbId at payload 4 and the card's template id, and until T83 we acked them and threw the
+-- contents away. preset is -1 while the card is owned but not mounted.
+CREATE TABLE IF NOT EXISTS cards (
+  character_id     INTEGER NOT NULL,
+  card_template_id INTEGER NOT NULL,
+  amount           INTEGER NOT NULL DEFAULT 1,
+  preset           INTEGER NOT NULL DEFAULT -1,
+  PRIMARY KEY (character_id, card_template_id)
+);
+CREATE INDEX IF NOT EXISTS ix_cards_character ON cards(character_id);
+
+-- T83: learned crests (glyphs). SA_LEARN_ALL_CREST_ACQUIRABLE (0x1463) is the only frame in any
+-- capture that names them - T50 answered it correctly and then discarded the ids. S_CREST_INFO
+-- lists them back, nine bytes each.
+CREATE TABLE IF NOT EXISTS crests (
+  character_id INTEGER NOT NULL,
+  crest_id     INTEGER NOT NULL,
+  value        INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (character_id, crest_id)
+);
+
 CREATE TABLE IF NOT EXISTS guild_perks (
   guild_id              INTEGER NOT NULL REFERENCES guilds(guild_id),
   perk_id               INTEGER NOT NULL,
@@ -1182,6 +1205,11 @@ CREATE TABLE IF NOT EXISTS watched_movies (
         AddColumnIfMissing("characters", "ep_reserve_bonus", "INTEGER NOT NULL DEFAULT 0");
         AddColumnIfMissing("characters", "ep_daily_limit", "INTEGER NOT NULL DEFAULT 0");
         AddColumnIfMissing("characters", "ep_reset_time", "INTEGER NOT NULL DEFAULT 0");
+
+        // T83: the two crest counters SA_CREST_POINT carries. T77 answered that frame and kept
+        // neither, so S_CREST_INFO had nothing but zeros to show.
+        AddColumnIfMissing("characters", "crest_point", "INTEGER NOT NULL DEFAULT 0");
+        AddColumnIfMissing("characters", "crest_ex_point", "INTEGER NOT NULL DEFAULT 0");
     }
 
     /// <summary>ALTER TABLE ADD COLUMN, but a no-op when the column is already there.</summary>
@@ -3863,6 +3891,166 @@ DELETE FROM guild_members     WHERE user_db_id = $id;";
             cmd.Parameters.AddWithValue("$u", userDbId);
             cmd.Parameters.AddWithValue("$m", joinMsg ?? "");
             cmd.Parameters.AddWithValue("$t", appliedAt);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    // ============================================================ T83: cards
+
+    /// <summary>One owned card. <paramref name="Preset"/> is -1 when it is not mounted.</summary>
+    public sealed record CardRow(int CardTemplateId, int Amount, int Preset);
+
+    /// <summary>
+    /// SDB_REGISTER_CARD. Adds <paramref name="amount"/> to what this character already has of
+    /// that card, which is what "register" means: cap_social4.log seq 7032 registers card 310010
+    /// with amount 1 and the reply echoes both back.
+    /// </summary>
+    public void AddCard(int characterId, int cardTemplateId, int amount)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "INSERT INTO cards(character_id, card_template_id, amount) VALUES($c,$t,$a) " +
+                "ON CONFLICT(character_id, card_template_id) DO UPDATE SET amount = amount + $a";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            cmd.Parameters.AddWithValue("$t", cardTemplateId);
+            cmd.Parameters.AddWithValue("$a", amount);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>SDB_MOUNT_CARD / SDB_UNMOUNT_CARD. <paramref name="preset"/> -1 unmounts. A card
+    /// the character does not own is not created here - the mount would be for a row World has
+    /// and we do not, and inventing it hides the disagreement.</summary>
+    public bool SetCardPreset(int characterId, int cardTemplateId, int preset)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE cards SET preset=$p WHERE character_id=$c AND card_template_id=$t";
+            cmd.Parameters.AddWithValue("$p", preset);
+            cmd.Parameters.AddWithValue("$c", characterId);
+            cmd.Parameters.AddWithValue("$t", cardTemplateId);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    /// <summary>Every card this character owns, lowest template first.</summary>
+    public IReadOnlyList<CardRow> GetCards(int characterId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "SELECT card_template_id, amount, preset FROM cards WHERE character_id=$c " +
+                "ORDER BY card_template_id";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            var rows = new List<CardRow>();
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) rows.Add(new CardRow(r.GetInt32(0), r.GetInt32(1), r.GetInt32(2)));
+            return rows;
+        }
+    }
+
+    // ============================================================ T83: crests
+
+    /// <summary>Record a learned crest. Returns true the first time, like AddVisitedSection.</summary>
+    public bool AddCrest(int characterId, int crestId, int value = 0)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "INSERT INTO crests(character_id, crest_id, value) VALUES($c,$i,$v) " +
+                "ON CONFLICT(character_id, crest_id) DO NOTHING";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            cmd.Parameters.AddWithValue("$i", crestId);
+            cmd.Parameters.AddWithValue("$v", value);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    /// <summary>The crest ids this character has learned, in id order - the order
+    /// S_CREST_INFO's eleven elements are in at cap_social4_client frame 5108.</summary>
+    public IReadOnlyList<int> GetCrests(int characterId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT crest_id FROM crests WHERE character_id=$c ORDER BY crest_id";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            var rows = new List<int>();
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) rows.Add(r.GetInt32(0));
+            return rows;
+        }
+    }
+
+    /// <summary>SA_CREST_POINT's NewPoint / NewExPoint, which S_CREST_INFO carries at +0x08
+    /// and +0x0C.</summary>
+    public bool SetCrestPoints(int characterId, int point, int exPoint)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE characters SET crest_point=$p, crest_ex_point=$e WHERE id=$id";
+            cmd.Parameters.AddWithValue("$p", point);
+            cmd.Parameters.AddWithValue("$e", exPoint);
+            cmd.Parameters.AddWithValue("$id", characterId);
+            return cmd.ExecuteNonQuery() == 1;
+        }
+    }
+
+    /// <summary>(point, exPoint); (0, 0) for a character that does not exist.</summary>
+    public (int Point, int ExPoint) GetCrestPoints(int characterId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT crest_point, crest_ex_point FROM characters WHERE id=$id";
+            cmd.Parameters.AddWithValue("$id", characterId);
+            using var r = cmd.ExecuteReader();
+            return r.Read() ? (r.GetInt32(0), r.GetInt32(1)) : (0, 0);
+        }
+    }
+
+    // ============================================================ T83: guild perks
+
+    /// <summary>One row of <c>spLoadGuildPerkList</c>: <c>{int perkId, tinyint, tinyint}</c>,
+    /// which is exactly the six bytes S_GUILD_PERK_LIST's 10-byte element carries after its
+    /// [here][next] pair.</summary>
+    public sealed record GuildPerkRow(int PerkId, int FlagA, int FlagB);
+
+    /// <summary>spLoadGuildPerkList(int guildDbId).</summary>
+    public IReadOnlyList<GuildPerkRow> GetGuildPerks(int guildId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "SELECT perk_id, flag_a, flag_b FROM guild_perks WHERE guild_id=$g ORDER BY perk_id";
+            cmd.Parameters.AddWithValue("$g", guildId);
+            var rows = new List<GuildPerkRow>();
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) rows.Add(new GuildPerkRow(r.GetInt32(0), r.GetInt32(1), r.GetInt32(2)));
+            return rows;
+        }
+    }
+
+    /// <summary>Add or replace one perk row.</summary>
+    public void UpsertGuildPerk(int guildId, int perkId, int flagA = 0, int flagB = 0)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "INSERT INTO guild_perks(guild_id, perk_id, flag_a, flag_b) VALUES($g,$p,$a,$b) " +
+                "ON CONFLICT(guild_id, perk_id) DO UPDATE SET flag_a=$a, flag_b=$b";
+            cmd.Parameters.AddWithValue("$g", guildId);
+            cmd.Parameters.AddWithValue("$p", perkId);
+            cmd.Parameters.AddWithValue("$a", flagA);
+            cmd.Parameters.AddWithValue("$b", flagB);
             cmd.ExecuteNonQuery();
         }
     }
