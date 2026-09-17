@@ -1063,6 +1063,37 @@ public static class ArbiterClientHandlers
     public const int CardDataFixedSize = 0x2A;
     public const int CardDataSlotSize = 12;
 
+    /// <summary>
+    /// T86. The same packet, assembled for one character: array B carries that character's
+    /// mounts, one element per mounted card, as <c>[i32 presetIndex][i32 cardTemplateId]</c>.
+    ///
+    /// <para>Only the EMPTY form is pinned - every captured frame is a character with nothing
+    /// mounted and an empty collection, and it carries exactly one all-zero element, which is
+    /// what a character with no mounts still gets here. Array A stays empty for the same reason
+    /// squared: no captured frame has an element in it, so its stride is unknown, and the account
+    /// collection (which is the obvious candidate for it) has nowhere it could go without
+    /// inventing one.</para>
+    /// </summary>
+    public static byte[] BuildCardDataFor(CharacterStore? store, int characterId,
+                                          string? ownerName, int pdidSerial)
+    {
+        var mounts = store?.GetCardMounts(characterId);
+        if (mounts is null || mounts.Count == 0) return BuildCardData(ownerName, pdidSerial);
+
+        var slots = new List<(int, int)>(mounts.Count);
+        foreach (var m in mounts) slots.Add((m.PresetIndex, m.CardTemplateId));
+        return BuildCardData(ownerName, pdidSerial, slots);
+    }
+
+    /// <summary>T86. The preset the client is told is active: the lowest one this character has a
+    /// mount in, and 0 when it has none - which is what all seventy-two captured frames carry,
+    /// every one of them from a character with nothing mounted.</summary>
+    public static byte[] BuildChangeCardPresetFor(CharacterStore? store, int characterId)
+    {
+        var mounts = store?.GetCardMounts(characterId);
+        return BuildChangeCardPreset(mounts is null || mounts.Count == 0 ? 0 : mounts[0].PresetIndex);
+    }
+
     public static byte[] BuildCardData(string? ownerName, int pdidSerial,
                                        IReadOnlyList<(int A, int B)>? slots = null)
     {
@@ -1283,6 +1314,21 @@ public static class ArbiterClientHandlers
     }
 
     /// <summary>
+    /// T86. The card page of one character, from its ACCOUNT's collection and its OWN mounts -
+    /// the two halves the three DB writes keep apart. The collection is looked up for the log
+    /// line and for the emptiness test; it has no slot on the wire that any capture pins.
+    /// </summary>
+    public static void SendCardPage(GameSession s, int characterId, string? name, int serial, ILogger log)
+    {
+        var store = Program.Store;
+        long account = store?.AccountOf(characterId) ?? 0;
+        int owned = account > 0 ? store!.GetAccountCards(account).Count : 0;
+        log.LogDebug("card page for {Name} (character {Id}, account {A}): {N} card(s), {M} mount(s)",
+            name, characterId, account, owned, store?.GetCardMounts(characterId).Count ?? 0);
+        s.Send(BuildCardDataFor(store, characterId, name, serial));
+    }
+
+    /// <summary>
     /// C_RQ_SKILL_POLISHING_LIST -&gt; S_RP_SKILL_POLISHING_LIST, and
     /// C_RQ_SKILL_POLISHING_EXP_INFO -&gt; S_RP_SKILL_POLISHING_EXP_INFO.
     ///
@@ -1338,7 +1384,7 @@ public static class ArbiterClientHandlers
     /// </summary>
     public static bool OnRequestOthersActivateCardCombineList(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
     {
-        var (name, serial) = OtherOwner(s, body);
+        var (name, serial, _) = OtherOwner(s, body);
         s.Send(BuildActivateCardCombineList(name, serial));
         return true;
     }
@@ -1346,8 +1392,10 @@ public static class ArbiterClientHandlers
     /// <summary>C_REQUEST_OTHERS_CARD_DATA_WITH_GAMEID (0xD91B), body <c>[u64 gameId]</c>.</summary>
     public static bool OnRequestOthersCardData(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
     {
-        var (name, serial) = OtherOwner(s, body);
-        s.Send(BuildCardData(name, serial));
+        // T86: the OTHER character's account, not ours - the collection follows the account the
+        // character belongs to, so the page has to be drawn from that one.
+        var (name, serial, characterId) = OtherOwner(s, body);
+        SendCardPage(s, characterId, name, serial, log);
         return true;
     }
 
@@ -1360,7 +1408,8 @@ public static class ArbiterClientHandlers
     public static Func<ulong, int>? PlayerIdForGameId { get; set; }
 
     /// <summary>The card-page owner an 8-byte gameId body names, or the caller.</summary>
-    private static (string Name, int Serial) OtherOwner(GameSession s, ReadOnlyMemory<byte> body)
+    private static (string Name, int Serial, int CharacterId) OtherOwner(
+        GameSession s, ReadOnlyMemory<byte> body)
     {
         if (body.Length >= 8 && Program.Store is not null)
         {
@@ -1369,10 +1418,10 @@ public static class ArbiterClientHandlers
             if (playerId > 0)
             {
                 var chr = Program.Store.GetCharacter(playerId);
-                if (chr is not null) return (chr.Name, playerId);
+                if (chr is not null) return (chr.Name, playerId, playerId);
             }
         }
-        return (OwnerName(s), PdidSerialFor(s));
+        return (OwnerName(s), PdidSerialFor(s), (int)(s.SelectedCharacter?.Id ?? 0));
     }
 
     /// <summary>

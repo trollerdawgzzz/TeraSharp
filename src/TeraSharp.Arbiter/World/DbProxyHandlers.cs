@@ -1274,17 +1274,20 @@ public sealed class DbProxyHandlers
                 // - payload 0, 4, 12, 16, 20. All three key on the ACCOUNT at payload 4; only
                 // the mount pair also names a character, which is the split the table does not
                 // model yet (status/STATUS.md, T85b).
-                _store?.AddCard(Ep32i(payload, 4), Ep32i(payload, 12), Ep32i(payload, 16));
+                // T86: the account at +4 is an i64, and it is the ONLY owner this frame has.
+                _store?.AddCard(Ep64(payload, 4), Ep32i(payload, 12), Ep32i(payload, 16));
                 link.SendFrame(DBS_REGISTER_CARD, BuildDbsRegisterCard(
                     Ep32(payload, 0), Ep32i(payload, 12), Ep32i(payload, 16))); return true;
             case SDB_MOUNT_CARD:
-                _store?.SetCardPreset(Ep32i(payload, 4), Ep32i(payload, 20), Ep32i(payload, 16));
+                // T86: UserDbId@12, PresetIndex@16, CardTemplateId@20 - the mount is the one card
+                // frame that names a character, and it names a preset slot with it.
+                _store?.MountCard(Ep32i(payload, 12), Ep32i(payload, 16), Ep32i(payload, 20));
                 link.SendFrame(DBS_MOUNT_CARD, BuildDbsMountCard(
                     Ep32(payload, 0), Ep32i(payload, 16), Ep32i(payload, 20))); return true;
             case SDB_UNMOUNT_CARD:
-                // The unmount carries the SAME preset index the mount did; -1 is ours, not the
-                // wire's, and it is what "owned but not in a preset" is stored as.
-                _store?.SetCardPreset(Ep32i(payload, 4), Ep32i(payload, 20), CardNotMounted);
+                // The unmount repeats the preset index the mount used rather than sending a
+                // sentinel, so the row goes out the way it came in.
+                _store?.UnmountCard(Ep32i(payload, 12), Ep32i(payload, 16), Ep32i(payload, 20));
                 link.SendFrame(DBS_UNMOUNT_CARD, BuildDbsMountCard(
                     Ep32(payload, 0), Ep32i(payload, 16), Ep32i(payload, 20))); return true;
 
@@ -1693,10 +1696,6 @@ public sealed class DbProxyHandlers
         return p;
     }
 
-
-    /// <summary>The preset a card is in when it is owned but not mounted. Ours, not the wire's:
-    /// SDB_UNMOUNT_CARD repeats the preset index the mount used rather than sending a sentinel.</summary>
-    public const int CardNotMounted = -1;
 
     /// <summary>
     /// T83. SA_CREST_POINT (0x1465), guard 0x21: <c>OwnerBinary ref@06, ArbiterUser@0E (i64),

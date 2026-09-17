@@ -350,3 +350,20 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   id in it, which is right only while the two ids coincide (they do in cap_social4, both 1). The
   fix is a schema change - `cards(account_id, card_template_id, amount)` plus a per-character
   mount row - and it wants a capture where the two ids differ before it is worth making.
+
+- T86: that schema change, made. `cards(account_id, card_template_id, amount)` is the collection
+  and `card_mounts(character_id, preset_index, card_template_id)` is the arrangement, because the
+  three frames name two different owners: SDB_REGISTER_CARD carries an `AccountDbId` and no
+  character at all, while SDB_MOUNT_CARD carries `UserDbId@12, PresetIndex@16, CardTemplateId@1A`
+  - so one card can sit in several characters' presets at once, and mounting takes nothing out of
+  the collection. `MigrateCardsToAccount` rebuilds an existing T83-shaped table: the old
+  `character_id` is read as the account it always was, and any row with a preset other than -1
+  becomes a mount. (`ix_cards_account` is created there rather than in the DDL - on an upgrade
+  `cards` still has the old columns when that block runs.) S_CARD_DATA's array B now carries the
+  requesting character's mounts as `[i32 presetIndex][i32 cardTemplateId]`, and
+  S_CHANGE_CARD_PRESET names the lowest preset that character uses.
+
+  **Still unpinned**: array A of S_CARD_DATA, which is where the account collection would go -
+  no captured frame has an element in it, so its stride is unknown and it stays empty. Every
+  captured page is a character with nothing mounted and an empty collection, which is exactly the
+  form a character with no mounts still produces, so frame 135 is still byte-exact.
