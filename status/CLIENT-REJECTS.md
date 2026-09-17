@@ -543,3 +543,69 @@ T80 report listed it as unregistered, which was wrong.
   occurrences, 42-byte empty body and 133-byte with two slots, driven by `C_PUT_WARE_ITEM` /
   `C_GET_WARE_ITEM`. `World/WarehouseHandlers.cs` was being edited while T82 ran, so it is hands-off.
 
+## 11. T84 — the leftovers with data in them
+
+T82 listed six mail packets, `S_VIEW_WARE_EX` and four account/config packets as "left to their
+own task". T84 took them with the capture open. **Four of the eleven are ours; the rest are
+World-built and want nothing from us.**
+
+### 11.1 Mail and warehouse — World-built, and the tap proves it
+
+T82 called the mail UI "all Arbiter-built". That was wrong, and the Arbiter↔World tap says so
+plainly. `cap_social4_client2` frames 5360–5670 are the mail episode; in `cap_social4` at exactly
+those seconds:
+
+| tap seq | time | frame | meaning |
+|---|---|---|---|
+| 4559/4560 | 01:28:41.037 | `SDB_LIST_PARCEL` 0x2777 → `DBS_LIST_PARCEL` 0x2778 (12715 B) | World asks us for the mailbox |
+| 4579/4580 | 01:28:43.572 | same pair | again on re-open |
+| 4639/4640 | 01:28:52.005 | same pair | again |
+| 4653…4672 | 01:28:53.38–41 | `SDB_RECV_PARCEL_EX` 0x277D → `DBS_RECV_PARCEL_EX` 0x277E ×6 | the claim |
+| 4676/4677 | 01:28:53.457 | `SDB_LIST_PARCEL` → `DBS_LIST_PARCEL` (35 B — now empty) | the re-list after claiming |
+
+World would not ask us for the rows if it were not the one building the packet. So
+`S_LIST_PARCEL_EX`, `S_SEND_PARCEL`, `S_SEND_PARCEL_TAX`, `S_SET_SEND_PARCEL_ITEM` and
+`S_SET_SEND_PARCEL_MONEY` are **World-built — leave them**. Our share of the mailbox is the
+`SDB_` answer `ParcelHandlers`/`DbProxyHandlers` already give.
+
+The one exception is `S_SHOW_PARCEL_MESSAGE` 0xABD3, which we do build —
+`cap_social4_client2` frame 5643 is `0C 00 D3 AB 0A 00 04 00 00 00 00 00`, which is
+`ParcelHandlers.BuildShowParcelMessage(4, "")` byte for byte. Pinned in
+`T84_opcodes_and_the_one_arbiter_built_mail_packet`.
+
+`S_VIEW_WARE_EX` 0x9F9A goes the same way, by the absence: `SDB_VIEW_WAREHOUSE` 0x274A fires
+**zero** times in the whole 15-minute tap, yet `cap_social4_client2` shows 18 `S_VIEW_WARE_EX`
+frames — so World held the container itself and built them. What DOES fire in that window is
+`SDB_ITEM_SINGLE` ×16, the persist-one-item atom `DbProxyHandlers` already answers. That is the
+whole shape of it: World owns the live container, we are the store. **World-built — leave.**
+
+### 11.2 The four that are ours
+
+All four shipped defs are RIGHT. What was missing was the data — `LoginHandlers` sends the first
+three with an empty field set and the fourth not at all.
+
+| packet | frames | on the wire | served from |
+|---|---|---|---|
+| `S_ACCOUNT_PACKAGE_LIST` 0xE9A9 | 14, 2894 | 52 B — 16-byte element, `uint32 packageId` + `int64 expirationDate` | new `account_benefits` table |
+| `S_ACCOUNT_BENEFIT_LIST` 0x88E0 | 47, 48 | 34 B / 63 B — 29-byte element behind a 1-byte header field (1) | the same rows |
+| `S_SEND_USER_PLAY_TIME` 0xA7E0 | 78, 2957 | 12 B — `uint32 totalPlaytime` + `uint64 localServerTime` | session play time + clock |
+| `S_ENABLE_DISABLE_SELLABLE_ITEM_LIST` 0x667C | 441, 442 | 39 B — 15-byte header + 3×8-byte elements | config (`DefaultSellableItems`) |
+
+All four arrive in the lobby burst, frames 14/47/48/78 before `S_LOGIN` at frame 50, so no
+character is picked and World is not in the picture at all.
+
+Three findings worth keeping:
+
+* **`timeRemaining` is misnamed.** Frame 47 carries `6F 28 CF 6A` = **1791961199** in that slot —
+  the same absolute unix second `S_ACCOUNT_PACKAGE_LIST` gives package 533 as its
+  `expirationDate`. It is an expiry, not a countdown, so one `expires_at` column serves both.
+* **Storage is a table, not account columns.** The brief suggested account-row columns; the
+  capture already shows three packages for one account and the list is variable-length, so
+  `account_benefits(account_id, package_id, expires_at, value)` it is. `ORDER BY package_id`
+  reproduces the capture order (533, 534, 1000).
+* **An empty `array` leaves BOTH ref words zero** — frame 441 `00 00 00 00` for lists 1 and 3 —
+  unlike an empty `bytes` ref, which §10 showed still gets a real offset. And an
+  `array<uint32>` element is the bare number after `[u16 here][u16 next]`, not a record.
+
+The three expiries in frame 14 are 1791961199, 2100409199 and 1786777199; the brief quoted
+1791165551, which does not round-trip to the capture hex.

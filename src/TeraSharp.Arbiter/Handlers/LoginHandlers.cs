@@ -116,7 +116,8 @@ public sealed class LoginHandlers
         });
 
         s.SendByDef("S_LOAD_CLIENT_ACCOUNT_SETTING", new Dictionary<string, object> { ["data"] = Array.Empty<byte>() });
-        s.SendByDef("S_ACCOUNT_PACKAGE_LIST", new Dictionary<string, object> { ["accountBenefits"] = new List<object>() });
+        s.SendByDef("S_ACCOUNT_PACKAGE_LIST", ArbiterClientHandlers.BuildAccountPackageFields(
+            Program.Store?.GetAccountBenefits((int)s.Account.AccountId) ?? new List<TeraSharp.Arbiter.Persistence.CharacterStore.AccountBenefitRow>()));   // T84
         SendContentFlags(s);
         ClientSettingsHandlers.SendUiSetting(s);
         ClientSettingsHandlers.SendChatOption(s);
@@ -220,8 +221,10 @@ public sealed class LoginHandlers
             ["zone"] = chr.Zone, ["x"] = chr.X, ["y"] = chr.Y, ["z"] = chr.Z, ["unk"] = 0,
         });
 
-        s.SendByDef("S_ACCOUNT_BENEFIT_LIST", new Dictionary<string, object>());
-        s.SendByDef("S_SEND_USER_PLAY_TIME", new Dictionary<string, object>());
+        var benefits = Program.Store?.GetAccountBenefits((int)s.Account.AccountId) ?? new List<TeraSharp.Arbiter.Persistence.CharacterStore.AccountBenefitRow>();
+        s.SendByDef("S_ACCOUNT_BENEFIT_LIST", ArbiterClientHandlers.BuildAccountBenefitFields(benefits));   // T84
+        s.SendByDef("S_SEND_USER_PLAY_TIME", ArbiterClientHandlers.BuildUserPlayTimeFields(0, DateTimeOffset.UtcNow.ToUnixTimeSeconds()));   // T84
+        s.SendByDef("S_ENABLE_DISABLE_SELLABLE_ITEM_LIST", ArbiterClientHandlers.BuildSellableItemListFields());   // T84 (frame 441)
         return true;
     }
 

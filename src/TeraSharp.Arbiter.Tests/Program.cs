@@ -9344,6 +9344,204 @@ int64    currentLevelMaxExp
             Hex.True(ArbiterClientHandlers.ArbiterOwned.Contains(op),
                 $"0x{op:X4} is the Arbiter s to answer, not World s to reject");
     }
+
+    // =======================================================================================
+    // T84 - the lobby account lists, play time and the sellable-item config.
+    // Research: status/CLIENT-REJECTS.md.
+    //
+    // Ground truth: cap_social4_client frames 14, 47, 48, 78, 441 and 2957. All four shipped
+    // defs are RIGHT; what was missing was the data - LoginHandlers sent the first three with
+    // an empty field set and the fourth not at all.
+    // =======================================================================================
+
+    /// <summary>The four shipped defs T84 serves through.</summary>
+    static DefinitionRegistry CreateT84Defs()
+    {
+        var reg = new DefinitionRegistry(QuietLog());
+        reg.RegisterFromDef("S_ACCOUNT_PACKAGE_LIST", @"
+array accountBenefits
+- uint32 packageId
+- int64  expirationDate
+");
+        reg.RegisterFromDef("S_ACCOUNT_BENEFIT_LIST", @"
+byte unk
+
+array accountBenefits
+- uint32 packageId
+- uint32 unk1
+- uint32 unk2
+- int32  timeRemaining
+- uint32 unk3
+- uint32 unk4
+- byte   unk5
+");
+        reg.RegisterFromDef("S_SEND_USER_PLAY_TIME", @"
+uint32 totalPlaytime
+uint64 localServerTime
+");
+        reg.RegisterFromDef("S_ENABLE_DISABLE_SELLABLE_ITEM_LIST", @"
+bool enabled1
+bool enabled2
+bool enabled3
+array<uint32> items1
+array<uint32> items2
+array<uint32> items3
+");
+        return reg;
+    }
+
+    /// <summary>
+    /// The account cap_social4 logged in with, carrying the three packages frame 14 lists:
+    /// 533 and 534 with a stored value, 1000 without. ORDER BY package_id is the capture order.
+    /// </summary>
+    static TeraSharp.Arbiter.Persistence.CharacterStore StoreWithCapturedBenefits()
+    {
+        var store = new TeraSharp.Arbiter.Persistence.CharacterStore(":memory:", QuietLog());
+        var acct = store.GetOrCreateAccount("accountonetest");
+        Hex.True(store.GrantAccountBenefit(acct.Id, 533, 1791961199L, 0x23E726L), "package 533 granted");
+        Hex.True(store.GrantAccountBenefit(acct.Id, 534, 2100409199L, 0x12867226L), "package 534 granted");
+        Hex.True(store.GrantAccountBenefit(acct.Id, 1000, 1786777199L, 0L), "package 1000 granted");
+        return store;
+    }
+
+    /// <summary>
+    /// T84 - S_ACCOUNT_PACKAGE_LIST, byte-exact against cap_social4_client frame 14.
+    ///
+    /// <para><b>Arbiter-built.</b> Frames 14, 47 and 48 all arrive before S_LOGIN at frame 50,
+    /// so no character is picked and the World link is not in the picture at all.</para>
+    ///
+    /// <para>The element is 16 bytes - <c>[u16 here][u16 next]</c> then <c>uint32 packageId</c>
+    /// and <c>int64 expirationDate</c> - and the frame is 4 + 3 x 16 = 52 on the wire. The
+    /// expiries are plain unix seconds: 1791961199, 2100409199 and 1786777199.</para>
+    /// </summary>
+    [Test] public static void T84_account_package_list_matches_cap_social4()
+    {
+        using var store = StoreWithCapturedBenefits();
+        var rows = store.GetAccountBenefits(store.GetOrCreateAccount("accountonetest").Id);
+        Hex.True(rows.Count == 3, "three rows, in package order");
+
+        Hex.Eq(WriteByDef(CreateT84Defs(), "S_ACCOUNT_PACKAGE_LIST",
+                ArbiterClientHandlers.BuildAccountPackageFields(rows)),
+            "03 00 08 00  "
+            + "08 00 18 00  15 02 00 00  6F 28 CF 6A 00 00 00 00  "
+            + "18 00 28 00  16 02 00 00  6F B3 31 7D 00 00 00 00  "
+            + "28 00 00 00  E8 03 00 00  6F 0E 80 6A 00 00 00 00",
+            "frame 14: packages 533, 534 and 1000 with their int64 expiries");
+
+        Hex.Eq(WriteByDef(CreateT84Defs(), "S_ACCOUNT_PACKAGE_LIST",
+                ArbiterClientHandlers.BuildAccountPackageFields(null)),
+            "00 00 00 00",
+            "an account with nothing bought is the four zero bytes LoginHandlers sends today");
+    }
+
+    /// <summary>
+    /// T84 - S_ACCOUNT_BENEFIT_LIST, byte-exact against cap_social4_client frames 47 and 48.
+    ///
+    /// <para>A 29-byte element behind a one-byte header field, so frame 47 is 5 + 29 = 34 and
+    /// frame 48 is 5 + 2 x 29 = 63. The header byte is 1 in both.</para>
+    ///
+    /// <para><b>The def name <c>timeRemaining</c> is wrong.</b> Frame 47 puts 1791961199 in that
+    /// slot - the same absolute unix second S_ACCOUNT_PACKAGE_LIST gives package 533 as its
+    /// <c>expirationDate</c>. It is an expiry, not a countdown, which is why both packets can be
+    /// served from the one <c>expires_at</c> column.</para>
+    /// </summary>
+    [Test] public static void T84_account_benefit_list_matches_cap_social4()
+    {
+        using var store = StoreWithCapturedBenefits();
+        var rows = store.GetAccountBenefits(store.GetOrCreateAccount("accountonetest").Id);
+
+        Hex.Eq(WriteByDef(CreateT84Defs(), "S_ACCOUNT_BENEFIT_LIST",
+                ArbiterClientHandlers.BuildAccountBenefitFields(rows.GetRange(0, 1))),
+            "01 00 09 00  01  "
+            + "09 00 00 00  15 02 00 00  26 E7 23 00  00 00 00 00  6F 28 CF 6A  00 00 00 00  00 00 00 00  00",
+            "frame 47: one benefit, expiry in the timeRemaining slot");
+
+        Hex.Eq(WriteByDef(CreateT84Defs(), "S_ACCOUNT_BENEFIT_LIST",
+                ArbiterClientHandlers.BuildAccountBenefitFields(rows.GetRange(0, 2))),
+            "02 00 09 00  01  "
+            + "09 00 26 00  15 02 00 00  26 E7 23 00  00 00 00 00  6F 28 CF 6A  00 00 00 00  00 00 00 00  00  "
+            + "26 00 00 00  16 02 00 00  26 72 86 12  00 00 00 00  6F B3 31 7D  00 00 00 00  00 00 00 00  00",
+            "frame 48: the second element starts at 0x26 and closes the chain with next = 0");
+    }
+
+    /// <summary>
+    /// T84 - S_SEND_USER_PLAY_TIME, byte-exact against cap_social4_client frames 78 and 2957.
+    ///
+    /// <para>Twelve bytes, no refs: <c>uint32 totalPlaytime</c> then <c>uint64 localServerTime</c>.
+    /// Frame 78 is 237 seconds at unix 1789608265 and frame 2957 is 1446 seconds at 1789608607 -
+    /// 342 seconds apart in both slots, which is what proves the first is seconds played and the
+    /// second the server clock.</para>
+    /// </summary>
+    [Test] public static void T84_user_play_time_matches_cap_social4()
+    {
+        var reg = CreateT84Defs();
+        Hex.Eq(WriteByDef(reg, "S_SEND_USER_PLAY_TIME",
+                ArbiterClientHandlers.BuildUserPlayTimeFields(237, 1789608265L)),
+            "ED 00 00 00  49 41 AB 6A 00 00 00 00", "frame 78");
+        Hex.Eq(WriteByDef(reg, "S_SEND_USER_PLAY_TIME",
+                ArbiterClientHandlers.BuildUserPlayTimeFields(1446, 1789608607L)),
+            "A6 05 00 00  9F 42 AB 6A 00 00 00 00", "frame 2957, 342 seconds later in both slots");
+        Hex.Eq(WriteByDef(reg, "S_SEND_USER_PLAY_TIME",
+                ArbiterClientHandlers.BuildUserPlayTimeFields(-1, -1L)),
+            "00 00 00 00  00 00 00 00 00 00 00 00", "a negative clamps rather than wrapping");
+    }
+
+    /// <summary>
+    /// T84 - S_ENABLE_DISABLE_SELLABLE_ITEM_LIST, byte-exact against cap_social4_client frame 441.
+    ///
+    /// <para><b>We never sent it.</b> Frames 441 and 442 are identical and neither follows a
+    /// request, so it is server config rather than per-character state.</para>
+    ///
+    /// <para>Three array refs (12 bytes) then three bools is a 15-byte header, and 15 + 3 x 8 is
+    /// the 39 on the wire. The empty first and third arrays leave BOTH ref words zero - unlike a
+    /// <c>bytes</c> ref, which T82 showed still gets a real offset when it is empty.</para>
+    /// </summary>
+    [Test] public static void T84_sellable_item_list_matches_cap_social4()
+    {
+        Hex.Eq(WriteByDef(CreateT84Defs(), "S_ENABLE_DISABLE_SELLABLE_ITEM_LIST",
+                ArbiterClientHandlers.BuildSellableItemListFields()),
+            "00 00 00 00  03 00 13 00  00 00 00 00  01 01 01  "
+            + "13 00 1B 00  8C 04 00 00  "
+            + "1B 00 23 00  8F 04 00 00  "
+            + "23 00 00 00  92 04 00 00",
+            "frame 441: only the second list is populated - items 1164, 1167 and 1170");
+
+        Hex.True(ArbiterClientHandlers.DefaultSellableItems.Length == 3
+                 && ArbiterClientHandlers.DefaultSellableItems[0] == 1164
+                 && ArbiterClientHandlers.DefaultSellableItems[1] == 1167
+                 && ArbiterClientHandlers.DefaultSellableItems[2] == 1170,
+            "the three item ids the capture carries");
+
+        Hex.Eq(WriteByDef(CreateT84Defs(), "S_ENABLE_DISABLE_SELLABLE_ITEM_LIST",
+                ArbiterClientHandlers.BuildSellableItemListFields(new[] { 7 }, new int[0], new[] { 8, 9 })),
+            "01 00 13 00  00 00 00 00  02 00 1B 00  01 01 01  "
+            + "13 00 00 00  07 00 00 00  "
+            + "1B 00 23 00  08 00 00 00  "
+            + "23 00 00 00  09 00 00 00",
+            "and an array<uint32> element is the bare number, not a record");
+    }
+
+    /// <summary>
+    /// T84 - the four opcodes, and the one mail packet the Arbiter really does build.
+    ///
+    /// <para>S_SHOW_PARCEL_MESSAGE is already pinned by
+    /// <see cref="T42_show_parcel_message_handles_an_empty_body"/>; cap_social4_client2 frame
+    /// 5643 is that exact form with parcel id 4. Every other packet in the T84 brief s mail and
+    /// warehouse list is World-built - see status/CLIENT-REJECTS.md.</para>
+    /// </summary>
+    [Test] public static void T84_opcodes_and_the_one_arbiter_built_mail_packet()
+    {
+        Hex.True(ArbiterClientHandlers.S_ACCOUNT_PACKAGE_LIST == 0xE9A9
+                 && ArbiterClientHandlers.S_ACCOUNT_BENEFIT_LIST == 0x88E0
+                 && ArbiterClientHandlers.S_SEND_USER_PLAY_TIME == 0xA7E0
+                 && ArbiterClientHandlers.S_ENABLE_DISABLE_SELLABLE_ITEM_LIST == 0x667C,
+            "the four opcodes cap_social4_client frames 14, 47, 78 and 441 carry");
+
+        Hex.Eq(ParcelHandlers.BuildShowParcelMessage(4, ""),
+            "0C 00 D3 AB 0A 00 04 00 00 00 00 00",
+            "cap_social4_client2 frame 5643 - an empty parcel note, built by the Arbiter");
+    }
+
     // ---- The rules ----
 
     [Test] public static void T30_system_message_format_matches_the_capture()
