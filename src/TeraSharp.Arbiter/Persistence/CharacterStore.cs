@@ -1207,6 +1207,9 @@ CREATE TABLE IF NOT EXISTS watched_movies (
         // CREATE TABLE IF NOT EXISTS does nothing to a DB that already has `characters`, so
         // columns added later need their own idempotent step. terasharp.db predates `exp`.
         AddColumnIfMissing("characters", "exp", "INTEGER NOT NULL DEFAULT 0");
+        // T88: the scheduled-delete stamp C_CANCEL_DELETE_USER clears. 0 = no delete pending,
+        // which is what every row had before this column existed.
+        AddColumnIfMissing("characters", "delete_at", "INTEGER NOT NULL DEFAULT 0");
         AddColumnIfMissing("characters", "return_zone", "INTEGER NOT NULL DEFAULT 0");
         AddColumnIfMissing("characters", "return_x", "REAL NOT NULL DEFAULT 0");
         AddColumnIfMissing("characters", "return_y", "REAL NOT NULL DEFAULT 0");
@@ -2734,6 +2737,98 @@ SELECT last_insert_rowid();";
     /// does not exist or belongs to someone else, so a forged C_DELETE_USER cannot delete another
     /// account's character even if the in-memory list check is bypassed.
     /// </summary>
+    // ------------------------------------------------------------ T88: the character rename
+
+    /// <summary>
+    /// Rename a character. Returns false when the row is gone or the new name collides - the
+    /// UNIQUE COLLATE NOCASE index on <c>characters.name</c> is the real gate, so a race with
+    /// another rename fails here rather than corrupting the table.
+    /// </summary>
+    /// <summary>The stored name of one character, or null when the row is gone.</summary>
+    public string? GetCharacterName(int id)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT name FROM characters WHERE id=$id";
+            cmd.Parameters.AddWithValue("$id", id);
+            return cmd.ExecuteScalar() as string;
+        }
+    }
+
+    public bool RenameCharacter(int id, string newName)
+    {
+        if (string.IsNullOrEmpty(newName)) return false;
+        lock (_lock)
+        {
+            try
+            {
+                using var cmd = _db.CreateCommand();
+                cmd.CommandText = "UPDATE characters SET name=$n WHERE id=$id";
+                cmd.Parameters.AddWithValue("$n", newName);
+                cmd.Parameters.AddWithValue("$id", id);
+                return cmd.ExecuteNonQuery() == 1;
+            }
+            catch (Microsoft.Data.Sqlite.SqliteException ex)
+            {
+                _log.LogWarning("RenameCharacter {Id} -> {Name} refused: {Msg}", id, newName, ex.Message);
+                return false;
+            }
+        }
+    }
+
+    // ------------------------------------------------------- T88: the scheduled delete
+
+    /// <summary>
+    /// Mark a character for deletion at <paramref name="deleteAtUnix"/> without removing the
+    /// row. The real Arbiter keeps the character listed while the timer runs - that is what
+    /// <c>S_GET_USER_LIST.deleteRemainSec</c> reports and what C_CANCEL_DELETE_USER undoes.
+    /// Ownership-checked, like <see cref="DeleteCharacter"/>.
+    /// </summary>
+    public bool ScheduleCharacterDelete(int id, long accountId, long deleteAtUnix)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE characters SET delete_at=$d WHERE id=$id AND account_id=$a";
+            cmd.Parameters.AddWithValue("$d", deleteAtUnix);
+            cmd.Parameters.AddWithValue("$id", id);
+            cmd.Parameters.AddWithValue("$a", accountId);
+            return cmd.ExecuteNonQuery() == 1;
+        }
+    }
+
+    /// <summary>
+    /// Clear a pending delete. Returns FALSE when the character is not on the account or has
+    /// nothing pending - the caller answers S_CANCEL_DELETE_USER with that same bool, so a
+    /// cancel for a character that was never scheduled must not report success.
+    /// </summary>
+    public bool CancelCharacterDelete(int id, long accountId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "UPDATE characters SET delete_at=0 WHERE id=$id AND account_id=$a AND delete_at<>0";
+            cmd.Parameters.AddWithValue("$id", id);
+            cmd.Parameters.AddWithValue("$a", accountId);
+            return cmd.ExecuteNonQuery() == 1;
+        }
+    }
+
+    /// <summary>The unix second this character is due to be removed, or 0 when none is set.</summary>
+    public long GetCharacterDeleteAt(int id)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT delete_at FROM characters WHERE id=$id";
+            cmd.Parameters.AddWithValue("$id", id);
+            var v = cmd.ExecuteScalar();
+            return v == null || v is DBNull ? 0L : Convert.ToInt64(v);
+        }
+    }
+
     public bool DeleteCharacter(int id, long accountId)
     {
         lock (_lock)

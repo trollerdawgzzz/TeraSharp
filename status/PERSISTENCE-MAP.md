@@ -546,3 +546,38 @@ gives 533 as `expirationDate`. See `status/CLIENT-REJECTS.md` section 11.
 - **`S_ENABLE_DISABLE_SELLABLE_ITEM_LIST`** (frames 441, 442) is server config, not per-account:
   both captured frames are identical and neither follows a request. Kept as
   `ArbiterClientHandlers.DefaultSellableItems` = 1164, 1167, 1170.
+
+## T88 - `characters.delete_at`, the scheduled delete
+
+`C_CANCEL_DELETE_USER` (cap_final_client2 frames 32/33) undoes a delete, which only means
+anything if the delete was scheduled rather than immediate. The real Arbiter keeps the doomed
+character LISTED while the timer runs - that is what `S_GET_USER_LIST.deleteRemainSec` carries -
+so the stamp is a column, not a row removal.
+
+```sql
+ALTER TABLE characters ADD COLUMN delete_at INTEGER NOT NULL DEFAULT 0;  -- unix seconds, 0 = none
+```
+
+`ScheduleCharacterDelete(id, accountId, at)` / `CancelCharacterDelete(id, accountId)` /
+`GetCharacterDeleteAt(id)`. Both mutators are ownership-checked, and the cancel returns FALSE
+when nothing was pending - the reply byte is that bool, so a cancel of an unscheduled character
+must not report success.
+
+### Still open
+
+- **`OnDeleteUser` still hard-deletes the row.** Switching it to stamp `delete_at` and letting a
+  sweeper remove the row changes behaviour the existing T50 delete tests assert, and changes what
+  the lobby puts in `deleteRemainSec` (today `0 - now`). Left alone deliberately; the store side
+  is ready for it.
+
+## T88 (second pass) - the character rename
+
+World-routed: `SDB_ASK_CHANGE_CHAR_NAME` (0x2854) asks whether a name is free and
+`SDB_DO_CHANGE_CHAR_NAME` (0x2856) performs it. Both land on `characters.name`, whose
+`UNIQUE COLLATE NOCASE` index is the real gate - `RenameCharacter` catches the constraint
+violation and returns false rather than throwing. `GetCharacterName(id)` exists so a rename to
+the name the character already has is not counted as a collision.
+
+Name rules the capture can pin: **four characters minimum** (tap 6094 refuses the three-letter
+"Dob", 6119 accepts "dobb"). The ceiling and the per-reason codes are not observable here, so
+every refusal answers code 1 - the only refusal code in the capture.
