@@ -284,3 +284,17 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   Guild war, LFG/party matching, servants, the wanted board and the guild logo are **A->W pushes
   only** in this capture (0x14A3/0x14AC/0x14AF/0x14B3, 0x1413, 0x14E1/0x14E2/0x14E6/0x14E9, ...) —
   nothing to pin a handler against, so they are reported rather than built.
+
+- T79 (live 2026-09-16, part 2): `SDB_USER_FORGET_SKILL` 0x2792 named and answered — six pairs in
+  cap_social4 went unanswered and head-blocked the account's DB queue on the first forgotten
+  skill. Warehouse withdraw no longer duplicates: the op-17 atom carries ItemDbId 0 **and src
+  slot 0** in every capture, so the row is resolved by template id — by slot it only worked when
+  the bank row happened to sit at slot 0, which is why it failed on a second character. The
+  served `ParcelData` record now carries its own send date (+0xAC, six u16s: year, month, day,
+  hour, minute, second) and read flag (+0xA8); replaying World's zeros there is what produced
+  "cannot claim now" and a deletion date in 2013. The intro cinematic is **not** driven by
+  `S_VISITED_SECTION_LIST` — the client reads `S_VISIT_NEW_SECTION.isFirstVisit` (1 in
+  cap_newchar_client frame 436 where the intro plays, 0 in cap_social_client frame 374 where it
+  does not); the list is built from the stored rows and is byte-exact, but we send it **eighth**
+  in the C_LOAD_TOPO_FIN burst where the real Arbiter sends it **first** (frame 257, ahead of
+  S_REQUEST_INVITE_GUILD_TAG).
