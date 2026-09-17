@@ -12985,6 +12985,7 @@ some prose with `backticks` that is not a table row
             39349, 60155, 27265, 54263, 60477, 33239, 34411, 53135, 22631,
             58817,
             22073, 42458, 31605,   // T62 - C_ASK_INTERACTIVE, C_WATCHED_MOVIES, C_FINDNAME
+            0xD902, 0xD3D9, 0xA7DF, // T78 - C_REGISTER_PARTY_INFO, C_UNREGISTER_PARTY_INFO, C_REQUEST_PARTY_MATCH_LINK
         };
         Hex.True(ArbiterClientHandlers.ArbiterOwned.Count == observed.Length,
             $"{ArbiterClientHandlers.ArbiterOwned.Count} in the set, {observed.Length} observed");
