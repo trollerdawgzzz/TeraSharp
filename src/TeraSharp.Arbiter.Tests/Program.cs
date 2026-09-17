@@ -2144,6 +2144,8 @@ array items
             0x27FE,
             // T74: SDB_ITEM_TRADE_LOG / SDB_CASH_ITEM_LOG - audit writes, handlers end at return 1, no writer.
             0x27DD, 0x288C,
+            // T77: SDB_UPDATE_EP_DAILY_LIMIT-style write with no reply, and the festival push.
+            0x28B8, 0x14CE,
             // T47 sealed the through-Arbiter contract family here (0x2809, 0x280C, 0x280D,
             // 0x280E). T60 UNSEALED all four: they are gated to ContractBroker off
             // WorldBridge's default arm instead, and a SEALED opcode never reaches a gate.

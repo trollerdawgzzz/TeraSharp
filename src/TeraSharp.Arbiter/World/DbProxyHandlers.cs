@@ -1060,7 +1060,7 @@ public sealed class DbProxyHandlers
         SA_LOAD_SERVANT_STORAGE_DATA,               // 0x1537
         SA_LOAD_SERVANT_DATA,                       // 0x1539
         SA_LOAD_SERVANT_ADVENTURE_DATA,             // 0x153B
-        SA_LOAD_EXTRAPOINT_DATA,                    // 0x1554
+        // 0x1554 SA_LOAD_EXTRAPOINT_DATA moved to the allow-list in T77 (served from characters.ep_*)
         SA_LOAD_BATTLE_FIELD_ENTER_COUNT,           // 0x155D
         SDB_LOAD_ITEM_RECIPE,                       // 0x2760
         SDB_LOAD_SKILL_PROF,                        // 0x2764
@@ -1170,6 +1170,7 @@ public sealed class DbProxyHandlers
             case SDB_USER_ACHIEVEMENT:            // 0x27F9 from the stored 0x27FA + 0x2802 records
             case SDB_TUTORIAL_SIMPLE_TIP:         // 0x2873 from the stored 0x286E tips
             case SDB_SEREN_GUIDE:                 // 0x2943 from the stored 0x2944 slots
+            case SA_LOAD_EXTRAPOINT_DATA:         // 0x1554 -> 0x1555, T77: stored EP
             case SDB_LOAD_2867:                   // 0x2868, now rebuilt from dungeon_cooldowns
             // --- T25: one-way dungeon writes. They send nothing back; they are here so
             // TryHandle sees them at all and can persist them. ---

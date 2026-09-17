@@ -184,12 +184,17 @@ public static class HandlerRegistry
         ArbiterClientHandlers.PartyLookup = id => PartyWiring.Manager.FindByMember(id) != null;
         foreach (var name in new[]
         {
-            "C_REQUEST_PARTY_MATCH_INFO", "C_REQUEST_MY_PARTY_MATCH_INFO", "C_PARTY_MATCH_WINDOW_CLOSED",
             "C_REQUEST_GUILD_LIST", "C_DUNGEON_COOL_TIME_LIST", "C_VIEW_BATTLE_FIELD_RESULT",
             "C_REQUEST_CANDIDATE_LIST", "C_SHOW_AWESOMIUMWEB_SHOP", "C_RESET_ALL_DUNGEON",
             "C_UPDATE_CONTENTS_PLAYTIME", "C_EVENT_GUIDE",
         })
             Reg(name, 0, (s, b) => ArbiterClientHandlers.OnAcceptSilently(s, b, misc));
+
+        // --- Party matching board (T78, status/PARTY-MATCH.md): publish / link / cancel, RAM-only ---
+        foreach (var (matchName, matchOp) in PartyMatchManager.ClientOpcodes)
+            Reg(matchName, PartyMatchManager.MinBodyLength(matchOp),
+                (s, body) => PartyMatchManager.OnClientPacket(s, matchOp, body));
+        PartyMatchManager.PartySize = id => PartyWiring.Manager.FindByMember(id)?.Count ?? 1;
 
         // --- Inventory window ---
         Reg("C_SHOW_ITEMLIST", 0, (s, body) =>
