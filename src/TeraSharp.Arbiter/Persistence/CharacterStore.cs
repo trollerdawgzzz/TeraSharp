@@ -1028,6 +1028,22 @@ CREATE TABLE IF NOT EXISTS cards (
 -- has T83's character_id shape when this block runs and the index would fail on a column that
 -- does not exist yet.
 
+-- T89: the In-Game Operation Tool's custom bookmarks - the teleport shortcuts a GM saves.
+-- C_ADMIN_ADD_CUSTOM_BOOKMARK carries (index, zone, x, y, z, name) and the list that comes back
+-- carries the coordinates TRUNCATED TO WHOLE NUMBERS: cap_final_gm_client2 frame 1167 sends
+-- 16920.03 / 1232.46 / -4427.045 and frame 1168 returns 16920 / 1232 / -4427. Per account,
+-- because the tool is opened from an account and not from a character.
+CREATE TABLE IF NOT EXISTS gm_bookmarks (
+  account_id     INTEGER NOT NULL,
+  bookmark_index INTEGER NOT NULL,
+  zone           INTEGER NOT NULL DEFAULT 0,
+  x              REAL    NOT NULL DEFAULT 0,
+  y              REAL    NOT NULL DEFAULT 0,
+  z              REAL    NOT NULL DEFAULT 0,
+  name           TEXT    NOT NULL DEFAULT '',
+  PRIMARY KEY (account_id, bookmark_index)
+);
+
 -- T86: and the per-CHARACTER half. SDB_MOUNT_CARD is the only card frame that names a
 -- character (UserDbId at frame 0x12), and it names a preset with it, so a mount is one card in
 -- one slot of one character's preset - not a column on the account-wide collection.
@@ -4098,6 +4114,58 @@ DELETE FROM guild_members     WHERE user_db_id = $id;";
             var rows = new List<CardMountRow>();
             using var r = cmd.ExecuteReader();
             while (r.Read()) rows.Add(new CardMountRow(r.GetInt32(0), r.GetInt32(1)));
+            return rows;
+        }
+    }
+
+    // ============================================================ T89: GM bookmarks
+
+    /// <summary>One saved teleport shortcut. The coordinates are whole numbers - see the DDL.</summary>
+    public sealed record GmBookmarkRow(int Index, int Zone, float X, float Y, float Z, string Name);
+
+    /// <summary>C_ADMIN_ADD_CUSTOM_BOOKMARK. Re-adding the same index overwrites it.</summary>
+    public void AddGmBookmark(long accountId, int index, int zone, float x, float y, float z, string? name)
+    {
+        if (accountId <= 0) return;
+        lock (_lock)
+        {
+            using var del = _db.CreateCommand();
+            del.CommandText = "DELETE FROM gm_bookmarks WHERE account_id=$k AND bookmark_index=$i";
+            del.Parameters.AddWithValue("$k", accountId);
+            del.Parameters.AddWithValue("$i", index);
+            del.ExecuteNonQuery();
+
+            using var ins = _db.CreateCommand();
+            ins.CommandText =
+                "INSERT INTO gm_bookmarks(account_id, bookmark_index, zone, x, y, z, name) " +
+                "VALUES($k,$i,$z,$x,$y,$w,$n)";
+            ins.Parameters.AddWithValue("$k", accountId);
+            ins.Parameters.AddWithValue("$i", index);
+            ins.Parameters.AddWithValue("$z", zone);
+            // Truncated on the way IN as well as out, so the row and the wire agree.
+            ins.Parameters.AddWithValue("$x", (float)(int)x);
+            ins.Parameters.AddWithValue("$y", (float)(int)y);
+            ins.Parameters.AddWithValue("$w", (float)(int)z);
+            ins.Parameters.AddWithValue("$n", name ?? string.Empty);
+            ins.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>This account's bookmarks, lowest index first.</summary>
+    public IReadOnlyList<GmBookmarkRow> GetGmBookmarks(long accountId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "SELECT bookmark_index, zone, x, y, z, name FROM gm_bookmarks WHERE account_id=$k " +
+                "ORDER BY bookmark_index";
+            cmd.Parameters.AddWithValue("$k", accountId);
+            var rows = new List<GmBookmarkRow>();
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                rows.Add(new GmBookmarkRow(r.GetInt32(0), r.GetInt32(1), (float)r.GetDouble(2),
+                                           (float)r.GetDouble(3), (float)r.GetDouble(4), r.GetString(5)));
             return rows;
         }
     }
