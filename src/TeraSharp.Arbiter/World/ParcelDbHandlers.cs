@@ -335,6 +335,30 @@ public static class ParcelDbHandlers
     public const int ParcelDataReceiverDbId = 0x50;
     public const int ParcelDataReceiverName = 0x54;
     public const int ParcelDataParcelId = 0xA0;
+    /// <summary>T79. +0xA4 is ParcelType: 102 for system mail, 1 for a player parcel
+    /// (cap_social2 seq 417 vs 2420). World already sends it, so it is echoed, not stamped.</summary>
+    public const int ParcelDataParcelType = 0xA4;
+    /// <summary>
+    /// T79. +0xA8 is the READ flag. Three captures agree: the first DBS_LIST_PARCEL that shows a
+    /// parcel has it 0 and every later listing of the same parcel has it 1 - cap_social2 seq 417
+    /// (0) then 429 (1), and cap_social4 seq 4580 where parcels 9/8/7/5 are 1 and the unopened 6
+    /// is still 0. World sends zero; the Arbiter fills it from its own row.
+    /// </summary>
+    public const int ParcelDataIsRead = 0xA8;
+    /// <summary>
+    /// T79. +0xAC starts the parcel's creation time as SIX u16s - year, month, day, hour, minute,
+    /// second - not a unix stamp: cap_social seq 1539 reads 2026/9/14 13:54:48, cap_social2 seq
+    /// 417 reads 2026/9/16 19:47:03, cap_social4 seq 4560 reads 2026/9/17 01:27:43, and the
+    /// matching SDB_MAKE_PARCEL carries twelve zero bytes there.
+    ///
+    /// <para>This is the "deletion date 2013" and "cannot claim now": we were replaying World's
+    /// zeros, so the client read year 0 and everything it computes from the send date - the
+    /// retention countdown and the claim delay - came out wrong. It is the one field in the
+    /// record the Arbiter must own, because World does not know when the row was written.</para>
+    /// </summary>
+    public const int ParcelDataCreatedAt = 0xAC;
+    /// <summary>The six u16 fields at <see cref="ParcelDataCreatedAt"/>.</summary>
+    public const int ParcelDateFields = 6;
     public const int ParcelDataMoney = 0xD0;
     public const int ParcelDataTitle = 0x960;
     /// <summary>Longest name either field has room for, in characters.</summary>
@@ -439,7 +463,36 @@ public static class ParcelDbHandlers
 
         BitConverter.GetBytes(row.ParcelId).CopyTo(rec, ParcelDataParcelId);
         BitConverter.GetBytes(row.ReceiverDbId).CopyTo(rec, ParcelDataReceiverDbId);
+        // T79: and the two fields only we know - see the constants above.
+        BitConverter.GetBytes(row.IsRead ? 1 : 0).CopyTo(rec, ParcelDataIsRead);
+        WriteRecordDate(rec, ParcelDataCreatedAt, store.GetParcelCreatedUtc(row.ParcelId));
         return rec;
+    }
+
+    /// <summary>
+    /// Write a date as the six u16s the record uses. LOCAL time, because the client renders the
+    /// value verbatim and the captured stamps are wall-clock times of the sessions they came from
+    /// (cap_social4 seq 4560 is 01:27 on a capture taken that night). That is the one part of
+    /// this field no capture pins on its own - the offset, the order and the widths all are.
+    /// </summary>
+    public static void WriteRecordDate(byte[] rec, int at, DateTime utc)
+    {
+        ArgumentNullException.ThrowIfNull(rec);
+        if (at < 0 || at + ParcelDateFields * 2 > rec.Length) return;
+        var t = utc.Kind == DateTimeKind.Utc ? utc.ToLocalTime() : utc;
+        int[] parts = { t.Year, t.Month, t.Day, t.Hour, t.Minute, t.Second };
+        for (int i = 0; i < ParcelDateFields; i++)
+            BitConverter.GetBytes((ushort)parts[i]).CopyTo(rec, at + i * 2);
+    }
+
+    /// <summary>Read the six u16s back - the tests and the log both want them.</summary>
+    public static (int Year, int Month, int Day, int Hour, int Minute, int Second) ReadRecordDate(
+        byte[] rec, int at)
+    {
+        ArgumentNullException.ThrowIfNull(rec);
+        if (at < 0 || at + ParcelDateFields * 2 > rec.Length) return default;
+        ushort U(int i) => BitConverter.ToUInt16(rec, at + i * 2);
+        return (U(0), U(1), U(2), U(3), U(4), U(5));
     }
 
     /// <summary>

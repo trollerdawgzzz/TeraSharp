@@ -615,6 +615,28 @@ public static class WarehouseHandlers
                     long delta = a.Op == TsWareChangeAmount ? -Math.Abs(a.Delta) : a.Delta;
 
                     int id = (int)a.ItemDbId;
+                    // T79: op 17 does not say WHICH warehouse row, only which template. Every
+                    // op-17 atom in every capture carries ItemDbId 0 AND src slot 0 - cap_social2
+                    // seq 2074 takes 20 of template 6550 with src (2,1,0), and seq 2096 takes 1 of
+                    // template 6560 with src (2,1,0) - while DBS_VIEW_WAREHOUSE seq 2052 shows the
+                    // two rows sitting at slots 2 and 0. Looking up (owner, inven, slot=0) found
+                    // the wrong row or none at all: template 6560 happened to be at slot 0 and
+                    // worked, template 6550 was at slot 2 and the bank kept its stack while the
+                    // bag got a fresh one. That is the withdraw "duplicating" - and it only showed
+                    // up once a second character had banked something, because the first
+                    // character's first deposit always lands at slot 0.
+                    //
+                    // So for op 17 the template is the key. (Op 2 is untouched: its atoms carry a
+                    // real ItemDbId, or a real bag slot.)
+                    if (id == 0 && a.Op == TsWareChangeAmount && a.TemplateId != 0)
+                    {
+                        var byTemplate = store.FindItemByTemplate(owner, inven, a.TemplateId);
+                        if (byTemplate is not null)
+                        {
+                            id = byTemplate.ItemDbId;
+                            slot = byTemplate.Slot;
+                        }
+                    }
                     if (id == 0) id = store.FindItemAt(owner, inven, slot)?.ItemDbId ?? 0;
 
                     if (id == 0)

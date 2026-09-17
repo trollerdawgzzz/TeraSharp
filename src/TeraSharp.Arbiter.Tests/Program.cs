@@ -17874,6 +17874,147 @@ string message
             "nor does SA_DARK_RIFT_EVENT_OPEN");
     }
 
+    // ===================== T79: the 2026-09-16 live pass, part 2 =====================
+
+    /// <summary>
+    /// SDB_USER_FORGET_SKILL (0x2792) -&gt; DBS_USER_FORGET_SKILL (0x2793). Six pairs in
+    /// cap_social4.log and not one of them was answered, so the first forgotten skill
+    /// head-blocked that account's DB queue.
+    /// </summary>
+    [Test] public static void T79_the_forget_skill_pair_is_byte_exact()
+    {
+        using var store = GuildStore(2);
+
+        // seq 5803: DlmId 0x4B7, UserDbId 1, SkillTemplateId 0x01036643, IsActive 1.
+        var (op, body) = RunHandler1(DbProxyHandlers.SDB_USER_FORGET_SKILL,
+            Hex.B("B7 04 00 00 01 00 00 00 43 66 03 01 01"), store);
+        Hex.True(op == DbProxyHandlers.DBS_USER_FORGET_SKILL,
+            $"0x2792 must answer 0x2793, got 0x{op:X4}");
+        Hex.Eq(body, "14 00 00 00 00 00 00 00 B7 04 00 00 01 00",
+            "cap_social4 seq 5804 - an empty SkillPeriodList, then DlmId, Success 1, "
+            + "DeletedSkillPeriod 0");
+
+        // The other two captured pairs differ only in the DlmId, which is the point: the id is
+        // read from the request, not invented.
+        Hex.Eq(RunHandler1(DbProxyHandlers.SDB_USER_FORGET_SKILL,
+                Hex.B("B8 04 00 00 01 00 00 00 45 66 03 01 01"), store).body,
+            "14 00 00 00 00 00 00 00 B8 04 00 00 01 00", "seq 5810");
+        Hex.True(DbProxyHandlers.IsHandledRequest(DbProxyHandlers.SDB_USER_FORGET_SKILL),
+            "and it is allow-listed, so it never falls through to the replay table");
+    }
+
+    /// <summary>
+    /// T79 (2). The withdraw that duplicated. The op-17 atom names a TEMPLATE and nothing else -
+    /// its ItemDbId and its src slot are both 0 in every capture - so resolving it by slot found
+    /// the wrong row whenever the bank row was not at slot 0. T74's test seeded slot 0 and
+    /// passed; cap_social2 seq 2074 takes template 6550 out of slot 2 (DBS_VIEW_WAREHOUSE seq
+    /// 2052), which is the case that was live-failing.
+    /// </summary>
+    [Test] public static void T79_a_warehouse_withdraw_finds_its_row_by_template()
+    {
+        using var store = GuildStore(2);
+        // The bank exactly as seq 2052 shows it: three rows, and 6550 is NOT the one at slot 0.
+        store.UpsertItem(10019, 2, WarehouseHandlers.InvenAccountWarehouse, 0, 6560, 1);
+        store.UpsertItem(10018, 2, WarehouseHandlers.InvenAccountWarehouse, 1, 17000, 1);
+        store.UpsertItem(10020, 2, WarehouseHandlers.InvenAccountWarehouse, 2, 6550, 20);
+
+        const int hdr = WarehouseHandlers.GetRequestSize;
+        var payload = new byte[hdr + 2 * DbProxyHandlers.ItemAtomSize];
+        BitConverter.GetBytes((uint)(6 + hdr)).CopyTo(payload, WarehouseHandlers.GetReqBinaryRef);
+        BitConverter.GetBytes((uint)(2 * DbProxyHandlers.ItemAtomSize))
+            .CopyTo(payload, WarehouseHandlers.GetReqBinaryRef + 4);
+        BitConverter.GetBytes(0xBCu).CopyTo(payload, WarehouseHandlers.GetReqDlmId);
+        BrokerAtom(0, WarehouseHandlers.TsInsertItem, 0, 6550, 20, 1003, 0, 0, 1003, BagItems.Pocket, 0)
+            .CopyTo(payload, hdr);
+        // src slot 0 - which is what World really sends, and is not where 6550 lives.
+        BrokerAtom(1, WarehouseHandlers.TsWareChangeAmount, 0, 6550, 20,
+                   2, WarehouseHandlers.InvenAccountWarehouse, 0,
+                   2, WarehouseHandlers.InvenAccountWarehouse, 0)
+            .CopyTo(payload, hdr + DbProxyHandlers.ItemAtomSize);
+
+        var (op, _) = RunHandler1(DbProxyHandlers.SDB_GET_WAREHOUSE, payload, store);
+        Hex.True(op == DbProxyHandlers.DBS_GET_WAREHOUSE, $"0x{op:X4}");
+
+        var bank = store.GetItems(2, WarehouseHandlers.InvenAccountWarehouse);
+        Hex.True(bank.Count == 2, $"the 6550 row is gone, the other two are untouched: {bank.Count}");
+        Hex.True(store.FindItemByTemplate(2, WarehouseHandlers.InvenAccountWarehouse, 6550) is null,
+            "the bank no longer holds template 6550 - before T79 it kept all 20 and the bag got 20 more");
+        Hex.True(store.FindItemByTemplate(2, WarehouseHandlers.InvenAccountWarehouse, 6560)?.Amount == 1
+                 && store.FindItemByTemplate(2, WarehouseHandlers.InvenAccountWarehouse, 17000)?.Amount == 1,
+            "and the row that DID sit at slot 0 was not the one decremented");
+    }
+
+    /// <summary>
+    /// T79 (3). "Cannot claim now" and a deletion date in 2013: the served ParcelData record
+    /// carried World's twelve zero bytes where the send date belongs. +0xAC is six u16s - year,
+    /// month, day, hour, minute, second - and +0xA8 is the read flag; both are the Arbiter's to
+    /// fill, because World does not know when the row was written or whether it was opened.
+    /// </summary>
+    [Test] public static void T79_the_served_parcel_record_carries_its_send_date()
+    {
+        using var store = GuildStore(2);
+        int id = store.CreateParcel(2, "Test", 1, "No subject", string.Empty, 100);
+
+        // A record exactly as World sends one: zeros at +0xA8 and +0xAC.
+        var fromWorld = new byte[ParcelDbHandlers.ParcelDataNoMsgSize];
+        BitConverter.GetBytes(2).CopyTo(fromWorld, ParcelDbHandlers.ParcelDataSenderDbId);
+        store.SetParcelRecord(id, fromWorld);
+        Hex.True(ParcelDbHandlers.ReadRecordDate(fromWorld, ParcelDbHandlers.ParcelDataCreatedAt)
+                 == (0, 0, 0, 0, 0, 0), "World's copy has year 0 - that is the bug's source");
+
+        var row = store.GetParcel(id)!;
+        var served = ParcelDbHandlers.ServedParcelRecord(store, row);
+        var date = ParcelDbHandlers.ReadRecordDate(served, ParcelDbHandlers.ParcelDataCreatedAt);
+        var now = store.GetParcelCreatedUtc(id).ToLocalTime();
+        Hex.True(date.Year == now.Year && date.Month == now.Month && date.Day == now.Day
+                 && date.Hour == now.Hour && date.Minute == now.Minute,
+            $"the served record carries the row's own send date: {date}");
+        Hex.True(date.Year >= 2020 && date.Month is >= 1 and <= 12 && date.Day is >= 1 and <= 31,
+            $"and it is a real date, not a unix stamp read as u16s: {date}");
+
+        // The read flag, and that it survives the full (RECV) form as well as the list form.
+        Hex.True(BitConverter.ToInt32(served, ParcelDbHandlers.ParcelDataIsRead) == 0,
+            "an unopened parcel: +0xA8 is 0, as cap_social2 seq 417 has it");
+        store.SetParcelRead(id, 1);
+        var reread = ParcelDbHandlers.ServedParcelRecord(store, store.GetParcel(id)!, full: true);
+        Hex.True(BitConverter.ToInt32(reread, ParcelDbHandlers.ParcelDataIsRead) == 1,
+            "and 1 once it has been opened - seq 429");
+        Hex.True(ParcelDbHandlers.ReadRecordDate(reread, ParcelDbHandlers.ParcelDataCreatedAt) == date,
+            "the full record carries the same date the list form does (seq 1539 vs 1554)");
+        Hex.True(ParcelDbHandlers.ParcelDataIsRead == 0xA8
+                 && ParcelDbHandlers.ParcelDataCreatedAt == 0xAC
+                 && ParcelDbHandlers.ParcelDataParcelType == 0xA4,
+            "the three offsets the MAKE-vs-LIST diff pins");
+    }
+
+    /// <summary>
+    /// T79 (4). The intro cinematic. The verification the brief asked for: the list the Arbiter
+    /// sends at C_LOAD_TOPO_FIN really is built from the stored rows, and the byte the client
+    /// actually reads - <c>S_VISIT_NEW_SECTION.isFirstVisit</c> - really does go to 0 the second
+    /// time a section is entered. cap_newchar_client frame 436 answers 1 and the intro plays;
+    /// cap_social_client frame 374 answers 0 for the same section and it does not.
+    /// </summary>
+    [Test] public static void T79_the_visited_section_list_survives_a_relog()
+    {
+        using var store = GuildStore(2);
+        Hex.True(store.AddVisitedSection(1, 1, 25, 0x000923D9), "a section is new the first time");
+        Hex.True(!store.AddVisitedSection(1, 1, 25, 0x000923D9),
+            "and NOT the second - isFirstVisit 0, which is what stops the cinematic");
+        Hex.True(store.AddVisitedSection(1, 9999, 25, 9827), "a different section is new again");
+
+        // and the list that goes out at C_LOAD_TOPO_FIN is cap_social_client frame 257 byte
+        // for byte once both rows are stored.
+        Hex.Eq(ArbiterClientHandlers.BuildVisitedSectionList(store.GetVisitedSections(1)),
+            "28 00  53 A8  02 00  08 00  "
+            + "08 00 18 00  01 00 00 00  19 00 00 00  D9 23 09 00  "
+            + "18 00 00 00  0F 27 00 00  19 00 00 00  63 26 00 00",
+            "S_VISITED_SECTION_LIST rebuilt from the rows, not from a literal");
+
+        // A second character's rows are its own - the list is per character, not per account.
+        Hex.Eq(ArbiterClientHandlers.BuildVisitedSectionList(store.GetVisitedSections(2)),
+            "08 00  53 A8  00 00  00 00", "character 2 has visited nothing");
+    }
+
     // ===================== T72: the broker's client windows =====================
 
     /// <summary>cap_social3_client.log seq 1472 - the search page after listing 3 was bought.</summary>

@@ -351,6 +351,14 @@ public static class ArbiterClientHandlers
         if (first)
             log.LogInformation("C_VISIT_NEW_SECTION: {Name} discovered map {Map} guard {Guard} section {Section}",
                 chr!.Name, mapId, guardId, sectionId);
+        else
+            // T79: this branch is the one that stops the zone cinematic. cap_newchar_client frame
+            // 436 answers isFirstVisit 1 and the intro plays; cap_social_client frame 374 answers
+            // 0 for the same section on an existing character and it does not. If the intro keeps
+            // replaying, this line says whether the stored row survived the relog - and a live log
+            // with no line at all means C_VISIT_NEW_SECTION is not reaching us.
+            log.LogInformation("C_VISIT_NEW_SECTION: {Name} re-entered map {Map} guard {Guard} "
+                + "section {Section} - isFirstVisit 0, no cinematic", chr?.Name, mapId, guardId, sectionId);
 
         s.Send(BuildVisitNewSection(first, mapId, guardId, sectionId));
         return true;

@@ -1110,6 +1110,7 @@ public sealed class DbProxyHandlers
             case SDB_SAVE_2924:
             case SDB_UPDATE_LEFT_COOLTIME_PREMIUM_SLOT:   // 0x28C1, T64
             case SDB_LOAD_REFER_A_FRIEND:   // 0x28B0, T69
+            case SDB_USER_FORGET_SKILL:                 // 0x2792, T79
             // --- T77: cap_social4's fifteen ---
             case SDB_UPDATE_DAILY_EXTRA_POINT:
             case SDB_UPDATE_EXTRA_POINT:
@@ -1253,6 +1254,9 @@ public sealed class DbProxyHandlers
                     BuildDbsReferAFriendList(payload.Length >= 8 ? U32(payload, 6) : 0)); return true;
 
             // --- T77: EP. The four plain acks, then the reset, which echoes its atoms. ---
+            case SDB_USER_FORGET_SKILL:
+                link.SendFrame(DBS_USER_FORGET_SKILL, BuildDbsUserForgetSkill(Ep32(payload, 0)));
+                return true;
             case SDB_UPDATE_DAILY_EXTRA_POINT: return OnUpdateDailyExtraPoint(link, payload);
             case SDB_UPDATE_EXTRA_POINT:       return OnUpdateExtraPoint(link, payload);
             case SDB_UPDATE_PRE_EP_INFO:       return OnUpdatePreEpInfo(link, payload);
@@ -1543,6 +1547,37 @@ public sealed class DbProxyHandlers
     /// levelling rewards in this capture.</summary>
     public const ushort SA_MAKE_SYS_PARCEL = 0x1479;
     public const ushort AS_MAKE_SYS_PARCEL = 0x147A;
+
+    /// <summary>
+    /// SDB_USER_FORGET_SKILL (0x2792) -&gt; DBS_USER_FORGET_SKILL (0x2793). Unlearning one skill.
+    /// Six pairs in cap_social4.log (seq 5803, 5808, 5815, ...) and not one of them was answered,
+    /// so the account's DB queue head-blocked on the first one every time a skill was forgotten.
+    ///
+    /// <para>Request, dumper guard 0x12 (Arb_part_018.c:459):
+    /// <c>DlmId@06, UserDbId@0A, SkillTemplateId@0E, IsActive@12 (u8)</c> - 19 bytes.
+    /// Reply, guard 0x13 (Arb_part_016.c:202):
+    /// <c>SkillPeriodList ref@06, DlmId@0E, Success@12 (u8), DeletedSkillPeriod@13 (u8)</c> -
+    /// 20 bytes, and the list is empty in all six: <c>14 00 00 00 00 00 00 00 &lt;dlm&gt; 01 00</c>,
+    /// offset = frame length, count 0.</para>
+    ///
+    /// <para>The SkillPeriodList is the timed (rented) skills the refund would return, and
+    /// <c>DeletedSkillPeriod</c> says whether one was consumed. TeraSharp models neither timed
+    /// skills nor the learned-skill set, so the honest answer is the one the capture shows for a
+    /// permanent skill: empty list, DeletedSkillPeriod 0.</para>
+    /// </summary>
+    public const ushort SDB_USER_FORGET_SKILL = 0x2792;
+    public const ushort DBS_USER_FORGET_SKILL = 0x2793;
+
+    /// <summary>DBS_USER_FORGET_SKILL (0x2793), frame 0x14 - cap_social4.log seq 5804.</summary>
+    public static byte[] BuildDbsUserForgetSkill(uint dlmId, bool ok = true, bool deletedPeriod = false)
+    {
+        var p = new byte[14];
+        BitConverter.GetBytes(20u).CopyTo(p, 0);        // offset = frame length, count 0
+        BitConverter.GetBytes(dlmId).CopyTo(p, 8);
+        p[12] = (byte)(ok ? 1 : 0);
+        p[13] = (byte)(deletedPeriod ? 1 : 0);
+        return p;
+    }
 
     /// <summary>DBS_INIT_LIMIT_REMAIN_REPUTATION (0x2894), frame 0x13. Success comes FIRST here,
     /// ahead of the DlmId - the one reply in this batch that does.

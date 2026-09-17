@@ -4081,6 +4081,33 @@ DELETE FROM guild_members     WHERE user_db_id = $id;";
     }
 
     /// <summary>
+    /// T79. The row holding <paramref name="templateId"/> in one pocket, lowest slot first, or
+    /// null. The warehouse amount atom (TS op 0x11) names a template and nothing else - its
+    /// ItemDbId and its src slot are both 0 in every capture - so this is the only way to find
+    /// the row it means. Stacks of one template share a row, which is why "lowest slot" is not
+    /// an arbitrary tie-break: there is normally only one.
+    /// </summary>
+    public ItemRow? FindItemByTemplate(long ownerDbId, int invenType, long templateId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "SELECT item_db_id, owner_db_id, inven_type, slot, template_id, amount, record " +
+                "FROM items WHERE owner_db_id=$o AND inven_type=$t AND template_id=$tpl " +
+                "ORDER BY slot, item_db_id LIMIT 1";
+            cmd.Parameters.AddWithValue("$o", ownerDbId);
+            cmd.Parameters.AddWithValue("$t", invenType);
+            cmd.Parameters.AddWithValue("$tpl", templateId);
+            using var r = cmd.ExecuteReader();
+            if (!r.Read()) return null;
+            byte[]? rec = r.IsDBNull(6) ? null : (byte[])r["record"];
+            return new ItemRow(r.GetInt32(0), r.GetInt64(1), r.GetInt32(2), r.GetInt32(3),
+                               r.GetInt32(4), r.GetInt64(5), rec);
+        }
+    }
+
+    /// <summary>
     /// Exchange the positions of two rows (DO_TS_CHANGE_ITEM_POS with both slots occupied - the
     /// op the client sends when you drag one item onto another). Done in one lock so a reader
     /// can never see both items in the same slot.
@@ -4272,6 +4299,27 @@ DELETE FROM guild_members     WHERE user_db_id = $id;";
             return new ParcelRow(r.GetInt32(0), r.GetInt32(1), r.GetString(2), r.GetInt32(3),
                                  r.GetString(4), r.GetString(5), r.GetInt64(6), r.GetInt32(7),
                                  r.GetInt32(8), r.GetInt32(9) != 0, r.GetInt32(10) != 0);
+        }
+    }
+
+    /// <summary>
+    /// T79. When the parcel row was written, UTC. The served ParcelData record carries it as six
+    /// u16s at +0xAC and the client computes the retention countdown and the claim delay from it,
+    /// so a parcel with no row reads back <see cref="DateTime.UtcNow"/> rather than year 0.
+    /// </summary>
+    public DateTime GetParcelCreatedUtc(int parcelId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT created_at FROM parcels WHERE parcel_id=$id";
+            cmd.Parameters.AddWithValue("$id", parcelId);
+            var raw = cmd.ExecuteScalar() as string;
+            return DateTime.TryParse(raw, System.Globalization.CultureInfo.InvariantCulture,
+                       System.Globalization.DateTimeStyles.AssumeUniversal
+                       | System.Globalization.DateTimeStyles.AdjustToUniversal, out var t)
+                ? DateTime.SpecifyKind(t, DateTimeKind.Utc)
+                : DateTime.UtcNow;
         }
     }
 
