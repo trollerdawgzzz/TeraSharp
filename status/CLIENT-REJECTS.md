@@ -782,3 +782,54 @@ request’s 1712-byte blob unchanged**, so the only thing the Arbiter owns is th
 
 Implemented as `SDB_ASK_CHANGE_CHAR_NAME` / `SDB_DO_CHANGE_CHAR_NAME` in `DbProxyHandlers`.
 `SA_UPDATE_RANK_USERNAME` (0x161C) is a push with no reply and is **not** handled yet.
+
+## 14. T90 — the last three cap_final frames, and two things that were already done
+
+| tap | opcode | shape | verdict |
+|---|---|---|---|
+| 2500 → 2504 | `SDB_GIVE_GUILD_MONEY_INCENTIVE` 0x27A0 → `DBS_` 0x27A1 | `[u32 reqId][u32 playerId][u32 guildId][float rate]` → `[u32 reqId][u8 ok]` | **implemented** |
+| 2501 | `AS_UPDATE_GUILD_DATA` 0x144E, 9134 B | the full guild blob | **still open** — guild-wiring push |
+| 6129 | `SA_UPDATE_RANK_USERNAME` 0x161C | `[u32 nameOff=14][u32 charId][wchar name]`, one-way | **sealed**, re-applies the name |
+| 6145 | `SA_START_CHANGE_APPEARANCE` 0x1498 | 32 B, one-way | **sealed**, nothing to persist |
+
+### 14.1 The appearance change never reaches the Arbiter
+
+The brief expected `C_COMMIT_CHANGE_USER_APPEARANCE` (cap_final_client4 1838, 132 B) to land on
+the characters row. It does not. The whole flow — `S_PREPARE_CHANGE_USER_APPEARANCE` (1748),
+`S_RACE_CHANGE_RESTRICTION` (1833), `S_START_CHANGE_USER_APPEARANCE` (1834), the commit (1838),
+`S_END_CHANGE_USER_APPEARANCE` (1839) — puts exactly **one** frame on the World link, the one-way
+`SA_START_CHANGE_APPEARANCE` at tap 6145.
+
+The proof is the gap: **the tap is empty between 6145 (04:43:07) and 6221 (04:43:17)**, and the
+commit happened inside it. World keeps the new look on its live user and it reaches the row
+through the ordinary save at the next hand-off — tap 6232 (`0x27FA`) and 6246 (`0x27CB`) in the
+relog burst that follows. So there is no appearance-specific write to implement, and
+`SA_USER_CHANGE_CLASS_RACE_GENDER` (0x28F0) never fires at all: the session changed appearance,
+not race.
+
+### 14.2 Two units of the brief were already built
+
+* **The wanted-board apply flow is Arbiter-owned and already implemented.**
+  `C_REQUEST_GUILD_INFO_BEFORE_APPLY_GUILD`, `C_APPLY_GUILD`, `C_GUILD_APPLY_LIST`,
+  `C_ACCEPT_GUILD_APPLY`, `S_GUILD_APPLY_LIST`, `S_ADD_GUILD_MEMBER`,
+  `S_REQUEST_JOIN_GUILD_NOTICE` and the `AS_ADD_GUILDMEMBER` push all live in `GuildHandlers`.
+  The tap confirms the routing: the accept at cap_final_client4 2834 produces **only** the
+  Arbiter→World push `AS_ADD_GUILDMEMBER` (0x140A) at tap 7589, with no `SA_` before it — the
+  client packet came straight to us. `C_REJECT_GUILD_APPLY` is the one member of the family with
+  no handler, and it is absent from all six client logs.
+* **`C_CHECK_USERNAME` → `S_CHECK_USERNAME` is already implemented and already pinned.**
+  cap_final_client3 2392/2393 is `05 00 D8 84 01` — byte-identical to the cap_newchar frame the
+  existing test asserts, so this is a second capture confirming the same 5-byte form, not new work.
+
+### 14.3 Still open, with frame numbers
+
+* `AS_UPDATE_GUILD_DATA` 0x144E (tap 2501) — the 9134-byte guild blob pushed after an incentive.
+  Belongs with the other guild pushes in `GuildWiring` (human-owned).
+* **The incentive payout amount.** `Guild::GiveGuildMoneyIncentive` (Arb_part_046.c:4489) gates on
+  membership, a cooldown and a rate cap (SMT 3880 / 3881), but the formula is past the part read
+  and the capture shows guild money only AFTER the grant (8898665). We gate, stamp the cooldown
+  and answer ok; the amount is deliberately not invented.
+* `C_REJECT_GUILD_APPLY` — no handler, no capture.
+* Byte-exact pins for the apply flow: the def-driven builders would need a registry fixture like
+  `CreateT82Defs`. Ground truth is now available — c3 2920, 2938, 2996, 3014, 3016, 3017, 3019;
+  c4 2781, 2789, 2822, 2835.

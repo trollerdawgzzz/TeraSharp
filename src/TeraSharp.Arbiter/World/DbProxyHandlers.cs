@@ -995,6 +995,48 @@ public sealed class DbProxyHandlers
     public const ushort SDB_ASK_CHANGE_CHAR_NAME = 0x2854; public const ushort DBS_ASK_CHANGE_CHAR_NAME = 0x2855;
     public const ushort SDB_DO_CHANGE_CHAR_NAME  = 0x2856; public const ushort DBS_DO_CHANGE_CHAR_NAME  = 0x2857;
 
+    // --- T90: SA_UPDATE_RANK_USERNAME (0x161C), tap 6129 ---
+    // The third leg of the rename. One-way: World tells us the ranking name changed and
+    // expects nothing back. Payload [u32 nameOff=14][u32 charId][wchar name] - the same id and
+    // name SDB_DO_CHANGE_CHAR_NAME just wrote, so applying it again is idempotent and makes
+    // the rename survive a dropped 0x2856.
+    public const ushort SA_UPDATE_RANK_USERNAME = 0x161C;
+
+    // --- T90: SA_START_CHANGE_APPEARANCE (0x1498), tap 6145 ---
+    // One-way, and the ONLY frame the appearance change puts on the World link. cap_final
+    // client4 runs the whole flow - S_PREPARE (1748), S_RACE_CHANGE_RESTRICTION (1833),
+    // S_START (1834), C_COMMIT_CHANGE_USER_APPEARANCE (1838), S_END (1839) - and none of it
+    // reaches us. The new customize blob lands in the characters row through the ordinary
+    // user save at the next world hand-off (tap 6232 0x27FA / 6246 0x27CB), not through any
+    // appearance-specific write. So there is nothing here to persist; sealing the opcode only
+    // keeps it off the replay table.
+    public const ushort SA_START_CHANGE_APPEARANCE = 0x1498;
+
+    // --- T90: SDB_GIVE_GUILD_MONEY_INCENTIVE (0x27A0) -> DBS (0x27A1) ---
+    // cap_final tap 2500 -> 2501 (AS_UPDATE_GUILD_DATA 0x144E, 9134 B) -> 2504. The client
+    // packet is C_REQUEST_GUILD_INCENTIVE (cap_final_gm_client 2269), so this is World-routed.
+    // Handler_SDB_GIVE_GUILD_MONEY_INCENTIVE (Arb_part_063.c:7177) guards frame >= 0x16 and
+    // reads reqId at frame 6, playerId at 10, guildId at 14 and the rate float at 18.
+    //
+    //   tap 2500  BB 00 00 00  EB 03 00 00  02 00 00 00  AE 47 E1 3D   (req 187, 1003, guild 2, 0.11f)
+    //   tap 2504  BB 00 00 00  01
+    //
+    // Guild::GiveGuildMoneyIncentive (Arb_part_046.c:4489) gates on membership, a cooldown and
+    // a rate cap, raising SMT 3880 / 3881 on the two failures. The payout itself is past the
+    // part that could be read, and the capture shows the guild money AFTER (8898665) but not
+    // before - so the amount is NOT modelled here. See status/CLIENT-REJECTS.md section 13.2.
+    public const ushort SDB_GIVE_GUILD_MONEY_INCENTIVE = 0x27A0;
+    public const ushort DBS_GIVE_GUILD_MONEY_INCENTIVE = 0x27A1;
+
+    /// <summary>AS_UPDATE_GUILD_DATA (0x144E) - the full guild blob the Arbiter pushes after an
+    /// incentive (tap 2501). Built by the guild wiring, not here; declared so the number has one
+    /// home.</summary>
+    public const ushort AS_UPDATE_GUILD_DATA = 0x144E;
+
+    /// <summary>Seconds between incentives. The capture has one grant, so this is our floor,
+    /// not an observed value - the real number comes from a config sheet we do not load.</summary>
+    public const int GuildIncentiveCooldownSeconds = 82800;   // 23 h, the usual daily shape
+
     /// <summary>Shortest name tap 6094 accepts. "Dob" (three) is refused, "dobb" (four) is not.</summary>
     public const int MinCharacterNameLength = 4;
     /// <summary>Longest name the characters row is built for.</summary>
@@ -1190,6 +1232,9 @@ public sealed class DbProxyHandlers
             case SDB_UPDATE_SEREN_GUIDE_INFO:     // 0x2945 = [reqId][playerId][ok]
             case SDB_ASK_CHANGE_CHAR_NAME:        // 0x2854, T88 - the rename name check
             case SDB_DO_CHANGE_CHAR_NAME:         // 0x2856, T88 - the rename itself
+            case SA_UPDATE_RANK_USERNAME:         // 0x161C, T90 - one-way rename echo
+            case SA_START_CHANGE_APPEARANCE:      // 0x1498, T90 - one-way, nothing to persist
+            case SDB_GIVE_GUILD_MONEY_INCENTIVE:  // 0x27A0, T90
             case SDB_UPDATE_USER_DAILY_EVENT_COUNT: // 0x293D = [reqId][ok], reqId at payload[8]
             case SDB_UPDATE_GET_EXTRA_REWARD:     // 0x293F = [reqId][ok]
             // --- T22: the per-character login loads, rebuilt from rows instead of replaying
@@ -1355,6 +1400,9 @@ public sealed class DbProxyHandlers
             case SDB_UPDATE_SEREN_GUIDE_INFO:       return OnUpdateSerenGuide(link, payload);
             case SDB_ASK_CHANGE_CHAR_NAME:          return OnAskChangeCharName(link, payload);
             case SDB_DO_CHANGE_CHAR_NAME:           return OnDoChangeCharName(link, payload);
+            case SA_UPDATE_RANK_USERNAME:           return OnUpdateRankUsername(payload);
+            case SA_START_CHANGE_APPEARANCE:        return OnStartChangeAppearance(payload);
+            case SDB_GIVE_GUILD_MONEY_INCENTIVE:    return OnGiveGuildMoneyIncentive(link, payload);
             case SDB_UPDATE_USER_DAILY_EVENT_COUNT: link.SendFrame(DBS_UPDATE_USER_DAILY_EVENT_COUNT, BuildReqIdAck(payload, 8)); return true;
             case SDB_UPDATE_GET_EXTRA_REWARD:       link.SendFrame(DBS_UPDATE_GET_EXTRA_REWARD, BuildReqIdAck(payload, 0)); return true;
 
@@ -3438,6 +3486,82 @@ public sealed class DbProxyHandlers
     }
 
     /// <summary>SDB_UPDATE_SEREN_GUIDE_INFO (0x2944): store the slot, then ack.</summary>
+    /// <summary>DBS_GIVE_GUILD_MONEY_INCENTIVE (0x27A1): <c>[u32 reqId][u8 ok]</c>, 5 bytes.
+    /// Tap 2504 is <c>BB 00 00 00 01</c>.</summary>
+    public static byte[] BuildDbsGiveGuildMoneyIncentive(uint reqId, bool ok)
+    {
+        var r = new byte[5];
+        BitConverter.GetBytes(reqId).CopyTo(r, 0);
+        r[4] = (byte)(ok ? 1 : 0);
+        return r;
+    }
+
+    /// <summary>
+    /// SA_UPDATE_RANK_USERNAME (0x161C). One-way. Re-applies the name to the row, which is a
+    /// no-op after a successful SDB_DO_CHANGE_CHAR_NAME and a repair after a missed one.
+    /// </summary>
+    private bool OnUpdateRankUsername(byte[] payload)
+    {
+        if (payload.Length < 8) return true;
+        int nameOff = (int)BitConverter.ToUInt32(payload, 0) - 6;
+        int charId  = (int)BitConverter.ToUInt32(payload, 4);
+        string name = ReadName(payload, nameOff);
+        if (_store is null || charId <= 0 || name.Length == 0) return true;
+        if (!string.Equals(_store.GetCharacterName(charId), name, StringComparison.Ordinal)
+            && _store.RenameCharacter(charId, name))
+            _log.LogInformation("SA_UPDATE_RANK_USERNAME: character {Cid} renamed to {Name}", charId, name);
+        return true;
+    }
+
+    /// <summary>
+    /// SA_START_CHANGE_APPEARANCE (0x1498). One-way, and nothing in it needs storing - the new
+    /// customize blob arrives with the ordinary user save at the next hand-off.
+    /// </summary>
+    private bool OnStartChangeAppearance(byte[] payload)
+    {
+        _log.LogDebug("SA_START_CHANGE_APPEARANCE ({Len} B) - appearance is saved with the user, not here",
+            payload.Length);
+        return true;
+    }
+
+    /// <summary>
+    /// SDB_GIVE_GUILD_MONEY_INCENTIVE (0x27A0) -&gt; DBS (0x27A1). Gates on guild membership and
+    /// the cooldown, stamps the cooldown, and answers the captured five-byte form.
+    ///
+    /// <para><b>The payout is deliberately not modelled.</b> The capture shows one grant and
+    /// only the guild money AFTER it, so the amount cannot be derived from these bytes - see
+    /// status/CLIENT-REJECTS.md section 13.2. Answering ok keeps World unblocked; inventing an
+    /// amount would silently drain guild funds.</para>
+    /// </summary>
+    private bool OnGiveGuildMoneyIncentive(WorldLink link, byte[] payload)
+    {
+        uint reqId  = payload.Length >= 4  ? BitConverter.ToUInt32(payload, 0) : 0;
+        int playerId = payload.Length >= 8  ? (int)BitConverter.ToUInt32(payload, 4) : 0;
+        int guildId  = payload.Length >= 12 ? (int)BitConverter.ToUInt32(payload, 8) : 0;
+        float rate   = payload.Length >= 16 ? BitConverter.ToSingle(payload, 12) : 0f;
+
+        bool ok = false;
+        if (_store is not null && playerId > 0 && guildId > 0)
+        {
+            long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            long last = _store.GetGuildIncentiveTime(guildId);
+            if (_store.GetGuildIdOf(playerId) != guildId)
+                _log.LogInformation("SDB_GIVE_GUILD_MONEY_INCENTIVE: player {Pid} is not in guild {Gid}",
+                    playerId, guildId);
+            else if (now - last < GuildIncentiveCooldownSeconds)
+                _log.LogInformation("SDB_GIVE_GUILD_MONEY_INCENTIVE: guild {Gid} still on cooldown", guildId);
+            else
+            {
+                _store.SetGuildIncentiveTime(guildId, now);
+                ok = true;
+                _log.LogInformation("SDB_GIVE_GUILD_MONEY_INCENTIVE: guild {Gid} rate {Rate} granted by {Pid}",
+                    guildId, rate, playerId);
+            }
+        }
+        link.SendFrame(DBS_GIVE_GUILD_MONEY_INCENTIVE, BuildDbsGiveGuildMoneyIncentive(reqId, ok));
+        return true;
+    }
+
     /// <summary>DBS_ASK_CHANGE_CHAR_NAME (0x2855): <c>[u32 reqId][u8 ok][u32 code]</c>, 9 bytes.
     /// Tap 6094 is <c>99 00 00 00 00 01 00 00 00</c> and 6119 <c>9A 00 00 00 01 00 00 00 00</c>.</summary>
     public static byte[] BuildDbsAskChangeCharName(uint reqId, int code)
