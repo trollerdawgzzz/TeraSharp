@@ -196,6 +196,11 @@ public static class HandlerRegistry
                 (s, body) => PartyMatchManager.OnClientPacket(s, matchOp, body));
         PartyMatchManager.PartySize = id => PartyWiring.Manager.FindByMember(id)?.Count ?? 1;
 
+        // --- Guild war (T80, status/GUILD-WAR.md): check / declare / withdraw / window, persisted ---
+        foreach (var (warName, warOp) in GuildWarManager.ClientOpcodes)
+            Reg(warName, GuildWarManager.MinBodyLength(warOp),
+                (s, body) => GuildWarManager.OnClientPacket(s, warOp, body));
+
         // --- Inventory window ---
         Reg("C_SHOW_ITEMLIST", 0, (s, body) =>
         {
