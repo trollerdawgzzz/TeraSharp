@@ -72,6 +72,9 @@ public static class ArbiterClientHandlers
     public const ushort C_FINDNAME = 0x7B75;               // 31605
     public const ushort S_FINDNAME = 0xF95D;               // 63837
 
+    /// <summary>T75. The sections the client already knows it has seen. Server-&gt;client only.</summary>
+    public const ushort S_VISITED_SECTION_LIST = 0xA853;   // 43091
+
     /// <summary>
     /// Every opcode above, as an explicit statement that these are the ARBITER's. The forwarding
     /// fallback in <c>PacketDispatcher</c> must never apply to one of them: forwarding produces
@@ -831,6 +834,65 @@ public static class ArbiterClientHandlers
         return true;
     }
 
+    // =========================================================================================
+    // 13. S_VISITED_SECTION_LIST                            (T75, the intro cutscene replay)
+    // =========================================================================================
+
+    /// <summary>
+    /// S_VISITED_SECTION_LIST (0xA853). The client plays a section's intro cinematic when it has
+    /// no record of having been there. T45 stored the visits and pushed them to World as
+    /// AS_UPDATE_VISITED_SECTION_LIST, but never told the CLIENT - so on Island of Dawn the intro
+    /// replayed on every relog. Inside an instance it did not, because the instance's section is
+    /// re-entered within the session and S_VISIT_NEW_SECTION alone is enough.
+    ///
+    /// <para>The real Arbiter sends it immediately after C_LOAD_TOPO_FIN:
+    /// <c>D:\packetlogs\cap_social_client_ctl.txt</c> frame 256 is the C_LOAD_TOPO_FIN and 257 is
+    /// this packet - the same point where HandlerRegistry already pushes the World-side list.</para>
+    ///
+    /// <para>Standard TERA list encoding, the same shape as S_WATCHED_MOVIES: count at 0x04, the
+    /// first entry's offset at 0x06, each entry carrying its own offset and the next one's.
+    /// The three u32 fields are the same (mapId, guardId, sectionId) triple that
+    /// S_VISIT_NEW_SECTION and the stored row carry.</para>
+    /// </summary>
+    public const int VisitedSectionListFixedSize = 8;
+    /// <summary><c>[u16 here][u16 next][u32 mapId][u32 guardId][u32 sectionId]</c>.</summary>
+    public const int VisitedSectionListEntrySize = 16;
+
+    public static byte[] BuildVisitedSectionList(IReadOnlyList<CharacterStore.VisitedSection>? sections)
+    {
+        sections ??= Array.Empty<CharacterStore.VisitedSection>();
+        int n = sections.Count;
+        int total = VisitedSectionListFixedSize + n * VisitedSectionListEntrySize;
+        var p = new byte[total];
+        BitConverter.GetBytes((ushort)total).CopyTo(p, 0);
+        BitConverter.GetBytes(S_VISITED_SECTION_LIST).CopyTo(p, 2);
+        BitConverter.GetBytes((ushort)n).CopyTo(p, 4);
+        BitConverter.GetBytes((ushort)(n == 0 ? 0 : VisitedSectionListFixedSize)).CopyTo(p, 6);
+        for (int i = 0; i < n; i++)
+        {
+            int at = VisitedSectionListFixedSize + i * VisitedSectionListEntrySize;
+            BitConverter.GetBytes((ushort)at).CopyTo(p, at);
+            BitConverter.GetBytes((ushort)(i == n - 1 ? 0 : at + VisitedSectionListEntrySize)).CopyTo(p, at + 2);
+            BitConverter.GetBytes(sections[i].MapId).CopyTo(p, at + 4);
+            BitConverter.GetBytes(sections[i].GuardId).CopyTo(p, at + 8);
+            BitConverter.GetBytes(sections[i].SectionId).CopyTo(p, at + 12);
+        }
+        return p;
+    }
+
+    /// <summary>
+    /// The whole stored list for this character, ready to send. Returns an empty packet (8 bytes,
+    /// both slots zero) when nothing is stored, which is still an answer - the client only replays
+    /// an intro for a section absent from it.
+    /// </summary>
+    public static byte[] BuildVisitedSectionListFor(GameSession s)
+    {
+        var chr = s?.SelectedCharacter;
+        var rows = chr != null && Program.Store != null
+            ? Program.Store.GetVisitedSections((int)chr.Id)
+            : (IReadOnlyList<CharacterStore.VisitedSection>)Array.Empty<CharacterStore.VisitedSection>();
+        return BuildVisitedSectionList(rows);
+    }
     // ---------------------------------------------------------------- helpers
 
     /// <summary>

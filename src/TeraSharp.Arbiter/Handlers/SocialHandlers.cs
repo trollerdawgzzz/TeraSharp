@@ -748,7 +748,11 @@ public sealed class SocialHandlers
         // T64: the accepter first, then the requester - the order at seq 1985/1986.
         PushFriendCounts(store, me, requester.Id);
 
-        SendSmt(s, SmtAcceptedToAccepter);
+        // T75: with no parameter the client has nothing to substitute into SMT 433 and prints
+        // the placeholder itself. Both sides get the OTHER party's name - cap_social_client
+        // frame 1436 is "@433\vUserName\vtwo" on the requester's side, and the accepter's copy
+        // is the same message with the requester's name.
+        SendSmt(s, SmtAcceptedToAccepter, "UserName", requester.Name);
         SendFriendList(s);
         SendUpdateFriendInfo(s);
 
