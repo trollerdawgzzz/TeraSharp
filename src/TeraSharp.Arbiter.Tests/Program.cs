@@ -9652,6 +9652,117 @@ array<uint32> items3
             "C_CANCEL_RETURN_TO_LOBBY stays out: the registry answers AND forwards it");
     }
 
+
+    // =======================================================================================
+    // T88 - the scheduled character delete and its cancel.
+    // Ground truth: cap_final_client2 frames 32 and 33. Research: status/CLIENT-REJECTS.md.
+    // =======================================================================================
+
+    /// <summary>
+    /// T88 - S_CANCEL_DELETE_USER, byte-exact against cap_final_client2 frame 33.
+    ///
+    /// <para><b>Arbiter-direct.</b> Frames 32 and 33 sit before S_GET_USER_LIST at frame 35, so
+    /// no character is picked and the World link is not involved. There is no shipped def: the
+    /// frame is five raw bytes.</para>
+    /// </summary>
+    [Test] public static void T88_cancel_delete_user_matches_cap_final()
+    {
+        Hex.Eq(CharacterHandlers.BuildCancelDeleteUser(true), "05 00 27 59 01",
+            "frame 33 - the cancel succeeded");
+        Hex.Eq(CharacterHandlers.BuildCancelDeleteUser(false), "05 00 27 59 00",
+            "and the refusal form, which the no-free-slot branch sends before its 0x2B3 message");
+        Hex.True(CharacterHandlers.S_CANCEL_DELETE_USER == 0x5927
+                 && CharacterHandlers.CancelDeleteUserBodySize == 4,
+            "opcode 0x5927, and the handler's packet guard of 8 is a body minimum of 4");
+        Hex.True(CharacterHandlers.SmtCancelDeleteNoSlot == 691,
+            "0x2B3 is the message the else branch raises");
+    }
+
+    /// <summary>
+    /// T88 - the <c>characters.delete_at</c> round trip. The real Arbiter keeps a doomed
+    /// character LISTED while its timer runs - that is what S_GET_USER_LIST.deleteRemainSec
+    /// reports - so the stamp is a column, not a row removal.
+    /// </summary>
+    [Test] public static void T88_scheduled_delete_round_trips()
+    {
+        using var store = StoreWithTwoAccounts();
+        var acct = store.GetOrCreateAccount("acct1");
+
+        Hex.True(store.GetCharacterDeleteAt(1) == 0, "a fresh character has nothing pending");
+        Hex.True(store.ScheduleCharacterDelete(1, acct.Id, 1789620000L), "the stamp goes on");
+        Hex.True(store.GetCharacterDeleteAt(1) == 1789620000L, "and reads back");
+
+        Hex.True(!store.CancelCharacterDelete(1, acct.Id + 99), "another account cannot cancel it");
+        Hex.True(store.GetCharacterDeleteAt(1) == 1789620000L, "so the stamp survives that");
+
+        Hex.True(store.CancelCharacterDelete(1, acct.Id), "the owner can");
+        Hex.True(store.GetCharacterDeleteAt(1) == 0, "and the stamp is gone");
+        Hex.True(!store.CancelCharacterDelete(1, acct.Id),
+            "a second cancel reports FALSE - nothing was pending, and the reply carries that bool");
+    }
+
+
+    /// <summary>
+    /// T88 - the character rename, byte-exact against the cap_final tap.
+    ///
+    /// <para><b>World-routed.</b> cap_final_client4 sends C_REQUEST_USABLE_CHARACTER_NAME (1702,
+    /// 1721) and C_REQUEST_CHANGE_CHARACTER_NAME (1726) to World, and World asks us:
+    /// SDB_ASK_CHANGE_CHAR_NAME at tap 6093 / 6118 and SDB_DO_CHANGE_CHAR_NAME at 6126.</para>
+    ///
+    /// <para><b>resultCode 0 means USABLE.</b> The three-letter "Dob" is refused with ok=0 and
+    /// code=1; "dobb" is accepted with ok=1 and code=0. The client frames carry the same numbers
+    /// (1703 = 01 00 00 00 for the refusal, 1722 = 00 00 00 00 for the acceptance), so a bool
+    /// reading of either packet inverts the answer.</para>
+    /// </summary>
+    [Test] public static void T88_change_char_name_replies_match_cap_final()
+    {
+        Hex.Eq(DbProxyHandlers.BuildDbsAskChangeCharName(0x99, 1),
+            "99 00 00 00  00  01 00 00 00", "tap 6094 - Dob refused, code 1");
+        Hex.Eq(DbProxyHandlers.BuildDbsAskChangeCharName(0x9A, 0),
+            "9A 00 00 00  01  00 00 00 00", "tap 6119 - dobb accepted, code 0");
+
+        // Tap 6127's header, with a stand-in blob: the real one is 1712 bytes echoed verbatim.
+        var blob = new byte[] { 0xDE, 0xAD, 0xBE, 0xEF };
+        Hex.Eq(DbProxyHandlers.BuildDbsDoChangeCharName(0x9B, 1, 0, blob),
+            "17 00 00 00  04 00 00 00  9B 00 00 00  01 00 00 00  00  DE AD BE EF",
+            "tap 6127 - blob offset 23 is frame-relative, and the blob comes back unchanged");
+
+        Hex.True(DbProxyHandlers.BuildDbsDoChangeCharName(0x9B, 1, 0, new byte[1712]).Length == 1729,
+            "the real reply is 1729 payload bytes, i.e. the 1735-byte frame at tap 6127");
+    }
+
+    /// <summary>T88 - both rename opcodes reach a handler instead of the replay table.</summary>
+    [Test] public static void T88_change_char_name_opcodes_are_handled()
+    {
+        Hex.True(DbProxyHandlers.IsHandledRequest(DbProxyHandlers.SDB_ASK_CHANGE_CHAR_NAME)
+                 && DbProxyHandlers.IsHandledRequest(DbProxyHandlers.SDB_DO_CHANGE_CHAR_NAME),
+            "0x2854 and 0x2856 are on the allow-list");
+        Hex.True(DbProxyHandlers.SDB_ASK_CHANGE_CHAR_NAME == 0x2854
+                 && DbProxyHandlers.DBS_ASK_CHANGE_CHAR_NAME == 0x2855
+                 && DbProxyHandlers.SDB_DO_CHANGE_CHAR_NAME == 0x2856
+                 && DbProxyHandlers.DBS_DO_CHANGE_CHAR_NAME == 0x2857,
+            "the four opcodes of the two exchanges");
+
+        // Tap 6118 verbatim: [u32 nameOff=18][u32 reqId][u32 charId][wchar "dobb"].
+        var ask = new byte[] { 0x12,0,0,0, 0x9A,0,0,0, 0x01,0,0,0,
+                               0x64,0, 0x6F,0, 0x62,0, 0x62,0, 0,0 };
+        Hex.True(HandlerAccepts(DbProxyHandlers.SDB_ASK_CHANGE_CHAR_NAME, ask),
+            "the ask is answered, not replayed");
+    }
+
+    /// <summary>T88 - the rename round trip on the characters row.</summary>
+    [Test] public static void T88_rename_character_round_trips()
+    {
+        using var store = StoreWithTwoAccounts();
+        Hex.True(store.GetCharacterName(1) == "t30_1", "the seeded name");
+        Hex.True(store.RenameCharacter(1, "dobb"), "the rename lands");
+        Hex.True(store.GetCharacterName(1) == "dobb", "and reads back");
+        Hex.True(!store.RenameCharacter(2, "DOBB"),
+            "the UNIQUE COLLATE NOCASE index refuses a case-only collision rather than throwing");
+        Hex.True(store.GetCharacterName(2) == "t30_2", "so the other character is untouched");
+        Hex.True(!store.RenameCharacter(999, "ghost"), "a missing row is a false, not an exception");
+    }
+
     // ---- The rules ----
 
     [Test] public static void T30_system_message_format_matches_the_capture()

@@ -977,6 +977,32 @@ public sealed class DbProxyHandlers
     // user. We always answer; ok = 1 matches every captured reply.
     public const ushort SDB_UPDATE_SEREN_GUIDE_INFO = 0x2944; public const ushort DBS_UPDATE_SEREN_GUIDE_INFO = 0x2945;
 
+    // --- T88: the character rename, cap_final tap frames 6093/6094, 6118/6119, 6126/6127 ---
+    // The rename is World-routed: the client sends C_REQUEST_USABLE_CHARACTER_NAME and
+    // C_REQUEST_CHANGE_CHARACTER_NAME to World (cap_final_client4 1702/1703, 1721/1722,
+    // 1726/1728), and World asks US. Offsets below are FRAME-relative in the decompile;
+    // payload index = frame offset - 6.
+    //
+    //   SDB_ASK 0x2854  [u32 nameOff=18][u32 reqId][u32 charId][wchar name]   frame >= 0x12
+    //   DBS_ASK 0x2855  [u32 reqId][u8 ok][u32 resultCode]                    payload 9
+    //   SDB_DO  0x2856  [u32 nameOff][u32 blobOff][u32 blobLen][u32 reqId][u32 charId][wchar name][blob]
+    //   DBS_DO  0x2857  [u32 blobOff=23][u32 blobLen][u32 reqId][u32 charId][u8 code][blob]
+    //
+    // <b>resultCode 0 means USABLE.</b> Tap 6094 refuses the three-letter "Dob" with ok=0 /
+    // code=1 and tap 6119 accepts "dobb" with ok=1 / code=0, and the client frames carry the
+    // same numbers the other way round (1703 = 01 00 00 00 for the refusal, 1722 = 00 00 00 00
+    // for the acceptance). A naive bool reading of either packet inverts the answer.
+    public const ushort SDB_ASK_CHANGE_CHAR_NAME = 0x2854; public const ushort DBS_ASK_CHANGE_CHAR_NAME = 0x2855;
+    public const ushort SDB_DO_CHANGE_CHAR_NAME  = 0x2856; public const ushort DBS_DO_CHANGE_CHAR_NAME  = 0x2857;
+
+    /// <summary>Shortest name tap 6094 accepts. "Dob" (three) is refused, "dobb" (four) is not.</summary>
+    public const int MinCharacterNameLength = 4;
+    /// <summary>Longest name the characters row is built for.</summary>
+    public const int MaxCharacterNameLength = 20;
+    /// <summary>The only refusal code the capture shows. The real server almost certainly has
+    /// distinct codes per reason; nothing here can tell them apart, so every refusal uses 1.</summary>
+    public const int NameRefusedCode = 1;
+
     // --- SDB_UPDATE_USER_DAILY_EVENT_COUNT (0x293C) -> DBS (0x293D) ---
     // cap_newchar.log seq 505 -> 507, 58 B -> 11 B.
     // Handler_SDB_UPDATE_USER_DAILY_EVENT_COUNT (Arb_part_064.c:14404) needs frame >= 0x26 and
@@ -1162,6 +1188,8 @@ public sealed class DbProxyHandlers
             case SDB_UPDATE_REPUTATION_INFO:      // 0x2892 = [ok][reqId]  (ok-first, the odd one out)
             case SDB_ADD_TUTORIAL_SIMPLE_TIP:     // 0x286F = [reqId][ok]
             case SDB_UPDATE_SEREN_GUIDE_INFO:     // 0x2945 = [reqId][playerId][ok]
+            case SDB_ASK_CHANGE_CHAR_NAME:        // 0x2854, T88 - the rename name check
+            case SDB_DO_CHANGE_CHAR_NAME:         // 0x2856, T88 - the rename itself
             case SDB_UPDATE_USER_DAILY_EVENT_COUNT: // 0x293D = [reqId][ok], reqId at payload[8]
             case SDB_UPDATE_GET_EXTRA_REWARD:     // 0x293F = [reqId][ok]
             // --- T22: the per-character login loads, rebuilt from rows instead of replaying
@@ -1325,6 +1353,8 @@ public sealed class DbProxyHandlers
             case SDB_UPDATE_REPUTATION_INFO:        return OnUpdateReputation(link, payload);
             case SDB_ADD_TUTORIAL_SIMPLE_TIP:       return OnAddTutorialTip(link, payload);
             case SDB_UPDATE_SEREN_GUIDE_INFO:       return OnUpdateSerenGuide(link, payload);
+            case SDB_ASK_CHANGE_CHAR_NAME:          return OnAskChangeCharName(link, payload);
+            case SDB_DO_CHANGE_CHAR_NAME:           return OnDoChangeCharName(link, payload);
             case SDB_UPDATE_USER_DAILY_EVENT_COUNT: link.SendFrame(DBS_UPDATE_USER_DAILY_EVENT_COUNT, BuildReqIdAck(payload, 8)); return true;
             case SDB_UPDATE_GET_EXTRA_REWARD:       link.SendFrame(DBS_UPDATE_GET_EXTRA_REWARD, BuildReqIdAck(payload, 0)); return true;
 
@@ -3408,6 +3438,108 @@ public sealed class DbProxyHandlers
     }
 
     /// <summary>SDB_UPDATE_SEREN_GUIDE_INFO (0x2944): store the slot, then ack.</summary>
+    /// <summary>DBS_ASK_CHANGE_CHAR_NAME (0x2855): <c>[u32 reqId][u8 ok][u32 code]</c>, 9 bytes.
+    /// Tap 6094 is <c>99 00 00 00 00 01 00 00 00</c> and 6119 <c>9A 00 00 00 01 00 00 00 00</c>.</summary>
+    public static byte[] BuildDbsAskChangeCharName(uint reqId, int code)
+    {
+        var r = new byte[9];
+        BitConverter.GetBytes(reqId).CopyTo(r, 0);
+        r[4] = (byte)(code == 0 ? 1 : 0);
+        BitConverter.GetBytes(code).CopyTo(r, 5);
+        return r;
+    }
+
+    /// <summary>DBS_DO_CHANGE_CHAR_NAME (0x2857):
+    /// <c>[u32 blobOff=23][u32 blobLen][u32 reqId][u32 charId][u8 code][blob]</c>. The blob is
+    /// the request s own, echoed unchanged - tap 6127 returns all 1712 bytes of tap 6126.</summary>
+    public static byte[] BuildDbsDoChangeCharName(uint reqId, int charId, int code, ReadOnlySpan<byte> blob)
+    {
+        var r = new byte[17 + blob.Length];
+        BitConverter.GetBytes(23).CopyTo(r, 0);
+        BitConverter.GetBytes(blob.Length).CopyTo(r, 4);
+        BitConverter.GetBytes(reqId).CopyTo(r, 8);
+        BitConverter.GetBytes(charId).CopyTo(r, 12);
+        r[16] = (byte)code;
+        blob.CopyTo(r.AsSpan(17));
+        return r;
+    }
+
+    /// <summary>Read a NUL-terminated UTF-16LE string at a PAYLOAD index.</summary>
+    private static string ReadName(byte[] payload, int at)
+    {
+        if (at < 0 || at >= payload.Length) return string.Empty;
+        var sb = new System.Text.StringBuilder();
+        for (int i = at; i + 1 < payload.Length; i += 2)
+        {
+            ushort c = BitConverter.ToUInt16(payload, i);
+            if (c == 0) break;
+            sb.Append((char)c);
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// The name rules the capture can actually pin: a length floor (three letters refused,
+    /// four accepted) a ceiling, and the UNIQUE COLLATE NOCASE index on the row. Returns 0
+    /// when the name is usable, <see cref="NameRefusedCode"/> otherwise.
+    /// </summary>
+    private int CheckCharacterName(string name, int charId)
+    {
+        if (name.Length < MinCharacterNameLength || name.Length > MaxCharacterNameLength)
+            return NameRefusedCode;
+        // Renaming a character to the name it already has is not a collision.
+        if (_store is not null && _store.NameExists(name)
+            && !string.Equals(_store.GetCharacterName(charId), name, StringComparison.OrdinalIgnoreCase))
+            return NameRefusedCode;
+        return 0;
+    }
+
+    /// <summary>
+    /// SDB_ASK_CHANGE_CHAR_NAME (0x2854) -&gt; DBS (0x2855). The "is this name free" step behind
+    /// the rename popup. Tap 6093/6094 and 6118/6119.
+    /// </summary>
+    private bool OnAskChangeCharName(WorldLink link, byte[] payload)
+    {
+        uint reqId = payload.Length >= 8 ? BitConverter.ToUInt32(payload, 4) : 0;
+        int charId = payload.Length >= 12 ? (int)BitConverter.ToUInt32(payload, 8) : 0;
+        int nameOff = payload.Length >= 4 ? (int)BitConverter.ToUInt32(payload, 0) - 6 : -1;
+        string name = ReadName(payload, nameOff);
+
+        int code = CheckCharacterName(name, charId);
+        _log.LogInformation("SDB_ASK_CHANGE_CHAR_NAME: character {Cid} -> {Name} = {Code}",
+            charId, name, code);
+
+        link.SendFrame(DBS_ASK_CHANGE_CHAR_NAME, BuildDbsAskChangeCharName(reqId, code));
+        return true;
+    }
+
+    /// <summary>
+    /// SDB_DO_CHANGE_CHAR_NAME (0x2856) -&gt; DBS (0x2857). Tap 6126/6127: the request carries
+    /// the new name plus a 1712-byte character blob, and the reply echoes that blob UNCHANGED
+    /// behind its own header. So the only thing we own here is the row.
+    /// </summary>
+    private bool OnDoChangeCharName(WorldLink link, byte[] payload)
+    {
+        int nameOff  = payload.Length >= 4  ? (int)BitConverter.ToUInt32(payload, 0) - 6 : -1;
+        int blobOff  = payload.Length >= 8  ? (int)BitConverter.ToUInt32(payload, 4) - 6 : -1;
+        int blobLen  = payload.Length >= 12 ? (int)BitConverter.ToUInt32(payload, 8) : 0;
+        uint reqId   = payload.Length >= 16 ? BitConverter.ToUInt32(payload, 12) : 0;
+        int charId   = payload.Length >= 20 ? (int)BitConverter.ToUInt32(payload, 16) : 0;
+        string name  = ReadName(payload, nameOff);
+
+        if (blobOff < 0 || blobLen < 0 || blobOff + blobLen > payload.Length) { blobOff = 0; blobLen = 0; }
+
+        int code = CheckCharacterName(name, charId);
+        if (code == 0 && _store is not null && !_store.RenameCharacter(charId, name))
+            code = NameRefusedCode;
+        _log.LogInformation("SDB_DO_CHANGE_CHAR_NAME: character {Cid} -> {Name} = {Code}",
+            charId, name, code);
+
+        link.SendFrame(DBS_DO_CHANGE_CHAR_NAME,
+            BuildDbsDoChangeCharName(reqId, charId, code, payload.AsSpan(blobOff, blobLen)));
+        return true;
+    }
+
     private bool OnUpdateSerenGuide(WorldLink link, byte[] payload)
     {
         if (_store is not null && payload.Length >= SerenGuideIdOffset + 4)

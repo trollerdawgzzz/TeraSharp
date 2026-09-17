@@ -63,6 +63,77 @@ public sealed class CharacterHandlers
     /// <summary>Fallback character-slot limit when the account has no configured maximum.</summary>
     public const int MaxCharactersPerAccount = 8;
 
+    // =====================================================================================
+    // T88 - C_CANCEL_DELETE_USER -> S_CANCEL_DELETE_USER
+    //
+    // cap_final_client2 frames 32 and 33, in the LOBBY - before S_GET_USER_LIST at 35, so no
+    // character is picked and the World link is not in the picture. Arbiter-direct.
+    //
+    //   32  C->S  C_CANCEL_DELETE_USER  08 00 3C FE  01 00 00 00      (character 1)
+    //   33  S->C  S_CANCEL_DELETE_USER  05 00 27 59  01               (ok)
+    //
+    // Handler_C_CANCEL_DELETE_USER (Arb_part_079.c:9104) guards packet >= 8, reads the u32 at
+    // frame offset 4, and then compares two counts off the account: it cancels and answers with
+    // the manager's bool only when `current < max`, otherwise it answers FALSE and raises system
+    // message 0x2B3. The pending-delete character is still IN the list while the timer runs -
+    // that is what S_GET_USER_LIST.deleteRemainSec reports - so the slot check really does need
+    // a spare slot beyond the one the doomed character still occupies. Modelled literally.
+    // =====================================================================================
+
+    /// <summary>Opcode of the reply. No shipped def exists - it is a raw three-field frame.</summary>
+    public const ushort S_CANCEL_DELETE_USER = 0x5927;
+
+    /// <summary>Body minimum, i.e. the handler's packet guard of 8 minus the four header bytes.</summary>
+    public const int CancelDeleteUserBodySize = 4;
+
+    /// <summary>System message 0x2B3 - what the real handler raises when there is no free slot.</summary>
+    public const int SmtCancelDeleteNoSlot = 691;
+
+    /// <summary>S_CANCEL_DELETE_USER: <c>[u16 len=5][u16 op][u8 ok]</c>.</summary>
+    public static byte[] BuildCancelDeleteUser(bool ok) => new byte[]
+    {
+        0x05, 0x00, unchecked((byte)S_CANCEL_DELETE_USER), (byte)(S_CANCEL_DELETE_USER >> 8),
+        (byte)(ok ? 1 : 0),
+    };
+
+    /// <summary>
+    /// C_CANCEL_DELETE_USER. Clears the <c>characters.delete_at</c> stamp
+    /// <see cref="OnDeleteUser"/> set, when the account has room to keep the character.
+    /// </summary>
+    public bool OnCancelDeleteUser(GameSession s, ReadOnlyMemory<byte> body)
+    {
+        if (body.Length < CancelDeleteUserBodySize)
+        {
+            s.Send(BuildCancelDeleteUser(false));
+            return true;
+        }
+
+        int charId = BitConverter.ToInt32(body.Span);
+        var chr = s.Account.Characters.Find(c => c.Id == (uint)charId);
+        if (chr == null)
+        {
+            _log.LogWarning("C_CANCEL_DELETE_USER from {Id}: character {CId} not on the account", s.Id, charId);
+            s.Send(BuildCancelDeleteUser(false));
+            return true;
+        }
+
+        if (s.Account.Characters.Count >= MaxCharactersPerAccount)
+        {
+            // The real handler's else branch: answer false FIRST, then raise the message.
+            _log.LogInformation("C_CANCEL_DELETE_USER from {Id}: no free slot, refusing", s.Id);
+            s.Send(BuildCancelDeleteUser(false));
+            s.SendByDef("S_SYSTEM_MESSAGE", new Dictionary<string, object>
+                { ["message"] = SocialHandlers.Smt(SmtCancelDeleteNoSlot) });
+            return true;
+        }
+
+        bool ok = Program.Store?.CancelCharacterDelete(charId, (long)s.Account.AccountId) ?? false;
+        _log.LogInformation("C_CANCEL_DELETE_USER from {Id}: character {CId} -> {Ok}", s.Id, charId, ok);
+        s.Send(BuildCancelDeleteUser(ok));
+        return true;
+    }
+
+
     // ---- Template ID ----
 
     /// <summary>

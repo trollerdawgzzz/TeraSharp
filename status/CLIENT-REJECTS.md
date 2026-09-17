@@ -663,3 +663,122 @@ Three findings worth keeping:
   opcode in the table. The asymmetry is real, not a gap in the capture.
 * **`RegNoop` is the wrong helper for every one of these.** It forwards to World when in-world,
   which is the §7 bug all over again; they are registered with `Reg` and listed in `ArbiterOwned`.
+
+## 13. T88 — cap_final, and how much of the guild remainder is World-routed
+
+The T88 brief listed 28 client packets across guild admin, character services and party extras.
+**26 of the 28 are not in cap_final at all** (checked by exact name across all four client logs:
+`cap_final_gm_client`, `_gm_client2`, `_client`, `_client2`). Absent, with a count of zero:
+`C_APPLY_GUILD`, `C_ACCEPT_GUILD_APPLY`, `C_REJECT_GUILD_APPLY`, `C_GUILD_APPLY_LIST`,
+`C_GET_GUILD_HISTORY`, `C_REQUEST_GUILD_WAREHOUSE_HISTORY`, `C_RECOMMEND_GUILD`,
+`C_START_GUILD_QUEST`, `C_FINISH_GUILD_QUEST`, `C_CANCEL_GUILD_QUEST`, `C_UPDATE_GUILD_LOGO`,
+`C_UPDATE_GUILD_TITLE`, `C_REQUEST_GUILD_LEVEL_RANKING`, `C_ACCEPT_GUILD_WAR`,
+`C_RAISE_GUILD_WAR`, `C_GIVEUP_GUILD_WAR`, `C_CHANGE_USER_NAME`, `C_CHECK_USER_NAME`,
+`C_CHANGE_USER_APPEARANCE`, `C_REQUEST_CHANGE_USER_APPEARANCE`, `C_CUSTOM_USER_CUSTOMIZING`,
+`C_DELETE_USER`, `C_REQUEST_CHANGE_PARTY_NAME`, `C_REQUEST_CHANGE_PARTY_MATCH_RULE`,
+`C_VIEW_PARTY_INVITE`, `C_PARTY_NOTIFY_MY_POSITION`. Those windows were never opened.
+
+### 13.1 The guild admin packets that ARE there are World-routed, and already done
+
+Three guild exchanges happen in cap_final. All three reach the Arbiter **through World**, not
+over the client link — the tap proves it:
+
+| client frames | client packet | tap frame | inter-server | status |
+|---|---|---|---|---|
+| gm_client2 1656/1657 | `C_SET_GUILDGROUP_AUTHORITY` → `S_UPDATE_GUILD_GROUP` | 1823 | `SA_SET_GUILDGROUP_AUTHORITY` 0x1404 | **done** — `GuildWiring.SetGuildGroupAuthority` |
+| gm_client 2178/2179, 2194/2195 | `C_CHANGE_GUILDGROUP` → `S_UPDATE_GUILD_MEMBER` | 2385, 2406 | `SA_CHANGE_GUILDGROUP` 0x140B | **done** — `GuildWiring.ChangeGuildGroup` |
+| gm_client 2269/2271 | `C_REQUEST_GUILD_INCENTIVE` → `S_GUILD_MONEY_INFO_CHANGED` | 2500/2504 | `SDB_GIVE_GUILD_MONEY_INCENTIVE` 0x27A0 → `DBS_` 0x27A1 | **MISSING** |
+
+So the first two need nothing. Registering either as an Arbiter-owned client handler would be
+the T45 bug in reverse — answering a packet World is already relaying.
+
+### 13.2 SDB_GIVE_GUILD_MONEY_INCENTIVE — decoded, not yet implemented
+
+`Handler_SDB_GIVE_GUILD_MONEY_INCENTIVE` (Arb_part_063.c:7177) guards frame ≥ 0x16 and reads
+frame-relative; payload index = frame offset − 6.
+
+```
+SDB 0x27A0  [u32 requestId][u32 playerId][u32 guildId][float rate]      payload 16, frame 22
+DBS 0x27A1  [u32 requestId][u8 ok]                                      payload  5, frame 11
+
+tap 2500  BB 00 00 00  EB 03 00 00  02 00 00 00  AE 47 E1 3D   (req 187, player 1003, guild 2, 0.11f)
+tap 2504  BB 00 00 00  01
+```
+
+It calls `Guild::GiveGuildMoneyIncentive(User*, float)` (Arb_part_046.c:4489), which gates on
+`CanGiveGuildMoneyIncentive`: the user’s guild id must equal the guild’s, a cooldown must have
+elapsed (config seconds), and a rate/level cap must pass — failures raise **SMT 0xF28 (3880)**
+and **0xF29 (3881)** respectively. `AS_UPDATE_GUILD_DATA` (0x144E, tap 2501, 9134 B) is the push
+that follows. The amount formula is past the part read; the capture shows the guild money AFTER
+as 8898665 but not before, so it cannot be pinned from these bytes alone.
+
+### 13.3 Character services — only the cancel is in the capture
+
+`C_CANCEL_DELETE_USER` → `S_CANCEL_DELETE_USER`, cap_final_client2 frames **32/33**, in the
+lobby before `S_GET_USER_LIST` at 35. **Arbiter-direct, and implemented here.** No shipped def:
+`[u16 len=5][u16 0x5927][u8 ok]`. `Handler_C_CANCEL_DELETE_USER` (Arb_part_079.c:9104) guards
+packet ≥ 8, reads the u32 at frame offset 4, and cancels only when `current < max` characters —
+otherwise it answers FALSE **first** and then raises SMT 0x2B3 (691). The doomed character stays
+listed while its timer runs, which is why the stamp is a column rather than a row removal.
+
+### 13.4 Party extras — one push, not yet built
+
+All four named `C_` packets are absent. What IS there is the `S_VIEW_PARTY_INVITE` **push**
+(12 occurrences; `cap_final_client` frame **252**, 34 bytes) and the LFG-join pair
+(`S_PARTY_MATCH_LINK`, gm_client 2530 after its request, gm_client2 **2794** with no request —
+that is the join arriving at the other client).
+
+`S_VIEW_PARTY_INVITE`’s shipped def is **wrong**: `S_VIEW_PARTY_INVITE.1.def` says opcode 23516
+and no fields, while the capture carries opcode **0xCBC2 (52162)** and a 34-byte body. Decoded:
+
+```
+frame 252  22 00 C2 CB | 00 00 00 00 | 01 00 0C 00 | 0C 00 00 00 | 1A 00 | 0C 00 00 00 | 14 00 00 00 | "New"
+           two array refs: the first empty, the second one element at 12
+           element [u16 here=12][u16 next=0][u16 nameOff=26][u32 12][u32 20] then the wide name
+```
+
+Correcting that def belongs in `Protocol/V100Definitions.cs` with the other wrong shipped defs.
+
+### 13.5 cap_final_client3 / _client4 — the rest of the GM session
+
+The two extra client logs carry the windows the first four did not. **The brief’s packet names
+are not this patch’s names**, which is why the first pass found nothing:
+
+| brief said | this patch actually sends | frames |
+|---|---|---|
+| `C_CHANGE_USER_NAME` / `C_CHECK_USER_NAME` | `C_REQUEST_USABLE_CHARACTER_NAME` → `S_RESULT_USABLE_CHARACTER_NAME`, `C_REQUEST_CHANGE_CHARACTER_NAME` → `S_RESULT_CHANGE_CHARACTER_NAME`, plus `S_OPEN_CHANGE_CHARACTER_NAME_POPUP` and the `S_USER_CHANGE_NAME` broadcast | c4 1676, 1702/1703, 1721/1722, 1726/1728, 1734; c3 1907 |
+| `C_CHECK_USER_NAME` (separate) | `C_CHECK_USERNAME` → `S_CHECK_USERNAME` | c3 2392/2393 |
+| `C_*CHANGE_USER_APPEARANCE*`, `C_CUSTOM_USER_CUSTOMIZING` | `S_PREPARE_CHANGE_USER_APPEARANCE`, `S_RACE_CHANGE_RESTRICTION`, `S_START_CHANGE_USER_APPEARANCE`, `C_COMMIT_CHANGE_USER_APPEARANCE` → `S_END_CHANGE_USER_APPEARANCE` | c4 1748, 1833, 1834, 1838/1839 |
+| wanted board / apply | `C_REQUEST_GUILD_INFO_BEFORE_APPLY_GUILD`, `C_APPLY_GUILD`, `C_GUILD_APPLY_LIST` → `S_GUILD_APPLY_LIST`, `C_ACCEPT_GUILD_APPLY` → `S_ADD_GUILD_MEMBER` | c3 2919/2920, 2938, 2996; c4 2780/2781, 2788, 2821/2822, 2834/2835 |
+
+**Still absent from all six client logs:** guild quest start/finish/cancel, guild war
+accept/raise/give-up (only `C_OPEN_GUILD_WAR_WINDOW` → `S_OPEN_GUILD_WAR_WINDOW`, c4 2756/2757,
+already T80), recommend, flag/title update, level ranking, penalty/tracking, and all four named
+party extras (`C_REQUEST_CHANGE_PARTY_NAME`, `C_REQUEST_CHANGE_PARTY_MATCH_RULE`,
+`C_VIEW_PARTY_INVITE`, `C_PARTY_NOTIFY_MY_POSITION`). Those windows were never opened.
+
+### 13.6 The rename is World-routed, and the pair is now ours
+
+The client packets go to World; World asks the Arbiter. Tap evidence at 04:43:00–04:43:04:
+
+```
+6093 W->A 0x2854 SDB_ASK_CHANGE_CHAR_NAME  12 00 00 00 99 00 00 00 01 00 00 00 "Dob"
+6094 A->W 0x2855 DBS_ASK_CHANGE_CHAR_NAME  99 00 00 00 00 01 00 00 00        <- ok=0, code=1
+6118 W->A 0x2854                           12 00 00 00 9A 00 00 00 01 00 00 00 "dobb"
+6119 A->W 0x2855                           9A 00 00 00 01 00 00 00 00        <- ok=1, code=0
+6126 W->A 0x2856 SDB_DO_CHANGE_CHAR_NAME   [u32 nameOff][u32 blobOff][u32 blobLen=1712][u32 reqId][u32 charId]["dobb"][blob]
+6127 A->W 0x2857 DBS_DO_CHANGE_CHAR_NAME   [u32 blobOff=23][u32 blobLen][u32 reqId][u32 charId][u8 code=0][blob echoed]
+6129 W->A 0x161C SA_UPDATE_RANK_USERNAME   0E 00 00 00 01 00 00 00 "dobb"    <- push, no reply
+```
+
+**`resultCode 0` means USABLE.** Two independent sources agree: the tap refuses three-letter
+"Dob" with code 1 and accepts "dobb" with code 0, and the client frames carry the same numbers
+(`S_RESULT_USABLE_CHARACTER_NAME` = `01 00 00 00` for the refusal at c4 1703,
+`00 00 00 00` for the acceptance at 1722). Reading either packet as a bool inverts the answer.
+
+`Handler_SDB_ASK_CHANGE_CHAR_NAME` (Arb_part_063.c:674) guards frame ≥ 0x12 and reads the string
+offset at frame 6, the request id at 10 and the character id at 14. The DO reply **echoes the
+request’s 1712-byte blob unchanged**, so the only thing the Arbiter owns is the row.
+
+Implemented as `SDB_ASK_CHANGE_CHAR_NAME` / `SDB_DO_CHANGE_CHAR_NAME` in `DbProxyHandlers`.
+`SA_UPDATE_RANK_USERNAME` (0x161C) is a push with no reply and is **not** handled yet.
