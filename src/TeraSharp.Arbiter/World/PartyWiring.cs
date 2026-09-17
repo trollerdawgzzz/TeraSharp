@@ -175,6 +175,12 @@ public static class PartyWiring
     /// default and answers the player with an S_SYSTEM_MESSAGE_CUSTOM rejection for pressing a
     /// button; swallowing it leaves the party-match panel blank, which is what it already is.
     /// So: swallowed, with a debug line.</para>
+    ///
+    /// <para><b>T78 did not change this.</b> The manual party BOARD - publish, browse, link,
+    /// cancel - is six other opcodes and is now answered by
+    /// <see cref="PartyMatchManager"/> (status/PARTY-MATCH.md). C_REQUEST_PARTY_INFO is the
+    /// other half, the candidate list behind S_PARTY_MEMBER_INFO, and its three shipped defs
+    /// still do not match the v100 writer - so it stays here.</para>
     /// </summary>
     public static readonly IReadOnlySet<ushort> NotModelled =
         new HashSet<ushort> { PartyPackets.C_REQUEST_PARTY_INFO };
