@@ -21134,6 +21134,94 @@ string message
             "deleting it twice is not an error - the tool sends the index twice on a double click");
     }
 
+    // ===================== T103: SA_REGISTER answered for real =====================
+    //
+    // D:\packetlogs\arb_world_2026-09-13T11-33-30-680Z.log opens with world 0's 25 registrations -
+    // one control link (IsBypass 0, BypassIndex -1) and 24 bypass links (IsBypass 1, 0..23). The
+    // builder below reproduces all 25 replies; the three pinned here are the first, the second and
+    // the last, which are the three shapes.
+
+    /// <summary>
+    /// SA_REGISTER (0x138A) -&gt; AS_REGISTER (0x138B). The reply echoes IsBypass, WorldId and
+    /// BypassIndex, then our own version and the result - which is what the replay table could
+    /// never do, because it handed every link world 0's captured BypassIndex.
+    /// </summary>
+    [Test] public static void T103_the_world_registration_reply_is_byte_exact()
+    {
+        var control = WorldRegistration.Parse(Hex.B("00 F0 0A 00 00 00 00 00 00 18 00 00 00 FF FF FF FF 07 BC 05 00"));
+        Hex.True(control is { IsBypass: false, PlanetId: 2800, WorldId: 0,
+                              TotalBypassCount: 24, BypassIndex: -1, WorldVersion: 0x0005BC07 },
+            $"the control link: {control}");
+        Hex.Eq(WorldRegistration.Reply(control!.Value), "00 00 00 00 00 FF FF FF FF 07 BC 05 00 01 00 00 00",
+            "tap frames 17 -> 18");
+
+        var first = WorldRegistration.Parse(Hex.B("01 F0 0A 00 00 00 00 00 00 18 00 00 00 00 00 00 00 07 BC 05 00"));
+        Hex.True(first is { IsBypass: true, BypassIndex: 0, TotalBypassCount: 24 },
+            "the first bypass link is index 0 of 24");
+        Hex.Eq(WorldRegistration.Reply(first!.Value), "01 00 00 00 00 00 00 00 00 07 BC 05 00 01 00 00 00", "frames 19 -> 20");
+
+        var last = WorldRegistration.Parse(Hex.B("01 F0 0A 00 00 00 00 00 00 18 00 00 00 17 00 00 00 07 BC 05 00"));
+        Hex.True(last is { IsBypass: true, BypassIndex: 23 }, "and the last is 23");
+        Hex.Eq(WorldRegistration.Reply(last!.Value), "01 00 00 00 00 17 00 00 00 07 BC 05 00 01 00 00 00", "the 25th pair");
+
+        Hex.True(WorldRegistration.RequestPayloadSize == 21
+                 && WorldRegistration.ReplyPayloadSize == 17,
+            "27-byte and 23-byte frames, less the six-byte header");
+    }
+
+    /// <summary>
+    /// The two refusals the real handler makes, and the one it does NOT make. A version that is
+    /// not ours and an id past 0x20 both answer with Result 0 - the reply still goes out, the
+    /// World disconnects itself. An id that is simply not in our config is NOT refused: the
+    /// binary logs "Unknown WorldServer [id=%d]" and carries on to the accept path.
+    /// </summary>
+    [Test] public static void T103_a_bad_version_or_world_id_is_answered_with_result_zero()
+    {
+        var good = WorldRegistration.Parse(Hex.B("01 F0 0A 00 00 00 00 00 00 18 00 00 00 00 00 00 00 07 BC 05 00"))!.Value;
+        Hex.True(WorldRegistration.ResultFor(good) == 1, "the captured link is accepted");
+
+        Hex.True(WorldRegistration.ResultFor(good with { WorldVersion = 0x0005BC06 }) == 0,
+            "one off the PDL version is a refusal - that field exists to be compared, not echoed");
+        Hex.True(WorldRegistration.ResultFor(good with { WorldId = 31 }) == 1
+                 && WorldRegistration.ResultFor(good with { WorldId = 32 }) == 0,
+            "31 is the highest id ServerConfig.xml uses and 0x20 is the handler's ceiling");
+        Hex.True(WorldRegistration.ResultFor(good with { WorldId = -1 }) == 0,
+            "and a negative id is out of range as UNSIGNED, not a wrap into world 4294967295");
+
+        // A refused link is still told which link it is.
+        Hex.Eq(WorldRegistration.Build(true, 13, 3, 0),
+            "01 0D 00 00 00 03 00 00 00 07 BC 05 00 00 00 00 00",
+            "world 13, bypass 3, refused");
+
+        Hex.True(WorldRegistration.Parse(new byte[20]) == null,
+            "a short frame is not a registration - the real handler calls that a version mismatch");
+    }
+
+    /// <summary>
+    /// The ticket space. A Ticket indexes one World's bypass slots, so two Worlds hand out the
+    /// same numbers; PerWorld keeps them apart. World 0 still gets a fresh allocator on its first
+    /// use, which is why the single-World tunnel tests are untouched.
+    /// </summary>
+    [Test] public static void T103_each_world_gets_its_own_ticket_space()
+    {
+        int made = 0;
+        var spaces = new PerWorld<List<int>>(() => { made++; return new List<int>(); });
+
+        Hex.True(spaces.Count == 0 && !spaces.Has(0), "nothing exists until a link registers");
+        spaces.For(0).Add(5);
+        Hex.True(made == 1 && spaces.Count == 1 && spaces.Has(0), "world 0 made one");
+        spaces.For(0).Add(6);
+        Hex.True(made == 1 && spaces.For(0).Count == 2, "the same World gets the same instance");
+
+        spaces.For(13).Add(5);
+        Hex.True(made == 2 && spaces.Count == 2
+                 && spaces.For(13).Count == 1 && spaces.For(0).Count == 2,
+            "world 13 starts its own - both handed out a 5 and neither noticed");
+
+        Hex.True(spaces.Forget(13) && !spaces.Has(13) && spaces.Has(0),
+            "and when world 13's last link drops, world 0 is untouched");
+    }
+
     /// <summary>SDB_REGISTER_CARD's payload: <c>DlmId@0, AccountDbId@4 (i64), CardTemplateId@12,
     /// Amount@16</c> - 20 bytes, the length of seq 7032.</summary>
     static byte[] CardRegister(long accountId, int cardTemplateId, int amount)

@@ -562,3 +562,31 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   would show a GM two empty inventories as if that were the trade. C_ADMIN_GMEVENT_NOTICE is
   logged rather than broadcast: it drives the GM-event manager (the OX quiz, the summons) and
   no event is running to notice about.
+
+- T103 (multi-world step 1, status/MULTIWORLD-DESIGN.md section 4 item 4): SA_REGISTER (0x138A) is
+  answered for real instead of replayed. New `World/WorldRegistration.cs` parses the request
+  (`IsBypass u8 @0`, `PlanetId @1`, **`WorldId @5`**, `TotalBypassCount @9`, `BypassIndex @13`,
+  `WorldVersion @17`, payload-relative) and builds AS_REGISTER (0x138B) the way
+  `Handler_SA_REGISTER` does: echo IsBypass / WorldId / BypassIndex, then our own version and the
+  result. **All 25 replies in the tap reproduce byte for byte** (one control link with
+  IsBypass 0 / BypassIndex -1, then 24 bypass links 0..23), so single-World behaviour is unchanged.
+
+  Three things the binary settles that the capture could not. **ArbiterVersion is a constant, not
+  an echo** - the handler is `if (WorldVersion == 0x5bc07)`, and echoing would defeat the field;
+  ours happens to match, which is why the capture cannot tell. **Result is 1 only when the version
+  matches AND `WorldId < 0x20`**, and 31 is the highest id in ServerConfig.xml. **An id that is not
+  in the config is NOT refused** - the handler logs `Unknown WorldServer [id=%d]` and carries on -
+  so only the version and the ceiling are refusals, and a refused link still gets a reply telling
+  it which link it is.
+
+  Also new: `PerWorld<T>`, one instance per WorldId created on first use. The ticket space is the
+  reason - a Ticket indexes one World's bypass slots, so two Worlds hand out the same numbers and
+  today's single global `TicketAllocator` would give two players in different Worlds the same
+  tunnel key. World 0 still gets a fresh allocator on first use, so the existing tunnel tests are
+  untouched. `TicketAllocator` itself is not changed (and not ours to change); `PerWorld` takes a
+  factory so it needs to know nothing about it.
+
+  **Not wired yet** - `World/WorldBridge.cs` is human-owned, and the T103 report carries the diff:
+  the per-World link set, `LinksOf(worldId)`, `WorldLink.WorldId/BypassIndex`, handling 0x138A
+  before the replay lookup, and `AllocateTunnelKey(worldId)`. Until that lands, the replay table
+  still answers 0x138A and nothing behaves differently.
