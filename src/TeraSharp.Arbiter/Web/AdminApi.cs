@@ -240,14 +240,27 @@ public sealed class AdminApi
           .Append(",\"achievements\":").Append(_store.GetAccomplishedAchievements(c.Id).Count)
           .Append(",\"sectionsVisited\":").Append(_store.GetVisitedSections(c.Id).Count).Append('}');
 
+        // T101d: null until the ep_* columns have actually been written.
+        //
+        // CharacterStore.GetCharacterEp returns a row for ANY character that exists - all seven
+        // ep_* columns are NOT NULL DEFAULT 0, and answering AS_LOAD_EXTRAPOINT_DATA with zeros
+        // is the correct packet behaviour (it is what both captured characters send). For a
+        // PAGE it is not: a fabricated zero row reads as "this character has an EP panel at
+        // level 0" when the truth is that nothing has ever touched it. All-zero is the only
+        // signal the schema offers, and it costs nothing to be wrong about - a character with
+        // 0 exp, 0 points and 0 level has no panel worth drawing either way.
         var ep = _store.GetCharacterEp(c.Id);
+        bool epWritten = ep != null && (ep.EpExp != 0 || ep.EpLevel != 0 || ep.EpPoint != 0
+                                        || ep.DailyEpExp != 0 || ep.ReserveBonus != 0
+                                        || ep.DailyLimit != 0 || ep.ResetTime != 0);
         sb.Append(",\"ep\":");
-        if (ep == null) sb.Append("null");
-        else sb.Append("{\"level\":").Append(ep.EpLevel)
+        if (!epWritten) sb.Append("null");
+        else sb.Append("{\"level\":").Append(ep!.EpLevel)
                .Append(",\"point\":").Append(ep.EpPoint)
                .Append(",\"exp\":").Append(ep.EpExp)
                .Append(",\"dailyExp\":").Append(ep.DailyEpExp)
-               .Append(",\"dailyLimit\":").Append(ep.DailyLimit).Append('}');
+               .Append(",\"dailyLimit\":").Append(ep.DailyLimit)
+               .Append(",\"resetTime\":").Append(ep.ResetTime).Append('}');
 
         sb.Append(",\"cards\":[");
         var cards = _store.GetAccountCards(c.AccountId);
