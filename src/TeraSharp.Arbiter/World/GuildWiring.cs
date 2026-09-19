@@ -973,6 +973,22 @@ public static class GuildWiring
     }
 
     /// <summary>
+    /// <summary>
+    /// AS_UPDATE_GUILD_DATA (0x144E) for one guild, or null when the row is gone. Same payload
+    /// as the AS_LOAD_GUILD_DATA push above; only the opcode differs.
+    ///
+    /// <para>The Arbiter sends this after anything that moves guild-wide state without a
+    /// dedicated push of its own. cap_final tap 2501 is the incentive case: 0x27A0 arrives,
+    /// the funds move, this goes out, then 0x27A1 answers.</para>
+    /// </summary>
+    public static byte[]? BuildGuildDataPush(CharacterStore store, int guildDbId)
+    {
+        var g = store.GetGuild(guildDbId);
+        return g == null
+            ? null
+            : GuildPackets.BuildAsGuildData(BuildGuildDataBlob(g, store.GetGuildLogo(guildDbId)));
+    }
+
     /// One 0x23A0-byte GuildData from a stored row. Offsets are GuildPackets' Gd* constants, which
     /// came from the spLoadAllGuild column binds; the five the capture confirms are GuildLevel,
     /// LastIncentiveTime, JoinMinLevel, JoinMaxLevel and GuildJoinType.

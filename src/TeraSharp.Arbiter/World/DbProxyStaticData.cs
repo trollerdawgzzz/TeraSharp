@@ -1458,6 +1458,15 @@ public static class GuildPackets
     public const ushort AS_UPDATE_GUILD_TITLE = 0x1412;
     public const ushort AS_UPDATE_GUILD_LOGO = 0x1413;
     public const ushort AS_LOAD_GUILD_DATA = 0x144D;
+
+    /// <summary>
+    /// AS_UPDATE_GUILD_DATA (0x144E) - the same payload as <see cref="AS_LOAD_GUILD_DATA"/>,
+    /// one opcode along: <see cref="BuildAsGuildData"/> builds both. cap_final tap 2501 is
+    /// 9134 bytes - <c>[u32 blobOff=14][u32 blobLen=0x23A0][GuildData]</c> - pushed straight
+    /// after an incentive grant (2500 -&gt; 2501 -&gt; 2504), and it is what makes World send
+    /// the client S_GUILD_MONEY_INFO_CHANGED.
+    /// </summary>
+    public const ushort AS_UPDATE_GUILD_DATA = 0x144E;
     public const ushort AS_UPDATE_GUILD_DATA = 0x144E;
     public const ushort AS_UPDATE_GUILD_QUEST_POINT_INFO = 0x1453;
     public const ushort AS_PUSH_GUILD_BUFF = 0x145D;

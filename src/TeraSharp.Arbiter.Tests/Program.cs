@@ -9875,17 +9875,23 @@ array<uint32> items3
     /// </summary>
     [Test] public static void T92_as_update_guild_data_header_matches_cap_final()
     {
+        // T92b: GuildPackets.BuildAsGuildData already builds exactly this - it is what
+        // AS_LOAD_GUILD_DATA (0x144D) carries, one opcode along - so 0x144E reuses it.
         var blob = new byte[] { 0x02, 0, 0, 0, 0x73, 0, 0x64, 0, 0x67, 0, 0, 0 };   // guild 2, "sdg"
-        Hex.Eq(GuildHandlers.BuildAsUpdateGuildData(blob),
+        Hex.Eq(GuildPackets.BuildAsGuildData(blob),
             "0E 00 00 00  0C 00 00 00  02 00 00 00  73 00 64 00 67 00 00 00",
             "tap 2501's header shape, with a stand-in blob");
 
-        var real = GuildHandlers.BuildAsUpdateGuildData(new byte[GuildHandlers.GuildDataBlobSize]);
+        var real = GuildPackets.BuildAsGuildData(new byte[GuildPackets.GuildDataSize]);
         Hex.True(real.Length == 9128,
             "a real 0x23A0 GuildData makes the 9134-byte frame tap 2501 carries");
         Hex.True(BitConverter.ToInt32(real, 0) == 14 && BitConverter.ToInt32(real, 4) == 0x23A0,
             "offset 14 is frame-relative, so the blob starts at payload 8");
-        Hex.True(GuildHandlers.AS_UPDATE_GUILD_DATA == 0x144E, "the opcode tap 2501 carries");
+        Hex.True(GuildPackets.AS_UPDATE_GUILD_DATA == 0x144E
+                 && GuildPackets.AS_LOAD_GUILD_DATA == 0x144D,
+            "the opcode tap 2501 carries, next to the load it shares a payload with");
+        Hex.True(GuildWiring.BuildGuildDataPush(StoreWithTwoAccounts(), 999) == null,
+            "a guild that does not exist pushes nothing rather than an empty blob");
     }
 
     /// <summary>
@@ -9907,6 +9913,146 @@ array<uint32> items3
             "and both name applicant 1004 at an UNALIGNED offset 1 - no padding after the bool");
         Hex.True(reject.Length == 5,
             "five body bytes, which is the handler's packet guard of 9 minus the four header bytes");
+    }
+
+
+    // =======================================================================================
+    // T92b - the five def-driven replies of the wanted-board apply flow, byte-exact.
+    //
+    // GuildPackets.NamedDefs lives in World/DbProxyStaticData.cs. All five defs turn out to be
+    // RIGHT as they stand - nothing needed fixing - and these pins are what keeps them that way.
+    // Ground truth: cap_final_client3 2920, 3014, 3016, 3019 and cap_final_client4 2781, 2822.
+    // =======================================================================================
+
+    /// <summary>The three apply-flow defs, exactly as GuildPackets states them.</summary>
+    static DefinitionRegistry CreateT92Defs()
+    {
+        var reg = new DefinitionRegistry(QuietLog());
+        reg.RegisterFromDef("S_GUILD_APPLY_LIST", @"
+ref guildApplyList
+
+bool  inviteAuthority
+int32 curPageNum
+int32 totalPageCount
+
+array guildApplyList
+- ref userName
+- ref joinMsg
+- int32 userDbId
+- int32 classType
+- int32 userLevel
+- int64 dateTime
+- string userName
+- string joinMsg
+");
+        reg.RegisterFromDef("S_ADD_GUILD_MEMBER", @"
+int32  memberDbId
+string name
+int32  worldId
+int32  guardId
+int32  sectionId
+int32  groupId
+int32  userLevel
+int32  race
+int32  userClass
+int32  state
+int32  gender
+int64  lastLogoutTime
+bool   isWorldEventTarget
+bool   cityWarCompensationStatus
+");
+        reg.RegisterFromDef("S_REQUEST_GUILD_INFO_BEFORE_APPLY_GUILD", @"
+string guildName
+int32  guildWarDeclareCount
+bool   isGuildWarAcceptable
+");
+        return reg;
+    }
+
+    /// <summary>The one application cap_final's board carries, with the message it was sent with.</summary>
+    static Dictionary<string, object> T92ApplyRow(string joinMsg, long dateTime) => new()
+    {
+        ["userName"] = "joinguild", ["joinMsg"] = joinMsg,
+        ["userDbId"] = 1004u, ["classType"] = 12u, ["userLevel"] = 1u, ["dateTime"] = dateTime,
+    };
+
+    static Dictionary<string, object> T92ApplyList(string joinMsg, long dateTime) => new()
+    {
+        ["guildApplyList"] = new List<object> { T92ApplyRow(joinMsg, dateTime) },
+        ["inviteAuthority"] = true, ["curPageNum"] = 1u, ["totalPageCount"] = 1u,
+    };
+
+    /// <summary>
+    /// T92b - S_GUILD_APPLY_LIST, byte-exact against cap_final_client4 2781 and 2822.
+    ///
+    /// <para>The header is 13 body bytes - the array ref, then the bool and the two page counts -
+    /// so the single element starts at packet offset 17 both times. Its two string slots are
+    /// filled in declaration order, which is what puts the name at 45 and the message at 65
+    /// whatever the message length; only the frame length moves between the two captures.</para>
+    /// </summary>
+    [Test] public static void T92b_guild_apply_list_matches_cap_final()
+    {
+        var reg = CreateT92Defs();
+        Hex.Eq(WriteByDef(reg, "S_GUILD_APPLY_LIST", T92ApplyList("Hi i would like to join!", 0x6AAB7058L)),
+            "01 00 11 00  01  01 00 00 00  01 00 00 00  "
+            + "11 00 00 00  2D 00  41 00  EC 03 00 00  0C 00 00 00  01 00 00 00  58 70 AB 6A 00 00 00 00  "
+            + "6A 00 6F 00 69 00 6E 00 67 00 75 00 69 00 6C 00 64 00 00 00  "
+            + "48 00 69 00 20 00 69 00 20 00 77 00 6F 00 75 00 6C 00 64 00 20 00 6C 00 69 00 6B 00 65 00 "
+            + "20 00 74 00 6F 00 20 00 6A 00 6F 00 69 00 6E 00 21 00 00 00",
+            "frame 2781 - the first application, 115 bytes on the wire");
+
+        Hex.Eq(WriteByDef(reg, "S_GUILD_APPLY_LIST", T92ApplyList("123", 0x6AAB7064L)),
+            "01 00 11 00  01  01 00 00 00  01 00 00 00  "
+            + "11 00 00 00  2D 00  41 00  EC 03 00 00  0C 00 00 00  01 00 00 00  64 70 AB 6A 00 00 00 00  "
+            + "6A 00 6F 00 69 00 6E 00 67 00 75 00 69 00 6C 00 64 00 00 00  "
+            + "31 00 32 00 33 00 00 00",
+            "frame 2822 - the second application, 73 bytes; the two offsets do not move");
+    }
+
+    /// <summary>
+    /// T92b - S_ADD_GUILD_MEMBER, byte-exact against cap_final_client3 3014 and client4 2835.
+    ///
+    /// <para>Both clients get the identical 76 bytes, which is the strongest ground truth in the
+    /// flow. The name ref comes FIRST at packet offset 4 even though the def declares
+    /// <c>memberDbId</c> above it - headers before scalars - so the string lands at 56.</para>
+    /// </summary>
+    [Test] public static void T92b_add_guild_member_matches_cap_final()
+    {
+        Hex.Eq(WriteByDef(CreateT92Defs(), "S_ADD_GUILD_MEMBER", new Dictionary<string, object>
+        {
+            ["memberDbId"] = 1004u, ["name"] = "joinguild", ["worldId"] = 1u, ["guardId"] = 25u,
+            ["sectionId"] = 599001u, ["groupId"] = 2u, ["userLevel"] = 1u, ["race"] = 4u,
+            ["userClass"] = 12u, ["state"] = 0u, ["gender"] = 1u, ["lastLogoutTime"] = 0L,
+            ["isWorldEventTarget"] = true, ["cityWarCompensationStatus"] = false,
+        }),
+            "38 00  EC 03 00 00  01 00 00 00  19 00 00 00  D9 23 09 00  02 00 00 00  01 00 00 00  "
+            + "04 00 00 00  0C 00 00 00  00 00 00 00  01 00 00 00  00 00 00 00 00 00 00 00  01  00  "
+            + "6A 00 6F 00 69 00 6E 00 67 00 75 00 69 00 6C 00 64 00 00 00",
+            "frames 3014 and 2835 - byte-identical at both clients");
+    }
+
+    /// <summary>
+    /// T92b - the three small replies: the guild card the board shows before you apply, the
+    /// pending-application count, and the bare notice.
+    ///
+    /// <para><c>S_REQUEST_GUILD_INFO_BEFORE_APPLY_GUILD</c> has no shipped def at all; the wire
+    /// confirms the field set GuildHandlers already fills - name, declare count, war flag - and
+    /// the ref-first rule puts the name at 11. The other two are raw writers, not defs.</para>
+    /// </summary>
+    [Test] public static void T92b_the_three_small_apply_replies_match_cap_final()
+    {
+        Hex.Eq(WriteByDef(CreateT92Defs(), "S_REQUEST_GUILD_INFO_BEFORE_APPLY_GUILD",
+            new Dictionary<string, object>
+            {
+                ["guildName"] = "fdh", ["guildWarDeclareCount"] = 0u, ["isGuildWarAcceptable"] = true,
+            }),
+            "0B 00  00 00 00 00  01  66 00 64 00 68 00 00 00",
+            "frame 2920 - guild fdh, no declarations, war acceptable");
+
+        Hex.Eq(GuildPackets.BuildCountBody(0), "00 00 00 00",
+            "frame 3016 - S_GUILD_APPLY_COUNT is a bare i32, and it is 0 once the apply is gone");
+        Hex.Eq(GuildPackets.BuildEmptyBody(), "",
+            "frame 3019 - S_REQUEST_JOIN_GUILD_NOTICE carries nothing; arrival IS the message");
     }
 
     // ---- The rules ----
