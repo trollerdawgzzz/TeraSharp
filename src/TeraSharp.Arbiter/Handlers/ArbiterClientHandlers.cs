@@ -3204,6 +3204,364 @@ public static class ArbiterClientHandlers
         return p;
     }
 
+    // =========================================================================================
+    // 20. Item strings, boards, previews, trade log and the dungeon ranking            (T99)
+    // =========================================================================================
+    //
+    // Decompile-driven like T97: no capture holds any of these. Every layout is its PDL
+    // dumper's, and where a dumper has a guard the computed fixed size is checked against it -
+    // S_REPLY_NONDB_ITEM_INFO's 0x25 -> 38, S_DUNGEON_RANK_RECORD_LIST's 0x40 -> 65,
+    // S_SHOW_TRADE_LOG's 0xf -> 16, S_BOARD_ITEM_LIST's 0xb -> 12, all of which agree.
+
+    public const ushort S_IMAGE_DATA = 0xA1D8;
+    public const ushort S_BOARD_ITEM_LIST = 0x6FE7;
+    public const ushort S_REPLY_NONDB_ITEM_INFO = 0x54EF;
+    public const ushort S_PREVIEW_ITEM = 0xE8A1;
+    public const ushort S_SHOW_TRADE_LOG = 0x6EFD;
+    public const ushort S_ADMIN_GET_DUNGEON_USER_LIST = 0xE55D;
+    public const ushort S_DUNGEON_RANK_RECORD_LIST = 0xC9E3;
+    public const ushort S_DUNGEON_RANK_SEASON_LIST = 0xDF62;
+
+    /// <summary>
+    /// S_IMAGE_DATA, the answer to C_REQUEST_IMAGE_DATA, built by
+    /// <c>Guild::SendGuildLogoNoLock</c>: <c>[u16 imageIdOffset][u16 imageOffset]
+    /// [u16 imageCount]</c> then the id string and the bytes. Same shape as T95's
+    /// S_REQUEST_GUILD_FLAG_IMAGE_DATA, and the same image behind it - the guild crest.
+    /// </summary>
+    public static byte[] BuildImageData(string? imageId, byte[]? image)
+    {
+        var text = WString(imageId);
+        image ??= Array.Empty<byte>();
+        var p = new byte[10 + text.Length + image.Length];
+        BitConverter.GetBytes((ushort)p.Length).CopyTo(p, 0);
+        BitConverter.GetBytes(S_IMAGE_DATA).CopyTo(p, 2);
+        BitConverter.GetBytes((ushort)10).CopyTo(p, 4);
+        BitConverter.GetBytes((ushort)(10 + text.Length)).CopyTo(p, 6);
+        BitConverter.GetBytes((ushort)image.Length).CopyTo(p, 8);
+        text.CopyTo(p, 10);
+        image.CopyTo(p, 10 + text.Length);
+        return p;
+    }
+
+    /// <summary>
+    /// S_BOARD_ITEM_LIST, from <c>Board::SendBoardItemList</c>: a list of
+    /// <c>[u16 here][u16 next][u16 writerNameOffset][u16 contentsOffset][i64 WriteTime]</c>
+    /// behind <c>[u16 count][u16 offset][i32 BoardId]</c>. Head 12 - the guard is 0xb - and 16
+    /// per element.
+    /// </summary>
+    public sealed record BoardItem(long WriteTime, string WriterName, string Contents);
+
+    public const int BoardItemListHeadSize = 12;
+    public const int BoardItemEntryFixedSize = 16;
+
+    public static byte[] BuildBoardItemList(int boardId, IReadOnlyList<BoardItem>? rows)
+    {
+        rows ??= Array.Empty<BoardItem>();
+        int size = BoardItemListHeadSize;
+        foreach (var r in rows)
+            size += BoardItemEntryFixedSize + WStringSize(r.WriterName) + WStringSize(r.Contents);
+
+        var p = new byte[size];
+        BitConverter.GetBytes((ushort)p.Length).CopyTo(p, 0);
+        BitConverter.GetBytes(S_BOARD_ITEM_LIST).CopyTo(p, 2);
+        BitConverter.GetBytes((ushort)rows.Count).CopyTo(p, 4);
+        BitConverter.GetBytes((ushort)(rows.Count == 0 ? 0 : BoardItemListHeadSize)).CopyTo(p, 6);
+        BitConverter.GetBytes(boardId).CopyTo(p, 8);
+
+        int at = BoardItemListHeadSize;
+        for (int i = 0; i < rows.Count; i++)
+        {
+            var r = rows[i];
+            int tail = at + BoardItemEntryFixedSize;
+            int next = tail + WStringSize(r.WriterName) + WStringSize(r.Contents);
+            BitConverter.GetBytes((ushort)at).CopyTo(p, at);
+            BitConverter.GetBytes((ushort)(i + 1 < rows.Count ? next : 0)).CopyTo(p, at + 2);
+            tail = WriteSlotAndString(p, at + 4, tail, r.WriterName);
+            tail = WriteSlotAndString(p, at + 6, tail, r.Contents);
+            BitConverter.GetBytes(r.WriteTime).CopyTo(p, at + 8);
+            at = next;
+        }
+        return p;
+    }
+
+    /// <summary>
+    /// S_REPLY_NONDB_ITEM_INFO: flat, 38 bytes, and the guard says so (0x25).
+    /// <code>
+    ///   +0x04 i32 ItemTemplateId  +0x08 u8 IsEquipment  +0x09 i32 ItemLevel
+    ///   +0x0D u8  MasterPiece     +0x0E i32 Enchant     +0x12 i32 UnidentifiedItemGrade
+    ///   +0x16 i32 BindItemTemplateId  +0x1A i32 NpcGuildId
+    ///   +0x1E i32 Grade           +0x22 i32 TimeLeft
+    /// </code>
+    /// "NonDB" is the point: the client is asking about an item that has no row anywhere - a
+    /// shop line, a preview - so everything but the two ids the request carried comes from the
+    /// item datasheet, which we do not have. The reply echoes the ids and leaves the rest 0.
+    /// </summary>
+    public const int NonDbItemInfoSize = 38;
+
+    public static byte[] BuildReplyNonDbItemInfo(int itemTemplateId, int bindItemTemplateId = 0,
+        bool isEquipment = false, int itemLevel = 0, bool masterPiece = false, int enchant = 0,
+        int unidentifiedItemGrade = 0, int npcGuildId = 0, int grade = 0, int timeLeft = 0)
+    {
+        var p = new byte[NonDbItemInfoSize];
+        BitConverter.GetBytes((ushort)p.Length).CopyTo(p, 0);
+        BitConverter.GetBytes(S_REPLY_NONDB_ITEM_INFO).CopyTo(p, 2);
+        BitConverter.GetBytes(itemTemplateId).CopyTo(p, 4);
+        p[8] = (byte)(isEquipment ? 1 : 0);
+        BitConverter.GetBytes(itemLevel).CopyTo(p, 9);
+        p[0x0D] = (byte)(masterPiece ? 1 : 0);
+        BitConverter.GetBytes(enchant).CopyTo(p, 0x0E);
+        BitConverter.GetBytes(unidentifiedItemGrade).CopyTo(p, 0x12);
+        BitConverter.GetBytes(bindItemTemplateId).CopyTo(p, 0x16);
+        BitConverter.GetBytes(npcGuildId).CopyTo(p, 0x1A);
+        BitConverter.GetBytes(grade).CopyTo(p, 0x1E);
+        BitConverter.GetBytes(timeLeft).CopyTo(p, 0x22);
+        return p;
+    }
+
+    /// <summary>
+    /// S_PREVIEW_ITEM: a list of <c>[u16 here][u16 next][u16 itemStringOffset][i64 ItemDbId]
+    /// [i32 ItemTemplateId][i32 ExteriorItemTemplateId][i32 ColoringValue]</c> - 26 bytes, the
+    /// element guard's 0x1a - behind a bare count/offset pair. The request is the same list of
+    /// bare ItemDbIds, so this is "tell me what these look like".
+    /// </summary>
+    public sealed record PreviewItem(long ItemDbId, int ItemTemplateId,
+                                     int ExteriorItemTemplateId, int ColoringValue,
+                                     string ItemString);
+
+    public const int PreviewItemEntryFixedSize = 0x1A;
+
+    public static byte[] BuildPreviewItem(IReadOnlyList<PreviewItem>? rows)
+    {
+        rows ??= Array.Empty<PreviewItem>();
+        int size = 8;
+        foreach (var r in rows) size += PreviewItemEntryFixedSize + WStringSize(r.ItemString);
+
+        var p = new byte[size];
+        BitConverter.GetBytes((ushort)p.Length).CopyTo(p, 0);
+        BitConverter.GetBytes(S_PREVIEW_ITEM).CopyTo(p, 2);
+        BitConverter.GetBytes((ushort)rows.Count).CopyTo(p, 4);
+        BitConverter.GetBytes((ushort)(rows.Count == 0 ? 0 : 8)).CopyTo(p, 6);
+
+        int at = 8;
+        for (int i = 0; i < rows.Count; i++)
+        {
+            var r = rows[i];
+            int tail = at + PreviewItemEntryFixedSize;
+            int next = tail + WStringSize(r.ItemString);
+            BitConverter.GetBytes((ushort)at).CopyTo(p, at);
+            BitConverter.GetBytes((ushort)(i + 1 < rows.Count ? next : 0)).CopyTo(p, at + 2);
+            WriteSlotAndString(p, at + 4, tail, r.ItemString);
+            BitConverter.GetBytes(r.ItemDbId).CopyTo(p, at + 6);
+            BitConverter.GetBytes(r.ItemTemplateId).CopyTo(p, at + 0x0E);
+            BitConverter.GetBytes(r.ExteriorItemTemplateId).CopyTo(p, at + 0x12);
+            BitConverter.GetBytes(r.ColoringValue).CopyTo(p, at + 0x16);
+            at = next;
+        }
+        return p;
+    }
+
+    /// <summary>
+    /// S_SHOW_TRADE_LOG: <c>[u16 count][u16 offset][i32 MaxPage][i32 ViewPage]</c> and elements
+    /// of <c>[here][next][u16 requestorOffset][u16 requesteeOffset][i32 TradeId][i64 Date]</c> -
+    /// 20 bytes, the element guard's 0x14. We keep no trade log (nothing records who traded
+    /// what), so the window gets page 0 of 0 rather than nothing at all.
+    /// </summary>
+    public sealed record TradeLogEntry(int TradeId, string Requestor, string Requestee, long Date);
+
+    public const int ShowTradeLogHeadSize = 16;
+    public const int ShowTradeLogEntryFixedSize = 0x14;
+
+    public static byte[] BuildShowTradeLog(IReadOnlyList<TradeLogEntry>? rows,
+        int maxPage = 0, int viewPage = 0)
+    {
+        rows ??= Array.Empty<TradeLogEntry>();
+        int size = ShowTradeLogHeadSize;
+        foreach (var r in rows)
+            size += ShowTradeLogEntryFixedSize + WStringSize(r.Requestor) + WStringSize(r.Requestee);
+
+        var p = new byte[size];
+        BitConverter.GetBytes((ushort)p.Length).CopyTo(p, 0);
+        BitConverter.GetBytes(S_SHOW_TRADE_LOG).CopyTo(p, 2);
+        BitConverter.GetBytes((ushort)rows.Count).CopyTo(p, 4);
+        BitConverter.GetBytes((ushort)(rows.Count == 0 ? 0 : ShowTradeLogHeadSize)).CopyTo(p, 6);
+        BitConverter.GetBytes(maxPage).CopyTo(p, 8);
+        BitConverter.GetBytes(viewPage).CopyTo(p, 0x0C);
+
+        int at = ShowTradeLogHeadSize;
+        for (int i = 0; i < rows.Count; i++)
+        {
+            var r = rows[i];
+            int tail = at + ShowTradeLogEntryFixedSize;
+            int next = tail + WStringSize(r.Requestor) + WStringSize(r.Requestee);
+            BitConverter.GetBytes((ushort)at).CopyTo(p, at);
+            BitConverter.GetBytes((ushort)(i + 1 < rows.Count ? next : 0)).CopyTo(p, at + 2);
+            tail = WriteSlotAndString(p, at + 4, tail, r.Requestor);
+            tail = WriteSlotAndString(p, at + 6, tail, r.Requestee);
+            BitConverter.GetBytes(r.TradeId).CopyTo(p, at + 8);
+            BitConverter.GetBytes(r.Date).CopyTo(p, at + 0x0C);
+            at = next;
+        }
+        return p;
+    }
+
+    /// <summary>
+    /// S_ADMIN_GET_DUNGEON_USER_LIST: one element per live dungeon instance -
+    /// <c>[here][next][u16 partyLeaderNameOffset][i32 ChannelId][i32 PartyLeaderPlanetId]
+    /// [i32 PartyLeaderDbId][i32 UserCount]</c>, 22 bytes, which is the element guard's 0x16.
+    /// The Arbiter does not run dungeons - World does - and we track no instances, so the tool
+    /// gets an empty list.
+    /// </summary>
+    public sealed record DungeonInstanceRow(int ChannelId, string PartyLeaderName,
+                                            int PartyLeaderPlanetId, int PartyLeaderDbId,
+                                            int UserCount);
+
+    public const int DungeonUserListEntryFixedSize = 0x16;
+
+    public static byte[] BuildAdminGetDungeonUserList(IReadOnlyList<DungeonInstanceRow>? rows)
+    {
+        rows ??= Array.Empty<DungeonInstanceRow>();
+        int size = 8;
+        foreach (var r in rows)
+            size += DungeonUserListEntryFixedSize + WStringSize(r.PartyLeaderName);
+
+        var p = new byte[size];
+        BitConverter.GetBytes((ushort)p.Length).CopyTo(p, 0);
+        BitConverter.GetBytes(S_ADMIN_GET_DUNGEON_USER_LIST).CopyTo(p, 2);
+        BitConverter.GetBytes((ushort)rows.Count).CopyTo(p, 4);
+        BitConverter.GetBytes((ushort)(rows.Count == 0 ? 0 : 8)).CopyTo(p, 6);
+
+        int at = 8;
+        for (int i = 0; i < rows.Count; i++)
+        {
+            var r = rows[i];
+            int tail = at + DungeonUserListEntryFixedSize;
+            int next = tail + WStringSize(r.PartyLeaderName);
+            BitConverter.GetBytes((ushort)at).CopyTo(p, at);
+            BitConverter.GetBytes((ushort)(i + 1 < rows.Count ? next : 0)).CopyTo(p, at + 2);
+            WriteSlotAndString(p, at + 4, tail, r.PartyLeaderName);
+            BitConverter.GetBytes(r.ChannelId).CopyTo(p, at + 6);
+            BitConverter.GetBytes(r.PartyLeaderPlanetId).CopyTo(p, at + 0x0A);
+            BitConverter.GetBytes(r.PartyLeaderDbId).CopyTo(p, at + 0x0E);
+            BitConverter.GetBytes(r.UserCount).CopyTo(p, at + 0x12);
+            at = next;
+        }
+        return p;
+    }
+
+    /// <summary>
+    /// S_DUNGEON_RANK_SEASON_LIST: <c>[u16 count][u16 offset][i32 DungeonId][i32 DrtType]</c>
+    /// and elements of <c>[here][next][i64 StartDate][i64 EndDate]</c> - 20 bytes, the element
+    /// guard's 0x14. No season has ever been run here, so the list is empty and the two ids are
+    /// echoed from the request.
+    /// </summary>
+    public const int DungeonRankSeasonHeadSize = 16;
+    public const int DungeonRankSeasonEntrySize = 0x14;
+
+    public static byte[] BuildDungeonRankSeasonList(int dungeonId, int drtType,
+        IReadOnlyList<(long StartDate, long EndDate)>? seasons = null)
+    {
+        seasons ??= Array.Empty<(long, long)>();
+        var p = new byte[DungeonRankSeasonHeadSize + seasons.Count * DungeonRankSeasonEntrySize];
+        BitConverter.GetBytes((ushort)p.Length).CopyTo(p, 0);
+        BitConverter.GetBytes(S_DUNGEON_RANK_SEASON_LIST).CopyTo(p, 2);
+        BitConverter.GetBytes((ushort)seasons.Count).CopyTo(p, 4);
+        BitConverter.GetBytes((ushort)(seasons.Count == 0 ? 0 : DungeonRankSeasonHeadSize)).CopyTo(p, 6);
+        BitConverter.GetBytes(dungeonId).CopyTo(p, 8);
+        BitConverter.GetBytes(drtType).CopyTo(p, 0x0C);
+
+        for (int i = 0; i < seasons.Count; i++)
+        {
+            int at = DungeonRankSeasonHeadSize + i * DungeonRankSeasonEntrySize;
+            BitConverter.GetBytes((ushort)at).CopyTo(p, at);
+            BitConverter.GetBytes((ushort)(i + 1 < seasons.Count ? at + DungeonRankSeasonEntrySize : 0))
+                .CopyTo(p, at + 2);
+            BitConverter.GetBytes(seasons[i].StartDate).CopyTo(p, at + 4);
+            BitConverter.GetBytes(seasons[i].EndDate).CopyTo(p, at + 0x0C);
+        }
+        return p;
+    }
+
+    /// <summary>
+    /// S_DUNGEON_RANK_RECORD_LIST. The head carries the caller's OWN record as loose fields -
+    /// that is what <c>HasMyRecord</c> guards - and the board itself as a list:
+    /// <code>
+    ///   +0x04 u16 count   +0x06 u16 offset   +0x08 u16 myNameOffset  +0x0A u16 myGuildOffset
+    ///   +0x0C i32 DungeonId  +0x10 i32 Season  +0x14 i32 DrtType  +0x18 i32 DctType
+    ///   +0x1C u8  HasMyRecord
+    ///   +0x1D i32 Rank  +0x21 i32 Classe  +0x25 i32 Race  +0x29 i32 Gender  +0x2D i32 Record
+    ///   +0x31 i64 Date  +0x39 i64 LastSortTime
+    /// </code>
+    /// 65 bytes, which is the head guard's 0x40 exactly. Elements are the same nine fields
+    /// without the dungeon ids: 36 bytes, the element guard's 0x24.
+    /// <para>No dungeon run is recorded anywhere in this build, so the board goes out empty with
+    /// HasMyRecord false and the four ids echoed from the request - the window then says "no
+    /// record" instead of waiting.</para>
+    /// </summary>
+    public sealed record DungeonRankRow(int Rank, string Name, string GuildName, int Classe,
+                                        int Race, int Gender, int Record, long Date);
+
+    public const int DungeonRankRecordHeadSize = 0x41;
+    public const int DungeonRankRecordEntryFixedSize = 0x24;
+
+    public static byte[] BuildDungeonRankRecordList(int dungeonId, int season, int drtType,
+        int dctType = 0, DungeonRankRow? myRecord = null, long lastSortTime = 0,
+        IReadOnlyList<DungeonRankRow>? rows = null)
+    {
+        rows ??= Array.Empty<DungeonRankRow>();
+        string myName = myRecord?.Name ?? "";
+        string myGuild = myRecord?.GuildName ?? "";
+
+        int size = DungeonRankRecordHeadSize + WStringSize(myName) + WStringSize(myGuild);
+        foreach (var r in rows)
+            size += DungeonRankRecordEntryFixedSize + WStringSize(r.Name) + WStringSize(r.GuildName);
+
+        var p = new byte[size];
+        BitConverter.GetBytes((ushort)p.Length).CopyTo(p, 0);
+        BitConverter.GetBytes(S_DUNGEON_RANK_RECORD_LIST).CopyTo(p, 2);
+
+        // The head's own two strings sit directly behind the fixed part; the list starts after
+        // them. Both are explicit offsets, so the order is ours - this one keeps the head whole.
+        int headTail = DungeonRankRecordHeadSize;
+        int firstElement = headTail + WStringSize(myName) + WStringSize(myGuild);
+
+        BitConverter.GetBytes((ushort)rows.Count).CopyTo(p, 4);
+        BitConverter.GetBytes((ushort)(rows.Count == 0 ? 0 : firstElement)).CopyTo(p, 6);
+        headTail = WriteSlotAndString(p, 8, headTail, myName);
+        WriteSlotAndString(p, 0x0A, headTail, myGuild);
+        BitConverter.GetBytes(dungeonId).CopyTo(p, 0x0C);
+        BitConverter.GetBytes(season).CopyTo(p, 0x10);
+        BitConverter.GetBytes(drtType).CopyTo(p, 0x14);
+        BitConverter.GetBytes(dctType).CopyTo(p, 0x18);
+        p[0x1C] = (byte)(myRecord is null ? 0 : 1);
+        BitConverter.GetBytes(myRecord?.Rank ?? 0).CopyTo(p, 0x1D);
+        BitConverter.GetBytes(myRecord?.Classe ?? 0).CopyTo(p, 0x21);
+        BitConverter.GetBytes(myRecord?.Race ?? 0).CopyTo(p, 0x25);
+        BitConverter.GetBytes(myRecord?.Gender ?? 0).CopyTo(p, 0x29);
+        BitConverter.GetBytes(myRecord?.Record ?? 0).CopyTo(p, 0x2D);
+        BitConverter.GetBytes(myRecord?.Date ?? 0L).CopyTo(p, 0x31);
+        BitConverter.GetBytes(lastSortTime).CopyTo(p, 0x39);
+
+        int at = firstElement;
+        for (int i = 0; i < rows.Count; i++)
+        {
+            var r = rows[i];
+            int tail = at + DungeonRankRecordEntryFixedSize;
+            int next = tail + WStringSize(r.Name) + WStringSize(r.GuildName);
+            BitConverter.GetBytes((ushort)at).CopyTo(p, at);
+            BitConverter.GetBytes((ushort)(i + 1 < rows.Count ? next : 0)).CopyTo(p, at + 2);
+            tail = WriteSlotAndString(p, at + 4, tail, r.Name);
+            tail = WriteSlotAndString(p, at + 6, tail, r.GuildName);
+            BitConverter.GetBytes(r.Rank).CopyTo(p, at + 8);
+            BitConverter.GetBytes(r.Classe).CopyTo(p, at + 0x0C);
+            BitConverter.GetBytes(r.Race).CopyTo(p, at + 0x10);
+            BitConverter.GetBytes(r.Gender).CopyTo(p, at + 0x14);
+            BitConverter.GetBytes(r.Record).CopyTo(p, at + 0x18);
+            BitConverter.GetBytes(r.Date).CopyTo(p, at + 0x1C);
+            at = next;
+        }
+        return p;
+    }
+
     /// <summary>A NUL-terminated UTF-16LE string, as the inter-server and client writers emit it.</summary>
     public static byte[] WString(string? s)
     {
@@ -3842,6 +4200,215 @@ public static class MiscClientPackets
         if (body.Length < LoginWorldBodySize)
             log.LogWarning("C_LOGIN_WORLD: {Len} B body (want {Want}) - PDL version mismatch",
                 body.Length, LoginWorldBodySize);
+        return true;
+    }
+}
+
+
+/// <summary>
+/// T99. The item/board tail and the dungeon ranking: ten client packets around item strings,
+/// the in-world message boards, item previews and the trade log, plus the two ranking lists.
+/// No capture holds any of them, so each was read out of its own <c>Handler_C_*</c> and does
+/// here what the real one does - five reply, three store, two are accepted and logged.
+/// </summary>
+public static class ItemBoardPackets
+{
+    // Body sizes are each handler's fixed part less the 4-byte header.
+    public const int SetItemStringBodySize = 14 - 4;      // [u16 off][i64 ItemDbId]
+    public const int RewriteItemStringBodySize = 22 - 4;  // + ContractId + EquipItemTemplateId
+    public const int WriteBoardBodySize = 10 - 4;         // [u16 off][i32 BoardId]
+    public const int BoardIdBodySize = 4;                 // [i32 BoardId]
+    public const int NonDbItemInfoBodySize = 16 - 4;      // three i32
+    public const int PageBodySize = 4;                    // [i32 Page]
+    public const int ImageIdBodySize = 2;                 // [u16 off]
+    public const int RankRecordBodySize = 16 - 4;         // DungeonId + Season + DrtType
+    public const int RankSeasonBodySize = 12 - 4;         // DungeonId + DrtType
+
+    private static int Me(GameSession s) => s.SelectedCharacter?.Id ?? 0;
+    private static long Now() => DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+
+    // ------------------------------- the item string -------------------------------
+
+    /// <summary>
+    /// C_SET_ITEM_STRING (0x601E): <c>[u16 stringOffset][i64 ItemDbId]</c> then the text. No
+    /// reply - the client redraws the item from what it already has.
+    /// </summary>
+    public static bool OnSetItemString(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        var b = body.Span;
+        if (b.Length < SetItemStringBodySize) return true;
+        long itemDbId = BitConverter.ToInt64(b[2..]);
+        Program.Store?.SetItemString(itemDbId, ArbiterClientHandlers.ReadWString(b, 0), Me(s), Now());
+        return true;
+    }
+
+    /// <summary>
+    /// C_REWRITE_ITEM_STRING (0x65F1): <c>[u16 stringOffset][i32 ContractId]
+    /// [i32 EquipItemTemplateId][i64 EquipItemDbId]</c>. Same column - the contract id is the
+    /// open rewrite contract, which this build does not model, so the write itself is what
+    /// matters and it lands on EquipItemDbId.
+    /// </summary>
+    public static bool OnRewriteItemString(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        var b = body.Span;
+        if (b.Length < RewriteItemStringBodySize) return true;
+        long itemDbId = BitConverter.ToInt64(b[10..]);
+        Program.Store?.SetItemString(itemDbId, ArbiterClientHandlers.ReadWString(b, 0), Me(s), Now());
+        return true;
+    }
+
+    // --------------------------------- the boards ---------------------------------
+
+    /// <summary>C_WRITE_BOARD (0xEDA6): <c>[u16 contentsOffset][i32 BoardId]</c> then the text.
+    /// The handler writes and returns; the client asks for the list itself afterwards.</summary>
+    public static bool OnWriteBoard(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        var b = body.Span;
+        if (b.Length < WriteBoardBodySize) return true;
+        int boardId = BitConverter.ToInt32(b[2..]);
+        string contents = ArbiterClientHandlers.ReadWString(b, 0);
+        Program.Store?.AddBoardPost(boardId, Me(s), s.SelectedCharacter?.Name ?? "", contents, Now());
+        return true;
+    }
+
+    /// <summary>C_REQUEST_WRITE_BOARD (0xD38A) -&gt; <c>Board::RequestWrite</c>, fourteen lines
+    /// that open the write window client-side and send nothing back. Accepted and dropped, as
+    /// there.</summary>
+    public static bool OnRequestWriteBoard(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+        => true;
+
+    /// <summary>C_BOARD_ITEM_LIST (0xEB61) -&gt; <c>Board::SendBoardItemList</c>.</summary>
+    public static bool OnBoardItemList(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        var b = body.Span;
+        int boardId = b.Length >= 4 ? BitConverter.ToInt32(b) : 0;
+        var posts = Program.Store?.GetBoardPosts(boardId);
+        var rows = new List<ArbiterClientHandlers.BoardItem>();
+        if (posts is not null)
+            foreach (var post in posts)
+                rows.Add(new ArbiterClientHandlers.BoardItem(post.WrittenAt, post.Writer, post.Contents));
+        s.Send(ArbiterClientHandlers.BuildBoardItemList(boardId, rows));
+        return true;
+    }
+
+    // ------------------------------ previews and info ------------------------------
+
+    /// <summary>
+    /// C_PREVIEW_ITEM (0xE5C9): a list of bare <c>[i64 ItemDbId]</c>. The reply is the same
+    /// items with their template, their exterior (the dye/skin) and their written string. We
+    /// hold the template and the string; the exterior and the colouring live on World's item
+    /// object, so they go out as 0 rather than invented.
+    /// </summary>
+    public static bool OnPreviewItem(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        var b = body.Span;
+        var rows = new List<ArbiterClientHandlers.PreviewItem>();
+        var store = Program.Store;
+
+        int count = b.Length >= 2 ? BitConverter.ToUInt16(b) : 0;
+        int at = b.Length >= 4 ? BitConverter.ToUInt16(b[2..]) - 4 : 0;   // packet -> body
+        for (int i = 0; i < count && at >= 0 && at + 12 <= b.Length; i++)
+        {
+            long itemDbId = BitConverter.ToInt64(b[(at + 4)..]);
+            // The id is an i64 on the wire and an int in the items table; anything outside that
+            // range is an id we cannot hold, so it previews as an unknown item rather than
+            // wrapping into somebody else's row.
+            var row = store is not null && itemDbId > 0 && itemDbId <= int.MaxValue
+                ? store.GetItem((int)itemDbId) : null;
+            rows.Add(new ArbiterClientHandlers.PreviewItem(
+                itemDbId, row?.TemplateId ?? 0, 0, 0, store?.GetItemString(itemDbId) ?? ""));
+            int next = BitConverter.ToUInt16(b[(at + 2)..]) - 4;
+            if (next <= at) break;                                        // a chain must move forward
+            at = next;
+        }
+
+        s.Send(ArbiterClientHandlers.BuildPreviewItem(rows));
+        return true;
+    }
+
+    /// <summary>
+    /// C_REQUEST_NONDB_ITEM_INFO (0x8BBF): <c>[i32 ItemTemplateId][i32 BindItemTemplateId]
+    /// [i32 BuyMenuListId]</c>. "NonDB" means the item has no row anywhere - a shop line - so
+    /// everything but the ids comes from the item datasheet the Arbiter loads and we do not
+    /// have. The reply echoes the two ids and leaves the rest at zero.
+    /// </summary>
+    public static bool OnRequestNonDbItemInfo(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        var b = body.Span;
+        int template = b.Length >= 4 ? BitConverter.ToInt32(b) : 0;
+        int bind = b.Length >= 8 ? BitConverter.ToInt32(b[4..]) : 0;
+        s.Send(ArbiterClientHandlers.BuildReplyNonDbItemInfo(template, bind));
+        return true;
+    }
+
+    // ---------------------------------- the trade ----------------------------------
+
+    /// <summary>C_SHOW_TRADE_LOG (0x7D73): <c>[i32 Page]</c>. Nothing records trades here, so
+    /// the window gets an empty page rather than nothing.</summary>
+    public static bool OnShowTradeLog(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        s.Send(ArbiterClientHandlers.BuildShowTradeLog(null));
+        return true;
+    }
+
+    /// <summary>
+    /// C_SHOW_TRADE_ITEM (0x983B) -&gt; <c>TradeItemLog::GetTradeInfo</c> and a full
+    /// S_SHOW_TRADE_ITEM tooltip of both sides of a past trade. There is no trade log to read
+    /// and the reply is a tooltip packet of its own; answering it with an empty trade would
+    /// show a GM two empty inventories as if that were the trade, so it is logged instead.
+    /// </summary>
+    public static bool OnShowTradeItem(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        log.LogInformation("C_SHOW_TRADE_ITEM: no trade log in this build - not served");
+        return true;
+    }
+
+    // ---------------------------------- image data ----------------------------------
+
+    /// <summary>
+    /// C_REQUEST_IMAGE_DATA (0xBA6D) -&gt; <c>Guild::SendGuildLogoNoLock</c>, i.e. the same
+    /// guild crest T95's flag packets carry, under a second opcode. The id resolves back to the
+    /// guild whose <c>logo_id</c> it is; an unknown id answers with the id and no bytes.
+    /// </summary>
+    public static bool OnRequestImageData(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        string imageId = ArbiterClientHandlers.ReadWString(body.Span, 0);
+        byte[]? image = null;
+        var store = Program.Store;
+        if (store is not null && int.TryParse(imageId, System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture, out int logoId) && logoId != 0)
+            foreach (var g in store.GetAllGuilds())
+                if (g.LogoId == logoId) { image = store.GetGuildLogo(g.GuildId); break; }
+
+        s.Send(ArbiterClientHandlers.BuildImageData(imageId, image));
+        return true;
+    }
+
+    // ------------------------------- the dungeon board -------------------------------
+
+    /// <summary>
+    /// C_DUNGEON_RANK_RECORD_LIST (0xF679): <c>[i32 DungeonId][i32 Season][i32 DrtType]</c>.
+    /// Nothing in this build records a dungeon run, so the board is empty, HasMyRecord is false
+    /// and the ids are echoed - the window then says "no record" instead of waiting.
+    /// </summary>
+    public static bool OnDungeonRankRecordList(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        var b = body.Span;
+        int dungeonId = b.Length >= 4 ? BitConverter.ToInt32(b) : 0;
+        int season = b.Length >= 8 ? BitConverter.ToInt32(b[4..]) : 0;
+        int drtType = b.Length >= 12 ? BitConverter.ToInt32(b[8..]) : 0;
+        s.Send(ArbiterClientHandlers.BuildDungeonRankRecordList(dungeonId, season, drtType));
+        return true;
+    }
+
+    /// <summary>C_DUNGEON_RANK_SEASON_LIST (0x5EA7): <c>[i32 DungeonId][i32 DrtType]</c>. No
+    /// season has been run, so the list is empty.</summary>
+    public static bool OnDungeonRankSeasonList(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        var b = body.Span;
+        int dungeonId = b.Length >= 4 ? BitConverter.ToInt32(b) : 0;
+        int drtType = b.Length >= 8 ? BitConverter.ToInt32(b[4..]) : 0;
+        s.Send(ArbiterClientHandlers.BuildDungeonRankSeasonList(dungeonId, drtType));
         return true;
     }
 }
