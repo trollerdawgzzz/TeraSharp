@@ -2482,6 +2482,479 @@ public static class ArbiterClientHandlers
         return p;
     }
 
+    // =========================================================================================
+    // 18. The guild list, the wanted board, the level ranking and the flag             (T95)
+    // =========================================================================================
+    //
+    // Every layout here comes from the Arbiter's own PDL dumpers (Arb_part_013/014/015/018/020/
+    // 022/024.c) and five of the seven replies are pinned to a captured frame. The shipped .def
+    // files were checked and NOT used: S_GUILD_LEVEL_RANKING_LIST.def is missing IsOccupation,
+    // S_REPLY_INVITE_GUILD_LIST.def and S_REPLY_GUILD_WANTED_WRITING_LIST.def have no array at
+    // all, S_BROCAST_GUILD_FLAG.def calls the whole body one int32, and their opcode comments
+    // are from another protocol version. The decompile wins, and where a capture exists it wins
+    // over the decompile.
+
+    public const ushort C_REQUEST_GUILD_LIST_PAGE = 0xD1D1;
+    public const ushort C_REQUEST_GUILD_LIST_SORT = 0x8883;
+    public const ushort S_REPLY_GUILD_LIST = 0x5F75;
+    public const ushort C_REQUEST_GUILD_WANTED_WRITING_LIST = 0x595A;
+    public const ushort C_REQUEST_GUILD_WANTED_WRITING_LIST_PAGE = 0x7249;
+    public const ushort C_REQUEST_SET_GUILD_WANTED_WRITING = 0x8F7B;
+    public const ushort S_REPLY_GUILD_WANTED_WRITING_LIST = 0x56CB;
+    public const ushort S_REPLY_SET_GUILD_WANTED_WRITING = 0xC8FA;
+    public const ushort C_REQUEST_INVITE_GUILD_LIST = 0x6632;
+    public const ushort C_REQUEST_INVITE_GUILD_LIST_PAGE = 0x89AB;
+    public const ushort S_REPLY_INVITE_GUILD_LIST = 0xF216;
+    public const ushort C_REQUEST_GUILD_LEVEL_RANKING = 0xB919;
+    public const ushort S_GUILD_LEVEL_RANKING_LIST = 0xDFA0;
+    public const ushort C_GET_GUILD_WARE_HISTORY = 0x8324;
+    public const ushort S_GUILD_WARE_HISTORY = 0x99B0;
+    public const ushort C_RECOMMEND_GUILD = 0xD114;
+    public const ushort C_RECOMMEND_USER_GUILD = 0x6DD9;
+    public const ushort C_UPDATE_GUILD_FLAG = 0xE39D;
+    public const ushort S_UPDATE_GUILD_FLAG = 0x7BA3;
+    public const ushort C_REQUEST_GUILD_FLAG_IMAGE_DATA = 0x8947;
+    public const ushort S_REQUEST_GUILD_FLAG_IMAGE_DATA = 0xA795;
+    public const ushort S_BROCAST_GUILD_FLAG = 0xDA23;
+
+    /// <summary>
+    /// How many rows a page of any of these boards holds. NOTHING pins this: the only populated
+    /// list in any capture is cap_social4_client frame 1640, two guilds on page 1 of 1, which
+    /// every page size above one satisfies. The client renders whatever arrives and takes the
+    /// page count from the head, so this only decides where the "next page" button appears.
+    /// </summary>
+    public const int GuildBoardPageSize = 20;
+
+    /// <summary>
+    /// One page: the index of the first row, how many rows fit, and the page count the head
+    /// carries. An empty board is page 1 of ZERO pages - cap_social3_client2 frames 2000, 2011,
+    /// 2035 and 2040 all carry CurPageNum 1 with TotalPageCount 0, so the page number is
+    /// clamped up to 1 and the count is not.
+    /// </summary>
+    public static (int First, int Count, int TotalPages) GuildBoardPage(
+        int total, int page, int size = GuildBoardPageSize)
+    {
+        if (size <= 0) size = 1;
+        if (total < 0) total = 0;
+        int totalPages = (total + size - 1) / size;
+        if (page < 1) page = 1;
+        if (totalPages > 0 && page > totalPages) page = totalPages;
+        long first = (long)(page - 1) * size;
+        if (first > total) first = total;                       // unsigned-safe: page is packet data
+        int count = total - (int)first;
+        if (count > size) count = size;
+        if (count < 0) count = 0;
+        return ((int)first, count, totalPages);
+    }
+
+    /// <summary>The page number a paging request carries, clamped to something sane. The field
+    /// is an i32 straight off the wire, so a negative or absurd page is a page-1 request.</summary>
+    public static int ReadPageNumber(ReadOnlySpan<byte> body, int at = 0)
+    {
+        if (at + 4 > body.Length) return 1;
+        int page = BitConverter.ToInt32(body[at..]);
+        return page < 1 || page > 1_000_000 ? 1 : page;
+    }
+
+    // ------------------------------- S_REPLY_GUILD_LIST -------------------------------
+
+    /// <summary>
+    /// One row of the guild-search window. Dumper order is GuildDbId, Name, MemberCount,
+    /// JoinType, GuildLogoId, PromotionStr, GuildPreference, JoinMinLevel, JoinMaxLevel; the
+    /// three strings take their offset slots first, then the six i32 follow, which is the 0x22
+    /// the element guard demands.
+    /// <para><c>GuildLogoId</c> is a STRING here, not the <c>logo_id</c> int of the guilds row -
+    /// the same image-id string S_UPDATE_GUILD_FLAG and S_REQUEST_GUILD_FLAG_IMAGE_DATA carry.
+    /// Both captured rows have it empty, so no capture pins a non-empty one.</para>
+    /// </summary>
+    public sealed record GuildListEntry(int GuildDbId, string Name, int MemberCount, int JoinType,
+                                        string GuildLogoId, string PromotionStr,
+                                        int GuildPreference, int JoinMinLevel, int JoinMaxLevel);
+
+    public const int GuildListHeadSize = 20;
+    public const int GuildListEntryFixedSize = 0x22;
+
+    /// <summary>
+    /// S_REPLY_GUILD_LIST (0x5F75). cap_social4_client frame 1640 - two guilds, page 1 of 1 -
+    /// and cap_social3_client2 frame 2000, the empty form.
+    /// </summary>
+    public static byte[] BuildReplyGuildList(IReadOnlyList<GuildListEntry>? rows,
+        int curPage = 1, int totalPages = 0, int totalGuilds = 0)
+    {
+        rows ??= Array.Empty<GuildListEntry>();
+        int size = GuildListHeadSize;
+        foreach (var r in rows)
+            size += GuildListEntryFixedSize + WStringSize(r.Name) + WStringSize(r.GuildLogoId)
+                    + WStringSize(r.PromotionStr);
+
+        var p = new byte[size];
+        BitConverter.GetBytes((ushort)p.Length).CopyTo(p, 0);
+        BitConverter.GetBytes(S_REPLY_GUILD_LIST).CopyTo(p, 2);
+        BitConverter.GetBytes((ushort)rows.Count).CopyTo(p, 4);
+        BitConverter.GetBytes((ushort)(rows.Count == 0 ? 0 : GuildListHeadSize)).CopyTo(p, 6);
+        BitConverter.GetBytes(curPage).CopyTo(p, 8);
+        BitConverter.GetBytes(totalPages).CopyTo(p, 0x0C);
+        BitConverter.GetBytes(totalGuilds).CopyTo(p, 0x10);
+
+        int at = GuildListHeadSize;
+        for (int i = 0; i < rows.Count; i++)
+        {
+            var r = rows[i];
+            int tail = at + GuildListEntryFixedSize;
+            int next = tail + WStringSize(r.Name) + WStringSize(r.GuildLogoId)
+                       + WStringSize(r.PromotionStr);
+            BitConverter.GetBytes((ushort)at).CopyTo(p, at);
+            BitConverter.GetBytes((ushort)(i + 1 < rows.Count ? next : 0)).CopyTo(p, at + 2);
+            tail = WriteSlotAndString(p, at + 4, tail, r.Name);
+            tail = WriteSlotAndString(p, at + 6, tail, r.GuildLogoId);
+            tail = WriteSlotAndString(p, at + 8, tail, r.PromotionStr);
+            BitConverter.GetBytes(r.GuildDbId).CopyTo(p, at + 0x0A);
+            BitConverter.GetBytes(r.MemberCount).CopyTo(p, at + 0x0E);
+            BitConverter.GetBytes(r.JoinType).CopyTo(p, at + 0x12);
+            BitConverter.GetBytes(r.GuildPreference).CopyTo(p, at + 0x16);
+            BitConverter.GetBytes(r.JoinMinLevel).CopyTo(p, at + 0x1A);
+            BitConverter.GetBytes(r.JoinMaxLevel).CopyTo(p, at + 0x1E);
+            at = next;
+        }
+        return p;
+    }
+
+    /// <summary>Bytes a NUL-terminated UTF-16LE string takes on the wire.</summary>
+    public static int WStringSize(string? s) => ((s?.Length ?? 0) + 1) * 2;
+
+    /// <summary>
+    /// Write the u16 offset slot at <paramref name="slotAt"/>, put the string at
+    /// <paramref name="tailAt"/>, and return where the next string goes. An EMPTY string still
+    /// gets a real offset and its two terminator bytes - the writer patches the slot to the
+    /// current end whether or not there is text, which is what T51's S_GET_USER_GUILD_LOGO note
+    /// records and what both captured guild rows do with their two empty strings.
+    /// </summary>
+    public static int WriteSlotAndString(byte[] p, int slotAt, int tailAt, string? value)
+    {
+        BitConverter.GetBytes((ushort)tailAt).CopyTo(p, slotAt);
+        var bytes = WString(value);
+        bytes.CopyTo(p, tailAt);
+        return tailAt + bytes.Length;
+    }
+
+    // ---------------------------- S_REPLY_INVITE_GUILD_LIST ----------------------------
+
+    /// <summary>
+    /// The "ask a guild to invite me" window. Same row as the guild list minus JoinType and
+    /// PromotionStr: two string slots and five i32, which is the 0x1C the element guard demands.
+    /// </summary>
+    public sealed record InviteGuildEntry(int GuildDbId, string Name, int MemberCount,
+                                          string GuildLogoId, int GuildPreference,
+                                          int JoinMinLevel, int JoinMaxLevel);
+
+    public const int InviteGuildHeadSize = 16;
+    public const int InviteGuildEntryFixedSize = 0x1C;
+
+    /// <summary>S_REPLY_INVITE_GUILD_LIST (0xF216), cap_social3_client2 frames 2040 / 2123 -
+    /// both empty.</summary>
+    public static byte[] BuildReplyInviteGuildList(IReadOnlyList<InviteGuildEntry>? rows,
+        int curPage = 1, int totalPages = 0)
+    {
+        rows ??= Array.Empty<InviteGuildEntry>();
+        int size = InviteGuildHeadSize;
+        foreach (var r in rows)
+            size += InviteGuildEntryFixedSize + WStringSize(r.Name) + WStringSize(r.GuildLogoId);
+
+        var p = new byte[size];
+        BitConverter.GetBytes((ushort)p.Length).CopyTo(p, 0);
+        BitConverter.GetBytes(S_REPLY_INVITE_GUILD_LIST).CopyTo(p, 2);
+        BitConverter.GetBytes((ushort)rows.Count).CopyTo(p, 4);
+        BitConverter.GetBytes((ushort)(rows.Count == 0 ? 0 : InviteGuildHeadSize)).CopyTo(p, 6);
+        BitConverter.GetBytes(curPage).CopyTo(p, 8);
+        BitConverter.GetBytes(totalPages).CopyTo(p, 0x0C);
+
+        int at = InviteGuildHeadSize;
+        for (int i = 0; i < rows.Count; i++)
+        {
+            var r = rows[i];
+            int tail = at + InviteGuildEntryFixedSize;
+            int next = tail + WStringSize(r.Name) + WStringSize(r.GuildLogoId);
+            BitConverter.GetBytes((ushort)at).CopyTo(p, at);
+            BitConverter.GetBytes((ushort)(i + 1 < rows.Count ? next : 0)).CopyTo(p, at + 2);
+            tail = WriteSlotAndString(p, at + 4, tail, r.Name);
+            tail = WriteSlotAndString(p, at + 6, tail, r.GuildLogoId);
+            BitConverter.GetBytes(r.GuildDbId).CopyTo(p, at + 8);
+            BitConverter.GetBytes(r.MemberCount).CopyTo(p, at + 0x0C);
+            BitConverter.GetBytes(r.GuildPreference).CopyTo(p, at + 0x10);
+            BitConverter.GetBytes(r.JoinMinLevel).CopyTo(p, at + 0x14);
+            BitConverter.GetBytes(r.JoinMaxLevel).CopyTo(p, at + 0x18);
+            at = next;
+        }
+        return p;
+    }
+
+    // --------------------------- S_GUILD_LEVEL_RANKING_LIST ---------------------------
+
+    /// <summary>
+    /// One row of the guild ranking window: three strings then six scalars and a bool, 0x27.
+    /// <c>IsOccupation</c> is the one the shipped .def drops - it is a real byte at +0x26 and
+    /// the element guard counts it.
+    /// </summary>
+    public sealed record GuildRankingEntry(int Ranking, int PreRanking, string GuildLogoId,
+                                           string GuildName, string GuildChiefName,
+                                           int GuildPreference, long GuildCreateDate,
+                                           int MemberCount, int GuildLevel, bool IsOccupation);
+
+    public const int GuildRankingHeadSize = 16;
+    public const int GuildRankingEntryFixedSize = 0x27;
+
+    /// <summary>S_GUILD_LEVEL_RANKING_LIST (0xDFA0). cap_social4_client frames 1638 / 1660 and
+    /// cap_social3_client2 2011 / 2021 - four instances, all the empty form, all page 1 of 0
+    /// even though two guilds existed by then. The real Arbiter builds this ranking on a
+    /// schedule, so an unranked server sends an empty board rather than the live list.</summary>
+    public static byte[] BuildGuildLevelRankingList(IReadOnlyList<GuildRankingEntry>? rows,
+        int page = 1, int totalPages = 0)
+    {
+        rows ??= Array.Empty<GuildRankingEntry>();
+        int size = GuildRankingHeadSize;
+        foreach (var r in rows)
+            size += GuildRankingEntryFixedSize + WStringSize(r.GuildLogoId)
+                    + WStringSize(r.GuildName) + WStringSize(r.GuildChiefName);
+
+        var p = new byte[size];
+        BitConverter.GetBytes((ushort)p.Length).CopyTo(p, 0);
+        BitConverter.GetBytes(S_GUILD_LEVEL_RANKING_LIST).CopyTo(p, 2);
+        BitConverter.GetBytes((ushort)rows.Count).CopyTo(p, 4);
+        BitConverter.GetBytes((ushort)(rows.Count == 0 ? 0 : GuildRankingHeadSize)).CopyTo(p, 6);
+        BitConverter.GetBytes(page).CopyTo(p, 8);
+        BitConverter.GetBytes(totalPages).CopyTo(p, 0x0C);
+
+        int at = GuildRankingHeadSize;
+        for (int i = 0; i < rows.Count; i++)
+        {
+            var r = rows[i];
+            int tail = at + GuildRankingEntryFixedSize;
+            int next = tail + WStringSize(r.GuildLogoId) + WStringSize(r.GuildName)
+                       + WStringSize(r.GuildChiefName);
+            BitConverter.GetBytes((ushort)at).CopyTo(p, at);
+            BitConverter.GetBytes((ushort)(i + 1 < rows.Count ? next : 0)).CopyTo(p, at + 2);
+            tail = WriteSlotAndString(p, at + 4, tail, r.GuildLogoId);
+            tail = WriteSlotAndString(p, at + 6, tail, r.GuildName);
+            tail = WriteSlotAndString(p, at + 8, tail, r.GuildChiefName);
+            BitConverter.GetBytes(r.Ranking).CopyTo(p, at + 0x0A);
+            BitConverter.GetBytes(r.PreRanking).CopyTo(p, at + 0x0E);
+            BitConverter.GetBytes(r.GuildPreference).CopyTo(p, at + 0x12);
+            BitConverter.GetBytes(r.GuildCreateDate).CopyTo(p, at + 0x16);
+            BitConverter.GetBytes(r.MemberCount).CopyTo(p, at + 0x1E);
+            BitConverter.GetBytes(r.GuildLevel).CopyTo(p, at + 0x22);
+            p[at + 0x26] = (byte)(r.IsOccupation ? 1 : 0);
+            at = next;
+        }
+        return p;
+    }
+
+    // ----------------------- S_REPLY_GUILD_WANTED_WRITING_LIST -----------------------
+
+    public const int GuildWantedHeadSize = 26;
+    public const int GuildWantedEntryFixedSize = 0x25;
+
+    /// <summary>
+    /// S_REPLY_GUILD_WANTED_WRITING_LIST (0x56CB). Head: CanBeWriting u8, InviteAuthority u8,
+    /// RemainTime i64, CurPageNum, TotalPageCount. Element: UserName and PromotionStr slots,
+    /// then UserDbId, Level, ClassType, GuildPreference, GuildSize, WritingDate i64,
+    /// CanBeInvite u8.
+    /// <para>cap_social3_client2 frame 2035 is the empty board a character sees before posting -
+    /// CanBeWriting 1, RemainTime 0 - and frame 2140 is the same board right after frame 2137
+    /// posted: one row, CanBeWriting 0 and RemainTime 86400, one day to the second.</para>
+    /// </summary>
+    public static byte[] BuildReplyGuildWantedWritingList(
+        IReadOnlyList<CharacterStore.GuildWantedRow>? rows, bool canBeWriting = true,
+        bool inviteAuthority = false, long remainTime = 0, int curPage = 1, int totalPages = 0)
+    {
+        rows ??= Array.Empty<CharacterStore.GuildWantedRow>();
+        int size = GuildWantedHeadSize;
+        foreach (var r in rows)
+            size += GuildWantedEntryFixedSize + WStringSize(r.UserName) + WStringSize(r.PromotionStr);
+
+        var p = new byte[size];
+        BitConverter.GetBytes((ushort)p.Length).CopyTo(p, 0);
+        BitConverter.GetBytes(S_REPLY_GUILD_WANTED_WRITING_LIST).CopyTo(p, 2);
+        BitConverter.GetBytes((ushort)rows.Count).CopyTo(p, 4);
+        BitConverter.GetBytes((ushort)(rows.Count == 0 ? 0 : GuildWantedHeadSize)).CopyTo(p, 6);
+        p[8] = (byte)(canBeWriting ? 1 : 0);
+        p[9] = (byte)(inviteAuthority ? 1 : 0);
+        BitConverter.GetBytes(remainTime).CopyTo(p, 0x0A);
+        BitConverter.GetBytes(curPage).CopyTo(p, 0x12);
+        BitConverter.GetBytes(totalPages).CopyTo(p, 0x16);
+
+        int at = GuildWantedHeadSize;
+        for (int i = 0; i < rows.Count; i++)
+        {
+            var r = rows[i];
+            int tail = at + GuildWantedEntryFixedSize;
+            int next = tail + WStringSize(r.UserName) + WStringSize(r.PromotionStr);
+            BitConverter.GetBytes((ushort)at).CopyTo(p, at);
+            BitConverter.GetBytes((ushort)(i + 1 < rows.Count ? next : 0)).CopyTo(p, at + 2);
+            tail = WriteSlotAndString(p, at + 4, tail, r.UserName);
+            tail = WriteSlotAndString(p, at + 6, tail, r.PromotionStr);
+            BitConverter.GetBytes(r.UserDbId).CopyTo(p, at + 8);
+            BitConverter.GetBytes(r.Level).CopyTo(p, at + 0x0C);
+            BitConverter.GetBytes(r.ClassType).CopyTo(p, at + 0x10);
+            BitConverter.GetBytes(r.GuildPreference).CopyTo(p, at + 0x14);
+            BitConverter.GetBytes(r.GuildSize).CopyTo(p, at + 0x18);
+            BitConverter.GetBytes(r.WritingDate).CopyTo(p, at + 0x1C);
+            // CanBeInvite is the reader's authority over THIS row, not the poster's state: it is
+            // 0 in frame 2140, whose reader is the poster himself and in no guild.
+            p[at + 0x24] = 0;
+            at = next;
+        }
+        return p;
+    }
+
+    /// <summary>S_REPLY_SET_GUILD_WANTED_WRITING (0xC8FA), cap_social3_client2 frame 2138: one
+    /// byte, and the capture's is 1.</summary>
+    public static byte[] BuildReplySetGuildWantedWriting(bool success)
+    {
+        var p = new byte[5];
+        BitConverter.GetBytes((ushort)5).CopyTo(p, 0);
+        BitConverter.GetBytes(S_REPLY_SET_GUILD_WANTED_WRITING).CopyTo(p, 2);
+        p[4] = (byte)(success ? 1 : 0);
+        return p;
+    }
+
+    // ------------------------------- S_GUILD_WARE_HISTORY -------------------------------
+
+    /// <summary>
+    /// One line of the guild bank log. Dumper: LogId i64, LogTime i64, ActionType, ActorName,
+    /// ItemTemplateId, ItemDbId i64, ItemAmountDelta, MoneyDelta i64 - one string slot and
+    /// 44 bytes of scalars, which is the 0x32 the element guard demands. (The shipped .def has
+    /// two extra i32 and MoneyDelta as an i32; it does not add up to 0x32 and is not used.)
+    /// </summary>
+    public sealed record GuildWareHistoryEntry(long LogId, long LogTime, int ActionType,
+                                               string ActorName, int ItemTemplateId,
+                                               long ItemDbId, int ItemAmountDelta, long MoneyDelta);
+
+    public const int GuildWareHistoryHeadSize = 16;
+    public const int GuildWareHistoryEntryFixedSize = 0x32;
+
+    /// <summary>
+    /// S_GUILD_WARE_HISTORY (0x99B0). No capture holds one: nobody opened the guild bank log
+    /// against the tap. We keep no bank log either - the guild warehouse moves items through the
+    /// same item atoms everything else does and nothing records who moved what - so this answers
+    /// the window with an empty page rather than leaving it spinning.
+    /// </summary>
+    public static byte[] BuildGuildWareHistory(IReadOnlyList<GuildWareHistoryEntry>? rows,
+        int viewPage = 1, int lastPage = 0)
+    {
+        rows ??= Array.Empty<GuildWareHistoryEntry>();
+        int size = GuildWareHistoryHeadSize;
+        foreach (var r in rows) size += GuildWareHistoryEntryFixedSize + WStringSize(r.ActorName);
+
+        var p = new byte[size];
+        BitConverter.GetBytes((ushort)p.Length).CopyTo(p, 0);
+        BitConverter.GetBytes(S_GUILD_WARE_HISTORY).CopyTo(p, 2);
+        BitConverter.GetBytes((ushort)rows.Count).CopyTo(p, 4);
+        BitConverter.GetBytes((ushort)(rows.Count == 0 ? 0 : GuildWareHistoryHeadSize)).CopyTo(p, 6);
+        BitConverter.GetBytes(viewPage).CopyTo(p, 8);
+        BitConverter.GetBytes(lastPage).CopyTo(p, 0x0C);
+
+        int at = GuildWareHistoryHeadSize;
+        for (int i = 0; i < rows.Count; i++)
+        {
+            var r = rows[i];
+            int tail = at + GuildWareHistoryEntryFixedSize;
+            int next = tail + WStringSize(r.ActorName);
+            BitConverter.GetBytes((ushort)at).CopyTo(p, at);
+            BitConverter.GetBytes((ushort)(i + 1 < rows.Count ? next : 0)).CopyTo(p, at + 2);
+            WriteSlotAndString(p, at + 4, tail, r.ActorName);
+            BitConverter.GetBytes(r.LogId).CopyTo(p, at + 6);
+            BitConverter.GetBytes(r.LogTime).CopyTo(p, at + 0x0E);
+            BitConverter.GetBytes(r.ActionType).CopyTo(p, at + 0x16);
+            BitConverter.GetBytes(r.ItemTemplateId).CopyTo(p, at + 0x1A);
+            BitConverter.GetBytes(r.ItemDbId).CopyTo(p, at + 0x1E);
+            BitConverter.GetBytes(r.ItemAmountDelta).CopyTo(p, at + 0x26);
+            BitConverter.GetBytes(r.MoneyDelta).CopyTo(p, at + 0x2A);
+            at = next;
+        }
+        return p;
+    }
+
+    // ---------------------------------- the guild flag ----------------------------------
+
+    /// <summary>
+    /// S_UPDATE_GUILD_FLAG (0x7BA3), the answer to C_UPDATE_GUILD_FLAG: <c>[u16 imageIdOffset]
+    /// [u8 Success]</c> then the string. The flag is identified by a STRING image id everywhere
+    /// it appears - here, in S_REQUEST_GUILD_FLAG_IMAGE_DATA, in each S_BROCAST_GUILD_FLAG
+    /// element and as GuildLogoId in the guild list - and the guilds row holds an int
+    /// <c>logo_id</c>, so we send its decimal form. Nothing pins the real format: no capture
+    /// carries a non-empty image id.
+    /// </summary>
+    public static byte[] BuildUpdateGuildFlag(bool success, string? imageId)
+    {
+        var text = WString(imageId);
+        var p = new byte[7 + text.Length];
+        BitConverter.GetBytes((ushort)p.Length).CopyTo(p, 0);
+        BitConverter.GetBytes(S_UPDATE_GUILD_FLAG).CopyTo(p, 2);
+        BitConverter.GetBytes((ushort)7).CopyTo(p, 4);
+        p[6] = (byte)(success ? 1 : 0);
+        text.CopyTo(p, 7);
+        return p;
+    }
+
+    /// <summary>
+    /// S_REQUEST_GUILD_FLAG_IMAGE_DATA (0xA795): <c>[u16 imageIdOffset][u16 imageOffset]
+    /// [u16 imageCount]</c>, then the id string and the bytes. A <c>bytes</c> ref is
+    /// <c>[offset][count]</c> in that order and an empty blob still gets a real offset - the end
+    /// of the packet - which is the rule T51 pinned on S_GET_USER_GUILD_LOGO.
+    /// </summary>
+    public static byte[] BuildRequestGuildFlagImageData(string? imageId, byte[]? image)
+    {
+        var text = WString(imageId);
+        image ??= Array.Empty<byte>();
+        var p = new byte[10 + text.Length + image.Length];
+        BitConverter.GetBytes((ushort)p.Length).CopyTo(p, 0);
+        BitConverter.GetBytes(S_REQUEST_GUILD_FLAG_IMAGE_DATA).CopyTo(p, 2);
+        BitConverter.GetBytes((ushort)10).CopyTo(p, 4);
+        BitConverter.GetBytes((ushort)(10 + text.Length)).CopyTo(p, 6);
+        BitConverter.GetBytes((ushort)image.Length).CopyTo(p, 8);
+        text.CopyTo(p, 10);
+        image.CopyTo(p, 10 + text.Length);
+        return p;
+    }
+
+    /// <summary>One castle's flag: the image id string and the castle it flies over.</summary>
+    public sealed record GuildFlagEntry(string GuildFlagId, int FloatingCastleId);
+
+    public const int GuildFlagEntryFixedSize = 10;
+
+    /// <summary>
+    /// S_BROCAST_GUILD_FLAG (0xDA23): a list of <c>[u16 here][u16 next][u16 guildFlagIdOffset]
+    /// [i32 FloatingCastleId]</c>. Eighteen instances across the captures and every one of them
+    /// is the eight-byte empty form - no floating castle was ever taken against the tap - so
+    /// that is what goes out at enter-world.
+    /// </summary>
+    public static byte[] BuildBrocastGuildFlag(IReadOnlyList<GuildFlagEntry>? rows)
+    {
+        rows ??= Array.Empty<GuildFlagEntry>();
+        int size = 8;
+        foreach (var r in rows) size += GuildFlagEntryFixedSize + WStringSize(r.GuildFlagId);
+
+        var p = new byte[size];
+        BitConverter.GetBytes((ushort)p.Length).CopyTo(p, 0);
+        BitConverter.GetBytes(S_BROCAST_GUILD_FLAG).CopyTo(p, 2);
+        BitConverter.GetBytes((ushort)rows.Count).CopyTo(p, 4);
+        BitConverter.GetBytes((ushort)(rows.Count == 0 ? 0 : 8)).CopyTo(p, 6);
+
+        int at = 8;
+        for (int i = 0; i < rows.Count; i++)
+        {
+            var r = rows[i];
+            int tail = at + GuildFlagEntryFixedSize;
+            int next = tail + WStringSize(r.GuildFlagId);
+            BitConverter.GetBytes((ushort)at).CopyTo(p, at);
+            BitConverter.GetBytes((ushort)(i + 1 < rows.Count ? next : 0)).CopyTo(p, at + 2);
+            WriteSlotAndString(p, at + 4, tail, r.GuildFlagId);
+            BitConverter.GetBytes(r.FloatingCastleId).CopyTo(p, at + 6);
+            at = next;
+        }
+        return p;
+    }
+
     /// <summary>A NUL-terminated UTF-16LE string, as the inter-server and client writers emit it.</summary>
     public static byte[] WString(string? s)
     {
@@ -2504,5 +2977,418 @@ public static class ArbiterClientHandlers
             sb.Append(ch);
         }
         return sb.ToString();
+    }
+}
+
+
+/// <summary>
+/// T95. The guild-search window, the wanted board, the level ranking, the guild-bank log and
+/// the flag - eleven client packets that were either forwarded to World (which answers them
+/// with "handler has not been implemented yet!!!") or, in C_REQUEST_GUILD_LIST's case, accepted
+/// silently since T51, which leaves the window spinning on an empty list.
+///
+/// <para>Guild storage is the Arbiter's outright (status/GUILD-DESIGN.md section 0), so every
+/// one of these is answered here from the <c>guilds</c>, <c>guild_members</c> and (new)
+/// <c>guild_wanted</c> tables. Five of the seven replies are byte-exact against a captured
+/// frame; the two that are not - S_GUILD_WARE_HISTORY and S_REQUEST_GUILD_FLAG_IMAGE_DATA -
+/// follow their PDL dumpers and go out empty, because we keep no bank log and no capture holds
+/// a non-empty flag.</para>
+/// </summary>
+public static class GuildBoard
+{
+    // Body sizes are the dumper's fixed part minus the 4-byte frame header.
+    public const int RequestGuildListBodySize = 0x16 - 4;   // SearchWord slot + four i32
+    public const int PageBodySize = 4;                      // [i32 PageNumber]
+    public const int SortBodySize = 4;                      // [i32 GuildSortCriteria]
+    public const int SetWantedBodySize = 0x0E - 4;          // slot + GuildSize + GuildPreference
+    public const int RecommendGuildBodySize = 3;            // slot + [u8 InGuildList]
+    public const int RecommendUserBodySize = 2;             // slot
+    public const int UpdateFlagBodySize = 4;                // [u16 offset][u16 count]
+    public const int FlagImageBodySize = 2;                 // slot
+
+    /// <summary>
+    /// What the window last searched for. C_REQUEST_GUILD_LIST carries the filter and
+    /// C_REQUEST_GUILD_LIST_PAGE / _SORT carry only a page or a sort key, so the filter has to
+    /// survive between them. Keyed by character, like every other per-player board here.
+    /// </summary>
+    public sealed record Query(string Word, int Level, int Size, int JoinType, int Preference,
+                               int Sort);
+
+    private static readonly Dictionary<int, Query> Queries = new();
+    private static readonly object Gate = new();
+
+    private static Query QueryOf(int characterId)
+    {
+        lock (Gate)
+            return Queries.TryGetValue(characterId, out var q)
+                ? q : new Query("", 0, -1, 0, 0, 0);
+    }
+
+    private static void Remember(int characterId, Query q)
+    {
+        if (characterId <= 0) return;
+        lock (Gate) Queries[characterId] = q;
+    }
+
+    /// <summary>Drop a character's remembered search - called when the session ends.</summary>
+    public static void Forget(int characterId)
+    {
+        lock (Gate) Queries.Remove(characterId);
+    }
+
+    private static int Me(GameSession s) => s.SelectedCharacter?.Id ?? 0;
+
+    /// <summary>The image-id string form of a guilds row's int <c>logo_id</c>. Empty for a
+    /// guild that has never uploaded one, which is every guild in every capture.</summary>
+    public static string LogoIdOf(int logoId)
+        => logoId == 0 ? "" : logoId.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+    // ------------------------------- the guild search -------------------------------
+
+    /// <summary>
+    /// C_REQUEST_GUILD_LIST (0x866B), cap_social4_client frame 1639 and cap_social3_client2
+    /// 1999: <c>[u16 searchWordOffset][i32 SearchLevel][i32 GuildSize][i32 JoinType]
+    /// [i32 GuildPreference]</c>, then the word.
+    /// </summary>
+    public static Query ParseRequestGuildList(ReadOnlySpan<byte> body)
+    {
+        if (body.Length < RequestGuildListBodySize) return new Query("", 0, -1, 0, 0, 0);
+        return new Query(
+            ArbiterClientHandlers.ReadWString(body, 0),
+            BitConverter.ToInt32(body[2..]),
+            BitConverter.ToInt32(body[6..]),
+            BitConverter.ToInt32(body[10..]),
+            BitConverter.ToInt32(body[14..]),
+            0);
+    }
+
+    /// <summary>
+    /// The rows a query matches, already sorted. <c>SearchWord</c>, <c>JoinType</c> and
+    /// <c>GuildPreference</c> filter on equality and a substring; <c>SearchLevel</c> is the
+    /// searching character's own level and drops guilds whose join range excludes it.
+    /// <para><c>GuildSize</c> is NOT applied: it is -1 in both captured requests, which is
+    /// "any", and nothing pins what a non-negative value means - it is a bucket in the client's
+    /// dropdown, not a member count, since the wanted board asks a poster for the same field.
+    /// Filtering on a guess would hide guilds from the window.</para>
+    /// </summary>
+    public static List<ArbiterClientHandlers.GuildListEntry> Matching(
+        CharacterStore? store, Query q)
+    {
+        var hits = new List<ArbiterClientHandlers.GuildListEntry>();
+        if (store is null) return hits;
+
+        var rows = new List<CharacterStore.GuildRow>();
+        foreach (var g in store.GetAllGuilds())
+        {
+            if (q.Word.Length > 0
+                && g.Name.IndexOf(q.Word, StringComparison.OrdinalIgnoreCase) < 0) continue;
+            if (q.JoinType > 0 && g.JoinType != q.JoinType) continue;
+            if (q.Preference > 0 && g.Preference != q.Preference) continue;
+            if (q.Level > 0 && g.JoinMaxLevel > 0
+                && (q.Level < g.JoinMinLevel || q.Level > g.JoinMaxLevel)) continue;
+            rows.Add(g);
+        }
+
+        // The sort key is unpinned - no capture sends C_REQUEST_GUILD_LIST_SORT - so 1 and 2 are
+        // the two orders the window offers and anything else is by name.
+        rows.Sort((a, b) => q.Sort switch
+        {
+            1 => b.Level.CompareTo(a.Level),
+            2 => b.CreateDate.CompareTo(a.CreateDate),
+            _ => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase),
+        });
+
+        foreach (var g in rows)
+            hits.Add(new ArbiterClientHandlers.GuildListEntry(
+                g.GuildId, g.Name, store.CountGuildMembers(g.GuildId), g.JoinType,
+                LogoIdOf(g.LogoId), g.Promotion, g.Preference, g.JoinMinLevel, g.JoinMaxLevel));
+        return hits;
+    }
+
+    private static void SendGuildListPage(GameSession s, Query q, int page)
+    {
+        var all = Matching(Program.Store, q);
+        var (first, count, pages) = ArbiterClientHandlers.GuildBoardPage(all.Count, page);
+        var slice = all.GetRange(first, count);
+        s.Send(ArbiterClientHandlers.BuildReplyGuildList(
+            slice, pages == 0 ? 1 : Math.Min(page < 1 ? 1 : page, pages), pages, all.Count));
+    }
+
+    public static bool OnRequestGuildList(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        var q = ParseRequestGuildList(body.Span);
+        Remember(Me(s), q);
+        SendGuildListPage(s, q, 1);
+        return true;
+    }
+
+    public static bool OnRequestGuildListPage(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        SendGuildListPage(s, QueryOf(Me(s)), ArbiterClientHandlers.ReadPageNumber(body.Span));
+        return true;
+    }
+
+    public static bool OnRequestGuildListSort(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        var b = body.Span;
+        int criteria = b.Length >= 4 ? BitConverter.ToInt32(b) : 0;
+        var q = QueryOf(Me(s)) with { Sort = criteria };
+        Remember(Me(s), q);
+        SendGuildListPage(s, q, 1);
+        return true;
+    }
+
+    // ------------------------------- the wanted board -------------------------------
+
+    /// <summary>
+    /// The head of the board as this character sees it: whether the post button is live, and
+    /// how long until it is. cap_social3_client2 frame 2140 is this one day after frame 2137.
+    /// </summary>
+    public static (bool CanWrite, long Remain) WantedCooldown(CharacterStore? store,
+        int characterId, long nowUnix)
+    {
+        long last = store?.GetGuildWantedTime(characterId) ?? 0;
+        if (last <= 0) return (true, 0);
+        long remain = last + CharacterStore.GuildWantedCooldownSeconds - nowUnix;
+        return remain <= 0 ? (true, 0) : (false, remain);
+    }
+
+    private static void SendWantedPage(GameSession s, int page)
+    {
+        var store = Program.Store;
+        int me = Me(s);
+        var all = store?.GetGuildWanted() ?? new List<CharacterStore.GuildWantedRow>();
+        var (first, count, pages) = ArbiterClientHandlers.GuildBoardPage(all.Count, page);
+        var (canWrite, remain) = WantedCooldown(store, me, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        // InviteAuthority is the reader's right to invite off this board, which is a guild
+        // authority we do hold - HasGuildAuthority is what C_INVITE_USER_TO_GUILD tests.
+        int guildId = store?.GetGuildIdOf(me) ?? 0;
+        bool invite = guildId > 0 && store is not null
+                      && store.HasGuildAuthority(guildId, me, CharacterStore.GuildAuthorityInvite);
+        s.Send(ArbiterClientHandlers.BuildReplyGuildWantedWritingList(
+            all.GetRange(first, count), canWrite, invite, remain,
+            pages == 0 ? 1 : Math.Min(page < 1 ? 1 : page, pages), pages));
+    }
+
+    public static bool OnRequestGuildWantedWritingList(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        SendWantedPage(s, 1);
+        return true;
+    }
+
+    public static bool OnRequestGuildWantedWritingListPage(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        SendWantedPage(s, ArbiterClientHandlers.ReadPageNumber(body.Span));
+        return true;
+    }
+
+    /// <summary>
+    /// C_REQUEST_SET_GUILD_WANTED_WRITING (0x8F7B), cap_social3_client2 frame 2137:
+    /// <c>[u16 promotionOffset][i32 GuildSize][i32 GuildPreference]</c> then the text. The reply
+    /// is one byte (frame 2138 says 1) and the client then re-asks for the list, which is how
+    /// frame 2140 comes to show the cooldown.
+    /// </summary>
+    public static bool OnRequestSetGuildWantedWriting(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        var b = body.Span;
+        int me = Me(s);
+        var store = Program.Store;
+        bool ok = false;
+        if (b.Length >= SetWantedBodySize && me > 0 && store is not null)
+        {
+            int size = BitConverter.ToInt32(b[2..]);
+            int preference = BitConverter.ToInt32(b[6..]);
+            string promotion = ArbiterClientHandlers.ReadWString(b, 0);
+            long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            var (canWrite, remain) = WantedCooldown(store, me, now);
+            if (!canWrite)
+                log.LogInformation("C_REQUEST_SET_GUILD_WANTED_WRITING: {Id} must wait {Remain}s",
+                    me, remain);
+            else
+                ok = store.SetGuildWanted(me, size, preference, promotion, now);
+        }
+        s.Send(ArbiterClientHandlers.BuildReplySetGuildWantedWriting(ok));
+        return true;
+    }
+
+    // ---------------------------- ask a guild for an invite ----------------------------
+
+    private static void SendInvitePage(GameSession s, int page)
+    {
+        var store = Program.Store;
+        var all = new List<ArbiterClientHandlers.InviteGuildEntry>();
+        if (store is not null)
+            foreach (var g in Matching(store, new Query("", 0, -1, 0, 0, 0)))
+                all.Add(new ArbiterClientHandlers.InviteGuildEntry(
+                    g.GuildDbId, g.Name, g.MemberCount, g.GuildLogoId, g.GuildPreference,
+                    g.JoinMinLevel, g.JoinMaxLevel));
+        var (first, count, pages) = ArbiterClientHandlers.GuildBoardPage(all.Count, page);
+        s.Send(ArbiterClientHandlers.BuildReplyInviteGuildList(
+            all.GetRange(first, count), pages == 0 ? 1 : Math.Min(page < 1 ? 1 : page, pages), pages));
+    }
+
+    public static bool OnRequestInviteGuildList(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        SendInvitePage(s, 1);
+        return true;
+    }
+
+    public static bool OnRequestInviteGuildListPage(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        SendInvitePage(s, ArbiterClientHandlers.ReadPageNumber(body.Span));
+        return true;
+    }
+
+    // -------------------------------- the level ranking --------------------------------
+
+    /// <summary>
+    /// Every guild by level, highest first. All four captured replies are EMPTY even though two
+    /// guilds existed by then, because the real Arbiter publishes this ranking from a scheduled
+    /// job rather than live; we have no such job, so we serve the live order and leave
+    /// PreRanking at 0 - we keep no previous ranking to compare against - and IsOccupation
+    /// false, since no floating castle is held in this build.
+    /// </summary>
+    public static List<ArbiterClientHandlers.GuildRankingEntry> Ranking(CharacterStore? store)
+    {
+        var rows = new List<ArbiterClientHandlers.GuildRankingEntry>();
+        if (store is null) return rows;
+        var guilds = store.GetAllGuilds();
+        guilds.Sort((a, b) =>
+        {
+            int byLevel = b.Level.CompareTo(a.Level);
+            if (byLevel != 0) return byLevel;
+            int byExp = b.Exp.CompareTo(a.Exp);
+            return byExp != 0 ? byExp : string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase);
+        });
+        for (int i = 0; i < guilds.Count; i++)
+        {
+            var g = guilds[i];
+            rows.Add(new ArbiterClientHandlers.GuildRankingEntry(
+                i + 1, 0, LogoIdOf(g.LogoId), g.Name,
+                store.GetCharacter(g.ChiefDbId)?.Name ?? "", g.Preference, g.CreateDate,
+                store.CountGuildMembers(g.GuildId), g.Level, false));
+        }
+        return rows;
+    }
+
+    public static bool OnRequestGuildLevelRanking(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        int page = ArbiterClientHandlers.ReadPageNumber(body.Span);
+        var all = Ranking(Program.Store);
+        var (first, count, pages) = ArbiterClientHandlers.GuildBoardPage(all.Count, page);
+        s.Send(ArbiterClientHandlers.BuildGuildLevelRankingList(
+            all.GetRange(first, count), pages == 0 ? 1 : Math.Min(page, pages), pages));
+        return true;
+    }
+
+    // ------------------------------- the guild bank log -------------------------------
+
+    /// <summary>
+    /// C_GET_GUILD_WARE_HISTORY (0x8324) -&gt; S_GUILD_WARE_HISTORY (0x99B0). We keep no bank
+    /// log - guild warehouse moves go through the same item atoms as every other container and
+    /// nothing records the actor - so the window gets an empty page. Answering is still the
+    /// point: forwarded, this is one of World's "handler has not been implemented yet!!!" lines.
+    /// </summary>
+    public static bool OnGetGuildWareHistory(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        s.Send(ArbiterClientHandlers.BuildGuildWareHistory(
+            null, ArbiterClientHandlers.ReadPageNumber(body.Span)));
+        return true;
+    }
+
+    // --------------------------------- recommendations ---------------------------------
+
+    /// <summary>
+    /// C_RECOMMEND_GUILD (0xD114): <c>[u16 nameOffset][u8 InGuildList]</c> then the guild name.
+    /// C_RECOMMEND_USER_GUILD (0x6DD9): <c>[u16 nameOffset]</c> then a character name, whose
+    /// guild is the one being recommended. Neither has a reply packet of its own - the window
+    /// re-reads the guild info - and both land on <c>guilds.recommendation_point</c>, which is
+    /// the column AS_SET_GUILD_RECOMMENDATION_POINT (0x1411) is the inter-server form of.
+    /// </summary>
+    public static bool OnRecommendGuild(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        string name = ArbiterClientHandlers.ReadWString(body.Span, 0);
+        var guild = name.Length == 0 ? null : Program.Store?.GetGuildByName(name);
+        if (guild is null)
+        {
+            log.LogInformation("C_RECOMMEND_GUILD: no guild '{Name}'", name);
+            return true;
+        }
+        Program.Store?.AddGuildRecommendation(guild.GuildId, 1);
+        return true;
+    }
+
+    public static bool OnRecommendUserGuild(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        string name = ArbiterClientHandlers.ReadWString(body.Span, 0);
+        var store = Program.Store;
+        var who = name.Length == 0 ? null : store?.GetCharacterByName(name);
+        int guildId = who is null ? 0 : store?.GetGuildIdOf(who.Id) ?? 0;
+        if (guildId <= 0)
+        {
+            log.LogInformation("C_RECOMMEND_USER_GUILD: '{Name}' is in no guild", name);
+            return true;
+        }
+        store?.AddGuildRecommendation(guildId, 1);
+        return true;
+    }
+
+    // ------------------------------------ the flag ------------------------------------
+
+    /// <summary>
+    /// C_UPDATE_GUILD_FLAG (0xE39D): one <c>bytes</c> ref, <c>[u16 offset][u16 count]</c>. The
+    /// image goes to the same <c>guilds.logo</c> column C_UPDATE_GUILD_LOGO writes, under the
+    /// same 8000-byte cap Guild::UpdateGuildLogo enforces, and is chief-only for the same
+    /// reason. The reply carries the new image id.
+    /// </summary>
+    public static byte[]? ParseFlagImage(ReadOnlySpan<byte> body)
+    {
+        if (body.Length < UpdateFlagBodySize) return null;
+        int at = BitConverter.ToUInt16(body) - 4;               // packet-relative
+        int count = BitConverter.ToUInt16(body[2..]);
+        if (count == 0) return Array.Empty<byte>();
+        if (at < 0 || count > body.Length || at > body.Length - count) return null;
+        return body.Slice(at, count).ToArray();
+    }
+
+    public static bool OnUpdateGuildFlag(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        var store = Program.Store;
+        int me = Me(s);
+        var image = ParseFlagImage(body.Span);
+        int guildId = store?.GetGuildIdOf(me) ?? 0;
+        var guild = guildId > 0 ? store!.GetGuild(guildId) : null;
+
+        if (image is null || guild is null || guild.ChiefDbId != me
+            || image.Length > CharacterStore.MaxGuildLogoBytes)
+        {
+            log.LogWarning("C_UPDATE_GUILD_FLAG: refused for {Id} ({Len} B)", me, image?.Length ?? -1);
+            s.Send(ArbiterClientHandlers.BuildUpdateGuildFlag(false, ""));
+            return true;
+        }
+
+        int logoId = store!.UpdateGuildLogo(guildId, image);
+        s.Send(ArbiterClientHandlers.BuildUpdateGuildFlag(logoId != 0, LogoIdOf(logoId)));
+        return true;
+    }
+
+    /// <summary>
+    /// C_REQUEST_GUILD_FLAG_IMAGE_DATA (0x8947): one wide string, the image id the client saw in
+    /// a guild list row or a flag broadcast. We resolve it back to the guild whose
+    /// <c>logo_id</c> it is and send that blob; an id we do not know answers with the id and no
+    /// bytes, which is the empty form of the same packet rather than silence.
+    /// </summary>
+    public static bool OnRequestGuildFlagImageData(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        string imageId = ArbiterClientHandlers.ReadWString(body.Span, 0);
+        byte[]? image = null;
+        var store = Program.Store;
+        if (store is not null && int.TryParse(imageId, System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture, out int logoId) && logoId != 0)
+            foreach (var g in store.GetAllGuilds())
+                if (g.LogoId == logoId) { image = store.GetGuildLogo(g.GuildId); break; }
+
+        s.Send(ArbiterClientHandlers.BuildRequestGuildFlagImageData(imageId, image));
+        return true;
     }
 }

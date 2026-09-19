@@ -452,3 +452,38 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   `items` table holds neither, so they are per-item parameters defaulting to zero -
   `CumulatedEnchantAmount` to -1, which is what nine of the eleven captured rows carry.
   The capture is committed as `data/t93_admin_inven_frame724.bin` for the byte-exact test.
+
+- T95 (cap_social3_client2 + cap_social4_client): the guild-search window, the wanted board, the
+  level ranking, the guild-bank log and the flag - eleven client packets that were either
+  FORWARDED to World (one "handler has not been implemented yet!!!" each) or, for
+  C_REQUEST_GUILD_LIST, accepted silently since T51, which is why the window always came up
+  empty. All eleven are answered here now; guild storage is the Arbiter's outright.
+
+  **Five replies are byte-exact against a frame**: S_REPLY_GUILD_LIST (cap_social4_client 1640,
+  two guilds, and cap_social3_client2 2000, empty), S_REPLY_GUILD_WANTED_WRITING_LIST (2035
+  before the post and 2140 after), S_REPLY_SET_GUILD_WANTED_WRITING (2138),
+  S_REPLY_INVITE_GUILD_LIST (2040), S_GUILD_LEVEL_RANKING_LIST (2011) and S_BROCAST_GUILD_FLAG
+  (46, eighteen instances, all the empty form). S_GUILD_WARE_HISTORY, S_UPDATE_GUILD_FLAG and
+  S_REQUEST_GUILD_FLAG_IMAGE_DATA have no captured instance and follow their PDL dumpers.
+
+  **The shipped .def files were checked and NOT used.** S_GUILD_LEVEL_RANKING_LIST.def is missing
+  `IsOccupation`, so its element is 38 bytes where the dumper's guard demands 0x27 = 39;
+  S_REPLY_INVITE_GUILD_LIST.def and S_REPLY_GUILD_WANTED_WRITING_LIST.def carry the head and no
+  array at all; S_BROCAST_GUILD_FLAG.def calls the whole body one int32 when it is a list of
+  `[string GuildFlagId][i32 FloatingCastleId]`; S_GUILD_WARE_HISTORY.def has two extra i32 and
+  MoneyDelta as an i32, which does not add up to the 0x32 its guard demands. Their opcode
+  comments are from another protocol version too. The decompile won every one of those.
+
+  **What the frames say that no def would**: an empty board is page 1 of **ZERO** pages (four
+  captured replies agree); the wanted board's RemainTime is **86400 - one day to the second** -
+  and CanBeWriting drops to 0 the moment a character posts (2137 -> 2140); and `GuildLogoId` is
+  a **string** image id, the same one S_UPDATE_GUILD_FLAG and each S_BROCAST_GUILD_FLAG element
+  carry, not the `logo_id` int of the guilds row. New table `guild_wanted`, one row per
+  character, cleared when they join a guild and when the character is deleted.
+
+  **Unpinned, and left alone deliberately**: the page size (no capture has more than two rows -
+  ours is 20); `GuildSortCriteria` (no capture sends C_REQUEST_GUILD_LIST_SORT); and
+  `GuildSize`, which is -1 = "any" in both captured searches and is a dropdown bucket rather
+  than a member count - filtering on a guess would hide guilds from the window, so it is read
+  and ignored. The ranking is served live, because all four captured replies are empty even
+  though two guilds existed: the real Arbiter publishes that list from a scheduled job.

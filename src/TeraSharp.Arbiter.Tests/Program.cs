@@ -20021,6 +20021,241 @@ string message
             "an unknown character answers with an empty inventory rather than silence");
     }
 
+    // ===================== T95: the guild list, the wanted board, the flag =====================
+    //
+    // cap_social3_client2 is the guild window opened against a server with no guilds; frame 1640
+    // of cap_social4_client is the only populated list any capture holds. The shipped .def files
+    // for these are wrong (missing arrays, a missing IsOccupation, another protocol's opcodes),
+    // so every layout here is the PDL dumper's, checked against the frame where one exists.
+
+    /// <summary>
+    /// S_REPLY_GUILD_LIST (0x5F75). Element: three string slots then six i32, 0x22 - which is
+    /// what the element guard demands and what frame 1640's two rows measure.
+    /// </summary>
+    [Test] public static void T95_the_guild_list_reply_is_byte_exact()
+    {
+        Hex.Eq(ArbiterClientHandlers.BuildReplyGuildList(null, 1, 0, 0),
+            "14 00 75 5F 00 00 00 00 01 00 00 00 00 00 00 00 "
+            + "00 00 00 00",
+            "cap_social3_client2 frame 2000 - no guilds, and still page 1 of ZERO pages");
+
+        var rows = new[]
+        {
+            new ArbiterClientHandlers.GuildListEntry(2, "sdg", 2, 1, "", "", 0, 1, 70),
+            new ArbiterClientHandlers.GuildListEntry(3, "fdh", 2, 1, "", "", 0, 1, 70),
+        };
+        Hex.Eq(ArbiterClientHandlers.BuildReplyGuildList(rows, 1, 1, 2),
+            "70 00 75 5F 02 00 14 00 01 00 00 00 01 00 00 00 "
+            + "02 00 00 00 14 00 42 00 36 00 3E 00 40 00 02 00 "
+            + "00 00 02 00 00 00 01 00 00 00 00 00 00 00 01 00 "
+            + "00 00 46 00 00 00 73 00 64 00 67 00 00 00 00 00 "
+            + "00 00 42 00 00 00 64 00 6C 00 6E 00 03 00 00 00 "
+            + "02 00 00 00 01 00 00 00 00 00 00 00 01 00 00 00 "
+            + "46 00 00 00 66 00 64 00 68 00 00 00 00 00 00 00",
+            "cap_social4_client frame 1640 - two guilds, page 1 of 1, two in total");
+        Hex.True(ArbiterClientHandlers.GuildListEntryFixedSize == 0x22
+                 && ArbiterClientHandlers.GuildListHeadSize == 20,
+            "34-byte element behind a 20-byte head");
+    }
+
+    /// <summary>
+    /// The same list served from the store. Guild ids are whatever CreateGuild hands out, so
+    /// this is not byte-exact against frame 1640; what it pins is the mapping - the member count
+    /// comes from guild_members, the rows come back name-sorted, and the head counts them all
+    /// rather than the page.
+    /// </summary>
+    [Test] public static void T95_the_guild_list_is_served_from_the_guild_tables()
+    {
+        using var store = GuildStore(3);
+        int sdg = store.CreateGuild("sdg", 1, warAcceptable: true);
+        int fdh = store.CreateGuild("fdh", 2, warAcceptable: true);
+        store.UpdateGuildJoinCondition(sdg, 1, 70, 1, 0);
+        store.UpdateGuildJoinCondition(fdh, 1, 70, 1, 0);
+        store.AddGuildMember(sdg, 1, "g1", 1, 2, 0, 30, 0);
+        store.AddGuildMember(fdh, 2, "g2", 1, 2, 0, 31, 0);
+        store.AddGuildMember(fdh, 3, "g3", 1, 2, 0, 32, 0);
+
+        var all = GuildBoard.Matching(store, new GuildBoard.Query("", 0, -1, 0, 0, 0));
+        Hex.True(all.Count == 2 && all[0].Name == "fdh" && all[1].Name == "sdg",
+            "two guilds, sorted by name");
+        Hex.True(all[0].MemberCount == 2 && all[1].MemberCount == 1,
+            $"member counts come from guild_members: {all[0].MemberCount} / {all[1].MemberCount}");
+        Hex.True(all[0].GuildLogoId.Length == 0,
+            "a guild that never uploaded a flag has an EMPTY image id, not \"0\"");
+
+        // The search word is a substring, case-insensitively; the level filter is the searching
+        // character's own level against the guild's join range.
+        Hex.True(GuildBoard.Matching(store, new GuildBoard.Query("SD", 0, -1, 0, 0, 0)).Count == 1,
+            "'SD' matches sdg only");
+        Hex.True(GuildBoard.Matching(store, new GuildBoard.Query("", 99, -1, 0, 0, 0)).Count == 0
+                 && GuildBoard.Matching(store, new GuildBoard.Query("", 70, -1, 0, 0, 0)).Count == 2,
+            "level 99 is outside a 1-70 range and level 70 is inside it");
+
+        var frame = ArbiterClientHandlers.BuildReplyGuildList(all, 1, 1, all.Count);
+        Hex.True(BitConverter.ToUInt16(frame, 4) == 2 && BitConverter.ToInt32(frame, 0x10) == 2,
+            "the head's TotalGuildCount counts every match, not the page");
+    }
+
+    /// <summary>
+    /// S_REPLY_GUILD_WANTED_WRITING_LIST (0x56CB), both sides of a post. cap_social3_client2
+    /// frame 2035 is the board before - CanBeWriting 1, RemainTime 0 - frame 2137 posts "213t!",
+    /// frame 2138 answers 1, and frame 2140 is the board again with the ad on it, CanBeWriting 0
+    /// and RemainTime 86400: one day to the second, which is the cooldown.
+    /// </summary>
+    [Test] public static void T95_the_wanted_board_is_byte_exact_on_both_sides_of_a_post()
+    {
+        Hex.Eq(ArbiterClientHandlers.BuildReplyGuildWantedWritingList(null, true, false, 0, 1, 0),
+            "1A 00 CB 56 00 00 00 00 01 00 00 00 00 00 00 00 "
+            + "00 00 01 00 00 00 00 00 00 00",
+            "frame 2035 - nobody has posted and this character may");
+        Hex.Eq(ArbiterClientHandlers.BuildReplySetGuildWantedWriting(true),
+            "05 00 FA C8 01",
+            "frame 2138");
+
+        using var store = GuildStore(1);
+        int me = store.CreateCharacter(new TeraSharp.Arbiter.Persistence.CharacterRecord
+        {
+            AccountId = store.AccountOf(1), Name = "Test", Gender = 0, Race = 1, Class = 12,
+            Level = 8, TemplateId = 10101, Zone = 5, X = 1f, Y = 2f, Z = 3f,
+            Appearance = new byte[8], Details = new byte[32], Shape = new byte[64], Position = 2,
+        });
+        Hex.True(me == 2, $"the poster in frame 2140 is UserDbId 2, got {me}");
+
+        const long written = 0x6AAB197A;          // the WritingDate frame 2140 carries
+        Hex.True(store.SetGuildWanted(me, 0, 0, "213t!", written), "the ad is stored");
+        var board = store.GetGuildWanted();
+        Hex.True(board.Count == 1 && board[0].UserName == "Test" && board[0].Level == 8
+                 && board[0].ClassType == 12 && board[0].PromotionStr == "213t!",
+            "the row comes back joined to the character");
+
+        var (canWrite, remain) = GuildBoard.WantedCooldown(store, me, written);
+        Hex.True(!canWrite && remain == TeraSharp.Arbiter.Persistence.CharacterStore.GuildWantedCooldownSeconds,
+            $"the whole day is still to run: {remain}");
+        Hex.Eq(ArbiterClientHandlers.BuildReplyGuildWantedWritingList(board, canWrite, false, remain, 1, 1),
+            "55 00 CB 56 01 00 1A 00 00 00 80 51 01 00 00 00 "
+            + "00 00 01 00 00 00 01 00 00 00 1A 00 00 00 3F 00 "
+            + "49 00 02 00 00 00 08 00 00 00 0C 00 00 00 00 00 "
+            + "00 00 00 00 00 00 7A 19 AB 6A 00 00 00 00 00 54 "
+            + "00 65 00 73 00 74 00 00 00 32 00 31 00 33 00 74 "
+            + "00 21 00 00 00",
+            "frame 2140, built from the row the store just took");
+
+        var (later, none) = GuildBoard.WantedCooldown(store, me, written + 86400);
+        Hex.True(later && none == 0, "a day later the post button is live again");
+
+        // Joining a guild takes the ad off the board - it is a request to be invited.
+        int guild = store.CreateGuild("sdg", 1, warAcceptable: true);
+        store.AddGuildMember(guild, me, "Test", 1, 12, 0, 8, 0);
+        Hex.True(store.GetGuildWanted().Count == 0, "a member of a guild is not on the board");
+    }
+
+    /// <summary>
+    /// The two empty boards the same window opens with: S_REPLY_INVITE_GUILD_LIST (0xF216,
+    /// frames 2040 / 2123) and S_GUILD_LEVEL_RANKING_LIST (0xDFA0, frames 2011 / 2021 and
+    /// cap_social4_client 1638 / 1660 - empty in all four even though two guilds existed, which
+    /// is a ranking job that never ran rather than a missing list).
+    /// </summary>
+    [Test] public static void T95_the_invite_list_and_the_level_ranking_are_byte_exact()
+    {
+        Hex.Eq(ArbiterClientHandlers.BuildReplyInviteGuildList(null, 1, 0),
+            "10 00 16 F2 00 00 00 00 01 00 00 00 00 00 00 00", "frame 2040");
+        Hex.Eq(ArbiterClientHandlers.BuildGuildLevelRankingList(null, 1, 0),
+            "10 00 A0 DF 00 00 00 00 01 00 00 00 00 00 00 00", "frame 2011");
+
+        // One ranking row, measured rather than pinned: 0x27 of fixed part and three strings.
+        var one = ArbiterClientHandlers.BuildGuildLevelRankingList(new[]
+        {
+            new ArbiterClientHandlers.GuildRankingEntry(1, 0, "", "sdg", "g1", 0, 1660205710L, 2, 3, false),
+        }, 1, 1);
+        Hex.True(one.Length == 16 + 0x27 + 2 + 8 + 6
+                 && BitConverter.ToUInt16(one, 16 + 2) == 0
+                 && one[16 + 0x26] == 0
+                 && BitConverter.ToInt64(one, 16 + 0x16) == 1660205710L,
+            $"39-byte element, a last next of 0 and IsOccupation at +0x26: {one.Length} bytes");
+
+        using var store = GuildStore(2);
+        store.CreateGuild("low", 1, warAcceptable: true);
+        store.CreateGuild("high", 2, warAcceptable: true);
+        var rank = GuildBoard.Ranking(store);
+        Hex.True(rank.Count == 2 && rank[0].Ranking == 1 && rank[1].Ranking == 2,
+            "the ranking is numbered from one");
+        Hex.True(rank[0].GuildName == "high" && rank[0].GuildChiefName == "g2",
+            "level and exp tie at 0, so the tiebreak is the name - and the chief's name is read "
+            + "from his character row");
+        Hex.True(rank[0].PreRanking == 0 && !rank[0].IsOccupation,
+            "we keep no previous ranking and hold no castle, so both stay 0");
+    }
+
+    /// <summary>
+    /// The paging arithmetic, which every one of these boards shares. The page number is an i32
+    /// straight off the wire, so it is clamped as UNSIGNED would be - a negative or absurd page
+    /// is page 1, and a page past the end is the last page rather than a slice past the array.
+    /// </summary>
+    [Test] public static void T95_the_board_pages_are_clamped()
+    {
+        Hex.True(ArbiterClientHandlers.GuildBoardPage(0, 1) == (0, 0, 0),
+            "an empty board has no pages at all");
+        Hex.True(ArbiterClientHandlers.GuildBoardPage(2, 1) == (0, 2, 1),
+            "two rows are one page");
+        Hex.True(ArbiterClientHandlers.GuildBoardPage(41, 3, 20) == (40, 1, 3),
+            "41 rows at 20 a page is three pages, the last of them one row");
+        Hex.True(ArbiterClientHandlers.GuildBoardPage(41, 9999, 20) == (40, 1, 3),
+            "a page past the end is the last page");
+        Hex.True(ArbiterClientHandlers.GuildBoardPage(41, int.MinValue, 20) == (0, 20, 3),
+            "and a negative page is page one, not a negative index");
+
+        Hex.True(ArbiterClientHandlers.ReadPageNumber(Hex.B("05 00 00 00")) == 5
+                 && ArbiterClientHandlers.ReadPageNumber(Hex.B("FF FF FF FF")) == 1
+                 && ArbiterClientHandlers.ReadPageNumber(Hex.B("00 00")) == 1,
+            "-1 and a short body both read as page 1");
+    }
+
+    /// <summary>
+    /// The flag and the bank log - the two this build answers from the dumper alone, because no
+    /// capture holds a populated one. S_BROCAST_GUILD_FLAG's empty form IS captured, eighteen
+    /// times: every one of them is the same eight bytes.
+    /// </summary>
+    [Test] public static void T95_the_flag_and_the_bank_log_follow_their_dumpers()
+    {
+        Hex.Eq(ArbiterClientHandlers.BuildBrocastGuildFlag(null),
+            "08 00 23 DA 00 00 00 00", "cap_social4_client frame 46 - no castle is flying anybody's flag");
+
+        Hex.Eq(ArbiterClientHandlers.BuildUpdateGuildFlag(true, ""),
+            "09 00 A3 7B 07 00 01 00 00",
+            "S_UPDATE_GUILD_FLAG: the id slot, the success byte, then the empty string");
+        var named = ArbiterClientHandlers.BuildUpdateGuildFlag(true, "77");
+        Hex.True(named.Length == 7 + 6 && BitConverter.ToUInt16(named, 4) == 7 && named[6] == 1,
+            "a two-character id adds six bytes");
+
+        Hex.Eq(ArbiterClientHandlers.BuildRequestGuildFlagImageData("", null),
+            "0C 00 95 A7 0A 00 0C 00 00 00 00 00",
+            "an empty blob still gets a real offset - the end of the packet - and a count of 0");
+        var withImage = ArbiterClientHandlers.BuildRequestGuildFlagImageData("7", new byte[] { 1, 2, 3 });
+        Hex.True(withImage.Length == 10 + 4 + 3
+                 && BitConverter.ToUInt16(withImage, 6) == 14
+                 && BitConverter.ToUInt16(withImage, 8) == 3,
+            $"[offset][count] in that order: {withImage.Length} bytes");
+
+        Hex.Eq(ArbiterClientHandlers.BuildGuildWareHistory(null, 1),
+            "10 00 B0 99 00 00 00 00 01 00 00 00 00 00 00 00",
+            "we keep no bank log, so the window gets an empty page rather than nothing");
+        var oneLine = ArbiterClientHandlers.BuildGuildWareHistory(new[]
+        {
+            new ArbiterClientHandlers.GuildWareHistoryEntry(1, 2, 3, "g1", 4, 5, 6, 7),
+        }, 1, 1);
+        Hex.True(oneLine.Length == 16 + 0x32 + 6 && BitConverter.ToUInt16(oneLine, 16 + 2) == 0,
+            $"50-byte element, MoneyDelta an i64 and not the .def's i32: {oneLine.Length}");
+
+        // The ref C_UPDATE_GUILD_FLAG carries is read bounds-checked: a count that runs past the
+        // body is refused rather than slicing whatever follows it.
+        Hex.True(GuildBoard.ParseFlagImage(Hex.B("08 00 03 00 01 02 03"))!.Length == 3,
+            "offset 8 is body index 4, three bytes");
+        Hex.True(GuildBoard.ParseFlagImage(Hex.B("08 00 FF 7F 01 02 03")) == null,
+            "a count past the end is refused");
+        Hex.True(GuildBoard.ParseFlagImage(Hex.B("00 00 00 00"))!.Length == 0,
+            "count 0 is an empty image, not a refusal");
+    }
+
     /// <summary>SDB_REGISTER_CARD's payload: <c>DlmId@0, AccountDbId@4 (i64), CardTemplateId@12,
     /// Amount@16</c> - 20 bytes, the length of seq 7032.</summary>
     static byte[] CardRegister(long accountId, int cardTemplateId, int amount)
