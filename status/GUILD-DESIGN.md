@@ -1516,11 +1516,31 @@ proves the `02 00 00 00` at payload 8 is the blob’s own guild id and not a thi
 `GuildHandlers.BuildAsUpdateGuildData(blob)` puts the header on; the blob is the same 0x23A0
 GuildData the other guild pushes already build.
 
-### T92.4 Still open
+### T92.4 The five def-driven replies — all pinned, none wrong (T92b)
 
-Byte-exact pins for the def-driven replies (`S_GUILD_APPLY_LIST` c4 2781/2822, `S_ADD_GUILD_MEMBER`
-c3 3014 / c4 2835, `S_REQUEST_GUILD_INFO_BEFORE_APPLY_GUILD` c3 2920, `S_GUILD_APPLY_COUNT` c3 3016,
-`S_REQUEST_JOIN_GUILD_NOTICE` c3 3019) need the def text, which lives in `GuildPackets.NamedDefs`.
-**`GuildPackets` is not in the worktree** — no `GuildPackets.cs` under `src/TeraSharp.Arbiter`
-anywhere, though `GuildWiring` and `GuildHandlers` both reference it and the project builds. Until
-that file is visible those five frames cannot be pinned from here.
+`GuildPackets` is the class inside `World/DbProxyStaticData.cs`; there is no separate file, which
+is why T92 could not find it. With `NamedDefs` in hand all five replies were checked against the
+wire and **every def is right as it stands** — nothing needed fixing.
+
+| frame | packet | bytes | what the pin proves |
+|---|---|---|---|
+| c4 2781 / 2822 | `S_GUILD_APPLY_LIST` | 115 / 73 | 13-byte header, so the element starts at 17; the two string slots put the name at 45 and the message at 65 **whatever the message length** |
+| c3 3014, c4 2835 | `S_ADD_GUILD_MEMBER` | 76, identical | the name ref sits at packet offset 4 even though `memberDbId` is declared above it — headers before scalars — so the string lands at 56 |
+| c3 2920 | `S_REQUEST_GUILD_INFO_BEFORE_APPLY_GUILD` | 19 | confirms the field set `GuildHandlers` already fills: name, declare count, war flag |
+| c3 3016 | `S_GUILD_APPLY_COUNT` | 8 | a bare i32, and it is 0 once the application is gone |
+| c3 3019 | `S_REQUEST_JOIN_GUILD_NOTICE` | 4 | carries nothing; arrival is the message |
+
+The last two are raw writers (`BuildCountBody`, `BuildEmptyBody`), not defs.
+`S_REQUEST_GUILD_INFO_BEFORE_APPLY_GUILD` has no shipped def at all — the wire is the only record
+of its layout, which is what the pin now holds.
+
+### T92.5 `AS_UPDATE_GUILD_DATA` reuses the load push (T92b)
+
+`GuildPackets.BuildAsGuildData` already builds exactly tap 2501’s payload — it is what
+`AS_LOAD_GUILD_DATA` (**0x144D**) carries, and `AS_UPDATE_GUILD_DATA` is **0x144E**, one opcode
+along with the same two header words. The separate builder T92 added has been removed as a
+duplicate.
+
+`GuildWiring.BuildGuildDataPush(store, guildDbId)` returns the push (null when the guild row is
+gone), and `DbProxyHandlers.OnGiveGuildMoneyIncentive` sends it **before** the 0x27A1 answer —
+the order tap 2500 → 2501 → 2504 shows.

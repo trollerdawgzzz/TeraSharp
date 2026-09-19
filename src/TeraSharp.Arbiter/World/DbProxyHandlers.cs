@@ -3554,6 +3554,10 @@ public sealed class DbProxyHandlers
             {
                 _store.SetGuildIncentiveTime(guildId, now);
                 ok = true;
+                // cap_final tap 2501: the whole guild is re-pushed BEFORE the 0x27A1 answer,
+                // which is how World learns the new funds and tells the client.
+                var push = GuildWiring.BuildGuildDataPush(_store, guildId);
+                if (push != null) link.SendFrame(GuildPackets.AS_UPDATE_GUILD_DATA, push);
                 _log.LogInformation("SDB_GIVE_GUILD_MONEY_INCENTIVE: guild {Gid} rate {Rate} granted by {Pid}",
                     guildId, rate, playerId);
             }

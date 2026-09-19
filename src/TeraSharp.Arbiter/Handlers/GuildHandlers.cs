@@ -611,30 +611,10 @@ public sealed class GuildHandlers
     /// </summary>
     public const int SmtGuildApplyRejected = 261;
 
-    /// <summary>
-    /// AS_UPDATE_GUILD_DATA (0x144E) - the whole guild re-pushed to every World. cap_final tap
-    /// 2501 is 9134 bytes: <c>[u32 blobOff=14][u32 blobLen=0x23A0][GuildData]</c>, and 8 + 0x23A0
-    /// is exactly the 9128-byte payload. The blob is the same 0x23A0-byte GuildData the other
-    /// guild pushes carry, so this builder only puts the two-word header on it.
-    ///
-    /// <para>It follows an incentive grant (tap 2500 -&gt; 2501 -&gt; 2504) and is what makes
-    /// World send the client S_GUILD_MONEY_INFO_CHANGED.</para>
-    /// </summary>
-    public const ushort AS_UPDATE_GUILD_DATA = 0x144E;
-
-    /// <summary>The 0x23A0 GuildData length tap 2501 declares.</summary>
-    public const int GuildDataBlobSize = 0x23A0;
-
-    /// <inheritdoc cref="AS_UPDATE_GUILD_DATA"/>
-    public static byte[] BuildAsUpdateGuildData(byte[] guildDataBlob)
-    {
-        guildDataBlob ??= Array.Empty<byte>();
-        var p = new byte[8 + guildDataBlob.Length];
-        BitConverter.GetBytes(14).CopyTo(p, 0);                    // blob offset, frame-relative
-        BitConverter.GetBytes(guildDataBlob.Length).CopyTo(p, 4);
-        guildDataBlob.CopyTo(p, 8);
-        return p;
-    }
+    // AS_UPDATE_GUILD_DATA (0x144E) lives with the other guild opcodes now: T92b found that
+    // GuildPackets.BuildAsGuildData already builds exactly tap 2501's payload - the same two
+    // header words - for AS_LOAD_GUILD_DATA (0x144D), one opcode along. GuildWiring pushes it
+    // through GuildWiring.BuildGuildDataPush, so the duplicate builder that stood here is gone.
 
     /// <summary>
     /// C_ACCEPT_GUILD_APPLY (0xDBE4): `[u8 accept][u32 userDbId]` - unaligned, no padding after
