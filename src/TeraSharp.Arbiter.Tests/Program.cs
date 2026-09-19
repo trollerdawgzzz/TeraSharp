@@ -19733,6 +19733,156 @@ string message
             "no capture holds an empty board; this is the fixed part alone");
     }
 
+    // ===================== T93: the tool's inventory tab =====================
+
+    /// <summary>
+    /// The eleven rows cap_final_gm_client2 frame 724 carries, in its order: the seven bag rows
+    /// first and the four worn pieces after, each container in ITEM DB ID order rather than
+    /// slot order. Everything past Count is World's item object or the item template sheet.
+    /// </summary>
+    static ArbiterClientHandlers.AdminInvenItem[] Cap93Frame724Items() => new ArbiterClientHandlers.AdminInvenItem[]
+    {
+            new() { TemplateId = 6560, ItemDbId = 10016, OwnerDbId = 1003, InvenPos = 1,
+                Count = 19, Durability = 30, CumulatedEnchantAmount = -1 },
+            new() { TemplateId = 17000, ItemDbId = 10018, OwnerDbId = 1003, InvenPos = 2,
+                Count = 1, CurrentUnidentifiedItemGrade = 1, CumulatedEnchantAmount = 2,
+                StatA = 121f, StatB = 121f, StatC = 149.8f },
+            new() { TemplateId = 6550, ItemDbId = 10021, OwnerDbId = 1003, InvenPos = 0,
+                Count = 20, CumulatedEnchantAmount = -1 },
+            new() { TemplateId = 202089, ItemDbId = 10022, OwnerDbId = 1003, InvenPos = 3,
+                Count = 1, CumulatedEnchantAmount = -1 },
+            new() { TemplateId = 202238, ItemDbId = 10023, OwnerDbId = 1003, InvenPos = 4,
+                Count = 1, CumulatedEnchantAmount = -1 },
+            new() { TemplateId = 17005, ItemDbId = 10030, OwnerDbId = 1003, InvenPos = 5,
+                Count = 1, CurrentUnidentifiedItemGrade = 1, CumulatedEnchantAmount = 3,
+                StatA = 121f, StatB = 121f, StatC = 149.8f },
+            new() { TemplateId = 139093, ItemDbId = 10032, OwnerDbId = 1003, InvenPos = 6,
+                Count = 1, CumulatedEnchantAmount = -1 },
+            new() { TemplateId = 59053, ItemDbId = 10011, OwnerDbId = 1003, InvenType = 14,
+                InvenPos = 1, Count = 1, Durability = 30, CumulatedEnchantAmount = -1,
+                StatA = 5f, StatB = 5f, StatC = 5f },
+            new() { TemplateId = 15004, ItemDbId = 10012, OwnerDbId = 1003, InvenType = 14,
+                InvenPos = 3, Count = 1, Durability = 30, CumulatedEnchantAmount = -1,
+                StatA = 1f, StatB = 1f, StatC = 1f },
+            new() { TemplateId = 15005, ItemDbId = 10013, OwnerDbId = 1003, InvenType = 14,
+                InvenPos = 4, Count = 1, Durability = 30, CumulatedEnchantAmount = -1,
+                StatA = 1f, StatB = 1f, StatC = 1f },
+            new() { TemplateId = 15006, ItemDbId = 10014, OwnerDbId = 1003, InvenType = 14,
+                InvenPos = 5, Count = 1, Durability = 30, CumulatedEnchantAmount = -1,
+                StatA = 1f, StatB = 1f, StatC = 1f },
+    };
+
+    /// <summary>frame 724's element for item 10022 (template 202089) - 400 bytes at 0x4D7. One
+    /// of the four whose every field is either in our <c>items</c> row or a default.</summary>
+    const string Cap93_Element10022 =
+        "D7 04 67 06 00 00 00 00 02 00 3F 05 00 00 00 00 "
+            + "69 15 03 00 26 27 00 00 00 00 00 00 EB 03 00 00 "
+            + "00 00 00 00 00 00 00 00 00 00 00 00 03 00 00 00 "
+            + "01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+            + "00 00 00 00 00 00 00 00 00 00 00 00 00 00 FF FF "
+            + "FF FF 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+            + "00 00 00 00 00 00 00 00 3F 05 D3 05 0F 00 5B 05 "
+            + "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+            + "00 00 00 00 5B 05 63 05 00 00 00 00 63 05 6B 05 "
+            + "00 00 00 00 6B 05 73 05 00 00 00 00 73 05 7B 05 "
+            + "00 00 00 00 7B 05 83 05 00 00 00 00 83 05 8B 05 "
+            + "00 00 00 00 8B 05 93 05 00 00 00 00 93 05 9B 05 "
+            + "00 00 00 00 9B 05 A3 05 00 00 00 00 A3 05 AB 05 "
+            + "00 00 00 00 AB 05 B3 05 00 00 00 00 B3 05 BB 05 "
+            + "00 00 00 00 BB 05 C3 05 00 00 00 00 C3 05 CB 05 "
+            + "00 00 00 00 CB 05 00 00 00 00 00 00 D3 05 00 00 "
+            + "0F 00 EF 05 01 00 00 00 00 00 00 00 00 00 00 00 "
+            + "00 00 00 00 00 00 00 00 EF 05 F7 05 00 00 00 00 "
+            + "F7 05 FF 05 00 00 00 00 FF 05 07 06 00 00 00 00 "
+            + "07 06 0F 06 00 00 00 00 0F 06 17 06 00 00 00 00 "
+            + "17 06 1F 06 00 00 00 00 1F 06 27 06 00 00 00 00 "
+            + "27 06 2F 06 00 00 00 00 2F 06 37 06 00 00 00 00 "
+            + "37 06 3F 06 00 00 00 00 3F 06 47 06 00 00 00 00 "
+            + "47 06 4F 06 00 00 00 00 4F 06 57 06 00 00 00 00 "
+            + "57 06 5F 06 00 00 00 00 5F 06 00 00 00 00 00 00";
+
+    /// <summary>
+    /// S_ADMIN_GET_USERINFO_INVEN (0xBBED), the reply to C_ADMIN_REQUEST_USERINFO kind 1 that
+    /// T89 and T91 both left unbuilt. 39-byte head + 11 * 400, and the 400 is not a flat record:
+    /// it is a 104-byte item followed by TWO stat blocks of 28 bytes, each with its own list of
+    /// fifteen 8-byte option slots. 104 + 2 * (28 + 120) = 400.
+    /// </summary>
+    [Test] public static void T93_the_admin_inventory_reply_is_byte_exact()
+    {
+        Hex.True(ArbiterClientHandlers.AdminInvenHeadSize == 39
+                 && ArbiterClientHandlers.AdminInvenItemFixedSize == 0x68
+                 && ArbiterClientHandlers.AdminInvenItemSize == 400,
+            $"39 / 104 / 400, got {ArbiterClientHandlers.AdminInvenItemSize}");
+
+        Hex.Eq(ArbiterClientHandlers.BuildAdminGetUserInfoInven(null),
+            "27 00 ED BB 00 00 00 00 00 00 00 00 00 00 00 00 "
+            + "00 00 00 00 00 00 00 00 01 01 00 28 00 00 00 00 "
+            + "00 00 00 00 00 00 00",
+            "the head alone. CreatureId is zero because the writer passes a literal 0; ShowInven "
+            + "and IsFirstPacket are 1, NeedNextPacket 0, MaxInvenSlotCount 0x28");
+
+        var path = FindRepoFile(Path.Combine("data", "t93_admin_inven_frame724.bin"));
+        if (path == null)
+        {
+            Console.WriteLine("        (skipped: data/t93_admin_inven_frame724.bin not found)");
+            return;
+        }
+        var capture = File.ReadAllBytes(path);
+        Hex.True(capture.Length == 4439, $"frame 724 is 4439 bytes, the file has {capture.Length}");
+
+        // Money is the only head field the capture pins to a value rather than a literal.
+        var frame = ArbiterClientHandlers.BuildAdminGetUserInfoInven(Cap93Frame724Items(), 46757599);
+        int diff = frame.Length == capture.Length ? -1 : 0;
+        if (diff < 0)
+            for (int i = 0; i < capture.Length; i++)
+                if (frame[i] != capture[i]) { diff = i; break; }
+        Hex.True(diff < 0, diff < 0
+            ? "byte-exact against frame 724"
+            : $"frame 724 differs at 0x{diff:X}: built {frame[diff]:X2}, captured {capture[diff]:X2}");
+    }
+
+    /// <summary>
+    /// The same reply served end to end from <c>TeraSharp.Arbiter.Persistence.CharacterStore</c>.
+    /// Two things this pins that no layout test would: the order - GetInventoryItems returns
+    /// (pocket, slot, id) and the packet wants (pocket, ID), which for this character is a
+    /// different order - and that four of the eleven elements come out byte-identical to the
+    /// capture from the row alone, because every other field of theirs is a default.
+    /// </summary>
+    [Test] public static void T93_the_inventory_tab_is_served_from_the_items_table()
+    {
+        using var store = GuildStore(1);
+        const long owner = 1003;
+        var rowsIn = new (int Id, int Type, int Slot, int Template, long Amount)[]
+        {
+            (10016, 0, 1, 6560, 19), (10018, 0, 2, 17000, 1), (10021, 0, 0, 6550, 20),
+            (10022, 0, 3, 202089, 1), (10023, 0, 4, 202238, 1), (10030, 0, 5, 17005, 1),
+            (10032, 0, 6, 139093, 1), (10011, 14, 1, 59053, 1), (10012, 14, 3, 15004, 1),
+            (10013, 14, 4, 15005, 1), (10014, 14, 5, 15006, 1),
+        };
+        foreach (var r in rowsIn)
+            store.UpsertItem(r.Id, owner, r.Type, r.Slot, r.Template, r.Amount);
+
+        var served = GmAdminTool.InvenRowsFor(store, owner);
+        var ids = new List<string>();
+        foreach (var it in served) ids.Add(it.ItemDbId.ToString());
+        Hex.True(string.Join(",", ids)
+                 == "10016,10018,10021,10022,10023,10030,10032,10011,10012,10013,10014",
+            "the bag in db-id order (slots 1, 2, 0, 3, 4, 5, 6) and then the worn pieces: "
+            + string.Join(",", ids));
+
+        var frame = ArbiterClientHandlers.BuildAdminGetUserInfoInven(served, 46757599);
+        Hex.True(frame.Length == 4439, $"eleven rows is still 4439 bytes, got {frame.Length}");
+        Hex.Eq(frame[0x4D7..(0x4D7 + ArbiterClientHandlers.AdminInvenItemSize)], Cap93_Element10022,
+            "element 4 of frame 724, built from nothing but the items row");
+
+        // A character with nothing is the head alone, not a frame with a dangling offset.
+        Hex.True(GmAdminTool.InvenRowsFor(store, 9999).Count == 0
+                 && ArbiterClientHandlers.BuildAdminGetUserInfoInven(
+                        GmAdminTool.InvenRowsFor(store, 9999)).Length
+                    == ArbiterClientHandlers.AdminInvenHeadSize,
+            "an unknown character answers with an empty inventory rather than silence");
+    }
+
     /// <summary>SDB_REGISTER_CARD's payload: <c>DlmId@0, AccountDbId@4 (i64), CardTemplateId@12,
     /// Amount@16</c> - 20 bytes, the length of seq 7032.</summary>
     static byte[] CardRegister(long accountId, int cardTemplateId, int amount)
