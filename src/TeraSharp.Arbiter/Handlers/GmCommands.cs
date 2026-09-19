@@ -929,6 +929,129 @@ public static class GmAdminTool
         return true;
     }
 
+    // =========================== T99: the rest of the tool ===========================
+    //
+    // Every one of these is gated the same way in the binary - `*(int *)(user + 0x3b98) < 1`
+    // rejects with GM_NOT_ENOUGH_AUTHORITY - which is the same admin level Allowed() tests.
+
+    public const int GmTeleportBodySize = 0x16 - 4;
+    public const int GmMapTeleportBodySize = 10 - 4;
+    public const int AdminLobbyBodySize = 10 - 4;
+    public const int GameIdBodySize = 8;
+    public const int DungeonIdBodySize = 4;
+    public const int BookmarkIndexBodySize = 4;
+    public const int GmEventNoticeBodySize = 2;
+
+    /// <summary>
+    /// C_ADMIN_GM_TELEPORT (0xEC4B): <c>[u16 _][i32 zone][f32 x][f32 y][f32 z]</c> - 22 bytes,
+    /// the handler's own guard. It builds a teleport request and hands it to World as
+    /// inter-server message <c>0xd0</c>; the Arbiter never moves anybody itself.
+    /// <para>So does this: the destination is logged and the packet is answered, because moving
+    /// a character is World's to do and the bridge is not ours to drive from here. The same
+    /// holds for C_ADMIN_GM_MAPTELEPORT, C_ADMIN_REMOVE_NPC and C_ADMIN_VANISH_PET - all four
+    /// end in the same forward.</para>
+    /// </summary>
+    public static bool OnGmTeleport(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        if (!Allowed(s, log, "C_ADMIN_GM_TELEPORT")) return true;
+        var b = body.Span;
+        if (b.Length < GmTeleportBodySize)
+        {
+            log.LogWarning("C_ADMIN_GM_TELEPORT: {Len} B body (want {Want})", b.Length, GmTeleportBodySize);
+            return true;
+        }
+        log.LogInformation("C_ADMIN_GM_TELEPORT: zone {Zone} ({X}, {Y}, {Z}) - World's to do",
+            BitConverter.ToInt32(b[2..]), BitConverter.ToSingle(b[6..]),
+            BitConverter.ToSingle(b[10..]), BitConverter.ToSingle(b[14..]));
+        return true;
+    }
+
+    /// <summary>C_ADMIN_GM_MAPTELEPORT (0xDC53): <c>[u16 nameOffset][i32 ContinentId]</c> then
+    /// the name - teleport to a continent by name.</summary>
+    public static bool OnGmMapTeleport(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        if (!Allowed(s, log, "C_ADMIN_GM_MAPTELEPORT")) return true;
+        var b = body.Span;
+        int continent = b.Length >= GmMapTeleportBodySize ? BitConverter.ToInt32(b[2..]) : 0;
+        log.LogInformation("C_ADMIN_GM_MAPTELEPORT: '{Name}' to continent {Id} - World's to do",
+            ArbiterClientHandlers.ReadWString(b, 0), continent);
+        return true;
+    }
+
+    /// <summary>
+    /// C_ADMIN_LOBBY (0xD80D): <c>[u16 reasonOffset][i32 userDbId]</c> then the reason - send a
+    /// player back to character select. The handler looks the target up and calls the session
+    /// manager; ending somebody else's session is the human-owned half of this build, so the
+    /// order is logged and answered.
+    /// </summary>
+    public static bool OnAdminLobby(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        if (!Allowed(s, log, "C_ADMIN_LOBBY")) return true;
+        var b = body.Span;
+        int target = b.Length >= AdminLobbyBodySize ? BitConverter.ToInt32(b[2..]) : 0;
+        log.LogInformation("C_ADMIN_LOBBY: player {Id} to the lobby ('{Why}') - not carried out",
+            target, ArbiterClientHandlers.ReadWString(b, 0));
+        return true;
+    }
+
+    /// <summary>C_ADMIN_REMOVE_NPC (0x830D) and C_ADMIN_VANISH_PET (0x6F81): one
+    /// <c>[i64 gameId]</c> each, both forwarded to World in the binary.</summary>
+    public static bool OnAdminRemoveNpc(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+        => LogGameIdOrder(s, body, log, "C_ADMIN_REMOVE_NPC");
+
+    public static bool OnAdminVanishPet(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+        => LogGameIdOrder(s, body, log, "C_ADMIN_VANISH_PET");
+
+    private static bool LogGameIdOrder(GameSession s, ReadOnlyMemory<byte> body, ILogger log, string what)
+    {
+        if (!Allowed(s, log, what)) return true;
+        var b = body.Span;
+        long gameId = b.Length >= GameIdBodySize ? BitConverter.ToInt64(b) : 0;
+        log.LogInformation("{What}: game id 0x{Id:X} - World's to do", what, gameId);
+        return true;
+    }
+
+    /// <summary>
+    /// C_ADMIN_GET_DUNGEON_USER_LIST (0xE2C8): <c>[i32 DungeonId]</c>. The reply is one row per
+    /// live instance; the Arbiter does not run dungeons and we track no instances, so the list
+    /// is empty - which the tool draws as "nobody inside" rather than hanging.
+    /// </summary>
+    public static bool OnAdminGetDungeonUserList(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        if (!Allowed(s, log, "C_ADMIN_GET_DUNGEON_USER_LIST")) return true;
+        s.Send(ArbiterClientHandlers.BuildAdminGetDungeonUserList(null));
+        return true;
+    }
+
+    /// <summary>
+    /// C_ADMIN_REMOVE_CUSTOM_BOOKMARK (0xBAA9): <c>[i32 index]</c>, min frame 8. The handler
+    /// deletes that index and then re-sends the whole list, exactly as the add does (T89), so
+    /// the tool redraws from the answer.
+    /// </summary>
+    public static bool OnRemoveCustomBookmark(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        if (!Allowed(s, log, "C_ADMIN_REMOVE_CUSTOM_BOOKMARK")) return true;
+        var b = body.Span;
+        long account = s.Account?.Id ?? 0;
+        if (b.Length >= BookmarkIndexBodySize && account > 0)
+            Program.Store?.DeleteGmBookmark(account, BitConverter.ToInt32(b));
+        return OnRequestCustomBookmark(s, body, log);
+    }
+
+    /// <summary>
+    /// C_ADMIN_GMEVENT_NOTICE (0xD622): <c>[u16 noticeOffset]</c> then the line. It goes to the
+    /// GM-event manager, which runs the OX quiz and the summon events this build has none of -
+    /// there is no event to notice about - so the line is logged rather than broadcast to every
+    /// player as a GM event that is not running.
+    /// </summary>
+    public static bool OnGmEventNotice(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        if (!Allowed(s, log, "C_ADMIN_GMEVENT_NOTICE")) return true;
+        log.LogInformation("C_ADMIN_GMEVENT_NOTICE: '{Notice}' - no GM event is running",
+            ArbiterClientHandlers.ReadWString(body.Span, 0));
+        return true;
+    }
+
     /// <summary>C_ADMIN_GM_SKILL (0x8949), frames 542 and 1210:
     /// <c>[pdid 8][i32 value]</c>.</summary>
     public static bool OnGmSkill(GameSession s, ReadOnlyMemory<byte> body, ILogger log)

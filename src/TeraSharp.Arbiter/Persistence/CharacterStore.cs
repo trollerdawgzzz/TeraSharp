@@ -1061,6 +1061,28 @@ CREATE TABLE IF NOT EXISTS cards (
 -- carries the coordinates TRUNCATED TO WHOLE NUMBERS: cap_final_gm_client2 frame 1167 sends
 -- 16920.03 / 1232.46 / -4427.045 and frame 1168 returns 16920 / 1232 / -4427. Per account,
 -- because the tool is opened from an account and not from a character.
+-- T99: the string a player writes onto an item - C_SET_ITEM_STRING for a blank one and
+-- C_REWRITE_ITEM_STRING for one already written. Keyed on the item, because both packets
+-- name the item by db id and nothing else reads it.
+CREATE TABLE IF NOT EXISTS item_strings (
+  item_db_id     INTEGER NOT NULL PRIMARY KEY,
+  text           TEXT    NOT NULL DEFAULT '',
+  written_by     INTEGER NOT NULL DEFAULT 0,
+  written_at     INTEGER NOT NULL DEFAULT 0
+);
+
+-- T99: the in-world message boards C_WRITE_BOARD posts to and S_BOARD_ITEM_LIST lists.
+-- BoardId is the board's own id, which the client sends in every one of the three packets.
+CREATE TABLE IF NOT EXISTS board_posts (
+  post_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+  board_id       INTEGER NOT NULL,
+  writer_id      INTEGER NOT NULL DEFAULT 0,
+  writer         TEXT    NOT NULL DEFAULT '',
+  contents       TEXT    NOT NULL DEFAULT '',
+  written_at     INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS ix_board_posts ON board_posts(board_id, post_id);
+
 CREATE TABLE IF NOT EXISTS gm_bookmarks (
   account_id     INTEGER NOT NULL,
   bookmark_index INTEGER NOT NULL,
@@ -4405,6 +4427,103 @@ DELETE FROM guild_members     WHERE user_db_id = $id;";
     /// <summary>One saved teleport shortcut. The coordinates are whole numbers - see the DDL.</summary>
     public sealed record GmBookmarkRow(int Index, int Zone, float X, float Y, float Z, string Name);
 
+    // ------------------------- T99: item strings and boards -------------------------
+
+    /// <summary>One board post, newest last - the order Board::SendBoardItemList walks.</summary>
+    public sealed record BoardPostRow(long PostId, int BoardId, int WriterId, string Writer,
+                                      string Contents, long WrittenAt);
+
+    /// <summary>
+    /// C_SET_ITEM_STRING (0x601E) and C_REWRITE_ITEM_STRING (0x65F1). Both end in
+    /// <c>User::SetItemString</c>-shaped work on the Arbiter's own item row, and neither sends
+    /// a reply. Writing over an existing string is what the rewrite packet is for, so this is
+    /// one upsert for both.
+    /// </summary>
+    public bool SetItemString(long itemDbId, string text, int writerId, long whenUnix)
+    {
+        if (itemDbId <= 0) return false;
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "INSERT INTO item_strings(item_db_id, text, written_by, written_at) " +
+                "VALUES($i, $t, $w, $d) " +
+                "ON CONFLICT(item_db_id) DO UPDATE SET text = $t, written_by = $w, written_at = $d";
+            cmd.Parameters.AddWithValue("$i", itemDbId);
+            cmd.Parameters.AddWithValue("$t", text ?? "");
+            cmd.Parameters.AddWithValue("$w", writerId);
+            cmd.Parameters.AddWithValue("$d", whenUnix);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    /// <summary>The string written on an item, or empty. S_PREVIEW_ITEM carries it.</summary>
+    public string GetItemString(long itemDbId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT text FROM item_strings WHERE item_db_id = $i";
+            cmd.Parameters.AddWithValue("$i", itemDbId);
+            return cmd.ExecuteScalar() as string ?? "";
+        }
+    }
+
+    /// <summary>C_WRITE_BOARD (0xEDA6): one post onto one board.</summary>
+    public long AddBoardPost(int boardId, int writerId, string writer, string contents, long whenUnix)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "INSERT INTO board_posts(board_id, writer_id, writer, contents, written_at) " +
+                "VALUES($b, $wid, $w, $c, $d); SELECT last_insert_rowid();";
+            cmd.Parameters.AddWithValue("$b", boardId);
+            cmd.Parameters.AddWithValue("$wid", writerId);
+            cmd.Parameters.AddWithValue("$w", writer ?? "");
+            cmd.Parameters.AddWithValue("$c", contents ?? "");
+            cmd.Parameters.AddWithValue("$d", whenUnix);
+            return Convert.ToInt64(cmd.ExecuteScalar()!);
+        }
+    }
+
+    /// <summary>Every post on a board, oldest first.</summary>
+    public List<BoardPostRow> GetBoardPosts(int boardId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "SELECT post_id, board_id, writer_id, writer, contents, written_at " +
+                "FROM board_posts WHERE board_id = $b ORDER BY post_id";
+            cmd.Parameters.AddWithValue("$b", boardId);
+            var rows = new List<BoardPostRow>();
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                rows.Add(new BoardPostRow(r.GetInt64(0), r.GetInt32(1), r.GetInt32(2),
+                                          r.GetString(3), r.GetString(4), r.GetInt64(5)));
+            return rows;
+        }
+    }
+
+    /// <summary>
+    /// T99. C_ADMIN_REMOVE_CUSTOM_BOOKMARK -&gt; <c>Bookmark::DeleteCustomBookmark(index)</c>,
+    /// after which the handler re-sends the whole list. Deleting an index that is not there is
+    /// not an error - the tool sends the same index twice on a double click.
+    /// </summary>
+    public bool DeleteGmBookmark(long accountId, int index)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "DELETE FROM gm_bookmarks WHERE account_id = $a AND bookmark_index = $i";
+            cmd.Parameters.AddWithValue("$a", accountId);
+            cmd.Parameters.AddWithValue("$i", index);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
     /// <summary>C_ADMIN_ADD_CUSTOM_BOOKMARK. Re-adding the same index overwrites it.</summary>
     public void AddGmBookmark(long accountId, int index, int zone, float x, float y, float z, string? name)
     {
@@ -4983,6 +5102,27 @@ DELETE FROM guild_members     WHERE user_db_id = $id;";
             using var cmd = _db.CreateCommand();
             cmd.CommandText = "DELETE FROM items WHERE amount <= 0";
             return cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>
+    /// T99. One item by its db id, whoever owns it - C_PREVIEW_ITEM names items by id alone and
+    /// nothing else in the packet says whose they are.
+    /// </summary>
+    public ItemRow? GetItem(int itemDbId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "SELECT item_db_id, owner_db_id, inven_type, slot, template_id, amount, record " +
+                "FROM items WHERE item_db_id = $id";
+            cmd.Parameters.AddWithValue("$id", itemDbId);
+            using var r = cmd.ExecuteReader();
+            if (!r.Read()) return null;
+            byte[]? rec = r.IsDBNull(6) ? null : (byte[])r["record"];
+            return new ItemRow(r.GetInt32(0), r.GetInt64(1), r.GetInt32(2), r.GetInt32(3),
+                               r.GetInt32(4), r.GetInt64(5), rec);
         }
     }
 

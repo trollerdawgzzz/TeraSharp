@@ -526,3 +526,39 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   ack; C_REQUEST_COUPON_DATA goes to CouponManager::RequestCouponData, which is an async DB
   round trip; and C_CUSTOM_USER_CUSTOMIZING / the two appearance cancels unwind an appearance
   change this build never starts.
+
+- T99: the items/board tail, the rest of the GM tool and the dungeon ranking - twenty client
+  packets, decompile-only again (no capture holds one). Every fixed size below was computed
+  from the PDL dumper's fields and then checked against that dumper's own guard; all of them
+  agree, which is the cross-check this batch had instead of a frame.
+
+  **Five replies built**: S_BOARD_ITEM_LIST (12-byte head, 16-byte elements, guard 0xb),
+  S_REPLY_NONDB_ITEM_INFO (flat 38, guard 0x25), S_PREVIEW_ITEM (26-byte elements, guard 0x1a),
+  S_SHOW_TRADE_LOG (16 + 20, guard 0xf), S_IMAGE_DATA, plus S_ADMIN_GET_DUNGEON_USER_LIST
+  (22-byte elements, guard 0x16) and the two ranking lists. **S_DUNGEON_RANK_RECORD_LIST is the
+  awkward one**: its head carries the caller's OWN record as loose fields behind `HasMyRecord`
+  at +0x1C - rank, class, race, gender, record, date, and the two strings - which is how it
+  reaches 65 bytes, exactly the guard's 0x40, with 36-byte elements (0x24) for the board.
+
+  **S_IMAGE_DATA is the guild crest again**: C_REQUEST_IMAGE_DATA ends in
+  `Guild::SendGuildLogoNoLock`, so it is T95's flag image under a third opcode, and it resolves
+  the same way - image id string -> the guild whose `logo_id` it is -> that blob.
+
+  **Three store**: new `item_strings` (C_SET_ITEM_STRING and C_REWRITE_ITEM_STRING both write
+  it - the rewrite packet exists to write over one already there) and `board_posts`
+  (C_WRITE_BOARD), plus `DeleteGmBookmark` for C_ADMIN_REMOVE_CUSTOM_BOOKMARK, which deletes
+  and then re-sends the whole list exactly as T89's add does. New `GetItem(itemDbId)` too:
+  C_PREVIEW_ITEM names items by db id alone.
+
+  **Four GM packets are World's work, not ours**: C_ADMIN_GM_TELEPORT, _MAPTELEPORT,
+  C_ADMIN_REMOVE_NPC and C_ADMIN_VANISH_PET all end in the same forward - the teleport one
+  hands World inter-server message **0xd0** - and the Arbiter never moves anything itself. All
+  four are gated on the same admin level (`*(int *)(user + 0x3b98) < 1` in the binary) and
+  logged. C_ADMIN_LOBBY ends somebody else's session, which is the human-owned half of this
+  build, so it is logged too.
+
+  **Not built, with the reason**: S_SHOW_TRADE_ITEM (C_SHOW_TRADE_ITEM) is a full both-sides
+  tooltip of a past trade and there is no trade log to read - answering it with an empty trade
+  would show a GM two empty inventories as if that were the trade. C_ADMIN_GMEVENT_NOTICE is
+  logged rather than broadcast: it drives the GM-event manager (the OX quiz, the summons) and
+  no event is running to notice about.

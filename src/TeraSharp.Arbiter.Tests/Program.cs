@@ -20567,6 +20567,161 @@ string message
             "an unknown character reads back empty");
     }
 
+    // ===================== T99: item strings, boards, previews, ranking =====================
+    //
+    // Decompile-only again - no capture holds any of these. Each computed fixed size is checked
+    // against its dumper's guard, and the two that disagreed with a first reading (the ranking
+    // head at 0x40 and the NonDB info at 0x25) are the ones asserted hardest below.
+
+    /// <summary>
+    /// The boards. S_BOARD_ITEM_LIST is <c>[u16 count][u16 offset][i32 BoardId]</c> and 16-byte
+    /// elements of <c>[here][next][writerOffset][contentsOffset][i64 WriteTime]</c>; the head is
+    /// 12, which is the guard's 0xb.
+    /// </summary>
+    [Test] public static void T99_the_board_list_is_built_from_the_posts_table()
+    {
+        Hex.Eq(ArbiterClientHandlers.BuildBoardItemList(5, null),
+            "0C 00 E7 6F 00 00 00 00 05 00 00 00", "an empty board still names itself");
+
+        using var store = GuildStore(1);
+        long id = store.AddBoardPost(5, 1, "g1", "hi", 1789300602L);
+        Hex.True(id > 0, "the post gets a row id");
+
+        var posts = store.GetBoardPosts(5);
+        var rows = new List<ArbiterClientHandlers.BoardItem>();
+        foreach (var p in posts)
+            rows.Add(new ArbiterClientHandlers.BoardItem(p.WrittenAt, p.Writer, p.Contents));
+        Hex.Eq(ArbiterClientHandlers.BuildBoardItemList(5, rows),
+            "28 00 E7 6F 01 00 0C 00 05 00 00 00 0C 00 00 00 "
+            + "1C 00 22 00 7A 8F A6 6A 00 00 00 00 67 00 31 00 "
+            + "00 00 68 00 69 00 00 00",
+            "one post, written by g1");
+        Hex.True(store.GetBoardPosts(6).Count == 0, "posts do not leak between boards");
+    }
+
+    /// <summary>
+    /// The item string C_SET_ITEM_STRING writes and C_REWRITE_ITEM_STRING writes over, and the
+    /// preview that reads it back. S_PREVIEW_ITEM's element is 26 bytes - the guard's 0x1a -
+    /// and carries the item's template and its string; the exterior and colouring are World's
+    /// item object, so they stay 0.
+    /// </summary>
+    [Test] public static void T99_an_item_string_round_trips_into_the_preview()
+    {
+        using var store = GuildStore(1);
+        store.UpsertItem(10022, 1, 0, 3, 202089, 1);
+        Hex.True(store.SetItemString(10022, "mine", 1, 1789300602L), "the string is stored");
+        Hex.True(store.GetItemString(10022) == "mine" && store.GetItemString(99) == "",
+            "and only on that item");
+
+        // The rewrite packet writes over the same column - that is what it is for.
+        store.SetItemString(10022, "mine again", 1, 1789300603L);
+        Hex.True(store.GetItemString(10022) == "mine again", "a rewrite replaces, not appends");
+        store.SetItemString(10022, "mine", 1, 1789300602L);
+
+        var row = store.GetItem(10022);
+        Hex.True(row is not null && row.TemplateId == 202089,
+            "GetItem finds an item by db id alone, which is all C_PREVIEW_ITEM sends");
+
+        Hex.Eq(ArbiterClientHandlers.BuildPreviewItem(new[]
+            {
+                new ArbiterClientHandlers.PreviewItem(10022, 202089, 0, 0, store.GetItemString(10022)),
+            }),
+            "2C 00 A1 E8 01 00 08 00 08 00 00 00 22 00 26 27 "
+            + "00 00 00 00 00 00 69 15 03 00 00 00 00 00 00 00 "
+            + "00 00 6D 00 69 00 6E 00 65 00 00 00",
+            "one preview row");
+        Hex.True(ArbiterClientHandlers.PreviewItemEntryFixedSize == 0x1A, "26-byte elements");
+    }
+
+    /// <summary>
+    /// The three flat replies. S_REPLY_NONDB_ITEM_INFO is 38 bytes, which is its guard's 0x25
+    /// exactly - the last field, TimeLeft, sits at +0x22 - and it echoes the two template ids
+    /// the request carried because everything else about a "NonDB" item is datasheet.
+    /// </summary>
+    [Test] public static void T99_the_flat_item_and_trade_replies_are_sized_by_their_guards()
+    {
+        Hex.Eq(ArbiterClientHandlers.BuildReplyNonDbItemInfo(6560, 7),
+            "26 00 EF 54 A0 19 00 00 00 00 00 00 00 00 00 00 "
+            + "00 00 00 00 00 00 07 00 00 00 00 00 00 00 00 00 "
+            + "00 00 00 00 00 00",
+            "ItemTemplateId at +4 and BindItemTemplateId at +0x16, everything else zero");
+        Hex.True(ArbiterClientHandlers.NonDbItemInfoSize == 38,
+            "38 bytes - the guard is 0x25 and TimeLeft ends the record at +0x26");
+
+        Hex.Eq(ArbiterClientHandlers.BuildShowTradeLog(null),
+            "10 00 FD 6E 00 00 00 00 00 00 00 00 00 00 00 00", "no trade log in this build: page 0 of 0");
+
+        Hex.Eq(ArbiterClientHandlers.BuildImageData("", null),
+            "0C 00 D8 A1 0A 00 0C 00 00 00 00 00",
+            "S_IMAGE_DATA is the guild crest under a second opcode - same [offset][count] ref "
+            + "as T95's flag packet, and an empty blob still gets a real offset");
+        var withImage = ArbiterClientHandlers.BuildImageData("7", new byte[] { 9, 8 });
+        Hex.True(withImage.Length == 10 + 4 + 2
+                 && BitConverter.ToUInt16(withImage, 6) == 14
+                 && BitConverter.ToUInt16(withImage, 8) == 2,
+            $"the bytes follow the id string: {withImage.Length}");
+    }
+
+    /// <summary>
+    /// The dungeon ranking. The head of S_DUNGEON_RANK_RECORD_LIST carries the caller's OWN
+    /// record as loose fields behind <c>HasMyRecord</c> - 65 bytes, the guard's 0x40 - and the
+    /// board itself as a list of 36-byte elements (the element guard's 0x24). Nothing here
+    /// records a dungeon run, so both go out empty with the request's ids echoed.
+    /// </summary>
+    [Test] public static void T99_the_dungeon_ranking_answers_empty_with_the_ids_echoed()
+    {
+        Hex.Eq(ArbiterClientHandlers.BuildDungeonRankSeasonList(3030, 1),
+            "10 00 62 DF 00 00 00 00 D6 0B 00 00 01 00 00 00", "no season has been run");
+
+        Hex.Eq(ArbiterClientHandlers.BuildDungeonRankRecordList(3030, 1, 2),
+            "45 00 E3 C9 00 00 00 00 41 00 43 00 D6 0B 00 00 "
+            + "01 00 00 00 02 00 00 00 00 00 00 00 00 00 00 00 "
+            + "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+            + "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+            + "00 00 00 00 00",
+            "HasMyRecord 0 at +0x1C, and the two head strings sit right behind the 65-byte "
+            + "fixed part");
+        Hex.True(ArbiterClientHandlers.DungeonRankRecordHeadSize == 0x41
+                 && ArbiterClientHandlers.DungeonRankRecordEntryFixedSize == 0x24,
+            "65 and 36, both straight off their guards");
+
+        var mine = new ArbiterClientHandlers.DungeonRankRow(1, "g1", "sdg", 2, 1, 0, 1234, 99L);
+        var one = ArbiterClientHandlers.BuildDungeonRankRecordList(3030, 1, 2, 0, mine, 55L,
+            new[] { mine });
+        Hex.True(one[0x1C] == 1 && BitConverter.ToInt32(one, 0x1D) == 1
+                 && BitConverter.ToInt64(one, 0x39) == 55L,
+            "with a record: the flag, the rank and LastSortTime at +0x39");
+        Hex.True(BitConverter.ToUInt16(one, 6) == 0x41 + 6 + 8
+                 && BitConverter.ToUInt16(one, BitConverter.ToUInt16(one, 6) + 2) == 0,
+            "the list starts after the head's own two strings and its last next is 0");
+    }
+
+    /// <summary>
+    /// The rest of the GM tool. The dungeon-user list is the only one with a reply we can
+    /// build; the bookmark delete does real work and then re-sends the list, exactly as T89's
+    /// add does.
+    /// </summary>
+    [Test] public static void T99_the_gm_tool_tail_deletes_a_bookmark_and_lists_dungeons()
+    {
+        Hex.Eq(ArbiterClientHandlers.BuildAdminGetDungeonUserList(null),
+            "08 00 5D E5 00 00 00 00", "we track no dungeon instances, so the tool sees none");
+        Hex.True(ArbiterClientHandlers.DungeonUserListEntryFixedSize == 0x16,
+            "22-byte elements when there are any");
+
+        using var store = GuildStore(1);
+        long account = store.AccountOf(1);
+        store.AddGmBookmark(account, 1, 5, 1f, 2f, 3f, "one");
+        store.AddGmBookmark(account, 2, 5, 4f, 5f, 6f, "two");
+        Hex.True(store.GetGmBookmarks(account).Count == 2, "two bookmarks");
+
+        Hex.True(store.DeleteGmBookmark(account, 1), "the first goes");
+        var left = store.GetGmBookmarks(account);
+        Hex.True(left.Count == 1 && left[0].Index == 2 && left[0].Name == "two",
+            "and the other one stays");
+        Hex.True(!store.DeleteGmBookmark(account, 1),
+            "deleting it twice is not an error - the tool sends the index twice on a double click");
+    }
+
     /// <summary>SDB_REGISTER_CARD's payload: <c>DlmId@0, AccountDbId@4 (i64), CardTemplateId@12,
     /// Amount@16</c> - 20 bytes, the length of seq 7032.</summary>
     static byte[] CardRegister(long accountId, int cardTemplateId, int amount)
