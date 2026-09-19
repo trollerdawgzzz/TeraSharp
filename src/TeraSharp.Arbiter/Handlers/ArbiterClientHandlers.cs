@@ -3673,7 +3673,7 @@ public static class MiscClientPackets
     public const int ProfileTextBodySize = 2;               // [u16 offset] + the string
     public const int LoginWorldBodySize = 0x12 - 4;         // guard 0x12 - see OnLoginWorld
 
-    private static int Me(GameSession s) => s.SelectedCharacter?.Id ?? 0;
+    private static int Me(GameSession s) => (int)(s.SelectedCharacter?.Id ?? 0);
 
     // ------------------------------- the party extras -------------------------------
 

@@ -237,8 +237,27 @@ public static class HandlerRegistry
             "C_DUNGEON_COOL_TIME_LIST", "C_VIEW_BATTLE_FIELD_RESULT",
             "C_REQUEST_CANDIDATE_LIST", "C_SHOW_AWESOMIUMWEB_SHOP", "C_RESET_ALL_DUNGEON",
             "C_UPDATE_CONTENTS_PLAYTIME", "C_EVENT_GUIDE",
+            // T97: real handlers that parse nothing / store nothing / reply nothing
+            "C_GET_ATTENDANCE_REWARD", "C_REQUEST_STACK_ATTENDANCE_EVENT_REWARD", "C_EVENT_MATCHING_DUNGEON_DETAIL_INFO",
+            "C_REQUEST_COUPON_DATA", "C_REQUEST_RECV_DAILY_TOKEN", "C_QUERY_COIN", "C_REQUEST_CHANGE_PARTY_NAME",
+            "C_PARTY_NOTIFY_MY_POSITION", "C_CANCEL_CHANGE_USER_APPEARANCE", "C_CANCEL_PREPARE_CHANGE_USER_APPEARANCE",
+            "C_CUSTOM_USER_CUSTOMIZING", "C_SAVE_CHAT_SETTING", "C_UPDATE_SKILL_SCRIPT",
         })
             Reg(name, 0, (s, b) => ArbiterClientHandlers.OnAcceptSilently(s, b, misc));
+
+        // --- T97: party extras, event/VIP windows, reports, profile ---
+        Reg("C_REQUEST_PARTY_NAME",                     MiscClientPackets.RequestPartyNameBodySize,      (s,b) => MiscClientPackets.OnRequestPartyName(s,b,misc));
+        Reg("C_VIEW_PARTY_INVITE",                      0,                                              (s,b) => MiscClientPackets.OnViewPartyInvite(s,b,misc));
+        Reg("C_GET_EVENT_DETAIL",                       0,                                              (s,b) => MiscClientPackets.OnGetEventDetail(s,b,misc));
+        Reg("C_REQUEST_VIP_SYSTEM_INFO",                0,                                              (s,b) => MiscClientPackets.OnRequestVipSystemInfo(s,b,misc));
+        Reg("C_REQUEST_STACK_ATTENDANCE_EVENT_INFO_UPDATE", 0,                                          (s,b) => MiscClientPackets.OnRequestStackAttendanceEventInfoUpdate(s,b,misc));
+        Reg("C_EVENT_MATCHING_BATTLEFIELD_DETAIL_INFO", MiscClientPackets.EventMatchingDetailBodySize,  (s,b) => MiscClientPackets.OnEventMatchingBattlefieldDetailInfo(s,b,misc));
+        Reg("C_CHAT_REPORT",                            MiscClientPackets.ChatReportBodySize,           (s,b) => MiscClientPackets.OnChatReport(s,b,misc));
+        Reg("C_USER_REPORT",                            MiscClientPackets.UserReportBodySize,           (s,b) => MiscClientPackets.OnUserReport(s,b,misc));
+        Reg("C_CHANGE_MY_PROFILE",                      MiscClientPackets.ProfileTextBodySize,          (s,b) => MiscClientPackets.OnChangeMyProfile(s,b,misc));
+        Reg("C_UPDATE_MY_DESCRIPTION",                  MiscClientPackets.ProfileTextBodySize,          (s,b) => MiscClientPackets.OnUpdateMyDescription(s,b,misc));
+        Reg("C_CHANGE_MY_STATE",                        MiscClientPackets.ChangeMyStateBodySize,        (s,b) => MiscClientPackets.OnChangeMyState(s,b,misc));
+        Reg("C_LOGIN_WORLD",                            0,                                              (s,b) => MiscClientPackets.OnLoginWorld(s,b,misc));
 
         // --- Guild board (T95): list/search/paging, wanted board, invite list, level ranking, flag, bank log ---
         Reg("C_REQUEST_GUILD_LIST",                      GuildBoard.RequestGuildListBodySize, (s, b) => GuildBoard.OnRequestGuildList(s, b, misc));
