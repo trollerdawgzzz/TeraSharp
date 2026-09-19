@@ -527,3 +527,31 @@ empty. Its element is `[u16 charNameOff][u32 userDbId][u32 userClass][u32 level]
 plus the name, and the def for that is right. Filling it needs the chat layer wired to the
 friend list; what the entries actually select is not settled by these two frames, so nothing is
 invented here.
+
+## T96 — the private channels are registered at last
+
+`ChatManager` has answered eight client packets since T43, but **nothing ever registered them**,
+so every one fell through `PacketDispatcher`’s forward-to-World path to a server with no handler
+for any of them. They are now on `ArbiterClientHandlers.ArbiterOwned` and the manager exposes the
+`PartyMatchManager` surface:
+
+```
+ChatManager.ClientOpcodes            (Name, Opcode)[] - the eight, in registration order
+ChatManager.MinBodyLength(op)        ChatPackets.MinClientLength minus the 4-byte header
+ChatManager.IsArbiterSide(op)        is it one of the eight
+ChatManager.OnClientPacket(session, op, body)   static, dispatches through ActionDispatcher
+ChatManager.Instance                 the live manager the static entry uses
+```
+
+`C_WHISPER` and `C_CHAT` are deliberately **not** in the list: they stay with `SocialHandlers`.
+`C_REUQUEST_JOINED_CHANNEL_LIST` (0x7F78 — the misspelling is the real one) had no case at all;
+it is now accepted and answered with nothing, because nothing in cap_final asks for it and the
+reply shape is therefore unknown. Registering it is still the point: it keeps it off the World link.
+
+### T96.1 Three T43 expectations moved to the captured behaviour
+
+Code unchanged; only the tests. `Chat_join_tells_the_joiner_then_every_member` now asserts an
+**empty** `userList`; `Chat_channel_info_answers_the_create_dialog_defaults_for_minus_one` asserts
+`isMaster` is **1**; and `Chat_every_emitted_packet_encodes_through_the_codec` checks the 0x12
+fixed part at the **name** ref (body[4]) with the list words at body[0..3] both zero — the same
+fact, moved to the word that still carries it now the list is empty. See T94.2 for the bytes.

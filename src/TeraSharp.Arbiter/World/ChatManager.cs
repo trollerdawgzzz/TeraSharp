@@ -1,4 +1,5 @@
 using Microsoft.Extensions.Logging;
+using TeraSharp.Arbiter.Network;
 using TeraSharp.Arbiter.Persistence;
 using TeraSharp.Arbiter.Protocol;
 
@@ -80,10 +81,21 @@ public sealed class ChatManager
     /// addresses a channel by its SLOT, never by the id.</summary>
     private readonly Dictionary<int, int[]> _slots = new();
 
+    /// <summary>
+    /// The live manager, for the static <see cref="OnClientPacket(GameSession, ushort, ReadOnlyMemory{byte})"/>
+    /// entry the registry calls. Set by the constructor, exactly as PartyWiring holds the party
+    /// manager; the tests build their own instances and never touch this.
+    /// </summary>
+    public static ChatManager? Instance { get; private set; }
+
+    private static ILogger Log = Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance;
+
     public ChatManager(CharacterStore store, ILogger log)
     {
         _store = store;
         _log = log;
+        Instance = this;
+        Log = log;
     }
 
     // ---- limits, all from the decompile ----
@@ -206,6 +218,12 @@ public sealed class ChatManager
             case ChatPackets.C_KICK_CHANNEL_MEMBER: return KickMember(a, characterId, body);
             case ChatPackets.C_CHANGE_CHANNEL_PASSWORD: return ChangePassword(a, characterId, body);
             case ChatPackets.C_REQUEST_PRIVATE_CHANNEL_INFO: return ChannelInfo(a, characterId, body);
+            // C_REUQUEST_JOINED_CHANNEL_LIST (the misspelling is the real one) is accepted and
+            // answered with nothing. Nothing in cap_final asks for it, so the reply shape is
+            // unknown; registering it keeps it off the World link, which is the whole point.
+            case ChatPackets.C_REUQUEST_JOINED_CHANNEL_LIST:
+                _log.LogTrace("C_REUQUEST_JOINED_CHANNEL_LIST from {Who} - accepted, no reply", characterId);
+                return a;
             default:
                 return a.Reject($"0x{opcode:X4} is not an Arbiter-side chat packet");
         }
@@ -593,6 +611,95 @@ public sealed class ChatManager
         a.ToPlayer(callerId, "S_REQUEST_PRIVATE_CHANNEL_INFO",
             ChatPackets.ChannelInfoFields(isMaster, password, names));
         return a;
+    }
+
+    // =======================================================================================
+    // T96 - the registry surface, the PartyMatchManager shape
+    // =======================================================================================
+
+    /// <summary>
+    /// The eight private-channel packets the Arbiter owns, in the order HandlerRegistry should
+    /// register them. C_WHISPER and C_CHAT are deliberately absent: those stay on
+    /// SocialHandlers, which already owns the chat-routing side.
+    /// </summary>
+    public static readonly (string Name, ushort Opcode)[] ClientOpcodes =
+    {
+        ("C_REQUEST_PRIVATE_CHANNEL_INFO",   ChatPackets.C_REQUEST_PRIVATE_CHANNEL_INFO),
+        ("C_CREATE_PRIVATE_CHANNEL",         ChatPackets.C_CREATE_PRIVATE_CHANNEL),
+        ("C_EDIT_PRIVATE_CHANNEL",           ChatPackets.C_EDIT_PRIVATE_CHANNEL),
+        ("C_JOIN_PRIVATE_CHANNEL",           ChatPackets.C_JOIN_PRIVATE_CHANNEL),
+        ("C_LEAVE_PRIVATE_CHANNEL",          ChatPackets.C_LEAVE_PRIVATE_CHANNEL),
+        ("C_KICK_CHANNEL_MEMBER",            ChatPackets.C_KICK_CHANNEL_MEMBER),
+        ("C_CHANGE_CHANNEL_PASSWORD",        ChatPackets.C_CHANGE_CHANNEL_PASSWORD),
+        ("C_REUQUEST_JOINED_CHANNEL_LIST",   ChatPackets.C_REUQUEST_JOINED_CHANNEL_LIST),
+    };
+
+    /// <summary>
+    /// Minimum BODY length, which is what <c>PacketDispatcher.Register</c> compares. The
+    /// decompile s guards are TOTAL client-packet lengths, which is what
+    /// <see cref="ChatPackets.MinClientLength"/> already reports, so this is that minus the
+    /// four-byte header - registering the frame figure would drop every packet the channels
+    /// actually receive.
+    /// </summary>
+    public const int ClientHeaderSize = 4;
+
+    /// <inheritdoc cref="ClientHeaderSize"/>
+    public static int MinBodyLength(ushort op)
+    {
+        int frame = ChatPackets.MinClientLength(op);
+        return frame <= ClientHeaderSize ? 0 : frame - ClientHeaderSize;
+    }
+
+    /// <summary>Is this one of the eight?</summary>
+    public static bool IsArbiterSide(ushort op)
+    {
+        foreach (var (_, code) in ClientOpcodes) if (code == op) return true;
+        return false;
+    }
+
+    private static WorldBridge? Bridge => global::TeraSharp.Arbiter.Program.World;
+
+    /// <summary>
+    /// An ActionDispatcher bound to live sessions. The channels address clients by character db
+    /// id only. <c>RelayRejections</c> is off: the real handlers answer with numbered SMTs,
+    /// which this file emits itself.
+    /// </summary>
+    internal static ActionDispatcher Dispatcher(GameSession? origin, ILogger log)
+    {
+        var world = Bridge;
+        int originId = (int)(origin?.SelectedCharacter?.Id ?? 0);
+        return new ActionDispatcher(
+            _ => Sink(origin),
+            p => Sink(world?.SessionForPlayerId(p) ?? (p == originId ? origin : null)),
+            (op, payload) => { if (world == null) return false; world.SendFrame(op, payload); return true; },
+            log)
+        { RelayRejections = false };
+    }
+
+    private static IClientSink? Sink(GameSession? s) => s == null ? null : new SessionSinkAdapter(s);
+
+    private sealed class SessionSinkAdapter : IClientSink
+    {
+        private readonly GameSession _s;
+        public SessionSinkAdapter(GameSession s) => _s = s;
+        public void SendByDef(string packetName, IReadOnlyDictionary<string, object> fields) => _s.SendByDef(packetName, fields);
+        public void SendRawBody(string packetName, byte[] body) => _s.SendRawBody(packetName, body);
+        public void Send(byte[] framedPacket) => _s.Send(framedPacket);
+    }
+
+    /// <summary>
+    /// One of <see cref="ClientOpcodes"/> arrived. Always true: all eight are Arbiter-owned, so
+    /// a packet that reaches here must never fall through to World.
+    /// </summary>
+    public static bool OnClientPacket(GameSession? session, ushort opcode, ReadOnlyMemory<byte> body)
+    {
+        var chr = session?.SelectedCharacter;
+        var cm = Instance;
+        if (chr == null || cm == null) return true;
+        var actions = cm.OnClientPacket((int)chr.Id, opcode, body.ToArray());
+        if (actions.IsEmpty && actions.Rejected == null) return true;
+        Dispatcher(session, Log).Dispatch(actions, "private-channel");
+        return true;
     }
 
     // =======================================================================================
