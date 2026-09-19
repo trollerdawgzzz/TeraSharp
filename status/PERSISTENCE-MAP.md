@@ -597,3 +597,26 @@ as our choice rather than an observed value.
 **No appearance column was added.** cap_final shows the appearance change reaching the row
 through the ordinary user save, not through any appearance-specific write - see
 `status/CLIENT-REJECTS.md` section 14.1.
+
+## T98 - `guild_quests`
+
+```sql
+CREATE TABLE guild_quests (
+  guild_id      INTEGER NOT NULL REFERENCES guilds(guild_id),
+  quest_id      INTEGER NOT NULL,
+  status        INTEGER NOT NULL DEFAULT 0,   -- 0 available, 1 running
+  started_at    INTEGER NOT NULL DEFAULT 0,
+  ends_at       INTEGER NOT NULL DEFAULT 0,   -- remainSec on the wire is this minus now
+  starter_db_id INTEGER NOT NULL DEFAULT 0,
+  progress      INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (guild_id, quest_id)
+);
+```
+
+`GetGuildQuests` / `GetRunningGuildQuest` / `SetGuildQuest`. One row per quest, not per run.
+
+**The catalogue is NOT in the database.** Both captured frames list the same six quests with the
+same ids, targets and rewards for two different guilds - it is sheet data, and it lives in
+`GuildPackets.GuildQuestCatalogue`. The only per-guild numbers are the header (`guilds.point`,
+`guilds.money`, the starter) and the running quest s countdown, which is computed from
+`ends_at`. See `status/GUILD-DESIGN.md` T98.1.

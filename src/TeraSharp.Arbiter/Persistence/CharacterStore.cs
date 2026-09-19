@@ -969,6 +969,21 @@ CREATE INDEX IF NOT EXISTS ix_guild_members_guild ON guild_members(guild_id);
 -- GuildGroupData = {i32 GuildGroupId, wchar Name[16], i32 Authority}. Authority is a bitmask;
 -- Guild::HaveGuildAuthorityWithLock tests (wanted & group.authority) != 0, and the chief
 -- bypasses it entirely.
+-- T98: the guild-quest board. PlanetDB keeps GuildQuest rows per guild and
+-- GuildQuestManager runs them; only the LIST was ever captured (the start/finish packets sit
+-- behind a 7-day cooldown), so this is the state S_GUILD_QUEST_LIST reads and nothing more.
+-- The catalogue itself is sheet data, not rows - see GuildPackets.GuildQuestCatalogue.
+CREATE TABLE IF NOT EXISTS guild_quests (
+  guild_id      INTEGER NOT NULL REFERENCES guilds(guild_id),
+  quest_id      INTEGER NOT NULL,
+  status        INTEGER NOT NULL DEFAULT 0,   -- 0 available, 1 running
+  started_at    INTEGER NOT NULL DEFAULT 0,   -- unix seconds
+  ends_at       INTEGER NOT NULL DEFAULT 0,   -- unix seconds; remainSec is this minus now
+  starter_db_id INTEGER NOT NULL DEFAULT 0,
+  progress      INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (guild_id, quest_id)
+);
+
 CREATE TABLE IF NOT EXISTS guild_groups (
   guild_id              INTEGER NOT NULL REFERENCES guilds(guild_id),
   guild_group_id        INTEGER NOT NULL,
@@ -3891,6 +3906,63 @@ DELETE FROM guild_members     WHERE user_db_id = $id;";
 
     /// <summary>The guild a character belongs to, or 0. User+0x1b54 in the real Arbiter.</summary>
     public int GetGuildIdOf(int userDbId) => GetGuildMember(userDbId)?.GuildId ?? 0;
+
+    // ------------------------------------------------------------- T98: guild quests
+
+    /// <summary>One guild s state for one quest of the catalogue.</summary>
+    public sealed record GuildQuestState(int GuildId, int QuestId, int Status, long StartedAt,
+        long EndsAt, int StarterDbId, int Progress);
+
+    /// <summary>Quest states for this guild, in quest order. Empty when none has ever run.</summary>
+    public List<GuildQuestState> GetGuildQuests(int guildId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "SELECT guild_id, quest_id, status, started_at, ends_at, starter_db_id, progress " +
+                "FROM guild_quests WHERE guild_id=$g ORDER BY quest_id";
+            cmd.Parameters.AddWithValue("$g", guildId);
+            var rows = new List<GuildQuestState>();
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                rows.Add(new GuildQuestState(r.GetInt32(0), r.GetInt32(1), r.GetInt32(2),
+                    r.GetInt64(3), r.GetInt64(4), r.GetInt32(5), r.GetInt32(6)));
+            return rows;
+        }
+    }
+
+    /// <summary>The quest this guild is running, or null. Status 1 is running.</summary>
+    public GuildQuestState? GetRunningGuildQuest(int guildId)
+    {
+        foreach (var q in GetGuildQuests(guildId)) if (q.Status == 1) return q;
+        return null;
+    }
+
+    /// <summary>Upsert one quest state. Start and finish are not modelled - the capture never
+    /// exercised them - so this is the seam a later task drives, and what the list reads.</summary>
+    public bool SetGuildQuest(int guildId, int questId, int status, long startedAt, long endsAt,
+        int starterDbId, int progress)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "INSERT INTO guild_quests(guild_id, quest_id, status, started_at, ends_at, " +
+                "starter_db_id, progress) VALUES($g,$q,$s,$a,$e,$u,$p) " +
+                "ON CONFLICT(guild_id, quest_id) DO UPDATE SET status=excluded.status, " +
+                "started_at=excluded.started_at, ends_at=excluded.ends_at, " +
+                "starter_db_id=excluded.starter_db_id, progress=excluded.progress";
+            cmd.Parameters.AddWithValue("$g", guildId);
+            cmd.Parameters.AddWithValue("$q", questId);
+            cmd.Parameters.AddWithValue("$s", status);
+            cmd.Parameters.AddWithValue("$a", startedAt);
+            cmd.Parameters.AddWithValue("$e", endsAt);
+            cmd.Parameters.AddWithValue("$u", starterDbId);
+            cmd.Parameters.AddWithValue("$p", progress);
+            return cmd.ExecuteNonQuery() >= 1;
+        }
+    }
 
     /// <summary>Unix second of this guild s last money incentive, 0 when it has never had one.</summary>
     public long GetGuildIncentiveTime(int guildId)

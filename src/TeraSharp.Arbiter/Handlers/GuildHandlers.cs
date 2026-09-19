@@ -801,6 +801,69 @@ public sealed class GuildHandlers
     // Builders - one place each S_ packet's fields are assembled
     // =======================================================================================
 
+    // ===================================================================================
+    // T98 - the guild-quest board
+    // ===================================================================================
+
+    /// <summary>Header scalars neither capture explains. Both frames carry exactly these, and
+    /// they do not move between two different guilds, so they are constants until something
+    /// makes one of them move.</summary>
+    public const int QuestUnk1 = 1, QuestUnk2 = 0, QuestUnk3 = 100, QuestUnk4 = 0,
+                     QuestUnk5 = 2, QuestUnk6 = 2, QuestUnk7 = 0, QuestUnk8 = 0;
+    /// <summary>The 900 both frames report, which is also the top tier s point total.</summary>
+    public const int QuestMaxPoint = 900;
+    /// <summary>The trailing byte, 1 in both frames.</summary>
+    public const byte QuestFlag = 1;
+
+    /// <summary>
+    /// S_GUILD_QUEST_LIST for one guild. The catalogue is sheet data and identical for every
+    /// guild; the only things that move are the header (guild id, money, the member who started
+    /// the running quest, the points) and the running quest s <c>remainSec</c>.
+    ///
+    /// <para>cap_final_client3 280 and client4 2084 differ ONLY in the header, the two names and
+    /// that one countdown - 7095 against 6823 seconds, ten minutes of capture apart. That is why
+    /// <paramref name="nowUnix"/> is a parameter: the number on the wire is <c>ends_at - now</c>,
+    /// not a stored value.</para>
+    /// </summary>
+    public byte[] BuildGuildQuestList(CharacterStore.GuildRow g, long nowUnix)
+    {
+        var running = _store.GetRunningGuildQuest(g.GuildId);
+        string starterName = string.Empty;
+        int starterDbId = 0;
+        if (running != null)
+        {
+            starterDbId = running.StarterDbId;
+            starterName = _store.GetGuildMember(running.StarterDbId)?.Name ?? string.Empty;
+        }
+
+        var rows = new List<GuildPackets.GuildQuestRow>(GuildPackets.GuildQuestCatalogue.Length);
+        foreach (var q in GuildPackets.GuildQuestCatalogue)
+        {
+            int remain = q.RemainSec;
+            if (running != null && running.QuestId == q.QuestId)
+            {
+                long left = running.EndsAt - nowUnix;
+                remain = left < 0 ? 0 : (left > int.MaxValue ? int.MaxValue : (int)left);
+            }
+            rows.Add(q with { RemainSec = remain });
+        }
+
+        return GuildPackets.BuildSGuildQuestListBody(
+            g.GuildId, starterDbId, QuestUnk1, g.Point, QuestUnk2, QuestUnk3, QuestUnk4,
+            g.Money, QuestUnk5, QuestUnk6, QuestUnk7, nowUnix, QuestUnk8, QuestMaxPoint,
+            QuestFlag, g.Name, starterName,
+            GuildPackets.GuildQuestTiers, rows);
+    }
+
+    /// <summary>
+    /// Push the board to one member. The capture sends it at exactly two moments: in the
+    /// enter-world burst beside S_GUILD_INFO (cap_final_client3 280, client4 2084) and again
+    /// right after the roster changes (client3 3020 and 4130, client4 2751).
+    /// </summary>
+    private void SendGuildQuestList(GuildActions a, int characterId, CharacterStore.GuildRow g)
+        => a.Client(GuildClientAction.Raw(characterId, "S_GUILD_QUEST_LIST",
+            BuildGuildQuestList(g, DateTimeOffset.UtcNow.ToUnixTimeSeconds())));
+
     private void SendGuildInfo(GuildActions a, int characterId, CharacterStore.GuildRow g)
     {
         var members = _store.GetGuildMembers(g.GuildId);
@@ -1021,6 +1084,11 @@ public sealed class GuildHandlers
     {
         var m = _store.GetGuildMember(userDbId);
         if (m == null) return;
+
+        // T98: the roster change re-pushes the quest board to the joiner -
+        // cap_final_client3 3020 (right after S_GUILD_INFO 3017) and client4 2751.
+        var guild = _store.GetGuild(guildId);
+        if (guild != null) SendGuildQuestList(a, userDbId, guild);
 
         var fields = new Dictionary<string, object>
         {
