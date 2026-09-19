@@ -267,6 +267,11 @@ public static class HandlerRegistry
             Reg(warName, GuildWarManager.MinBodyLength(warOp),
                 (s, body) => GuildWarManager.OnClientPacket(s, warOp, body));
 
+        // --- Private channels (T96, status/CHAT-DESIGN.md): the eight channel packets. C_WHISPER / C_CHAT stay with SocialHandlers. ---
+        foreach (var (chatName, chatOp) in ChatManager.ClientOpcodes)
+            Reg(chatName, ChatManager.MinBodyLength(chatOp),
+                (s, b) => ChatManager.OnClientPacket(s, chatOp, b));
+
         // --- Inventory window ---
         Reg("C_SHOW_ITEMLIST", 0, (s, body) =>
         {
