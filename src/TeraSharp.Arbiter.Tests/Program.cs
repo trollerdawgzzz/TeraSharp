@@ -2136,7 +2136,8 @@ array items
             0x1436, 0x15A8, 0x159A, 0x2958, 0x13FA, 0x13CC, 0x1626, 0x1441,
             0x143F, 0x15B5, 0x13AA, 0x13F2, 0x13E5, 0x164D,
             // T15, from D:\packetlogs\cap_newchar.log: no A->W frame follows any occurrence.
-            0x2927, 0x1491, 0x156F, 0x13C5, 0x13C6, 0x1499, 0x15FA,   // 0x13B6 became a handler in T25
+            0x2927, 0x1491, 0x156F, 0x1499, 0x15FA,   // 0x13B6 became a handler in T25,
+            //                                            0x13C5 and 0x13C6 in T108
             // T23: Handler_SA_REWARD_CITYWAR_KILL_DEATH_COUNT has no SendToSession.
             0x15F9,
             // T42: SDB_MOVE_WAREHOUSE_ITEM is a ten-line stub in the real Arbiter that sends nothing.
@@ -22219,7 +22220,10 @@ string message
         var zero = WorldRegistration.Parse(
             Hex.B("01 F0 0A 00 00 00 00 00 00 18 00 00 00 00 00 00 00 07 BC 05 00"))!.Value;
         var thirteen = WorldRegistration.Parse(
-            Hex.B("01 F0 0A 00 0D 00 00 00 04 00 00 00 01 00 00 00 07 BC 05 00"))!.Value;
+            //   IsBypass | PlanetId 0x0AF0 | WorldId 13 | Total 4 | Index 1 | Version 0x5BC07
+            Hex.B("01 F0 0A 00 00 0D 00 00 00 04 00 00 00 01 00 00 00 07 BC 05 00"))!.Value;
+        Hex.True(thirteen.PlanetId == 0x0AF0,
+            $"21 bytes, not 20 - a short SA_REGISTER parses to null: planet {thirteen.PlanetId}");
         Hex.True(zero.WorldId == 0 && thirteen.WorldId == 13 && thirteen.TotalBypassCount == 4,
             $"the dungeon World registers as 13 with 4 bypass links: {thirteen}");
         Hex.Eq(WorldRegistration.Reply(thirteen), "01 0D 00 00 00 01 00 00 00 07 BC 05 00 01 00 00 00",

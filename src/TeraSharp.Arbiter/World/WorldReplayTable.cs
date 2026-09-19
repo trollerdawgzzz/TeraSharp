@@ -138,9 +138,13 @@ public sealed class WorldReplayTable
                 //   is 0x273B then 0x156F then 0x273C). Without this entry 0x156F becomes a
                 //   request whose "response" is 0x273C, and the real 0x273B loses it.
         // 0x13B6 SA_UPDATE_DUNGEON_COOLTIME is a real (reply-less) handler since T25 - see
-        // DbProxyHandlers.IsHandledRequest; it must not also be sealed here.
-        0x13C5, // SA_ADD_DUNGEON_CHANNEL          (zone change)
-        0x13C6, // SA_REMOVE_DUNGEON_CHANNEL       (zone change)
+        // DbProxyHandlers.IsHandledRequest; it must not also be sealed here. T108 moved
+        // 0x13C5 / 0x13C6 SA_ADD_/REMOVE_DUNGEON_CHANNEL out for the same reason: they feed the
+        // instance registry now, and a sealed opcode never reaches a handler. Nothing is lost at
+        // load time - 0x13C5 is immediately followed by 0x1499, which is still sealed and seals
+        // it in turn, and the frames after 0x13C6 are the A->W spawn trio the loader skips
+        // outright. Both still get an entry in _byRequest; it is dead, because TryHandle answers
+        // them before WorldBridge ever reaches the replay lookup.
         0x1499, // SA_SAVE_ETC_DATA_FOR_MOVE_WORLD (zone change)
 
         // --- T47 sealed the four "Arbiter Contract" requests here. T60 UNSEALED them: the
