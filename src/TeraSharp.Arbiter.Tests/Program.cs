@@ -13424,9 +13424,13 @@ some prose with `backticks` that is not a table row
 
         var b = cm.OnClientPacket(3, ChatPackets.C_JOIN_PRIVATE_CHANNEL, CJoinBody("raidchat", 4242));
         Hex.True(ChatCount(b, "S_PRIVATE_CHANNEL_NOTICE") == 3, "three members, three notices");
+        // T94: userList is EMPTY on the wire, in all six captured S_JOIN_PRIVATE_CHANNEL
+        // frames, including the ones where the channel already had two members
+        // (cap_final_client3 963, 3725, 4126, 4664; client4 3464, 4558). The roster reaches
+        // the client through S_REQUEST_PRIVATE_CHANNEL_INFO instead - CHAT-DESIGN.md T94.2.
         var list = (List<Dictionary<string, object>>)ChatFields(b, 0)["userList"];
-        Hex.True(list.Count == 3 && (int)list[0]["userDbId"] == 1 && (int)list[2]["userDbId"] == 3,
-            "the member list is every member in join order");
+        Hex.True(list.Count == 0,
+            "the join packet carries no roster, however many members the channel has");
         Hex.True((int)ChatFields(b, 0)["index"] == 0,
             "slots are PER USER - c3's first channel is c3's slot 0, whatever c1 and c2 hold");
 
@@ -13622,9 +13626,12 @@ some prose with `backticks` that is not a table row
 
         var create = cm.OnClientPacket(3, ChatPackets.C_REQUEST_PRIVATE_CHANNEL_INFO, CInfoBody(-1));
         var d = ChatFields(create, 0);
-        Hex.True(!(bool)d["isMaster"] && (ushort)d["password"] == ChatManager.MinPassword
+        // T94: cap_final_client3 frame 938 answers channelId -1 with isMaster = 1, not 0 -
+        // "you would be the master of the channel you are about to make", which is what lets
+        // the dialog keep its name and password fields editable. CHAT-DESIGN.md T94.2.
+        Hex.True((bool)d["isMaster"] && (ushort)d["password"] == ChatManager.MinPassword
             && ((List<Dictionary<string, object>>)d["memberList"]).Count == 0,
-            "channelId -1 answers the create-dialog defaults: not the master, password 1000, no members");
+            "channelId -1 answers the create-dialog defaults: master, password 1000, no members");
     }
 
     // ---------------------------------- lifetime ----------------------------------
@@ -13693,9 +13700,16 @@ some prose with `backticks` that is not a table row
                 encoded++;
 
                 if (c.PacketName == "S_JOIN_PRIVATE_CHANNEL")
-                    Hex.True(BitConverter.ToUInt16(bytes, 2) == 0x12,
-                        "S_JOIN_PRIVATE_CHANNEL's userList starts at the 0x12 fixed part - "
+                {
+                    // The 0x12 fixed part is still the point, but T94 moved which word proves
+                    // it: userList is empty on the wire, so its count AND offset are 0 and the
+                    // name ref at body[4] is what carries 0x12.
+                    Hex.True(BitConverter.ToUInt32(bytes, 0) == 0,
+                        "S_JOIN_PRIVATE_CHANNEL's userList is empty - count 0, offset 0");
+                    Hex.True(BitConverter.ToUInt16(bytes, 4) == 0x12,
+                        "the name starts at the 0x12 fixed part - "
                         + "ResolveDef must prefer CorrectedDefs over the shipped .def");
+                }
             }
 
         foreach (var name in new[]

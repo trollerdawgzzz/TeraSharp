@@ -155,6 +155,18 @@ public static class ArbiterClientHandlers
         C_REQUEST_LATEST_UPDATE_NOTIFICATION, C_CONFIRM_UPDATE_NOTIFICATION,
         C_SECOND_PASSWORD_AUTH, C_SECOND_PASSWORD_REGISTER, C_REFRESH_API_ACCESS_TOKEN,
         C_CANCEL_EXIT,
+        // T96 - the eight private-channel packets. ChatManager has answered them since T43 but
+        // nothing registered them, so every one was still being forwarded to a World that has no
+        // handler for any of them. C_WHISPER and C_CHAT are deliberately absent: those stay with
+        // SocialHandlers. status/CHAT-DESIGN.md.
+        World.ChatPackets.C_REQUEST_PRIVATE_CHANNEL_INFO,
+        World.ChatPackets.C_CREATE_PRIVATE_CHANNEL,
+        World.ChatPackets.C_EDIT_PRIVATE_CHANNEL,
+        World.ChatPackets.C_JOIN_PRIVATE_CHANNEL,
+        World.ChatPackets.C_LEAVE_PRIVATE_CHANNEL,
+        World.ChatPackets.C_KICK_CHANNEL_MEMBER,
+        World.ChatPackets.C_CHANGE_CHANNEL_PASSWORD,
+        World.ChatPackets.C_REUQUEST_JOINED_CHANNEL_LIST,
     };
 
     // =========================================================================================
