@@ -20,6 +20,8 @@ public sealed class AdminServer : IDisposable
     public const int DefaultPort = 8050;
     public const string PortVariable = "TERASHARP_ADMIN_PORT";
     public const string TokenVariable = "TERASHARP_ADMIN_TOKEN";
+    /// <summary>T106: the header the page's own fetch() puts the token in.</summary>
+    public const string TokenHeader = "X-Admin-Token";
 
     private readonly HttpListener _listener = new();
     private readonly AdminApi _api;
@@ -27,6 +29,14 @@ public sealed class AdminServer : IDisposable
     private readonly CancellationTokenSource _stop = new();
 
     public int Port { get; }
+
+    /// <summary>
+    /// T106. The JSON surface, so the wiring in <c>Program.cs</c> can hand it the two delegates
+    /// T101b left settable - <c>KickPlayer</c> and <c>Announce</c> - after the server is up. It
+    /// was unreachable before: <c>TryStart</c> built the <c>AdminApi</c> inside the constructor
+    /// call and nothing ever got a reference back.
+    /// </summary>
+    public AdminApi Api => _api;
 
     private AdminServer(AdminApi api, int port, ILogger log)
     {
@@ -100,11 +110,17 @@ public sealed class AdminServer : IDisposable
         foreach (string? key in req.QueryString.AllKeys)
             if (key != null) query[key] = req.QueryString[key] ?? string.Empty;
 
-        string? token = null;
-        string? auth = req.Headers["Authorization"];
-        if (auth != null && auth.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
-            token = auth["Bearer ".Length..].Trim();
-        else if (query.TryGetValue("token", out var qt)) token = qt;
+        // T106: three ways in, in order of preference. X-Admin-Token is what the page sends -
+        // it prompts for the token itself now, because the page is served WITHOUT one, so the
+        // browser has nowhere to put an Authorization header on the first request.
+        string? token = req.Headers[TokenHeader];
+        if (string.IsNullOrEmpty(token))
+        {
+            string? auth = req.Headers["Authorization"];
+            if (auth != null && auth.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+                token = auth["Bearer ".Length..].Trim();
+            else if (query.TryGetValue("token", out var qt)) token = qt;
+        }
 
         string? body = null;
         if (req.HasEntityBody)
@@ -168,12 +184,19 @@ public static class AdminPage
   pre { margin:12px 0 0; padding:12px; background:rgba(127,127,127,.09); border-radius:6px;
         overflow:auto; font:12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; max-height:340px; }
   .note { font-size:12px; color:var(--dim); margin-top:10px; }
+  .tiles { display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:10px; }
+  .tile { border:1px solid var(--line); border-radius:6px; padding:10px 12px; }
+  .tile b { display:block; font-size:19px; font-weight:600; letter-spacing:-0.01em; }
+  .tile span { font-size:11px; text-transform:uppercase; letter-spacing:0.06em; color:var(--dim); }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; }
+  #tail { max-height:420px; }
+  @media (max-width: 480px) { .tiles { grid-template-columns:repeat(2, 1fr); } }
 </style>
 </head>
 <body>
 <main>
   <h1>TeraSharp admin</h1>
-  <p class='sub'>Phases 1 and 2 - lookups, restore, and the character edits. 127.0.0.1 only.</p>
+  <p class='sub'>Status, lookups, restore and the character edits. 127.0.0.1 only - the token is kept in this browser.</p>
 
   <section>
     <h2>Token</h2>
@@ -182,6 +205,23 @@ public static class AdminPage
       <button onclick='save()'>Remember</button>
     </div>
     <div class='note'>Kept in this browser only, and sent as a bearer header.</div>
+  </section>
+
+  <section>
+    <h2>Status</h2>
+    <div class='tiles' id='tiles'>
+      <div class='tile'><b id='st_up'>-</b><span>uptime</span></div>
+      <div class='tile'><b id='st_world'>-</b><span>world links</span></div>
+      <div class='tile'><b id='st_online'>-</b><span>online</span></div>
+      <div class='tile'><b id='st_mem'>-</b><span>working set</span></div>
+      <div class='tile'><b id='st_gc'>-</b><span>managed / gc</span></div>
+      <div class='tile'><b id='st_thr'>-</b><span>threads</span></div>
+    </div>
+    <div class='row' style='margin-top:12px'>
+      <button onclick='toggleLive()' id='livebtn'>Start live tail</button>
+      <span class='note' id='st_file' style='margin:0'></span>
+    </div>
+    <pre id='tail'>-</pre>
   </section>
 
   <section>
@@ -288,7 +328,8 @@ function save() { try { localStorage.setItem('ts_admin_token', tok()); } catch (
 try { document.getElementById('token').value = localStorage.getItem('ts_admin_token') || ''; } catch (e) {}
 
 async function call(method, path, body) {
-  const opt = { method: method, headers: { 'Authorization': 'Bearer ' + tok() } };
+  // T106: the page is served without a token, so it carries its own in this header.
+  const opt = { method: method, headers: { 'X-Admin-Token': tok() } };
   if (body) { opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
   const r = await fetch(path, opt);
   let text;
@@ -335,6 +376,56 @@ async function go(n) {
       { accountId: num('gaid'), level: num('glvl') });
   } catch (e) { out.textContent = 'error: ' + e; }
 }
+
+// ---- T106: the Status tab ----
+
+function dur(s) {
+  s = Math.max(0, Math.floor(s));
+  const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600);
+  const m = Math.floor(s % 3600 / 60);
+  if (d) return d + 'd ' + h + 'h';
+  if (h) return h + 'h ' + m + 'm';
+  return m + 'm ' + (s % 60) + 's';
+}
+function mb(n) { return (n / 1048576).toFixed(0) + ' MB'; }
+function set(id, text) { document.getElementById(id).textContent = text; }
+
+async function refreshStatus() {
+  if (!tok()) { set('st_up', '-'); return; }
+  const r = await fetch('/api/status', { headers: { 'X-Admin-Token': tok() } });
+  if (!r.ok) { set('st_up', r.status === 401 ? 'token?' : 'err'); return; }
+  const s = await r.json();
+  set('st_up', dur(s.uptimeSeconds));
+  set('st_world', s.worldLinks + (s.worldReady ? ' ready' : ' loading'));
+  set('st_online', s.online);
+  set('st_mem', mb(s.workingSetBytes));
+  set('st_gc', mb(s.managedBytes) + ' / ' + s.gc0 + '-' + s.gc2);
+  set('st_thr', s.threads);
+  document.getElementById('st_file').textContent =
+    (s.logFile || 'no log file') + '  -  console ' + s.consoleLevel;
+}
+
+async function refreshTail() {
+  if (!tok()) return;
+  const r = await fetch('/api/log?lines=200', { headers: { 'X-Admin-Token': tok() } });
+  if (!r.ok) return;
+  const s = await r.json();
+  const pre = document.getElementById('tail');
+  const stick = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 24;
+  pre.textContent = s.lines.join('\n') || '(nothing logged yet)';
+  if (stick) pre.scrollTop = pre.scrollHeight;
+}
+
+let liveTimer = null;
+async function tick() { try { await refreshStatus(); await refreshTail(); } catch (e) {} }
+function toggleLive() {
+  const btn = document.getElementById('livebtn');
+  if (liveTimer) { clearInterval(liveTimer); liveTimer = null; btn.textContent = 'Start live tail'; return; }
+  tick();
+  liveTimer = setInterval(tick, 2000);
+  btn.textContent = 'Stop live tail';
+}
+tick();
 </script>
 </body>
 </html>

@@ -386,3 +386,53 @@ character would have failed with SQLite error 19 (the same way quests did on 202
 
 `AdminApi.PhaseThreePaths` is down to three: `/api/bulk-mail`, `/api/event`, `/api/festival`.
 Section 6's phase 3.
+
+## 10. T106 - the page opens, and the console is readable again
+
+### 10.1 The page is served without a token
+
+T101 put `GET /` behind the same 401 as the data, which made the tool **unusable from a browser**:
+typing `http://127.0.0.1:8050/` has nowhere to put an `Authorization` header, so the only way in
+was curl. The page is now served before the token check (still behind `Enabled`, so an unset
+`TERASHARP_ADMIN_TOKEN` serves nothing at all). It carries no data: it prompts for the token, keeps
+it in that browser's localStorage, and sends it as **`X-Admin-Token`** on every API call - each of
+which is still gated exactly as before. The listener binds 127.0.0.1 and `Serve()` re-checks the
+peer is loopback, so serving a static shell costs nothing.
+
+`AdminServer.Api` is now public. `TryStart` built the `AdminApi` inside the constructor call and
+nothing ever got a reference back, so T101b's `KickPlayer` and `Announce` delegates were
+unreachable from `Program.cs`.
+
+### 10.2 Logging: two sinks, not one level
+
+`Web/ArbiterLog.cs`. `Program.cs` asked for `LogLevel.Debug` on a console sink and `WorldBridge`
+logs one line per W->A frame, so the console was unreadable on a live server.
+
+* **Console** is `Warning` by default; `TERASHARP_LOG_LEVEL` overrides it with any
+  Microsoft.Extensions.Logging level name, case-insensitive. Unset, empty or unparseable all fall
+  back to Warning - a typo must not silently turn logging off.
+* **File** takes everything from Debug up: `arbiter-yyyy-MM-dd.log` under `TERASHARP_LOGS`, rolled
+  at midnight, opened `FileShare.ReadWrite` so it can be tailed while the server runs. A sink that
+  throws would take the server with it, so a failed write disables the file and keeps going.
+* The provider also keeps the last 2000 lines in memory, which is what the Status tab reads - the
+  tail never touches the file and cannot collide with the writer.
+
+The seven noisy pushes (`0x13FA`, `0x159A`, `0x1598`, `0x13CC`, `0x1562`, `0x1626`, `0x2927`) move
+to Debug through `WorldReplayTable.QuietInLog` / `LogsAtDebug(op)`, which also absorbs the four
+`WorldBridge` was suppressing with an inline literal list (`0x138A`, `0x15A8`, `0x1436`, `0x164D`).
+
+**It is a separate set from `OneWayFromWorld` on purpose.** `0x1562`
+(`SA_CLEAR_BATTLE_FIELD_ENTER_COUNT`) has a real `AS_` reply (0x1563) and a real handler - sealing
+it as one-way to quieten it would break the battlefield counter. Quiet is not the same as one-way.
+
+### 10.3 The Status tab
+
+| endpoint | answers |
+|---|---|
+| `GET /api/status` | uptime, world links + ready, online count, working set, managed bytes, gc0/gc2, threads, the log file path and the console level |
+| `GET /api/log?lines=N` | the newest N lines from the ring, oldest first (default 200, capped at 2000) |
+
+The World figures come through an `AdminApi.WorldStatus` delegate, so this file still knows nothing
+about `WorldBridge`; unwired it reports zero links and not-ready rather than pretending. The page
+polls both every 2 s while the live tail is on, and keeps the tail pinned to the bottom unless the
+reader has scrolled up.

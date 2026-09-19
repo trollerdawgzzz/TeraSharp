@@ -53,6 +53,41 @@ public sealed class WorldReplayTable
     /// SA_BYPASS_TO_CLIENT (0x13F7) is deliberately NOT here: it is the tunnel, it interleaves
     /// constantly, and sealing on it would break every attribution.
     /// </summary>
+    // =========================================================================================
+    // T106: the logging filter. NOT the same set as OneWayFromWorld below, and deliberately so.
+    //
+    // WorldBridge logs one Information line per W->A frame. On a live server that is most of the
+    // console, and none of it is news: these seven are periodic heartbeats and harmless pushes
+    // that arrive by the hundred. Demoting them to Debug leaves the console readable while the
+    // file (T106's ArbiterLogProvider) still has every one of them.
+    //
+    // 0x1562 is the reason this is a separate set: SA_CLEAR_BATTLE_FIELD_ENTER_COUNT has a real
+    // AS_ reply (0x1563) and a real handler, so it must never be sealed as one-way - it only
+    // needs to stop shouting. Putting it in OneWayFromWorld would break the battlefield counter.
+    //
+    // 0x138A, 0x15A8, 0x1436 and 0x164D were already being suppressed by a literal list inline
+    // in WorldBridge; they are folded in here so there is one place to look.
+    // =========================================================================================
+
+    /// <summary>W-&gt;A opcodes whose arrival is logged at Debug instead of Information.</summary>
+    public static readonly IReadOnlySet<ushort> QuietInLog = new HashSet<ushort>
+    {
+        0x138A, // SA_REGISTER            - the pool heartbeat (0x13AA is its DEL twin)
+        0x15A8, // SA_BROADCAST_FLOATING_CASTLE_NAMEPLATE
+        0x1436, // SA_BROADCAST_SYSTEM_MESSAGE_TO_WHOLE_WORLD
+        0x164D, // SA_WORLD_SERVER_STATUS                - periodic
+        0x13FA, // SA_DUMMY_PACKET                       - exactly what it says
+        0x159A, // SA_UPDATE_EVENT_MATCHING_ADD_REWARD_RESETTIME
+        0x1598, // SA_UPDATE_PLAYGUIDE_EXTRA_REWARD_RESETTIME
+        0x13CC, // SA_EQUIP_ITEM_LEVEL
+        0x1562, // SA_CLEAR_BATTLE_FIELD_ENTER_COUNT     - answered, just noisy
+        0x1626, // SA_SEND_USE_OPTIONAL_ITEM
+        0x2927, // SDB_CANCEL_NPC_ARENA_BET              - the logout-countdown ticks
+    };
+
+    /// <summary>True when this frame's arrival should be logged at Debug rather than Information.</summary>
+    public static bool LogsAtDebug(ushort op) => QuietInLog.Contains(op);
+
     public static readonly IReadOnlySet<ushort> OneWayFromWorld = new HashSet<ushort>
     {
         0x1436, // SA_BROADCAST_SYSTEM_MESSAGE_TO_WHOLE_WORLD
