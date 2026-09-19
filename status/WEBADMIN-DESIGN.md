@@ -436,3 +436,62 @@ The World figures come through an `AdminApi.WorldStatus` delegate, so this file 
 about `WorldBridge`; unwired it reports zero links and not-ready rather than pretending. The page
 polls both every 2 s while the live tail is on, and keeps the tail pinned to the bottom unless the
 reader has scrolled up.
+
+## 11. T101c - the parity pass
+
+Section 6's catalogue, endpoint by endpoint. Everything is gated on the token except `GET /`
+(T106); every write records an `admin_log` row with its reason, source IP and result code.
+
+| catalogue item | endpoint | notes |
+|---|---|---|
+| account: fields, characters, benefits, bans, play time, last login | `GET /api/account?id=\|name=` | bans are the union over its characters - the schema keys restrictions on the character |
+| character: money, guild, position, quests, achievements, EP, cards, restrictions | `GET /api/character?id=\|name=` | one call, one page |
+| character: inventory with item names | same | `name` is `""` when no sheet is loaded - see below |
+| character: warehouse | same, `warehouse[]` | two tabs: account (inven 1, keyed on the ACCOUNT) and character (inven 9) |
+| restore / undelete | `POST /api/restore-character` | T101b; items come back with the row |
+| rename | `POST /api/rename` | runs `CharacterHandlers.ValidateName`, so the tool cannot write a name the game would reject |
+| search: name / id / guild / online | `GET /api/search?kind=&q=` | name is a prefix match; id tries character then account; each hit says whether it is in world |
+| online list | `GET /api/online` | through the delegate |
+| kick / warn / teleport-to | `POST /api/kick`, `/api/warn`, `/api/teleport` | all three are live-session only; teleport answers `0x16` when unwired rather than pretending |
+| announce now | `POST /api/announce` | never becomes a row |
+| announce scheduled | `POST /api/announce-schedule`, `GET /api/announces`, `POST /api/announce-delete` | the `announces` table, the last of section 4's four |
+| ban / mute with reason + expiry, list + lift | `POST /api/ban`, `/api/unban`, `/api/mute`, `/api/unmute`, `GET /api/restrictions` | `hours` 0 is permanent; a lapsed `until` stops counting on its own |
+| item / money grant with reason | `POST /api/give-item`, `/api/set-money`, `/api/set-level`, `/api/gm-level` | T101b |
+| admin log viewer | `GET /api/admin-log?limit=` | newest first |
+| server status | `GET /api/status`, `GET /api/log?lines=` | T106 |
+
+### 11.1 Item names: why there is no sheet in the box
+
+The brief asks for names "from the item strsheet". There is no strsheet TeraSharp can read:
+
+* the names live in **`StrSheet_Item` inside the client DataCenter**
+  (`tera-api/data/datasheets/DataCenter_Final_*.dat`, 61 MB, packed);
+* **tera-api** parses it with its own DataCenter reader into an in-memory `Map`
+  (`src/models/datasheet/strSheetItem.model.js`) and serialises that Map to the opaque
+  `dc_*.bin` blobs under `tera-api/data/cache`. There is no table and no HTTP route to ask.
+
+Parsing a DataCenter inside the Arbiter to label one column of an admin page is the wrong trade,
+so `Protocol/ItemNames.cs` reads a plain two-column file instead and **everything works without
+one** - an unknown template renders as its id, exactly as T101/T101b showed it.
+
+Format: `<templateId><TAB or comma><name>`, `#`/`;` comments, UTF-8. It looks at
+`$TERASHARP_ITEM_NAMES`, then `<dataRoot>/data/item_names.tsv`, then `data/item_names.tsv` beside
+the exe. `GET /api/character` reports `itemNames` (how many are loaded) so the page can say so.
+
+To produce one, run this beside tera-api - it uses tera-api's own loader, so no DataCenter code
+has to be rewritten:
+
+```js
+const loader = require('./src/lib/datasheetLoader');
+const model = new (require('./src/models/datasheet/strSheetItem.model'))();
+// after the loader has filled it:
+require('fs').writeFileSync('item_names.tsv',
+  [...model.getAll()].map(r => r.itemTemplateId + '\t' + r.string).join('\n'));
+```
+
+### 11.2 Play time
+
+`accounts.play_time_sec` and `GetAccountPlayTime` / `AddAccountPlayTime` exist, and the account
+page reports them. **Nothing feeds the column yet**: T87 made `C_PLAY_TIME` and
+`C_REQUEST_PLAYTIME` plain acks, so a session-length counter has to call `AddAccountPlayTime` on
+leave-world before the figure means anything. It reads 0 until then, which is honest.
