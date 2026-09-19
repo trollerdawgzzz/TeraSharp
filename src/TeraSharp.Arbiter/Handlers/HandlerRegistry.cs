@@ -234,11 +234,27 @@ public static class HandlerRegistry
         GmAdminTool.OnlineSessions = () => Program.World?.InWorldSessions() ?? new List<GameSession>();
         foreach (var name in new[]
         {
-            "C_REQUEST_GUILD_LIST", "C_DUNGEON_COOL_TIME_LIST", "C_VIEW_BATTLE_FIELD_RESULT",
+            "C_DUNGEON_COOL_TIME_LIST", "C_VIEW_BATTLE_FIELD_RESULT",
             "C_REQUEST_CANDIDATE_LIST", "C_SHOW_AWESOMIUMWEB_SHOP", "C_RESET_ALL_DUNGEON",
             "C_UPDATE_CONTENTS_PLAYTIME", "C_EVENT_GUIDE",
         })
             Reg(name, 0, (s, b) => ArbiterClientHandlers.OnAcceptSilently(s, b, misc));
+
+        // --- Guild board (T95): list/search/paging, wanted board, invite list, level ranking, flag, bank log ---
+        Reg("C_REQUEST_GUILD_LIST",                      GuildBoard.RequestGuildListBodySize, (s, b) => GuildBoard.OnRequestGuildList(s, b, misc));
+        Reg("C_REQUEST_GUILD_LIST_PAGE",                 GuildBoard.PageBodySize,       (s, b) => GuildBoard.OnRequestGuildListPage(s, b, misc));
+        Reg("C_REQUEST_GUILD_LIST_SORT",                 GuildBoard.SortBodySize,       (s, b) => GuildBoard.OnRequestGuildListSort(s, b, misc));
+        Reg("C_REQUEST_GUILD_WANTED_WRITING_LIST",       0,                             (s, b) => GuildBoard.OnRequestGuildWantedWritingList(s, b, misc));
+        Reg("C_REQUEST_GUILD_WANTED_WRITING_LIST_PAGE",  GuildBoard.PageBodySize,       (s, b) => GuildBoard.OnRequestGuildWantedWritingListPage(s, b, misc));
+        Reg("C_REQUEST_SET_GUILD_WANTED_WRITING",        GuildBoard.SetWantedBodySize,  (s, b) => GuildBoard.OnRequestSetGuildWantedWriting(s, b, misc));
+        Reg("C_REQUEST_INVITE_GUILD_LIST",               0,                             (s, b) => GuildBoard.OnRequestInviteGuildList(s, b, misc));
+        Reg("C_REQUEST_INVITE_GUILD_LIST_PAGE",          GuildBoard.PageBodySize,       (s, b) => GuildBoard.OnRequestInviteGuildListPage(s, b, misc));
+        Reg("C_REQUEST_GUILD_LEVEL_RANKING",             GuildBoard.PageBodySize,       (s, b) => GuildBoard.OnRequestGuildLevelRanking(s, b, misc));
+        Reg("C_GET_GUILD_WARE_HISTORY",                  GuildBoard.PageBodySize,       (s, b) => GuildBoard.OnGetGuildWareHistory(s, b, misc));
+        Reg("C_RECOMMEND_GUILD",                         GuildBoard.RecommendGuildBodySize, (s, b) => GuildBoard.OnRecommendGuild(s, b, misc));
+        Reg("C_RECOMMEND_USER_GUILD",                    GuildBoard.RecommendUserBodySize,  (s, b) => GuildBoard.OnRecommendUserGuild(s, b, misc));
+        Reg("C_UPDATE_GUILD_FLAG",                       GuildBoard.UpdateFlagBodySize, (s, b) => GuildBoard.OnUpdateGuildFlag(s, b, misc));
+        Reg("C_REQUEST_GUILD_FLAG_IMAGE_DATA",           GuildBoard.FlagImageBodySize,  (s, b) => GuildBoard.OnRequestGuildFlagImageData(s, b, misc));
 
         // --- Party matching board (T78, status/PARTY-MATCH.md): publish / link / cancel, RAM-only ---
         foreach (var (matchName, matchOp) in PartyMatchManager.ClientOpcodes)

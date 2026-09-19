@@ -3036,7 +3036,7 @@ public static class GuildBoard
         lock (Gate) Queries.Remove(characterId);
     }
 
-    private static int Me(GameSession s) => s.SelectedCharacter?.Id ?? 0;
+    private static int Me(GameSession s) => (int)(s.SelectedCharacter?.Id ?? 0);
 
     /// <summary>The image-id string form of a guilds row's int <c>logo_id</c>. Empty for a
     /// guild that has never uploaded one, which is every guild in every capture.</summary>
