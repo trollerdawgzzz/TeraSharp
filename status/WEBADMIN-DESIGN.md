@@ -268,3 +268,65 @@ timing out.
    `WebApp.dll`'s Steer code is the only reference.
 4. **`WA_DELETE_USER` offsets 4-13 are unread by the handler.** Minimum length 18 implies a field
    there (probably accountId u64 at 6); the handler only reads userId at 14. A capture would confirm.
+
+---
+
+## 8. T101 — our own admin web, phase 1
+
+Sections 1–7 above are about making the **retail** `WebApp.dll` work (Steer stub, `WebAppDB_2800`,
+the binary `WA_*` protocol on 8081). T101 takes a different road for the same features: a small
+`HttpListener` **inside the Arbiter** serving one HTML page and JSON, with no Steer, no IIS and no
+second database. Sections 1–7 stay as the record of the retail tool — this section is the
+reimplementation, and it borrows the doc’s **feature list and result codes**, not its phase plan.
+
+```
+Web/AdminApi.cs      pure: routing + JSON over CharacterStore. No socket. Every test drives this.
+Web/AdminServer.cs   the HttpListener shell + the static page. Holds no decisions.
+```
+
+* **127.0.0.1 only.** The prefix is the loopback literal, never `+` or `*`, and `Serve` re-checks
+  `IPAddress.IsLoopback` in case anything is ever put in front.
+* **Fails closed.** No `TERASHARP_ADMIN_TOKEN` means the tool does not start, and `AdminApi`
+  answers 503 even to a caller who guessed the token. Port from `TERASHARP_ADMIN_PORT`, default
+  **8050**. The token is compared length-first then constant-time.
+* **Result codes are the retail ones** from section 2: `0` ok, `2` not found, `3` invalid,
+  `0x16` refused.
+* **Every write is audited** in the new `admin_log` table — and section 2 notes the original logs
+  only a free-text reason and never stamps who did it, so this keeps the source IP and the result
+  code as well.
+
+### 8.1 What phase 1 serves
+
+| endpoint | answers |
+|---|---|
+| `GET /` | the one page |
+| `GET /api/accounts?q=` | accounts by name substring or id, each with its characters |
+| `GET /api/character?id=` \| `?name=` | the row, money, guild, items, `deleteAt` |
+| `GET /api/online` | `WorldBridge.InWorldSessions()`, through a delegate |
+| `GET /api/admin-log?limit=` | the audit trail |
+| `POST /api/restore-character` | clears a scheduled delete |
+
+That is section 6’s phase 1 — "read-only lookups" — plus the restore the brief adds.
+
+### 8.2 Restore is narrower than `WA_UNDELETE_USER`, and this matters
+
+The retail message brings back a character whose **row is gone**. That needs the soft-delete
+columns and the `deleted_items` table section 4 lists as new, and TeraSharp has neither.
+
+What TeraSharp does have is `characters.delete_at` (T88) — a **scheduled** delete with a grace
+window — and T88 deliberately left `OnDeleteUser` hard-deleting the row. So
+`POST /api/restore-character` can only rescue a character *inside* its window; a truly deleted one
+answers `2` (not found) rather than pretending. Closing that gap is phase 2 work with the new
+tables, and it is the one place where this tool is visibly less capable than the original.
+
+(The brief said "`delete_at` -> null"; the column is `INTEGER NOT NULL DEFAULT 0`, so the cleared
+value is **0**, which is what T88’s `CancelCharacterDelete` already writes.)
+
+### 8.3 Phase 2, and why those endpoints already exist as refusals
+
+`set-money`, `set-level`, `give-item`, `ban`, `unban`, `kick`, `announce`, `gm-level` are routed
+today and answer **501 with result `0x16`** rather than 404 — section 6’s out-of-scope note asks
+for exactly that, so the page shows "not in this phase" instead of looking broken. They map to the
+doc’s phases 2–3: `kick` and `announce` act on live sessions and need nothing persisted;
+`set-money` / `give-item` are the `WA_CHANGE_MONEY` / `WA_ADD_ITEM` mutations (the latter’s
+262-byte option block is still a task of its own); `ban` / `unban` need the `restrictions` table.

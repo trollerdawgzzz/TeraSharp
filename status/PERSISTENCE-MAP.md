@@ -620,3 +620,20 @@ same ids, targets and rewards for two different guilds - it is sheet data, and i
 `GuildPackets.GuildQuestCatalogue`. The only per-guild numbers are the header (`guilds.point`,
 `guilds.money`, the starter) and the running quest s countdown, which is computed from
 `ends_at`. See `status/GUILD-DESIGN.md` T98.1.
+
+## T101 - `admin_log`
+
+```sql
+CREATE TABLE admin_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  at INTEGER NOT NULL, source_ip TEXT, action TEXT NOT NULL,
+  target TEXT, reason TEXT, result INTEGER NOT NULL DEFAULT 0
+);
+```
+
+`AddAdminLog` / `GetAdminLog(limit)` (newest first). Every write the admin web tool makes lands
+here. `WEBADMIN-DESIGN.md` section 2 notes the retail tool logs only a free-text reason and never
+stamps who did it - this keeps the source IP and the result code too.
+
+Also added: `SearchAccounts(term, limit)` - by id when the term parses as one, otherwise a name
+substring with LIKE wildcards escaped, the same way `GetNamesStartingWith` does it.

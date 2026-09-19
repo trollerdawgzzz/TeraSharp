@@ -973,6 +973,19 @@ CREATE INDEX IF NOT EXISTS ix_guild_members_guild ON guild_members(guild_id);
 -- GuildQuestManager runs them; only the LIST was ever captured (the start/finish packets sit
 -- behind a 7-day cooldown), so this is the state S_GUILD_QUEST_LIST reads and nothing more.
 -- The catalogue itself is sheet data, not rows - see GuildPackets.GuildQuestCatalogue.
+-- T101: every write the admin web tool makes. WEBADMIN-DESIGN.md section 2 notes that the
+-- retail tool logs only a free-text reason and never stamps WHO did it; this keeps the source
+-- IP and the result code as well, which is strictly more than the original had.
+CREATE TABLE IF NOT EXISTS admin_log (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  at         INTEGER NOT NULL,            -- unix seconds
+  source_ip  TEXT    NOT NULL DEFAULT (''),
+  action     TEXT    NOT NULL,
+  target     TEXT    NOT NULL DEFAULT (''),
+  reason     TEXT    NOT NULL DEFAULT (''),
+  result     INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS guild_quests (
   guild_id      INTEGER NOT NULL REFERENCES guilds(guild_id),
   quest_id      INTEGER NOT NULL,
@@ -3928,6 +3941,96 @@ DELETE FROM guild_members     WHERE user_db_id = $id;";
 
     /// <summary>The guild a character belongs to, or 0. User+0x1b54 in the real Arbiter.</summary>
     public int GetGuildIdOf(int userDbId) => GetGuildMember(userDbId)?.GuildId ?? 0;
+
+    // ------------------------------------------------------------ T101: the admin web tool
+
+    /// <summary>One line of the admin audit trail.</summary>
+    public sealed record AdminLogRow(long At, string SourceIp, string Action, string Target,
+        string Reason, int Result);
+
+    /// <summary>Record one admin action. Never throws into a request path - a failed audit
+    /// write is logged and swallowed, because losing the action is worse than losing the log.</summary>
+    public bool AddAdminLog(long atUnix, string sourceIp, string action, string target,
+        string reason, int result)
+    {
+        lock (_lock)
+        {
+            try
+            {
+                using var cmd = _db.CreateCommand();
+                cmd.CommandText =
+                    "INSERT INTO admin_log(at, source_ip, action, target, reason, result) " +
+                    "VALUES($t,$i,$a,$g,$r,$s)";
+                cmd.Parameters.AddWithValue("$t", atUnix);
+                cmd.Parameters.AddWithValue("$i", sourceIp ?? string.Empty);
+                cmd.Parameters.AddWithValue("$a", action ?? string.Empty);
+                cmd.Parameters.AddWithValue("$g", target ?? string.Empty);
+                cmd.Parameters.AddWithValue("$r", reason ?? string.Empty);
+                cmd.Parameters.AddWithValue("$s", result);
+                return cmd.ExecuteNonQuery() == 1;
+            }
+            catch (Microsoft.Data.Sqlite.SqliteException ex)
+            {
+                _log.LogWarning("AddAdminLog failed: {Msg}", ex.Message);
+                return false;
+            }
+        }
+    }
+
+    /// <summary>The most recent admin actions, newest first.</summary>
+    public List<AdminLogRow> GetAdminLog(int limit)
+    {
+        if (limit < 1) limit = 1;
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "SELECT at, source_ip, action, target, reason, result FROM admin_log " +
+                "ORDER BY id DESC LIMIT $n";
+            cmd.Parameters.AddWithValue("$n", limit);
+            var rows = new List<AdminLogRow>();
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                rows.Add(new AdminLogRow(r.GetInt64(0), r.GetString(1), r.GetString(2),
+                    r.GetString(3), r.GetString(4), r.GetInt32(5)));
+            return rows;
+        }
+    }
+
+    /// <summary>
+    /// Accounts whose name contains <paramref name="term"/>, or the single account whose id it
+    /// is. An empty term lists the first <paramref name="limit"/> accounts, which is what the
+    /// admin page opens with. LIKE wildcards in the term are escaped, as GetNamesStartingWith
+    /// does - an operator typing % should search for a percent sign, not for everything.
+    /// </summary>
+    public List<AccountRecord> SearchAccounts(string? term, int limit)
+    {
+        if (limit < 1) limit = 1;
+        term ??= string.Empty;
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            if (long.TryParse(term, out long id))
+            {
+                cmd.CommandText = "SELECT id, name, admin_level FROM accounts WHERE id = $i";
+                cmd.Parameters.AddWithValue("$i", id);
+            }
+            else
+            {
+                cmd.CommandText =
+                    "SELECT id, name, admin_level FROM accounts WHERE name LIKE $p ESCAPE '\\' " +
+                    "ORDER BY name LIMIT $n";
+                string escaped = term.Replace("\\", "\\\\").Replace("%", "\\%").Replace("_", "\\_");
+                cmd.Parameters.AddWithValue("$p", "%" + escaped + "%");
+                cmd.Parameters.AddWithValue("$n", limit);
+            }
+            var rows = new List<AccountRecord>();
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                rows.Add(new AccountRecord { Id = r.GetInt64(0), Name = r.GetString(1), AdminLevel = r.GetInt32(2) });
+            return rows;
+        }
+    }
 
     // ------------------------------------------------------------- T98: guild quests
 
