@@ -5,6 +5,7 @@ using TeraSharp.Arbiter.Auth;
 using TeraSharp.Arbiter.Handlers;
 using TeraSharp.Arbiter.Protocol;
 using TeraSharp.Arbiter.World;
+using TeraSharp.Arbiter.Web;
 
 namespace TeraSharp.Arbiter.Tests;
 
@@ -10365,6 +10366,159 @@ bool   isGuildWarAcceptable
         Hex.True(store.SetGuildQuest(guildId, 10006, 0, 0, 0, 0, 0), "finishing it is the same upsert");
         Hex.True(store.GetRunningGuildQuest(guildId) == null, "status 0 is not running");
         Hex.True(store.GetGuildQuests(guildId).Count == 1, "but the row stays - one per quest, not per run");
+    }
+
+
+    // =======================================================================================
+    // T101 - the admin web tool, phase 1. Feature list: status/WEBADMIN-DESIGN.md.
+    //
+    // Every test drives AdminApi directly. Nothing here opens a socket: AdminServer is the
+    // HttpListener shell and holds no decisions, which is the point of the split.
+    // =======================================================================================
+
+    const string T101Token = "s3cret-token";
+
+    static AdminApi NewAdminApi(TeraSharp.Arbiter.Persistence.CharacterStore store,
+        string? token = T101Token, IReadOnlyList<AdminOnlineRow>? online = null)
+        => new(store, token, () => online ?? Array.Empty<AdminOnlineRow>(), QuietLog());
+
+    /// <summary>
+    /// T101 - the token gate. An unset TERASHARP_ADMIN_TOKEN disables the tool outright rather
+    /// than leaving it open, which is the one mistake on an admin surface that cannot be undone.
+    /// </summary>
+    [Test] public static void T101_admin_api_refuses_without_a_token()
+    {
+        using var store = StoreWithTwoAccounts();
+
+        var off = NewAdminApi(store, token: null);
+        Hex.True(!off.Enabled, "no token configured means the tool is off");
+        Hex.True(off.Handle("GET", "/api/online", token: T101Token).Status == 503,
+            "and it refuses even a caller who guessed right");
+
+        var on = NewAdminApi(store);
+        Hex.True(on.Handle("GET", "/api/online").Status == 401, "a missing token is 401");
+        Hex.True(on.Handle("GET", "/api/online", token: "wrong").Status == 401, "so is a wrong one");
+        Hex.True(on.Handle("GET", "/api/online", token: T101Token + "x").Status == 401,
+            "and so is a prefix - the compare is length-checked before it is constant-time");
+        Hex.True(on.Handle("GET", "/api/online", token: T101Token).Status == 200, "the real one works");
+        Hex.True(on.Handle("GET", "/", token: T101Token).ContentType.StartsWith("text/html"),
+            "the page itself is behind the same gate");
+    }
+
+    /// <summary>T101 - the read-only lookups, which are all phase 1 promises.</summary>
+    [Test] public static void T101_admin_api_reads_accounts_and_characters()
+    {
+        using var store = StoreWithTwoAccounts();
+        var api = NewAdminApi(store, online: new[]
+        {
+            new AdminOnlineRow(1, "t30_1", 11, 7005, "acct1"),
+        });
+
+        var accounts = api.Handle("GET", "/api/accounts",
+            new Dictionary<string, string> { ["q"] = "acct" }, token: T101Token);
+        Hex.True(accounts.Status == 200 && accounts.Body.Contains("\"name\":\"acct1\"")
+                 && accounts.Body.Contains("\"name\":\"acct2\""), $"both accounts: {accounts.Body}");
+        Hex.True(accounts.Body.Contains("\"name\":\"t30_1\""),
+            "and each one carries its characters, which is what the picker shows");
+
+        var byId = api.Handle("GET", "/api/character",
+            new Dictionary<string, string> { ["id"] = "1" }, token: T101Token);
+        Hex.True(byId.Status == 200 && byId.Body.Contains("\"name\":\"t30_1\"")
+                 && byId.Body.Contains("\"money\":") && byId.Body.Contains("\"items\":"),
+            $"the row, its money and its items: {byId.Body}");
+
+        var byName = api.Handle("GET", "/api/character",
+            new Dictionary<string, string> { ["name"] = "t30_2" }, token: T101Token);
+        Hex.True(byName.Status == 200 && byName.Body.Contains("\"id\":2"), "by name too");
+
+        var missing = api.Handle("GET", "/api/character",
+            new Dictionary<string, string> { ["id"] = "999" }, token: T101Token);
+        Hex.True(missing.Status == 404 && missing.Body.Contains("\"result\":" + AdminApi.ResultNotFound),
+            "a miss is result 2, the retail not-found code - WEBADMIN-DESIGN.md section 2");
+
+        var online = api.Handle("GET", "/api/online", token: T101Token);
+        Hex.True(online.Body.Contains("\"playerId\":1") && online.Body.Contains("\"zone\":7005"),
+            $"the live list comes through the delegate: {online.Body}");
+    }
+
+    /// <summary>
+    /// T101 - restore clears a SCHEDULED delete, and says so plainly when it cannot.
+    ///
+    /// <para>This is not retail's WA_UNDELETE_USER. That brings back a row that is gone, which
+    /// needs the soft-delete columns and <c>deleted_items</c> that WEBADMIN-DESIGN.md section 4
+    /// lists as new tables. TeraSharp's <c>delete_at</c> (T88) is a grace window, and T88 left
+    /// <c>OnDeleteUser</c> hard-deleting - so a truly deleted character answers 2, not 0.</para>
+    /// </summary>
+    [Test] public static void T101_admin_api_restore_only_rescues_a_scheduled_delete()
+    {
+        using var store = StoreWithTwoAccounts();
+        var api = NewAdminApi(store);
+        var acct = store.GetOrCreateAccount("acct1");
+
+        var none = api.Handle("POST", "/api/restore-character",
+            body: "{\"id\":1,\"reason\":\"oops\"}", token: T101Token);
+        Hex.True(none.Status == 409 && none.Body.Contains("\"result\":" + AdminApi.ResultInvalid),
+            $"nothing pending is result 3, not a silent success: {none.Body}");
+
+        Hex.True(store.ScheduleCharacterDelete(1, acct.Id, 1789620000L), "schedule one");
+        var ok = api.Handle("POST", "/api/restore-character",
+            body: "{\"id\":1,\"reason\":\"player asked\"}", token: T101Token, sourceIp: "127.0.0.1");
+        Hex.True(ok.Status == 200 && ok.Body.Contains("\"result\":" + AdminApi.ResultOk),
+            $"the grace window is what restore can reach: {ok.Body}");
+        Hex.True(store.GetCharacterDeleteAt(1) == 0, "and the stamp is gone");
+
+        var gone = api.Handle("POST", "/api/restore-character",
+            body: "{\"id\":4242,\"reason\":\"x\"}", token: T101Token);
+        Hex.True(gone.Status == 404 && gone.Body.Contains("\"result\":" + AdminApi.ResultNotFound),
+            "a row that is not there cannot be restored in phase 1");
+
+        var bad = api.Handle("POST", "/api/restore-character", body: "{}", token: T101Token);
+        Hex.True(bad.Status == 400 && bad.Body.Contains("\"result\":" + AdminApi.ResultInvalid),
+            "no id is result 3");
+
+        // every write landed in the audit trail, reason and source IP included
+        var log = store.GetAdminLog(10);
+        Hex.True(log.Count == 3, $"three attempts, three log rows: {log.Count}");
+        Hex.True(log[1].Action == "restore-character" && log[1].Reason == "player asked"
+                 && log[1].SourceIp == "127.0.0.1" && log[1].Result == AdminApi.ResultOk,
+            "newest first, so the successful restore is the middle one, with its reason and IP");
+    }
+
+    /// <summary>
+    /// T101 - the phase-2 endpoints answer a clean refusal instead of 404.
+    ///
+    /// <para>WEBADMIN-DESIGN.md's out-of-scope note asks for exactly this: a failure result so the
+    /// tool reports "not supported" rather than hanging or looking broken.</para>
+    /// </summary>
+    [Test] public static void T101_admin_api_phase_two_endpoints_refuse_cleanly()
+    {
+        using var store = StoreWithTwoAccounts();
+        var api = NewAdminApi(store);
+        foreach (var path in AdminApi.PhaseTwoPaths)
+        {
+            var r = api.Handle("POST", path, token: T101Token);
+            Hex.True(r.Status == 501 && r.Body.Contains("\"result\":" + AdminApi.ResultRefused),
+                $"{path} answers 501 / result 0x16, not 404: {r.Status} {r.Body}");
+        }
+        Hex.True(AdminApi.PhaseTwoPaths.Length == 8, "the eight the brief lists for phase 2");
+
+        var nope = api.Handle("GET", "/api/nothing-here", token: T101Token);
+        Hex.True(nope.Status == 404, "a genuinely unknown path is still 404");
+    }
+
+    /// <summary>T101 - the hand-rolled JSON helpers, which are the only place a quote can escape.</summary>
+    [Test] public static void T101_admin_json_helpers_escape_and_parse()
+    {
+        Hex.True(AdminApi.Str("a\"b\\c") == "\"a\\\"b\\\\c\"", "quotes and backslashes are escaped");
+        Hex.True(AdminApi.Str("line\nbreak") == "\"line\\nbreak\"", "and control characters");
+        Hex.True(AdminApi.Str(null) == "\"\"", "null is the empty string, not the word null");
+
+        Hex.True(AdminApi.JsonNumber("{\"id\":42}", "id") == 42, "a flat number");
+        Hex.True(AdminApi.JsonNumber("{\"id\":-7}", "id") == -7, "and a negative one");
+        Hex.True(AdminApi.JsonNumber("{\"other\":1}", "id") == null, "a missing key is null");
+        Hex.True(AdminApi.JsonString("{\"reason\":\"a \\\"quoted\\\" word\"}", "reason")
+                 == "a \"quoted\" word", "escapes come back undone");
+        Hex.True(AdminApi.JsonString("{\"reason\":\"\"}", "reason") == "", "an empty string is empty");
     }
 
     // ---- The rules ----
