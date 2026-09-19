@@ -422,6 +422,33 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   (10/30/37 PvP, 3126/3203/9126 PvE) never move across any capture. `C_REQUEST_PVE_RANKING`
   stays unanswered, exactly as the real server leaves it.
 
-  **Not built**: `S_ADMIN_GET_USERINFO_INVEN` (0xBBED, frame 724, 4439 B) - eleven 400-byte item
-  records behind a 39-byte head, a decode of its own, and a wrong one draws a wrong inventory for
-  a GM who is about to act on it. Kind 1 falls through to the default branch.
+  **Not built here**: `S_ADMIN_GET_USERINFO_INVEN` (0xBBED, frame 724, 4439 B) - eleven
+  400-byte item records behind a 39-byte head, a decode of its own. Kind 1 fell through to the
+  default branch until T93.
+
+- T93 (cap_final_gm_client2 frame 724): `S_ADMIN_GET_USERINFO_INVEN` (0xBBED), kind 1's reply -
+  39-byte head + 11 * 400, byte-exact. The 400 is **not a flat record**: a 104-byte item
+  (the 22 fields the PDL dumper at Arb_part_018.c:7506 names, ending at `Damaged` @0x67) carries
+  a list of **two 28-byte stat blocks**, and each of those carries its own list of **fifteen
+  8-byte option slots** - 104 + 2 * (28 + 15*8) = 400. The dumper stops at `Damaged` because a
+  PDL dumper skips arrays nested inside an array element, so the two inner lists came out of the
+  writer (`User::_Send_S_ADMIN_GET_USERINFO_INVEN`, Arb_part_031.c:5254) and the capture.
+
+  Four head fields are **literals in the writer**: CreatureId is a bare `0` - the packet is
+  entirely about one character and never says which, the id is repeated as `OwnerDbId` in every
+  element - and ShowInven 1 / IsFirstPacket 1 / NeedNextPacket 0. Money is the character's
+  `money` column; MaxInvenSlotCount (0x28) and TCatAmount are World's, so they are parameters
+  with the captured defaults.
+
+  **Order**: the writer appends two containers, inventory then equipment, and inside each the
+  capture is in **item-db-id order, not slot order** (the bag runs slots 1, 2, 0, 3, 4, 5, 6
+  while its ids run 10016..10032). `GmAdminTool.InvenRowsFor` re-sorts `GetInventoryItems` that
+  way; four of the eleven elements then come out byte-identical to the capture from the
+  `items` row alone, which is what the round-trip test asserts.
+
+  **Left blank**: the enchant / bind / option / durability fields are World's item object and
+  the three floats in each stat block are the item template sheet's (121/121/149.8 for the two
+  weapons, 5/5/5 and 1/1/1 for the worn armour, 0 for everything stackable). The Arbiter's
+  `items` table holds neither, so they are per-item parameters defaulting to zero -
+  `CumulatedEnchantAmount` to -1, which is what nine of the eleven captured rows carry.
+  The capture is committed as `data/t93_admin_inven_frame724.bin` for the byte-exact test.

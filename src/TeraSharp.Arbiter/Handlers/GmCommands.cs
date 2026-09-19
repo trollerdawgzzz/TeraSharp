@@ -629,11 +629,11 @@ public sealed class GmCommandHandlers
 /// client packets and an ordinary client can send them, so the gate is theirs too - a
 /// non-GM gets silence and a log line rather than another player's IP address.</para>
 ///
-/// <para><b>Not here:</b> the three replies that are World's data, not ours -
-/// <c>S_ADMIN_GET_USERINFO_INVEN</c> (frame 724, 4439 B), <c>_WAREHOUSE</c> (747) and
-/// <c>_SKILL</c> (1428, 665 B), all answers to <c>C_ADMIN_REQUEST_USERINFO</c>; and
-/// <c>C_ADMIN_REQUEST_USERACTION</c> (786, 956), whose action ids the capture only shows two of.
-/// status/STATUS.md T89 lists them with their frame numbers.</para>
+/// <para>T91 added the warehouse and skill tabs and the action row, T93 the inventory tab, so
+/// every C_ADMIN_* the capture holds is now answered. The kinds of
+/// <c>C_ADMIN_REQUEST_USERINFO</c> that the real Arbiter answered with nothing (2, 3, 14) and
+/// the <c>C_ADMIN_REQUEST_USERACTION</c> ids past 12 and 13 are still refused - see
+/// status/STATUS.md T89 / T91 / T93.</para>
 /// </summary>
 public static class GmAdminTool
 {
@@ -830,13 +830,64 @@ public static class GmAdminTool
                     null, Program.Store?.GetCrests(target)));
                 return true;
 
+            case ArbiterClientHandlers.UserInfoKindInven:
+                // T93.
+                s.Send(ArbiterClientHandlers.BuildAdminGetUserInfoInven(
+                    InvenRowsFor(Program.Store, target),
+                    Program.Store?.GetCharacter(target)?.Money ?? 0));
+                return true;
+
             default:
-                // Kind 1 included: see the note above. Everything the capture does not answer is
-                // answered here the same way it was there - with nothing.
+                // Everything the capture does not answer is answered here the same way it was
+                // there - with nothing.
                 log.LogInformation("C_ADMIN_REQUEST_USERINFO: kind {Kind} for player {Id} - not served",
                     kind, target);
                 return true;
         }
+    }
+
+    /// <summary>INVEN_TYPE 14, the worn pocket - the second of the two containers the writer
+    /// appends to the inventory reply.</summary>
+    public const int InvenTypeEquipped = 14;
+
+    /// <summary>
+    /// T93. The character's rows in the order frame 724 lists them. The writer appends two
+    /// containers - the inventory (<c>param_2 + 0x3c80</c>) and then the equipment
+    /// (<c>+ 0x3d18</c>) - and inside each one the capture is in ITEM DB ID order, not slot
+    /// order: the bag runs slots 1, 2, 0, 3, 4, 5, 6 while its db ids run 10016, 10018, 10021,
+    /// 10022, 10023, 10030, 10032, and the four worn pieces follow at 10011..10014.
+    ///
+    /// <para>Everything past the row is left at its default. The enchant, option and durability
+    /// fields belong to World's item object and the three stat floats to the item template
+    /// sheet; the Arbiter's <c>items</c> table holds neither, and a GM reading a made-up
+    /// enchant level is worse served than one reading a blank.</para>
+    /// </summary>
+    public static List<ArbiterClientHandlers.AdminInvenItem> InvenRowsFor(
+        CharacterStore? store, long ownerDbId)
+    {
+        var list = new List<ArbiterClientHandlers.AdminInvenItem>();
+        var rows = store?.GetInventoryItems(ownerDbId);
+        if (rows is null || rows.Count == 0) return list;
+
+        var sorted = new List<CharacterStore.ItemRow>(rows);
+        sorted.Sort((a, b) =>
+        {
+            int ga = a.InvenType == InvenTypeEquipped ? 1 : 0;
+            int gb = b.InvenType == InvenTypeEquipped ? 1 : 0;
+            return ga != gb ? ga - gb : a.ItemDbId.CompareTo(b.ItemDbId);
+        });
+
+        foreach (var r in sorted)
+            list.Add(new ArbiterClientHandlers.AdminInvenItem
+            {
+                TemplateId = r.TemplateId,
+                ItemDbId = r.ItemDbId,
+                OwnerDbId = r.OwnerDbId,
+                InvenType = r.InvenType,
+                InvenPos = r.Slot,
+                Count = r.Amount > int.MaxValue ? int.MaxValue : (int)r.Amount,
+            });
+        return list;
     }
 
     /// <summary>

@@ -2268,6 +2268,220 @@ public static class ArbiterClientHandlers
     public static byte[] BuildPveLeaderBoardInfo()
         => BuildLeaderBoardInfo(S_PVE_LEADER_BOARD_INFO, LeaderBoardCapturedPve);
 
+    // =========================================================================================
+    // 17. S_ADMIN_GET_USERINFO_INVEN - the tool's inventory tab                         (T93)
+    // =========================================================================================
+
+    /// <summary>
+    /// The head, from the PDL dumper at Arb_part_018.c:7506. Its guard is
+    /// <c>if (0x26 &lt; param_2)</c>, so the minimum frame is 39 bytes, which is exactly the head:
+    /// <code>
+    ///   +0x04 u16 count            +0x06 u16 firstOffset
+    ///   +0x08 i64 CreatureId       +0x10 i64 Money
+    ///   +0x18 u8  ShowInven        +0x19 u8  IsFirstPacket   +0x1A u8 NeedNextPacket
+    ///   +0x1B i32 MaxInvenSlotCount
+    ///   +0x1F i64 TCatAmount
+    /// </code>
+    /// <para>Four of those are literals in the writer
+    /// (<c>User::_Send_S_ADMIN_GET_USERINFO_INVEN</c>, Arb_part_031.c:5254): CreatureId is
+    /// written as a bare <c>0</c>, ShowInven and IsFirstPacket as <c>1</c>, NeedNextPacket as
+    /// <c>0</c>. The capture agrees - frame 724's CreatureId is zero even though the packet is
+    /// entirely about one character, whose id is repeated in every element as OwnerDbId.</para>
+    /// <para>NeedNextPacket is the paging flag. The writer sets it from nothing we can see and
+    /// the capture never pages, so the whole inventory goes in one frame; a character with enough
+    /// rows to overflow the 64 KB frame would need that flag and a continuation, which no capture
+    /// pins.</para>
+    /// </summary>
+    public const int AdminInvenHeadSize = 39;
+
+    /// <summary>
+    /// The 40 slots the capture reports. The writer reads it from <c>param_2 + 0x3ba0</c> - a
+    /// live field on World's character - so it is a parameter here with the captured default.
+    /// </summary>
+    public const int AdminInvenMaxSlotCount = 40;
+
+    /// <summary>
+    /// The item element. The dumper names 22 scalars and the writer advances by <c>0x68</c>
+    /// after each one, which is where the fixed part ends:
+    /// <code>
+    ///   +0x00 u16 here             +0x02 u16 next
+    ///   +0x08 u16 statCount        +0x0A u16 statOffset
+    ///   +0x10 i32 TemplateId       +0x14 i64 Dbid          +0x1C i64 OwnerDbId
+    ///   +0x24 i32 InvenType        +0x28 i32 TabIndex      +0x2C i32 InvenPos
+    ///   +0x30 i32 Count            +0x34 i32 EnchantCount  +0x38 i32 Durability
+    ///   +0x3C u8  IsBound          +0x3D u8  Masterpiece
+    ///   +0x3E i32 CurrentUnidentifiedItemGrade
+    ///   +0x42 i32 EnchantAdjustment            +0x46 i32 EnchantBoosterPoint
+    ///   +0x4A i32 EnchantBoosterMaxGrade       +0x4E i32 CumulatedEnchantAmount
+    ///   +0x52 u8  Awakened         +0x53 i32 UnbindCount   +0x57 i32 SelectedOptionIdx
+    ///   +0x5B i32 OpenOptionIdx    +0x5F i64 EquipmentExp  +0x67 u8 Damaged
+    /// </code>
+    /// <para>+0x04 and +0x0C are a second pair of list slots the writer zeroes and never fills;
+    /// they are zero in all eleven captured elements.</para>
+    /// </summary>
+    public const int AdminInvenItemFixedSize = 0x68;
+
+    /// <summary>
+    /// Behind each item hang TWO stat blocks, which the dumper does not name - it stops at
+    /// <c>Damaged</c>, because a PDL dumper skips arrays nested inside an array element. The
+    /// writer builds them (Arb_part_031.c:5447): an index <c>0, 1</c> at +0x08, three values
+    /// read out of the item template sheet at +0x10/+0x14/+0x18, and its own list of 15 option
+    /// slots.
+    /// <code>
+    ///   +0x00 u16 here   +0x02 u16 next   +0x04 u16 optionCount   +0x06 u16 optionOffset
+    ///   +0x08 i32 index (0 then 1)        +0x0C i32 0
+    ///   +0x10 f32        +0x14 f32        +0x18 f32
+    /// </code>
+    /// <para>The three floats are the same in both blocks in all eleven captured items and they
+    /// track the template, not the row: 121 / 121 / 149.8 for the two weapons (17000, 17005),
+    /// 5 / 5 / 5 and 1 / 1 / 1 for the worn armour, 0 / 0 / 0 for everything stackable. They
+    /// come from the item datasheet the Arbiter loads and we do not have, so they are per-item
+    /// parameters that default to zero rather than anything invented.</para>
+    /// <para>The 15 option entries are <c>[u16 here][u16 next][i32 value]</c> and every one of
+    /// the 330 in frame 724 carries 0.</para>
+    /// </summary>
+    public const int AdminInvenStatBlockSize = 0x1C;
+    public const int AdminInvenStatBlocks = 2;
+    public const int AdminInvenOptionSlots = 15;
+    public const int AdminInvenOptionEntrySize = 8;
+
+    /// <summary>104 + 2 * (28 + 15 * 8) = 400, the stride frame 724 walks.</summary>
+    public const int AdminInvenItemSize = AdminInvenItemFixedSize
+        + AdminInvenStatBlocks * (AdminInvenStatBlockSize
+                                  + AdminInvenOptionSlots * AdminInvenOptionEntrySize);
+
+    /// <summary>
+    /// One row of the tool's inventory tab, named as the dumper names it. Everything past
+    /// <c>Count</c> is World's item object rather than anything the Arbiter's <c>items</c> table
+    /// holds, so it defaults to what an unenchanted, unbound, unmodified item reads as.
+    /// </summary>
+    public sealed class AdminInvenItem
+    {
+        public int TemplateId { get; init; }
+        public long ItemDbId { get; init; }
+        public long OwnerDbId { get; init; }
+        public int InvenType { get; init; }
+        public int TabIndex { get; init; }
+        public int InvenPos { get; init; }
+        public int Count { get; init; }
+        public int EnchantCount { get; init; }
+        public int Durability { get; init; }
+        public bool IsBound { get; init; }
+        public bool Masterpiece { get; init; }
+        public int CurrentUnidentifiedItemGrade { get; init; }
+        public int EnchantAdjustment { get; init; }
+        public int EnchantBoosterPoint { get; init; }
+        public int EnchantBoosterMaxGrade { get; init; }
+
+        /// <summary>
+        /// -1 in nine of the eleven captured rows and a small positive number in the two
+        /// enchantable weapons (2 and 3), so -1 is "this item does not accumulate enchantment"
+        /// rather than zero.
+        /// </summary>
+        public int CumulatedEnchantAmount { get; init; } = -1;
+
+        public bool Awakened { get; init; }
+        public int UnbindCount { get; init; }
+        public int SelectedOptionIdx { get; init; }
+        public int OpenOptionIdx { get; init; }
+        public long EquipmentExp { get; init; }
+        public bool Damaged { get; init; }
+
+        /// <summary>The three template values both stat blocks carry. See AdminInvenStatBlockSize.</summary>
+        public float StatA { get; init; }
+        public float StatB { get; init; }
+        public float StatC { get; init; }
+    }
+
+    /// <summary>
+    /// S_ADMIN_GET_USERINFO_INVEN (0xBBED), cap_final_gm_client2 frame 724 - 39 + 11 * 400 =
+    /// 4439 bytes. The reply to <c>C_ADMIN_REQUEST_USERINFO</c> kind 1.
+    /// </summary>
+    public static byte[] BuildAdminGetUserInfoInven(
+        IReadOnlyList<AdminInvenItem>? items, long money = 0, long tcatAmount = 0,
+        int maxInvenSlotCount = AdminInvenMaxSlotCount,
+        bool showInven = true, bool isFirstPacket = true, bool needNextPacket = false)
+    {
+        items ??= Array.Empty<AdminInvenItem>();
+        var p = new byte[AdminInvenHeadSize + items.Count * AdminInvenItemSize];
+        BitConverter.GetBytes((ushort)p.Length).CopyTo(p, 0);
+        BitConverter.GetBytes(S_ADMIN_GET_USERINFO_INVEN).CopyTo(p, 2);
+        BitConverter.GetBytes((ushort)items.Count).CopyTo(p, 4);
+        BitConverter.GetBytes((ushort)(items.Count == 0 ? 0 : AdminInvenHeadSize)).CopyTo(p, 6);
+        // +0x08 CreatureId stays zero: the writer passes a literal 0.
+        BitConverter.GetBytes(money).CopyTo(p, 0x10);
+        p[0x18] = (byte)(showInven ? 1 : 0);
+        p[0x19] = (byte)(isFirstPacket ? 1 : 0);
+        p[0x1A] = (byte)(needNextPacket ? 1 : 0);
+        BitConverter.GetBytes(maxInvenSlotCount).CopyTo(p, 0x1B);
+        BitConverter.GetBytes(tcatAmount).CopyTo(p, 0x1F);
+
+        int blockStride = AdminInvenStatBlockSize
+                          + AdminInvenOptionSlots * AdminInvenOptionEntrySize;
+
+        for (int i = 0; i < items.Count; i++)
+        {
+            var it = items[i];
+            int at = AdminInvenHeadSize + i * AdminInvenItemSize;
+            int statsAt = at + AdminInvenItemFixedSize;
+
+            BitConverter.GetBytes((ushort)at).CopyTo(p, at);
+            BitConverter.GetBytes((ushort)(i + 1 < items.Count ? at + AdminInvenItemSize : 0))
+                .CopyTo(p, at + 2);
+            BitConverter.GetBytes((ushort)AdminInvenStatBlocks).CopyTo(p, at + 8);
+            BitConverter.GetBytes((ushort)statsAt).CopyTo(p, at + 10);
+
+            BitConverter.GetBytes(it.TemplateId).CopyTo(p, at + 0x10);
+            BitConverter.GetBytes(it.ItemDbId).CopyTo(p, at + 0x14);
+            BitConverter.GetBytes(it.OwnerDbId).CopyTo(p, at + 0x1C);
+            BitConverter.GetBytes(it.InvenType).CopyTo(p, at + 0x24);
+            BitConverter.GetBytes(it.TabIndex).CopyTo(p, at + 0x28);
+            BitConverter.GetBytes(it.InvenPos).CopyTo(p, at + 0x2C);
+            BitConverter.GetBytes(it.Count).CopyTo(p, at + 0x30);
+            BitConverter.GetBytes(it.EnchantCount).CopyTo(p, at + 0x34);
+            BitConverter.GetBytes(it.Durability).CopyTo(p, at + 0x38);
+            p[at + 0x3C] = (byte)(it.IsBound ? 1 : 0);
+            p[at + 0x3D] = (byte)(it.Masterpiece ? 1 : 0);
+            BitConverter.GetBytes(it.CurrentUnidentifiedItemGrade).CopyTo(p, at + 0x3E);
+            BitConverter.GetBytes(it.EnchantAdjustment).CopyTo(p, at + 0x42);
+            BitConverter.GetBytes(it.EnchantBoosterPoint).CopyTo(p, at + 0x46);
+            BitConverter.GetBytes(it.EnchantBoosterMaxGrade).CopyTo(p, at + 0x4A);
+            BitConverter.GetBytes(it.CumulatedEnchantAmount).CopyTo(p, at + 0x4E);
+            p[at + 0x52] = (byte)(it.Awakened ? 1 : 0);
+            BitConverter.GetBytes(it.UnbindCount).CopyTo(p, at + 0x53);
+            BitConverter.GetBytes(it.SelectedOptionIdx).CopyTo(p, at + 0x57);
+            BitConverter.GetBytes(it.OpenOptionIdx).CopyTo(p, at + 0x5B);
+            BitConverter.GetBytes(it.EquipmentExp).CopyTo(p, at + 0x5F);
+            p[at + 0x67] = (byte)(it.Damaged ? 1 : 0);
+
+            for (int k = 0; k < AdminInvenStatBlocks; k++)
+            {
+                int blockAt = statsAt + k * blockStride;
+                int optAt = blockAt + AdminInvenStatBlockSize;
+
+                BitConverter.GetBytes((ushort)blockAt).CopyTo(p, blockAt);
+                // Each list terminates on its own: the last block's next is 0, not the next item.
+                BitConverter.GetBytes((ushort)(k + 1 < AdminInvenStatBlocks ? blockAt + blockStride : 0))
+                    .CopyTo(p, blockAt + 2);
+                BitConverter.GetBytes((ushort)AdminInvenOptionSlots).CopyTo(p, blockAt + 4);
+                BitConverter.GetBytes((ushort)optAt).CopyTo(p, blockAt + 6);
+                BitConverter.GetBytes(k).CopyTo(p, blockAt + 8);
+                BitConverter.GetBytes(it.StatA).CopyTo(p, blockAt + 0x10);
+                BitConverter.GetBytes(it.StatB).CopyTo(p, blockAt + 0x14);
+                BitConverter.GetBytes(it.StatC).CopyTo(p, blockAt + 0x18);
+
+                for (int o = 0; o < AdminInvenOptionSlots; o++)
+                {
+                    int e = optAt + o * AdminInvenOptionEntrySize;
+                    BitConverter.GetBytes((ushort)e).CopyTo(p, e);
+                    BitConverter.GetBytes((ushort)(o + 1 < AdminInvenOptionSlots
+                        ? e + AdminInvenOptionEntrySize : 0)).CopyTo(p, e + 2);
+                }
+            }
+        }
+        return p;
+    }
+
     /// <summary>A NUL-terminated UTF-16LE string, as the inter-server and client writers emit it.</summary>
     public static byte[] WString(string? s)
     {
