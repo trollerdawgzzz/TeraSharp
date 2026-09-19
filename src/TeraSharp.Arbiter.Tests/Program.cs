@@ -20270,6 +20270,126 @@ string message
             "count 0 is an empty image, not a refusal");
     }
 
+    // ===================== T97: the small replies =====================
+    //
+    // No capture holds any of these twenty-six packets, so nothing here is pinned to a frame.
+    // Every layout is its PDL dumper's, cross-checked against the handler's own length guard:
+    // where the guard and the fields disagree the test says so rather than papering over it.
+
+    /// <summary>
+    /// The two party windows. S_ANSWER_PARTY_NAME is SIX entries because the handler's loop is
+    /// <c>while (i &lt; 6)</c> over Party::GetPartyName(i) - not a guess - and each is
+    /// <c>[u16 here][u16 next][u16 nameOffset][i32 PartyIndex]</c>. S_VIEW_PARTY_INVITE is two
+    /// lists, friends then guild mates, of <c>[here][next][nameOffset][i32 class][i32 level]</c>
+    /// behind a 12-byte head (its guard is 0xb).
+    /// </summary>
+    [Test] public static void T97_the_party_extras_answer_their_windows()
+    {
+        Hex.Eq(ArbiterClientHandlers.BuildAnswerPartyName(),
+            "50 00 32 D0 06 00 08 00 08 00 14 00 12 00 00 00 "
+            + "00 00 00 00 14 00 20 00 1E 00 01 00 00 00 00 00 "
+            + "20 00 2C 00 2A 00 02 00 00 00 00 00 2C 00 38 00 "
+            + "36 00 03 00 00 00 00 00 38 00 44 00 42 00 04 00 "
+            + "00 00 00 00 44 00 00 00 4E 00 05 00 00 00 00 00",
+            "six presets with no names: the preset sheet is the Arbiter's and we do not have it");
+        Hex.True(ArbiterClientHandlers.AnswerPartyNameCount == 6
+                 && ArbiterClientHandlers.AnswerPartyNameEntrySize == 10,
+            "six 10-byte elements");
+
+        Hex.Eq(ArbiterClientHandlers.BuildViewPartyInvite(null, null),
+            "0C 00 C2 CB 00 00 00 00 00 00 00 00",
+            "nobody to invite: two empty lists, and the head is still 12 bytes");
+
+        var one = ArbiterClientHandlers.BuildViewPartyInvite(
+            new[] { new ArbiterClientHandlers.PartyInvitable("g1", 2, 31) },
+            new[] { new ArbiterClientHandlers.PartyInvitable("g2", 3, 32) });
+        Hex.Eq(one,
+            "34 00 C2 CB 01 00 0C 00 01 00 20 00 0C 00 00 00 "
+            + "1A 00 02 00 00 00 1F 00 00 00 67 00 31 00 00 00 "
+            + "20 00 00 00 2E 00 03 00 00 00 20 00 00 00 67 00 "
+            + "32 00 00 00",
+            "one friend and one guild mate");
+        Hex.True(BitConverter.ToUInt16(one, 0x0C + 2) == 0,
+            "the friend list's last next is 0, NOT the first guild member - each list ends on "
+            + "its own, which is the thing T91 had to learn twice");
+    }
+
+    /// <summary>
+    /// The four windows that open onto content this server does not have. Answering them empty
+    /// is what closes them; forwarded, each is one of World's "handler has not been implemented
+    /// yet!!!" lines and the window waits forever.
+    /// </summary>
+    [Test] public static void T97_the_event_and_vip_windows_get_a_real_empty_answer()
+    {
+        Hex.Eq(ArbiterClientHandlers.BuildGetEventDetail(),
+            "08 00 98 DA 06 00 00 00", "S_GET_EVENT_DETAIL: one wide string, and it is empty");
+
+        Hex.Eq(ArbiterClientHandlers.BuildSendVipSystemInfo(),
+            "37 00 C2 70 35 00 00 00 00 00 00 00 00 00 00 00 "
+            + "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+            + "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+            + "00 00 00 00 00 00 00",
+            "S_SEND_VIP_SYSTEM_INFO: 53 bytes of fixed part - the 0x34 guard - and VIP off");
+        Hex.True(ArbiterClientHandlers.VipSystemInfoFixedSize == 0x35,
+            "StoreReset is the last byte at +0x34, so the fixed part is 0x35");
+
+        Hex.Eq(ArbiterClientHandlers.BuildUpdateStackAttendanceEventInfo(),
+            "14 00 EA 74 00 00 00 00 00 00 00 00 00 00 00 00 "
+            + "00 00 00 00", "S_UPDATE_STACK_ATTENDANCE_EVENT_INFO: no attendance event configured");
+        var days = ArbiterClientHandlers.BuildUpdateStackAttendanceEventInfo(
+            new[] { (1, 0), (2, 1) }, rewardType: 3, today: 2, notReceiveCount: 1);
+        Hex.True(days.Length == 20 + 2 * 12
+                 && BitConverter.ToUInt16(days, 20 + 2) == 32
+                 && BitConverter.ToUInt16(days, 20 + 12 + 2) == 0,
+            $"12-byte elements chained 20 -> 32 -> end: {days.Length} bytes");
+
+        Hex.Eq(ArbiterClientHandlers.BuildEventMatchingBattlefieldDetailInfo(7),
+            "0C 00 6F FB 07 00 00 00 00 00 00 00",
+            "S_EVENT_MATCHING_BATTLEFIELD_DETAIL_INFO echoes the EventId the request asked "
+            + "about - the window keys on it - with type 0");
+    }
+
+    /// <summary>
+    /// The two report packets, whose reply is the FAILURE path. Handler_C_CHAT_REPORT looks the
+    /// reported name up, files the report and returns having sent nothing; it only writes this
+    /// five-byte frame, with a literal 0, when the name is unknown. So silence means the report
+    /// was taken and S_CHAT_REPORT means "no such player" - the opposite of what the name reads
+    /// like.
+    /// </summary>
+    [Test] public static void T97_a_report_answers_only_when_the_name_is_unknown()
+    {
+        Hex.Eq(ArbiterClientHandlers.BuildReportFailure(ArbiterClientHandlers.S_CHAT_REPORT),
+            "05 00 F2 52 00", "S_CHAT_REPORT, the only form the handler ever writes");
+        Hex.Eq(ArbiterClientHandlers.BuildReportFailure(ArbiterClientHandlers.S_USER_REPORT),
+            "05 00 EA 4F 00", "S_USER_REPORT, the same five bytes under another opcode");
+        Hex.True(MiscClientPackets.ChatReportBodySize == 12 && MiscClientPackets.UserReportBodySize == 6,
+            "the handlers' own guards are 0x10 and 10, less the four-byte header");
+    }
+
+    /// <summary>
+    /// The three that store. C_CHANGE_MY_PROFILE already had a column (T30's profile_message);
+    /// C_UPDATE_MY_DESCRIPTION and C_CHANGE_MY_STATE got one each. None of the three replies -
+    /// the real handlers do not either.
+    /// </summary>
+    [Test] public static void T97_the_profile_fields_round_trip()
+    {
+        using var store = GuildStore(1);
+        store.SetProfileMessage(1, "hi");
+        store.SetMyDescription(1, "a longer line about me");
+        store.SetMyState(1, 2);
+
+        Hex.True(store.GetProfileMessage(1) == "hi"
+                 && store.GetMyDescription(1) == "a longer line about me"
+                 && store.GetMyState(1) == 2,
+            $"all three come back: '{store.GetProfileMessage(1)}' / "
+            + $"'{store.GetMyDescription(1)}' / {store.GetMyState(1)}");
+
+        // A character with no row of its own is left alone rather than throwing.
+        store.SetMyDescription(9999, "nobody");
+        Hex.True(store.GetMyDescription(9999) == "" && store.GetMyState(9999) == 0,
+            "an unknown character reads back empty");
+    }
+
     /// <summary>SDB_REGISTER_CARD's payload: <c>DlmId@0, AccountDbId@4 (i64), CardTemplateId@12,
     /// Amount@16</c> - 20 bytes, the length of seq 7032.</summary>
     static byte[] CardRegister(long accountId, int cardTemplateId, int amount)

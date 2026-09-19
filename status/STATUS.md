@@ -487,3 +487,42 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   than a member count - filtering on a guess would hide guilds from the window, so it is read
   and ignored. The ranking is served live, because all four captured replies are empty even
   though two guilds existed: the real Arbiter publishes that list from a scheduled job.
+
+- T97: twenty-six ack/small-reply client packets, read out of their own `Handler_C_*` in the
+  decompile. None of them appears in any capture, so nothing here is pinned to a frame - every
+  layout is its PDL dumper's, cross-checked against the handler's own `param_3 <` length guard.
+  Registering them matters because the fallback FORWARDS an unregistered client packet to World,
+  which answers "handler has not been implemented yet!!!" and drops it.
+
+  **Eight reply.** S_ANSWER_PARTY_NAME is **six** entries - the handler's loop is literally
+  `while (i < 6)` over Party::GetPartyName(i) - of `[here][next][nameOffset][i32 PartyIndex]`;
+  the preset names are a sheet we do not have, so they go out empty. S_VIEW_PARTY_INVITE is TWO
+  lists (friends, then guild mates) served from our own tables. S_GET_EVENT_DETAIL,
+  S_SEND_VIP_SYSTEM_INFO (53 bytes fixed), S_UPDATE_STACK_ATTENDANCE_EVENT_INFO and
+  S_EVENT_MATCHING_BATTLEFIELD_DETAIL_INFO all answer empty - no event, attendance or VIP data
+  exists on this server - and the battlefield one echoes the EventId the request asked about.
+
+  **The two report packets are the surprise**: S_CHAT_REPORT / S_USER_REPORT are the FAILURE
+  path. Handler_C_CHAT_REPORT looks the reported name up, files the report and returns having
+  sent NOTHING; it only builds the five-byte frame, with a literal 0, when the name is unknown.
+  Silence means the report was taken.
+
+  **Three store**: C_CHANGE_MY_PROFILE into T30's `profile_message`, and two new columns -
+  `characters.description` (C_UPDATE_MY_DESCRIPTION) and `characters.player_state`
+  (C_CHANGE_MY_STATE, `User::ChangeUserState`). None of the three replies, and neither does the
+  real handler.
+
+  **The rest are accepted and dropped**, which is exactly what their handlers do -
+  Handler_C_SAVE_CHAT_SETTING and Handler_C_PARTY_NOTIFY_MY_POSITION are four and five lines of
+  nothing but the trace guard - so they are registered on `OnAcceptSilently` rather than given a
+  handler. C_LOGIN_WORLD is the one exception worth a line: its whole body is a length check
+  that logs `Arbiter <-> World PDL Version Mismatch! Bye :(` under 0x12 bytes.
+
+  **Not done, listed for a later task**: C_REQUEST_CHANGE_PARTY_MATCH_RULE has no
+  `Handler_C_*` under that name in the decompile at all and was left unregistered;
+  C_GET_ATTENDANCE_REWARD, C_REQUEST_STACK_ATTENDANCE_EVENT_REWARD, C_REQUEST_RECV_DAILY_TOKEN
+  and C_QUERY_COIN reach managers (AttendanceEvent, VipSystemManager::TryToRecvDailyToken,
+  Account::RequestUpdateCoin) that would need a reward/coin table before they can do more than
+  ack; C_REQUEST_COUPON_DATA goes to CouponManager::RequestCouponData, which is an async DB
+  round trip; and C_CUSTOM_USER_CUSTOMIZING / the two appearance cancels unwind an appearance
+  change this build never starts.
