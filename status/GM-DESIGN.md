@@ -340,3 +340,44 @@ change there is one line:
 ["status"] = GmAccounts.LoginStatusFor(s.Account.Name,
                  Program.Store?.GetAdminLevel((long)s.Account.AccountId) ?? 0),
 ```
+
+## T107 - and why it STILL did not open: nobody answered Alt+A
+
+T104/T106 made the lobby byte-equal to cap_final_gm_client2 and the panel stayed shut, so the
+diff moved past it - frames 50-450, enter-world through the first Alt+A.
+
+**The GM tool is an Awesomium web view. Alt+A does not open a window; it asks the server where to
+point one.**
+
+| frame | | packet |
+|---|---|---|
+| 99 | S->C | `S_ADMIN_GM_SKILL` `09 00 BE 64 00 00 00 00 01` - unprompted, in the enter-world burst, right before `S_LOAD_TOPO` |
+| 402 | S->C | `S_ADMIN_HOLD_CHARACTER` `05 00 0E A3 00` |
+| **405** | **C->S** | **`C_REQUEST_SERVER_ADMINTOOL_AWESOMIUM_URL` `04 00 D9 8B` - four bytes, no body. This is Alt+A.** |
+| **412** | **S->C** | **`S_RESPONSE_SERVER_ADMINTOOL_AWESOMIUM_URL` `0C 00 CE F2 08 00 0A 00 00 00 00 00`** |
+| 524 | C->S | `C_ADMIN_REQUEST_CUSTOM_BOOKMARK` - the panel is open |
+
+The second enter-world repeats it (2445 GM_SKILL, 2741 request, 2747 reply, 2924 first `C_ADMIN_*`),
+so the client asks once per Alt+A and **waits for the answer**.
+
+**TeraSharp never sent that answer.** `C_REQUEST_SERVER_ADMINTOOL_AWESOMIUM_URL` (0x8BD9) was
+registered nowhere and was absent from `ArbiterClientHandlers.ArbiterOwned`, so `PacketDispatcher`
+forwarded it to a World that has no handler for it. The only mention of the reply in the whole
+codebase was an unprompted push in `LoginHandlers`' **standalone (no-World) path** - which is why
+this never showed up in replay testing and always failed live.
+
+### What the reply carries: nothing
+
+`08 00 0A 00 00 00 00 00` is `[u16 off=8][u16 off=10]` then **two empty wide strings**. That server
+had no admin-tool URL configured and the panel opened regardless - so the window is waiting for the
+REPLY, not for its contents. `BuildAdminToolUrl()` sends the empty form (byte-exact against 412);
+pass a URL and it goes in the first slot.
+
+### Two notes, not fixed here
+
+* `S_ADMIN_GM_SKILL` and `S_ADMIN_HOLD_CHARACTER` are pushed at `C_LOAD_TOPO_FIN` to **every
+  player**, with no GM gate (`HandlerRegistry.cs:82-83`, T89). The real server sends neither to a
+  non-GM - they appear in no non-GM capture. Worth gating on `GmAccounts.LevelFor >= 1`.
+* Ordering: the real server pushes `S_ADMIN_GM_SKILL` at frame 99, *before* `S_LOAD_TOPO` (100) and
+  170 frames before `C_LOAD_TOPO_FIN` (271); TeraSharp pushes it after. No capture proves that
+  matters, and the URL reply is sufficient on its own, so this is left alone.
