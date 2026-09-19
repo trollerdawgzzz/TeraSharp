@@ -10055,6 +10055,144 @@ bool   isGuildWarAcceptable
             "frame 3019 - S_REQUEST_JOIN_GUILD_NOTICE carries nothing; arrival IS the message");
     }
 
+
+    // =======================================================================================
+    // T94 - the private-channel packets, pinned against cap_final for the first time.
+    // T43 built all of this from the decompile alone; these are the bytes.
+    // Ground truth: cap_final_client3 938, 963, 965, 4664, 4717; client4 3485, 3967, 4111, 4161.
+    // =======================================================================================
+
+    /// <summary>The four private-channel defs, resolved the way the handlers resolve them.</summary>
+    static DefinitionRegistry CreateT94Defs()
+    {
+        var reg = new DefinitionRegistry(QuietLog());
+        reg.RegisterFromDef("S_REQUEST_PRIVATE_CHANNEL_INFO",
+            ChatPackets.NamedDefs["S_REQUEST_PRIVATE_CHANNEL_INFO"]);
+        reg.RegisterFromDef("S_PRIVATE_CHANNEL_NOTICE",
+            ChatPackets.NamedDefs["S_PRIVATE_CHANNEL_NOTICE"]);
+        reg.RegisterFromDef("S_JOIN_PRIVATE_CHANNEL",
+            ChatPackets.CorrectedDefs["S_JOIN_PRIVATE_CHANNEL"]);
+        reg.RegisterFromDef("S_LEAVE_PRIVATE_CHANNEL", "int32 channelId\n");
+        return reg;
+    }
+
+    /// <summary>
+    /// T94 - S_REQUEST_PRIVATE_CHANNEL_INFO, byte-exact against cap_final_client3 938 and
+    /// client4 3485.
+    ///
+    /// <para><b>The ref slots and the data are in DIFFERENT orders.</b> The def lists
+    /// <c>ref friendList</c> then <c>ref memberList</c>, so the slots come in that order - but
+    /// the array BLOCKS are declared memberList first, and the data follows the blocks. Frame
+    /// 3485 proves it: slot 1 says count 1 at offset 57, slot 2 says count 2 at offset 15, and
+    /// the two-member roster really is the one that sits at 15. A writer that emitted data in
+    /// ref order would swap them and still produce a plausible-looking packet.</para>
+    ///
+    /// <para><b>isMaster is 1 in the defaults reply.</b> Frame 938 answers channelId -1 with
+    /// <c>01</c>, not 0 - "you would be the master of the channel you are about to create".</para>
+    /// </summary>
+    [Test] public static void T94_private_channel_info_matches_cap_final()
+    {
+        var reg = CreateT94Defs();
+        Hex.Eq(WriteByDef(reg, "S_REQUEST_PRIVATE_CHANNEL_INFO",
+                ChatPackets.ChannelInfoFields(true, 1000, new string[0])),
+            "00 00 00 00  00 00 00 00  01  E8 03",
+            "frame 938 - the create dialog's defaults: no members, password 1000, isMaster 1");
+
+        Hex.Eq(WriteByDef(reg, "S_REQUEST_PRIVATE_CHANNEL_INFO", new Dictionary<string, object>
+        {
+            ["isMaster"] = true,
+            ["password"] = (ushort)1234,
+            ["memberList"] = new List<Dictionary<string, object>>
+            {
+                new() { ["charName"] = "dobb" }, new() { ["charName"] = "joinguild" },
+            },
+            ["friendList"] = new List<Dictionary<string, object>>
+            {
+                new()
+                {
+                    ["charName"] = "joinguild", ["userDbId"] = 1004u,
+                    ["userClass"] = 12u, ["level"] = 1u, ["groupId"] = 1u,
+                },
+            },
+        }),
+            "01 00 39 00  02 00 0F 00  01  D2 04  "
+            + "0F 00 1F 00  15 00  64 00 6F 00 62 00 62 00 00 00  "
+            + "1F 00 00 00  25 00  6A 00 6F 00 69 00 6E 00 67 00 75 00 69 00 6C 00 64 00 00 00  "
+            + "39 00 00 00  4F 00  EC 03 00 00  0C 00 00 00  01 00 00 00  01 00 00 00  "
+            + "6A 00 6F 00 69 00 6E 00 67 00 75 00 69 00 6C 00 64 00 00 00",
+            "frame 3485 - two members at 15, one friend at 57, in block order not ref order");
+    }
+
+    /// <summary>
+    /// T94 - S_JOIN_PRIVATE_CHANNEL, byte-exact against cap_final_client3 963 and 4664.
+    ///
+    /// <para><b>userList is empty on the wire, always.</b> Six captured frames - c3 963, 3725,
+    /// 4126, 4664 and c4 3464, 4558 - all carry <c>00 00 00 00</c> there, including 4664 where
+    /// the channel already had two members. T43 filled it from the roster because the def has
+    /// the array; the roster actually travels in S_REQUEST_PRIVATE_CHANNEL_INFO.</para>
+    /// </summary>
+    [Test] public static void T94_join_private_channel_matches_cap_final()
+    {
+        var reg = CreateT94Defs();
+        Hex.Eq(WriteByDef(reg, "S_JOIN_PRIVATE_CHANNEL", ChatPackets.JoinFields(0, 1, "hi")),
+            "00 00 00 00  12 00  00 00 00 00  01 00 00 00  68 00 69 00 00 00",
+            "frame 963 - slot 0, channel 1, name at 18, empty list");
+        Hex.Eq(WriteByDef(reg, "S_JOIN_PRIVATE_CHANNEL", ChatPackets.JoinFields(1, 2, "hii")),
+            "00 00 00 00  12 00  01 00 00 00  02 00 00 00  68 00 69 00 69 00 00 00",
+            "frame 4664 - slot 1 of a channel with two members, and the list is STILL empty");
+    }
+
+    /// <summary>
+    /// T94 - S_PRIVATE_CHANNEL_NOTICE and S_LEAVE_PRIVATE_CHANNEL, byte-exact against
+    /// cap_final_client3 965 and 4717 and client4 4161.
+    /// </summary>
+    [Test] public static void T94_channel_notice_and_leave_match_cap_final()
+    {
+        var reg = CreateT94Defs();
+        Hex.Eq(WriteByDef(reg, "S_PRIVATE_CHANNEL_NOTICE",
+                ChatPackets.NoticeFields(1, ChatManager.NoticeCreated, "")),
+            "0E 00  01 00 00 00  FE 0D 00 00  00 00",
+            "frame 965 - channel 1 created, no name interpolated");
+        Hex.Eq(WriteByDef(reg, "S_PRIVATE_CHANNEL_NOTICE",
+                ChatPackets.NoticeFields(2, ChatManager.NoticeLeft, "New")),
+            "0E 00  02 00 00 00  00 0E 00 00  4E 00 65 00 77 00 00 00",
+            "frame 4161 - New left channel 2");
+        Hex.Eq(WriteByDef(reg, "S_LEAVE_PRIVATE_CHANNEL", ChatPackets.LeaveFields(2)),
+            "02 00 00 00", "frame 4717 - the leaver is told which channel closed");
+    }
+
+    /// <summary>
+    /// T94 - C_EDIT_PRIVATE_CHANNEL parses as C_CREATE_PRIVATE_CHANNEL, byte for byte.
+    ///
+    /// <para>cap_final_client4 3967 is an edit with no invites and 4111 one with a single
+    /// invited UserDbId; client3 962 and client4 3463 are creates with the same two shapes. The
+    /// frame carries NO channel id, which is why the handler finds the channel by asking which
+    /// one the caller masters.</para>
+    /// </summary>
+    [Test] public static void T94_edit_private_channel_shares_the_create_layout()
+    {
+        // frame 3967 body: [u16 count=0][u16 off=0][u16 nameOff=12][u16 password=2345]["hii"]
+        var noInvites = new byte[] { 0x00,0x00, 0x00,0x00, 0x0C,0x00, 0x29,0x09,
+                                     0x68,0x00, 0x69,0x00, 0x69,0x00, 0x00,0x00 };
+        var one = ChatPackets.ParseCCreatePrivateChannel(noInvites);
+        Hex.True(one != null && one.Value.Item1 == "hii" && one.Value.Item2 == 2345
+                 && one.Value.Item3.Count == 0,
+            "frame 3967 - rename to hii, password 2345, nobody invited");
+
+        // frame 4111 body: the same, then one element [u16 here=20][u16 next=0][u32 1003].
+        var withInvite = new byte[] { 0x01,0x00, 0x14,0x00, 0x0C,0x00, 0x29,0x09,
+                                      0x68,0x00, 0x69,0x00, 0x69,0x00, 0x00,0x00,
+                                      0x14,0x00, 0x00,0x00, 0xEB,0x03,0x00,0x00 };
+        var two = ChatPackets.ParseCCreatePrivateChannel(withInvite);
+        Hex.True(two != null && two.Value.Item1 == "hii" && two.Value.Item2 == 2345
+                 && two.Value.Item3.Count == 1 && two.Value.Item3[0] == 1003,
+            "frame 4111 - the same edit, inviting character 1003");
+
+        Hex.True(ChatPackets.C_EDIT_PRIVATE_CHANNEL == 0x7DA0
+                 && ChatPackets.C_CREATE_PRIVATE_CHANNEL == 0xB868,
+            "the two opcodes that share one parser");
+    }
+
     // ---- The rules ----
 
     [Test] public static void T30_system_message_format_matches_the_capture()

@@ -472,3 +472,58 @@ still has to build.
   some channels); the gate's table is not read yet.
 - **Whether `IsExistingUser` and `IsWorldEventTarget` are ever true.** Both go out false. The
   existing `SocialHandlers.OnWhisper` does the same and nobody has complained.
+
+## T94 — the private channels against cap_final
+
+T43 built the whole subsystem from the decompile. cap_final_client3 / _client4 are the first
+bytes, and they confirm every def and correct three values.
+
+| frame | packet | verdict |
+|---|---|---|
+| c3 938 | `S_REQUEST_PRIVATE_CHANNEL_INFO` defaults | **isMaster was wrong** — see below |
+| c4 3485 | `S_REQUEST_PRIVATE_CHANNEL_INFO` with data | def right, **writer order matters** |
+| c3 963, 4664 | `S_JOIN_PRIVATE_CHANNEL` | def right, **userList was wrong** |
+| c3 965, c4 4161 | `S_PRIVATE_CHANNEL_NOTICE` | def right |
+| c3 4717 | `S_LEAVE_PRIVATE_CHANNEL` | right |
+| c4 3967, 4111 | `C_EDIT_PRIVATE_CHANNEL` | shares C_CREATE’s layout; **now handled** |
+
+### T94.1 Ref-slot order and data order are not the same order
+
+`S_REQUEST_PRIVATE_CHANNEL_INFO` declares `ref friendList` then `ref memberList`, but its array
+BLOCKS are declared memberList first. Frame 3485 settles which governs what:
+
+```
+01 00 39 00   slot 1 = friendList : count 1, offset 57
+02 00 0F 00   slot 2 = memberList : count 2, offset 15
+...           data at 15 is the TWO-member roster; data at 57 is the ONE friend
+```
+
+So **the slots follow the `ref` lines and the data follows the array blocks**. A writer that
+emitted data in ref order would swap the two sections and still produce a packet that parses.
+`DefinitionWriter` already does this correctly — it walks its data fields in field order,
+independently of the ref slots — but nothing had ever pinned it, and a hand model written from
+the T78 note ("headers in field-appearance order", which is about the IMPLICIT case) gets it
+wrong. Pinned by `T94_private_channel_info_matches_cap_final`.
+
+### T94.2 Three corrections
+
+* **`isMaster` is 1 in the defaults reply.** The create dialog asks with channelId = -1 and
+  frame 938 answers `00 00 00 00 00 00 00 00 01 E8 03`. T43 sent 0. It reads as "you would be
+  the master of the channel you are about to make".
+* **`S_JOIN_PRIVATE_CHANNEL.userList` is always empty.** All six captured frames (c3 963, 3725,
+  4126, 4664; c4 3464, 4558) carry `00 00 00 00`, including 4664 where the channel already had
+  two members. T43 filled it from the roster because the def has the array. The roster reaches
+  the client through `S_REQUEST_PRIVATE_CHANNEL_INFO` instead, so the parameter is gone.
+* **`C_EDIT_PRIVATE_CHANNEL` (0x7DA0) now has a handler.** It is byte-identical to
+  `C_CREATE_PRIVATE_CHANNEL` and shares its parser — T43 had already noted that. The frame
+  carries **no channel id**, so the target is the channel the caller masters. No reply: frame
+  3967 is answered by silence, and the notices at 4112 / 4161 belong to a member joining and
+  leaving, not to the edit.
+
+### T94.3 Still open
+
+`friendList` is **populated on the wire** (c4 3485 one entry, c4 4105 two) and we still send it
+empty. Its element is `[u16 charNameOff][u32 userDbId][u32 userClass][u32 level][u32 groupId]`
+plus the name, and the def for that is right. Filling it needs the chat layer wired to the
+friend list; what the entries actually select is not settled by these two frames, so nothing is
+invented here.

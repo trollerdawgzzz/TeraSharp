@@ -200,6 +200,7 @@ public sealed class ChatManager
             case ChatPackets.C_WHISPER: return Whisper(a, characterId, body);
             case ChatPackets.C_CHAT: return Chat(a, characterId, body);
             case ChatPackets.C_CREATE_PRIVATE_CHANNEL: return CreateChannel(a, characterId, body);
+            case ChatPackets.C_EDIT_PRIVATE_CHANNEL: return EditChannel(a, characterId, body);
             case ChatPackets.C_JOIN_PRIVATE_CHANNEL: return JoinChannel(a, characterId, body);
             case ChatPackets.C_LEAVE_PRIVATE_CHANNEL: return LeaveChannelPacket(a, characterId, body);
             case ChatPackets.C_KICK_CHANNEL_MEMBER: return KickMember(a, characterId, body);
@@ -339,10 +340,55 @@ public sealed class ChatManager
         // The invite list is VALIDATED (the cap check above) but not acted on: the real Arbiter
         // sends each invitee a prompt, and the packet that carries it is not identified yet -
         // see CHAT-DESIGN.md section 9. Invitees join by name and password like anyone else
-        // until it is. Same for C_EDIT_PRIVATE_CHANNEL, which is why it has no handler here.
+        // until it is. EditChannel below takes the same line with the same list.
         a.ToPlayer(creatorId, "S_PRIVATE_CHANNEL_NOTICE",
             ChatPackets.NoticeFields(channel.Id, NoticeCreated, channel.Name));
         AddMember(a, channel, creatorId);
+        return a;
+    }
+
+    /// <summary>
+    /// C_EDIT_PRIVATE_CHANNEL (0x7DA0) - byte-identical to C_CREATE_PRIVATE_CHANNEL, which is
+    /// why it shares the parser. T94 pinned both against cap_final_client4: frame 3967 is an
+    /// edit with no invites and 4111 one with a single invited UserDbId, and frame 3463 is a
+    /// create with the same shape.
+    ///
+    /// <para><b>The channel is found by the caller, not by the packet.</b> The frame carries
+    /// no channel id at all - only the new name, the new password and the invite list - so the
+    /// target is the channel the caller masters. A caller who masters none has nothing to edit.</para>
+    ///
+    /// <para>No reply is sent. cap_final_client4 3967 is answered by silence; the notices at
+    /// 4112 and 4161 belong to a member joining and leaving, not to the edit.</para>
+    /// </summary>
+    private ArbiterActions EditChannel(ArbiterActions a, int callerId, byte[] body)
+    {
+        var req = ChatPackets.ParseCCreatePrivateChannel(body);
+        if (req == null) return a.Reject("C_EDIT_PRIVATE_CHANNEL: short body");
+        var (name, password, invited) = req.Value;
+
+        PrivateChannel? channel = null;
+        foreach (var c in _channels.Values)
+            if (c.IsMaster(callerId)) { channel = c; break; }
+        if (channel == null) return a.Reject("C_EDIT_PRIVATE_CHANNEL: the caller masters no channel");
+
+        if (name.Length == 0 || name.Length > MaxChannelNameChars)
+            return a.Reject($"C_EDIT_PRIVATE_CHANNEL: name must be 1..{MaxChannelNameChars} characters");
+        if (!string.Equals(name, channel.Name, StringComparison.Ordinal) && _byName.ContainsKey(name))
+            return Sysmsg(a, callerId, MsgChannelNameTaken).Reject($"channel s name to '{name}' is taken");
+        if (invited.Count > MaxMembersPerChannel)
+            return Sysmsg(a, callerId, MsgChannelFull).Reject("too many invitees");
+        if (password < MinPassword || password > MaxPassword)
+            return Sysmsg(a, callerId, MsgBadPassword).Reject($"password {password} is outside 1000..9999");
+
+        if (!string.Equals(name, channel.Name, StringComparison.Ordinal))
+        {
+            _byName.Remove(channel.Name);
+            channel.Name = name;
+            _byName[name] = channel.Id;
+        }
+        channel.Password = password;
+        _log.LogInformation("private channel {Id} renamed to '{Name}' by character {Who}",
+            channel.Id, channel.Name, callerId);
         return a;
     }
 
@@ -387,7 +433,7 @@ public sealed class ChatManager
         channel.EmptySinceMs = 0;
 
         a.ToPlayer(userDbId, "S_JOIN_PRIVATE_CHANNEL",
-            ChatPackets.JoinFields(slot, channel.Id, channel.Name, channel.Members));
+            ChatPackets.JoinFields(slot, channel.Id, channel.Name));
 
         var notice = ChatPackets.NoticeFields(channel.Id, NoticeJoined, NameOf(userDbId));
         foreach (int member in channel.Members)
@@ -529,7 +575,11 @@ public sealed class ChatManager
 
         var channel = Channel(channelId.Value);
         var names = new List<string>();
-        bool isMaster = false;
+        // The create dialog asks with channelId = -1 and the real Arbiter answers isMaster = 1,
+        // not 0: cap_final_client3 frame 938 is 00 00 00 00 00 00 00 00 [01] E8 03. It reads as
+        // "you would be the master of the channel you are about to make", and the dialog uses it
+        // to decide whether the name and password fields are editable.
+        bool isMaster = true;
         ushort password = MinPassword;
         if (channel != null)
         {
@@ -798,20 +848,24 @@ public static class ChatPackets
             ["fromGameId"] = sender.GameId,
         };
 
-    /// <summary>S_JOIN_PRIVATE_CHANNEL (0x81E7), fixed part 0x12: the joiner's SLOT, the real
-    /// channel id, the name, and the member list as `{i32 UserDbId}` elements.</summary>
-    public static Dictionary<string, object> JoinFields(int slot, int channelId, string name, IEnumerable<int> members)
-    {
-        var list = new List<Dictionary<string, object>>();
-        foreach (int m in members) list.Add(new Dictionary<string, object> { ["userDbId"] = m });
-        return new Dictionary<string, object>
+    /// <summary>
+    /// S_JOIN_PRIVATE_CHANNEL (0x81E7), fixed part 0x12: the joiner s SLOT, the real channel
+    /// id, the name, and a member list that is <b>always empty on the wire</b>.
+    ///
+    /// <para>T43 filled <c>userList</c> from the channel s roster because the def has the
+    /// array. T94 checked six captured frames - cap_final_client3 963, 3725, 4126, 4664 and
+    /// client4 3464, 4558 - and every one carries <c>00 00 00 00</c> there, including the ones
+    /// where the channel already had two members. The roster reaches the client through
+    /// S_REQUEST_PRIVATE_CHANNEL_INFO instead, so the parameter is gone rather than ignored.</para>
+    /// </summary>
+    public static Dictionary<string, object> JoinFields(int slot, int channelId, string name)
+        => new()
         {
             ["index"] = slot,
             ["channelId"] = channelId,
             ["name"] = name ?? "",
-            ["userList"] = list,
+            ["userList"] = new List<Dictionary<string, object>>(),
         };
-    }
 
     /// <summary>S_LEAVE_PRIVATE_CHANNEL (0x67AD), fixed part 0x08.</summary>
     public static Dictionary<string, object> LeaveFields(int channelId)
