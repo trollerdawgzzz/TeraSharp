@@ -141,7 +141,7 @@ public sealed class LoginHandlers
     private static void SendContentFlags(GameSession s)
     {
         int[] contents = { 2, 3, 4, 8, 9, 22, 23, 20, 21, 34 };
-        bool[] disabled = { false, false, false, true, true, false, false, false, false, false };
+        bool[] disabled = { false, false, false, false, true, false, false, false, false, false };   // EXPERIMENT: id 8 enabled (was disabled) - looking for the mode-select gate
         for (int i = 0; i < contents.Length; i++)
             s.SendByDef("S_UPDATE_CONTENTS_ON_OFF", new Dictionary<string, object>
             {
