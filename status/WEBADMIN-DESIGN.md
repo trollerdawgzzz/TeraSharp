@@ -330,3 +330,59 @@ for exactly that, so the page shows "not in this phase" instead of looking broke
 doc’s phases 2–3: `kick` and `announce` act on live sessions and need nothing persisted;
 `set-money` / `give-item` are the `WA_CHANGE_MONEY` / `WA_ADD_ITEM` mutations (the latter’s
 262-byte option block is still a task of its own); `ban` / `unban` need the `restrictions` table.
+
+> **Superseded by section 9.** T101b implemented all eight, and closed 8.2's gap: the delete is a
+> soft delete now, so restore *is* `WA_UNDELETE_USER`. What still refuses is phase 3.
+
+## 9. T101b - phase 2
+
+Eight endpoints stopped being refusals, and the delete stopped being a hard delete.
+
+### 9.1 The endpoints
+
+| endpoint | body | answers | retail |
+|---|---|---|---|
+| `POST /api/set-money` | `{id\|name, money, reason}` | `{result, oldMoney, newMoney}` | `WA_CHANGE_MONEY` |
+| `POST /api/set-level` | `{id\|name, level, reason}` | `{result, message}`, 1..`MaxLevel` (70) | - |
+| `POST /api/give-item` | `{id\|name, templateId, amount, reason}` | `{result, itemDbId, slot}` | `WA_ADD_ITEM` |
+| `POST /api/ban` | `{id\|name, hours, reason}` | `{result, until}`, `hours` 0 = permanent | `WA_ADD_CHARACTER_RESTRICTION` |
+| `POST /api/unban` | `{id\|name, reason}` | `{result, message}`, `2` when not banned | `WA_DEL_CHARACTER_RESTRICTION` |
+| `POST /api/kick` | `{id, reason}` | `{result, message}`, `2` when not in world | `WA_FORCE_KICK` |
+| `POST /api/announce` | `{text, reason}` | `{result, sent}` | `WA_INSTANT_INGAME_ANNOUNCE` |
+| `POST /api/gm-level` | `{accountId, level, reason}` | `{result, message}` | - |
+| `GET /api/deleted?limit=` | - | the characters waiting out the window | - |
+
+Result codes are section 2's throughout: `0` ok, `2` not found, `3` invalid, `0x16` refused. Every
+one of them, refusals included, writes an `admin_log` row.
+
+`give-item` does **not** carry the 262-byte option block; section 6 budgets that separately. The
+item lands in the first free slot of inventory 0.
+
+`kick` and `announce` have nothing in the store behind them, so they go through two delegates the
+wiring sets (`AdminApi.KickPlayer`, `AdminApi.Announce`). Unset, `kick` answers `2` rather than
+reporting a disconnect that never happened.
+
+### 9.2 The soft delete - what 8.2 said could not be done
+
+`CharacterHandlers.OnDeleteUser` **schedules** now instead of dropping the row:
+
+* the `characters` row stays, with `delete_at`, `deleted_at` and `deleted_by` stamped - which is
+  what `S_GET_USER_LIST.deleteRemainSec` has been counting down since T76;
+* the character's `items` rows move to `deleted_items` and come back on a restore;
+* `CharacterStore.PurgeExpiredDeletes` hard-deletes past `deleteCharacterExpireHour2` (72 h, from
+  `LoginHandlers`' S_GET_USER_LIST) - it needs a timer in `Program.cs`;
+* `CancelCharacterDelete` (the client's `C_CANCEL_DELETE_USER`) and `POST /api/restore-character`
+  both land on `RestoreDeletedCharacter`, so the two paths cannot drift.
+
+One wrinkle left deliberately: `OnDeleteUser` still does `s.Account.Characters.Remove(chr)`, so the
+character vanishes from the lobby list for the rest of that session and reappears with its
+countdown on the next login. The real client is told the delete succeeded either way.
+
+`DeleteCharacter` gained `DELETE FROM restrictions` in its children list - `restrictions.character_id`
+references `characters(id)` and Microsoft.Data.Sqlite enforces foreign keys, so a purge of a banned
+character would have failed with SQLite error 19 (the same way quests did on 2026-09-14).
+
+### 9.3 What still refuses
+
+`AdminApi.PhaseThreePaths` is down to three: `/api/bulk-mail`, `/api/event`, `/api/festival`.
+Section 6's phase 3.

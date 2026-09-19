@@ -6,18 +6,18 @@ using TeraSharp.Arbiter.Persistence;
 namespace TeraSharp.Arbiter.Web;
 
 // =============================================================================================
-// AdminApi - the admin web tool's JSON surface, T101 phase 1.
+// AdminApi - the admin web tool's JSON surface, T101 phase 1 + T101b phase 2.
 // Feature list and the retail tool it replaces: status/WEBADMIN-DESIGN.md.
 //
 // PURE. Nothing here touches a socket: Handle() takes a method, a path, a query bag and a body,
 // and returns a status and a string. AdminServer is the twenty lines of HttpListener around it,
 // and every test drives this class directly.
 //
-// SCOPE. WEBADMIN-DESIGN.md section 6 calls phase 1 "read-only lookups", and its section 4 table
-// is what TeraSharp can already answer without a new table. That is what is implemented:
-// accounts, character, online, plus the restore the brief adds. The money / item / ban / announce
-// / kick / gm-level endpoints are phase 2 there, and they answer 501 with a result code rather
-// than 404, so the page can show "not in this phase" instead of looking broken.
+// SCOPE. Phase 1 (T101) was WEBADMIN-DESIGN.md section 6's "read-only lookups": accounts,
+// character, online, admin-log. Phase 2 (T101b) is the rest of section 6's second row - money,
+// give-item, ban/unban, kick, announce, gm-level - plus the soft delete that makes restore mean
+// what WA_UNDELETE_USER means. Phase 3 (bulk mail, events, festivals) still answers 501 with a
+// result code rather than 404, so the page shows "not in this phase" instead of looking broken.
 //
 // RESULT CODES. The doc's section 2 catalogue reads them off the real writers: 0 ok, 2 not found,
 // 3 invalid argument, 0x16 refused. The JSON mirrors those rather than inventing a scheme.
@@ -53,14 +53,20 @@ public sealed class AdminApi
         _log = log;
     }
 
+    /// <summary>Disconnect one player. Returns false when they are not online. Set by the
+    /// wiring; unset means kick answers 2 (not found) rather than pretending.</summary>
+    public Func<int, bool>? KickPlayer { get; set; }
+
+    /// <summary>Send a system message to everyone in world. Returns how many got it.</summary>
+    public Func<string, int>? Announce { get; set; }
+
     /// <summary>True when the tool is usable at all. False means TERASHARP_ADMIN_TOKEN is unset.</summary>
     public bool Enabled => _token != null;
 
-    /// <summary>The phase-2 endpoints, answered with a clean refusal so the page can say so.</summary>
-    public static readonly string[] PhaseTwoPaths =
+    /// <summary>Phase 3 - bulk operations and events. Still answered as refusals.</summary>
+    public static readonly string[] PhaseThreePaths =
     {
-        "/api/set-money", "/api/set-level", "/api/give-item",
-        "/api/ban", "/api/unban", "/api/kick", "/api/announce", "/api/gm-level",
+        "/api/bulk-mail", "/api/event", "/api/festival",
     };
 
     // -------------------------------------------------------------------------- entry point
@@ -92,12 +98,23 @@ public sealed class AdminApi
         if (method == "GET" && path == "/api/character") return Character(query);
         if (method == "GET" && path == "/api/online") return Online();
         if (method == "GET" && path == "/api/admin-log") return AdminLog(query);
+        if (method == "GET" && path == "/api/deleted") return Deleted(query);
         if (method == "POST" && path == "/api/restore-character") return RestoreCharacter(body, sourceIp);
 
-        foreach (var p in PhaseTwoPaths)
+        // ---- phase 2 (T101b) ----
+        if (method == "POST" && path == "/api/set-money") return SetMoney(body, sourceIp);
+        if (method == "POST" && path == "/api/set-level") return SetLevel(body, sourceIp);
+        if (method == "POST" && path == "/api/give-item") return GiveItem(body, sourceIp);
+        if (method == "POST" && path == "/api/ban") return Ban(body, sourceIp, true);
+        if (method == "POST" && path == "/api/unban") return Ban(body, sourceIp, false);
+        if (method == "POST" && path == "/api/kick") return Kick(body, sourceIp);
+        if (method == "POST" && path == "/api/announce") return Announcement(body, sourceIp);
+        if (method == "POST" && path == "/api/gm-level") return GmLevel(body, sourceIp);
+
+        foreach (var p in PhaseThreePaths)
             if (path == p)
                 return Json(501, ResultRefused,
-                    $"{path} is phase 2 - see status/WEBADMIN-DESIGN.md section 6");
+                    $"{path} is phase 3 - see status/WEBADMIN-DESIGN.md section 6");
 
         return Json(404, ResultNotFound, "no such endpoint");
     }
@@ -231,14 +248,14 @@ public sealed class AdminApi
     }
 
     /// <summary>
-    /// POST /api/restore-character {"id":N,"reason":"..."} - clears a SCHEDULED delete.
+    /// POST /api/restore-character {"id":N,"reason":"..."} - the retail WA_UNDELETE_USER.
     ///
-    /// <para><b>This is not the retail WA_UNDELETE_USER.</b> That one brings back a character whose
-    /// row is gone, which needs the soft-delete columns and the <c>deleted_items</c> table
-    /// WEBADMIN-DESIGN.md section 4 lists as new. TeraSharp's <c>characters.delete_at</c> (T88) is
-    /// a SCHEDULED delete, and T88 left <c>OnDeleteUser</c> hard-deleting the row - so this can
-    /// only rescue a character inside its grace window, and answers 2 (not found) for anything
-    /// else. Restoring a truly deleted character is phase 2 work with the new tables.</para>
+    /// <para>T101b made this real. T88's <c>OnDeleteUser</c> hard-deleted the row, so phase 1
+    /// could only rescue a character the client had scheduled and not yet confirmed. The delete
+    /// is a SOFT delete now: the row stays, its items wait in <c>deleted_items</c>, and
+    /// <c>CharacterStore.PurgeExpiredDeletes</c> is what finally removes it once
+    /// <c>deleteCharacterExpireHour2</c> (72 h) has run out. So this undoes a real delete for the
+    /// whole window, items included, and answers 2 only once the purge has been through.</para>
     /// </summary>
     private AdminResponse RestoreCharacter(string? body, string? sourceIp)
     {
@@ -250,7 +267,7 @@ public sealed class AdminApi
         if (c == null)
         {
             Log(sourceIp, "restore-character", id.ToString(CultureInfo.InvariantCulture), reason, ResultNotFound);
-            return Json(404, ResultNotFound, "no such character - a hard-deleted row cannot be restored in phase 1");
+            return Json(404, ResultNotFound, "no such character - the purge has already been through");
         }
         if (_store.GetCharacterDeleteAt(id) == 0)
         {
@@ -263,6 +280,170 @@ public sealed class AdminApi
         return ok
             ? Json(200, ResultOk, $"delete cancelled for {c.Name}")
             : Json(500, ResultRefused, "the store refused the cancel");
+    }
+
+    // ------------------------------------------------------------------------- phase 2 (T101b)
+
+    /// <summary>Resolve the target of a write: {"id":N} or {"name":"X"}.</summary>
+    private CharacterRecord? Target(string? body)
+    {
+        int id = (int)(JsonNumber(body, "id") ?? 0);
+        if (id > 0) return _store.GetCharacter(id);
+        string? name = JsonString(body, "name");
+        return string.IsNullOrEmpty(name) ? null : _store.GetCharacterByName(name);
+    }
+
+    /// <summary>POST /api/set-money {"id":N,"money":M,"reason":"..."} - WA_CHANGE_MONEY.</summary>
+    private AdminResponse SetMoney(string? body, string? ip)
+    {
+        var c = Target(body);
+        string reason = JsonString(body, "reason") ?? string.Empty;
+        if (c == null) { Log(ip, "set-money", "?", reason, ResultNotFound); return Json(404, ResultNotFound, "no such character"); }
+        double? m = JsonNumber(body, "money");
+        if (m == null || m < 0) { Log(ip, "set-money", c.Name, reason, ResultInvalid); return Json(400, ResultInvalid, "money must be >= 0"); }
+
+        long old = _store.GetCharacterMoney(c.Id);
+        long now = _store.SetCharacterMoney(c.Id, (long)m.Value);
+        Log(ip, "set-money", c.Name, reason, ResultOk);
+        // The retail reply carries both figures (WEBADMIN-DESIGN.md section 2), so this does too.
+        return new AdminResponse(200, "application/json; charset=utf-8",
+            "{\"result\":" + ResultOk + ",\"oldMoney\":" + old + ",\"newMoney\":" + now + "}");
+    }
+
+    /// <summary>The level ceiling the tool will set. Retail caps at 70 in this build.</summary>
+    public const int MaxLevel = 70;
+
+    /// <summary>POST /api/set-level {"id":N,"level":L,"reason":"..."}.</summary>
+    private AdminResponse SetLevel(string? body, string? ip)
+    {
+        var c = Target(body);
+        string reason = JsonString(body, "reason") ?? string.Empty;
+        if (c == null) { Log(ip, "set-level", "?", reason, ResultNotFound); return Json(404, ResultNotFound, "no such character"); }
+        double? l = JsonNumber(body, "level");
+        if (l == null || l < 1 || l > MaxLevel) { Log(ip, "set-level", c.Name, reason, ResultInvalid); return Json(400, ResultInvalid, $"level must be 1..{MaxLevel}"); }
+
+        bool ok = _store.UpdateLevelAndExp(c.Id, (int)l.Value, c.Exp);
+        Log(ip, "set-level", c.Name, reason, ok ? ResultOk : ResultRefused);
+        return ok ? Json(200, ResultOk, $"{c.Name} is level {(int)l.Value}")
+                  : Json(500, ResultRefused, "the store refused the update");
+    }
+
+    /// <summary>
+    /// POST /api/give-item {"id":N,"templateId":T,"amount":A,"reason":"..."} - WA_ADD_ITEM,
+    /// minus the 262-byte option block. WEBADMIN-DESIGN.md section 6 budgets that block its own
+    /// task; a plain template and amount is what the tool needs for a make-good.
+    /// </summary>
+    private AdminResponse GiveItem(string? body, string? ip)
+    {
+        var c = Target(body);
+        string reason = JsonString(body, "reason") ?? string.Empty;
+        if (c == null) { Log(ip, "give-item", "?", reason, ResultNotFound); return Json(404, ResultNotFound, "no such character"); }
+        int template = (int)(JsonNumber(body, "templateId") ?? 0);
+        long amount = (long)(JsonNumber(body, "amount") ?? 1);
+        if (template <= 0 || amount <= 0)
+        { Log(ip, "give-item", c.Name, reason, ResultInvalid); return Json(400, ResultInvalid, "templateId and amount must be positive"); }
+
+        int itemId = _store.NextItemId();
+        int slot = NextFreeSlot(c.Id);
+        _store.UpsertItem(itemId, c.Id, 0, slot, template, amount);
+        Log(ip, "give-item", c.Name, reason, ResultOk);
+        return new AdminResponse(200, "application/json; charset=utf-8",
+            "{\"result\":" + ResultOk + ",\"itemDbId\":" + itemId + ",\"slot\":" + slot + "}");
+    }
+
+    private int NextFreeSlot(long ownerDbId)
+    {
+        int slot = 0;
+        foreach (var it in _store.GetItems(ownerDbId, 0)) if (it.Slot >= slot) slot = it.Slot + 1;
+        return slot;
+    }
+
+    /// <summary>
+    /// POST /api/ban and /api/unban {"id":N,"hours":H,"reason":"..."} - the retail
+    /// WA_ADD/DEL_CHARACTER_RESTRICTION pair. <c>hours</c> 0 is permanent.
+    /// </summary>
+    private AdminResponse Ban(string? body, string? ip, bool add)
+    {
+        string what = add ? "ban" : "unban";
+        var c = Target(body);
+        string reason = JsonString(body, "reason") ?? string.Empty;
+        if (c == null) { Log(ip, what, "?", reason, ResultNotFound); return Json(404, ResultNotFound, "no such character"); }
+
+        long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        if (!add)
+        {
+            bool lifted = _store.RemoveRestriction(c.Id, CharacterStore.RestrictionBan);
+            Log(ip, what, c.Name, reason, lifted ? ResultOk : ResultNotFound);
+            return lifted ? Json(200, ResultOk, $"{c.Name} is unbanned")
+                          : Json(404, ResultNotFound, "that character is not banned");
+        }
+        double hours = JsonNumber(body, "hours") ?? 0;
+        if (hours < 0) { Log(ip, what, c.Name, reason, ResultInvalid); return Json(400, ResultInvalid, "hours must be >= 0"); }
+        long until = hours <= 0 ? 0 : now + (long)(hours * 3600);
+        bool ok = _store.AddRestriction(c.Id, CharacterStore.RestrictionBan, 1, until, reason, now);
+        Log(ip, what, c.Name, reason, ok ? ResultOk : ResultRefused);
+        return new AdminResponse(200, "application/json; charset=utf-8",
+            "{\"result\":" + (ok ? ResultOk : ResultRefused) + ",\"until\":" + until + "}");
+    }
+
+    /// <summary>POST /api/kick {"id":N,"reason":"..."} - WA_FORCE_KICK, live sessions only.</summary>
+    private AdminResponse Kick(string? body, string? ip)
+    {
+        int id = (int)(JsonNumber(body, "id") ?? 0);
+        string reason = JsonString(body, "reason") ?? string.Empty;
+        if (id <= 0) return Json(400, ResultInvalid, "id is required");
+        bool ok = KickPlayer?.Invoke(id) ?? false;
+        Log(ip, "kick", id.ToString(CultureInfo.InvariantCulture), reason, ok ? ResultOk : ResultNotFound);
+        return ok ? Json(200, ResultOk, "disconnected")
+                  : Json(404, ResultNotFound, "that player is not online");
+    }
+
+    /// <summary>POST /api/announce {"text":"...","reason":"..."} - WA_INSTANT_INGAME_ANNOUNCE.</summary>
+    private AdminResponse Announcement(string? body, string? ip)
+    {
+        string text = JsonString(body, "text") ?? string.Empty;
+        string reason = JsonString(body, "reason") ?? string.Empty;
+        if (text.Length == 0) return Json(400, ResultInvalid, "text is required");
+        int sent = Announce?.Invoke(text) ?? 0;
+        Log(ip, "announce", text.Length > 40 ? text[..40] : text, reason, ResultOk);
+        return new AdminResponse(200, "application/json; charset=utf-8",
+            "{\"result\":" + ResultOk + ",\"sent\":" + sent + "}");
+    }
+
+    /// <summary>POST /api/gm-level {"accountId":N,"level":L,"reason":"..."}.</summary>
+    private AdminResponse GmLevel(string? body, string? ip)
+    {
+        long accountId = (long)(JsonNumber(body, "accountId") ?? 0);
+        string reason = JsonString(body, "reason") ?? string.Empty;
+        double? level = JsonNumber(body, "level");
+        if (accountId <= 0 || level == null || level < 0)
+            return Json(400, ResultInvalid, "accountId and a level >= 0 are required");
+        var acct = _store.GetAccountById(accountId);
+        if (acct == null) { Log(ip, "gm-level", accountId.ToString(CultureInfo.InvariantCulture), reason, ResultNotFound); return Json(404, ResultNotFound, "no such account"); }
+
+        bool ok = _store.SetAdminLevel(accountId, (int)level.Value);
+        Log(ip, "gm-level", acct.Name, reason, ok ? ResultOk : ResultRefused);
+        return ok ? Json(200, ResultOk, $"{acct.Name} is admin level {(int)level.Value}")
+                  : Json(500, ResultRefused, "the store refused the update");
+    }
+
+    /// <summary>GET /api/deleted - characters waiting out the 72 h window.</summary>
+    private AdminResponse Deleted(IReadOnlyDictionary<string, string> q)
+    {
+        int limit = 50;
+        string? l = Get(q, "limit");
+        if (l != null && int.TryParse(l, NumberStyles.Integer, CultureInfo.InvariantCulture, out int n))
+            limit = n < 1 ? 1 : (n > 200 ? 200 : n);
+        var rows = _store.GetDeletedCharacters(limit);
+        var sb = new StringBuilder();
+        sb.Append("{\"result\":").Append(ResultOk).Append(",\"deleted\":[");
+        for (int i = 0; i < rows.Count; i++)
+        {
+            if (i > 0) sb.Append(',');
+            sb.Append(CharacterBrief(rows[i]));
+        }
+        sb.Append("]}");
+        return new AdminResponse(200, "application/json; charset=utf-8", sb.ToString());
     }
 
     private void Log(string? ip, string action, string target, string reason, int result)

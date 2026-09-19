@@ -553,7 +553,15 @@ public sealed class CharacterHandlers
             return true;
         }
 
-        bool deleted = Program.Store?.DeleteCharacter(charId, (long)s.Account.AccountId) ?? false;
+        // T101b: SCHEDULE the delete instead of dropping the row. The character stays listed
+        // for the whole window - which is what S_GET_USER_LIST.deleteRemainSec reports, and
+        // what makes C_CANCEL_DELETE_USER and the admin tool s restore mean anything - and
+        // CharacterStore.PurgeExpiredDeletes removes it once deleteCharacterExpireHour2 (72 h,
+        // LoginHandlers) has run out. T88 left this as a hard delete; this is that gap closed.
+        long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        long deleteAt = now + (long)CharacterStore.DeleteExpireHours * 3600L;
+        bool deleted = Program.Store?.SoftDeleteCharacter(
+            charId, (long)s.Account.AccountId, chr.Name, deleteAt, now) ?? false;
         if (!deleted)
         {
             _log.LogWarning("C_DELETE_USER from {Id}: store refused delete of {CId}", s.Id, charId);

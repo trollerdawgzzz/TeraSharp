@@ -6,7 +6,7 @@ using TeraSharp.Arbiter.Persistence;
 namespace TeraSharp.Arbiter.Web;
 
 // =============================================================================================
-// AdminServer - the HttpListener shell around AdminApi. T101 phase 1.
+// AdminServer - the HttpListener shell around AdminApi. T101 phase 1, T101b phase 2.
 //
 // Everything that decides anything lives in AdminApi; this file only moves bytes. It binds
 // 127.0.0.1 ONLY - never + or *, which would make the tool reachable from the network - and it
@@ -173,7 +173,7 @@ public static class AdminPage
 <body>
 <main>
   <h1>TeraSharp admin</h1>
-  <p class='sub'>Phase 1 - read-only lookups and restore. 127.0.0.1 only.</p>
+  <p class='sub'>Phases 1 and 2 - lookups, restore, and the character edits. 127.0.0.1 only.</p>
 
   <section>
     <h2>Token</h2>
@@ -210,15 +210,70 @@ public static class AdminPage
   </section>
 
   <section>
-    <h2>Restore a scheduled delete</h2>
+    <h2>Deleted characters</h2>
     <div class='row'>
+      <button onclick='go(5)'>List</button>
       <input id='rid' placeholder='character id' size='12'>
       <input id='reason' placeholder='reason' size='24'>
       <button onclick='go(3)'>Restore</button>
     </div>
-    <div class='note'>Clears a pending delete inside its grace window. A character whose row is
-    already gone needs the phase-2 soft-delete tables.</div>
+    <div class='note'>A delete is a soft delete: the row and its items wait out
+    deleteCharacterExpireHour2 (72 h) before the purge takes them. Restore inside the window
+    brings the items back too.</div>
+    <pre id='out5'>-</pre>
     <pre id='out3'>-</pre>
+  </section>
+
+  <section>
+    <h2>Edit a character</h2>
+    <div class='row'>
+      <input id='tid' placeholder='character id' size='12'>
+      <input id='treason' placeholder='reason' size='20'>
+    </div>
+    <div class='row' style='margin-top:8px'>
+      <input id='money' placeholder='money' size='12'>
+      <button onclick='go(6)'>Set money</button>
+      <input id='lvl' placeholder='level 1-70' size='10'>
+      <button onclick='go(7)'>Set level</button>
+    </div>
+    <div class='row' style='margin-top:8px'>
+      <input id='tpl' placeholder='item template id' size='16'>
+      <input id='amt' placeholder='amount' size='8'>
+      <button onclick='go(8)'>Give item</button>
+    </div>
+    <pre id='out6'>-</pre>
+  </section>
+
+  <section>
+    <h2>Restrictions and sessions</h2>
+    <div class='row'>
+      <input id='bid' placeholder='character id' size='12'>
+      <input id='bhours' placeholder='hours (0 = forever)' size='18'>
+      <input id='breason' placeholder='reason' size='20'>
+      <button onclick='go(9)'>Ban</button>
+      <button onclick='go(10)'>Unban</button>
+      <button onclick='go(11)'>Kick</button>
+    </div>
+    <pre id='out9'>-</pre>
+  </section>
+
+  <section>
+    <h2>Announce</h2>
+    <div class='row'>
+      <input id='atext' placeholder='message to everyone in world' size='40'>
+      <button onclick='go(12)'>Send</button>
+    </div>
+    <pre id='out12'>-</pre>
+  </section>
+
+  <section>
+    <h2>GM level</h2>
+    <div class='row'>
+      <input id='gaid' placeholder='account id' size='12'>
+      <input id='glvl' placeholder='admin level' size='12'>
+      <button onclick='go(13)'>Set</button>
+    </div>
+    <pre id='out13'>-</pre>
   </section>
 
   <section>
@@ -241,8 +296,12 @@ async function call(method, path, body) {
   return r.status + '\n' + text;
 }
 
+function num(id) { return parseInt(document.getElementById(id).value, 10) || 0; }
+
 async function go(n) {
-  const out = document.getElementById('out' + n);
+  // every control in a section writes into that section's one pre
+  const slot = n >= 6 && n <= 8 ? 6 : (n >= 9 && n <= 11 ? 9 : n);
+  const out = document.getElementById('out' + slot);
   out.textContent = 'working...';
   try {
     if (n === 0) out.textContent = await call('GET', '/api/accounts?q=' + encodeURIComponent(document.getElementById('q').value));
@@ -258,6 +317,22 @@ async function go(n) {
       reason: document.getElementById('reason').value
     });
     if (n === 4) out.textContent = await call('GET', '/api/admin-log?limit=100');
+    if (n === 5) out.textContent = await call('GET', '/api/deleted');
+    if (n >= 6 && n <= 8) {
+      const t = { id: num('tid'), reason: document.getElementById('treason').value };
+      if (n === 6) { t.money = num('money'); out.textContent = await call('POST', '/api/set-money', t); }
+      if (n === 7) { t.level = num('lvl'); out.textContent = await call('POST', '/api/set-level', t); }
+      if (n === 8) { t.templateId = num('tpl'); t.amount = num('amt') || 1;
+                     out.textContent = await call('POST', '/api/give-item', t); }
+    }
+    if (n >= 9 && n <= 11) {
+      const t = { id: num('bid'), hours: num('bhours'), reason: document.getElementById('breason').value };
+      const where = n === 9 ? '/api/ban' : (n === 10 ? '/api/unban' : '/api/kick');
+      out.textContent = await call('POST', where, t);
+    }
+    if (n === 12) out.textContent = await call('POST', '/api/announce', { text: document.getElementById('atext').value });
+    if (n === 13) out.textContent = await call('POST', '/api/gm-level',
+      { accountId: num('gaid'), level: num('glvl') });
   } catch (e) { out.textContent = 'error: ' + e; }
 }
 </script>

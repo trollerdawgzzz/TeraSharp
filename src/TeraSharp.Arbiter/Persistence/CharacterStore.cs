@@ -976,6 +976,31 @@ CREATE INDEX IF NOT EXISTS ix_guild_members_guild ON guild_members(guild_id);
 -- T101: every write the admin web tool makes. WEBADMIN-DESIGN.md section 2 notes that the
 -- retail tool logs only a free-text reason and never stamps WHO did it; this keeps the source
 -- IP and the result code as well, which is strictly more than the original had.
+-- T101b: character restrictions (bans and mutes). WEBADMIN-DESIGN.md section 4 lists this as
+-- one of the four new tables; the retail shape is (character, type, level, until, reason).
+CREATE TABLE IF NOT EXISTS restrictions (
+  character_id INTEGER NOT NULL REFERENCES characters(id),
+  type         INTEGER NOT NULL,            -- 1 ban, 2 mute
+  level        INTEGER NOT NULL DEFAULT 0,
+  until        INTEGER NOT NULL DEFAULT 0,  -- unix seconds; 0 = permanent
+  reason       TEXT    NOT NULL DEFAULT (''),
+  set_at       INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (character_id, type)
+);
+
+-- T101b: where a soft-deleted character s items wait out the grace window, so a restore can
+-- put them back. The retail tool calls this DeletedItemData.
+CREATE TABLE IF NOT EXISTS deleted_items (
+  item_db_id   INTEGER PRIMARY KEY,
+  character_id INTEGER NOT NULL,
+  inven_type   INTEGER NOT NULL DEFAULT 0,
+  slot         INTEGER NOT NULL DEFAULT 0,
+  template_id  INTEGER NOT NULL DEFAULT 0,
+  amount       INTEGER NOT NULL DEFAULT 0,
+  record       BLOB,
+  deleted_at   INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS admin_log (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   at         INTEGER NOT NULL,            -- unix seconds
@@ -1275,6 +1300,10 @@ CREATE TABLE IF NOT EXISTS watched_movies (
         AddColumnIfMissing("characters", "delete_at", "INTEGER NOT NULL DEFAULT 0");
         // T90: the guild-incentive cooldown Guild::CanGiveGuildMoneyIncentive checks.
         AddColumnIfMissing("guilds", "last_incentive_at", "INTEGER NOT NULL DEFAULT 0");
+        // T101b: the soft delete. delete_at (T88) is WHEN the row goes; these two are the
+        // audit half - that it went, and who sent it there.
+        AddColumnIfMissing("characters", "deleted_at", "INTEGER NOT NULL DEFAULT 0");
+        AddColumnIfMissing("characters", "deleted_by", "TEXT NOT NULL DEFAULT ('')");
         AddColumnIfMissing("characters", "return_zone", "INTEGER NOT NULL DEFAULT 0");
         AddColumnIfMissing("characters", "return_x", "REAL NOT NULL DEFAULT 0");
         AddColumnIfMissing("characters", "return_y", "REAL NOT NULL DEFAULT 0");
@@ -2879,11 +2908,16 @@ SELECT last_insert_rowid();";
         {
             using var cmd = _db.CreateCommand();
             cmd.CommandText =
-                "UPDATE characters SET delete_at=0 WHERE id=$id AND account_id=$a AND delete_at<>0";
+                "SELECT 1 FROM characters WHERE id=$id AND account_id=$a AND delete_at<>0";
             cmd.Parameters.AddWithValue("$id", id);
             cmd.Parameters.AddWithValue("$a", accountId);
-            return cmd.ExecuteNonQuery() == 1;
+            if (cmd.ExecuteScalar() == null) return false;
         }
+        // T101b: the delete is a SOFT delete now - OnDeleteUser parks the items rather than
+        // dropping them - so clearing delete_at on its own would bring the character back
+        // empty-handed. RestoreDeletedCharacter undoes both halves, and the admin tool's
+        // restore lands on it through here as well.
+        return RestoreDeletedCharacter(id);
     }
 
     /// <summary>The unix second this character is due to be removed, or 0 when none is set.</summary>
@@ -2935,7 +2969,8 @@ DELETE FROM client_settings   WHERE character_id = $id;
 DELETE FROM guild_applies     WHERE user_db_id = $id;
 DELETE FROM guild_wanted      WHERE user_db_id = $id;
 DELETE FROM guild_invites     WHERE user_db_id = $id;
-DELETE FROM guild_members     WHERE user_db_id = $id;";
+DELETE FROM guild_members     WHERE user_db_id = $id;
+DELETE FROM restrictions      WHERE character_id = $id;";
             kids.Parameters.AddWithValue("$id", id);
             kids.ExecuteNonQuery();
 
@@ -3941,6 +3976,225 @@ DELETE FROM guild_members     WHERE user_db_id = $id;";
 
     /// <summary>The guild a character belongs to, or 0. User+0x1b54 in the real Arbiter.</summary>
     public int GetGuildIdOf(int userDbId) => GetGuildMember(userDbId)?.GuildId ?? 0;
+
+    // -------------------------------------------------------- T101b: restrictions
+
+    /// <summary>Restriction types. The retail catalogue has more; these are the two the tool sets.</summary>
+    public const int RestrictionBan = 1, RestrictionMute = 2;
+
+    /// <summary>One restriction on one character.</summary>
+    public sealed record RestrictionRow(int CharacterId, int Type, int Level, long Until,
+        string Reason, long SetAt);
+
+    /// <summary>Place or replace a restriction. <paramref name="until"/> 0 is permanent.</summary>
+    public bool AddRestriction(int characterId, int type, int level, long until, string reason, long setAt)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "INSERT INTO restrictions(character_id, type, level, until, reason, set_at) " +
+                "VALUES($c,$t,$l,$u,$r,$s) ON CONFLICT(character_id, type) DO UPDATE SET " +
+                "level=excluded.level, until=excluded.until, reason=excluded.reason, set_at=excluded.set_at";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            cmd.Parameters.AddWithValue("$t", type);
+            cmd.Parameters.AddWithValue("$l", level);
+            cmd.Parameters.AddWithValue("$u", until);
+            cmd.Parameters.AddWithValue("$r", reason ?? string.Empty);
+            cmd.Parameters.AddWithValue("$s", setAt);
+            return cmd.ExecuteNonQuery() >= 1;
+        }
+    }
+
+    /// <summary>Lift one restriction. False when there was none.</summary>
+    public bool RemoveRestriction(int characterId, int type)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "DELETE FROM restrictions WHERE character_id=$c AND type=$t";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            cmd.Parameters.AddWithValue("$t", type);
+            return cmd.ExecuteNonQuery() == 1;
+        }
+    }
+
+    /// <summary>Every restriction on this character, in type order.</summary>
+    public List<RestrictionRow> GetRestrictions(int characterId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "SELECT character_id, type, level, until, reason, set_at FROM restrictions " +
+                "WHERE character_id=$c ORDER BY type";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            var rows = new List<RestrictionRow>();
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                rows.Add(new RestrictionRow(r.GetInt32(0), r.GetInt32(1), r.GetInt32(2),
+                    r.GetInt64(3), r.GetString(4), r.GetInt64(5)));
+            return rows;
+        }
+    }
+
+    /// <summary>Is this character banned right now? An expired <c>until</c> does not count.</summary>
+    public bool IsRestricted(int characterId, int type, long nowUnix)
+    {
+        foreach (var r in GetRestrictions(characterId))
+            if (r.Type == type && (r.Until == 0 || r.Until > nowUnix)) return true;
+        return false;
+    }
+
+    // -------------------------------------------------------- T101b: the soft delete
+
+    /// <summary>The retail grace window, <c>deleteCharacterExpireHour2</c> in S_GET_USER_LIST.</summary>
+    public const int DeleteExpireHours = 72;
+
+    /// <summary>
+    /// Schedule a delete and park the character s items, instead of dropping the row. The row
+    /// stays listed for the whole window - that is what <c>deleteRemainSec</c> reports - and
+    /// <see cref="PurgeExpiredDeletes"/> is what finally removes it.
+    /// </summary>
+    public bool SoftDeleteCharacter(int id, long accountId, string byWhom, long deleteAtUnix, long nowUnix)
+    {
+        lock (_lock)
+        {
+            using var tx = _db.BeginTransaction();
+            using (var own = _db.CreateCommand())
+            {
+                own.Transaction = tx;
+                own.CommandText = "SELECT 1 FROM characters WHERE id=$id AND account_id=$a";
+                own.Parameters.AddWithValue("$id", id);
+                own.Parameters.AddWithValue("$a", accountId);
+                if (own.ExecuteScalar() == null) { tx.Rollback(); return false; }
+            }
+            using (var park = _db.CreateCommand())
+            {
+                park.Transaction = tx;
+                park.CommandText =
+                    "INSERT OR REPLACE INTO deleted_items(item_db_id, character_id, inven_type, slot, " +
+                    "template_id, amount, record, deleted_at) " +
+                    "SELECT item_db_id, owner_db_id, inven_type, slot, template_id, amount, record, $n " +
+                    "FROM items WHERE owner_db_id=$id";
+                park.Parameters.AddWithValue("$id", id);
+                park.Parameters.AddWithValue("$n", nowUnix);
+                park.ExecuteNonQuery();
+            }
+            using (var drop = _db.CreateCommand())
+            {
+                drop.Transaction = tx;
+                drop.CommandText = "DELETE FROM items WHERE owner_db_id=$id";
+                drop.Parameters.AddWithValue("$id", id);
+                drop.ExecuteNonQuery();
+            }
+            using (var stamp = _db.CreateCommand())
+            {
+                stamp.Transaction = tx;
+                stamp.CommandText =
+                    "UPDATE characters SET delete_at=$d, deleted_at=$n, deleted_by=$w WHERE id=$id";
+                stamp.Parameters.AddWithValue("$d", deleteAtUnix);
+                stamp.Parameters.AddWithValue("$n", nowUnix);
+                stamp.Parameters.AddWithValue("$w", byWhom ?? string.Empty);
+                stamp.Parameters.AddWithValue("$id", id);
+                if (stamp.ExecuteNonQuery() != 1) { tx.Rollback(); return false; }
+            }
+            tx.Commit();
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Undo a soft delete: clear the stamps and put the parked items back. This is the retail
+    /// WA_UNDELETE_USER, and it works for the whole window rather than only before the client
+    /// confirms - which is what T101 phase 1 could not do.
+    /// </summary>
+    public bool RestoreDeletedCharacter(int id)
+    {
+        lock (_lock)
+        {
+            using var tx = _db.BeginTransaction();
+            using (var back = _db.CreateCommand())
+            {
+                back.Transaction = tx;
+                back.CommandText =
+                    "INSERT OR REPLACE INTO items(item_db_id, owner_db_id, inven_type, slot, " +
+                    "template_id, amount, record, updated_at) " +
+                    "SELECT item_db_id, character_id, inven_type, slot, template_id, amount, record, " +
+                    "datetime('now') FROM deleted_items WHERE character_id=$id";
+                back.Parameters.AddWithValue("$id", id);
+                back.ExecuteNonQuery();
+            }
+            using (var clear = _db.CreateCommand())
+            {
+                clear.Transaction = tx;
+                clear.CommandText = "DELETE FROM deleted_items WHERE character_id=$id";
+                clear.Parameters.AddWithValue("$id", id);
+                clear.ExecuteNonQuery();
+            }
+            using (var stamp = _db.CreateCommand())
+            {
+                stamp.Transaction = tx;
+                stamp.CommandText =
+                    "UPDATE characters SET delete_at=0, deleted_at=0, deleted_by='' WHERE id=$id";
+                stamp.Parameters.AddWithValue("$id", id);
+                if (stamp.ExecuteNonQuery() != 1) { tx.Rollback(); return false; }
+            }
+            tx.Commit();
+            return true;
+        }
+    }
+
+    /// <summary>Characters waiting out their window, newest first.</summary>
+    public List<CharacterRecord> GetDeletedCharacters(int limit)
+    {
+        if (limit < 1) limit = 1;
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT id FROM characters WHERE deleted_at <> 0 ORDER BY deleted_at DESC LIMIT $n";
+            cmd.Parameters.AddWithValue("$n", limit);
+            var ids = new List<int>();
+            using (var r = cmd.ExecuteReader()) while (r.Read()) ids.Add(r.GetInt32(0));
+            var rows = new List<CharacterRecord>();
+            foreach (int id in ids) { var c = GetCharacter(id); if (c != null) rows.Add(c); }
+            return rows;
+        }
+    }
+
+    /// <summary>
+    /// Hard-delete everything whose window has run out. Returns how many went. Called on a
+    /// timer; <paramref name="expireHours"/> is <see cref="DeleteExpireHours"/> unless a test
+    /// wants to move it.
+    /// </summary>
+    public int PurgeExpiredDeletes(long nowUnix, int expireHours = DeleteExpireHours)
+    {
+        long cutoff = nowUnix - (long)expireHours * 3600L;
+        List<int> doomed = new();
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT id FROM characters WHERE deleted_at <> 0 AND deleted_at <= $c";
+            cmd.Parameters.AddWithValue("$c", cutoff);
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) doomed.Add(r.GetInt32(0));
+        }
+        int gone = 0;
+        foreach (int id in doomed)
+        {
+            lock (_lock)
+            {
+                using var drop = _db.CreateCommand();
+                drop.CommandText = "DELETE FROM deleted_items WHERE character_id=$id";
+                drop.Parameters.AddWithValue("$id", id);
+                drop.ExecuteNonQuery();
+            }
+            var c = GetCharacter(id);
+            if (c != null && DeleteCharacter(id, c.AccountId)) gone++;
+        }
+        if (gone > 0) _log.LogInformation("purged {N} character(s) past the {H} h delete window", gone, expireHours);
+        return gone;
+    }
 
     // ------------------------------------------------------------ T101: the admin web tool
 
