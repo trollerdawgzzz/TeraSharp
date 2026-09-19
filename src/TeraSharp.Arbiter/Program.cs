@@ -108,6 +108,11 @@ public static class Program
 
         var endpoint = new IPEndPoint(IPAddress.Parse(BindAddress), BindPort);
         var server = new TcpServer(endpoint, dispatcher, opcodes, defs, ProtocolVersion, MajorPatchVersion, loggerFactory);
+        // T101: admin web (loopback only, TERASHARP_ADMIN_TOKEN required; null when unset)
+        using var admin = TeraSharp.Arbiter.Web.AdminServer.TryStart(Store, () => (World?.InWorldSessions() ?? new List<GameSession>())
+            .Select(s => new TeraSharp.Arbiter.Web.AdminOnlineRow((int)(s.SelectedCharacter?.Id ?? 0),
+                s.SelectedCharacter?.Name ?? "", s.SelectedCharacter?.Level ?? 0,
+                s.SelectedCharacter?.Zone ?? 0, s.Account.Name)).ToList(), log);
 
         using var cts = new CancellationTokenSource();
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; log.LogInformation("Shutdown requested"); cts.Cancel(); };

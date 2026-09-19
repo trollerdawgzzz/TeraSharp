@@ -178,7 +178,7 @@ public sealed class AdminApi
             sb.Append("{\"itemDbId\":").Append(it.ItemDbId)
               .Append(",\"templateId\":").Append(it.TemplateId)
               .Append(",\"slot\":").Append(it.Slot)
-              .Append(",\"count\":").Append(it.Count).Append('}');
+              .Append(",\"count\":").Append(it.Amount).Append('}');
         }
         sb.Append("]}");
         return new AdminResponse(200, "application/json; charset=utf-8", sb.ToString());
