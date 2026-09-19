@@ -618,3 +618,36 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   1953 hp at level 1, 85956 at 70. **Exp is deliberately not stamped**: /@perfect_level leaves it
   at the level's base, the level-1 and level-70 blobs of the same character differ in 640 runs, and
   none reads as a total-exp counter, so guessing an offset would overwrite hp or mp.
+
+- T108 (multi-world step 2, status/MULTIWORLD-DESIGN.md section 7): the enter-dungeon handshake
+  is **routed** instead of echoed. New `World/WorldInstances.cs` holds the instance registry
+  (`DungeonChannels`: `(ContinentId, ChannelId) -> WorldId`, fed by `SA_ADD_DUNGEON_CHANNEL`
+  0x13C5 and emptied by 0x13C6 - both were falling through to a replay table that has nothing
+  for them), the in-flight `PDId -> asking World` map, and `DungeonRouting`, which sends 0x13BF
+  to the World that owns the requested continent and 0x13C1 back to the World the user is still
+  in. `WorldRuntime` (in `World/WorldRegistration.cs`) is the per-World `IsReady` + game-id
+  counter + one-shot `MarkReady` that `DbProxy.OnWorldReady` hangs off.
+
+  Pinned this task: 0x13C5 is `[i32 ContinentId][i32 ChannelId][24 B DungeonOwnerInfo]`, min
+  payload 32 (the owner struct is memcpy'd with its padding, which is why the frame is 0x26 and
+  not 0x23); 0x13C6 is the first eight bytes of that, min payload 8. The routing key is
+  `DungeonEnterContext[0]` = payload 8, the value `Handler_SA_REQUEST_ENTER_DUNGEON` hands its
+  own continent-to-World lookup. `Handler_SA_RESPONSE_ENTER_DUNGEON` finds the user from the
+  PDId's HIGH 32 bits and answers on that user's **own** World session - so the responder is not
+  the recipient, which is invisible with one World and wrong with two.
+
+  **Single-World is unchanged by construction**, not by care: both tables start empty and the two
+  `WorldRouting` hooks start null, so every decision resolves to the link the frame arrived on -
+  the same `link.SendFrame` as before. The T10 capture tests are untouched and
+  `T108_with_one_world_the_dungeon_handshake_is_unchanged` re-pins them with a channel registered.
+
+  **Not built, with the reason**: nothing *allocates* an instance. Routing can only find a World
+  that has already announced a channel or is configured for the continent, so the first entry into
+  a continent no World owns still goes to the asking World. The real allocator reads the per-World
+  load feed (0x164C/0x164D), which is dropped today, and section 5's capture has not been taken.
+
+  **Not wired yet** - `World/WorldBridge.cs` is human-owned, and this is now a **cumulative**
+  patch: the T103 diff was never applied, so the T108 report carries both (per-World link sets,
+  `WorldLink.WorldId/PlanetId/BypassIndex`, 0x138A answered before the replay lookup,
+  `SendFrame(worldId, ...)`, `PerWorld<WorldRuntime>`, `AllocateTunnelKey(worldId)`, and the two
+  `WorldRouting` hooks). Until it lands, nothing behaves differently.
