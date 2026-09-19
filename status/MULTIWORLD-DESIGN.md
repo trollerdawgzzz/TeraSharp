@@ -170,3 +170,45 @@ One session, tap on every link (the point is to see two Worlds at once):
 
 None of this is worth starting before the capture: the ticket-collision question (point 5) decides
 whether the tunnel map needs a compound key or just a per-World allocator.
+
+## 7. Step 2 (T108) - what is built, and what still needs the capture
+
+New `World/WorldInstances.cs` (Cowork-owned) plus `WorldRuntime` in `World/WorldRegistration.cs`:
+
+| Piece | What it is |
+|---|---|
+| `WorldRouting` | Two hooks - `WorldIdOfLink`, `SendToWorld` - that `WorldBridge` fills in. Null = every link is world 0 and nothing can be routed, i.e. the tree as it stands. |
+| `DungeonChannels` | The instance registry. `(ContinentId, ChannelId) -> WorldId` from 0x13C5, dropped by 0x13C6, plus `MapContinent` for the static `WorldServerList` half. |
+| `DungeonTransfers` | `PDId -> the World that sent the 0x13BE`, so 0x13C1 goes back to the World the user is still in. |
+| `DungeonRouting` | `RouteRequest` / `RouteResponse` / `Dispatch`, and `WorldForEnterWorld` for the 0x138E that follows. |
+| `WorldRuntime` | Per-World `IsReady`, the game-id counter, and the one-shot `MarkReady` that `DbProxy.OnWorldReady` hangs off. |
+
+Layouts pinned this task (payload index = frame offset - 6):
+
+| Op | Payload |
+|---|---|
+| 0x13C5 `SA_ADD_DUNGEON_CHANNEL` | `+0 i32 ContinentId`, `+4 i32 ChannelId`, `+8 DungeonOwnerInfo` (24 B: u64, u8, 3 pad, u64, i32); min 32 |
+| 0x13C6 `SA_REMOVE_DUNGEON_CHANNEL` | `+0 i32 ContinentId`, `+4 i32 ChannelId`; min 8 |
+| 0x13BE/0x13BF/0x13C1 | already pinned in T10; `DungeonEnterContext[0]` (payload 8) is the ContinentId the real handler routes on |
+
+`Handler_SA_REQUEST_ENTER_DUNGEON` (Arb_part_062.c:12933) picks the target with
+`FUN_14082e730(ContinentId)` and builds the PDId as `CONCAT44(User+0x120, DAT_140e2d020)` -
+`[u32 planet][u32 playerId]`, which is what `BuildAsRequestEnterDungeon` already writes.
+`Handler_SA_RESPONSE_ENTER_DUNGEON` (:13707) finds the user from the PDId's HIGH 32 bits and
+answers on **that user's own** World session - the source World, not the responder.
+
+**Single-World is unchanged by construction.** Both tables start empty and both hooks start null,
+so every routing decision resolves to the link the frame arrived on - the exact call
+`DbProxyHandlers` made before T108. `T108_with_one_world_the_dungeon_handshake_is_unchanged`
+pins that against the same capture bytes the T10 tests use.
+
+**Still open, and still waiting on the capture in section 5.**
+
+1. **Nobody allocates an instance.** Routing only finds a World that has already announced a
+   channel (or is configured for the continent). The first entry into a continent no World has
+   announced still resolves to the asking World. The real allocator reads
+   `WorldServerList`/`AS_REQUEST_WORLD_SERVER_STATUS` (0x164C/0x164D), which is dropped today.
+2. **The ticket space is per World but the tunnel map is not.** `_tunnels` is still keyed by
+   Ticket alone. Whether that needs a compound key is section 5 point 5, unanswered.
+3. **`GameSession` has no `CurrentWorldId`.** Until it does, the leave/enter hand-off cannot name
+   its source World, and `TunnelFromClient` still sends to world 0.

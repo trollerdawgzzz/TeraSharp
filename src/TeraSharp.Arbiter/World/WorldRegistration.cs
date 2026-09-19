@@ -49,6 +49,14 @@ public static class WorldRegistration
     public const int ControlBypassIndex = -1;
 
     /// <summary>
+    /// T108. The World a link belongs to before it has registered, and the World everything that
+    /// predates multi-World means when it says "the World": id 0, the main
+    /// <c>&lt;WorldServer id="0" loadAllContinents="true"&gt;</c>. A single-World server never
+    /// leaves this id, which is what keeps every existing test byte-identical.
+    /// </summary>
+    public const int DefaultWorldId = 0;
+
+    /// <summary>
     /// Parse SA_REGISTER's payload:
     /// <code>
     ///   +0x00 u8  IsBypass          +0x01 i32 PlanetId     +0x05 i32 WorldId
@@ -148,4 +156,52 @@ public sealed class PerWorld<T>
 
     /// <summary>Drop a World's instance when its last link goes away.</summary>
     public bool Forget(int worldId) { lock (_lock) return _byWorld.Remove(worldId); }
+}
+
+/// <summary>
+/// T108. The per-World half of what <c>WorldBridge</c> keeps as three process-wide fields today:
+/// the startup-handshake flag, the game-id counter it resets, and whether
+/// <c>DbProxy.OnWorldReady</c> has already fired.
+///
+/// <para>Why it has to be per World: <c>IsReady</c> is set by the first <c>0x294F</c> on any
+/// link and that same branch zeroes <c>_gameIdSeq</c>. A dungeon World finishing its handshake
+/// an hour after the main World would therefore restart the main World's game-id counter under
+/// live players and hand the next two logins ids that are already in use
+/// (status/MULTIWORLD-DESIGN.md section 4 item 3).</para>
+///
+/// <para>Single-World behaviour is unchanged to the byte: world 0's runtime is created on first
+/// use with <c>IsReady == false</c> and the counter at 0, so the first game id is still
+/// <c>0x80000AF00001</c>.</para>
+/// </summary>
+public sealed class WorldRuntime
+{
+    /// <summary>The high half of every game id. gameId = this | a per-World counter.</summary>
+    public const ulong GameIdBase = 0x80000AF00000UL;
+
+    private int _gameIdSeq;
+
+    /// <summary>True once this World has completed the startup handshake and can take players.</summary>
+    public bool IsReady { get; private set; }
+
+    /// <summary>
+    /// The handshake finished. Returns true exactly once per ready transition, which is the
+    /// <c>if (op == OpHandshakeDone &amp;&amp; !IsReady)</c> guard WorldBridge has today - so
+    /// <c>DbProxy.OnWorldReady</c> still fires once per World, not once per link.
+    /// </summary>
+    public bool MarkReady()
+    {
+        if (IsReady) return false;
+        IsReady = true;
+        Interlocked.Exchange(ref _gameIdSeq, 0);
+        return true;
+    }
+
+    /// <summary>Every link of this World went away.</summary>
+    public void MarkDisconnected() => IsReady = false;
+
+    /// <summary>The next game id for this World.</summary>
+    public ulong AllocateGameId() => GameIdBase | (ulong)(uint)Interlocked.Increment(ref _gameIdSeq);
+
+    /// <summary>How many ids this World has handed out. For the status tab and for tests.</summary>
+    public int IssuedGameIds => Volatile.Read(ref _gameIdSeq);
 }

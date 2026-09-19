@@ -22046,6 +22046,185 @@ string message
             "and when world 13's last link drops, world 0 is untouched");
     }
 
+
+    // ===================== T108: multi-world step 2 =====================
+
+    /// <summary>
+    /// The instance registry. SA_ADD_DUNGEON_CHANNEL (0x13C5) is how a World announces that it
+    /// is hosting one channel of one continent; the dumper (FUN_140212600, Arb_part_016.c) reads
+    /// ContinentId at payload 0 and ChannelId at 4 and then copies a 24-byte DungeonOwnerInfo,
+    /// which is why the frame is 0x26 and the payload 32.
+    /// </summary>
+    [Test] public static void T108_the_instance_registry_learns_and_forgets_a_channel()
+    {
+        var reg = new DungeonChannels();
+        Hex.True(reg.Add(13, new byte[DungeonChannels.AddMinPayload - 1]) == null,
+            "a frame shorter than the real guard announces nothing");
+        Hex.True(reg.WorldForContinent(9827) == null && reg.Count == 0, "and nothing is known yet");
+
+        var added = reg.Add(13, T108ChannelPayload(9827, 4, DungeonChannels.AddMinPayload));
+        Hex.True(added != null && added.Value.ContinentId == 9827 && added.Value.ChannelId == 4
+                 && added.Value.WorldId == 13,
+            $"world 13 announced continent 9827 channel 4: {added}");
+        reg.Add(0, T108ChannelPayload(3023, 1, DungeonChannels.AddMinPayload));
+
+        Hex.True(reg.WorldForChannel(9827, 4) == 13 && reg.WorldForChannel(3023, 1) == 0,
+            "each channel resolves to the World that announced it");
+        Hex.True(reg.WorldForChannel(9827, 5) == null, "and a channel nobody announced resolves to nobody");
+        Hex.True(reg.WorldForContinent(9827) == 13, "a continent resolves through its announced channel");
+
+        Hex.True(reg.WorldForContinent(3126) == null, "an unannounced continent has no owner");
+        reg.MapContinent(3126, 12);
+        Hex.True(reg.WorldForContinent(3126) == 12,
+            "until ServerConfig.xml's WorldServerList says which World loads it");
+
+        var gone = T108ChannelPayload(9827, 4, DungeonChannels.RemoveMinPayload);
+        Hex.True(!reg.Remove(0, gone), "world 0 cannot remove world 13's channel");
+        Hex.True(reg.Remove(13, gone) && reg.WorldForChannel(9827, 4) == null,
+            "0x13C6 from the owner does");
+
+        reg.Add(13, T108ChannelPayload(9920, 2, DungeonChannels.AddMinPayload));
+        Hex.True(reg.ForgetWorld(13) == 1 && reg.Count == 1 && reg.WorldForChannel(3023, 1) == 0,
+            "and when world 13 drops, its instances go and world 0's stay");
+    }
+
+    /// <summary>A 0x13C5 / 0x13C6 payload: [i32 ContinentId][i32 ChannelId] then the owner blob.</summary>
+    static byte[] T108ChannelPayload(int continentId, int channelId, int size)
+    {
+        var p = new byte[size];
+        BitConverter.GetBytes(continentId).CopyTo(p, DungeonChannels.ContinentIdOffset);
+        BitConverter.GetBytes(channelId).CopyTo(p, DungeonChannels.ChannelIdOffset);
+        return p;
+    }
+
+    /// <summary>
+    /// The transfer path across two Worlds. World 0 asks (0x13BE), the Arbiter forwards to the
+    /// World that announced the continent (0x13BF), that World answers (0x13C0), and the
+    /// Arbiter sends 0x13C1 back to the World the user is still in - world 0 - not to the World
+    /// that answered. That last hop is what Handler_SA_RESPONSE_ENTER_DUNGEON does by finding
+    /// the user from the PDId's high 32 bits and writing to that user's own World session.
+    /// </summary>
+    [Test] public static void T108_a_dungeon_entry_is_routed_to_the_world_that_owns_the_instance()
+    {
+        var reg = new DungeonChannels();
+        var transfers = new DungeonTransfers();
+        reg.Add(13, T108ChannelPayload(9827, 4, DungeonChannels.AddMinPayload));
+
+        var forward = DbProxyHandlers.BuildAsRequestEnterDungeon(Cap13BEReq)!;
+        var ask = DungeonRouting.RouteRequest(reg, transfers, 0, Cap13BEReq, forward);
+        Hex.True(ask.WorldId == 13 && ask.Opcode == DbProxyHandlers.AS_REQUEST_ENTER_DUNGEON,
+            $"continent 9827 is world 13's, so 0x13BF goes there: world {ask.WorldId}");
+        Hex.Eq(ask.Payload, forward, "and the bytes are the ones the capture-pinned builder made");
+        Hex.True(transfers.Pending == 1, "the Arbiter remembers who asked");
+
+        var back = DbProxyHandlers.BuildAsResponseEnterDungeon(Cap13C0Req)!;
+        Hex.True(BitConverter.ToUInt64(back, 0) == BitConverter.ToUInt64(forward, 0),
+            "the response carries the same PDId the request did - that is the key");
+        var answer = DungeonRouting.RouteResponse(transfers, 13, back);
+        Hex.True(answer.WorldId == 0 && answer.Opcode == DbProxyHandlers.AS_RESPONSE_ENTER_DUNGEON,
+            $"so 0x13C1 goes back to world 0, not world 13: world {answer.WorldId}");
+        Hex.True(transfers.Pending == 0, "and the transfer is done");
+
+        Hex.True(DungeonRouting.RouteResponse(transfers, 13, back).WorldId == 13,
+            "a 0x13C0 with no request on file falls back to the World that sent it");
+
+        var seen = new List<(int world, ushort op)>();
+        try
+        {
+            WorldRouting.SendToWorld = (w, op, _) => seen.Add((w, op));
+            DungeonRouting.Dispatch(null, 0, ask, null);
+            Hex.True(seen.Count == 1 && seen[0] == (13, DbProxyHandlers.AS_REQUEST_ENTER_DUNGEON),
+                $"a cross-World send goes through the bridge hook, not the link: {seen.Count}");
+
+            // ... and the AS_ENTER_WORLD that follows the transfer has to go to the same World.
+            // It carries no worldId - the destination is decided by which socket we write to -
+            // so it is resolved from the continent and instance in the payload we just built.
+            DungeonRouting.Channels.Add(13, T108ChannelPayload(9827, 4, DungeonChannels.AddMinPayload));
+            var enter = new byte[84];
+            BitConverter.GetBytes(9827).CopyTo(enter, DungeonRouting.EnterWorldContinentOffset);
+            BitConverter.GetBytes(4).CopyTo(enter, DungeonRouting.EnterWorldChannelInstanceOffset);
+            Hex.True(DungeonRouting.WorldForEnterWorld(enter) == 13,
+                "enter-world into instance 4 of continent 9827 targets world 13's links");
+            BitConverter.GetBytes(DungeonRouting.OpenWorldChannelInstance)
+                .CopyTo(enter, DungeonRouting.EnterWorldChannelInstanceOffset);
+            Hex.True(DungeonRouting.WorldForEnterWorld(enter) == 13
+                     && DungeonRouting.WorldForEnterWorld(new byte[8]) == WorldRegistration.DefaultWorldId,
+                "the continent alone still resolves it; a payload too short to read is world 0");
+        }
+        finally { DungeonRouting.ResetForTest(); }
+    }
+
+    /// <summary>
+    /// The single-World guarantee. With one World every routing decision resolves to the link
+    /// the frame arrived on, so 0x13BE -&gt; 0x13BF is the same frame on the same socket it was
+    /// before T108 - including after that World has announced a channel of its own.
+    /// </summary>
+    [Test] public static void T108_with_one_world_the_dungeon_handshake_is_unchanged()
+    {
+        try
+        {
+            DungeonRouting.ResetForTest();
+            var seen = 0;
+            WorldRouting.SendToWorld = (_, _, _) => seen++;
+
+            var (op, body) = RunHandler1(DbProxyHandlers.SA_REQUEST_ENTER_DUNGEON, Cap13BEReq);
+            Hex.True(op == DbProxyHandlers.AS_REQUEST_ENTER_DUNGEON, "0x13BF on the arriving link");
+            Hex.Eq(body, DbProxyHandlers.BuildAsRequestEnterDungeon(Cap13BEReq)!,
+                "byte for byte what the capture-pinned builder makes");
+            Hex.True(seen == 0, "and nothing was routed anywhere - there is only one World");
+
+            // World 0 announces the instance it just made, the way the capture does right after
+            // the 0x13C0. The next entry into that continent must still go out on the link.
+            RunHandler(DungeonChannels.SA_ADD_DUNGEON_CHANNEL,
+                T108ChannelPayload(9827, 4, DungeonChannels.AddMinPayload), 0);
+            Hex.True(DungeonRouting.Channels.WorldForContinent(9827) == 0,
+                "the registry learned it, on world 0");
+
+            var (op2, body2) = RunHandler1(DbProxyHandlers.SA_REQUEST_ENTER_DUNGEON, Cap13BEReq);
+            Hex.True(op2 == DbProxyHandlers.AS_REQUEST_ENTER_DUNGEON, "still 0x13BF on the link");
+            Hex.Eq(body2, body, "still the same bytes");
+            Hex.True(seen == 0, "still nothing routed - the owner IS this link's World");
+        }
+        finally { DungeonRouting.ResetForTest(); }
+    }
+
+    /// <summary>
+    /// Two links registering as world 0 and world 13, and the three things WorldBridge keeps
+    /// once per process today. World 13 finishing its handshake must not zero world 0's game-id
+    /// counter under live players (status/MULTIWORLD-DESIGN.md section 4 item 3).
+    /// </summary>
+    [Test] public static void T108_two_links_register_as_world_0_and_13_and_do_not_share_state()
+    {
+        var zero = WorldRegistration.Parse(
+            Hex.B("01 F0 0A 00 00 00 00 00 00 18 00 00 00 00 00 00 00 07 BC 05 00"))!.Value;
+        var thirteen = WorldRegistration.Parse(
+            Hex.B("01 F0 0A 00 0D 00 00 00 04 00 00 00 01 00 00 00 07 BC 05 00"))!.Value;
+        Hex.True(zero.WorldId == 0 && thirteen.WorldId == 13 && thirteen.TotalBypassCount == 4,
+            $"the dungeon World registers as 13 with 4 bypass links: {thirteen}");
+        Hex.Eq(WorldRegistration.Reply(thirteen), "01 0D 00 00 00 01 00 00 00 07 BC 05 00 01 00 00 00",
+            "and is told it is world 13, link 1 - not world 0's captured answer");
+
+        var worlds = new PerWorld<WorldRuntime>(() => new WorldRuntime());
+        Hex.True(!worlds.For(zero.WorldId).IsReady && !worlds.For(thirteen.WorldId).IsReady,
+            "neither takes players before its own handshake");
+
+        Hex.True(worlds.For(0).MarkReady(), "world 0's 0x294F makes it ready");
+        Hex.True(!worlds.For(0).MarkReady(), "and the other 24 links of world 0 do not re-fire OnWorldReady");
+        Hex.True(worlds.For(0).AllocateGameId() == 0x80000AF00001UL,
+            "world 0's first game id is the one the single-World capture has");
+        worlds.For(0).AllocateGameId();
+
+        Hex.True(!worlds.For(13).IsReady, "world 13 is still not ready");
+        Hex.True(worlds.For(13).MarkReady() && worlds.For(13).AllocateGameId() == 0x80000AF00001UL,
+            "it starts its own counter at 1 - a Ticket and a game id index one World");
+        Hex.True(worlds.For(0).IssuedGameIds == 2 && worlds.For(0).AllocateGameId() == 0x80000AF00003UL,
+            "and world 0's counter did NOT restart under it");
+
+        worlds.For(13).MarkDisconnected();
+        Hex.True(!worlds.For(13).IsReady && worlds.For(0).IsReady,
+            "world 13 dropping leaves world 0 taking players");
+    }
+
     // ===================== T105: the live 2026-09-19 regressions =====================
 
     /// <summary>Two starter records with the kit's own ids (7 and 8), the shape

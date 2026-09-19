@@ -1269,6 +1269,10 @@ public sealed class DbProxyHandlers
             case SA_UPDATE_DUNGEON_COOLTIME:      // 0x13B6
             case SA_UPDATE_DUNGEON_CLEAR_COUNT:   // 0x13B7
             case SA_DELETE_DUNGEON_COOLTIME:      // 0x13BD
+            // --- T108: the instance registry. Both are one-way (the capture has no reply to
+            // either) and were falling through to a replay lookup that has nothing for them. ---
+            case DungeonChannels.SA_ADD_DUNGEON_CHANNEL:     // 0x13C5
+            case DungeonChannels.SA_REMOVE_DUNGEON_CHANNEL:  // 0x13C6
             // --- T26: the last two per-character login loads, rebuilt from rows. ---
             case SDB_REPUTATION_LIST:             // 0x2890 from the stored 0x2891 records
             case SDB_FATIGABILITY_LIST:           // 0x2909 from the account's fatigue row
@@ -1488,7 +1492,12 @@ public sealed class DbProxyHandlers
                     BitConverter.ToUInt32(payload, DungeonCtxPlayerId),
                     BitConverter.ToUInt32(payload, DungeonCtxDungeonId), payload.Length);
                 RecordDungeonEntry(payload, response: false);
-                link.SendFrame(AS_REQUEST_ENTER_DUNGEON, r);
+                // T108: 0x13BF goes to the World that owns the requested continent. With one
+                // World - or none announced - that resolves to this link, which is the send
+                // this line was before T108.
+                int fromWorld = WorldRouting.WorldIdOf(link);
+                DungeonRouting.Dispatch(link, fromWorld, DungeonRouting.RouteRequest(
+                    DungeonRouting.Channels, DungeonRouting.Transfers, fromWorld, payload, r), _log);
                 return true;
             }
             case SA_RESPONSE_ENTER_DUNGEON:
@@ -1496,7 +1505,11 @@ public sealed class DbProxyHandlers
                 var r = BuildAsResponseEnterDungeon(payload);
                 if (r == null) return false;
                 RecordDungeonEntry(payload, response: true);
-                link.SendFrame(AS_RESPONSE_ENTER_DUNGEON, r);
+                // T108: 0x13C1 goes back to the World that sent the 0x13BE for this PDId - the
+                // World the user is still in - not to the World that answered.
+                int fromWorld = WorldRouting.WorldIdOf(link);
+                DungeonRouting.Dispatch(link, fromWorld,
+                    DungeonRouting.RouteResponse(DungeonRouting.Transfers, fromWorld, r), _log);
                 return true;
             }
             case SA_ENTER_WORLD_FAIL: return OnEnterWorldFail(link, payload);
@@ -1541,6 +1554,8 @@ public sealed class DbProxyHandlers
 
             // --- Remaining login-time: programmatic builders ---
             case SDB_LOAD_2867: return OnLoadDungeonCoolTime(link, payload);
+            case DungeonChannels.SA_ADD_DUNGEON_CHANNEL:    return OnAddDungeonChannel(link, payload);
+            case DungeonChannels.SA_REMOVE_DUNGEON_CHANNEL: return OnRemoveDungeonChannel(link, payload);
             case SA_UPDATE_DUNGEON_COOLTIME:    return OnUpdateDungeonCoolTime(payload);
             case SA_UPDATE_DUNGEON_CLEAR_COUNT: return OnUpdateDungeonClearCount(payload);
             case SA_DELETE_DUNGEON_COOLTIME:    return OnDeleteDungeonCoolTime(payload);
@@ -4072,6 +4087,37 @@ public sealed class DbProxyHandlers
         if (playerId <= 0)
             _log.LogWarning("{What}: no live session owns gameId 0x{G:X} - not stored", what, gameId);
         return playerId;
+    }
+
+    /// <summary>
+    /// SA_ADD_DUNGEON_CHANNEL (0x13C5). One-way - the capture has no reply, and World sends it
+    /// right after the 0x13C0 that finished an entry. T108 records it in the instance registry
+    /// so the next entry into that continent can be routed to whichever World is hosting it.
+    /// </summary>
+    private bool OnAddDungeonChannel(WorldLink link, byte[] payload)
+    {
+        int worldId = WorldRouting.WorldIdOf(link);
+        var ch = DungeonRouting.Channels.Add(worldId, payload);
+        if (ch == null)
+        {
+            _log.LogWarning("SA_ADD_DUNGEON_CHANNEL: {Len} B payload, need {Need}",
+                payload.Length, DungeonChannels.AddMinPayload);
+            return true;
+        }
+        _log.LogInformation("SA_ADD_DUNGEON_CHANNEL: continent {C} channel {Ch} is on world {W} ({N} known)",
+            ch.Value.ContinentId, ch.Value.ChannelId, worldId, DungeonRouting.Channels.Count);
+        return true;
+    }
+
+    /// <summary>SA_REMOVE_DUNGEON_CHANNEL (0x13C6). One-way; the instance is gone.</summary>
+    private bool OnRemoveDungeonChannel(WorldLink link, byte[] payload)
+    {
+        int worldId = WorldRouting.WorldIdOf(link);
+        if (DungeonRouting.Channels.Remove(worldId, payload))
+            _log.LogInformation("SA_REMOVE_DUNGEON_CHANNEL: continent {C} channel {Ch} gone from world {W}",
+                BitConverter.ToInt32(payload, DungeonChannels.ContinentIdOffset),
+                BitConverter.ToInt32(payload, DungeonChannels.ChannelIdOffset), worldId);
+        return true;
     }
 
     /// <summary>
