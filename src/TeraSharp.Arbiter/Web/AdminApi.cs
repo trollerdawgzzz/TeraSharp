@@ -67,6 +67,13 @@ public sealed class AdminApi
     /// <summary>T106: when the process started, for uptime. Set once by the wiring.</summary>
     public DateTimeOffset StartedAt { get; set; } = DateTimeOffset.UtcNow;
 
+    /// <summary>T101c: one system message to one player. False when they are not in world.</summary>
+    public Func<int, string, bool>? WarnPlayer { get; set; }
+
+    /// <summary>T101c: move <c>(playerId, targetPlayerId)</c> to the target. False when either
+    /// is not in world. Unset means teleport answers 0x16 rather than pretending.</summary>
+    public Func<int, int, bool>? TeleportTo { get; set; }
+
     /// <summary>True when the tool is usable at all. False means TERASHARP_ADMIN_TOKEN is unset.</summary>
     public bool Enabled => _token != null;
 
@@ -113,6 +120,10 @@ public sealed class AdminApi
         if (method == "GET" && path == "/api/online") return Online();
         if (method == "GET" && path == "/api/admin-log") return AdminLog(query);
         if (method == "GET" && path == "/api/deleted") return Deleted(query);
+        if (method == "GET" && path == "/api/account") return Account(query);
+        if (method == "GET" && path == "/api/search") return Search(query);
+        if (method == "GET" && path == "/api/restrictions") return Restrictions(query);
+        if (method == "GET" && path == "/api/announces") return Announces(query);
         if (method == "GET" && path == "/api/status") return Status();
         if (method == "GET" && path == "/api/log") return LogTail(query);
         if (method == "POST" && path == "/api/restore-character") return RestoreCharacter(body, sourceIp);
@@ -126,6 +137,14 @@ public sealed class AdminApi
         if (method == "POST" && path == "/api/kick") return Kick(body, sourceIp);
         if (method == "POST" && path == "/api/announce") return Announcement(body, sourceIp);
         if (method == "POST" && path == "/api/gm-level") return GmLevel(body, sourceIp);
+        // ---- phase 2b (T101c) ----
+        if (method == "POST" && path == "/api/mute") return Mute(body, sourceIp, true);
+        if (method == "POST" && path == "/api/unmute") return Mute(body, sourceIp, false);
+        if (method == "POST" && path == "/api/warn") return Warn(body, sourceIp);
+        if (method == "POST" && path == "/api/teleport") return Teleport(body, sourceIp);
+        if (method == "POST" && path == "/api/rename") return Rename(body, sourceIp);
+        if (method == "POST" && path == "/api/announce-schedule") return ScheduleAnnounce(body, sourceIp);
+        if (method == "POST" && path == "/api/announce-delete") return DeleteAnnounce(body, sourceIp);
 
         foreach (var p in PhaseThreePaths)
             if (path == p)
@@ -202,19 +221,104 @@ public sealed class AdminApi
         else sb.Append("{\"id\":").Append(guild.GuildId)
                .Append(",\"name\":").Append(Str(guild.Name)).Append('}');
 
+        // T101c: the rest of the character page. Every figure here is a read the store already
+        // had; the only new thing is the item NAME, which comes from the optional sheet
+        // (Protocol/ItemNames) and falls back to the empty string so the page shows the id.
+        long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        sb.Append(",\"position\":{\"zone\":").Append(c.Zone)
+          .Append(",\"x\":").Append(c.X.ToString("0.##", CultureInfo.InvariantCulture))
+          .Append(",\"y\":").Append(c.Y.ToString("0.##", CultureInfo.InvariantCulture))
+          .Append(",\"z\":").Append(c.Z.ToString("0.##", CultureInfo.InvariantCulture))
+          .Append(",\"world\":").Append(c.LastWorld)
+          .Append(",\"guard\":").Append(c.LastGuard)
+          .Append(",\"section\":").Append(c.LastSection).Append('}');
+
+        sb.Append(",\"progress\":{\"exp\":").Append(c.Exp)
+          .Append(",\"restBonus\":").Append(c.RestBonus)
+          .Append(",\"questsActive\":").Append(_store.CountQuests(c.Id))
+          .Append(",\"questsCompleted\":").Append(_store.GetCompletedQuestIds(c.Id).Count)
+          .Append(",\"achievements\":").Append(_store.GetAccomplishedAchievements(c.Id).Count)
+          .Append(",\"sectionsVisited\":").Append(_store.GetVisitedSections(c.Id).Count).Append('}');
+
+        var ep = _store.GetCharacterEp(c.Id);
+        sb.Append(",\"ep\":");
+        if (ep == null) sb.Append("null");
+        else sb.Append("{\"level\":").Append(ep.EpLevel)
+               .Append(",\"point\":").Append(ep.EpPoint)
+               .Append(",\"exp\":").Append(ep.EpExp)
+               .Append(",\"dailyExp\":").Append(ep.DailyEpExp)
+               .Append(",\"dailyLimit\":").Append(ep.DailyLimit).Append('}');
+
+        sb.Append(",\"cards\":[");
+        var cards = _store.GetAccountCards(c.AccountId);
+        for (int i = 0; i < cards.Count; i++)
+        {
+            if (i > 0) sb.Append(',');
+            sb.Append("{\"templateId\":").Append(cards[i].CardTemplateId)
+              .Append(",\"amount\":").Append(cards[i].Amount)
+              .Append(",\"name\":").Append(Str(Protocol.ItemNames.Lookup(cards[i].CardTemplateId))).Append('}');
+        }
+        sb.Append(']');
+
+        sb.Append(",\"restrictions\":[");
+        var restrictions = _store.GetRestrictions(c.Id);
+        for (int i = 0; i < restrictions.Count; i++)
+        {
+            if (i > 0) sb.Append(',');
+            sb.Append(RestrictionJson(c, restrictions[i], now));
+        }
+        sb.Append(']');
+
         sb.Append(",\"items\":[");
-        var items = _store.GetItems(c.Id, 0);
+        var items = _store.GetInventoryItems(c.Id);
         for (int i = 0; i < items.Count; i++)
         {
-            var it = items[i];
             if (i > 0) sb.Append(',');
-            sb.Append("{\"itemDbId\":").Append(it.ItemDbId)
-              .Append(",\"templateId\":").Append(it.TemplateId)
-              .Append(",\"slot\":").Append(it.Slot)
-              .Append(",\"count\":").Append(it.Amount).Append('}');
+            sb.Append(ItemJson(items[i]));
+        }
+        sb.Append(']');
+
+        // Two warehouses: the ACCOUNT one (inven 1, shared) and this character's own (inven 9).
+        sb.Append(",\"warehouse\":[");
+        AppendWarehouse(sb, c, World.WarehouseHandlers.InvenAccountWarehouse, "account", first: true);
+        AppendWarehouse(sb, c, World.WarehouseHandlers.InvenCharacterWarehouse, "character", first: false);
+        sb.Append(']');
+
+        sb.Append(",\"itemNames\":").Append(Protocol.ItemNames.Count);
+        sb.Append('}');
+        return new AdminResponse(200, "application/json; charset=utf-8", sb.ToString());
+    }
+
+    /// <summary>One inventory row. <c>count</c> keeps T101's key; <c>name</c> is new and may be
+    /// empty, which is what the page renders as the bare template id.</summary>
+    private static string ItemJson(CharacterStore.ItemRow it)
+        => "{\"itemDbId\":" + it.ItemDbId
+         + ",\"templateId\":" + it.TemplateId
+         + ",\"slot\":" + it.Slot
+         + ",\"inven\":" + it.InvenType
+         + ",\"count\":" + it.Amount
+         + ",\"name\":" + Str(Protocol.ItemNames.Lookup(it.TemplateId)) + "}";
+
+    /// <summary>One warehouse tab: its money, its slot count and its rows.</summary>
+    private void AppendWarehouse(StringBuilder sb, CharacterRecord c, int invenType, string label, bool first)
+    {
+        // Inven 1 is keyed on the ACCOUNT, inven 9 on the character - TransSQLExec's mask 0x1132.
+        long owner = invenType == World.WarehouseHandlers.InvenAccountWarehouse ? c.AccountId : c.Id;
+        var (money, slots) = _store.GetWarehouse(owner, invenType);
+        var rows = _store.GetItems(owner, invenType);
+
+        if (!first) sb.Append(',');
+        sb.Append("{\"tab\":").Append(Str(label))
+          .Append(",\"inven\":").Append(invenType)
+          .Append(",\"money\":").Append(money)
+          .Append(",\"slots\":").Append(slots)
+          .Append(",\"items\":[");
+        for (int i = 0; i < rows.Count; i++)
+        {
+            if (i > 0) sb.Append(',');
+            sb.Append(ItemJson(rows[i]));
         }
         sb.Append("]}");
-        return new AdminResponse(200, "application/json; charset=utf-8", sb.ToString());
     }
 
     /// <summary>GET /api/online - WorldBridge.InWorldSessions(), through the delegate.</summary>
@@ -520,6 +624,334 @@ public sealed class AdminApi
         }
         sb.Append("]}");
         return new AdminResponse(200, "application/json; charset=utf-8", sb.ToString());
+    }
+
+    // ======================================================================= T101c: the pages
+
+    /// <summary>Resolve a character from ?id= or ?name=.</summary>
+    private CharacterRecord? FromQuery(IReadOnlyDictionary<string, string> q)
+    {
+        string? idText = Get(q, "id");
+        if (idText != null && int.TryParse(idText, NumberStyles.Integer, CultureInfo.InvariantCulture, out int id))
+            return _store.GetCharacter(id);
+        string? name = Get(q, "name");
+        return string.IsNullOrEmpty(name) ? null : _store.GetCharacterByName(name);
+    }
+
+    /// <summary>
+    /// GET /api/account?id=N or ?name=X - the account page. Everything the account HAS, rather
+    /// than everything the account IS: TeraSharp's <c>accounts</c> row is only (id, name,
+    /// admin_level, created_at, play_time_sec), so the rest is derived from its characters.
+    /// </summary>
+    private AdminResponse Account(IReadOnlyDictionary<string, string> q)
+    {
+        AccountRecord? a = null;
+        string? idText = Get(q, "id");
+        if (idText != null && long.TryParse(idText, NumberStyles.Integer, CultureInfo.InvariantCulture, out long id))
+            a = _store.GetAccountById(id);
+        else
+        {
+            string? name = Get(q, "name");
+            if (!string.IsNullOrEmpty(name)) a = _store.GetAccount(name);
+        }
+        if (a == null) return Json(404, ResultNotFound, "no such account");
+
+        var chars = _store.GetCharacters(a.Id);
+        long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        DateTime lastLogin = default;
+        foreach (var c in chars) if (c.LastLogin > lastLogin) lastLogin = c.LastLogin;
+
+        var sb = new StringBuilder();
+        sb.Append("{\"result\":").Append(ResultOk)
+          .Append(",\"account\":{\"id\":").Append(a.Id)
+          .Append(",\"name\":").Append(Str(a.Name))
+          .Append(",\"adminLevel\":").Append(a.AdminLevel)
+          .Append(",\"playTimeSec\":").Append(_store.GetAccountPlayTime(a.Id))
+          .Append(",\"characterCount\":").Append(chars.Count)
+          .Append(",\"lastLogin\":").Append(Str(lastLogin == default
+              ? string.Empty : lastLogin.ToString("o", CultureInfo.InvariantCulture)))
+          .Append('}');
+
+        sb.Append(",\"characters\":[");
+        for (int i = 0; i < chars.Count; i++)
+        {
+            if (i > 0) sb.Append(',');
+            sb.Append(CharacterBrief(chars[i]));
+        }
+        sb.Append(']');
+
+        sb.Append(",\"benefits\":[");
+        var benefits = _store.GetAccountBenefits(a.Id);
+        for (int i = 0; i < benefits.Count; i++)
+        {
+            if (i > 0) sb.Append(',');
+            sb.Append("{\"packageId\":").Append(benefits[i].PackageId)
+              .Append(",\"expiresAt\":").Append(benefits[i].ExpiresAt)
+              .Append(",\"value\":").Append(benefits[i].Value).Append('}');
+        }
+        sb.Append(']');
+
+        // Bans are per CHARACTER in this schema, so the account view is the union over its own.
+        sb.Append(",\"bans\":[");
+        bool first = true;
+        foreach (var c in chars)
+            foreach (var r in _store.GetRestrictions(c.Id))
+            {
+                if (!first) sb.Append(',');
+                first = false;
+                sb.Append(RestrictionJson(c, r, now));
+            }
+        sb.Append("]}");
+        return new AdminResponse(200, "application/json; charset=utf-8", sb.ToString());
+    }
+
+    /// <summary>One restriction, with the character it is on and whether it is still biting.</summary>
+    private static string RestrictionJson(CharacterRecord c, CharacterStore.RestrictionRow r, long now)
+        => "{\"characterId\":" + c.Id
+         + ",\"character\":" + Str(c.Name)
+         + ",\"type\":" + r.Type
+         + ",\"typeName\":" + Str(r.Type == CharacterStore.RestrictionBan ? "ban"
+                                : r.Type == CharacterStore.RestrictionMute ? "mute" : "other")
+         + ",\"level\":" + r.Level
+         + ",\"until\":" + r.Until
+         + ",\"active\":" + ((r.Until == 0 || r.Until > now) ? "true" : "false")
+         + ",\"reason\":" + Str(r.Reason)
+         + ",\"setAt\":" + r.SetAt + "}";
+
+    /// <summary>GET /api/restrictions?id=N - the ban/mute list for one character.</summary>
+    private AdminResponse Restrictions(IReadOnlyDictionary<string, string> q)
+    {
+        var c = FromQuery(q);
+        if (c == null) return Json(404, ResultNotFound, "no such character");
+        long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var sb = new StringBuilder();
+        sb.Append("{\"result\":").Append(ResultOk).Append(",\"restrictions\":[");
+        var rows = _store.GetRestrictions(c.Id);
+        for (int i = 0; i < rows.Count; i++)
+        {
+            if (i > 0) sb.Append(',');
+            sb.Append(RestrictionJson(c, rows[i], now));
+        }
+        sb.Append("]}");
+        return new AdminResponse(200, "application/json; charset=utf-8", sb.ToString());
+    }
+
+    /// <summary>
+    /// GET /api/search?q=&amp;kind=name|id|guild|online - the one search box.
+    /// <c>name</c> is a prefix match on characters, <c>id</c> takes a character or account id,
+    /// <c>guild</c> lists a guild's roster and <c>online</c> filters the live list.
+    /// </summary>
+    private AdminResponse Search(IReadOnlyDictionary<string, string> q)
+    {
+        string term = (Get(q, "q") ?? string.Empty).Trim();
+        string kind = (Get(q, "kind") ?? "name").Trim().ToLowerInvariant();
+        var hits = new List<CharacterRecord>();
+        string note = string.Empty;
+
+        switch (kind)
+        {
+            case "id":
+            {
+                if (int.TryParse(term, NumberStyles.Integer, CultureInfo.InvariantCulture, out int n))
+                {
+                    var c = _store.GetCharacter(n);
+                    if (c != null) hits.Add(c);
+                    else hits.AddRange(_store.GetCharacters(n));   // then try it as an account id
+                }
+                break;
+            }
+            case "guild":
+            {
+                var g = _store.GetGuildByName(term);
+                if (g == null) { note = "no such guild"; break; }
+                note = g.Name;
+                foreach (var m in _store.GetGuildMembers(g.GuildId))
+                {
+                    var c = _store.GetCharacter(m.UserDbId);
+                    if (c != null) hits.Add(c);
+                }
+                break;
+            }
+            case "online":
+            {
+                foreach (var o in _online())
+                {
+                    if (term.Length != 0 && o.Name.IndexOf(term, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                    var c = _store.GetCharacter(o.PlayerId);
+                    if (c != null) hits.Add(c);
+                }
+                break;
+            }
+            default:
+            {
+                foreach (var name in _store.FindCharacterNamesByPrefix(term, SearchLimit))
+                {
+                    var c = _store.GetCharacterByName(name);
+                    if (c != null) hits.Add(c);
+                }
+                break;
+            }
+        }
+
+        var live = new HashSet<int>();
+        foreach (var o in _online()) live.Add(o.PlayerId);
+
+        var sb = new StringBuilder();
+        sb.Append("{\"result\":").Append(ResultOk)
+          .Append(",\"kind\":").Append(Str(kind))
+          .Append(",\"note\":").Append(Str(note))
+          .Append(",\"hits\":[");
+        for (int i = 0; i < hits.Count && i < SearchLimit; i++)
+        {
+            if (i > 0) sb.Append(',');
+            sb.Append("{\"character\":").Append(CharacterBrief(hits[i]))
+              .Append(",\"online\":").Append(live.Contains(hits[i].Id) ? "true" : "false")
+              .Append('}');
+        }
+        sb.Append("]}");
+        return new AdminResponse(200, "application/json; charset=utf-8", sb.ToString());
+    }
+
+    /// <summary>How many hits one search returns.</summary>
+    public const int SearchLimit = 50;
+
+    // ======================================================================= T101c: the writes
+
+    /// <summary>POST /api/mute and /api/unmute - the same shape as ban, other restriction type.</summary>
+    private AdminResponse Mute(string? body, string? ip, bool add)
+    {
+        string what = add ? "mute" : "unmute";
+        var c = Target(body);
+        string reason = JsonString(body, "reason") ?? string.Empty;
+        if (c == null) { Log(ip, what, "?", reason, ResultNotFound); return Json(404, ResultNotFound, "no such character"); }
+
+        long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        if (!add)
+        {
+            bool lifted = _store.RemoveRestriction(c.Id, CharacterStore.RestrictionMute);
+            Log(ip, what, c.Name, reason, lifted ? ResultOk : ResultNotFound);
+            return lifted ? Json(200, ResultOk, c.Name + " is unmuted")
+                          : Json(404, ResultNotFound, "that character is not muted");
+        }
+        double hours = JsonNumber(body, "hours") ?? 0;
+        if (hours < 0) { Log(ip, what, c.Name, reason, ResultInvalid); return Json(400, ResultInvalid, "hours must be >= 0"); }
+        long until = hours <= 0 ? 0 : now + (long)(hours * 3600);
+        bool ok = _store.AddRestriction(c.Id, CharacterStore.RestrictionMute, 1, until, reason, now);
+        Log(ip, what, c.Name, reason, ok ? ResultOk : ResultRefused);
+        return new AdminResponse(200, "application/json; charset=utf-8",
+            "{\"result\":" + (ok ? ResultOk : ResultRefused) + ",\"until\":" + until + "}");
+    }
+
+    /// <summary>POST /api/warn {"id":N,"text":"...","reason":"..."} - one system message, one player.</summary>
+    private AdminResponse Warn(string? body, string? ip)
+    {
+        int id = (int)(JsonNumber(body, "id") ?? 0);
+        string text = JsonString(body, "text") ?? string.Empty;
+        string reason = JsonString(body, "reason") ?? string.Empty;
+        if (id <= 0 || text.Length == 0) return Json(400, ResultInvalid, "id and text are required");
+        bool ok = WarnPlayer?.Invoke(id, text) ?? false;
+        Log(ip, "warn", id.ToString(CultureInfo.InvariantCulture), reason, ok ? ResultOk : ResultNotFound);
+        return ok ? Json(200, ResultOk, "warned")
+                  : Json(404, ResultNotFound, "that player is not online");
+    }
+
+    /// <summary>POST /api/teleport {"id":N,"targetId":M} - move id to target. Both must be in world.</summary>
+    private AdminResponse Teleport(string? body, string? ip)
+    {
+        int id = (int)(JsonNumber(body, "id") ?? 0);
+        int target = (int)(JsonNumber(body, "targetId") ?? 0);
+        string reason = JsonString(body, "reason") ?? string.Empty;
+        if (id <= 0 || target <= 0) return Json(400, ResultInvalid, "id and targetId are required");
+        if (TeleportTo == null) return Json(501, ResultRefused, "teleport is not wired on this server");
+        bool ok = TeleportTo.Invoke(id, target);
+        Log(ip, "teleport", id + " -> " + target, reason, ok ? ResultOk : ResultNotFound);
+        return ok ? Json(200, ResultOk, "moved")
+                  : Json(404, ResultNotFound, "one of them is not online");
+    }
+
+    /// <summary>
+    /// POST /api/rename {"id":N,"name":"X","reason":"..."} - the admin half of T88's rename.
+    /// The name goes through the same <c>CharacterHandlers.ValidateName</c> rules the client
+    /// path uses, so the tool cannot create a row the game would reject.
+    /// </summary>
+    private AdminResponse Rename(string? body, string? ip)
+    {
+        int id = (int)(JsonNumber(body, "id") ?? 0);
+        string name = (JsonString(body, "name") ?? string.Empty).Trim();
+        string reason = JsonString(body, "reason") ?? string.Empty;
+        var c = id > 0 ? _store.GetCharacter(id) : null;
+        if (c == null) { Log(ip, "rename", id.ToString(CultureInfo.InvariantCulture), reason, ResultNotFound); return Json(404, ResultNotFound, "no such character"); }
+
+        var verdict = Handlers.CharacterHandlers.ValidateName(name);
+        if (verdict != Handlers.NameCheck.Ok)
+        { Log(ip, "rename", c.Name, reason, ResultInvalid); return Json(400, ResultInvalid, "the name is rejected: " + verdict); }
+        if (_store.GetCharacterByName(name) != null)
+        { Log(ip, "rename", c.Name, reason, ResultInvalid); return Json(409, ResultInvalid, "that name is taken"); }
+
+        bool ok = _store.RenameCharacter(c.Id, name);
+        Log(ip, "rename", c.Name + " -> " + name, reason, ok ? ResultOk : ResultRefused);
+        return ok ? Json(200, ResultOk, c.Name + " is now " + name)
+                  : Json(500, ResultRefused, "the store refused the rename");
+    }
+
+    /// <summary>GET /api/announces - the scheduled ones. An instant announce is never a row.</summary>
+    private AdminResponse Announces(IReadOnlyDictionary<string, string> q)
+    {
+        var rows = _store.GetAnnounces(100);
+        var sb = new StringBuilder();
+        sb.Append("{\"result\":").Append(ResultOk).Append(",\"announces\":[");
+        for (int i = 0; i < rows.Count; i++)
+        {
+            var a = rows[i];
+            if (i > 0) sb.Append(',');
+            sb.Append("{\"id\":").Append(a.Id)
+              .Append(",\"text\":").Append(Str(a.Text))
+              .Append(",\"startAt\":").Append(a.StartAt)
+              .Append(",\"endAt\":").Append(a.EndAt)
+              .Append(",\"intervalSec\":").Append(a.IntervalSec)
+              .Append(",\"lastSent\":").Append(a.LastSent)
+              .Append(",\"enabled\":").Append(a.Enabled ? "true" : "false")
+              .Append(",\"createdBy\":").Append(Str(a.CreatedBy)).Append('}');
+        }
+        sb.Append("]}");
+        return new AdminResponse(200, "application/json; charset=utf-8", sb.ToString());
+    }
+
+    /// <summary>
+    /// POST /api/announce-schedule {"text":"...","startAt":U,"endAt":U,"intervalSec":S}.
+    /// <c>startAt</c> 0 means now. A row with <c>intervalSec</c> 0 goes out once and disables
+    /// itself; the timer that drains them is <c>CharacterStore.TakeDueAnnounces</c>.
+    /// </summary>
+    private AdminResponse ScheduleAnnounce(string? body, string? ip)
+    {
+        string text = JsonString(body, "text") ?? string.Empty;
+        string reason = JsonString(body, "reason") ?? string.Empty;
+        if (text.Length == 0) return Json(400, ResultInvalid, "text is required");
+
+        long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        long startAt = (long)(JsonNumber(body, "startAt") ?? 0);
+        if (startAt <= 0) startAt = now;
+        long endAt = (long)(JsonNumber(body, "endAt") ?? 0);
+        long interval = (long)(JsonNumber(body, "intervalSec") ?? 0);
+        if (endAt != 0 && endAt < startAt) return Json(400, ResultInvalid, "endAt is before startAt");
+        if (interval < 0) return Json(400, ResultInvalid, "intervalSec must be >= 0");
+
+        long id = _store.AddAnnounce(text, startAt, endAt, interval, ip ?? string.Empty, now);
+        Log(ip, "announce-schedule", text.Length > 40 ? text[..40] : text, reason, ResultOk);
+        return new AdminResponse(200, "application/json; charset=utf-8",
+            "{\"result\":" + ResultOk + ",\"id\":" + id + ",\"startAt\":" + startAt + "}");
+    }
+
+    /// <summary>POST /api/announce-delete {"id":N}.</summary>
+    private AdminResponse DeleteAnnounce(string? body, string? ip)
+    {
+        long id = (long)(JsonNumber(body, "id") ?? 0);
+        string reason = JsonString(body, "reason") ?? string.Empty;
+        if (id <= 0) return Json(400, ResultInvalid, "id is required");
+        bool ok = _store.DeleteAnnounce(id);
+        Log(ip, "announce-delete", id.ToString(CultureInfo.InvariantCulture), reason, ok ? ResultOk : ResultNotFound);
+        return ok ? Json(200, ResultOk, "removed")
+                  : Json(404, ResultNotFound, "no such announce");
     }
 
     private void Log(string? ip, string action, string target, string reason, int result)

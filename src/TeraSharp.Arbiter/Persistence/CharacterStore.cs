@@ -1044,6 +1044,22 @@ CREATE TABLE IF NOT EXISTS deleted_items (
   deleted_at   INTEGER NOT NULL DEFAULT 0
 );
 
+-- T101c: scheduled and instant announces. WEBADMIN-DESIGN.md section 4 lists this as one of
+-- the four new tables the tool needs; it is the last of them. An INSTANT announce is sent and
+-- logged and never lands here - only the scheduled ones are rows, because only they have to
+-- survive a restart.
+CREATE TABLE IF NOT EXISTS announces (
+  id        INTEGER PRIMARY KEY AUTOINCREMENT,
+  text      TEXT    NOT NULL,
+  start_at  INTEGER NOT NULL DEFAULT 0,   -- unix seconds; when it first goes out
+  end_at    INTEGER NOT NULL DEFAULT 0,   -- 0 = no end
+  interval_sec INTEGER NOT NULL DEFAULT 0,-- 0 = once
+  last_sent INTEGER NOT NULL DEFAULT 0,
+  enabled   INTEGER NOT NULL DEFAULT 1,
+  created_by TEXT   NOT NULL DEFAULT (''),
+  created_at INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS admin_log (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   at         INTEGER NOT NULL,            -- unix seconds
@@ -1361,6 +1377,8 @@ CREATE TABLE IF NOT EXISTS watched_movies_account (
         AddColumnIfMissing("guilds", "last_incentive_at", "INTEGER NOT NULL DEFAULT 0");
         // T101b: the soft delete. delete_at (T88) is WHEN the row goes; these two are the
         // audit half - that it went, and who sent it there.
+        // T101c: the account page's play-time figure. Nothing feeds it yet - see AddAccountPlayTime.
+        AddColumnIfMissing("accounts", "play_time_sec", "INTEGER NOT NULL DEFAULT 0");
         AddColumnIfMissing("characters", "deleted_at", "INTEGER NOT NULL DEFAULT 0");
         AddColumnIfMissing("characters", "deleted_by", "TEXT NOT NULL DEFAULT ('')");
         AddColumnIfMissing("characters", "return_zone", "INTEGER NOT NULL DEFAULT 0");
@@ -4321,6 +4339,135 @@ DELETE FROM restrictions      WHERE character_id = $id;";
 
     /// <summary>Record one admin action. Never throws into a request path - a failed audit
     /// write is logged and swallowed, because losing the action is worse than losing the log.</summary>
+    // -------------------------------------------------------- T101c: announces
+
+    /// <summary>One scheduled announce. <c>IntervalSec</c> 0 means it goes out once.</summary>
+    public sealed record AnnounceRow(long Id, string Text, long StartAt, long EndAt,
+        long IntervalSec, long LastSent, bool Enabled, string CreatedBy, long CreatedAt);
+
+    /// <summary>Schedule an announce. Returns its id.</summary>
+    public long AddAnnounce(string text, long startAt, long endAt, long intervalSec,
+                            string createdBy, long nowUnix)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "INSERT INTO announces(text, start_at, end_at, interval_sec, enabled, created_by, created_at) " +
+                "VALUES($t,$s,$e,$i,1,$b,$n); SELECT last_insert_rowid();";
+            cmd.Parameters.AddWithValue("$t", text ?? string.Empty);
+            cmd.Parameters.AddWithValue("$s", startAt);
+            cmd.Parameters.AddWithValue("$e", endAt);
+            cmd.Parameters.AddWithValue("$i", intervalSec);
+            cmd.Parameters.AddWithValue("$b", createdBy ?? string.Empty);
+            cmd.Parameters.AddWithValue("$n", nowUnix);
+            var v = cmd.ExecuteScalar();
+            return v == null || v is DBNull ? 0L : Convert.ToInt64(v);
+        }
+    }
+
+    /// <summary>Every scheduled announce, newest first.</summary>
+    public List<AnnounceRow> GetAnnounces(int limit = 100)
+    {
+        if (limit < 1) limit = 1;
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "SELECT id, text, start_at, end_at, interval_sec, last_sent, enabled, created_by, created_at " +
+                "FROM announces ORDER BY id DESC LIMIT $n";
+            cmd.Parameters.AddWithValue("$n", limit);
+            var rows = new List<AnnounceRow>();
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                rows.Add(new AnnounceRow(r.GetInt64(0), r.GetString(1), r.GetInt64(2), r.GetInt64(3),
+                    r.GetInt64(4), r.GetInt64(5), r.GetInt32(6) != 0, r.GetString(7), r.GetInt64(8)));
+            return rows;
+        }
+    }
+
+    /// <summary>Drop one scheduled announce. False when there was no such id.</summary>
+    public bool DeleteAnnounce(long id)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "DELETE FROM announces WHERE id=$i";
+            cmd.Parameters.AddWithValue("$i", id);
+            return cmd.ExecuteNonQuery() == 1;
+        }
+    }
+
+    /// <summary>
+    /// The announces due at <paramref name="nowUnix"/>, and their <c>last_sent</c> stamped so the
+    /// same tick cannot send one twice. A one-shot (interval 0) is disabled as it goes out.
+    /// </summary>
+    public List<AnnounceRow> TakeDueAnnounces(long nowUnix)
+    {
+        lock (_lock)
+        {
+            var due = new List<AnnounceRow>();
+            using (var cmd = _db.CreateCommand())
+            {
+                cmd.CommandText =
+                    "SELECT id, text, start_at, end_at, interval_sec, last_sent, enabled, created_by, created_at " +
+                    "FROM announces WHERE enabled<>0 AND start_at<=$n AND (end_at=0 OR end_at>=$n) " +
+                    "AND (last_sent=0 OR (interval_sec>0 AND last_sent+interval_sec<=$n)) ORDER BY id";
+                cmd.Parameters.AddWithValue("$n", nowUnix);
+                using var r = cmd.ExecuteReader();
+                while (r.Read())
+                    due.Add(new AnnounceRow(r.GetInt64(0), r.GetString(1), r.GetInt64(2), r.GetInt64(3),
+                        r.GetInt64(4), r.GetInt64(5), r.GetInt32(6) != 0, r.GetString(7), r.GetInt64(8)));
+            }
+            foreach (var a in due)
+            {
+                using var up = _db.CreateCommand();
+                up.CommandText = a.IntervalSec > 0
+                    ? "UPDATE announces SET last_sent=$n WHERE id=$i"
+                    : "UPDATE announces SET last_sent=$n, enabled=0 WHERE id=$i";
+                up.Parameters.AddWithValue("$n", nowUnix);
+                up.Parameters.AddWithValue("$i", a.Id);
+                up.ExecuteNonQuery();
+            }
+            return due;
+        }
+    }
+
+    // -------------------------------------------------------- T101c: account play time
+
+    /// <summary>
+    /// Seconds this account has been in world. <b>Nothing feeds this yet</b> - T87 made
+    /// <c>C_PLAY_TIME</c> and <c>C_REQUEST_PLAYTIME</c> acks, and neither stores anything, so the
+    /// account page reports 0 until a session-length counter calls
+    /// <see cref="AddAccountPlayTime"/> on leave-world.
+    /// </summary>
+    public long GetAccountPlayTime(long accountId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT play_time_sec FROM accounts WHERE id=$a";
+            cmd.Parameters.AddWithValue("$a", accountId);
+            var v = cmd.ExecuteScalar();
+            return v == null || v is DBNull ? 0L : Convert.ToInt64(v);
+        }
+    }
+
+    /// <summary>Add to the running total. Returns the new total.</summary>
+    public long AddAccountPlayTime(long accountId, long deltaSeconds)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "UPDATE accounts SET play_time_sec = MAX(0, play_time_sec + $d) WHERE id=$a";
+            cmd.Parameters.AddWithValue("$d", deltaSeconds);
+            cmd.Parameters.AddWithValue("$a", accountId);
+            cmd.ExecuteNonQuery();
+        }
+        return GetAccountPlayTime(accountId);
+    }
+
     public bool AddAdminLog(long atUnix, string sourceIp, string action, string target,
         string reason, int result)
     {

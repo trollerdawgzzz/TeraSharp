@@ -11313,6 +11313,283 @@ bool   isGuildWarAcceptable
             "two u16 refs after the header - frame 412 puts the first string at packet offset 8");
     }
 
+    // =======================================================================================
+    // T101c - the parity pass. One test per JSON handler, all driving AdminApi directly.
+    // Spec: status/WEBADMIN-DESIGN.md section 11.
+    // =======================================================================================
+
+    /// <summary>T101c - GET /api/account: the row, its characters, benefits and every
+    /// restriction across them. Bans are per CHARACTER in this schema, so the account view is
+    /// the union.</summary>
+    [Test] public static void T101c_account_page_gathers_the_whole_account()
+    {
+        using var store = StoreWithTwoAccounts();
+        var api = NewAdminApi(store);
+        var acct = store.GetOrCreateAccount("acct1");
+        long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        store.AddRestriction(1, CS_RestrictionBan, 1, 0, "bot", now);
+        store.AddAccountPlayTime(acct.Id, 7200);
+
+        var r = api.Handle("GET", "/api/account",
+            new Dictionary<string, string> { ["id"] = acct.Id.ToString() }, token: T101Token);
+        Hex.True(r.Status == 200 && r.Body.Contains("\"name\":\"acct1\"")
+                 && r.Body.Contains("\"characterCount\":1"), $"the row: {r.Body}");
+        Hex.True(r.Body.Contains("\"playTimeSec\":7200"),
+            "play time is a column now - nothing feeds it yet, which is the point of having it");
+        Hex.True(r.Body.Contains("\"bans\":[{") && r.Body.Contains("\"typeName\":\"ban\"")
+                 && r.Body.Contains("\"reason\":\"bot\"") && r.Body.Contains("\"active\":true"),
+            $"and the ban on its character shows on the account: {r.Body}");
+
+        var byName = api.Handle("GET", "/api/account",
+            new Dictionary<string, string> { ["name"] = "acct2" }, token: T101Token);
+        Hex.True(byName.Status == 200 && byName.Body.Contains("\"name\":\"acct2\""), "by name too");
+        var miss = api.Handle("GET", "/api/account",
+            new Dictionary<string, string> { ["id"] = "4242" }, token: T101Token);
+        Hex.True(miss.Status == 404 && miss.Body.Contains("\"result\":" + AdminApi.ResultNotFound),
+            "an unknown account is result 2");
+    }
+
+    const int CS_RestrictionBan = 1, CS_RestrictionMute = 2;
+
+    /// <summary>T101c - GET /api/search, all four kinds.</summary>
+    [Test] public static void T101c_search_covers_name_id_guild_and_online()
+    {
+        using var store = StoreWithTwoAccounts();
+        var api = NewAdminApi(store, online: new[] { new AdminOnlineRow(2, "t30_2", 12, 7005, "acct2") });
+
+        var byName = api.Handle("GET", "/api/search",
+            new Dictionary<string, string> { ["kind"] = "name", ["q"] = "t30" }, token: T101Token);
+        Hex.True(byName.Status == 200 && byName.Body.Contains("\"name\":\"t30_1\"")
+                 && byName.Body.Contains("\"name\":\"t30_2\""), $"prefix match: {byName.Body}");
+        Hex.True(byName.Body.Contains("\"online\":true") && byName.Body.Contains("\"online\":false"),
+            "and each hit says whether it is in world");
+
+        var byId = api.Handle("GET", "/api/search",
+            new Dictionary<string, string> { ["kind"] = "id", ["q"] = "1" }, token: T101Token);
+        Hex.True(byId.Body.Contains("\"id\":1"), "a character id resolves");
+
+        int guildId = store.CreateGuild("searchable", 1, warAcceptable: true);
+        store.AddGuildMember(guildId, 1, "t30_1", 4, 12, 1, 11, 1);
+        var byGuild = api.Handle("GET", "/api/search",
+            new Dictionary<string, string> { ["kind"] = "guild", ["q"] = "searchable" }, token: T101Token);
+        Hex.True(byGuild.Body.Contains("\"note\":\"searchable\"") && byGuild.Body.Contains("\"name\":\"t30_1\""),
+            $"the roster comes back: {byGuild.Body}");
+        var noGuild = api.Handle("GET", "/api/search",
+            new Dictionary<string, string> { ["kind"] = "guild", ["q"] = "nope" }, token: T101Token);
+        Hex.True(noGuild.Body.Contains("\"note\":\"no such guild\"") && noGuild.Body.Contains("\"hits\":[]"),
+            "and a guild that is not there says so rather than returning everyone");
+
+        var live = api.Handle("GET", "/api/search",
+            new Dictionary<string, string> { ["kind"] = "online" }, token: T101Token);
+        Hex.True(live.Body.Contains("\"id\":2") && !live.Body.Contains("\"name\":\"t30_1\""),
+            $"online lists only the live one: {live.Body}");
+    }
+
+    /// <summary>T101c - GET /api/restrictions, and the mute pair that fills it.</summary>
+    [Test] public static void T101c_restrictions_list_and_the_mute_pair()
+    {
+        using var store = StoreWithTwoAccounts();
+        var api = NewAdminApi(store);
+
+        var empty = api.Handle("GET", "/api/restrictions",
+            new Dictionary<string, string> { ["id"] = "1" }, token: T101Token);
+        Hex.True(empty.Status == 200 && empty.Body.Contains("\"restrictions\":[]"), "nothing yet");
+
+        var no = api.Handle("POST", "/api/unmute", body: "{\"id\":1}", token: T101Token);
+        Hex.True(no.Status == 404, "unmuting someone who is not muted is result 2");
+
+        var on = api.Handle("POST", "/api/mute",
+            body: "{\"id\":1,\"hours\":2,\"reason\":\"spam\"}", token: T101Token);
+        Hex.True(on.Status == 200 && on.Body.Contains("\"until\":"), $"muted: {on.Body}");
+        Hex.True(store.IsRestricted(1, CS_RestrictionMute, DateTimeOffset.UtcNow.ToUnixTimeSeconds()),
+            "and the store agrees");
+        Hex.True(!store.IsRestricted(1, CS_RestrictionBan, DateTimeOffset.UtcNow.ToUnixTimeSeconds()),
+            "a mute is NOT a ban - they are separate rows of separate types");
+
+        var listed = api.Handle("GET", "/api/restrictions",
+            new Dictionary<string, string> { ["name"] = "t30_1" }, token: T101Token);
+        Hex.True(listed.Body.Contains("\"typeName\":\"mute\"") && listed.Body.Contains("\"reason\":\"spam\"")
+                 && listed.Body.Contains("\"active\":true"), $"and it is listed: {listed.Body}");
+
+        var off = api.Handle("POST", "/api/unmute", body: "{\"id\":1,\"reason\":\"appeal\"}", token: T101Token);
+        Hex.True(off.Status == 200 && store.GetRestrictions(1).Count == 0, "lifted");
+
+        var gone = api.Handle("GET", "/api/restrictions",
+            new Dictionary<string, string> { ["id"] = "999" }, token: T101Token);
+        Hex.True(gone.Status == 404, "an unknown character is result 2");
+    }
+
+    /// <summary>T101c - warn and teleport, the two that are live-session only.</summary>
+    [Test] public static void T101c_warn_and_teleport_go_through_delegates()
+    {
+        using var store = StoreWithTwoAccounts();
+        var api = NewAdminApi(store);
+
+        var unwired = api.Handle("POST", "/api/warn",
+            body: "{\"id\":1,\"text\":\"behave\"}", token: T101Token);
+        Hex.True(unwired.Status == 404, "no delegate means nobody is online");
+        var noTp = api.Handle("POST", "/api/teleport", body: "{\"id\":1,\"targetId\":2}", token: T101Token);
+        Hex.True(noTp.Status == 501 && noTp.Body.Contains("\"result\":" + AdminApi.ResultRefused),
+            "teleport with no wiring is 0x16 - it says it cannot, rather than that nobody is there");
+
+        int warned = 0; string said = string.Empty;
+        (int From, int To) moved = (0, 0);
+        api.WarnPlayer = (id, text) => { warned = id; said = text; return id == 1; };
+        api.TeleportTo = (id, to) => { moved = (id, to); return id == 1 && to == 2; };
+
+        var ok = api.Handle("POST", "/api/warn",
+            body: "{\"id\":1,\"text\":\"last warning\",\"reason\":\"language\"}", token: T101Token);
+        Hex.True(ok.Status == 200 && warned == 1 && said == "last warning", $"delivered: {ok.Body}");
+        var absent = api.Handle("POST", "/api/warn", body: "{\"id\":9,\"text\":\"x\"}", token: T101Token);
+        Hex.True(absent.Status == 404, "someone not in world is still result 2");
+        var noText = api.Handle("POST", "/api/warn", body: "{\"id\":1}", token: T101Token);
+        Hex.True(noText.Status == 400, "an empty warning is refused, not broadcast");
+
+        var tp = api.Handle("POST", "/api/teleport", body: "{\"id\":1,\"targetId\":2}", token: T101Token);
+        Hex.True(tp.Status == 200 && moved == (1, 2), $"moved: {tp.Body}");
+        var badTp = api.Handle("POST", "/api/teleport", body: "{\"id\":1}", token: T101Token);
+        Hex.True(badTp.Status == 400, "no target is result 3");
+    }
+
+    /// <summary>T101c - POST /api/rename, through the same name rules the client path uses.</summary>
+    [Test] public static void T101c_rename_uses_the_game_name_rules()
+    {
+        using var store = StoreWithTwoAccounts();
+        var api = NewAdminApi(store);
+
+        var ok = api.Handle("POST", "/api/rename",
+            body: "{\"id\":1,\"name\":\"Renamed\",\"reason\":\"support\"}", token: T101Token);
+        Hex.True(ok.Status == 200 && store.GetCharacterName(1) == "Renamed", $"renamed: {ok.Body}");
+
+        var taken = api.Handle("POST", "/api/rename",
+            body: "{\"id\":1,\"name\":\"t30_2\"}", token: T101Token);
+        Hex.True(taken.Status == 409 && store.GetCharacterName(1) == "Renamed",
+            "a name already on another character is refused and changes nothing");
+
+        var bad = api.Handle("POST", "/api/rename", body: "{\"id\":1,\"name\":\"a\"}", token: T101Token);
+        Hex.True(bad.Status == 400 && bad.Body.Contains("\"result\":" + AdminApi.ResultInvalid),
+            "one character is below the client minimum, so the tool cannot write a name the game rejects");
+        var digits = api.Handle("POST", "/api/rename", body: "{\"id\":1,\"name\":\"abc123\"}", token: T101Token);
+        Hex.True(digits.Status == 400, "and neither can it write one with digits in it");
+
+        var gone = api.Handle("POST", "/api/rename", body: "{\"id\":999,\"name\":\"Nobody\"}", token: T101Token);
+        Hex.True(gone.Status == 404, "an unknown character is result 2");
+    }
+
+    /// <summary>
+    /// T101c - the announce trio: schedule, list, delete. An INSTANT announce is sent and logged
+    /// and never becomes a row; only a scheduled one has to survive a restart.
+    /// </summary>
+    [Test] public static void T101c_scheduled_announces_round_trip()
+    {
+        using var store = StoreWithTwoAccounts();
+        var api = NewAdminApi(store);
+        long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+
+        var empty = api.Handle("GET", "/api/announces", token: T101Token);
+        Hex.True(empty.Status == 200 && empty.Body.Contains("\"announces\":[]"), "nothing scheduled");
+
+        var once = api.Handle("POST", "/api/announce-schedule",
+            body: "{\"text\":\"downtime at 9\",\"startAt\":0,\"intervalSec\":0}", token: T101Token);
+        Hex.True(once.Status == 200 && once.Body.Contains("\"id\":1"), $"scheduled: {once.Body}");
+        Hex.True(once.Body.Contains("\"startAt\":" + now) || once.Body.Contains("\"startAt\":" + (now + 1)),
+            "startAt 0 means now");
+
+        var repeat = api.Handle("POST", "/api/announce-schedule",
+            body: "{\"text\":\"every minute\",\"startAt\":" + now + ",\"intervalSec\":60}", token: T101Token);
+        Hex.True(repeat.Status == 200, "and a repeating one");
+
+        var listed = api.Handle("GET", "/api/announces", token: T101Token);
+        Hex.True(listed.Body.Contains("\"text\":\"downtime at 9\"") && listed.Body.Contains("\"intervalSec\":60"),
+            $"both come back, newest first: {listed.Body}");
+
+        var bad = api.Handle("POST", "/api/announce-schedule", body: "{\"text\":\"\"}", token: T101Token);
+        Hex.True(bad.Status == 400, "an empty announce is refused");
+        var backwards = api.Handle("POST", "/api/announce-schedule",
+            body: "{\"text\":\"x\",\"startAt\":" + (now + 100) + ",\"endAt\":" + now + "}", token: T101Token);
+        Hex.True(backwards.Status == 400, "and so is an end before its start");
+
+        // The timer's half: due rows come out once, and a one-shot disables itself.
+        var due = store.TakeDueAnnounces(now);
+        Hex.True(due.Count == 2, $"both are due at {now}: {due.Count}");
+        Hex.True(store.TakeDueAnnounces(now).Count == 0,
+            "and neither is due again in the same second - last_sent is stamped as they go");
+        Hex.True(store.TakeDueAnnounces(now + 61).Count == 1,
+            "a minute later only the repeating one comes back; the one-shot disabled itself");
+
+        var dropped = api.Handle("POST", "/api/announce-delete", body: "{\"id\":1}", token: T101Token);
+        Hex.True(dropped.Status == 200 && store.GetAnnounces(10).Count == 1, "removed");
+        Hex.True(api.Handle("POST", "/api/announce-delete", body: "{\"id\":1}", token: T101Token).Status == 404,
+            "removing it twice is result 2");
+    }
+
+    /// <summary>
+    /// T101c - the character page carries the whole catalogue now: position, progress, EP, cards,
+    /// restrictions, inventory and BOTH warehouses.
+    /// </summary>
+    [Test] public static void T101c_character_page_carries_the_catalogue()
+    {
+        using var store = StoreWithTwoAccounts();
+        var api = NewAdminApi(store);
+        var acct = store.GetOrCreateAccount("acct1");
+
+        store.UpsertItem(9001, 1, 0, 0, 88375, 3);
+        store.UpsertItem(9002, acct.Id, TeraSharp.Arbiter.World.WarehouseHandlers.InvenAccountWarehouse, 0, 77001, 1);
+        store.AddWarehouseMoney(acct.Id, TeraSharp.Arbiter.World.WarehouseHandlers.InvenAccountWarehouse, 555);
+        store.SetCharacterMoney(1, 4242);
+        store.AddCard(acct.Id, 310010, 2);
+        store.AddRestriction(1, CS_RestrictionBan, 1, 0, "bot", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+
+        var r = api.Handle("GET", "/api/character",
+            new Dictionary<string, string> { ["id"] = "1" }, token: T101Token);
+        Hex.True(r.Status == 200 && r.Body.Contains("\"money\":4242"), $"money: {r.Body}");
+        Hex.True(r.Body.Contains("\"position\":{\"zone\":5") && r.Body.Contains("\"section\":"),
+            "position, with the section trio T76 fills");
+        Hex.True(r.Body.Contains("\"progress\":{\"exp\":") && r.Body.Contains("\"questsActive\":0")
+                 && r.Body.Contains("\"achievements\":0"), "progress counters");
+        Hex.True(r.Body.Contains("\"ep\":null"), "EP is null until something writes one, not a fake zero row");
+        Hex.True(r.Body.Contains("\"templateId\":310010") && r.Body.Contains("\"amount\":2"),
+            "the account's cards");
+        Hex.True(r.Body.Contains("\"typeName\":\"ban\""), "and the restrictions on this character");
+        Hex.True(r.Body.Contains("\"templateId\":88375") && r.Body.Contains("\"count\":3"),
+            "the inventory row, still under the key T101 used");
+        Hex.True(r.Body.Contains("\"tab\":\"account\"") && r.Body.Contains("\"money\":555")
+                 && r.Body.Contains("\"templateId\":77001") && r.Body.Contains("\"tab\":\"character\""),
+            $"both warehouse tabs, the account one keyed on the ACCOUNT: {r.Body}");
+        Hex.True(r.Body.Contains("\"itemNames\":0"),
+            "and it reports that no name sheet is loaded, so the page shows template ids");
+    }
+
+    /// <summary>
+    /// T101c - the optional item-name sheet. There is no sheet in the repo: the names live in
+    /// StrSheet_Item inside the 61 MB client DataCenter, which tera-api parses into an in-memory
+    /// Map and serialises to opaque dc_*.bin blobs. So this parses a two-column file instead, and
+    /// everything works without one.
+    /// </summary>
+    [Test] public static void T101c_item_names_are_optional_and_forgiving()
+    {
+        var map = TeraSharp.Arbiter.Protocol.ItemNames.Parse(new[]
+        {
+            "# a comment",
+            "; another",
+            "templateId\tname",          // a header - the id does not parse, so it is skipped
+            "88375\tFine Mana Potion",
+            "77001,Bundle of Feathers",  // commas work too
+            "  200997  \t  Spring Cake  ",
+            "notanumber\tignored",
+            "0\tzero is not a template",
+            "12345\t",                   // no name, so no row
+            "",
+        });
+        Hex.True(map.Count == 3, $"three real rows out of ten lines: {map.Count}");
+        Hex.True(map[88375] == "Fine Mana Potion" && map[77001] == "Bundle of Feathers"
+                 && map[200997] == "Spring Cake", "tabs, commas and stray whitespace all parse");
+        Hex.True(!map.ContainsKey(0) && !map.ContainsKey(12345), "and the junk lines are dropped");
+
+        Hex.True(TeraSharp.Arbiter.Protocol.ItemNames.Lookup(4242) == "",
+            "an unknown template is the empty string, which the page renders as the bare id");
+    }
+
     // ---- The rules ----
 
     [Test] public static void T30_system_message_format_matches_the_capture()
