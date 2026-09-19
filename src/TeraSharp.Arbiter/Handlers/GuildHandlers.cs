@@ -849,7 +849,7 @@ public sealed class GuildHandlers
         }
 
         return GuildPackets.BuildSGuildQuestListBody(
-            g.GuildId, starterDbId, QuestUnk1, g.Point, QuestUnk2, QuestUnk3, QuestUnk4,
+            g.GuildId, starterDbId, QuestUnk1, (int)g.Point, QuestUnk2, QuestUnk3, QuestUnk4,
             g.Money, QuestUnk5, QuestUnk6, QuestUnk7, nowUnix, QuestUnk8, QuestMaxPoint,
             QuestFlag, g.Name, starterName,
             GuildPackets.GuildQuestTiers, rows);
