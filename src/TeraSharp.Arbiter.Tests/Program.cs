@@ -11461,10 +11461,20 @@ bool   isGuildWarAcceptable
             body: "{\"id\":1,\"name\":\"Renamed\",\"reason\":\"support\"}", token: T101Token);
         Hex.True(ok.Status == 200 && store.GetCharacterName(1) == "Renamed", $"renamed: {ok.Body}");
 
+        // T101d: the duplicate case needs a target whose name the GAME would accept.
+        // StoreWithTwoAccounts writes "t30_1"/"t30_2" straight into the table, and ValidateName
+        // rejects digits and underscores - so renaming TO "t30_2" stops at the 400 gate and the
+        // duplicate check below it never runs. That is what made this assertion fail, not a
+        // missing check. Give character 2 a legal name first.
+        Hex.True(store.RenameCharacter(2, "Taken"), "character 2 gets a name the game would accept");
         var taken = api.Handle("POST", "/api/rename",
-            body: "{\"id\":1,\"name\":\"t30_2\"}", token: T101Token);
+            body: "{\"id\":1,\"name\":\"Taken\"}", token: T101Token);
         Hex.True(taken.Status == 409 && store.GetCharacterName(1) == "Renamed",
             "a name already on another character is refused and changes nothing");
+        var casing = api.Handle("POST", "/api/rename",
+            body: "{\"id\":1,\"name\":\"taken\"}", token: T101Token);
+        Hex.True(casing.Status == 409,
+            "and the name column is COLLATE NOCASE, so a case change is the same name");
 
         var bad = api.Handle("POST", "/api/rename", body: "{\"id\":1,\"name\":\"a\"}", token: T101Token);
         Hex.True(bad.Status == 400 && bad.Body.Contains("\"result\":" + AdminApi.ResultInvalid),
@@ -11548,6 +11558,17 @@ bool   isGuildWarAcceptable
         Hex.True(r.Body.Contains("\"progress\":{\"exp\":") && r.Body.Contains("\"questsActive\":0")
                  && r.Body.Contains("\"achievements\":0"), "progress counters");
         Hex.True(r.Body.Contains("\"ep\":null"), "EP is null until something writes one, not a fake zero row");
+
+        // T101d: and it appears the moment anything is written. GetCharacterEp returns a row for
+        // every character that exists - the ep_* columns are NOT NULL DEFAULT 0 - so the page,
+        // not the store, is what decides an all-zero row means "no panel". The store keeps
+        // answering AS_LOAD_EXTRAPOINT_DATA with zeros, which is what the capture shows.
+        Hex.True(store.GetCharacterEp(1) != null, "the store still hands the packet path a zero row");
+        store.SetCharacterEpLevel(1, 3, 40);
+        var withEp = api.Handle("GET", "/api/character",
+            new Dictionary<string, string> { ["id"] = "1" }, token: T101Token);
+        Hex.True(withEp.Body.Contains("\"ep\":{\"level\":3") && withEp.Body.Contains("\"point\":40"),
+            $"once ep_level is written the panel is there: {withEp.Body}");
         Hex.True(r.Body.Contains("\"templateId\":310010") && r.Body.Contains("\"amount\":2"),
             "the account's cards");
         Hex.True(r.Body.Contains("\"typeName\":\"ban\""), "and the restrictions on this character");
