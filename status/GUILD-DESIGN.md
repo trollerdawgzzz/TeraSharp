@@ -1592,10 +1592,14 @@ cannot explain are constants in both frames and are named `QuestUnk1..8` on `Gui
 
 ### T98.3 Serve points
 
-The board is pushed at two moments: in the enter-world burst beside `S_GUILD_INFO`
-(client3 280, client4 2084) and again right after the roster changes (client3 3020 — immediately
-after `S_GUILD_INFO` 3017 — and 4130, client4 2751). The roster case is wired into
-`EmitMemberAdded`; the enter-world case is a one-line call in whatever owns that burst.
+The board is pushed at two moments, and T98b wired both:
+
+* **After `S_GUILD_INFO`** — `SendGuildInfo` now ends with it (client3 280 / client4 2084 in the
+  enter-world burst, and 3017 → 3020 when the window is reopened). **Members only**: window type
+  3 shows an outsider the guild card, and the capture never sends the board to a non-member.
+* **After a roster change** — the last thing `EmitMemberAdded` does, and last is the point:
+  client3 sends `S_ADD_GUILD_MEMBER` at 3014 and only reaches the board at 3020. The joiner alone
+  gets it; the other members keep the board they have.
 
 Start / finish / cancel were **never captured** — a 7-day cooldown kept them out of the session —
 so `SetGuildQuest` is the seam a later task drives and nothing about those packets is guessed.

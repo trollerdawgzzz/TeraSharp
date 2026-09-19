@@ -8636,7 +8636,9 @@ public bool TryHandle(WorldBridge bridge, WorldLink link, ushort op, byte[] payl
             "Ordered holds exactly the same items as the two typed lists");
 
         var r = h.Dispatcher.Dispatch(accept, "guild");
-        Hex.True(r.ClientsDropped == 1, $"the joiner is offline and is skipped: {r}");
+        // T98b: EmitMemberAdded now ends with S_GUILD_QUEST_LIST to the joiner, so an offline
+        // joiner misses TWO packets - the member row and the board.
+        Hex.True(r.ClientsDropped == 2, $"the joiner is offline and is skipped twice: {r}");
         Hex.True(r.WorldSent == 2, $"both World frames went: {r}");
         Hex.True(h.WorldLog[0].Op == GuildPackets.AS_ADD_GUILDMEMBER
                  && h.WorldLog[1].Op == GuildPackets.AS_GUILD_JOINED,
@@ -10346,18 +10348,23 @@ bool   isGuildWarAcceptable
     [Test] public static void T98_guild_quest_state_round_trips()
     {
         using var store = StoreWithTwoAccounts();
-        Hex.True(store.GetGuildQuests(1).Count == 0, "a guild that has never run one has no rows");
-        Hex.True(store.GetRunningGuildQuest(1) == null, "and nothing running");
+        // guild_quests has a FOREIGN KEY to guilds, so the guild has to exist first - the same
+        // shape T85 uses for the perk rows.
+        int guildId = store.CreateGuild("sdg", 1, warAcceptable: true);
+        Hex.True(guildId > 0, "the guild row the quest rows hang off");
 
-        Hex.True(store.SetGuildQuest(1, 10006, 1, 1789550000L, 1789605225L, 1003, 20), "the row goes in");
-        var running = store.GetRunningGuildQuest(1);
+        Hex.True(store.GetGuildQuests(guildId).Count == 0, "a guild that has never run one has no rows");
+        Hex.True(store.GetRunningGuildQuest(guildId) == null, "and nothing running");
+
+        Hex.True(store.SetGuildQuest(guildId, 10006, 1, 1789550000L, 1789605225L, 1003, 20), "the row goes in");
+        var running = store.GetRunningGuildQuest(guildId);
         Hex.True(running != null && running.QuestId == 10006 && running.StarterDbId == 1003
                  && running.EndsAt == 1789605225L,
             "and comes back as the running quest");
 
-        Hex.True(store.SetGuildQuest(1, 10006, 0, 0, 0, 0, 0), "finishing it is the same upsert");
-        Hex.True(store.GetRunningGuildQuest(1) == null, "status 0 is not running");
-        Hex.True(store.GetGuildQuests(1).Count == 1, "but the row stays - one per quest, not per run");
+        Hex.True(store.SetGuildQuest(guildId, 10006, 0, 0, 0, 0, 0), "finishing it is the same upsert");
+        Hex.True(store.GetRunningGuildQuest(guildId) == null, "status 0 is not running");
+        Hex.True(store.GetGuildQuests(guildId).Count == 1, "but the row stays - one per quest, not per run");
     }
 
     // ---- The rules ----
@@ -15191,11 +15198,14 @@ string message
         //      SDB_CREATE_GUILD2 down the DB-proxy link, so this is the seam that half calls.
         var (guildId, created) = GuildWiring.DispatchCreateGuild(guilds, h.Dispatcher, 1, "Ere");
         Hex.True(guildId > 0, $"CreateGuild returned {guildId}");
-        Hex.True(chief.Log.Count == 2
+        // T98b: the board comes LAST, which is the order cap_final_client3 shows -
+        // S_ADD_GUILD_MEMBER at 3014, S_GUILD_QUEST_LIST only at 3020.
+        Hex.True(chief.Log.Count == 3
                  && chief.Log[0] == "def:S_REQUEST_JOIN_GUILD_NOTICE"
-                 && chief.Log[1].StartsWith("body:S_ADD_GUILD_MEMBER:"),
-            "the notice, then the member - and the member through SendRawBody, which is what a "
-            + "CORRECTED def looks like on the wire: " + string.Join(",", chief.Log));
+                 && chief.Log[1].StartsWith("body:S_ADD_GUILD_MEMBER:")
+                 && chief.Log[2].StartsWith("body:S_GUILD_QUEST_LIST:"),
+            "the notice, then the member, then the board - the member through SendRawBody, which "
+            + "is what a CORRECTED def looks like on the wire: " + string.Join(",", chief.Log));
         Hex.True(BitConverter.ToUInt16(chief.Bodies[0], 0) == 0x38,
             $"S_ADD_GUILD_MEMBER fixed part 0x{BitConverter.ToUInt16(chief.Bodies[0], 0):X2}, want 0x38 "
             + "- the .def's 0x33 would mean the correction never reached the wire");
@@ -15204,7 +15214,7 @@ string message
             "AS_ADD_GUILDMEMBER (0x140A) then AS_GUILD_JOINED (0x2866), the order "
             + "GuildUtil::UserJoinToGuild sends them: "
             + string.Join(",", h.WorldLog.Select(w => $"0x{w.Op:X4}")));
-        Hex.True(created.ClientsSent == 2, $"{created}");
+        Hex.True(created.ClientsSent == 3, $"notice + member + board, all to the founder: {created}");
 
         // ---- apply. C_INVITE_USER_TO_GUILD still needs the wanted board, so the invite that
         //      IS wired is the applicant's half: the holders of the invite authority are told.
