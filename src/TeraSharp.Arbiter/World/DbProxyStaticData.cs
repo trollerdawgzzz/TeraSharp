@@ -1411,6 +1411,10 @@ public static class GuildPackets
     public const ushort S_ADD_GUILD_MEMBER = 0xAB18;
     public const ushort S_GUILD_APPLY_LIST = 0x8033;
     public const ushort S_GUILD_APPLY_COUNT = 0xC89A;
+    /// <summary>The guild-quest board. T98 decoded it from cap_final_client3 280 (1357 B) and
+    /// client4 2084 (1359 B); both are reproduced byte for byte by
+    /// <see cref="BuildSGuildQuestListBody"/>.</summary>
+    public const ushort S_GUILD_QUEST_LIST = 0xC85C;
     public const ushort S_REQUEST_JOIN_GUILD_NOTICE = 0xF1DF;
     public const ushort S_REQUEST_INVITE_GUILD_TAG = 0x7E14;
     public const ushort S_EMPTY_GUILD_WINDOW = 0x7252;
@@ -1952,6 +1956,142 @@ public static class GuildPackets
     /// <summary>S_GUILD_APPLY_COUNT (0xC89A) and S_REQUEST_INVITE_GUILD_TAG (0x7E14):
     /// a single `i32 Count`. Both writers are one FUN_1400554e0 after the opcode.</summary>
     public static byte[] BuildCountBody(int count) => BitConverter.GetBytes(count);
+
+    // ------------------------------------------------------- T98: the guild-quest board
+
+    /// <summary>One quest of the catalogue. Every field here is identical in both captured
+    /// frames and for both guilds, so it is sheet data, not guild state - the ONLY per-guild
+    /// number in the whole array is <see cref="GuildQuestRow.RemainSec"/>.</summary>
+    public sealed record GuildQuestRow(
+        int QuestId, int Unk1, int Unk2, int Unk3, int Unk4, int Unk5,
+        int RemainSec, int Unk6, int Unk7, byte Unk8,
+        string NameToken, string DescToken,
+        (int A, int B, int C, int D)[] Targets, (int ItemId, int Amount, int Unk)[] Rewards);
+
+    /// <summary>A row of the small second array: three tiers at 180 / 540 / 900 points, the
+    /// same in both frames.</summary>
+    public sealed record GuildQuestTier(int Tier, int Point, short Unk);
+
+    /// <summary>The three tiers both captures carry.</summary>
+    public static readonly GuildQuestTier[] GuildQuestTiers =
+    {
+        new(0, 180, 0), new(1, 540, 0), new(2, 900, 0),
+    };
+
+    /// <summary>
+    /// The six quests both captures list, in the order they arrive - note it is NOT sorted by
+    /// id: 10000, 10001, 10004, 10002, 10003, 10006. The two string tokens are the client s
+    /// own <c>@GuildQuest:</c> lookups, so no text travels.
+    /// </summary>
+    public static readonly GuildQuestRow[] GuildQuestCatalogue =
+    {
+        new(10000, 4, 25, 0, 720, 0, 43200, 2, 1, 0, "@GuildQuest:10000001", "@GuildQuest:10000002",
+            new[] { (0, 0, 0, 15) },   new[] { (20000000, 325, 0),  (20000001, 25, 0) }),
+        new(10001, 2, 30, 0, 720, 0, 43200, 3, 1, 0, "@GuildQuest:10001001", "@GuildQuest:10001002",
+            new[] { (0, 0, 0, 600) },  new[] { (20000000, 300, 0),  (20000001, 30, 0) }),
+        new(10004, 5, 20, 0, 720, 0, 43200, 3, 2, 0, "@GuildQuest:10004001", "@GuildQuest:10004002",
+            new[] { (0, 0, 0, 50) },   new[] { (20000000, 415, 0),  (20000001, 30, 0) }),
+        new(10002, 0, 10, 0, 720, 0, 43200, 1, 1, 0, "@GuildQuest:10002001", "@GuildQuest:10002002",
+            new[] { (0, 0, 0, 300) },  new[] { (20000000, 105, 0),  (20000001, 35, 0) }),
+        new(10003, 0, 15, 0, 720, 0, 43200, 1, 1, 0, "@GuildQuest:10003001", "@GuildQuest:10003002",
+            new[] { (0, 0, 0, 15) },   new[] { (20000000, 260, 0),  (20000001, 55, 0) }),
+        new(10006, 0, 40, 2, 120, 0, 43200, 1, 1, 0, "@GuildQuest:10006001", "@GuildQuest:10006002",
+            new[] { (34, 2002, 0, 1) }, new[] { (20000000, 1100, 0), (20000001, 60, 0) }),
+    };
+
+    /// <summary>
+    /// S_GUILD_QUEST_LIST (0xC85C). Raw, because the packet nests arrays two deep and no def
+    /// ships for it.
+    ///
+    /// <code>
+    /// header  [u16 questCount][u16 questOff][u16 tierCount][u16 tierOff]
+    ///         [u16 guildNameOff][u16 starterNameOff]
+    ///         7 x i32, i64 guildMoney, 3 x i32, i64 lastUpdated, 2 x i32, u8      (65 B)
+    /// quest   [u16 here][u16 next] 3 array refs, 3 string refs, 9 x i32, u8       (59 B)
+    /// tier    [u16 here][u16 next] i32 tier, i32 point, i16                       (14 B)
+    /// </code>
+    ///
+    /// <para>The data sections come out in a fixed order that is NOT the ref-slot order: the
+    /// two names first, then the tiers, then the quests - and inside a quest, its three strings
+    /// before its three sub-arrays. cap_final_client3 280 and client4 2084 both reproduce
+    /// exactly, 1357 and 1359 bytes.</para>
+    /// </summary>
+    public static byte[] BuildSGuildQuestListBody(
+        int guildId, int starterDbId, int unk1, int guildPoint, int unk2, int unk3, int unk4,
+        long guildMoney, int unk5, int unk6, int unk7, long lastUpdated, int unk8, int maxPoint,
+        byte flag, string guildName, string starterName,
+        IReadOnlyList<GuildQuestTier> tiers, IReadOnlyList<GuildQuestRow> quests)
+    {
+        var b = new List<byte>();
+        b.AddRange(new byte[12]);                       // 2 array refs + 2 string refs
+        void I32(int v) => b.AddRange(BitConverter.GetBytes(v));
+        void I64(long v) => b.AddRange(BitConverter.GetBytes(v));
+        void I16(short v) => b.AddRange(BitConverter.GetBytes(v));
+        void Patch(int at, int value) { b[at] = (byte)value; b[at + 1] = (byte)(value >> 8); }
+        // Client packets are [u16 len][u16 opcode], so a body index is four less than the
+        // packet-relative offset every ref slot in this packet carries.
+        int Off() => b.Count + 4;
+        void Str(string? s2) { foreach (char c in s2 ?? string.Empty) I16((short)c); I16(0); }
+
+        I32(guildId); I32(starterDbId); I32(unk1); I32(guildPoint); I32(unk2); I32(unk3); I32(unk4);
+        I64(guildMoney); I32(unk5); I32(unk6); I32(unk7); I64(lastUpdated); I32(unk8); I32(maxPoint);
+        b.Add(flag);
+
+        Patch(8, Off());  Str(guildName);
+        Patch(10, Off()); Str(starterName);
+
+        Patch(4, tiers.Count);
+        if (tiers.Count > 0) Patch(6, Off());
+        int prev = -1;
+        foreach (var t in tiers)
+        {
+            int here = Off();
+            if (prev >= 0) Patch(prev, here);
+            I16((short)here); I16(0); prev = b.Count - 2;
+            I32(t.Tier); I32(t.Point); I16(t.Unk);
+        }
+
+        Patch(0, quests.Count);
+        if (quests.Count > 0) Patch(2, Off());
+        int prevQ = -1;
+        foreach (var q in quests)
+        {
+            int here = Off();
+            if (prevQ >= 0) Patch(prevQ, here);
+            int e = b.Count;
+            I16((short)here); I16(0); prevQ = b.Count - 2;
+            b.AddRange(new byte[18]);                   // 3 array refs + 3 string refs
+            I32(q.QuestId); I32(q.Unk1); I32(q.Unk2); I32(q.Unk3); I32(q.Unk4); I32(q.Unk5);
+            I32(q.RemainSec); I32(q.Unk6); I32(q.Unk7); b.Add(q.Unk8);
+
+            Patch(e + 16, Off()); Str(q.NameToken);
+            Patch(e + 18, Off()); Str(q.DescToken);
+            Patch(e + 20, Off()); Str(guildName);
+
+            Patch(e + 4, q.Targets.Length);
+            if (q.Targets.Length > 0) Patch(e + 6, Off());
+            int p = -1;
+            foreach (var t in q.Targets)
+            {
+                int hx = Off();
+                if (p >= 0) Patch(p, hx);
+                I16((short)hx); I16(0); p = b.Count - 2;
+                I32(t.A); I32(t.B); I32(t.C); I32(t.D);
+            }
+            // The middle array is empty in every captured quest - both slots stay zero.
+            Patch(e + 12, q.Rewards.Length);
+            if (q.Rewards.Length > 0) Patch(e + 14, Off());
+            p = -1;
+            foreach (var r in q.Rewards)
+            {
+                int hx = Off();
+                if (p >= 0) Patch(p, hx);
+                I16((short)hx); I16(0); p = b.Count - 2;
+                I32(r.ItemId); I32(r.Amount); I32(r.Unk);
+            }
+        }
+        return b.ToArray();
+    }
 
     /// <summary>S_CHANGE_GUILD_CHIEF (0xAB7E): `i32 NewChiefDbId`.</summary>
     public static byte[] BuildSChangeGuildChiefBody(int newChiefDbId) => BitConverter.GetBytes(newChiefDbId);

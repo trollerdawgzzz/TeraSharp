@@ -1544,3 +1544,58 @@ duplicate.
 `GuildWiring.BuildGuildDataPush(store, guildDbId)` returns the push (null when the guild row is
 gone), and `DbProxyHandlers.OnGiveGuildMoneyIncentive` sends it **before** the 0x27A1 answer —
 the order tap 2500 → 2501 → 2504 shows.
+
+## T98 — the guild-quest board, `S_GUILD_QUEST_LIST` (0xC85C)
+
+Decoded from cap_final_client3 280 (1357 B) and client4 2084 (1359 B); both are reproduced byte
+for byte. No def ships for it and it nests arrays two deep, so the builder is raw.
+
+```
+header  [u16 questCount][u16 questOff][u16 tierCount][u16 tierOff]
+        [u16 guildNameOff][u16 starterNameOff]
+        7 x i32, i64 guildMoney, 3 x i32, i64 lastUpdated, 2 x i32, u8       (65 B)
+quest   [u16 here][u16 next] 3 array refs, 3 string refs, 9 x i32, u8        (59 B)
+tier    [u16 here][u16 next] i32 tier, i32 point, i16                        (14 B)
+```
+
+Data comes out in a fixed order that is **not** the ref-slot order: the two names, then the
+tiers, then the quests — and inside a quest, its three strings before its three sub-arrays. (Same
+family of trap as T94.1, where slots and data also disagreed.)
+
+### T98.1 The catalogue is sheet data, not guild state
+
+Two different guilds, ten minutes apart, list **the same six quests** — same ids, targets and
+rewards, in the same unsorted order (10000, 10001, 10004, 10002, 10003, 10006), each naming its
+text as `@GuildQuest:1000x001` / `...002` so no string travels. Everything that differs is in the
+header, plus **exactly one number in the array**: quest 10006’s countdown, 7095 seconds in
+client3 against 6823 in client4.
+
+That one difference is what settles the design: `remainSec` is computed as `ends_at - now`, not
+stored, and only the **running** quest needs a row. The catalogue lives in
+`GuildPackets.GuildQuestCatalogue`; the tiers (180 / 540 / 900 points) in `GuildQuestTiers`.
+
+### T98.2 What the header carries
+
+| offset | field | client3 280 | client4 2084 |
+|---|---|---|---|
+| 16 | guildId | 2 | 3 |
+| 20 | starterDbId | 1003 | 1 |
+| 28 | guildPoint | 20 | 0 |
+| 44 | guildMoney (i64) | 8898665 | 0 |
+| 64 | lastUpdated (i64) | 1789598130 | 1789608369 |
+| 76 | maxPoint | 900 | 900 |
+| — | guildName / starterName | sdg / New | fdh / dobb |
+
+`guildMoney` **8898665 is the same figure T90’s incentive left behind** (tap 2500 → 2504), which
+is a free cross-check that this field really is `guilds.money`. The seven scalars the capture
+cannot explain are constants in both frames and are named `QuestUnk1..8` on `GuildHandlers`.
+
+### T98.3 Serve points
+
+The board is pushed at two moments: in the enter-world burst beside `S_GUILD_INFO`
+(client3 280, client4 2084) and again right after the roster changes (client3 3020 — immediately
+after `S_GUILD_INFO` 3017 — and 4130, client4 2751). The roster case is wired into
+`EmitMemberAdded`; the enter-world case is a one-line call in whatever owns that burst.
+
+Start / finish / cancel were **never captured** — a 7-day cooldown kept them out of the session —
+so `SetGuildQuest` is the seam a later task drives and nothing about those packets is guessed.

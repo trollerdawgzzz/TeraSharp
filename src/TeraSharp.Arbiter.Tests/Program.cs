@@ -10193,6 +10193,173 @@ bool   isGuildWarAcceptable
             "the two opcodes that share one parser");
     }
 
+
+    // =======================================================================================
+    // T98 - the guild-quest board, S_GUILD_QUEST_LIST (0xC85C).
+    // Ground truth: cap_final_client3 280 (1357 B) and client4 2084 (1359 B).
+    // =======================================================================================
+
+    /// <summary>CapGuildQuestListSdg, body only (1353 bytes).</summary>
+    const string CapGuildQuestListSdg =
+          "06 00 8B 00 03 00 61 00 51 00 59 00 02 00 00 00 EB 03 00 00 01 00 00 00 14 00 00 00 00 00 00 00 "
+        + "64 00 00 00 00 00 00 00 69 C8 87 00 00 00 00 00 02 00 00 00 02 00 00 00 00 00 00 00 B2 19 AB 6A "
+        + "00 00 00 00 00 00 00 00 84 03 00 00 01 73 00 64 00 67 00 00 00 4E 00 65 00 77 00 00 00 61 00 6F "
+        + "00 00 00 00 00 B4 00 00 00 00 00 6F 00 7D 00 01 00 00 00 1C 02 00 00 00 00 7D 00 00 00 02 00 00 "
+        + "00 84 03 00 00 00 00 8B 00 56 01 01 00 22 01 00 00 00 00 02 00 36 01 C6 00 F0 00 1A 01 10 27 00 "
+        + "00 04 00 00 00 19 00 00 00 00 00 00 00 D0 02 00 00 00 00 00 00 C0 A8 00 00 02 00 00 00 01 00 00 "
+        + "00 00 40 00 47 00 75 00 69 00 6C 00 64 00 51 00 75 00 65 00 73 00 74 00 3A 00 31 00 30 00 30 00 "
+        + "30 00 30 00 30 00 30 00 31 00 00 00 40 00 47 00 75 00 69 00 6C 00 64 00 51 00 75 00 65 00 73 00 "
+        + "74 00 3A 00 31 00 30 00 30 00 30 00 30 00 30 00 30 00 32 00 00 00 73 00 64 00 67 00 00 00 22 01 "
+        + "00 00 00 00 00 00 00 00 00 00 00 00 00 00 0F 00 00 00 36 01 46 01 00 2D 31 01 45 01 00 00 00 00 "
+        + "00 00 46 01 00 00 01 2D 31 01 19 00 00 00 00 00 00 00 56 01 21 02 01 00 ED 01 00 00 00 00 02 00 "
+        + "01 02 91 01 BB 01 E5 01 11 27 00 00 02 00 00 00 1E 00 00 00 00 00 00 00 D0 02 00 00 00 00 00 00 "
+        + "C0 A8 00 00 03 00 00 00 01 00 00 00 00 40 00 47 00 75 00 69 00 6C 00 64 00 51 00 75 00 65 00 73 "
+        + "00 74 00 3A 00 31 00 30 00 30 00 30 00 31 00 30 00 30 00 31 00 00 00 40 00 47 00 75 00 69 00 6C "
+        + "00 64 00 51 00 75 00 65 00 73 00 74 00 3A 00 31 00 30 00 30 00 30 00 31 00 30 00 30 00 32 00 00 "
+        + "00 73 00 64 00 67 00 00 00 ED 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 58 02 00 00 01 02 11 "
+        + "02 00 2D 31 01 2C 01 00 00 00 00 00 00 11 02 00 00 01 2D 31 01 1E 00 00 00 00 00 00 00 21 02 EC "
+        + "02 01 00 B8 02 00 00 00 00 02 00 CC 02 5C 02 86 02 B0 02 14 27 00 00 05 00 00 00 14 00 00 00 00 "
+        + "00 00 00 D0 02 00 00 00 00 00 00 C0 A8 00 00 03 00 00 00 02 00 00 00 00 40 00 47 00 75 00 69 00 "
+        + "6C 00 64 00 51 00 75 00 65 00 73 00 74 00 3A 00 31 00 30 00 30 00 30 00 34 00 30 00 30 00 31 00 "
+        + "00 00 40 00 47 00 75 00 69 00 6C 00 64 00 51 00 75 00 65 00 73 00 74 00 3A 00 31 00 30 00 30 00 "
+        + "30 00 34 00 30 00 30 00 32 00 00 00 73 00 64 00 67 00 00 00 B8 02 00 00 00 00 00 00 00 00 00 00 "
+        + "00 00 00 00 32 00 00 00 CC 02 DC 02 00 2D 31 01 9F 01 00 00 00 00 00 00 DC 02 00 00 01 2D 31 01 "
+        + "1E 00 00 00 00 00 00 00 EC 02 B7 03 01 00 83 03 00 00 00 00 02 00 97 03 27 03 51 03 7B 03 12 27 "
+        + "00 00 00 00 00 00 0A 00 00 00 00 00 00 00 D0 02 00 00 00 00 00 00 C0 A8 00 00 01 00 00 00 01 00 "
+        + "00 00 00 40 00 47 00 75 00 69 00 6C 00 64 00 51 00 75 00 65 00 73 00 74 00 3A 00 31 00 30 00 30 "
+        + "00 30 00 32 00 30 00 30 00 31 00 00 00 40 00 47 00 75 00 69 00 6C 00 64 00 51 00 75 00 65 00 73 "
+        + "00 74 00 3A 00 31 00 30 00 30 00 30 00 32 00 30 00 30 00 32 00 00 00 73 00 64 00 67 00 00 00 83 "
+        + "03 00 00 00 00 00 00 00 00 00 00 00 00 00 00 2C 01 00 00 97 03 A7 03 00 2D 31 01 69 00 00 00 00 "
+        + "00 00 00 A7 03 00 00 01 2D 31 01 23 00 00 00 00 00 00 00 B7 03 82 04 01 00 4E 04 00 00 00 00 02 "
+        + "00 62 04 F2 03 1C 04 46 04 13 27 00 00 00 00 00 00 0F 00 00 00 00 00 00 00 D0 02 00 00 00 00 00 "
+        + "00 C0 A8 00 00 01 00 00 00 01 00 00 00 00 40 00 47 00 75 00 69 00 6C 00 64 00 51 00 75 00 65 00 "
+        + "73 00 74 00 3A 00 31 00 30 00 30 00 30 00 33 00 30 00 30 00 31 00 00 00 40 00 47 00 75 00 69 00 "
+        + "6C 00 64 00 51 00 75 00 65 00 73 00 74 00 3A 00 31 00 30 00 30 00 30 00 33 00 30 00 30 00 32 00 "
+        + "00 00 73 00 64 00 67 00 00 00 4E 04 00 00 00 00 00 00 00 00 00 00 00 00 00 00 0F 00 00 00 62 04 "
+        + "72 04 00 2D 31 01 04 01 00 00 00 00 00 00 72 04 00 00 01 2D 31 01 37 00 00 00 00 00 00 00 82 04 "
+        + "00 00 01 00 19 05 00 00 00 00 02 00 2D 05 BD 04 E7 04 11 05 16 27 00 00 00 00 00 00 28 00 00 00 "
+        + "02 00 00 00 78 00 00 00 00 00 00 00 B7 1B 00 00 01 00 00 00 01 00 00 00 00 40 00 47 00 75 00 69 "
+        + "00 6C 00 64 00 51 00 75 00 65 00 73 00 74 00 3A 00 31 00 30 00 30 00 30 00 36 00 30 00 30 00 31 "
+        + "00 00 00 40 00 47 00 75 00 69 00 6C 00 64 00 51 00 75 00 65 00 73 00 74 00 3A 00 31 00 30 00 30 "
+        + "00 30 00 36 00 30 00 30 00 32 00 00 00 73 00 64 00 67 00 00 00 19 05 00 00 22 00 00 00 D2 07 00 "
+        + "00 00 00 00 00 01 00 00 00 2D 05 3D 05 00 2D 31 01 4C 04 00 00 00 00 00 00 3D 05 00 00 01 2D 31 "
+        + "01 3C 00 00 00 00 00 00 00";
+
+    /// <summary>CapGuildQuestListFdh, body only (1355 bytes).</summary>
+    const string CapGuildQuestListFdh =
+          "06 00 8D 00 03 00 63 00 51 00 59 00 03 00 00 00 01 00 00 00 01 00 00 00 00 00 00 00 00 00 00 00 "
+        + "64 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 02 00 00 00 02 00 00 00 00 00 00 00 B1 41 AB 6A "
+        + "00 00 00 00 00 00 00 00 84 03 00 00 01 66 00 64 00 68 00 00 00 64 00 6F 00 62 00 62 00 00 00 63 "
+        + "00 71 00 00 00 00 00 B4 00 00 00 00 00 71 00 7F 00 01 00 00 00 1C 02 00 00 00 00 7F 00 00 00 02 "
+        + "00 00 00 84 03 00 00 00 00 8D 00 58 01 01 00 24 01 00 00 00 00 02 00 38 01 C8 00 F2 00 1C 01 10 "
+        + "27 00 00 04 00 00 00 19 00 00 00 00 00 00 00 D0 02 00 00 00 00 00 00 C0 A8 00 00 02 00 00 00 01 "
+        + "00 00 00 00 40 00 47 00 75 00 69 00 6C 00 64 00 51 00 75 00 65 00 73 00 74 00 3A 00 31 00 30 00 "
+        + "30 00 30 00 30 00 30 00 30 00 31 00 00 00 40 00 47 00 75 00 69 00 6C 00 64 00 51 00 75 00 65 00 "
+        + "73 00 74 00 3A 00 31 00 30 00 30 00 30 00 30 00 30 00 30 00 32 00 00 00 66 00 64 00 68 00 00 00 "
+        + "24 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 0F 00 00 00 38 01 48 01 00 2D 31 01 45 01 00 00 "
+        + "00 00 00 00 48 01 00 00 01 2D 31 01 19 00 00 00 00 00 00 00 58 01 23 02 01 00 EF 01 00 00 00 00 "
+        + "02 00 03 02 93 01 BD 01 E7 01 11 27 00 00 02 00 00 00 1E 00 00 00 00 00 00 00 D0 02 00 00 00 00 "
+        + "00 00 C0 A8 00 00 03 00 00 00 01 00 00 00 00 40 00 47 00 75 00 69 00 6C 00 64 00 51 00 75 00 65 "
+        + "00 73 00 74 00 3A 00 31 00 30 00 30 00 30 00 31 00 30 00 30 00 31 00 00 00 40 00 47 00 75 00 69 "
+        + "00 6C 00 64 00 51 00 75 00 65 00 73 00 74 00 3A 00 31 00 30 00 30 00 30 00 31 00 30 00 30 00 32 "
+        + "00 00 00 66 00 64 00 68 00 00 00 EF 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 58 02 00 00 03 "
+        + "02 13 02 00 2D 31 01 2C 01 00 00 00 00 00 00 13 02 00 00 01 2D 31 01 1E 00 00 00 00 00 00 00 23 "
+        + "02 EE 02 01 00 BA 02 00 00 00 00 02 00 CE 02 5E 02 88 02 B2 02 14 27 00 00 05 00 00 00 14 00 00 "
+        + "00 00 00 00 00 D0 02 00 00 00 00 00 00 C0 A8 00 00 03 00 00 00 02 00 00 00 00 40 00 47 00 75 00 "
+        + "69 00 6C 00 64 00 51 00 75 00 65 00 73 00 74 00 3A 00 31 00 30 00 30 00 30 00 34 00 30 00 30 00 "
+        + "31 00 00 00 40 00 47 00 75 00 69 00 6C 00 64 00 51 00 75 00 65 00 73 00 74 00 3A 00 31 00 30 00 "
+        + "30 00 30 00 34 00 30 00 30 00 32 00 00 00 66 00 64 00 68 00 00 00 BA 02 00 00 00 00 00 00 00 00 "
+        + "00 00 00 00 00 00 32 00 00 00 CE 02 DE 02 00 2D 31 01 9F 01 00 00 00 00 00 00 DE 02 00 00 01 2D "
+        + "31 01 1E 00 00 00 00 00 00 00 EE 02 B9 03 01 00 85 03 00 00 00 00 02 00 99 03 29 03 53 03 7D 03 "
+        + "12 27 00 00 00 00 00 00 0A 00 00 00 00 00 00 00 D0 02 00 00 00 00 00 00 C0 A8 00 00 01 00 00 00 "
+        + "01 00 00 00 00 40 00 47 00 75 00 69 00 6C 00 64 00 51 00 75 00 65 00 73 00 74 00 3A 00 31 00 30 "
+        + "00 30 00 30 00 32 00 30 00 30 00 31 00 00 00 40 00 47 00 75 00 69 00 6C 00 64 00 51 00 75 00 65 "
+        + "00 73 00 74 00 3A 00 31 00 30 00 30 00 30 00 32 00 30 00 30 00 32 00 00 00 66 00 64 00 68 00 00 "
+        + "00 85 03 00 00 00 00 00 00 00 00 00 00 00 00 00 00 2C 01 00 00 99 03 A9 03 00 2D 31 01 69 00 00 "
+        + "00 00 00 00 00 A9 03 00 00 01 2D 31 01 23 00 00 00 00 00 00 00 B9 03 84 04 01 00 50 04 00 00 00 "
+        + "00 02 00 64 04 F4 03 1E 04 48 04 13 27 00 00 00 00 00 00 0F 00 00 00 00 00 00 00 D0 02 00 00 00 "
+        + "00 00 00 C0 A8 00 00 01 00 00 00 01 00 00 00 00 40 00 47 00 75 00 69 00 6C 00 64 00 51 00 75 00 "
+        + "65 00 73 00 74 00 3A 00 31 00 30 00 30 00 30 00 33 00 30 00 30 00 31 00 00 00 40 00 47 00 75 00 "
+        + "69 00 6C 00 64 00 51 00 75 00 65 00 73 00 74 00 3A 00 31 00 30 00 30 00 30 00 33 00 30 00 30 00 "
+        + "32 00 00 00 66 00 64 00 68 00 00 00 50 04 00 00 00 00 00 00 00 00 00 00 00 00 00 00 0F 00 00 00 "
+        + "64 04 74 04 00 2D 31 01 04 01 00 00 00 00 00 00 74 04 00 00 01 2D 31 01 37 00 00 00 00 00 00 00 "
+        + "84 04 00 00 01 00 1B 05 00 00 00 00 02 00 2F 05 BF 04 E9 04 13 05 16 27 00 00 00 00 00 00 28 00 "
+        + "00 00 02 00 00 00 78 00 00 00 00 00 00 00 A7 1A 00 00 01 00 00 00 01 00 00 00 00 40 00 47 00 75 "
+        + "00 69 00 6C 00 64 00 51 00 75 00 65 00 73 00 74 00 3A 00 31 00 30 00 30 00 30 00 36 00 30 00 30 "
+        + "00 31 00 00 00 40 00 47 00 75 00 69 00 6C 00 64 00 51 00 75 00 65 00 73 00 74 00 3A 00 31 00 30 "
+        + "00 30 00 30 00 36 00 30 00 30 00 32 00 00 00 66 00 64 00 68 00 00 00 1B 05 00 00 22 00 00 00 D2 "
+        + "07 00 00 00 00 00 00 01 00 00 00 2F 05 3F 05 00 2D 31 01 4C 04 00 00 00 00 00 00 3F 05 00 00 01 "
+        + "2D 31 01 3C 00 00 00 00 00 00 00";
+
+    /// <summary>The six catalogue rows with one quest's countdown replaced, as the wire has it.</summary>
+    static List<GuildPackets.GuildQuestRow> T98Catalogue(int runningQuestId, int remainSec)
+    {
+        var rows = new List<GuildPackets.GuildQuestRow>();
+        foreach (var q in GuildPackets.GuildQuestCatalogue)
+            rows.Add(q.QuestId == runningQuestId ? q with { RemainSec = remainSec } : q);
+        return rows;
+    }
+
+    /// <summary>
+    /// T98 - S_GUILD_QUEST_LIST, byte-exact against both captured frames.
+    ///
+    /// <para><b>The catalogue is sheet data, not guild state.</b> Two different guilds, ten
+    /// minutes apart, list the same six quests with the same ids, targets and rewards in the same
+    /// unsorted order (10000, 10001, 10004, 10002, 10003, 10006). Everything that differs is in
+    /// the header - guild id, money, the member who started the running quest, the points - plus
+    /// ONE number in the array: quest 10006's countdown, 7095 seconds in client3 and 6823 in
+    /// client4. That is what makes <c>remainSec</c> a computed <c>ends_at - now</c> rather than a
+    /// stored column, and it is why only the running quest needs a row.</para>
+    ///
+    /// <para>The packet nests arrays two deep and no def ships for it, so the builder is raw. The
+    /// data sections come out in a fixed order that is NOT the ref-slot order: the two names,
+    /// then the tiers, then the quests - and inside a quest, its three strings before its three
+    /// sub-arrays.</para>
+    /// </summary>
+    [Test] public static void T98_guild_quest_list_matches_cap_final()
+    {
+        Hex.Eq(GuildPackets.BuildSGuildQuestListBody(
+                2, 1003, GuildHandlers.QuestUnk1, 20, GuildHandlers.QuestUnk2, GuildHandlers.QuestUnk3,
+                GuildHandlers.QuestUnk4, 8898665L, GuildHandlers.QuestUnk5, GuildHandlers.QuestUnk6,
+                GuildHandlers.QuestUnk7, 1789598130L, GuildHandlers.QuestUnk8, GuildHandlers.QuestMaxPoint,
+                GuildHandlers.QuestFlag, "sdg", "New",
+                GuildPackets.GuildQuestTiers, T98Catalogue(10006, 7095)),
+            CapGuildQuestListSdg,
+            "cap_final_client3 frame 280 - guild 2, 8898665 money, New running 10006");
+
+        Hex.Eq(GuildPackets.BuildSGuildQuestListBody(
+                3, 1, GuildHandlers.QuestUnk1, 0, GuildHandlers.QuestUnk2, GuildHandlers.QuestUnk3,
+                GuildHandlers.QuestUnk4, 0L, GuildHandlers.QuestUnk5, GuildHandlers.QuestUnk6,
+                GuildHandlers.QuestUnk7, 1789608369L, GuildHandlers.QuestUnk8, GuildHandlers.QuestMaxPoint,
+                GuildHandlers.QuestFlag, "fdh", "dobb",
+                GuildPackets.GuildQuestTiers, T98Catalogue(10006, 6823)),
+            CapGuildQuestListFdh,
+            "cap_final_client4 frame 2084 - a different guild, and only the header and one countdown move");
+
+        Hex.True(GuildPackets.S_GUILD_QUEST_LIST == 0xC85C, "the opcode both frames carry");
+        Hex.True(GuildPackets.GuildQuestCatalogue.Length == 6
+                 && GuildPackets.GuildQuestTiers.Length == 3,
+            "six quests and three point tiers at 180 / 540 / 900");
+    }
+
+    /// <summary>T98 - the guild_quests row the list reads, round-tripped.</summary>
+    [Test] public static void T98_guild_quest_state_round_trips()
+    {
+        using var store = StoreWithTwoAccounts();
+        Hex.True(store.GetGuildQuests(1).Count == 0, "a guild that has never run one has no rows");
+        Hex.True(store.GetRunningGuildQuest(1) == null, "and nothing running");
+
+        Hex.True(store.SetGuildQuest(1, 10006, 1, 1789550000L, 1789605225L, 1003, 20), "the row goes in");
+        var running = store.GetRunningGuildQuest(1);
+        Hex.True(running != null && running.QuestId == 10006 && running.StarterDbId == 1003
+                 && running.EndsAt == 1789605225L,
+            "and comes back as the running quest");
+
+        Hex.True(store.SetGuildQuest(1, 10006, 0, 0, 0, 0, 0), "finishing it is the same upsert");
+        Hex.True(store.GetRunningGuildQuest(1) == null, "status 0 is not running");
+        Hex.True(store.GetGuildQuests(1).Count == 1, "but the row stays - one per quest, not per run");
+    }
+
     // ---- The rules ----
 
     [Test] public static void T30_system_message_format_matches_the_capture()
