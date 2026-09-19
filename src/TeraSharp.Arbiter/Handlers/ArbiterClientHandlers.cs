@@ -55,6 +55,10 @@ public static class ArbiterClientHandlers
     public const ushort C_REQUEST_CANDIDATE_LIST = 0x81D7; // 33239
     public const ushort C_SHOW_AWESOMIUMWEB_SHOP = 0xCF8F; // 53135
     public const ushort S_SHOW_AWESOMIUMWEB_SHOP = 0xDFAE; // 57262
+
+    /// <summary>T107. Alt+A. 35801 / 62158 - the GM tool's embedded web view asking for its URL.</summary>
+    public const ushort C_REQUEST_SERVER_ADMINTOOL_AWESOMIUM_URL = 0x8BD9;
+    public const ushort S_RESPONSE_SERVER_ADMINTOOL_AWESOMIUM_URL = 0xF2CE;
     public const ushort C_RESET_ALL_DUNGEON = 0x5867;      // 22631
 
     /// <summary>T60. 58817. The Arbiter owns it and forwards it to World as AS_ADD_TRADE_BAG.</summary>
@@ -167,7 +171,73 @@ public static class ArbiterClientHandlers
         World.ChatPackets.C_KICK_CHANNEL_MEMBER,
         World.ChatPackets.C_CHANGE_CHANNEL_PASSWORD,
         World.ChatPackets.C_REUQUEST_JOINED_CHANNEL_LIST,
+        // T107 - Alt+A. This is why the GM panel never opened: the request was being FORWARDED
+        // to a World that has no handler for it, so the web view never got a URL and the window
+        // stayed shut. The lobby was already byte-equal to the capture (T104/T106); the gate was
+        // here, 350 frames later.
+        C_REQUEST_SERVER_ADMINTOOL_AWESOMIUM_URL,
     };
+
+    // =========================================================================================
+    // 0. C_REQUEST_SERVER_ADMINTOOL_AWESOMIUM_URL -> S_RESPONSE_..._URL   (Alt+A)      (T107)
+    // =========================================================================================
+
+    /// <summary>
+    /// The GM tool is an <b>Awesomium web view</b>, and Alt+A does not open a window - it asks
+    /// the server where to point one. cap_final_gm_client2 407 is the whole handshake:
+    /// <c>C_REQUEST_SERVER_ADMINTOOL_AWESOMIUM_URL</c> at frame <b>405</b> (4 bytes, no body),
+    /// <c>S_RESPONSE_SERVER_ADMINTOOL_AWESOMIUM_URL</c> at <b>412</b>, and the tool's first
+    /// <c>C_ADMIN_*</c> at <b>524</b>. The same three appear again on the second enter-world
+    /// (2741 / 2747 / 2924), so the client asks once per Alt+A and waits for the answer.
+    ///
+    /// <para><b>The captured reply carries no URL at all:</b>
+    /// <c>0C 00 CE F2 08 00 0A 00 00 00 00 00</c> is <c>[u16 off=8][u16 off=10]</c> and then two
+    /// EMPTY wide strings. That server had no admin-tool URL configured and the panel opened
+    /// anyway - so what the window waits for is the REPLY, not its contents. Sending the empty
+    /// form is both correct and all we can honestly send.</para>
+    /// </summary>
+    /// <summary>The two <c>[u16 offset]</c> string refs that follow the packet header.</summary>
+    public const int AdminToolUrlFixedSize = 4;
+
+    /// <summary>A client packet's <c>[u16 len][u16 opcode]</c> header.</summary>
+    public const int AdminToolHeaderSize = 4;
+
+    /// <summary>
+    /// S_RESPONSE_SERVER_ADMINTOOL_AWESOMIUM_URL. Both strings default to empty, which is
+    /// frame 412 byte for byte; pass a URL and it goes out in the first slot.
+    /// </summary>
+    public static byte[] BuildAdminToolUrl(string url = "", string arg = "")
+    {
+        int off1 = AdminToolHeaderSize + AdminToolUrlFixedSize;
+        int off2 = off1 + (url.Length + 1) * 2;
+        int total = off2 + (arg.Length + 1) * 2;
+
+        var p = new byte[total];
+        BitConverter.GetBytes((ushort)total).CopyTo(p, 0);
+        BitConverter.GetBytes(S_RESPONSE_SERVER_ADMINTOOL_AWESOMIUM_URL).CopyTo(p, 2);
+        BitConverter.GetBytes((ushort)off1).CopyTo(p, 4);
+        BitConverter.GetBytes((ushort)off2).CopyTo(p, 6);
+        System.Text.Encoding.Unicode.GetBytes(url).CopyTo(p, off1);
+        System.Text.Encoding.Unicode.GetBytes(arg).CopyTo(p, off2);
+        return p;   // the terminators are already zero
+    }
+
+    /// <summary>
+    /// C_REQUEST_SERVER_ADMINTOOL_AWESOMIUM_URL. Four bytes, no body, nothing to read - the
+    /// reply is the whole job.
+    ///
+    /// <para>Before T107 this opcode was registered nowhere and was not in
+    /// <see cref="ArbiterOwned"/>, so <c>PacketDispatcher</c> forwarded it to World, which has no
+    /// handler for it. The client sat waiting for a URL it was never going to get, which is
+    /// exactly what "Alt+A does nothing" looks like from the outside.</para>
+    /// </summary>
+    public static bool OnRequestAdminToolUrl(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        s.Send(BuildAdminToolUrl());
+        log.LogInformation("C_REQUEST_SERVER_ADMINTOOL_AWESOMIUM_URL from {Name} - answered with the empty URL form",
+            s.SelectedCharacter?.Name);
+        return true;
+    }
 
     // =========================================================================================
     // 1. C_SHOW_ITEM_TOOLTIP_EX -> S_SHOW_ITEM_TOOLTIP    (the potion counter)

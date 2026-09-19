@@ -11267,6 +11267,52 @@ bool   isGuildWarAcceptable
             "frame 15 S_CONFIRM_INVITE_CODE_BUTTON: [u16 strOff=0x0F][u8 1][i64 unix][wchar terminator]");
     }
 
+    /// <summary>
+    /// T107 - why Alt+A did nothing, 350 frames past the lobby.
+    ///
+    /// <para>The GM tool is an Awesomium web view: Alt+A does not open a window, it asks the
+    /// server where to point one. cap_final_gm_client2 frame <b>405</b> is
+    /// <c>C_REQUEST_SERVER_ADMINTOOL_AWESOMIUM_URL</c> (4 bytes, no body), <b>412</b> is the
+    /// reply, and <b>524</b> is the tool's first <c>C_ADMIN_*</c>. The second enter-world repeats
+    /// it at 2741 / 2747 / 2924, so the client asks once per Alt+A and waits for the answer.</para>
+    ///
+    /// <para>TeraSharp registered that opcode NOWHERE and did not list it in
+    /// <c>ArbiterOwned</c>, so <c>PacketDispatcher</c> forwarded it to a World that has no
+    /// handler for it. The lobby was already byte-equal (T104/T106); this was the gate.</para>
+    /// </summary>
+    [Test] public static void T107_the_admintool_url_request_is_answered()
+    {
+        Hex.True(ArbiterClientHandlers.C_REQUEST_SERVER_ADMINTOOL_AWESOMIUM_URL == 0x8BD9
+                 && ArbiterClientHandlers.S_RESPONSE_SERVER_ADMINTOOL_AWESOMIUM_URL == 0xF2CE,
+            "35801 -> 62158, the two opcodes the capture names");
+
+        // The whole fix: without this the packet is forwarded to World instead of answered.
+        Hex.True(ArbiterClientHandlers.ArbiterOwned.Contains(
+                     ArbiterClientHandlers.C_REQUEST_SERVER_ADMINTOOL_AWESOMIUM_URL),
+            "Arbiter-owned, so it is never forwarded again");
+
+        // Frame 412, byte for byte. Note what it does NOT contain: the real server answered with
+        // TWO EMPTY strings - it had no admin-tool URL configured - and the panel opened anyway.
+        // So the window waits for the reply, not for its contents.
+        Hex.Eq(ArbiterClientHandlers.BuildAdminToolUrl(),
+            "0C 00 CE F2 08 00 0A 00 00 00 00 00",
+            "cap_final_gm_client2 frame 412, and frame 2747 is the same twelve bytes");
+
+        var url = ArbiterClientHandlers.BuildAdminToolUrl("http://127.0.0.1:8050/");
+        Hex.True(BitConverter.ToUInt16(url, 0) == url.Length && url.Length == 56
+                 && BitConverter.ToUInt16(url, 2) == ArbiterClientHandlers.S_RESPONSE_SERVER_ADMINTOOL_AWESOMIUM_URL,
+            $"a real URL still self-describes its length: {url.Length}");
+        Hex.True(BitConverter.ToUInt16(url, 4) == 8 && BitConverter.ToUInt16(url, 6) == 54,
+            "the first ref stays at 8; the second moves past the string");
+        Hex.True(System.Text.Encoding.Unicode.GetString(url, 8, 44) == "http://127.0.0.1:8050/"
+                 && url[52] == 0 && url[53] == 0 && url[54] == 0 && url[55] == 0,
+            "and both wide strings are terminated");
+
+        // The request itself carries nothing, so a zero-length body must still be answered.
+        Hex.True(ArbiterClientHandlers.AdminToolUrlFixedSize == 4,
+            "two u16 refs after the header - frame 412 puts the first string at packet offset 8");
+    }
+
     // ---- The rules ----
 
     [Test] public static void T30_system_message_format_matches_the_capture()
