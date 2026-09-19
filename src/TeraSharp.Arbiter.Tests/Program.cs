@@ -11244,7 +11244,7 @@ bool   isGuildWarAcceptable
             "26 bytes of 0xFAEB");
         Hex.True(BitConverter.ToInt64(p, ArbiterClientHandlers.ElectionDeadlineOffset)
                  == ArbiterClientHandlers.ElectionDeadline
-                 && ArbiterClientHandlers.ElectionDeadline == 1790035625L,
+                 && ArbiterClientHandlers.ElectionDeadline == 1790395049L,
             "the deadline is the only non-zero field, at +18");
         Hex.True(p[4..ArbiterClientHandlers.ElectionDeadlineOffset].All(x => x == 0),
             "everything ahead of it is zero in all five captures, so its fields stay unnamed");
