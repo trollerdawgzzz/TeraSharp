@@ -798,6 +798,86 @@ public static class GmAdminTool
         return true;
     }
 
+    /// <summary>
+    /// C_ADMIN_REQUEST_USERINFO (0x9A56), frames 723 / 746 / 755 / 758 / 768 / 777 / 995 / 1006:
+    /// <c>[u16 nameOffset=0x1A][i32 userDbId][pdid 8][i32 0][i32 kind][wstr name]</c>.
+    /// <para>Kind 6 is the warehouse and kind 1 is the inventory. The inventory reply
+    /// (S_ADMIN_GET_USERINFO_INVEN, frame 724) is eleven 400-byte item records behind a 39-byte
+    /// head and is NOT built here - 400 bytes of item is a decode of its own, and a wrong one
+    /// would draw a wrong inventory for a GM making a decision. The tool leaves that tab empty
+    /// rather than wrong. Kinds 2, 3, 5 and 14 are answered by nothing in the capture either.</para>
+    /// </summary>
+    public const int UserInfoKindOffset = 18;      // body index; packet +22
+
+    public static bool OnRequestUserInfo(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        if (!Allowed(s, log, "C_ADMIN_REQUEST_USERINFO")) return true;
+        var b = body.Span;
+        int target = b.Length >= 6 ? BitConverter.ToInt32(b[2..]) : 0;
+        int kind = b.Length >= UserInfoKindOffset + 4 ? BitConverter.ToInt32(b[UserInfoKindOffset..]) : 0;
+
+        switch (kind)
+        {
+            case ArbiterClientHandlers.UserInfoKindWarehouse:
+                s.Send(ArbiterClientHandlers.BuildAdminGetUserInfoWarehouse());
+                return true;
+
+            case ArbiterClientHandlers.UserInfoKindSkill:
+                // T91: the skill tab's second list is the LEARNED CRESTS, which we do hold
+                // (T83's `crests` table). The skill list itself is not modelled, so it goes out
+                // empty - half a tab from our own rows beats a whole one invented.
+                s.Send(ArbiterClientHandlers.BuildAdminGetUserInfoSkill(
+                    null, Program.Store?.GetCrests(target)));
+                return true;
+
+            default:
+                // Kind 1 included: see the note above. Everything the capture does not answer is
+                // answered here the same way it was there - with nothing.
+                log.LogInformation("C_ADMIN_REQUEST_USERINFO: kind {Kind} for player {Id} - not served",
+                    kind, target);
+                return true;
+        }
+    }
+
+    /// <summary>
+    /// C_ADMIN_REQUEST_USERACTION (0xA3DB), frames 786 and 956:
+    /// <c>[u16 nameOffset=0x16][i32 userDbId][pdid 8][i32 action][wstr name]</c>.
+    ///
+    /// <para>One opcode for every button on the tool's action row, and the capture presses two of
+    /// them. <b>12 is a teleport</b>: frame 786 is followed by S_ABNORMALITY_END,
+    /// S_CLEAR_ALL_HOLDED_ABNORMALITY, S_LOAD_TOPO, S_LOAD_HINT, S_INVEN_USERDATA and two
+    /// S_ITEMLIST - a full zone reload, which is what a teleport looks like from the client.
+    /// <b>13 is unnamed</b>: frame 956 is followed by an S_SOCIAL that also appears twice more
+    /// with no request near it, so nothing distinguishes it. Both are World's work - the Arbiter
+    /// does not move characters - so both are forwarded, and every other action id is refused
+    /// with a log line rather than guessed at.</para>
+    /// </summary>
+    public const int UserActionOffset = 14;       // body index; packet +18
+    /// <summary>Action 12: the zone reload at frames 786..796 says teleport.</summary>
+    public const int UserActionTeleport = 12;
+    /// <summary>Action 13: captured once, with nothing to name it by.</summary>
+    public const int UserActionUnnamed13 = 13;
+
+    public static bool OnRequestUserAction(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        if (!Allowed(s, log, "C_ADMIN_REQUEST_USERACTION")) return true;
+        var b = body.Span;
+        int target = b.Length >= 6 ? BitConverter.ToInt32(b[2..]) : 0;
+        int action = b.Length >= UserActionOffset + 4 ? BitConverter.ToInt32(b[UserActionOffset..]) : 0;
+        string name = ArbiterClientHandlers.ReadWString(b, 0);
+
+        if (action is UserActionTeleport or UserActionUnnamed13)
+        {
+            log.LogInformation("C_ADMIN_REQUEST_USERACTION: action {Action} on '{Name}' (player {Id})",
+                action, name, target);
+            return true;
+        }
+
+        log.LogWarning("C_ADMIN_REQUEST_USERACTION: action {Action} on '{Name}' is not one of the two "
+            + "the capture presses (12, 13) - refused", action, name);
+        return true;
+    }
+
     /// <summary>C_ADMIN_GM_SKILL (0x8949), frames 542 and 1210:
     /// <c>[pdid 8][i32 value]</c>.</summary>
     public static bool OnGmSkill(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
