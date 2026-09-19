@@ -126,7 +126,7 @@ public sealed class LoginHandlers
             var inv = new byte[17];
             inv[0] = 0x11; inv[1] = 0x00; inv[2] = 0x1D; inv[3] = 0xD4;                                 // S_CONFIRM_INVITE_CODE_BUTTON
             inv[4] = 0x0F; inv[5] = 0x00; inv[6] = 0x01;                                               // [u16 off=0x0F][u8 1]
-            BitConverter.GetBytes(DateTimeOffset.UtcNow.ToUnixTimeSeconds()).CopyTo(inv, 7);           // [i64 unix]
+            BitConverter.GetBytes(DateTimeOffset.UtcNow.AddDays(9).ToUnixTimeSeconds()).CopyTo(inv, 7);   // [i64 unix expiry] - captures carry ~9 days ahead (T106)
             inv[15] = 0x00; inv[16] = 0x00;
             s.Send(inv);
         }
@@ -185,6 +185,7 @@ public sealed class LoginHandlers
             ["unk1"] = 1, ["unk2"] = 0, ["unk3"] = 72339069014638592UL,
         });
         s.SendByDef("S_BROCAST_GUILD_FLAG", new Dictionary<string, object>());
+        ArbiterClientHandlers.SendCurrentElectionState(s);   // T106: frame 49, constant
         SendContentFlags(s);
 
         s.SendByDef("S_LOGIN", new Dictionary<string, object>

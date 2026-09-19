@@ -29,6 +29,7 @@ public static class WorldEntry
             ["unk1"] = 1, ["unk2"] = 0, ["unk3"] = 72339069014638592UL,
         });
         s.SendByDef("S_BROCAST_GUILD_FLAG", new Dictionary<string, object>());
+        ArbiterClientHandlers.SendCurrentElectionState(s);   // T106
         int[] contents = { 2, 3, 4, 8, 9, 22, 23, 20, 21, 34 };
         bool[] disabled = { false, false, false, true, true, false, false, false, false, false };
         for (int i = 0; i < contents.Length; i++)

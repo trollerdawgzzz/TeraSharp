@@ -37,9 +37,14 @@ public static class Program
 
     public static async Task Main(string[] args)
     {
+        var logFolder = PacketLogsPath;
         using var loggerFactory = LoggerFactory.Create(b =>
         {
-            b.AddSimpleConsole(o => { o.SingleLine = true; o.TimestampFormat = "HH:mm:ss "; });
+            // T106: console shows Warning+ by default (TERASHARP_LOG_LEVEL overrides); the daily file takes everything
+            b.AddSimpleConsole(o => { o.SingleLine = true; o.TimestampFormat = "HH:mm:ss "; })
+             .AddFilter<Microsoft.Extensions.Logging.Console.ConsoleLoggerProvider>(
+                 null, TeraSharp.Arbiter.Web.ArbiterLogProvider.ConsoleLevel());
+            b.AddProvider(new TeraSharp.Arbiter.Web.ArbiterLogProvider(logFolder));
             b.SetMinimumLevel(LogLevel.Debug);
         });
 
@@ -113,6 +118,15 @@ public static class Program
             .Select(s => new TeraSharp.Arbiter.Web.AdminOnlineRow((int)(s.SelectedCharacter?.Id ?? 0),
                 s.SelectedCharacter?.Name ?? "", s.SelectedCharacter?.Level ?? 0,
                 s.SelectedCharacter?.Zone ?? 0, s.Account.Name)).ToList(), log);
+        if (admin != null)
+        {
+            admin.Api.StartedAt = DateTimeOffset.UtcNow;
+            admin.Api.WorldStatus = () => (World?.LinkCount ?? 0, World?.IsReady ?? false, World?.InWorldSessions().Count ?? 0);
+            admin.Api.KickPlayer = id => { var s = World?.SessionForPlayerId(id); if (s == null) return false; s.Close(); return true; };
+            admin.Api.Announce = text => { var all = World?.InWorldSessions() ?? new List<GameSession>();
+                foreach (var s in all) s.SendByDef("S_SYSTEM_MESSAGE", new Dictionary<string, object> { ["message"] = text });
+                return all.Count; };
+        }
 
         using var cts = new CancellationTokenSource();
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; log.LogInformation("Shutdown requested"); cts.Cancel(); };
