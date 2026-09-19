@@ -1002,6 +1002,23 @@ public sealed class DbProxyHandlers
     // the rename survive a dropped 0x2856.
     public const ushort SA_UPDATE_RANK_USERNAME = 0x161C;
 
+    // --- T104: SA_WATCH_MOVIE (0x155C) ---
+    // One-way, and the write that was missing behind C_WATCHED_MOVIES: World tells us a
+    // cinematic finished playing and the Arbiter files it on the ACCOUNT.
+    //   _Handler_SA_WATCH_MOVIE (Arb_part_066.c:6455) guards on  0x11 < frameLength,  so the
+    //   frame is at least 0x12 = 18 bytes, and takes the user by the u64 at frame +6.
+    //   Handler_SA_WATCH_MOVIE (Arb_part_062.c:18768) reads the movie id at frame +0x0E and
+    //   calls Account::InsertWatchedMovieWithLock on User+0x3f40.
+    // Frame:  [u32 len][u16 0x155C][u64 arbiterUserId][u32 movieId]   - payload 12 bytes.
+    // There is no AS_ partner: nothing is sent back.
+    public const ushort SA_WATCH_MOVIE = 0x155C;
+    /// <summary>Smallest legal SA_WATCH_MOVIE frame - the decompile's <c>0x11 &lt; len</c>.</summary>
+    public const int WatchMovieMinFrame = 0x12;
+    /// <summary>Where the movie id sits in the PAYLOAD (frame +0x0E, minus the 6-byte header).</summary>
+    public const int WatchMovieIdOffset = 8;
+    /// <summary>The smallest legal PAYLOAD: the frame guard minus <c>[u32 len][u16 opcode]</c>.</summary>
+    public const int WatchMovieMinPayload = WatchMovieMinFrame - 6;
+
     // --- T90: SA_START_CHANGE_APPEARANCE (0x1498), tap 6145 ---
     // One-way, and the ONLY frame the appearance change puts on the World link. cap_final
     // client4 runs the whole flow - S_PREPARE (1748), S_RACE_CHANGE_RESTRICTION (1833),
@@ -1233,6 +1250,7 @@ public sealed class DbProxyHandlers
             case SDB_ASK_CHANGE_CHAR_NAME:        // 0x2854, T88 - the rename name check
             case SDB_DO_CHANGE_CHAR_NAME:         // 0x2856, T88 - the rename itself
             case SA_UPDATE_RANK_USERNAME:         // 0x161C, T90 - one-way rename echo
+            case SA_WATCH_MOVIE:                  // 0x155C, T104 - one-way cinematic marker
             case SA_START_CHANGE_APPEARANCE:      // 0x1498, T90 - one-way, nothing to persist
             case SDB_GIVE_GUILD_MONEY_INCENTIVE:  // 0x27A0, T90
             case SDB_UPDATE_USER_DAILY_EVENT_COUNT: // 0x293D = [reqId][ok], reqId at payload[8]
@@ -1401,6 +1419,7 @@ public sealed class DbProxyHandlers
             case SDB_ASK_CHANGE_CHAR_NAME:          return OnAskChangeCharName(link, payload);
             case SDB_DO_CHANGE_CHAR_NAME:           return OnDoChangeCharName(link, payload);
             case SA_UPDATE_RANK_USERNAME:           return OnUpdateRankUsername(payload);
+            case SA_WATCH_MOVIE:                    return OnWatchMovie(payload);
             case SA_START_CHANGE_APPEARANCE:        return OnStartChangeAppearance(payload);
             case SDB_GIVE_GUILD_MONEY_INCENTIVE:    return OnGiveGuildMoneyIncentive(link, payload);
             case SDB_UPDATE_USER_DAILY_EVENT_COUNT: link.SendFrame(DBS_UPDATE_USER_DAILY_EVENT_COUNT, BuildReqIdAck(payload, 8)); return true;
@@ -3514,6 +3533,38 @@ public sealed class DbProxyHandlers
     }
 
     /// <summary>
+    /// SA_WATCH_MOVIE (0x155C). One-way. The cinematic that just finished is filed on the
+    /// ACCOUNT, which is the half C_WATCHED_MOVIES was missing: T62 could answer the question
+    /// but nothing ever wrote an answer, so the list came back empty on every relog and the
+    /// client replayed the intro.
+    ///
+    /// <para><b>No capture exercises this.</b> Neither SA_WATCH_MOVIE nor C_WATCHED_MOVIES,
+    /// S_WATCHED_MOVIES, S_PLAY_MOVIE or C_END_MOVIE appears anywhere in the fourteen captures -
+    /// the accounts in them had all watched the intro long before. The layout is the decompile's:
+    /// the guard fixes the length and <c>Handler_SA_WATCH_MOVIE</c> fixes the one field's offset.</para>
+    /// </summary>
+    private bool OnWatchMovie(byte[] payload)
+    {
+        if (payload.Length < WatchMovieMinPayload) return true;
+        ulong gameId = BitConverter.ToUInt64(payload, 0);
+        int movieId = (int)BitConverter.ToUInt32(payload, WatchMovieIdOffset);
+        if (_store is null || movieId <= 0) return true;
+
+        int playerId = PlayerIdForGameId?.Invoke(gameId) ?? 0;
+        var chr = playerId > 0 ? _store.GetCharacter(playerId) : null;
+        if (chr is null)
+        {
+            _log.LogWarning("SA_WATCH_MOVIE: movie {Movie} for gameId {Game} - no character, not filed",
+                movieId, gameId);
+            return true;
+        }
+        if (_store.AddWatchedMovieForAccount(chr.AccountId, movieId))
+            _log.LogInformation("SA_WATCH_MOVIE: account {Acct} has now watched movie {Movie}",
+                chr.AccountId, movieId);
+        return true;
+    }
+
+    /// <summary>
     /// SA_START_CHANGE_APPEARANCE (0x1498). One-way, and nothing in it needs storing - the new
     /// customize blob arrives with the ordinary user save at the next hand-off.
     /// </summary>
@@ -5494,7 +5545,36 @@ public sealed class DbProxyHandlers
 
         link.SendFrame(BrokerPackets.DBS_TRADE_BROKER_REGISTER_ITEM,
             BrokerPackets.BuildDbsRegisterItem(dlmId, success: tradeId != 0, atoms));
+        if (tradeId != 0) PushRegisteredItemList(ownerDbId);
         return true;
+    }
+
+    /// <summary>
+    /// T104. After a register lands, the real Arbiter pushes the seller his Active Listings
+    /// UNASKED - <c>cap_social3_client2.log</c> frame 1258 is an
+    /// <c>S_TRADE_BROKER_REGISTERED_ITEM_LIST</c> of 74 bytes (one row) sitting directly between
+    /// the <c>C_TRADE_BROKER_REGISTER_ITEM</c> at 1257 and the <c>S_INVEN_USERDATA</c> at 1260,
+    /// with no <c>C_TRADE_BROKER_REGISTERED_ITEM_LIST</c> anywhere in front of it. Frames 1436
+    /// (two rows) and 1457 (three) are the same push after the second and third listing.
+    ///
+    /// <para>The body is <c>BrokerHandlers.ReplyFor</c>'s, so the push and the tab the client
+    /// asks for cannot drift apart.</para>
+    ///
+    /// <para>Nothing is sent when the seller is not in world - the list is a UI refresh, not
+    /// state, and he gets it from the tab on the way back in.</para>
+    /// </summary>
+    private void PushRegisteredItemList(int sellerDbId)
+    {
+        if (_store is null || sellerDbId <= 0) return;
+        var session = global::TeraSharp.Arbiter.Program.World?.SessionForPlayerId(sellerDbId);
+        if (session is null) return;
+
+        var frame = global::TeraSharp.Arbiter.Handlers.BrokerHandlers.ReplyFor(
+            BrokerPackets.C_TRADE_BROKER_REGISTERED_ITEM_LIST, _store, sellerDbId);
+        if (frame is null) return;
+        session.Send(frame);
+        _log.LogInformation("S_TRADE_BROKER_REGISTERED_ITEM_LIST: pushed {N} byte(s) to seller {Id}",
+            frame.Length, sellerDbId);
     }
 
     /// <summary>

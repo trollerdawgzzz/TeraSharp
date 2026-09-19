@@ -10779,6 +10779,207 @@ bool   isGuildWarAcceptable
         Hex.True(store.GetDeletedCharacters(10).Count == 0, "the waiting list is empty");
     }
 
+    // =======================================================================================
+    // T104 - three live fixes.
+    //
+    //   1. SA_WATCH_MOVIE (0x155C), the write that was missing behind C_WATCHED_MOVIES.
+    //   2. the unasked S_TRADE_BROKER_REGISTERED_ITEM_LIST push after a register.
+    //   3. the one lobby value that separates the session where Alt+A opened from the ones
+    //      where it did not.
+    // =======================================================================================
+
+    /// <summary>Drive one World -&gt; Arbiter frame through a handler that HAS a store, with the
+    /// gameId -&gt; playerId hook wired. <c>HandlerAccepts</c>'s twin; the one-way pushes need
+    /// both, and neither of them replies.</summary>
+    static bool OneWayFrameWithStore(TeraSharp.Arbiter.Persistence.CharacterStore store,
+        ushort op, byte[] payload, Func<ulong, int> playerForGameId)
+    {
+        var log = QuietLog();
+        using var listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        listener.Bind(new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, 0));
+        listener.Listen(1);
+        using var client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        client.Connect((System.Net.IPEndPoint)listener.LocalEndPoint!);
+        using var peer = listener.Accept();
+
+        var bridge = new WorldBridge(WorldReplayTable.Load("/nonexistent", log), log);
+        var link = new WorldLink(1, client, bridge, log);
+        var handlers = new DbProxyHandlers(store, log) { PlayerIdForGameId = playerForGameId };
+        return handlers.TryHandle(bridge, link, op, payload);
+    }
+
+    /// <summary>
+    /// T104.1 - SA_WATCH_MOVIE files the cinematic on the ACCOUNT, and C_WATCHED_MOVIES reads it
+    /// back. T62 built the reply and the table but nothing ever wrote a row, so the list came
+    /// back empty every time and the client replayed the intro.
+    ///
+    /// <para><b>No capture exercises any of this.</b> SA_WATCH_MOVIE, C_WATCHED_MOVIES,
+    /// S_WATCHED_MOVIES, S_PLAY_MOVIE and C_END_MOVIE appear in none of the fourteen captures -
+    /// every account in them had watched the intro long before the tap was running. So the frame
+    /// here is the decompile's, not a capture's: <c>_Handler_SA_WATCH_MOVIE</c>
+    /// (Arb_part_066.c:6455) guards on <c>0x11 &lt; frameLength</c> and takes the user by the u64
+    /// at frame +6; <c>Handler_SA_WATCH_MOVIE</c> (Arb_part_062.c:18768) reads the movie id at
+    /// frame +0x0E and calls <c>Account::InsertWatchedMovieWithLock</c>.</para>
+    /// </summary>
+    [Test] public static void T104_watch_movie_files_the_cinematic_on_the_account()
+    {
+        Hex.True(DbProxyHandlers.SA_WATCH_MOVIE == 0x155C
+                 && DbProxyHandlers.WatchMovieMinFrame == 0x12
+                 && DbProxyHandlers.WatchMovieIdOffset == 8,
+            "0x155C, frame >= 0x12, movie id at frame +0x0E");
+        Hex.True(DbProxyHandlers.IsHandledRequest(DbProxyHandlers.SA_WATCH_MOVIE),
+            "it is on the allow-list, so it does not fall through to the replay table");
+
+        using var store = StoreWithTwoAccounts();
+        var acct = store.GetOrCreateAccount("acct1");
+        Hex.True(store.GetWatchedMoviesForAccount(acct.Id).Count == 0, "nothing watched yet");
+
+        // [u64 arbiterUserId][u32 movieId] - the 12 payload bytes of an 18-byte frame.
+        byte[] Frame(ulong gameId, int movie)
+        {
+            var pl = new byte[12];
+            BitConverter.GetBytes(gameId).CopyTo(pl, 0);
+            BitConverter.GetBytes(movie).CopyTo(pl, DbProxyHandlers.WatchMovieIdOffset);
+            return pl;
+        }
+
+        Hex.True(OneWayFrameWithStore(store, DbProxyHandlers.SA_WATCH_MOVIE, Frame(0x1D945BF40u, 1), _ => 1),
+            "accepted, and nothing is sent back - there is no AS_ partner");
+        var seen = store.GetWatchedMoviesForAccount(acct.Id);
+        Hex.True(seen.Count == 1 && seen[0] == 1, $"movie 1 is on the account: {seen.Count}");
+
+        // De-duplicated, the way the set at Account+0x3000 de-duplicates before the insert runs.
+        OneWayFrameWithStore(store, DbProxyHandlers.SA_WATCH_MOVIE, Frame(0x1D945BF40u, 1), _ => 1);
+        Hex.True(store.GetWatchedMoviesForAccount(acct.Id).Count == 1, "a repeat adds no row");
+
+        // The ACCOUNT is the key, not the character: character 1 watched it, and the account's
+        // other characters are past it too. That is the half T62 could not do.
+        Hex.True(store.GetWatchedMovies(1).Count == 0,
+            "and it did NOT go in the per-character table T62 used");
+
+        // A short frame is dropped rather than read - the decompile's guard is on the length.
+        Hex.True(OneWayFrameWithStore(store, DbProxyHandlers.SA_WATCH_MOVIE, new byte[11], _ => 1)
+                 && store.GetWatchedMoviesForAccount(acct.Id).Count == 1,
+            "11 payload bytes is one short of the 0x12 frame guard");
+
+        // And an unknown gameId files nothing rather than guessing an account.
+        OneWayFrameWithStore(store, DbProxyHandlers.SA_WATCH_MOVIE, Frame(0xDEADu, 7), _ => 0);
+        Hex.True(store.GetWatchedMoviesForAccount(acct.Id).Count == 1, "no character, no row");
+
+        // The reply the client actually reads, in the T62 layout: [u16 len][u16 op][u16 count]
+        // [u16 firstOff] then [u16 here][u16 next][u32 movieId].
+        store.AddWatchedMovieForAccount(acct.Id, 2);
+        Hex.Eq(ArbiterClientHandlers.BuildWatchedMovies(store.GetWatchedMoviesForAccount(acct.Id)),
+            "18 00 A4 97 02 00 08 00 08 00 10 00 01 00 00 00 10 00 00 00 02 00 00 00",
+            "S_WATCHED_MOVIES now has the two the account has seen, chained");
+    }
+
+    /// <summary>
+    /// T104.2 - a successful SDB_TRADE_BROKER_REGISTER_ITEM pushes the seller his Active
+    /// Listings unasked. <c>cap_social3_client2.log</c> frame 1258 is an
+    /// <c>S_TRADE_BROKER_REGISTERED_ITEM_LIST</c> of 74 bytes sitting between the
+    /// <c>C_TRADE_BROKER_REGISTER_ITEM</c> at 1257 and the <c>S_INVEN_USERDATA</c> at 1260, with
+    /// no <c>C_TRADE_BROKER_REGISTERED_ITEM_LIST</c> anywhere in front of it; 1436 and 1457 are
+    /// the same push after the second and third listing.
+    ///
+    /// <para>The push body is the tab's, so this drives a real register and then checks the
+    /// frame the push would carry against 1258 byte for byte. Only the register TIME is
+    /// substituted - the store stamps it <c>datetime('now')</c>, and the capture's is fixed.</para>
+    /// </summary>
+    [Test] public static void T104_registering_pushes_the_seller_his_active_listings()
+    {
+        using var store = GuildStore(2);
+        store.UpsertItem(10027, 2, BagItems.Pocket, 6, 200997, 1);
+        store.AddCharacterMoney(2, 5000);
+
+        var payload = BrokerRequest(BrokerPackets.RegisterRequestHeader, 0,
+            BrokerAtom(0, WarehouseHandlers.TsChangeMoney, 0, 0, -500, 2, 0, 0, 2, 0, 0),
+            BrokerAtom(1, WarehouseHandlers.TsBrokerRegister, 10027, 200997, 1, 2, 0, 0, 2, 0, 0, price: 10001),
+            BrokerAtom(2, WarehouseHandlers.TsBrokerMoveItem, 10027, 200997, 1, 2, 0, 0, 2, WarehouseHandlers.InvenBroker, 0));
+        BitConverter.GetBytes(0xB4u).CopyTo(payload, 8);
+        BitConverter.GetBytes(2).CopyTo(payload, 12);
+
+        // The register itself still answers exactly one DBS frame - the push is extra, and it is
+        // a CLIENT packet on the seller's own socket, so it cannot disturb the World link.
+        var (op, _) = RunHandler1(DbProxyHandlers.SDB_TRADE_BROKER_REGISTER_ITEM, payload, store);
+        Hex.True(op == BrokerPackets.DBS_TRADE_BROKER_REGISTER_ITEM, $"replied 0x{op:X4}, want 0x2818");
+
+        var pushed = BrokerHandlers.ReplyFor(
+            BrokerPackets.C_TRADE_BROKER_REGISTERED_ITEM_LIST, store, 2)!;
+        Hex.True(pushed.Length == 74
+                 && BitConverter.ToUInt16(pushed, 0) == 74
+                 && BitConverter.ToUInt16(pushed, 2) == BrokerPackets.S_TRADE_BROKER_REGISTERED_ITEM_LIST,
+            $"frame 1258 is 74 bytes of 0xCDEA: {pushed.Length}");
+
+        // Frame 1258's RegisterTime is 0x6AAB18F0; this row's is now. Substitute it and the rest
+        // has to match to the byte.
+        int timeAt = 4 + BrokerPackets.EmptyArraySlots + BrokerPackets.RlRegisterTime;
+        BitConverter.GetBytes(0x6AAB18F0L).CopyTo(pushed, timeAt);
+        Hex.Eq(pushed[4..], Cap81_RegisteredOneRow,
+            "and the push carries exactly what cap_social3_client2 frame 1258 carried");
+
+        // Program.World is null here, so the push finds no session and quietly does nothing -
+        // the list is a UI refresh, not state, and an offline seller gets it from the tab.
+        Hex.True(store.GetBrokerListingsOf(2, TeraSharp.Arbiter.Persistence.CharacterStore.BrokerListed).Count == 1,
+            "an offline seller still gets the listing; only the refresh is skipped");
+    }
+
+    /// <summary>
+    /// T104.3 - the Alt+A gate. The lobby of <c>cap_final_gm_client2.log</c> (frames 3..49, the
+    /// one captured session where the In-Game Operation Tool opened) against the lobbies of
+    /// <c>cap_final_client2.log</c>, <c>cap_final_client.log</c> and <c>cap_final_gm_client.log</c>
+    /// differs in exactly one u32: <c>S_LOGIN_ARBITER.status</c>, body +2, 33 instead of 31.
+    ///
+    /// <para>Everything else in that window is the same: S_LOGIN_ACCOUNT_INFO is 544 bytes in all
+    /// four and differs only in the account id and the random session strings, S_GET_USER_LIST
+    /// carries no per-character admin flag, and the ten S_UPDATE_CONTENTS_ON_OFF toggles are
+    /// contents 2, 3, 4, 8, 9, 22, 23, 20, 21, 34 with the same bytes in the same order.</para>
+    /// </summary>
+    [Test] public static void T104_the_gm_login_status_is_the_one_lobby_byte_that_differs()
+    {
+        // cap_final_gm_client2.log frame 7 and cap_final_client2.log frame 7, verbatim.
+        var opened  = Hex.B("17 00 A6 92 01 00 21 00 00 00 00 00 00 00 06 00 00 00 00 00 00 00 00");
+        var refused = Hex.B("17 00 A6 92 01 00 1F 00 00 00 00 00 00 00 06 00 00 00 00 00 00 00 00");
+        int diffs = 0;
+        for (int i = 0; i < opened.Length; i++) if (opened[i] != refused[i]) diffs++;
+        Hex.True(opened.Length == 23 && refused.Length == 23 && diffs == 1,
+            $"23 bytes each and one byte between them: {diffs}");
+        Hex.True(BitConverter.ToUInt32(opened, 6) == GmAccounts.LoginStatusOperator
+                 && BitConverter.ToUInt32(refused, 6) == GmAccounts.LoginStatusNormal,
+            "and that byte is status, 33 against 31");
+
+        // T89b drove status from TERASHARP_GM_ACCOUNTS alone. Two things had to be true at once
+        // for that to work, and neither is obvious.
+        Hex.True(!GmAccounts.IsListed("GameMaster", "2800"),
+            "the env value holds the numeric accountDBID - that is what the launcher puts in "
+            + "C_LOGIN_ARBITER.name - so a display name in there never matches");
+        Hex.True(GmAccounts.IsListed("2800", "1, 2800; 4"),
+            "commas, semicolons and spaces all separate");
+
+        // T104: the stored admin_level is the second route in, which is what set_admin_level and
+        // the admin web tool's POST /api/gm-level (T101b) write. tera-api's own privilege cannot
+        // get here at all - GameAuthenticationLogin answers {Return, ReturnCode, Msg} and
+        // AuthResult has no privilege field.
+        string? saved = Environment.GetEnvironmentVariable(GmAccounts.EnvVariable);
+        try
+        {
+            Environment.SetEnvironmentVariable(GmAccounts.EnvVariable, null);
+            Hex.True(GmAccounts.LoginStatusFor("2800", 0) == GmAccounts.LoginStatusNormal,
+                "unlisted and admin_level 0 is 31 - the lobby the panel stayed shut on");
+            Hex.True(GmAccounts.LoginStatusFor("2800", 1) == GmAccounts.LoginStatusOperator,
+                "admin_level 1 is enough - every gate in the binary only tests >= 1");
+            Hex.True(GmAccounts.LoginStatusFor("2800", GmAccounts.GmAdminLevel) == GmAccounts.LoginStatusOperator,
+                "and so is 5, the level set_go on writes");
+
+            Environment.SetEnvironmentVariable(GmAccounts.EnvVariable, "2800");
+            Hex.True(GmAccounts.LoginStatusFor("2800", 0) == GmAccounts.LoginStatusOperator,
+                "the allow-list still wins on its own - it is the bootstrap");
+            Hex.True(GmAccounts.LoginStatusFor("2801", 0) == GmAccounts.LoginStatusNormal,
+                "and it is still exact-match");
+        }
+        finally { Environment.SetEnvironmentVariable(GmAccounts.EnvVariable, saved); }
+    }
+
     // ---- The rules ----
 
     [Test] public static void T30_system_message_format_matches_the_capture()
