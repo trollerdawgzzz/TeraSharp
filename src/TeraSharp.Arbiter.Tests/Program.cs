@@ -2998,6 +2998,8 @@ array items
         var expect = (byte[])original.Clone();
         Array.Clear(stored, TeraSharp.Arbiter.Persistence.StarterBlob.MoneyOffset, 8);
         Array.Clear(expect, TeraSharp.Arbiter.Persistence.StarterBlob.MoneyOffset, 8);
+        Array.Clear(stored, TeraSharp.Arbiter.Persistence.StarterBlob.LevelOffset, 4);   // T105: level stamped from the row too
+        Array.Clear(expect, TeraSharp.Arbiter.Persistence.StarterBlob.LevelOffset, 4);
         Hex.Eq(stored, expect, "the stored blob must be byte-identical to the one World sent (outside the money field)");
     }
 

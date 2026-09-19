@@ -53,7 +53,9 @@ public sealed class LoginHandlers
             // got 31 (0b11111) and only a brand-new account got 0; 33 is the In-Game Operation Tool
             // account. Sending 0 tells the client it is a fresh account, which is what draws the
             // TERA / Battle Arena mode-select screen before character select.
-            ["success"] = true, ["loginQueue"] = false, ["status"] = GmAccounts.IsListed(s.Account.Name) ? 33u : 31u, ["unk"] = 0u,
+            ["success"] = true, ["loginQueue"] = false,
+            ["status"] = GmAccounts.LoginStatusFor(s.Account.Name, Program.Store?.GetAdminLevel((long)s.Account.AccountId) ?? 0),   // T104: 33 opens Alt+A
+            ["unk"] = 0u,
             ["language"] = language, ["pvpDisabled"] = false, ["unk1"] = (ushort)0, ["unk2"] = (ushort)0,
         });
         s.SendByDef("S_LOGIN_ACCOUNT_INFO", new Dictionary<string, object>
