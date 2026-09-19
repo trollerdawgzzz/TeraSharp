@@ -3593,6 +3593,55 @@ public static class ArbiterClientHandlers
         }
         return sb.ToString();
     }
+
+    // =========================================================================================
+    // 21. S_CURRENT_ELECTION_STATE - the last lobby packet TeraSharp never sent       (T106)
+    // =========================================================================================
+
+    /// <summary>S_CURRENT_ELECTION_STATE (0xFAEB, 64235).</summary>
+    public const ushort S_CURRENT_ELECTION_STATE = 0xFAEB;
+
+    /// <summary>
+    /// The 26-byte packet, and the whole of it is a constant.
+    ///
+    /// <para><b>All five captures carry the identical 26 bytes</b> - cap_final_client 46,
+    /// cap_final_client2 124, cap_final_gm_client2 49, cap_social_client 45 and
+    /// cap_newchar_client 99 - INCLUDING the trailing i64, which reads 0x6AB742A9 in every one of
+    /// them. The captures are days apart, so that field is not a clock: it is a fixed deadline
+    /// off the politics sheet, and the right implementation is the constant rather than
+    /// <c>now + something</c>. If a later capture ever disagrees, this is the line that
+    /// changes.</para>
+    ///
+    /// <para>Everything ahead of it is zero in all five, so the field boundaries in there are a
+    /// guess and are deliberately not named - 18 zero bytes then the deadline is all the wire
+    /// proves. T104 found this packet by diffing the GM lobby; it is a pure push with no
+    /// <c>C_</c> request anywhere in any capture, and it lands right after
+    /// <c>S_BROCAST_GUILD_FLAG</c> in the one capture where the Arbiter sends it itself
+    /// (cap_final_client 45 -&gt; 46).</para>
+    /// </summary>
+    public const long ElectionDeadline = 0x6AB742A9L;   // 1790035625
+
+    /// <summary>The packet's total length, from all five captures.</summary>
+    public const int CurrentElectionStateSize = 26;
+
+    /// <summary>Where the deadline sits in the packet.</summary>
+    public const int ElectionDeadlineOffset = 18;
+
+    /// <summary>
+    /// S_CURRENT_ELECTION_STATE, byte-exact. <paramref name="deadline"/> is there so a test can
+    /// prove the field's offset rather than only that the constant round-trips.
+    /// </summary>
+    public static byte[] BuildCurrentElectionState(long deadline = ElectionDeadline)
+    {
+        var p = new byte[CurrentElectionStateSize];
+        BitConverter.GetBytes((ushort)CurrentElectionStateSize).CopyTo(p, 0);
+        BitConverter.GetBytes(S_CURRENT_ELECTION_STATE).CopyTo(p, 2);
+        BitConverter.GetBytes(deadline).CopyTo(p, ElectionDeadlineOffset);
+        return p;
+    }
+
+    /// <summary>Send it. One line, so the call site in <c>LoginHandlers</c> is one line.</summary>
+    public static void SendCurrentElectionState(GameSession s) => s.Send(BuildCurrentElectionState());
 }
 
 
@@ -4419,53 +4468,4 @@ public static class ItemBoardPackets
         s.Send(ArbiterClientHandlers.BuildDungeonRankSeasonList(dungeonId, drtType));
         return true;
     }
-
-    // =========================================================================================
-    // 21. S_CURRENT_ELECTION_STATE - the last lobby packet TeraSharp never sent       (T106)
-    // =========================================================================================
-
-    /// <summary>S_CURRENT_ELECTION_STATE (0xFAEB, 64235).</summary>
-    public const ushort S_CURRENT_ELECTION_STATE = 0xFAEB;
-
-    /// <summary>
-    /// The 26-byte packet, and the whole of it is a constant.
-    ///
-    /// <para><b>All five captures carry the identical 26 bytes</b> - cap_final_client 46,
-    /// cap_final_client2 124, cap_final_gm_client2 49, cap_social_client 45 and
-    /// cap_newchar_client 99 - INCLUDING the trailing i64, which reads 0x6AB742A9 in every one of
-    /// them. The captures are days apart, so that field is not a clock: it is a fixed deadline
-    /// off the politics sheet, and the right implementation is the constant rather than
-    /// <c>now + something</c>. If a later capture ever disagrees, this is the line that
-    /// changes.</para>
-    ///
-    /// <para>Everything ahead of it is zero in all five, so the field boundaries in there are a
-    /// guess and are deliberately not named - 18 zero bytes then the deadline is all the wire
-    /// proves. T104 found this packet by diffing the GM lobby; it is a pure push with no
-    /// <c>C_</c> request anywhere in any capture, and it lands right after
-    /// <c>S_BROCAST_GUILD_FLAG</c> in the one capture where the Arbiter sends it itself
-    /// (cap_final_client 45 -&gt; 46).</para>
-    /// </summary>
-    public const long ElectionDeadline = 0x6AB742A9L;   // 1790035625
-
-    /// <summary>The packet's total length, from all five captures.</summary>
-    public const int CurrentElectionStateSize = 26;
-
-    /// <summary>Where the deadline sits in the packet.</summary>
-    public const int ElectionDeadlineOffset = 18;
-
-    /// <summary>
-    /// S_CURRENT_ELECTION_STATE, byte-exact. <paramref name="deadline"/> is there so a test can
-    /// prove the field's offset rather than only that the constant round-trips.
-    /// </summary>
-    public static byte[] BuildCurrentElectionState(long deadline = ElectionDeadline)
-    {
-        var p = new byte[CurrentElectionStateSize];
-        BitConverter.GetBytes((ushort)CurrentElectionStateSize).CopyTo(p, 0);
-        BitConverter.GetBytes(S_CURRENT_ELECTION_STATE).CopyTo(p, 2);
-        BitConverter.GetBytes(deadline).CopyTo(p, ElectionDeadlineOffset);
-        return p;
-    }
-
-    /// <summary>Send it. One line, so the call site in <c>LoginHandlers</c> is one line.</summary>
-    public static void SendCurrentElectionState(GameSession s) => s.Send(BuildCurrentElectionState());
 }
