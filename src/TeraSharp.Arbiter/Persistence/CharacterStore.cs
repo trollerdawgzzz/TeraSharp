@@ -986,6 +986,19 @@ CREATE TABLE IF NOT EXISTS guild_applies (
   PRIMARY KEY (guild_id, user_db_id)
 );
 
+-- T95: the guild wanted board - the looking-for-a-guild ads S_REPLY_GUILD_WANTED_WRITING_LIST
+-- lists. One row per character, because C_REQUEST_SET_GUILD_WANTED_WRITING has no ad id and the
+-- capture's reply carries the poster's UserDbId as the element key. `written_at` is both the
+-- WritingDate the row shows and the start of the posting cooldown: cap_social3_client2 frame
+-- 2140 comes back with CanBeWriting 0 and RemainTime 86400 immediately after frame 2137 posted.
+CREATE TABLE IF NOT EXISTS guild_wanted (
+  user_db_id            INTEGER NOT NULL PRIMARY KEY REFERENCES characters(id),
+  guild_size            INTEGER NOT NULL DEFAULT 0,
+  guild_preference      INTEGER NOT NULL DEFAULT 0,
+  promotion_str         TEXT    NOT NULL DEFAULT '',
+  written_at            INTEGER NOT NULL DEFAULT 0
+);
+
 -- spAddInviteUserToGuild / spLoadInviteUserToGuild / spDeleteInviteUserToGuild*
 CREATE TABLE IF NOT EXISTS guild_invites (
   guild_id              INTEGER NOT NULL REFERENCES guilds(guild_id),
@@ -2865,6 +2878,7 @@ DELETE FROM tutorial_tips     WHERE owner_id = $id;
 DELETE FROM seren_guide       WHERE owner_id = $id;
 DELETE FROM client_settings   WHERE character_id = $id;
 DELETE FROM guild_applies     WHERE user_db_id = $id;
+DELETE FROM guild_wanted      WHERE user_db_id = $id;
 DELETE FROM guild_invites     WHERE user_db_id = $id;
 DELETE FROM guild_members     WHERE user_db_id = $id;";
             kids.Parameters.AddWithValue("$id", id);
@@ -3293,6 +3307,15 @@ DELETE FROM guild_members     WHERE user_db_id = $id;";
     public sealed record GuildGroupRow(int GuildGroupId, string Name, int Authority);
 
     public sealed record GuildApplyRow(int UserDbId, string JoinMsg, long AppliedAt);
+
+    /// <summary>
+    /// T95. One wanted-board ad, already joined to the poster's character row - the element of
+    /// S_REPLY_GUILD_WANTED_WRITING_LIST carries the name, level and class as well as the three
+    /// fields C_REQUEST_SET_GUILD_WANTED_WRITING wrote, and nothing else reads this table.
+    /// </summary>
+    public sealed record GuildWantedRow(int UserDbId, string UserName, int Level, int ClassType,
+                                        int GuildPreference, int GuildSize, long WritingDate,
+                                        string PromotionStr);
     public sealed record GuildInviteRow(int GuildId, int UserDbId, int InvitorDbId, long InvitedAt);
     public sealed record GuildLogRow(
         long Id, int ActionType, long LogTime, int ActorDbId, string ActorName, string TargetName,
@@ -4425,6 +4448,124 @@ DELETE FROM guild_members     WHERE user_db_id = $id;";
             cmd.Parameters.AddWithValue("$a", flagA);
             cmd.Parameters.AddWithValue("$b", flagB);
             cmd.ExecuteNonQuery();
+        }
+    }
+
+    // ------------------------- T95: the wanted board -------------------------
+
+    /// <summary>
+    /// A character may re-post once a day. cap_social3_client2 frame 2140 answers the list
+    /// request right after the post with RemainTime 86400 - one day to the second - and
+    /// CanBeWriting 0, so this is the window the real Arbiter enforces.
+    /// </summary>
+    public const long GuildWantedCooldownSeconds = 86400;
+
+    /// <summary>
+    /// C_REQUEST_SET_GUILD_WANTED_WRITING. One row per character: re-posting replaces the ad and
+    /// restarts the cooldown, which is what the capture's single row does. Returns false when
+    /// the character has no row of its own, so an ad can never outlive its poster.
+    /// </summary>
+    public bool SetGuildWanted(int userDbId, int guildSize, int guildPreference,
+                               string promotionStr, long whenUnix)
+    {
+        if (GetCharacter(userDbId) is null) return false;
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "INSERT INTO guild_wanted(user_db_id, guild_size, guild_preference, promotion_str, written_at) " +
+                "VALUES($u, $s, $p, $m, $w) " +
+                "ON CONFLICT(user_db_id) DO UPDATE SET guild_size = $s, guild_preference = $p, " +
+                "promotion_str = $m, written_at = $w";
+            cmd.Parameters.AddWithValue("$u", userDbId);
+            cmd.Parameters.AddWithValue("$s", guildSize);
+            cmd.Parameters.AddWithValue("$p", guildPreference);
+            cmd.Parameters.AddWithValue("$m", promotionStr ?? "");
+            cmd.Parameters.AddWithValue("$w", whenUnix);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    /// <summary>When this character last posted, or 0. The cooldown reads it.</summary>
+    public long GetGuildWantedTime(int userDbId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT written_at FROM guild_wanted WHERE user_db_id = $u";
+            cmd.Parameters.AddWithValue("$u", userDbId);
+            var v = cmd.ExecuteScalar();
+            return v is null || v is DBNull ? 0 : Convert.ToInt64(v);
+        }
+    }
+
+    /// <summary>
+    /// Every ad, newest first. No capture holds more than one row, so the order is ours; newest
+    /// first is the one a board is read in. Characters already in a guild are excluded - the ad
+    /// is a request to be invited, and the wanted board is where C_INVITE_USER_TO_GUILD's
+    /// <c>fromWantedList</c> looks (GuildHandlers.MsgNotOnWantedList).
+    /// </summary>
+    public List<GuildWantedRow> GetGuildWanted()
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "SELECT w.user_db_id, c.name, c.level, c.class, w.guild_preference, w.guild_size, " +
+                "       w.written_at, w.promotion_str " +
+                "FROM guild_wanted w JOIN characters c ON c.id = w.user_db_id " +
+                "WHERE NOT EXISTS (SELECT 1 FROM guild_members m WHERE m.user_db_id = w.user_db_id) " +
+                "ORDER BY w.written_at DESC, w.user_db_id";
+            var rows = new List<GuildWantedRow>();
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                rows.Add(new GuildWantedRow(r.GetInt32(0), r.GetString(1), r.GetInt32(2),
+                                            r.GetInt32(3), r.GetInt32(4), r.GetInt32(5),
+                                            r.GetInt64(6), r.GetString(7)));
+            return rows;
+        }
+    }
+
+    /// <summary>Drop this character's ad - joining a guild takes it off the board.</summary>
+    public bool ClearGuildWanted(int userDbId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "DELETE FROM guild_wanted WHERE user_db_id = $u";
+            cmd.Parameters.AddWithValue("$u", userDbId);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    /// <summary>T95. How many characters are in the guild - the MemberCount every guild-list
+    /// element carries.</summary>
+    public int CountGuildMembers(int guildId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT COUNT(*) FROM guild_members WHERE guild_id = $g";
+            cmd.Parameters.AddWithValue("$g", guildId);
+            return Convert.ToInt32(cmd.ExecuteScalar()!);
+        }
+    }
+
+    /// <summary>T95. C_RECOMMEND_GUILD / C_RECOMMEND_USER_GUILD both land here: the
+    /// <c>recommendation_point</c> column of the guilds row, which AS_SET_GUILD_RECOMMENDATION_
+    /// POINT (0x1411) is the inter-server form of.</summary>
+    public bool AddGuildRecommendation(int guildId, int delta)
+    {
+        if (GetGuild(guildId) is null) return false;
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "UPDATE guilds SET recommendation_point = MAX(0, recommendation_point + $d) " +
+                "WHERE guild_id = $g";
+            cmd.Parameters.AddWithValue("$g", guildId);
+            cmd.Parameters.AddWithValue("$d", delta);
+            return cmd.ExecuteNonQuery() > 0;
         }
     }
 
