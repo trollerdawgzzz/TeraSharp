@@ -921,6 +921,12 @@ public sealed class GuildHandlers
             ["guildLogoId"] = g.LogoId.ToString(CultureInfo.InvariantCulture),
             ["guildGroups"] = ranks,
         }));
+
+        // T98b: the board follows S_GUILD_INFO wherever it goes out - cap_final_client3 3017
+        // then 3020, and the enter-world burst at client3 280 / client4 2084. MEMBERS only:
+        // window type 3 shows an outsider the guild card, and the capture never sends the
+        // board to anyone who is not in the guild.
+        if (mine != null) SendGuildQuestList(a, characterId, g);
     }
 
     private void SendMemberList(GuildActions a, int characterId, CharacterStore.GuildRow g)
@@ -1085,11 +1091,6 @@ public sealed class GuildHandlers
         var m = _store.GetGuildMember(userDbId);
         if (m == null) return;
 
-        // T98: the roster change re-pushes the quest board to the joiner -
-        // cap_final_client3 3020 (right after S_GUILD_INFO 3017) and client4 2751.
-        var guild = _store.GetGuild(guildId);
-        if (guild != null) SendGuildQuestList(a, userDbId, guild);
-
         var fields = new Dictionary<string, object>
         {
             ["memberDbId"] = m.UserDbId,
@@ -1115,6 +1116,12 @@ public sealed class GuildHandlers
             m.Race, m.UserClass, m.Gender, MemberStateOnline, m.GuildGroupId,
             m.LastLogoutTime, false, m.AccountId, m.GuildJoinDate));
         a.World(GuildPackets.AS_GUILD_JOINED, GuildPackets.BuildAsGuildJoined(m.UserDbId));
+
+        // T98b: last, because that is the order on the wire - cap_final_client3 sends
+        // S_ADD_GUILD_MEMBER at 3014 and only reaches the board at 3020. Client4 2751 is the
+        // same shape. The joiner alone gets it; the other members keep the board they have.
+        var guild = _store.GetGuild(guildId);
+        if (guild != null) SendGuildQuestList(a, userDbId, guild);
     }
 
     // =======================================================================================
