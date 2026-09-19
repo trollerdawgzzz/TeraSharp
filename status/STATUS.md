@@ -397,3 +397,31 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   17 B); both sit between `S_LOAD_CLIENT_ACCOUNT_SETTING` and the ten content flags.
   `SendContentFlags` already sends those ten with the right values at the right point - the T89
   report was wrong to call that a timing bug.
+
+- T91 (cap_final_gm_client2): the tool's user-info tabs, its action row, and the two leaderboard
+  pushes. `C_ADMIN_REQUEST_USERINFO` (0x9A56) is one packet with an i32 **kind at packet +22**,
+  and the capture presses six of them - 1 (inventory, frame 723), 6 (warehouse, 746 and four
+  more) and 5 (skill, 1427) are answered, 2 / 3 / 14 are answered by nothing. So kinds 6 and 5
+  are served and everything else is logged and dropped, which is what the real Arbiter did.
+
+  `S_ADMIN_GET_USERINFO_SKILL` (0xA3B4, frame 1428) is **two arrays in one packet** -
+  20 + 42*13 + 11*9 = 665 - and that is why a single-list reading never closed: the last skill
+  entry's `next` is **0, not the crest list's offset**. Each list terminates on its own. The
+  eleven ids in the second list are the same eleven `S_CREST_INFO` carries at
+  cap_social4_client frame 5108, i.e. T83's `crests` table, so the crest half is served from our
+  own rows; the skill half goes out empty (T79: no skill row is ever written).
+
+  `C_ADMIN_REQUEST_USERACTION` (0xA3DB) has an i32 **action at packet +18** and the capture
+  presses two: **12 is a teleport** (frame 786 is followed by S_ABNORMALITY_END, S_LOAD_TOPO,
+  S_INVEN_USERDATA and two S_ITEMLIST - a full zone reload) and **13 is unnamed**. Both log and
+  return; every other id is refused rather than guessed at.
+
+  `S_PVP/PVE_LEADER_BOARD_INFO` (0xB724 / 0x819F, 52 B) are one layout under two opcodes, pushed
+  back to back at enter-world. The two i64s are unix 1660205710 and 1662624910 - 2022-08-11 and
+  2022-09-08, **exactly four weeks apart to the second** - a closed season whose three values
+  (10/30/37 PvP, 3126/3203/9126 PvE) never move across any capture. `C_REQUEST_PVE_RANKING`
+  stays unanswered, exactly as the real server leaves it.
+
+  **Not built**: `S_ADMIN_GET_USERINFO_INVEN` (0xBBED, frame 724, 4439 B) - eleven 400-byte item
+  records behind a 39-byte head, a decode of its own, and a wrong one draws a wrong inventory for
+  a GM who is about to act on it. Kind 1 falls through to the default branch.

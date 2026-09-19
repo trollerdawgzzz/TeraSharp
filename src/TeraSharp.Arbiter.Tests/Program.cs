@@ -19377,6 +19377,216 @@ string message
             "08 00 8B 83 06 00 00 00", "an empty warning is still a well-formed frame");
     }
 
+    // ===================== T91: the tool's user-info tabs, and the leaderboards =====================
+    //
+    // cap_final_gm_client2.log is the GM's client with the In-Game Operation Tool open. T89 left
+    // the four packets below unimplemented because their layouts were not read yet; they are.
+
+    /// <summary>
+    /// The two requests the tool sends once it has a target, read at the offsets the handlers use.
+    /// <c>C_ADMIN_REQUEST_USERINFO</c> (0x9A56, 34 B) is
+    /// <c>[u16 nameOffset=0x1A][i32 userDbId][pdid 8][i32 0][i32 kind][wstr name]</c> and
+    /// <c>C_ADMIN_REQUEST_USERACTION</c> (0xA3DB, 30 B) is the same shape without the spare i32:
+    /// <c>[u16 nameOffset=0x16][i32 userDbId][pdid 8][i32 action][wstr name]</c>. Both name the
+    /// same player twice - once by db id and once by name - and the handlers key on the id.
+    /// </summary>
+    [Test] public static void T91_the_two_admin_requests_are_read_at_the_captured_offsets()
+    {
+        var kindInven = Hex.B("1A 00 EB 03 00 00 01 00 F0 0A 00 80 00 00 00 00 "
+            + "00 00 01 00 00 00 4E 00 65 00 77 00 00 00");
+        var kindWarehouse = Hex.B("1A 00 EB 03 00 00 01 00 F0 0A 00 80 00 00 00 00 "
+            + "00 00 06 00 00 00 4E 00 65 00 77 00 00 00");
+        var kindSkill = Hex.B("1A 00 EB 03 00 00 01 00 F0 0A 00 80 00 00 00 00 "
+            + "00 00 05 00 00 00 4E 00 65 00 77 00 00 00");
+
+        Hex.True(GmAdminTool.UserInfoKindOffset == 18, "kind is packet +22, body +18");
+        Hex.True(BitConverter.ToInt32(kindInven, GmAdminTool.UserInfoKindOffset)
+                     == ArbiterClientHandlers.UserInfoKindInven
+                 && BitConverter.ToInt32(kindWarehouse, GmAdminTool.UserInfoKindOffset)
+                     == ArbiterClientHandlers.UserInfoKindWarehouse
+                 && BitConverter.ToInt32(kindSkill, GmAdminTool.UserInfoKindOffset)
+                     == ArbiterClientHandlers.UserInfoKindSkill,
+            "frames 723 / 746 / 1427 ask for kinds 1, 6 and 5");
+        Hex.True(BitConverter.ToInt32(kindInven, 2) == 1003
+                 && ArbiterClientHandlers.ReadWString(kindInven, 0) == "New",
+            "and all three name player 1003, 'New'");
+
+        // Kinds 2, 3 and 14 (frames 755, 758, 995, 1006) get no reply in the capture either, so
+        // the default branch logging and sending nothing is what the real Arbiter does.
+        var kind14 = Hex.B("1A 00 EB 03 00 00 01 00 F0 0A 00 80 00 00 00 00 "
+            + "00 00 0E 00 00 00 4E 00 65 00 77 00 00 00");
+        Hex.True(BitConverter.ToInt32(kind14, GmAdminTool.UserInfoKindOffset) == 14,
+            "frame 1006 is kind 14 - the tap holds no reply to it");
+
+        var teleport = Hex.B("16 00 EB 03 00 00 01 00 F0 0A 00 80 00 00 0C 00 "
+            + "00 00 4E 00 65 00 77 00 00 00");
+        var unnamed = Hex.B("16 00 EB 03 00 00 01 00 F0 0A 00 80 00 00 0D 00 "
+            + "00 00 4E 00 65 00 77 00 00 00");
+        Hex.True(GmAdminTool.UserActionOffset == 14, "action is packet +18, body +14");
+        Hex.True(BitConverter.ToInt32(teleport, GmAdminTool.UserActionOffset)
+                     == GmAdminTool.UserActionTeleport
+                 && BitConverter.ToInt32(unnamed, GmAdminTool.UserActionOffset)
+                     == GmAdminTool.UserActionUnnamed13,
+            "frames 786 and 956 are the only two actions the capture presses: 12 and 13");
+        Hex.True(ArbiterClientHandlers.ReadWString(unnamed, 0) == "New",
+            "the name slot sits at 0x16 in this one, not 0x1A");
+    }
+
+    /// <summary>
+    /// S_ADMIN_GET_USERINFO_WAREHOUSE (0x7B41), the reply to kind 6. Five instances in the
+    /// capture - frames 747 / 756 / 769 / 778 / 1007 - of the same empty warehouse, and they
+    /// differ in exactly one u16 at the end. Nothing in the session moves an item in or out of
+    /// it, so the three non-zero fields are parameters carrying the captured defaults.
+    /// </summary>
+    [Test] public static void T91_the_admin_warehouse_reply_is_byte_exact()
+    {
+        Hex.Eq(ArbiterClientHandlers.BuildAdminGetUserInfoWarehouse(),
+            "2E 00 41 7B 00 00 00 00 00 00 00 00 00 00 00 00 "
+            + "01 00 00 00 00 00 00 00 00 00 00 00 47 00 00 00 "
+            + "00 00 00 00 00 00 00 00 00 00 00 00 48 00",
+            "frames 747 / 756 / 769 / 778");
+        Hex.Eq(ArbiterClientHandlers.BuildAdminGetUserInfoWarehouse(tail: 0),
+            "2E 00 41 7B 00 00 00 00 00 00 00 00 00 00 00 00 "
+            + "01 00 00 00 00 00 00 00 00 00 00 00 47 00 00 00 "
+            + "00 00 00 00 00 00 00 00 00 00 00 00 00 00",
+            "frame 1007 - the same body with the trailing u16 cleared");
+        Hex.True(ArbiterClientHandlers.AdminWarehouseBodySize == 42,
+            "46-byte frame, 42-byte body");
+    }
+
+    /// <summary>
+    /// S_ADMIN_GET_USERINFO_SKILL (0xA3B4), frame 1428, 665 bytes. TWO arrays behind one
+    /// 20-byte fixed part: 20 + 42*13 + 11*9 = 665 exactly. The captured skill list is fed back
+    /// in here because it is the one thing that pins the layout - the last skill's <c>next</c>
+    /// is 0 and NOT the crest list's offset, which is how a two-list packet terminates.
+    /// <para>The trailing byte of a skill entry is active-vs-passive: the 25 entries that carry
+    /// 1 are actives and the 17 that carry 0 are 10002, 19500, 19501 and the whole 94001..94015
+    /// passive block.</para>
+    /// </summary>
+    [Test] public static void T91_the_admin_skill_reply_is_two_lists_in_one_packet()
+    {
+        var skills = new (int Id, bool Active)[]
+        {
+            (10499, true), (30199, true), (40299, true), (60499, true),
+            (70199, true), (90399, true), (100399, true), (130399, true),
+            (140199, true), (150499, true), (160499, true), (180299, true),
+            (210199, true), (9010100, true), (9020100, true), (9030100, true),
+            (12000115, true), (12200137, true), (16000291, true), (17000002, true),
+            (17000004, true), (17000006, true), (17000008, true), (60401301, true),
+            (60401305, true), (10002, false), (19500, false), (19501, false),
+            (94001, false), (94002, false), (94003, false), (94005, false),
+            (94006, false), (94007, false), (94008, false), (94009, false),
+            (94010, false), (94011, false), (94012, false), (94013, false),
+            (94014, false), (94015, false)
+        };
+        var crests = new[] { 33000, 33008, 33012, 33018, 33020, 33029, 33031, 33033, 33034, 33038, 33041 };
+
+        Hex.Eq(ArbiterClientHandlers.BuildAdminGetUserInfoSkill(skills, crests),
+            "99 02 B4 A3 2A 00 14 00 0B 00 36 02 0A 00 00 00 "
+            + "00 00 00 00 14 00 21 00 03 29 00 00 00 00 00 00 "
+            + "01 21 00 2E 00 F7 75 00 00 00 00 00 00 01 2E 00 "
+            + "3B 00 6B 9D 00 00 00 00 00 00 01 3B 00 48 00 53 "
+            + "EC 00 00 00 00 00 00 01 48 00 55 00 37 12 01 00 "
+            + "00 00 00 00 01 55 00 62 00 1F 61 01 00 00 00 00 "
+            + "00 01 62 00 6F 00 2F 88 01 00 00 00 00 00 01 6F "
+            + "00 7C 00 5F FD 01 00 00 00 00 00 01 7C 00 89 00 "
+            + "A7 23 02 00 00 00 00 00 01 89 00 96 00 E3 4B 02 "
+            + "00 00 00 00 00 01 96 00 A3 00 F3 72 02 00 00 00 "
+            + "00 00 01 A3 00 B0 00 4B C0 02 00 00 00 00 00 01 "
+            + "B0 00 BD 00 17 35 03 00 00 00 00 00 01 BD 00 CA "
+            + "00 B4 7B 89 00 00 00 00 00 01 CA 00 D7 00 C4 A2 "
+            + "89 00 00 00 00 00 01 D7 00 E4 00 D4 C9 89 00 00 "
+            + "00 00 00 01 E4 00 F1 00 73 1B B7 00 00 00 00 00 "
+            + "01 F1 00 FE 00 C9 28 BA 00 00 00 00 00 01 FE 00 "
+            + "0B 01 23 25 F4 00 00 00 00 00 01 0B 01 18 01 42 "
+            + "66 03 01 00 00 00 00 01 18 01 25 01 44 66 03 01 "
+            + "00 00 00 00 01 25 01 32 01 46 66 03 01 00 00 00 "
+            + "00 01 32 01 3F 01 48 66 03 01 00 00 00 00 01 3F "
+            + "01 4C 01 95 A6 99 03 00 00 00 00 01 4C 01 59 01 "
+            + "99 A6 99 03 00 00 00 00 01 59 01 66 01 12 27 00 "
+            + "00 00 00 00 00 00 66 01 73 01 2C 4C 00 00 00 00 "
+            + "00 00 00 73 01 80 01 2D 4C 00 00 00 00 00 00 00 "
+            + "80 01 8D 01 31 6F 01 00 00 00 00 00 00 8D 01 9A "
+            + "01 32 6F 01 00 00 00 00 00 00 9A 01 A7 01 33 6F "
+            + "01 00 00 00 00 00 00 A7 01 B4 01 35 6F 01 00 00 "
+            + "00 00 00 00 B4 01 C1 01 36 6F 01 00 00 00 00 00 "
+            + "00 C1 01 CE 01 37 6F 01 00 00 00 00 00 00 CE 01 "
+            + "DB 01 38 6F 01 00 00 00 00 00 00 DB 01 E8 01 39 "
+            + "6F 01 00 00 00 00 00 00 E8 01 F5 01 3A 6F 01 00 "
+            + "00 00 00 00 00 F5 01 02 02 3B 6F 01 00 00 00 00 "
+            + "00 00 02 02 0F 02 3C 6F 01 00 00 00 00 00 00 0F "
+            + "02 1C 02 3D 6F 01 00 00 00 00 00 00 1C 02 29 02 "
+            + "3E 6F 01 00 00 00 00 00 00 29 02 00 00 3F 6F 01 "
+            + "00 00 00 00 00 00 36 02 3F 02 E8 80 00 00 00 3F "
+            + "02 48 02 F0 80 00 00 00 48 02 51 02 F4 80 00 00 "
+            + "00 51 02 5A 02 FA 80 00 00 00 5A 02 63 02 FC 80 "
+            + "00 00 00 63 02 6C 02 05 81 00 00 00 6C 02 75 02 "
+            + "07 81 00 00 00 75 02 7E 02 09 81 00 00 00 7E 02 "
+            + "87 02 0A 81 00 00 00 87 02 90 02 0E 81 00 00 00 "
+            + "90 02 00 00 11 81 00 00 00",
+            "frame 1428");
+    }
+
+    /// <summary>
+    /// What we can actually serve of that packet. The eleven crests frame 1428 carries are the
+    /// same eleven T83's S_CREST_INFO carries at cap_social4_client frame 5108 - our own
+    /// <c>crests</c> table - so the crest list comes out of the store. The skill list does not
+    /// exist here (T79: SDB_USER_FORGET_SKILL is acked without a skill row ever being written),
+    /// so it goes out empty, which moves the crest list up to offset 20.
+    /// </summary>
+    [Test] public static void T91_the_skill_reply_serves_the_crests_we_hold()
+    {
+        using var store = GuildStore(1);
+        foreach (int id in new[] { 33000, 33008, 33012, 33018, 33020, 33029, 33031, 33033, 33034, 33038, 33041 })
+            store.AddCrest(1, id);
+
+        var frame = ArbiterClientHandlers.BuildAdminGetUserInfoSkill(null, store.GetCrests(1));
+        Hex.Eq(frame,
+            "77 00 B4 A3 00 00 00 00 0B 00 14 00 0A 00 00 00 "
+            + "00 00 00 00 14 00 1D 00 E8 80 00 00 00 1D 00 26 "
+            + "00 F0 80 00 00 00 26 00 2F 00 F4 80 00 00 00 2F "
+            + "00 38 00 FA 80 00 00 00 38 00 41 00 FC 80 00 00 "
+            + "00 41 00 4A 00 05 81 00 00 00 4A 00 53 00 07 81 "
+            + "00 00 00 53 00 5C 00 09 81 00 00 00 5C 00 65 00 "
+            + "0A 81 00 00 00 65 00 6E 00 0E 81 00 00 00 6E 00 "
+            + "00 00 11 81 00 00 00",
+            "no skills, eleven crests: the crest list starts at 20 and the skill offset is 0");
+        Hex.True(BitConverter.ToUInt16(frame, 4) == 0 && BitConverter.ToUInt16(frame, 6) == 0,
+            "an empty list writes count 0 AND offset 0 here, the convention this packet uses");
+    }
+
+    /// <summary>
+    /// S_PVP_LEADER_BOARD_INFO (0xB724) and S_PVE_LEADER_BOARD_INFO (0x819F) - one 52-byte
+    /// layout under two opcodes, pushed back to back at enter-world (cap_final_client frames
+    /// 288 / 289, and again at 314 / 315 and 294 / 295 in the two GM captures). The two i64s are
+    /// unix 1660205710 and 1662624910 - 2022-08-11 and 2022-09-08, exactly four weeks apart to
+    /// the second - so this is a closed season and the three values are its final ones.
+    /// </summary>
+    [Test] public static void T91_the_two_leaderboard_pushes_are_byte_exact()
+    {
+        Hex.Eq(ArbiterClientHandlers.BuildPvpLeaderBoardInfo(),
+            "34 00 24 B7 03 00 1C 00 01 00 00 00 8E BA F4 62 "
+            + "00 00 00 00 8E A4 19 63 00 00 00 00 1C 00 24 00 "
+            + "0A 00 00 00 24 00 2C 00 1E 00 00 00 2C 00 00 00 "
+            + "25 00 00 00",
+            "cap_final_client frame 288");
+        Hex.Eq(ArbiterClientHandlers.BuildPveLeaderBoardInfo(),
+            "34 00 9F 81 03 00 1C 00 01 00 00 00 8E BA F4 62 "
+            + "00 00 00 00 8E A4 19 63 00 00 00 00 1C 00 24 00 "
+            + "36 0C 00 00 24 00 2C 00 83 0C 00 00 2C 00 00 00 "
+            + "A6 23 00 00",
+            "frame 289 - the same fixed part, three different values");
+
+        Hex.True(ArbiterClientHandlers.LeaderBoardCapturedEnd
+                 - ArbiterClientHandlers.LeaderBoardCapturedStart == 28L * 24 * 60 * 60,
+            "four weeks to the second");
+        Hex.Eq(ArbiterClientHandlers.BuildLeaderBoardInfo(
+                ArbiterClientHandlers.S_PVP_LEADER_BOARD_INFO, null),
+            "1C 00 24 B7 00 00 00 00 01 00 00 00 8E BA F4 62 "
+            + "00 00 00 00 8E A4 19 63 00 00 00 00",
+            "no capture holds an empty board; this is the fixed part alone");
+    }
+
     /// <summary>SDB_REGISTER_CARD's payload: <c>DlmId@0, AccountDbId@4 (i64), CardTemplateId@12,
     /// Amount@16</c> - 20 bytes, the length of seq 7032.</summary>
     static byte[] CardRegister(long accountId, int cardTemplateId, int amount)

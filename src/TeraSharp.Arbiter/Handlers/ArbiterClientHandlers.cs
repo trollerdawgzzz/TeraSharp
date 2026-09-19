@@ -2106,6 +2106,168 @@ public static class ArbiterClientHandlers
         return p;
     }
 
+    // =========================================================================================
+    // 16. The tool's user-info replies, and the two leaderboard pushes                  (T91)
+    // =========================================================================================
+
+    public const ushort C_ADMIN_REQUEST_USERINFO = 0x9A56;
+    public const ushort C_ADMIN_REQUEST_USERACTION = 0xA3DB;
+    public const ushort S_ADMIN_GET_USERINFO_INVEN = 0xBBED;
+    public const ushort S_ADMIN_GET_USERINFO_WAREHOUSE = 0x7B41;
+    public const ushort S_ADMIN_GET_USERINFO_SKILL = 0xA3B4;
+    public const ushort S_PVP_LEADER_BOARD_INFO = 0xB724;
+    public const ushort S_PVE_LEADER_BOARD_INFO = 0x819F;
+
+    /// <summary>
+    /// The <c>kind</c> C_ADMIN_REQUEST_USERINFO asks for, an i32 at packet +22. The capture
+    /// presses six of them: 1 answers with the inventory (frame 723 -&gt; 724), 6 with the
+    /// warehouse (746 -&gt; 747 and four more) and 5 with the skill tab (1427 -&gt; 1428).
+    /// Kinds 2, 3 and 14 (frames 758, 995, 1006) are answered by nothing the tap recorded.
+    /// </summary>
+    public const int UserInfoKindInven = 1;
+    /// <summary>Kind 5 is the tab S_ADMIN_GET_USERINFO_SKILL answers - frame 1427 asks for 5
+    /// and 1428 is the reply.</summary>
+    public const int UserInfoKindSkill = 5;
+    public const int UserInfoKindWarehouse = 6;
+
+    /// <summary>
+    /// S_ADMIN_GET_USERINFO_WAREHOUSE (0x7B41), frames 747 / 756 / 769 / 778 / 1007 - five
+    /// instances, all of the same empty warehouse, and they differ in exactly one place. The
+    /// body is 42 bytes:
+    /// <code>
+    ///   +0x04 .. +0x0F   twelve zero bytes
+    ///   +0x10 i32  1     +0x14 i32 0   +0x18 i32 0   +0x1C i32 0x47
+    ///   +0x20 .. +0x2B   twelve zero bytes
+    ///   +0x2C u16  0x48 in 747 / 756 / 769 / 778, and 0 in 1007
+    /// </code>
+    /// Nothing in the capture moves an item in or out of that warehouse, so which of those is a
+    /// slot count and which is a page is not pinned - they are parameters with the captured
+    /// defaults, and an empty warehouse reproduces frame 747 byte for byte.
+    /// </summary>
+    public const int AdminWarehouseBodySize = 42;
+
+    public static byte[] BuildAdminGetUserInfoWarehouse(
+        int a = 1, int b = 0x47, int tail = 0x48)
+    {
+        var p = new byte[4 + AdminWarehouseBodySize];
+        BitConverter.GetBytes((ushort)p.Length).CopyTo(p, 0);
+        BitConverter.GetBytes(S_ADMIN_GET_USERINFO_WAREHOUSE).CopyTo(p, 2);
+        BitConverter.GetBytes(a).CopyTo(p, 0x10);
+        BitConverter.GetBytes(b).CopyTo(p, 0x1C);
+        BitConverter.GetBytes((ushort)tail).CopyTo(p, 0x2C);
+        return p;
+    }
+
+    /// <summary>
+    /// S_ADMIN_GET_USERINFO_SKILL (0xA3B4), frame 1428. TWO arrays, which is why the single-list
+    /// reading never closed: 20 + 42*13 + 11*9 = 665 exactly.
+    /// <code>
+    ///   +0x04 u16 skillCount  +0x06 u16 skillOffset (always 20)
+    ///   +0x08 u16 crestCount  +0x0A u16 crestOffset (= 20 + skillCount*13)
+    ///   +0x0C i32 (10)        +0x10 i32 0
+    ///   skill 13 B: [u16 here][u16 next][i32 skillId][i32 0][u8 active]
+    ///   crest  9 B: [u16 here][u16 next][i32 crestId][u8 0]
+    /// </code>
+    /// <para>The trailing byte of a skill entry is not a constant: the first 25 of the 42 carry
+    /// 1 and the last 17 carry 0, and that tail is 10002, 19500, 19501 and the whole 94001..94015
+    /// block - TERA's passive range. So it reads as active-vs-passive. The middle i32 is 0 in all
+    /// 42, and the crest entries' trailing byte is 0 in all 11.</para>
+    /// <para>The second list is the LEARNED CRESTS: its eleven ids - 33000, 33008, 33012, 33018,
+    /// 33020, 33029, 33031, 33033, 33034, 33038, 33041 - are the same eleven
+    /// <c>S_CREST_INFO</c> carries at cap_social4_client frame 5108, which is the
+    /// <c>crests</c> table T83 filled. The skill list is not modelled (T79: SDB_USER_FORGET_SKILL
+    /// is acked without storing one), so it goes out empty.</para>
+    /// </summary>
+    public const int AdminSkillFixedSize = 20;
+    public const int AdminSkillEntrySize = 13;
+    public const int AdminCrestEntrySize = 9;
+
+    public static byte[] BuildAdminGetUserInfoSkill(
+        IReadOnlyList<(int Id, bool Active)>? skillIds, IReadOnlyList<int>? crestIds, int unk = 10)
+    {
+        skillIds ??= Array.Empty<(int, bool)>();
+        crestIds ??= Array.Empty<int>();
+        int skillsAt = AdminSkillFixedSize;
+        int crestsAt = skillsAt + skillIds.Count * AdminSkillEntrySize;
+        var p = new byte[crestsAt + crestIds.Count * AdminCrestEntrySize];
+
+        BitConverter.GetBytes((ushort)p.Length).CopyTo(p, 0);
+        BitConverter.GetBytes(S_ADMIN_GET_USERINFO_SKILL).CopyTo(p, 2);
+        BitConverter.GetBytes((ushort)skillIds.Count).CopyTo(p, 4);
+        BitConverter.GetBytes((ushort)(skillIds.Count == 0 ? 0 : skillsAt)).CopyTo(p, 6);
+        BitConverter.GetBytes((ushort)crestIds.Count).CopyTo(p, 8);
+        BitConverter.GetBytes((ushort)(crestIds.Count == 0 ? 0 : crestsAt)).CopyTo(p, 10);
+        BitConverter.GetBytes(unk).CopyTo(p, 12);
+
+        for (int i = 0; i < skillIds.Count; i++)
+        {
+            int at = skillsAt + i * AdminSkillEntrySize;
+            BitConverter.GetBytes((ushort)at).CopyTo(p, at);
+            // Each list terminates on its own: the last skill's next is 0, not the crest list.
+            BitConverter.GetBytes((ushort)(i + 1 < skillIds.Count ? at + AdminSkillEntrySize : 0))
+                .CopyTo(p, at + 2);
+            BitConverter.GetBytes(skillIds[i].Id).CopyTo(p, at + 4);
+            p[at + 12] = (byte)(skillIds[i].Active ? 1 : 0);
+        }
+        for (int i = 0; i < crestIds.Count; i++)
+        {
+            int at = crestsAt + i * AdminCrestEntrySize;
+            BitConverter.GetBytes((ushort)at).CopyTo(p, at);
+            BitConverter.GetBytes((ushort)(i + 1 < crestIds.Count ? at + AdminCrestEntrySize : 0)).CopyTo(p, at + 2);
+            BitConverter.GetBytes(crestIds[i]).CopyTo(p, at + 4);
+        }
+        return p;
+    }
+
+    /// <summary>
+    /// S_PVP_LEADER_BOARD_INFO (0xB724) and S_PVE_LEADER_BOARD_INFO (0x819F) - one layout, two
+    /// opcodes, 52 bytes each, pushed at enter-world (cap_final_client frames 288 and 289).
+    /// <code>
+    ///   +0x04 u16 count (3)  +0x06 u16 firstOffset (0x1C)
+    ///   +0x08 i32 season (1) +0x0C i64 seasonStart  +0x14 i64 seasonEnd
+    ///   element 8 B: [u16 here][u16 next][i32 value]
+    /// </code>
+    /// The two captured stamps are unix 1660205710 and 1662624910 - 2022-08-11 and 2022-09-08,
+    /// four years before the capture and exactly four weeks apart to the second, so this is a
+    /// season long closed and the three values are its final ones (10 / 30 / 37 for PvP,
+    /// 3126 / 3203 / 9126 for PvE). Both opcodes carry the same pair.
+    /// </summary>
+    public const int LeaderBoardFixedSize = 0x1C;
+    public const int LeaderBoardEntrySize = 8;
+    public const long LeaderBoardCapturedStart = 1660205710L;
+    public const long LeaderBoardCapturedEnd = 1662624910L;
+    public static readonly int[] LeaderBoardCapturedPvp = { 10, 30, 37 };
+    public static readonly int[] LeaderBoardCapturedPve = { 3126, 3203, 9126 };
+
+    public static byte[] BuildLeaderBoardInfo(ushort opcode, IReadOnlyList<int>? values,
+        int season = 1, long start = LeaderBoardCapturedStart, long end = LeaderBoardCapturedEnd)
+    {
+        values ??= Array.Empty<int>();
+        var p = new byte[LeaderBoardFixedSize + values.Count * LeaderBoardEntrySize];
+        BitConverter.GetBytes((ushort)p.Length).CopyTo(p, 0);
+        BitConverter.GetBytes(opcode).CopyTo(p, 2);
+        BitConverter.GetBytes((ushort)values.Count).CopyTo(p, 4);
+        BitConverter.GetBytes((ushort)(values.Count == 0 ? 0 : LeaderBoardFixedSize)).CopyTo(p, 6);
+        BitConverter.GetBytes(season).CopyTo(p, 8);
+        BitConverter.GetBytes(start).CopyTo(p, 12);
+        BitConverter.GetBytes(end).CopyTo(p, 20);
+        for (int i = 0; i < values.Count; i++)
+        {
+            int at = LeaderBoardFixedSize + i * LeaderBoardEntrySize;
+            BitConverter.GetBytes((ushort)at).CopyTo(p, at);
+            BitConverter.GetBytes((ushort)(i + 1 < values.Count ? at + LeaderBoardEntrySize : 0)).CopyTo(p, at + 2);
+            BitConverter.GetBytes(values[i]).CopyTo(p, at + 4);
+        }
+        return p;
+    }
+
+    /// <summary>The two frames as the capture pushes them, for the enter-world burst.</summary>
+    public static byte[] BuildPvpLeaderBoardInfo()
+        => BuildLeaderBoardInfo(S_PVP_LEADER_BOARD_INFO, LeaderBoardCapturedPvp);
+
+    public static byte[] BuildPveLeaderBoardInfo()
+        => BuildLeaderBoardInfo(S_PVE_LEADER_BOARD_INFO, LeaderBoardCapturedPve);
+
     /// <summary>A NUL-terminated UTF-16LE string, as the inter-server and client writers emit it.</summary>
     public static byte[] WString(string? s)
     {
