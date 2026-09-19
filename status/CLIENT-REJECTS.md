@@ -847,10 +847,15 @@ T89b had since added two of them; this is the third.
 
 All five captures carry those identical bytes - cap_final_client **46**, cap_final_client2 **124**,
 cap_final_gm_client2 **49**, cap_social_client **45**, cap_newchar_client **99** - *including* the
-trailing i64, which reads `0x6AB742A9` (1790035625) in every one. The captures are days apart, so
-that field is **not a clock**: it is a fixed deadline off the politics sheet, and the right
-implementation is the constant, not `now + something`. Everything ahead of it is zero in all five,
-so the field boundaries in the first 18 bytes are unknowable from the wire and are left unnamed.
+trailing i64 at **+18**, which reads `0x6AB742A9` = **1790395049** = 2026-09-26 03:57 UTC in every
+one. The captures are days apart, so that field is **not a clock**: it is a fixed deadline, and the
+right implementation is the constant, not `now + something`. Everything ahead of it is zero in all
+five, so the field boundaries in the first 18 bytes are unknowable from the wire and are left
+unnamed.
+
+That deadline is **8.96 days after** the 2026-09-17 capture - and the invite-code expiry in frame
+15 below is 1790398178, 2026-09-26 04:49 UTC, **52 minutes later**. Two unrelated windows landing
+within the hour, nine days out, reads like one server-config date rather than two sheet values.
 
 It is a pure push - no `C_CURRENT_ELECTION_STATE` exists in any capture. In cap_final_client the
 Arbiter sends it itself, directly after its own `S_BROCAST_GUILD_FLAG` (45 -> 46); in the captures

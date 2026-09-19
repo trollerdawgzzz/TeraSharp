@@ -3619,7 +3619,7 @@ public static class ArbiterClientHandlers
     /// <c>S_BROCAST_GUILD_FLAG</c> in the one capture where the Arbiter sends it itself
     /// (cap_final_client 45 -&gt; 46).</para>
     /// </summary>
-    public const long ElectionDeadline = 0x6AB742A9L;   // 1790035625
+    public const long ElectionDeadline = 0x6AB742A9L;   // 1790395049 = 2026-09-26 03:57 UTC
 
     /// <summary>The packet's total length, from all five captures.</summary>
     public const int CurrentElectionStateSize = 26;
