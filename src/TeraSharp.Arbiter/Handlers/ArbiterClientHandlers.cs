@@ -4224,7 +4224,7 @@ public static class ItemBoardPackets
     public const int RankRecordBodySize = 16 - 4;         // DungeonId + Season + DrtType
     public const int RankSeasonBodySize = 12 - 4;         // DungeonId + DrtType
 
-    private static int Me(GameSession s) => s.SelectedCharacter?.Id ?? 0;
+    private static int Me(GameSession s) => (int)(s.SelectedCharacter?.Id ?? 0);
     private static long Now() => DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 
     // ------------------------------- the item string -------------------------------

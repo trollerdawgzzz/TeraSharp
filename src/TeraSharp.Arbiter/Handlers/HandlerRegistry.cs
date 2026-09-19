@@ -231,6 +231,28 @@ public static class HandlerRegistry
         Reg("C_ADMIN_GM_SKILL", 12,                (s, b) => GmAdminTool.OnGmSkill(s, b, misc));
         Reg("C_ADMIN_REQUEST_USERINFO",   22, (s, b) => GmAdminTool.OnRequestUserInfo(s, b, misc));     // T91
         Reg("C_ADMIN_REQUEST_USERACTION", 18, (s, b) => GmAdminTool.OnRequestUserAction(s, b, misc));   // T91
+        // T99: GM tool tail
+        Reg("C_ADMIN_GM_TELEPORT",              GmAdminTool.GmTeleportBodySize,     (s,b) => GmAdminTool.OnGmTeleport(s,b,misc));
+        Reg("C_ADMIN_GM_MAPTELEPORT",           GmAdminTool.GmMapTeleportBodySize,  (s,b) => GmAdminTool.OnGmMapTeleport(s,b,misc));
+        Reg("C_ADMIN_LOBBY",                    GmAdminTool.AdminLobbyBodySize,     (s,b) => GmAdminTool.OnAdminLobby(s,b,misc));
+        Reg("C_ADMIN_REMOVE_NPC",               GmAdminTool.GameIdBodySize,         (s,b) => GmAdminTool.OnAdminRemoveNpc(s,b,misc));
+        Reg("C_ADMIN_VANISH_PET",               GmAdminTool.GameIdBodySize,         (s,b) => GmAdminTool.OnAdminVanishPet(s,b,misc));
+        Reg("C_ADMIN_GET_DUNGEON_USER_LIST",    GmAdminTool.DungeonIdBodySize,      (s,b) => GmAdminTool.OnAdminGetDungeonUserList(s,b,misc));
+        Reg("C_ADMIN_REMOVE_CUSTOM_BOOKMARK",   GmAdminTool.BookmarkIndexBodySize,  (s,b) => GmAdminTool.OnRemoveCustomBookmark(s,b,misc));
+        Reg("C_ADMIN_GMEVENT_NOTICE",           GmAdminTool.GmEventNoticeBodySize,  (s,b) => GmAdminTool.OnGmEventNotice(s,b,misc));
+        // T99: item strings, boards, previews, trade log, dungeon rank
+        Reg("C_SET_ITEM_STRING",        ItemBoardPackets.SetItemStringBodySize,     (s,b) => ItemBoardPackets.OnSetItemString(s,b,misc));
+        Reg("C_REWRITE_ITEM_STRING",    ItemBoardPackets.RewriteItemStringBodySize, (s,b) => ItemBoardPackets.OnRewriteItemString(s,b,misc));
+        Reg("C_WRITE_BOARD",            ItemBoardPackets.WriteBoardBodySize,        (s,b) => ItemBoardPackets.OnWriteBoard(s,b,misc));
+        Reg("C_REQUEST_WRITE_BOARD",    ItemBoardPackets.BoardIdBodySize,           (s,b) => ItemBoardPackets.OnRequestWriteBoard(s,b,misc));
+        Reg("C_BOARD_ITEM_LIST",        ItemBoardPackets.BoardIdBodySize,           (s,b) => ItemBoardPackets.OnBoardItemList(s,b,misc));
+        Reg("C_PREVIEW_ITEM",           4,                                          (s,b) => ItemBoardPackets.OnPreviewItem(s,b,misc));
+        Reg("C_REQUEST_NONDB_ITEM_INFO",ItemBoardPackets.NonDbItemInfoBodySize,     (s,b) => ItemBoardPackets.OnRequestNonDbItemInfo(s,b,misc));
+        Reg("C_SHOW_TRADE_LOG",         ItemBoardPackets.PageBodySize,              (s,b) => ItemBoardPackets.OnShowTradeLog(s,b,misc));
+        Reg("C_SHOW_TRADE_ITEM",        0,                                          (s,b) => ItemBoardPackets.OnShowTradeItem(s,b,misc));
+        Reg("C_REQUEST_IMAGE_DATA",     ItemBoardPackets.ImageIdBodySize,           (s,b) => ItemBoardPackets.OnRequestImageData(s,b,misc));
+        Reg("C_DUNGEON_RANK_RECORD_LIST", ItemBoardPackets.RankRecordBodySize,      (s,b) => ItemBoardPackets.OnDungeonRankRecordList(s,b,misc));
+        Reg("C_DUNGEON_RANK_SEASON_LIST", ItemBoardPackets.RankSeasonBodySize,      (s,b) => ItemBoardPackets.OnDungeonRankSeasonList(s,b,misc));
         GmAdminTool.OnlineSessions = () => Program.World?.InWorldSessions() ?? new List<GameSession>();
         foreach (var name in new[]
         {

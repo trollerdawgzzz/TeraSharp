@@ -1032,7 +1032,7 @@ public static class GmAdminTool
     {
         if (!Allowed(s, log, "C_ADMIN_REMOVE_CUSTOM_BOOKMARK")) return true;
         var b = body.Span;
-        long account = s.Account?.Id ?? 0;
+        long account = (long)(s.Account?.AccountId ?? 0);
         if (b.Length >= BookmarkIndexBodySize && account > 0)
             Program.Store?.DeleteGmBookmark(account, BitConverter.ToInt32(b));
         return OnRequestCustomBookmark(s, body, log);
