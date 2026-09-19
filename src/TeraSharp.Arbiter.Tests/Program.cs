@@ -10444,10 +10444,11 @@ bool   isGuildWarAcceptable
     /// <summary>
     /// T101 - restore clears a SCHEDULED delete, and says so plainly when it cannot.
     ///
-    /// <para>This is not retail's WA_UNDELETE_USER. That brings back a row that is gone, which
-    /// needs the soft-delete columns and <c>deleted_items</c> that WEBADMIN-DESIGN.md section 4
-    /// lists as new tables. TeraSharp's <c>delete_at</c> (T88) is a grace window, and T88 left
-    /// <c>OnDeleteUser</c> hard-deleting - so a truly deleted character answers 2, not 0.</para>
+    /// <para>T101b widened this into the real WA_UNDELETE_USER - the delete is a soft delete now
+    /// and the items come back with the row, which
+    /// <see cref="T101b_soft_delete_parks_the_items_and_restore_brings_them_back"/> covers. What
+    /// stays true, and is what this test holds, is the shape: nothing pending is 3, a row the
+    /// purge has already taken is 2, and no id at all is 3.</para>
     /// </summary>
     [Test] public static void T101_admin_api_restore_only_rescues_a_scheduled_delete()
     {
@@ -10485,22 +10486,30 @@ bool   isGuildWarAcceptable
     }
 
     /// <summary>
-    /// T101 - the phase-2 endpoints answer a clean refusal instead of 404.
+    /// T101b - phase 3 is what refuses now. T101 had the eight money/ban/kick paths answering
+    /// 501; this pass implements them, so the refusal list is down to the bulk operations and
+    /// events that WEBADMIN-DESIGN.md section 6 puts in phase 3.
     ///
-    /// <para>WEBADMIN-DESIGN.md's out-of-scope note asks for exactly this: a failure result so the
-    /// tool reports "not supported" rather than hanging or looking broken.</para>
+    /// <para>The refusal itself is still what the doc's out-of-scope note asks for: a failure
+    /// result so the tool reports "not supported" rather than hanging or looking broken.</para>
     /// </summary>
-    [Test] public static void T101_admin_api_phase_two_endpoints_refuse_cleanly()
+    [Test] public static void T101b_admin_api_phase_three_endpoints_refuse_cleanly()
     {
         using var store = StoreWithTwoAccounts();
         var api = NewAdminApi(store);
-        foreach (var path in AdminApi.PhaseTwoPaths)
+        foreach (var path in AdminApi.PhaseThreePaths)
         {
             var r = api.Handle("POST", path, token: T101Token);
             Hex.True(r.Status == 501 && r.Body.Contains("\"result\":" + AdminApi.ResultRefused),
                 $"{path} answers 501 / result 0x16, not 404: {r.Status} {r.Body}");
         }
-        Hex.True(AdminApi.PhaseTwoPaths.Length == 8, "the eight the brief lists for phase 2");
+        Hex.True(AdminApi.PhaseThreePaths.Length == 3, "bulk mail, events and festivals are what is left");
+
+        // and the eight that used to sit in that list now do real work
+        var money = api.Handle("POST", "/api/set-money",
+            body: "{\"id\":1,\"money\":5}", token: T101Token);
+        Hex.True(money.Status == 200 && money.Body.Contains("\"result\":" + AdminApi.ResultOk),
+            $"set-money is phase 2 work now, not a refusal: {money.Status} {money.Body}");
 
         var nope = api.Handle("GET", "/api/nothing-here", token: T101Token);
         Hex.True(nope.Status == 404, "a genuinely unknown path is still 404");
@@ -10519,6 +10528,255 @@ bool   isGuildWarAcceptable
         Hex.True(AdminApi.JsonString("{\"reason\":\"a \\\"quoted\\\" word\"}", "reason")
                  == "a \"quoted\" word", "escapes come back undone");
         Hex.True(AdminApi.JsonString("{\"reason\":\"\"}", "reason") == "", "an empty string is empty");
+    }
+
+    // =======================================================================================
+    // T101b - the admin web tool, phase 2. status/WEBADMIN-DESIGN.md section 9.
+    //
+    // Same shape as T101: every test drives AdminApi directly and nothing opens a socket. The
+    // two new store tables (restrictions, deleted_items) get their round trips here as well,
+    // because the soft delete is the half of this pass the web tool only reads.
+    // =======================================================================================
+
+    /// <summary>T101b - WA_CHANGE_MONEY and the level setter, including what they refuse.</summary>
+    [Test] public static void T101b_admin_api_sets_money_and_level()
+    {
+        using var store = StoreWithTwoAccounts();
+        var api = NewAdminApi(store);
+        store.SetCharacterMoney(1, 1234);
+
+        var ok = api.Handle("POST", "/api/set-money",
+            body: "{\"id\":1,\"money\":9000,\"reason\":\"make-good\"}",
+            token: T101Token, sourceIp: "127.0.0.1");
+        // the retail reply carries both figures - WEBADMIN-DESIGN.md section 2
+        Hex.True(ok.Status == 200 && ok.Body.Contains("\"oldMoney\":1234")
+                 && ok.Body.Contains("\"newMoney\":9000"), $"both figures come back: {ok.Body}");
+        Hex.True(store.GetCharacterMoney(1) == 9000, "and the row actually moved");
+
+        var byName = api.Handle("POST", "/api/set-money",
+            body: "{\"name\":\"t30_2\",\"money\":7}", token: T101Token);
+        Hex.True(byName.Status == 200 && store.GetCharacterMoney(2) == 7,
+            "a name resolves the target too - the picker hands one or the other");
+
+        var neg = api.Handle("POST", "/api/set-money", body: "{\"id\":1,\"money\":-1}", token: T101Token);
+        Hex.True(neg.Status == 400 && neg.Body.Contains("\"result\":" + AdminApi.ResultInvalid),
+            "negative money is result 3, not a silent clamp");
+        var gone = api.Handle("POST", "/api/set-money", body: "{\"id\":999,\"money\":1}", token: T101Token);
+        Hex.True(gone.Status == 404 && gone.Body.Contains("\"result\":" + AdminApi.ResultNotFound),
+            "an unknown character is result 2");
+        Hex.True(store.GetCharacterMoney(1) == 9000, "and neither refusal touched anything");
+
+        var lvl = api.Handle("POST", "/api/set-level", body: "{\"id\":1,\"level\":60}", token: T101Token);
+        Hex.True(lvl.Status == 200 && store.GetCharacter(1)!.Level == 60, $"level set: {lvl.Body}");
+        var over = api.Handle("POST", "/api/set-level",
+            body: "{\"id\":1,\"level\":" + (AdminApi.MaxLevel + 1) + "}", token: T101Token);
+        Hex.True(over.Status == 400 && store.GetCharacter(1)!.Level == 60,
+            $"past the {AdminApi.MaxLevel} ceiling is refused and changes nothing");
+        var zero = api.Handle("POST", "/api/set-level", body: "{\"id\":1,\"level\":0}", token: T101Token);
+        Hex.True(zero.Status == 400, "and so is level 0");
+
+        var log = store.GetAdminLog(50);
+        Hex.True(log.Count == 7, $"every attempt, refusals included, is in the audit trail: {log.Count}");
+    }
+
+    /// <summary>
+    /// T101b - WA_ADD_ITEM, minus the 262-byte option block WEBADMIN-DESIGN.md section 6 budgets
+    /// separately. This also pins ItemRow.Amount, which T101 shipped as ItemRow.Count.
+    /// </summary>
+    [Test] public static void T101b_admin_api_gives_an_item_into_the_first_free_slot()
+    {
+        using var store = StoreWithTwoAccounts();
+        var api = NewAdminApi(store);
+
+        var first = api.Handle("POST", "/api/give-item",
+            body: "{\"id\":1,\"templateId\":88375,\"amount\":3,\"reason\":\"make-good\"}",
+            token: T101Token);
+        Hex.True(first.Status == 200 && first.Body.Contains("\"slot\":0")
+                 && first.Body.Contains("\"itemDbId\":"), $"into the first free slot: {first.Body}");
+
+        var second = api.Handle("POST", "/api/give-item",
+            body: "{\"id\":1,\"templateId\":88376,\"amount\":1}", token: T101Token);
+        Hex.True(second.Body.Contains("\"slot\":1"), $"the next lands beside it, not on top: {second.Body}");
+
+        var items = store.GetItems(1, 0);
+        Hex.True(items.Count == 2 && items[0].TemplateId == 88375 && items[0].Amount == 3,
+            $"two rows in slot order: {items.Count}");
+
+        var bad = api.Handle("POST", "/api/give-item",
+            body: "{\"id\":1,\"templateId\":0,\"amount\":1}", token: T101Token);
+        Hex.True(bad.Status == 400 && bad.Body.Contains("\"result\":" + AdminApi.ResultInvalid),
+            "template 0 is result 3");
+
+        var look = api.Handle("GET", "/api/character",
+            new Dictionary<string, string> { ["id"] = "1" }, token: T101Token);
+        Hex.True(look.Body.Contains("\"count\":3"),
+            $"and the lookup reports it - the JSON key stays count, the ItemRow field is Amount: {look.Body}");
+    }
+
+    /// <summary>
+    /// T101b - WA_ADD/DEL_CHARACTER_RESTRICTION. One row per (character, type), hours 0 means
+    /// permanent, and a lapsed until stops counting on its own.
+    /// </summary>
+    [Test] public static void T101b_admin_api_bans_and_unbans()
+    {
+        using var store = StoreWithTwoAccounts();
+        var api = NewAdminApi(store);
+        int ban = TeraSharp.Arbiter.Persistence.CharacterStore.RestrictionBan;
+        long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+
+        var lifted = api.Handle("POST", "/api/unban", body: "{\"id\":1}", token: T101Token);
+        Hex.True(lifted.Status == 404 && lifted.Body.Contains("\"result\":" + AdminApi.ResultNotFound),
+            "unbanning someone who is not banned is result 2, not a cheerful 0");
+
+        var perm = api.Handle("POST", "/api/ban",
+            body: "{\"id\":1,\"hours\":0,\"reason\":\"bot\"}", token: T101Token);
+        Hex.True(perm.Status == 200 && perm.Body.Contains("\"until\":0"), $"hours 0 is permanent: {perm.Body}");
+        Hex.True(store.IsRestricted(1, ban, now + 10L * 365 * 24 * 3600), "and it never lapses");
+
+        var timed = api.Handle("POST", "/api/ban",
+            body: "{\"id\":1,\"hours\":48,\"reason\":\"cooldown\"}", token: T101Token);
+        Hex.True(timed.Status == 200, $"a second ban replaces the first: {timed.Body}");
+        var rows = store.GetRestrictions(1);
+        Hex.True(rows.Count == 1 && rows[0].Reason == "cooldown",
+            $"one row per (character, type), so it is an upsert: {rows.Count}");
+        Hex.True(rows[0].Until >= now + 48L * 3600 - 5 && rows[0].Until <= now + 48L * 3600 + 5,
+            $"48 h out: {rows[0].Until - now}");
+        Hex.True(store.IsRestricted(1, ban, rows[0].Until - 1), "banned right up to the deadline");
+        Hex.True(!store.IsRestricted(1, ban, rows[0].Until + 1), "and free a second after it");
+
+        var off = api.Handle("POST", "/api/unban", body: "{\"id\":1,\"reason\":\"appeal\"}", token: T101Token);
+        Hex.True(off.Status == 200 && store.GetRestrictions(1).Count == 0, $"and lifting it clears the row: {off.Body}");
+        Hex.True(!store.IsRestricted(2, ban, now), "character 2 was never in this");
+    }
+
+    /// <summary>
+    /// T101b - kick and announce are the two endpoints with nothing in the store behind them, so
+    /// they go through delegates the wiring sets. Unset means kick answers 2 rather than
+    /// pretending it disconnected somebody.
+    /// </summary>
+    [Test] public static void T101b_admin_api_kick_and_announce_go_through_the_delegates()
+    {
+        using var store = StoreWithTwoAccounts();
+        var api = NewAdminApi(store);
+
+        var unwired = api.Handle("POST", "/api/kick", body: "{\"id\":1}", token: T101Token);
+        Hex.True(unwired.Status == 404 && unwired.Body.Contains("\"result\":" + AdminApi.ResultNotFound),
+            "no delegate means nobody is online, and the tool says so");
+
+        int kicked = 0;
+        string said = string.Empty;
+        api.KickPlayer = id => { kicked = id; return id == 1; };
+        api.Announce = t => { said = t; return 7; };
+
+        var ok = api.Handle("POST", "/api/kick",
+            body: "{\"id\":1,\"reason\":\"afk in a raid\"}", token: T101Token);
+        Hex.True(ok.Status == 200 && kicked == 1, $"the live one goes: {ok.Body}");
+        var absent = api.Handle("POST", "/api/kick", body: "{\"id\":2}", token: T101Token);
+        Hex.True(absent.Status == 404, "someone who is not in world is still result 2");
+        var noId = api.Handle("POST", "/api/kick", body: "{}", token: T101Token);
+        Hex.True(noId.Status == 400, "and no id at all is result 3");
+
+        var ann = api.Handle("POST", "/api/announce",
+            body: "{\"text\":\"server down in 5\"}", token: T101Token);
+        Hex.True(ann.Status == 200 && ann.Body.Contains("\"sent\":7") && said == "server down in 5",
+            $"the text reaches the delegate and the count comes back: {ann.Body}");
+        var empty = api.Handle("POST", "/api/announce", body: "{\"text\":\"\"}", token: T101Token);
+        Hex.True(empty.Status == 400, "an empty announce is refused, not broadcast");
+    }
+
+    /// <summary>T101b - the GM level, which is an ACCOUNT column rather than a character one.</summary>
+    [Test] public static void T101b_admin_api_sets_a_gm_level()
+    {
+        using var store = StoreWithTwoAccounts();
+        var api = NewAdminApi(store);
+        var acct = store.GetOrCreateAccount("acct1");
+
+        var ok = api.Handle("POST", "/api/gm-level",
+            body: "{\"accountId\":" + acct.Id + ",\"level\":4,\"reason\":\"new gm\"}", token: T101Token);
+        Hex.True(ok.Status == 200 && store.GetAdminLevel(acct.Id) == 4, $"set: {ok.Body}");
+
+        var down = api.Handle("POST", "/api/gm-level",
+            body: "{\"accountId\":" + acct.Id + ",\"level\":0}", token: T101Token);
+        Hex.True(down.Status == 200 && store.GetAdminLevel(acct.Id) == 0, "0 is a legal level - it is how a GM is demoted");
+
+        var missing = api.Handle("POST", "/api/gm-level",
+            body: "{\"accountId\":4242,\"level\":1}", token: T101Token);
+        Hex.True(missing.Status == 404 && missing.Body.Contains("\"result\":" + AdminApi.ResultNotFound),
+            "an unknown account is result 2");
+        var bad = api.Handle("POST", "/api/gm-level", body: "{\"level\":1}", token: T101Token);
+        Hex.True(bad.Status == 400, "no accountId is result 3");
+    }
+
+    /// <summary>
+    /// T101b - the soft delete. T88 hard-deleted the row on C_DELETE_USER, which made both
+    /// C_CANCEL_DELETE_USER and the admin tool's restore meaningless; OnDeleteUser schedules now
+    /// and parks the items in deleted_items, so restore is the retail WA_UNDELETE_USER.
+    /// </summary>
+    [Test] public static void T101b_soft_delete_parks_the_items_and_restore_brings_them_back()
+    {
+        using var store = StoreWithTwoAccounts();
+        var api = NewAdminApi(store);
+        var acct = store.GetOrCreateAccount("acct1");
+        store.UpsertItem(9001, 1, 0, 0, 88375, 3);
+        store.UpsertItem(9002, 1, 0, 1, 88376, 1);
+        store.SetCharacterMoney(1, 4242);
+
+        long now = 1789790000L;
+        long at = now + (long)TeraSharp.Arbiter.Persistence.CharacterStore.DeleteExpireHours * 3600L;
+        Hex.True(store.SoftDeleteCharacter(1, acct.Id, "t30_1", at, now), "scheduled, not done");
+        Hex.True(store.GetCharacter(1) != null,
+            "the row stays - that is what S_GET_USER_LIST.deleteRemainSec counts down");
+        Hex.True(store.GetCharacterDeleteAt(1) == at, "stamped 72 h out");
+        Hex.True(store.GetItems(1, 0).Count == 0, "but the items are parked out of the way");
+
+        Hex.True(!store.SoftDeleteCharacter(1, acct.Id + 1, "x", at, now),
+            "and the ownership check still holds - another account cannot schedule it");
+
+        var listed = api.Handle("GET", "/api/deleted", token: T101Token);
+        Hex.True(listed.Status == 200 && listed.Body.Contains("\"id\":1")
+                 && !listed.Body.Contains("\"id\":2"), $"only the one waiting: {listed.Body}");
+
+        var back = api.Handle("POST", "/api/restore-character",
+            body: "{\"id\":1,\"reason\":\"support ticket\"}", token: T101Token, sourceIp: "127.0.0.1");
+        Hex.True(back.Status == 200 && back.Body.Contains("\"result\":" + AdminApi.ResultOk),
+            $"restore inside the window: {back.Body}");
+
+        var items = store.GetItems(1, 0);
+        Hex.True(items.Count == 2 && items[0].ItemDbId == 9001 && items[0].TemplateId == 88375
+                 && items[0].Amount == 3 && items[1].Slot == 1,
+            $"the items came back, ids and slots intact - phase 1 could not do this: {items.Count}");
+        Hex.True(store.GetCharacterDeleteAt(1) == 0 && store.GetCharacterMoney(1) == 4242,
+            "the stamp is cleared and the money never moved");
+        Hex.True(store.GetDeletedCharacters(10).Count == 0, "nothing is waiting any more");
+    }
+
+    /// <summary>
+    /// T101b - and the purge is what finally removes it, once deleteCharacterExpireHour2 (72 h,
+    /// LoginHandlers' S_GET_USER_LIST) has run out.
+    /// </summary>
+    [Test] public static void T101b_the_purge_is_what_finally_removes_a_deleted_character()
+    {
+        using var store = StoreWithTwoAccounts();
+        var acct = store.GetOrCreateAccount("acct1");
+        int hours = TeraSharp.Arbiter.Persistence.CharacterStore.DeleteExpireHours;
+        int ban = TeraSharp.Arbiter.Persistence.CharacterStore.RestrictionBan;
+        long now = 1789790000L;
+
+        store.UpsertItem(9001, 1, 0, 0, 88375, 3);
+        store.AddRestriction(1, ban, 1, 0, "bot", now);
+        Hex.True(store.SoftDeleteCharacter(1, acct.Id, "t30_1", now + (long)hours * 3600, now), "one soft delete");
+
+        Hex.True(store.PurgeExpiredDeletes(now + (long)(hours - 1) * 3600, hours) == 0,
+            "inside the window nothing goes");
+        Hex.True(store.GetCharacter(1) != null, "the row is still restorable");
+
+        Hex.True(store.PurgeExpiredDeletes(now + (long)(hours + 1) * 3600, hours) == 1,
+            "past it, exactly one goes");
+        Hex.True(store.GetCharacter(1) == null, "the row is finally gone");
+        Hex.True(store.GetRestrictions(1).Count == 0,
+            "with its restriction rows - restrictions.character_id is a real foreign key");
+        Hex.True(store.GetCharacter(2) != null, "and the other character never noticed");
+        Hex.True(store.GetDeletedCharacters(10).Count == 0, "the waiting list is empty");
     }
 
     // ---- The rules ----

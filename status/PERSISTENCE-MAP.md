@@ -637,3 +637,43 @@ stamps who did it - this keeps the source IP and the result code too.
 
 Also added: `SearchAccounts(term, limit)` - by id when the term parses as one, otherwise a name
 substring with LIKE wildcards escaped, the same way `GetNamesStartingWith` does it.
+
+## T101b - `restrictions`, `deleted_items`, and the soft delete
+
+```sql
+CREATE TABLE restrictions (
+  character_id INTEGER NOT NULL REFERENCES characters(id),
+  type INTEGER NOT NULL,              -- 1 ban, 2 mute
+  level INTEGER NOT NULL DEFAULT 0,
+  until INTEGER NOT NULL DEFAULT 0,   -- unix seconds; 0 = permanent
+  reason TEXT NOT NULL DEFAULT (''), set_at INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (character_id, type)
+);
+CREATE TABLE deleted_items (
+  item_db_id INTEGER PRIMARY KEY, character_id INTEGER NOT NULL,
+  inven_type INTEGER NOT NULL DEFAULT 0, slot INTEGER NOT NULL DEFAULT 0,
+  template_id INTEGER NOT NULL DEFAULT 0, amount INTEGER NOT NULL DEFAULT 0,
+  record BLOB, deleted_at INTEGER NOT NULL DEFAULT 0
+);
+```
+
+Plus two columns on `characters`: `deleted_at` and `deleted_by` (both added with
+`AddColumnIfMissing`, so an existing db upgrades in place).
+
+`AddRestriction` / `RemoveRestriction` / `GetRestrictions` / `IsRestricted(id, type, now)` - one row
+per `(character_id, type)`, so a second ban replaces the first. An expired `until` stops counting on
+its own; `until` 0 never lapses.
+
+`SoftDeleteCharacter(id, accountId, byWhom, deleteAt, now)` / `RestoreDeletedCharacter(id)` /
+`GetDeletedCharacters(limit)` / `PurgeExpiredDeletes(now, expireHours = DeleteExpireHours)`. Both
+mutators are transactional and keep item ids and slots, so a restore is byte-identical to what was
+parked. `DeleteExpireHours = 72` is `deleteCharacterExpireHour2` from `LoginHandlers`'
+S_GET_USER_LIST.
+
+`DeleteCharacter` also gained `DELETE FROM restrictions WHERE character_id = $id` - the table has a
+real foreign key on `characters(id)` and Microsoft.Data.Sqlite enforces them, so purging a banned
+character would otherwise fail with SQLite error 19.
+
+`CancelCharacterDelete` now checks ownership and a pending stamp, then delegates to
+`RestoreDeletedCharacter`, so `C_CANCEL_DELETE_USER` and the admin tool's restore are one code path.
+See `status/WEBADMIN-DESIGN.md` section 9.
