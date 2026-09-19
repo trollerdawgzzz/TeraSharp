@@ -1467,7 +1467,6 @@ public static class GuildPackets
     /// the client S_GUILD_MONEY_INFO_CHANGED.
     /// </summary>
     public const ushort AS_UPDATE_GUILD_DATA = 0x144E;
-    public const ushort AS_UPDATE_GUILD_DATA = 0x144E;
     public const ushort AS_UPDATE_GUILD_QUEST_POINT_INFO = 0x1453;
     public const ushort AS_PUSH_GUILD_BUFF = 0x145D;
     public const ushort AS_LEARN_GUILD_PERK = 0x145E;
