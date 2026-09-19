@@ -3767,22 +3767,64 @@ array items
             $"{why}: {actual.Length} bytes vs {expected.Length}");
         var a = (byte[])actual.Clone();
         var b = (byte[])expected.Clone();
-        for (int at = BagItems.PayloadHeader; at + BagItems.RecordSize <= a.Length;
-             at += BagItems.RecordSize)
+        var starts = RecordStartsIn(expected);
+        foreach (int at in starts)
         {
-            Array.Clear(a, at + BagItems.RecordIdOffset, 4);
-            Array.Clear(b, at + BagItems.RecordIdOffset, 4);
+            Array.Clear(a, at, ItemIdFieldSize);
+            Array.Clear(b, at, ItemIdFieldSize);
         }
-        Hex.Eq(a, b, why);
+
+        // Name the offsets rather than just failing: if a byte outside the masked id fields
+        // still differs, the message says where, so the next look does not need another run.
+        var diff = new List<int>();
+        for (int i = 0; i < a.Length && diff.Count < 8; i++) if (a[i] != b[i]) diff.Add(i);
+        if (diff.Count == 0) return;
+
+        var at0 = diff[0];
+        Hex.True(false,
+            $"{why}: {diff.Count} differing byte(s) outside the masked ids, first at {at0} "
+            + $"(record start {(starts.Count == 0 ? -1 : (at0 - starts[0]) / BagItems.RecordSize)}, "
+            + $"field +{(starts.Count == 0 ? at0 : (at0 - starts[0]) % BagItems.RecordSize)}): "
+            + $"got {a[at0]:X2} want {b[at0]:X2}; offsets {string.Join(",", diff)}; "
+            + $"masked {string.Join(",", starts)}");
+    }
+
+    /// <summary>The id is the first four bytes of each 536-byte record.</summary>
+    const int ItemIdFieldSize = 4;
+
+    /// <summary>
+    /// T105c. Where each record starts in a 0x27A4 payload, read from the payload's OWN header
+    /// instead of from a constant: <c>[u32 listOffset][u32 listBytes][u32 reqId][u8 flag]</c>,
+    /// and <c>listOffset</c> is frame-relative, so the first record is at
+    /// <c>listOffset - 6</c> = 19 - 6 = 13. data/starter_inventory.bin is 3229 bytes = 13 + 6 *
+    /// 536, and its six ids (11, 12, 7, 8, 9, 10 - datasheet order written in wire order) sit at
+    /// 13, 549, 1085, 1621, 2157 and 2693 exactly.
+    /// </summary>
+    static List<int> RecordStartsIn(byte[] payload)
+    {
+        const int headerSize = 13, recordSize = 536;
+        Hex.True(BagItems.PayloadHeader == headerSize && BagItems.RecordSize == recordSize
+                 && BagItems.RecordIdOffset == 0,
+            $"the 0x27A4 layout moved: header {BagItems.PayloadHeader}, record "
+            + $"{BagItems.RecordSize}, id at {BagItems.RecordIdOffset}");
+
+        var starts = new List<int>();
+        if (payload.Length < headerSize) return starts;
+
+        int first = (int)BitConverter.ToUInt32(payload, 0) - 6;      // frame-relative -> payload
+        int bytes = (int)BitConverter.ToUInt32(payload, 4);
+        if (first < headerSize || first >= payload.Length) first = headerSize;
+        if (bytes <= 0 || first + bytes > payload.Length) bytes = payload.Length - first;
+
+        for (int at = first; at + recordSize <= first + bytes; at += recordSize) starts.Add(at);
+        return starts;
     }
 
     /// <summary>The item db id of each record in a served inventory payload, in wire order.</summary>
     static List<int> ItemIdsIn(byte[] payload)
     {
         var ids = new List<int>();
-        for (int at = BagItems.PayloadHeader; at + BagItems.RecordSize <= payload.Length;
-             at += BagItems.RecordSize)
-            ids.Add(BitConverter.ToInt32(payload, at + BagItems.RecordIdOffset));
+        foreach (int at in RecordStartsIn(payload)) ids.Add(BitConverter.ToInt32(payload, at));
         return ids;
     }
 
