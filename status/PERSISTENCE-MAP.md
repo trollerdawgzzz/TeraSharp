@@ -677,3 +677,32 @@ character would otherwise fail with SQLite error 19.
 `CancelCharacterDelete` now checks ownership and a pending stamp, then delegates to
 `RestoreDeletedCharacter`, so `C_CANCEL_DELETE_USER` and the admin tool's restore are one code path.
 See `status/WEBADMIN-DESIGN.md` section 9.
+
+## T104 - `watched_movies_account`, the write behind C_WATCHED_MOVIES
+
+```sql
+CREATE TABLE watched_movies_account (
+  account_id INTEGER NOT NULL, movie_id INTEGER NOT NULL,
+  watched_at TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (account_id, movie_id)
+);
+```
+
+`AddWatchedMovieForAccount(accountId, movieId)` / `GetWatchedMoviesForAccount(accountId)`. The read
+UNIONs T62's per-character `watched_movies` rows in, so an existing database does not replay the
+intro once more on the way past.
+
+**T62 keyed this on the character; the real Arbiter keys it on the ACCOUNT.** The whole chain hangs
+off the Account object: `Handler_SA_WATCH_MOVIE` (Arb_part_062.c:18768) takes `User+0x3f40` and
+calls `Account::InsertWatchedMovieWithLock(movieId)`, which de-duplicates against the `std::set` at
+`Account+0x3000` and only then runs `dbo.spInsertUserWatchedMovie`; the read is
+`Account::CachedWatchedMoviesWithLock` (Arb_part_061.c:6450) behind a once-per-account latch at
+`Account+0x2ff8`, running `dbo.spLoadUserWatchedMovies`.
+
+T62 built the reply and the table but **nothing ever wrote a row** - `AddWatchedMovie` had no
+caller. The missing writer is `SA_WATCH_MOVIE` (0x155C), now handled in `DbProxyHandlers`.
+
+Not implemented: `Account::InsertWatchedMoviesWithNoLock` (Arb_part_064.c:16853) merges the
+`ReplayMovieData` datasheet on top of the loaded set - rows whose level or dungeon-clear condition
+the account already meets get marked so the cinematic REPLAY menu offers them. That is the replay
+list, not the first-watch gate, and it needs a sheet TeraSharp does not carry.

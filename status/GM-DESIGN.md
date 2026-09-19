@@ -297,3 +297,46 @@ per whisper — correct, just wasteful — and it is why whisper works without t
 `UnregisterChat` also dispatches the private-channel leave announcements `ChatManager.Unregister`
 returns; without the line, a character who logs out stays in their channels until the server
 restarts.
+
+## T104 - why Alt+A did not open, and the one lobby value that decides it
+
+Diffing the lobby of `cap_final_gm_client2.log` - the one captured session where the In-Game
+Operation Tool opened - against `cap_final_client2.log`, `cap_final_client.log` and
+`cap_final_gm_client.log`, frame by frame over frames **3..49**:
+
+| frame | packet | GM session | the other three |
+|---|---|---|---|
+| 7 | `S_LOGIN_ARBITER` | 23 B, `status` = **0x21 (33)** | 23 B, `status` = **0x1F (31)** |
+| 8 | `S_LOGIN_ACCOUNT_INFO` | 544 B | 544 B - differs only in the account id and the random session strings |
+| 11 | `S_GET_USER_LIST` | 1181 B | 1181-1183 B, no per-character admin flag (the only byte that separates the lists sits inside `restBonusXp`) |
+| 16-25 | `S_UPDATE_CONTENTS_ON_OFF` x10 | contents 2,3,4,8,9,22,23,20,21,34 | identical, same order, same on/off bytes |
+| 13, 14, 15, 48, 49 | `S_DECO_UI_INFO`, `S_ACCOUNT_PACKAGE_LIST`, `S_CONFIRM_INVITE_CODE_BUTTON`, `S_BROCAST_GUILD_FLAG`, `S_CURRENT_ELECTION_STATE` | identical | identical |
+
+**One u32 separates them:** `S_LOGIN_ARBITER` body +2 (packet offset 6). Note that
+`cap_final_gm_client.log` is a GM ACCOUNT whose panel never opened, and it reads 31 - so 33 is the
+switch, not the account. Nothing later matters either: the client opens the panel on its own at
+frame 524 of the GM session, with no server packet in front of it, and the
+`S_RESPONSE_SERVER_ADMINTOOL_AWESOMIUM_URL` that answers `C_REQUEST_SERVER_ADMINTOOL_AWESOMIUM_URL`
+appears in the non-GM sessions too.
+
+### Why TeraSharp sends 31 even with tera-api privilege 33
+
+`LoginHandlers` (T89b) writes `GmAccounts.IsListed(s.Account.Name) ? 33u : 31u`, i.e. it reads only
+`TERASHARP_GM_ACCOUNTS`. Two traps:
+
+1. **The env value must hold the numeric tera-api `accountDBID`** ("1", "2800"), because that is
+   what the launcher puts in `C_LOGIN_ARBITER.name` - see `AuthRequest.AccountName`. A display name
+   in there never matches, and the account silently gets 31.
+2. **tera-api's privilege cannot reach this code at all.** `GameAuthenticationLogin` answers
+   `{Return, ReturnCode, Msg}`; `AuthResult` has no privilege field, and `LoginHandlers` never
+   consults `accounts.admin_level` either.
+
+T104 adds `GmAccounts.LoginStatusFor(accountName, storedAdminLevel)`, which returns 33 when the
+allow-list matches **or** the stored `admin_level` is >= 1 - the column `set_admin_level` and the
+admin web tool's `POST /api/gm-level` (T101b) both write. `LoginHandlers.cs` is human-owned; the
+change there is one line:
+
+```csharp
+["status"] = GmAccounts.LoginStatusFor(s.Account.Name,
+                 Program.Store?.GetAdminLevel((long)s.Account.AccountId) ?? 0),
+```

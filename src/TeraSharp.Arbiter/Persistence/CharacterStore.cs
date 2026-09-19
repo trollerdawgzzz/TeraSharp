@@ -1291,6 +1291,22 @@ CREATE TABLE IF NOT EXISTS watched_movies (
   watched_at   TEXT    NOT NULL DEFAULT (datetime('now')),
   PRIMARY KEY (character_id, movie_id)
 );
+
+-- T104: and the ACCOUNT-scoped one, which is what the real Arbiter actually keeps. The whole
+-- chain is on the Account object, not the User: Handler_SA_WATCH_MOVIE (Arb_part_062.c:18768)
+-- takes User+0x3f40 - the account - and calls Account::InsertWatchedMovieWithLock(movieId),
+-- which de-duplicates against the std::set at Account+0x3000 and only then runs
+-- dbo.spInsertUserWatchedMovie; the read is Account::CachedWatchedMoviesWithLock
+-- (Arb_part_061.c:6450) behind a once-per-account latch at Account+0x2ff8, running
+-- dbo.spLoadUserWatchedMovies. T62 keyed the table on the character because that was the row
+-- we owned; with SA_WATCH_MOVIE landing (T104) the account is the right key, and a second
+-- character on the same account no longer sits through the intro.
+CREATE TABLE IF NOT EXISTS watched_movies_account (
+  account_id INTEGER NOT NULL,
+  movie_id   INTEGER NOT NULL,
+  watched_at TEXT    NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (account_id, movie_id)
+);
 ");
         // CREATE TABLE IF NOT EXISTS does nothing to a DB that already has `characters`, so
         // columns added later need their own idempotent step. terasharp.db predates `exp`.
@@ -6152,6 +6168,51 @@ DELETE FROM restrictions      WHERE character_id = $id;";
             using var cmd = _db.CreateCommand();
             cmd.CommandText = "SELECT movie_id FROM watched_movies WHERE character_id=$c ORDER BY rowid";
             cmd.Parameters.AddWithValue("$c", characterId);
+            var rows = new List<int>();
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) rows.Add(r.GetInt32(0));
+            return rows;
+        }
+    }
+
+    // ---- T104: the same pair keyed the way the real Arbiter keys it, on the ACCOUNT ----
+
+    /// <summary>
+    /// Mark a cinematic as seen for a whole account - <c>Account::InsertWatchedMovieWithNoLock</c>
+    /// plus <c>dbo.spInsertUserWatchedMovie</c>. Returns true the first time, false for a repeat,
+    /// which is the same answer the real one's set-insert gives before it decides to run the
+    /// stored procedure at all.
+    /// </summary>
+    public bool AddWatchedMovieForAccount(long accountId, int movieId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "INSERT INTO watched_movies_account(account_id, movie_id) VALUES($a,$m) " +
+                "ON CONFLICT(account_id, movie_id) DO NOTHING";
+            cmd.Parameters.AddWithValue("$a", accountId);
+            cmd.Parameters.AddWithValue("$m", movieId);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    /// <summary>
+    /// Every cinematic this ACCOUNT has seen, oldest first - what
+    /// <c>Account::CachedWatchedMoviesWithLock</c> hands
+    /// <c>Account::SendWatchedMoviesToClient</c>. The per-character rows T62 wrote are folded in
+    /// so a database that predates T104 does not replay the intro once more on the way past.
+    /// </summary>
+    public IReadOnlyList<int> GetWatchedMoviesForAccount(long accountId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "SELECT movie_id FROM watched_movies_account WHERE account_id=$a " +
+                "UNION SELECT movie_id FROM watched_movies WHERE character_id IN " +
+                "(SELECT id FROM characters WHERE account_id=$a) ORDER BY movie_id";
+            cmd.Parameters.AddWithValue("$a", accountId);
             var rows = new List<int>();
             using var r = cmd.ExecuteReader();
             while (r.Read()) rows.Add(r.GetInt32(0));

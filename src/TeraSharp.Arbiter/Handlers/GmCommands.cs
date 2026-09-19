@@ -203,6 +203,51 @@ public static class GmAccounts
     /// </summary>
     public static int LevelFor(string? accountName, int storedLevel)
         => IsListed(accountName) ? GmAdminLevel : storedLevel;
+
+    // ------------------------------------------------------------------ T104: the Alt+A gate
+
+    /// <summary>
+    /// The value the client reads to decide whether Alt+A opens the In-Game Operation Tool:
+    /// <c>S_LOGIN_ARBITER.status</c>, body +2 (packet offset 6), a u32.
+    ///
+    /// <para><b>It is the only thing that differs.</b> Diffing the lobby of
+    /// <c>cap_final_gm_client2.log</c> - the one captured session where the panel opened -
+    /// against <c>cap_final_client2.log</c>, <c>cap_final_client.log</c> and
+    /// <c>cap_final_gm_client.log</c> frame by frame over frames 3..49: every packet is the same
+    /// name, the same length and the same bytes except this one u32, which reads <c>0x21</c> (33)
+    /// in the session that opened it and <c>0x1F</c> (31) in all three that did not.
+    /// S_LOGIN_ACCOUNT_INFO is 544 bytes in all four and differs only in the account id and the
+    /// random session strings; S_GET_USER_LIST carries no per-character admin flag (the only byte
+    /// that separates the lists is inside restBonusXp); the ten S_UPDATE_CONTENTS_ON_OFF toggles
+    /// are contents 2, 3, 4, 8, 9, 22, 23, 20, 21, 34 with the same on/off bytes in the same
+    /// order in all four.</para>
+    /// </summary>
+    public const uint LoginStatusOperator = 33;
+
+    /// <summary>The ordinary value - 31 in every non-operator capture we have.</summary>
+    public const uint LoginStatusNormal = 31;
+
+    /// <summary>
+    /// <see cref="LoginStatusOperator"/> when this login should get the tool, otherwise
+    /// <see cref="LoginStatusNormal"/>.
+    ///
+    /// <para>T89b drove this from <see cref="IsListed(string?)"/> alone, i.e. from
+    /// <c>TERASHARP_GM_ACCOUNTS</c>. That is a trap in two ways. The env value has to hold the
+    /// <b>numeric tera-api accountDBID</b>, because that is what the launcher puts in
+    /// <c>C_LOGIN_ARBITER.name</c> (see <c>AuthRequest.AccountName</c>) - a display name in there
+    /// never matches. And a privilege set in tera-api cannot reach here at all:
+    /// <c>GameAuthenticationLogin</c> answers <c>{Return, ReturnCode, Msg}</c> and
+    /// <c>AuthResult</c> has no privilege field, so TeraSharp never sees it.</para>
+    ///
+    /// <para><paramref name="storedAdminLevel"/> closes that: it is
+    /// <c>CharacterStore.GetAdminLevel(accountId)</c>, the <c>accounts.admin_level</c> column
+    /// that <c>set_admin_level</c> and the admin web tool's <c>POST /api/gm-level</c> (T101b)
+    /// both write. Either route now opens the panel.</para>
+    /// </summary>
+    public static uint LoginStatusFor(string? accountName, int storedAdminLevel)
+        => LevelFor(accountName, storedAdminLevel) >= MinimumAdminLevel
+            ? LoginStatusOperator
+            : LoginStatusNormal;
 }
 
 /// <summary>What the dispatcher decided to do with a line.</summary>

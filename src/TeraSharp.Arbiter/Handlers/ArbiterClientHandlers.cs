@@ -814,19 +814,27 @@ public static class ArbiterClientHandlers
     }
 
     /// <summary>
-    /// C_WATCHED_MOVIES. Answers from the stored per-character list.
+    /// C_WATCHED_MOVIES. Answers from the stored ACCOUNT list.
     ///
-    /// <para><b>The real Arbiter stores this per ACCOUNT, not per character</b> -
-    /// <c>Account::CachedWatchedMoviesWithLock</c> (FUN_1407095a0) reads it with the stored
-    /// procedure <c>spLoadUserWatchedMovies</c> and merges the ReplayMovieData sheet on top.
-    /// We store it per character because that is the row TeraSharp owns; if two characters on one
-    /// account should share the flag, the store method is the one place to change.</para>
+    /// <para>T62 answered from the per-CHARACTER table because that was the row TeraSharp owned.
+    /// T104 moved it: the real Arbiter's whole chain hangs off the Account object -
+    /// <c>Account::CachedWatchedMoviesWithLock</c> (Arb_part_061.c:6450) runs
+    /// <c>dbo.spLoadUserWatchedMovies</c> once per account behind a latch and
+    /// <c>Account::SendWatchedMoviesToClient</c> serialises that set - and the write behind it,
+    /// <c>SA_WATCH_MOVIE</c> (0x155C), is account-scoped too. The account read folds the old
+    /// per-character rows in, so nothing a player had already watched is forgotten.</para>
+    ///
+    /// <para>The real one also merges the <c>ReplayMovieData</c> sheet on top
+    /// (<c>Account::InsertWatchedMoviesWithNoLock</c>, Arb_part_064.c:16853): rows whose level or
+    /// dungeon-clear condition the account already meets are marked watched so the replay UI
+    /// offers them. That is the cinematic REPLAY list, not the first-watch gate, and it needs a
+    /// datasheet TeraSharp does not carry - so it is left out.</para>
     /// </summary>
     public static bool OnWatchedMovies(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
     {
         var chr = s.SelectedCharacter;
-        var movies = chr != null && Program.Store != null
-            ? Program.Store.GetWatchedMovies((int)chr.Id)
+        var movies = Program.Store != null
+            ? Program.Store.GetWatchedMoviesForAccount((long)s.Account.AccountId)
             : (IReadOnlyList<int>)Array.Empty<int>();
         s.Send(BuildWatchedMovies(movies));
         log.LogInformation("C_WATCHED_MOVIES: {Name} has seen {N} cinematic(s)", chr?.Name, movies.Count);

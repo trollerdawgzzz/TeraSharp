@@ -654,3 +654,18 @@ The shipped defs are from another build — the same conclusion PARTY-DESIGN.md 
 `opcode=` comments. `T74_the_broker_list_defs_disagree_with_the_wire` is the guard that says so
 out loud; `T81_the_registered_item_list_is_byte_exact` and
 `T81_the_sold_item_list_is_byte_exact` are what replaced the guessing with frames.
+
+## T104 - the unasked S_TRADE_BROKER_REGISTERED_ITEM_LIST push
+
+After a successful `SDB_TRADE_BROKER_REGISTER_ITEM` the real Arbiter pushes the seller his Active
+Listings without being asked. `cap_social3_client2.log` frame **1258** is an
+`S_TRADE_BROKER_REGISTERED_ITEM_LIST` (0xCDEA) of 74 bytes sitting directly between the
+`C_TRADE_BROKER_REGISTER_ITEM` at 1257 and the `S_INVEN_USERDATA` at 1260, with **no**
+`C_TRADE_BROKER_REGISTERED_ITEM_LIST` anywhere in front of it. Frames **1436** (two rows, 140 B)
+and **1457** (three, 206 B) are the same push after the second and third listing - which is also
+why T81 had three row counts of the same packet to pin the element against.
+
+`DbProxyHandlers.PushRegisteredItemList(sellerDbId)` does it, and takes its body from
+`BrokerHandlers.ReplyFor(C_TRADE_BROKER_REGISTERED_ITEM_LIST, store, sellerDbId)` so the push and
+the tab the client asks for cannot drift apart. It is skipped when the seller is not in world: the
+list is a UI refresh, not state, and he gets it from the tab on the way back in.
