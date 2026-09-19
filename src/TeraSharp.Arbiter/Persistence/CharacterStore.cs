@@ -1238,6 +1238,11 @@ CREATE TABLE IF NOT EXISTS watched_movies (
         AddColumnIfMissing("friends", "memo", "TEXT NOT NULL DEFAULT ''");
         AddColumnIfMissing("blocks", "memo", "TEXT NOT NULL DEFAULT ''");
         AddColumnIfMissing("characters", "profile_message", "TEXT NOT NULL DEFAULT ''");
+        // T97: the other two the "my profile" window writes. C_CHANGE_MY_PROFILE already had a
+        // column (T30's profile_message); C_UPDATE_MY_DESCRIPTION is the longer free-text one
+        // and C_CHANGE_MY_STATE is the online/away/busy flag User::ChangeUserState sets.
+        AddColumnIfMissing("characters", "description", "TEXT NOT NULL DEFAULT ''");
+        AddColumnIfMissing("characters", "player_state", "INTEGER NOT NULL DEFAULT 0");
         AddColumnIfMissing("characters", "sample_group_provided", "INTEGER NOT NULL DEFAULT 0");
         // T32: GM level, per account (see AccountRecord.AdminLevel).
         AddColumnIfMissing("accounts", "admin_level", "INTEGER NOT NULL DEFAULT 0");
@@ -3158,6 +3163,65 @@ DELETE FROM guild_members     WHERE user_db_id = $id;";
     }
 
     /// <summary>The profile message shown as personalNote in S_FRIEND_LIST (spLoadUserFriendProfile).</summary>
+    // ------------------------- T97: description and state -------------------------
+
+    /// <summary>
+    /// C_UPDATE_MY_DESCRIPTION (0xC72D). The real handler runs the text past the net moderator
+    /// and hands it to <c>User::UpdateUserDescription</c>, which keeps it on the user object;
+    /// here it is a column, so it survives a relog the way the profile message does.
+    /// </summary>
+    public void SetMyDescription(int characterId, string description)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE characters SET description = $d WHERE id = $id";
+            cmd.Parameters.AddWithValue("$id", characterId);
+            cmd.Parameters.AddWithValue("$d", description ?? "");
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    public string GetMyDescription(int characterId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT description FROM characters WHERE id = $id";
+            cmd.Parameters.AddWithValue("$id", characterId);
+            return cmd.ExecuteScalar() as string ?? "";
+        }
+    }
+
+    /// <summary>
+    /// C_CHANGE_MY_STATE (0x6E08), one i32. <c>User::ChangeUserState(enum PlayerState)</c> is
+    /// the whole handler - no reply, no broadcast from the Arbiter - so this is a stored flag
+    /// and nothing else reads it yet.
+    /// </summary>
+    public void SetMyState(int characterId, int state)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE characters SET player_state = $s WHERE id = $id";
+            cmd.Parameters.AddWithValue("$id", characterId);
+            cmd.Parameters.AddWithValue("$s", state);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    public int GetMyState(int characterId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT player_state FROM characters WHERE id = $id";
+            cmd.Parameters.AddWithValue("$id", characterId);
+            var v = cmd.ExecuteScalar();
+            return v is null || v is DBNull ? 0 : Convert.ToInt32(v);
+        }
+    }
+
     public string GetProfileMessage(int characterId)
     {
         lock (_lock)

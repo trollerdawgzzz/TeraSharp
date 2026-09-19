@@ -2967,6 +2967,243 @@ public static class ArbiterClientHandlers
         return p;
     }
 
+    // =========================================================================================
+    // 19. The small replies: events, party extras, appearance, profile                 (T97)
+    // =========================================================================================
+    //
+    // Twenty-six client packets with no data behind them on this server and no captured
+    // instance of any of them. Each was read out of its own `Handler_C_*` in the decompile
+    // (Arb_part_013/014/015/019/020/022/024/040/041/079.c) and does here exactly what the real
+    // one does: eight send a reply, three store, and the rest are accepted and dropped. The
+    // minimum body sizes below are the handlers' own `param_3 <` guards, which is what they
+    // answer GET_CLIENT_BUFFER_BUFSIZE_MISMATCH to.
+
+    public const ushort S_ANSWER_PARTY_NAME = 0xD032;
+    public const ushort S_CHAT_REPORT = 0x52F2;
+    public const ushort S_USER_REPORT = 0x4FEA;
+    public const ushort S_VIEW_PARTY_INVITE = 0xCBC2;
+    public const ushort S_GET_EVENT_DETAIL = 0xDA98;
+    public const ushort S_SEND_VIP_SYSTEM_INFO = 0x70C2;
+    public const ushort S_UPDATE_STACK_ATTENDANCE_EVENT_INFO = 0x74EA;
+    public const ushort S_EVENT_MATCHING_BATTLEFIELD_DETAIL_INFO = 0xFB6F;
+
+    /// <summary>
+    /// S_ANSWER_PARTY_NAME (0xD032), the answer to C_REQUEST_PARTY_NAME. The handler loops
+    /// <c>while (i &lt; 6)</c> over <c>Party::GetPartyName(i)</c> and writes one 10-byte element
+    /// per index: <c>[u16 here][u16 next][u16 nameOffset][i32 PartyIndex]</c> then the name.
+    /// Six is not a guess - it is the loop bound.
+    /// <para>The names come from a datasheet the Arbiter loads and we do not have, so the six
+    /// go out with empty names unless a caller supplies them: the window then offers six blank
+    /// presets rather than hanging on a reply that never arrives.</para>
+    /// </summary>
+    public const int AnswerPartyNameCount = 6;
+    public const int AnswerPartyNameEntrySize = 10;
+
+    public static byte[] BuildAnswerPartyName(IReadOnlyList<string>? names = null)
+    {
+        int size = 8;
+        for (int i = 0; i < AnswerPartyNameCount; i++)
+            size += AnswerPartyNameEntrySize + WStringSize(NameAt(names, i));
+
+        var p = new byte[size];
+        BitConverter.GetBytes((ushort)p.Length).CopyTo(p, 0);
+        BitConverter.GetBytes(S_ANSWER_PARTY_NAME).CopyTo(p, 2);
+        BitConverter.GetBytes((ushort)AnswerPartyNameCount).CopyTo(p, 4);
+        BitConverter.GetBytes((ushort)8).CopyTo(p, 6);
+
+        int at = 8;
+        for (int i = 0; i < AnswerPartyNameCount; i++)
+        {
+            string name = NameAt(names, i);
+            int tail = at + AnswerPartyNameEntrySize;
+            int next = tail + WStringSize(name);
+            BitConverter.GetBytes((ushort)at).CopyTo(p, at);
+            BitConverter.GetBytes((ushort)(i + 1 < AnswerPartyNameCount ? next : 0)).CopyTo(p, at + 2);
+            WriteSlotAndString(p, at + 4, tail, name);
+            BitConverter.GetBytes(i).CopyTo(p, at + 6);
+            at = next;
+        }
+        return p;
+    }
+
+    private static string NameAt(IReadOnlyList<string>? names, int i)
+        => names is not null && i < names.Count ? names[i] ?? "" : "";
+
+    /// <summary>
+    /// S_CHAT_REPORT (0x52F2) and S_USER_REPORT (0x4FEA): five bytes, one <c>Success</c> at +4.
+    /// <para>Both are FAILURE replies. Handler_C_CHAT_REPORT looks the reported name up and,
+    /// when it finds them and the report is taken, returns having sent NOTHING; it only builds
+    /// this frame - with a literal 0 - when the lookup or the report fails. C_USER_REPORT does
+    /// the same. So a successful report is silent and this packet means "no such player".</para>
+    /// </summary>
+    public static byte[] BuildReportFailure(ushort opcode, bool success = false)
+    {
+        var p = new byte[5];
+        BitConverter.GetBytes((ushort)5).CopyTo(p, 0);
+        BitConverter.GetBytes(opcode).CopyTo(p, 2);
+        p[4] = (byte)(success ? 1 : 0);
+        return p;
+    }
+
+    /// <summary>
+    /// S_VIEW_PARTY_INVITE (0xCBC2), from <c>User::SendPartyInvitableList</c>: TWO lists,
+    /// <c>Friends</c> and <c>GuildMembers</c>, of <c>[u16 here][u16 next][u16 nameOffset]
+    /// [i32 UserClass][i32 UserLevel]</c>. Head is 12 - the guard is 0xb - which is four bytes
+    /// of frame plus a count/offset pair for each list.
+    /// </summary>
+    public sealed record PartyInvitable(string Name, int UserClass, int UserLevel);
+
+    public const int ViewPartyInviteHeadSize = 12;
+    public const int ViewPartyInviteEntryFixedSize = 14;
+
+    public static byte[] BuildViewPartyInvite(IReadOnlyList<PartyInvitable>? friends,
+                                              IReadOnlyList<PartyInvitable>? guildMembers)
+    {
+        friends ??= Array.Empty<PartyInvitable>();
+        guildMembers ??= Array.Empty<PartyInvitable>();
+        int size = ViewPartyInviteHeadSize;
+        foreach (var r in friends) size += ViewPartyInviteEntryFixedSize + WStringSize(r.Name);
+        foreach (var r in guildMembers) size += ViewPartyInviteEntryFixedSize + WStringSize(r.Name);
+
+        var p = new byte[size];
+        BitConverter.GetBytes((ushort)p.Length).CopyTo(p, 0);
+        BitConverter.GetBytes(S_VIEW_PARTY_INVITE).CopyTo(p, 2);
+
+        int at = ViewPartyInviteHeadSize;
+        BitConverter.GetBytes((ushort)friends.Count).CopyTo(p, 4);
+        BitConverter.GetBytes((ushort)(friends.Count == 0 ? 0 : at)).CopyTo(p, 6);
+        at = WriteInvitableList(p, at, friends);
+        BitConverter.GetBytes((ushort)guildMembers.Count).CopyTo(p, 8);
+        BitConverter.GetBytes((ushort)(guildMembers.Count == 0 ? 0 : at)).CopyTo(p, 10);
+        WriteInvitableList(p, at, guildMembers);
+        return p;
+    }
+
+    private static int WriteInvitableList(byte[] p, int at, IReadOnlyList<PartyInvitable> rows)
+    {
+        for (int i = 0; i < rows.Count; i++)
+        {
+            var r = rows[i];
+            int tail = at + ViewPartyInviteEntryFixedSize;
+            int next = tail + WStringSize(r.Name);
+            BitConverter.GetBytes((ushort)at).CopyTo(p, at);
+            // Each list terminates on its own - the last friend does NOT point at the first
+            // guild member (T91).
+            BitConverter.GetBytes((ushort)(i + 1 < rows.Count ? next : 0)).CopyTo(p, at + 2);
+            WriteSlotAndString(p, at + 4, tail, r.Name);
+            BitConverter.GetBytes(r.UserClass).CopyTo(p, at + 6);
+            BitConverter.GetBytes(r.UserLevel).CopyTo(p, at + 0x0A);
+            at = next;
+        }
+        return at;
+    }
+
+    /// <summary>
+    /// S_GET_EVENT_DETAIL (0xDA98): one wide string, <c>Text</c> - the body of whatever event
+    /// notice the client asked to read. There is no event table on this server, so the reply is
+    /// the empty string, which closes the window instead of leaving it waiting.
+    /// </summary>
+    public static byte[] BuildGetEventDetail(string? text = null)
+    {
+        var body = WString(text);
+        var p = new byte[6 + body.Length];
+        BitConverter.GetBytes((ushort)p.Length).CopyTo(p, 0);
+        BitConverter.GetBytes(S_GET_EVENT_DETAIL).CopyTo(p, 2);
+        BitConverter.GetBytes((ushort)6).CopyTo(p, 4);
+        body.CopyTo(p, 6);
+        return p;
+    }
+
+    /// <summary>
+    /// S_SEND_VIP_SYSTEM_INFO (0x70C2), from <c>VipSystemManager::NotifyVipSystemInfo</c>:
+    /// <code>
+    ///   +0x04 u16 greetingOffset   +0x06 u8  VipSystemOn        +0x07 i32 GradeLevel
+    ///   +0x0B i64 IngameExp        +0x13 i64 PublisherExp       +0x1B i64 VipTokenAmount
+    ///   +0x23 u8  CanRecvDailyToken
+    ///   +0x24 i64 StoreResetRemainSec   +0x2C i64 DungeonResetRemainSec
+    ///   +0x34 u8  StoreReset
+    /// </code>
+    /// 53 bytes of fixed part, which is the 0x34 the guard demands. VIP is off on this server,
+    /// so every number is 0 and <c>VipSystemOn</c> is false - the window then draws itself as
+    /// "not a VIP" rather than hanging.
+    /// </summary>
+    public const int VipSystemInfoFixedSize = 0x35;
+
+    public static byte[] BuildSendVipSystemInfo(bool vipSystemOn = false, int gradeLevel = 0,
+        long ingameExp = 0, long publisherExp = 0, long vipTokenAmount = 0,
+        bool canRecvDailyToken = false, long storeResetRemainSec = 0,
+        long dungeonResetRemainSec = 0, bool storeReset = false, string? greeting = null)
+    {
+        var text = WString(greeting);
+        var p = new byte[VipSystemInfoFixedSize + text.Length];
+        BitConverter.GetBytes((ushort)p.Length).CopyTo(p, 0);
+        BitConverter.GetBytes(S_SEND_VIP_SYSTEM_INFO).CopyTo(p, 2);
+        BitConverter.GetBytes((ushort)VipSystemInfoFixedSize).CopyTo(p, 4);
+        p[6] = (byte)(vipSystemOn ? 1 : 0);
+        BitConverter.GetBytes(gradeLevel).CopyTo(p, 7);
+        BitConverter.GetBytes(ingameExp).CopyTo(p, 0x0B);
+        BitConverter.GetBytes(publisherExp).CopyTo(p, 0x13);
+        BitConverter.GetBytes(vipTokenAmount).CopyTo(p, 0x1B);
+        p[0x23] = (byte)(canRecvDailyToken ? 1 : 0);
+        BitConverter.GetBytes(storeResetRemainSec).CopyTo(p, 0x24);
+        BitConverter.GetBytes(dungeonResetRemainSec).CopyTo(p, 0x2C);
+        p[0x34] = (byte)(storeReset ? 1 : 0);
+        text.CopyTo(p, VipSystemInfoFixedSize);
+        return p;
+    }
+
+    /// <summary>
+    /// S_UPDATE_STACK_ATTENDANCE_EVENT_INFO (0x74EA): a <c>RewardList</c> of
+    /// <c>[u16 here][u16 next][i32 Day][i32 RewardState]</c> behind
+    /// <c>[u16 count][u16 offset][i32 RewardType][i32 Today][i32 NotReceiveCount]</c> - 20 bytes
+    /// of head (the guard is 0x13) and 12 per element. No attendance event is configured, so
+    /// the list is empty and Today is 0.
+    /// </summary>
+    public const int StackAttendanceHeadSize = 20;
+    public const int StackAttendanceEntrySize = 12;
+
+    public static byte[] BuildUpdateStackAttendanceEventInfo(
+        IReadOnlyList<(int Day, int RewardState)>? rewards = null,
+        int rewardType = 0, int today = 0, int notReceiveCount = 0)
+    {
+        rewards ??= Array.Empty<(int, int)>();
+        var p = new byte[StackAttendanceHeadSize + rewards.Count * StackAttendanceEntrySize];
+        BitConverter.GetBytes((ushort)p.Length).CopyTo(p, 0);
+        BitConverter.GetBytes(S_UPDATE_STACK_ATTENDANCE_EVENT_INFO).CopyTo(p, 2);
+        BitConverter.GetBytes((ushort)rewards.Count).CopyTo(p, 4);
+        BitConverter.GetBytes((ushort)(rewards.Count == 0 ? 0 : StackAttendanceHeadSize)).CopyTo(p, 6);
+        BitConverter.GetBytes(rewardType).CopyTo(p, 8);
+        BitConverter.GetBytes(today).CopyTo(p, 0x0C);
+        BitConverter.GetBytes(notReceiveCount).CopyTo(p, 0x10);
+
+        for (int i = 0; i < rewards.Count; i++)
+        {
+            int at = StackAttendanceHeadSize + i * StackAttendanceEntrySize;
+            BitConverter.GetBytes((ushort)at).CopyTo(p, at);
+            BitConverter.GetBytes((ushort)(i + 1 < rewards.Count ? at + StackAttendanceEntrySize : 0))
+                .CopyTo(p, at + 2);
+            BitConverter.GetBytes(rewards[i].Day).CopyTo(p, at + 4);
+            BitConverter.GetBytes(rewards[i].RewardState).CopyTo(p, at + 8);
+        }
+        return p;
+    }
+
+    /// <summary>
+    /// S_EVENT_MATCHING_BATTLEFIELD_DETAIL_INFO (0xFB6F): twelve bytes,
+    /// <c>[i32 EventId][i32 BattleFieldType]</c>, and the handler writes it inline. The request
+    /// carries the EventId, so the reply echoes it back with type 0 - no battlefield event is
+    /// configured, and an event id the client did not ask about would draw the wrong window.
+    /// </summary>
+    public static byte[] BuildEventMatchingBattlefieldDetailInfo(int eventId, int battleFieldType = 0)
+    {
+        var p = new byte[12];
+        BitConverter.GetBytes((ushort)12).CopyTo(p, 0);
+        BitConverter.GetBytes(S_EVENT_MATCHING_BATTLEFIELD_DETAIL_INFO).CopyTo(p, 2);
+        BitConverter.GetBytes(eventId).CopyTo(p, 4);
+        BitConverter.GetBytes(battleFieldType).CopyTo(p, 8);
+        return p;
+    }
+
     /// <summary>A NUL-terminated UTF-16LE string, as the inter-server and client writers emit it.</summary>
     public static byte[] WString(string? s)
     {
@@ -3401,6 +3638,210 @@ public static class GuildBoard
                 if (g.LogoId == logoId) { image = store.GetGuildLogo(g.GuildId); break; }
 
         s.Send(ArbiterClientHandlers.BuildRequestGuildFlagImageData(imageId, image));
+        return true;
+    }
+}
+
+
+/// <summary>
+/// T97. Twenty-six client packets with nothing behind them on this server: the event and
+/// attendance windows, the party extras, the appearance cancels and the profile fields. None of
+/// them appears in any capture, so every one was read out of its own <c>Handler_C_*</c> in the
+/// decompile and does here what the real one does.
+///
+/// <para><b>Eight reply</b> - C_REQUEST_PARTY_NAME, C_VIEW_PARTY_INVITE, C_GET_EVENT_DETAIL,
+/// C_REQUEST_VIP_SYSTEM_INFO, C_REQUEST_STACK_ATTENDANCE_EVENT_INFO_UPDATE,
+/// C_EVENT_MATCHING_BATTLEFIELD_DETAIL_INFO, and the two report packets, whose reply is a
+/// FAILURE path (see BuildReportFailure). <b>Three store</b>: C_CHANGE_MY_PROFILE,
+/// C_UPDATE_MY_DESCRIPTION and C_CHANGE_MY_STATE. <b>The rest are accepted and dropped</b>,
+/// which is literally what their handlers do - Handler_C_SAVE_CHAT_SETTING and
+/// Handler_C_PARTY_NOTIFY_MY_POSITION are four and five lines of nothing but the trace guard.
+/// They are registered on OnAcceptSilently rather than given a handler here.</para>
+///
+/// <para>The point of registering them at all is that the fallback FORWARDS an unregistered
+/// client packet to World, which answers with "handler has not been implemented yet!!!" - a
+/// dropped packet with a misleading log line. status/CLIENT-REJECTS.md section 7.</para>
+/// </summary>
+public static class MiscClientPackets
+{
+    // The minimum body sizes are each handler's own `param_3 <` guard, less the 4-byte header.
+    public const int RequestPartyNameBodySize = 0;          // guard 4, the bare frame
+    public const int ChatReportBodySize = 0x10 - 4;         // guard 0x10
+    public const int UserReportBodySize = 10 - 4;           // guard 10
+    public const int EventMatchingDetailBodySize = 4;       // [i32 EventId]
+    public const int ChangeMyStateBodySize = 4;             // [i32 State]
+    public const int ProfileTextBodySize = 2;               // [u16 offset] + the string
+    public const int LoginWorldBodySize = 0x12 - 4;         // guard 0x12 - see OnLoginWorld
+
+    private static int Me(GameSession s) => s.SelectedCharacter?.Id ?? 0;
+
+    // ------------------------------- the party extras -------------------------------
+
+    /// <summary>
+    /// C_REQUEST_PARTY_NAME (0xE18D), a bare four-byte frame. The handler answers with the six
+    /// preset party names and nothing else.
+    /// </summary>
+    public static bool OnRequestPartyName(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        s.Send(ArbiterClientHandlers.BuildAnswerPartyName());
+        return true;
+    }
+
+    /// <summary>
+    /// C_VIEW_PARTY_INVITE (0xB7C3) -&gt; <c>User::SendPartyInvitableList</c>: everyone this
+    /// character could invite, as two lists - friends first, then guild mates. Both come from
+    /// our own tables; a friend or guild mate who has no character row is skipped rather than
+    /// sent with an empty name.
+    /// </summary>
+    public static bool OnViewPartyInvite(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        var store = Program.Store;
+        int me = Me(s);
+        var friends = new List<ArbiterClientHandlers.PartyInvitable>();
+        var mates = new List<ArbiterClientHandlers.PartyInvitable>();
+
+        if (store is not null && me > 0)
+        {
+            foreach (var f in store.GetFriendRows(me))
+            {
+                if (f.Type != 0) continue;                   // 0 = mutual; a pending request is not invitable
+                var chr = store.GetCharacter(f.FriendId);
+                if (chr is not null)
+                    friends.Add(new ArbiterClientHandlers.PartyInvitable(chr.Name, chr.Class, chr.Level));
+            }
+
+            int guildId = store.GetGuildIdOf(me);
+            if (guildId > 0)
+                foreach (var m in store.GetGuildMembers(guildId))
+                    if (m.UserDbId != me)
+                        mates.Add(new ArbiterClientHandlers.PartyInvitable(
+                            m.Name, m.UserClass, m.UserLevel));
+        }
+
+        s.Send(ArbiterClientHandlers.BuildViewPartyInvite(friends, mates));
+        return true;
+    }
+
+    // --------------------------------- events and VIP ---------------------------------
+
+    /// <summary>C_GET_EVENT_DETAIL (0x7786), a bare frame -&gt; the notice text, which is empty
+    /// here because no event table is configured.</summary>
+    public static bool OnGetEventDetail(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        s.Send(ArbiterClientHandlers.BuildGetEventDetail());
+        return true;
+    }
+
+    /// <summary>C_REQUEST_VIP_SYSTEM_INFO (0x8F33) -&gt;
+    /// <c>VipSystemManager::NotifyVipSystemInfo</c>. VIP is off, so the reply says so.</summary>
+    public static bool OnRequestVipSystemInfo(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        s.Send(ArbiterClientHandlers.BuildSendVipSystemInfo());
+        return true;
+    }
+
+    /// <summary>C_REQUEST_STACK_ATTENDANCE_EVENT_INFO_UPDATE (0xA4EF) -&gt; the attendance
+    /// board, empty: no attendance event is configured.</summary>
+    public static bool OnRequestStackAttendanceEventInfoUpdate(
+        GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        s.Send(ArbiterClientHandlers.BuildUpdateStackAttendanceEventInfo());
+        return true;
+    }
+
+    /// <summary>
+    /// C_EVENT_MATCHING_BATTLEFIELD_DETAIL_INFO (0xE79A): <c>[i32 EventId]</c>, answered inline
+    /// by the handler with the same id and a battlefield type. The id is echoed because the
+    /// window keys on it; the type is 0 because no battlefield event exists.
+    /// </summary>
+    public static bool OnEventMatchingBattlefieldDetailInfo(
+        GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        var b = body.Span;
+        int eventId = b.Length >= 4 ? BitConverter.ToInt32(b) : 0;
+        s.Send(ArbiterClientHandlers.BuildEventMatchingBattlefieldDetailInfo(eventId));
+        return true;
+    }
+
+    // ----------------------------------- the reports -----------------------------------
+
+    /// <summary>
+    /// C_CHAT_REPORT (0x8DD0): <c>[u16 targetNameOffset][u16 talkOffset][i32 ChatType]
+    /// [i32 Reason]</c> then the two strings. The real handler looks the name up, files the
+    /// report and returns SILENTLY; the five-byte S_CHAT_REPORT with Success 0 is only sent
+    /// when the name is unknown. We have nowhere to file a report, so a known name is logged
+    /// and answered with the same silence.
+    /// </summary>
+    public static bool OnChatReport(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+        => Report(s, body, log, "C_CHAT_REPORT", ArbiterClientHandlers.S_CHAT_REPORT, 8);
+
+    /// <summary>C_USER_REPORT (0x5ED7): <c>[u16 targetNameOffset][i32 Reason]</c>, the same
+    /// shape without the chat line.</summary>
+    public static bool OnUserReport(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+        => Report(s, body, log, "C_USER_REPORT", ArbiterClientHandlers.S_USER_REPORT, 2);
+
+    private static bool Report(GameSession s, ReadOnlyMemory<byte> body, ILogger log,
+                               string what, ushort failureOpcode, int reasonAt)
+    {
+        var b = body.Span;
+        string target = ArbiterClientHandlers.ReadWString(b, 0);
+        int reason = b.Length >= reasonAt + 4 ? BitConverter.ToInt32(b[reasonAt..]) : 0;
+
+        var who = target.Length == 0 ? null : Program.Store?.GetCharacterByName(target);
+        if (who is null)
+        {
+            log.LogInformation("{What}: no player '{Name}'", what, target);
+            s.Send(ArbiterClientHandlers.BuildReportFailure(failureOpcode));
+            return true;
+        }
+
+        log.LogInformation("{What}: {From} reported {Name} (reason {Reason}) - logged, not filed",
+            what, s.SelectedCharacter?.Name, target, reason);
+        return true;
+    }
+
+    // ----------------------------------- the profile -----------------------------------
+
+    /// <summary>C_CHANGE_MY_PROFILE (0xD70E): <c>[u16 offset]</c> then the new profile message -
+    /// the line the friend panel shows, which T30 already gave a column.</summary>
+    public static bool OnChangeMyProfile(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        int me = Me(s);
+        if (me > 0) Program.Store?.SetProfileMessage(me, ArbiterClientHandlers.ReadWString(body.Span, 0));
+        return true;
+    }
+
+    /// <summary>C_UPDATE_MY_DESCRIPTION (0xC72D): the longer free-text field. The real handler
+    /// runs it past the net moderator first; we have no moderator, so it is stored as
+    /// given.</summary>
+    public static bool OnUpdateMyDescription(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        int me = Me(s);
+        if (me > 0) Program.Store?.SetMyDescription(me, ArbiterClientHandlers.ReadWString(body.Span, 0));
+        return true;
+    }
+
+    /// <summary>C_CHANGE_MY_STATE (0x6E08): <c>[i32 State]</c> -&gt;
+    /// <c>User::ChangeUserState(enum PlayerState)</c>. No reply and no broadcast.</summary>
+    public static bool OnChangeMyState(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        var b = body.Span;
+        int me = Me(s);
+        if (me > 0 && b.Length >= 4) Program.Store?.SetMyState(me, BitConverter.ToInt32(b));
+        return true;
+    }
+
+    /// <summary>
+    /// C_LOGIN_WORLD (0xE4FE). The whole handler is a length check: under 0x12 bytes it logs
+    /// <c>Arbiter &lt;-&gt; World PDL Version Mismatch! Bye :(</c> and otherwise does nothing at
+    /// all. It is here for that log line - a client sending a short one is telling us its PDL
+    /// does not match, which is worth seeing rather than forwarding.
+    /// </summary>
+    public static bool OnLoginWorld(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        if (body.Length < LoginWorldBodySize)
+            log.LogWarning("C_LOGIN_WORLD: {Len} B body (want {Want}) - PDL version mismatch",
+                body.Length, LoginWorldBodySize);
         return true;
     }
 }
