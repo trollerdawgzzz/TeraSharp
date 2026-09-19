@@ -81,6 +81,8 @@ public static class HandlerRegistry
                 s.Send(ArbiterClientHandlers.BuildChangeCardPreset());         // T83: card preset (frames 329/375)
                 s.Send(ArbiterClientHandlers.BuildAdminHoldCharacter());       // T89: frame 402
                 s.Send(ArbiterClientHandlers.BuildAdminGmSkill(0, on: true));  // T89: frame 99
+                s.Send(ArbiterClientHandlers.BuildPvpLeaderBoardInfo());       // T91: frame 288
+                s.Send(ArbiterClientHandlers.BuildPveLeaderBoardInfo());       // T91: frame 289
                 Program.World?.SendFrame(WorldBridge.OpUpdateVisitedSection,
                     ArbiterClientHandlers.BuildUpdateVisitedSectionList(s.PlayerId,
                         Program.Store?.GetVisitedSections((int)s.SelectedCharacter!.Id)
@@ -227,6 +229,8 @@ public static class HandlerRegistry
         Reg("C_ADMIN_GET_USER_INFO_LIST_BY_DISTANCE", 4, (s, b) => GmAdminTool.OnGetUserInfoListByDistance(s, b, misc));
         Reg("C_ADMIN_WARNING_MESSAGE", 6,          (s, b) => GmAdminTool.OnWarningMessage(s, b, misc));
         Reg("C_ADMIN_GM_SKILL", 12,                (s, b) => GmAdminTool.OnGmSkill(s, b, misc));
+        Reg("C_ADMIN_REQUEST_USERINFO",   22, (s, b) => GmAdminTool.OnRequestUserInfo(s, b, misc));     // T91
+        Reg("C_ADMIN_REQUEST_USERACTION", 18, (s, b) => GmAdminTool.OnRequestUserAction(s, b, misc));   // T91
         GmAdminTool.OnlineSessions = () => Program.World?.InWorldSessions() ?? new List<GameSession>();
         foreach (var name in new[]
         {

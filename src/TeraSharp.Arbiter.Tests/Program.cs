@@ -14748,7 +14748,7 @@ string message
             GuildPackets.C_APPLY_GUILD, CApplyGuildBody("Ere", "let me in"));
         Hex.True(string.Join(",", chief.Log) == "def:S_GUILD_APPLY_COUNT",
             "the chief holds the invite authority: " + string.Join(",", chief.Log));
-        Hex.True(joiner.Log.Count == 0 && !applied.RejectionSent, $"the applicant waits: {applied}");
+        Hex.True(joiner.Log.Count == 1 && !applied.RejectionSent, $"the applicant waits, told once by SMT 1604 (T92): {applied}");
         Hex.True(store.GetGuildApplies(guildId).Count == 1, "spInsertGuildApply wrote the row");
 
         // ---- accept ----
