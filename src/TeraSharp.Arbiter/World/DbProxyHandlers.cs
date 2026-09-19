@@ -4890,6 +4890,48 @@ public sealed class DbProxyHandlers
     public const ushort DBS_USER_LOAD_POCKET_DATA = 0x27A3;
     public const ushort DBS_USER_LOAD_INVENTORY = 0x27A4;
     public const int StarterInventorySize = 3229;
+    /// <summary>
+    /// T105. Write the starter kit into rows with FRESH item db ids.
+    ///
+    /// <para>The kit's own ids are <see cref="StarterInventory.FirstStarterItemId"/>..+n - the
+    /// same six numbers for every character, because before T44 there was no items table and
+    /// they only had to be stable per login. With rows behind them those ids are a collision:
+    /// <c>UpsertItem</c> is an upsert on <c>item_db_id</c>, so seeding character B MOVED
+    /// character A's six rows to B, A came back with an empty bag, and the next
+    /// SDB_USER_LOAD_INVENTORY re-seeded A - stealing them back. Two characters played tug of
+    /// war over ids 7..12 and each lost the whole bag in turn, because
+    /// <see cref="CharacterStore.ReplaceInventory"/> clears the pocket first. That is the live
+    /// 2026-09-19 report of a character that had played being served six starter items.</para>
+    ///
+    /// <para>The ids are drawn from the same counter every other item uses, which is what the
+    /// real Arbiter does - 7..12 in the capture is simply what its counter was at for the first
+    /// character ever created. The reply World gets is rebuilt from the rows immediately after
+    /// this, so it carries the new ids and never the kit's.</para>
+    /// </summary>
+    public static int SeedStarterRows(CharacterStore store, int playerId, byte[] payload)
+    {
+        ArgumentNullException.ThrowIfNull(store);
+        var kit = BagItems.SplitPayload(payload, playerId);
+        if (kit.Count == 0) return 0;
+
+        int first = store.ReserveItemIds(kit.Count);
+        var rows = new List<CharacterStore.ItemRow>(kit.Count);
+        for (int i = 0; i < kit.Count; i++)
+        {
+            var src = kit[i];
+            int id = first + i;
+            byte[]? rec = src.Record;
+            if (rec is not null && rec.Length >= BagItems.RecordIdOffset + 4)
+            {
+                rec = (byte[])rec.Clone();
+                BitConverter.GetBytes(id).CopyTo(rec, BagItems.RecordIdOffset);
+            }
+            rows.Add(src with { ItemDbId = id, Record = rec });
+        }
+        store.ReplaceInventory(playerId, rows);
+        return rows.Count;
+    }
+
     public const int StarterInventoryItemStart = 13;
     public const int StarterInventoryItemSize = 536;
     public const int StarterInventoryOwnerOffset = 16;
@@ -4941,7 +4983,7 @@ public sealed class DbProxyHandlers
         {
             if (_store.CountInventoryItems(playerId) == 0)
             {
-                int seeded = BagItems.Seed(_store, playerId, inventory);
+                int seeded = SeedStarterRows(_store, playerId, inventory);
                 _log.LogInformation("SDB_USER_LOAD_INVENTORY: seeded {N} starter row(s) for player {Pid}",
                     seeded, playerId);
             }
