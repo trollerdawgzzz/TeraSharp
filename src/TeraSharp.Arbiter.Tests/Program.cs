@@ -3751,6 +3751,83 @@ array items
         Hex.True(StarterInventory.Build(captured, 13, 1, 1) == null, "Build must return null so the caller can fall back");
     }
 
+    /// <summary>
+    /// T105b. Compare a served inventory payload with the kit it was seeded from, with the
+    /// ITEM DB ID of every record masked out.
+    ///
+    /// <para>T105 stopped the seed from writing the kit's own ids (7..12, the same six numbers
+    /// on every character) into the rows: they are an upsert key, so the second character to be
+    /// seeded took the first one's rows and left it with an empty bag. The ids now come from
+    /// <c>ReserveItemIds</c>, so a reply rebuilt from the rows cannot carry the captured ones -
+    /// and every other byte of all 536 per record still has to match.</para>
+    /// </summary>
+    static void EqExceptItemIds(byte[] actual, byte[] expected, string why)
+    {
+        Hex.True(actual.Length == expected.Length,
+            $"{why}: {actual.Length} bytes vs {expected.Length}");
+        var a = (byte[])actual.Clone();
+        var b = (byte[])expected.Clone();
+        var starts = RecordStartsIn(expected);
+        foreach (int at in starts)
+        {
+            Array.Clear(a, at, ItemIdFieldSize);
+            Array.Clear(b, at, ItemIdFieldSize);
+        }
+
+        // Name the offsets rather than just failing: if a byte outside the masked id fields
+        // still differs, the message says where, so the next look does not need another run.
+        var diff = new List<int>();
+        for (int i = 0; i < a.Length && diff.Count < 8; i++) if (a[i] != b[i]) diff.Add(i);
+        if (diff.Count == 0) return;
+
+        var at0 = diff[0];
+        Hex.True(false,
+            $"{why}: {diff.Count} differing byte(s) outside the masked ids, first at {at0} "
+            + $"(record start {(starts.Count == 0 ? -1 : (at0 - starts[0]) / BagItems.RecordSize)}, "
+            + $"field +{(starts.Count == 0 ? at0 : (at0 - starts[0]) % BagItems.RecordSize)}): "
+            + $"got {a[at0]:X2} want {b[at0]:X2}; offsets {string.Join(",", diff)}; "
+            + $"masked {string.Join(",", starts)}");
+    }
+
+    /// <summary>The id is the first four bytes of each 536-byte record.</summary>
+    const int ItemIdFieldSize = 4;
+
+    /// <summary>
+    /// T105c. Where each record starts in a 0x27A4 payload, read from the payload's OWN header
+    /// instead of from a constant: <c>[u32 listOffset][u32 listBytes][u32 reqId][u8 flag]</c>,
+    /// and <c>listOffset</c> is frame-relative, so the first record is at
+    /// <c>listOffset - 6</c> = 19 - 6 = 13. data/starter_inventory.bin is 3229 bytes = 13 + 6 *
+    /// 536, and its six ids (11, 12, 7, 8, 9, 10 - datasheet order written in wire order) sit at
+    /// 13, 549, 1085, 1621, 2157 and 2693 exactly.
+    /// </summary>
+    static List<int> RecordStartsIn(byte[] payload)
+    {
+        const int headerSize = 13, recordSize = 536;
+        Hex.True(BagItems.PayloadHeader == headerSize && BagItems.RecordSize == recordSize
+                 && BagItems.RecordIdOffset == 0,
+            $"the 0x27A4 layout moved: header {BagItems.PayloadHeader}, record "
+            + $"{BagItems.RecordSize}, id at {BagItems.RecordIdOffset}");
+
+        var starts = new List<int>();
+        if (payload.Length < headerSize) return starts;
+
+        int first = (int)BitConverter.ToUInt32(payload, 0) - 6;      // frame-relative -> payload
+        int bytes = (int)BitConverter.ToUInt32(payload, 4);
+        if (first < headerSize || first >= payload.Length) first = headerSize;
+        if (bytes <= 0 || first + bytes > payload.Length) bytes = payload.Length - first;
+
+        for (int at = first; at + recordSize <= first + bytes; at += recordSize) starts.Add(at);
+        return starts;
+    }
+
+    /// <summary>The item db id of each record in a served inventory payload, in wire order.</summary>
+    static List<int> ItemIdsIn(byte[] payload)
+    {
+        var ids = new List<int>();
+        foreach (int at in RecordStartsIn(payload)) ids.Add(BitConverter.ToInt32(payload, at));
+        return ids;
+    }
+
     [Test] public static void OnLoadInventory_serves_the_kit_for_the_characters_class()
     {
         var captured = LoadStarterInventoryOrSkip();
@@ -3781,8 +3858,24 @@ array items
             var frames = RunHandler(DbProxyHandlers.SDB_USER_LOAD_INVENTORY, req, 2, store);
 
             Hex.True(frames[1].op == DbProxyHandlers.DBS_USER_LOAD_INVENTORY, "second frame is 0x27A4");
-            Hex.Eq(frames[1].body, StarterInventory.Build(captured, WarriorClassId, id, 0x0BAD)!,
+            EqExceptItemIds(frames[1].body, StarterInventory.Build(captured, WarriorClassId, id, 0x0BAD)!,
                 "the handler must serve the warrior kit, not the captured glaiver list");
+
+            // T105b: the ids are the block ReserveItemIds handed out, and they are the rows'.
+            var served = ItemIdsIn(frames[1].body);
+            var stored = new List<int>();
+            foreach (var row in store.GetInventoryItems(id)) stored.Add(row.ItemDbId);
+            stored.Sort();
+            var stampedOrder = new List<int>(served); stampedOrder.Sort();
+            Hex.True(served.Count > 0 && stampedOrder.Count == served.Count,
+                $"one id per record: {served.Count}");
+            Hex.True(string.Join(",", stampedOrder) == string.Join(",", stored),
+                $"the reply carries the rows' ids: {string.Join(",", stampedOrder)} vs "
+                + $"{string.Join(",", stored)}");
+            Hex.True(stored[0] >= TeraSharp.Arbiter.Persistence.CharacterStore.FirstItemId,
+                $"drawn from the item counter, not the kit's {StarterInventory.FirstStarterItemId}: {stored[0]}");
+            for (int i = 1; i < stored.Count; i++)
+                Hex.True(stored[i] == stored[i - 1] + 1, "one consecutive block per seed");
             Hex.True(RecInt(frames[1].body, 2, StarterInventory.RecordTemplateIdOffset) == 10001,
                 "a warrior gets 10001, not 59053");
         }
@@ -13505,12 +13598,25 @@ some prose with `backticks` that is not a table row
                 Path.Combine(dir, "seed.db"), QuietLog());
 
             var first = RunHandler(DbProxyHandlers.SDB_USER_LOAD_INVENTORY, CapNc27A2Req, 2, store);
-            Hex.Eq(first[1].body, t, "first login: seeded from the kit and rebuilt from the rows");
+            EqExceptItemIds(first[1].body, t, "first login: seeded from the kit and rebuilt from the rows");
             Hex.True(store.CountInventoryItems(2) == 6, "and the six rows are now on disk");
 
             var second = RunHandler(DbProxyHandlers.SDB_USER_LOAD_INVENTORY, CapNc27A2Req, 2, store);
-            Hex.Eq(second[1].body, t, "relog: rebuilt from the rows alone, still byte-identical");
+            EqExceptItemIds(second[1].body, t, "relog: rebuilt from the rows alone, still byte-identical");
             Hex.True(store.CountInventoryItems(2) == 6, "and seeding did not run twice");
+
+            // T105b: the ids the capture carried (7..12) are the one thing that MUST differ, and
+            // they must not move on a relog - a second seed would mean the rows were lost again.
+            var firstIds = ItemIdsIn(first[1].body);
+            var secondIds = ItemIdsIn(second[1].body);
+            Hex.True(string.Join(",", firstIds) == string.Join(",", secondIds),
+                $"the relog serves the same ids: {string.Join(",", firstIds)} vs {string.Join(",", secondIds)}");
+            Hex.True(firstIds.Count == 6
+                     && firstIds[0] >= TeraSharp.Arbiter.Persistence.CharacterStore.FirstItemId,
+                $"six ids from the counter, not {StarterInventory.FirstStarterItemId}..: "
+                + string.Join(",", firstIds));
+            Hex.True(!firstIds.Contains(StarterInventory.FirstStarterItemId),
+                "and none of them is the shared id that was being re-owned between characters");
         }
         finally
         {
