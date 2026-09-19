@@ -590,3 +590,31 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   the per-World link set, `LinksOf(worldId)`, `WorldLink.WorldId/BypassIndex`, handling 0x138A
   before the replay lookup, and `AllocateTunnelKey(worldId)`. Until that lands, the replay table
   still answers 0x138A and nothing behaves differently.
+
+- T105 (live 2026-09-19): **the starter kit gave every character the SAME six item db ids**, and
+  since T44 made the bag real rows that was a collision, not a convenience. `UpsertItem` is an
+  upsert on `item_db_id`, so seeding character B MOVED character A's six rows to B; A came back
+  with an empty bag, `SDB_USER_LOAD_INVENTORY` re-seeded it, and the rows went back the other way.
+  Two characters played tug of war over ids 7..12 and each lost its whole bag in turn - the pocket
+  is cleared before a seed - which is the live "player 3 -> 6 starter items ... seeded 6 starter
+  row(s)" for a character that had played. Reproduced in sqlite against the real DDL: seed 3, seed
+  4, and owner 3 goes from six rows to none.
+
+  Fix: `DbProxyHandlers.SeedStarterRows` draws the ids from `ReserveItemIds` - the same counter
+  every other item uses, which is what the real Arbiter does (7..12 in the capture is just where
+  its counter stood for the first character ever created) - and patches the id inside the row's
+  536-byte record so the rebuilt 0x27A4 agrees. `StarterInventory.Build` is untouched, so every
+  byte-exact starter test still passes: those ids are the payload's, and the reply is rebuilt from
+  the rows straight after the seed. `MigrateSharedStarterItemIds` renumbers what is already in the
+  file (anything below `FirstItemId`), keeping the owner, so an existing database stops colliding.
+  Nothing else since T74 loses rows: the T101b soft delete parks items in `deleted_items` and
+  `RestoreDeletedCharacter` puts them back, and it has no production caller yet; T86, T95 and T99
+  add tables and a cascade that only run on a real delete.
+
+  Also: **/@perfect_level wrote the row and the blob kept the old level** - the lobby reads the row
+  (70) and enter-world serves the saved blob (3). `StarterBlob.LevelOffset = 204` is stamped on the
+  way out next to T59's money, pinned against six real 0x2738 blobs (1/1/1 fresh, 8 for two that
+  had levelled, 70 for "dob" after the command); +208 and +216 move with it but are hp and mp -
+  1953 hp at level 1, 85956 at 70. **Exp is deliberately not stamped**: /@perfect_level leaves it
+  at the level's base, the level-1 and level-70 blobs of the same character differ in 640 runs, and
+  none reads as a total-exp counter, so guessing an offset would overwrite hp or mp.

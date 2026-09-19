@@ -72,6 +72,10 @@ public static class StarterInventory
     /// the same on every login for the same character, and with no items table behind them a
     /// fresh id per load would hand World a different id for the same item each time.
     /// </summary>
+    /// <para><b>T105:</b> these are the ids of the PAYLOAD only. They are the same for every
+    /// character, so they must never reach the items table as they are - seeding renumbers them
+    /// from the item-id counter (<c>DbProxyHandlers.SeedStarterRows</c>). Before that, seeding a
+    /// second character re-owned the first one's six rows and emptied its bag.</para>
     public const int FirstStarterItemId = 7;
 
     /// <summary>

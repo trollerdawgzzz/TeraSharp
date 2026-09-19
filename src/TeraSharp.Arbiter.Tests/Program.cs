@@ -21423,6 +21423,143 @@ string message
             "and when world 13's last link drops, world 0 is untouched");
     }
 
+    // ===================== T105: the live 2026-09-19 regressions =====================
+
+    /// <summary>Two starter records with the kit's own ids (7 and 8), the shape
+    /// SDB_USER_LOAD_INVENTORY hands the seeder.</summary>
+    static byte[] T105StarterPayload()
+    {
+        var p = new byte[BagItems.PayloadHeader + 2 * BagItems.RecordSize];
+        for (int i = 0; i < 2; i++)
+        {
+            int at = BagItems.PayloadHeader + i * BagItems.RecordSize;
+            BitConverter.GetBytes(StarterInventory.FirstStarterItemId + i).CopyTo(p, at + BagItems.RecordIdOffset);
+            BitConverter.GetBytes(6550 + i).CopyTo(p, at + BagItems.RecordTemplateIdOffset);
+            BitConverter.GetBytes(1).CopyTo(p, at + BagItems.RecordAmountOffset);
+            BitConverter.GetBytes(0).CopyTo(p, at + BagItems.RecordPocketOffset);
+            BitConverter.GetBytes(i).CopyTo(p, at + BagItems.RecordSlotOffset);
+        }
+        return p;
+    }
+
+    /// <summary>
+    /// The bug behind "player 3 -&gt; 6 starter items ... seeded 6 starter row(s)" for a
+    /// character that had played. Every character was seeded with the SAME item db ids
+    /// (7..12), and UpsertItem is an upsert on item_db_id - so seeding the second character
+    /// MOVED the first one's rows to it, and the first came back with an empty bag.
+    /// </summary>
+    [Test] public static void T105_a_second_character_cannot_steal_the_first_ones_starter_rows()
+    {
+        using var store = GuildStore(2);
+        var payload = T105StarterPayload();
+
+        Hex.True(DbProxyHandlers.SeedStarterRows(store, 1, payload) == 2, "character 1 is seeded");
+        var one = store.GetInventoryItems(1);
+        Hex.True(one.Count == 2, $"and has two rows: {one.Count}");
+        Hex.True(one[0].ItemDbId >= TeraSharp.Arbiter.Persistence.CharacterStore.FirstItemId,
+            $"with ids from the counter, not the kit's 7: {one[0].ItemDbId}");
+
+        Hex.True(DbProxyHandlers.SeedStarterRows(store, 2, payload) == 2, "character 2 is seeded");
+        Hex.True(store.GetInventoryItems(1).Count == 2 && store.GetInventoryItems(2).Count == 2,
+            "and BOTH still have their rows - this is the whole regression");
+
+        var a = new List<int>(); foreach (var r in store.GetInventoryItems(1)) a.Add(r.ItemDbId);
+        var b = new List<int>(); foreach (var r in store.GetInventoryItems(2)) b.Add(r.ItemDbId);
+        foreach (int id in a) Hex.True(!b.Contains(id), $"ids must not overlap: {id}");
+
+        // The record blob carries the id at offset 0, so it is renumbered with the row -
+        // otherwise the rebuilt 0x27A4 would hand World an id no row has.
+        var rec = store.GetInventoryItems(2)[0];
+        Hex.True(rec.Record is not null
+                 && BitConverter.ToInt32(rec.Record, BagItems.RecordIdOffset) == rec.ItemDbId,
+            "the stored record agrees with the row");
+    }
+
+    /// <summary>
+    /// A row already in the file has to survive Migrate() - the thing the live report made us
+    /// check. One row above the counter's floor keeps its id exactly; one below it (a legacy
+    /// shared starter id) is renumbered but keeps its owner, its pocket and its template.
+    /// </summary>
+    [Test] public static void T105_a_pre_existing_items_row_survives_migrate()
+    {
+        var dbPath = Path.Combine(Path.GetTempPath(), $"terasharp_t105_{Guid.NewGuid():N}.db");
+        try
+        {
+            var log = Microsoft.Extensions.Logging.LoggerFactory.Create(b => { }).CreateLogger("test");
+            int keptId;
+            using (var store = new TeraSharp.Arbiter.Persistence.CharacterStore(dbPath, log))
+            {
+                var acct = store.GetOrCreateAccount("t105");
+                int id = store.CreateCharacter(new TeraSharp.Arbiter.Persistence.CharacterRecord
+                {
+                    AccountId = acct.Id, Name = "Keeper", Gender = 0, Race = 1, Class = 2,
+                    Level = 70, TemplateId = 10101, Zone = 5, X = 1f, Y = 2f, Z = 3f,
+                    Appearance = new byte[8], Details = new byte[32], Shape = new byte[64], Position = 1,
+                });
+                keptId = store.ReserveItemIds(1);
+                store.UpsertItem(keptId, id, 0, 4, 88888, 3);
+                store.UpsertItem(9, id, 0, 5, 77777, 1);          // a legacy shared starter id
+                Hex.True(store.GetInventoryItems(id).Count == 2, "two rows before the reopen");
+            }
+
+            using (var store = new TeraSharp.Arbiter.Persistence.CharacterStore(dbPath, log))
+            {
+                var rows = store.GetInventoryItems(1);
+                Hex.True(rows.Count == 2, $"both rows survived Migrate(): {rows.Count}");
+
+                var kept = store.GetItem(keptId);
+                Hex.True(kept is not null && kept.TemplateId == 88888 && kept.Slot == 4,
+                    "a row above the counter's floor keeps its id untouched");
+
+                bool legacyGone = store.GetItem(9) is null;
+                var moved = rows[0].TemplateId == 77777 ? rows[0] : rows[1];
+                Hex.True(legacyGone && moved.TemplateId == 77777 && moved.OwnerDbId == 1
+                         && moved.ItemDbId >= TeraSharp.Arbiter.Persistence.CharacterStore.FirstItemId,
+                    $"and the shared starter id was renumbered to {moved.ItemDbId}, same owner");
+            }
+        }
+        finally { try { File.Delete(dbPath); } catch { } }
+    }
+
+    /// <summary>
+    /// /@perfect_level 70 wrote the row, the lobby read the row and showed 70, and enter-world
+    /// served the saved blob - which still said 3. Level is stamped into the blob on the way
+    /// out now, exactly as T59 does with money.
+    /// <para>Offset 204 is pinned against six real 0x2738 blobs: race / gender / class / level
+    /// as four i32 at 192..207. The two slices below are "dob" in cap_social4.log at level 1
+    /// (seq 250) and at level 70 after the GM command (seq 5715) - same character, same race,
+    /// gender and class, and only the fourth word moves.</para>
+    /// </summary>
+    [Test] public static void T105_the_served_blob_carries_the_rows_level()
+    {
+        var atLevel1 = Hex.B("04 00 00 00 01 00 00 00 0C 00 00 00 01 00 00 00 A1 07 00 00");
+        var atLevel70 = Hex.B("04 00 00 00 01 00 00 00 0C 00 00 00 46 00 00 00 C4 4F 01 00");
+        const int baseAt = 192;
+        Hex.True(TeraSharp.Arbiter.Persistence.StarterBlob.LevelOffset == 204,
+            "level is the fourth i32 of that run");
+        Hex.True(BitConverter.ToInt32(atLevel1, 204 - baseAt) == 1
+                 && BitConverter.ToInt32(atLevel70, 204 - baseAt) == 70,
+            "1 and 70 in the two captured blobs");
+        Hex.True(BitConverter.ToInt32(atLevel1, 208 - baseAt) == 1953
+                 && BitConverter.ToInt32(atLevel70, 208 - baseAt) == 85956,
+            "+208 moves with the level too, but it is hp - 1953 at level 1 is not an exp total");
+
+        var blob = new byte[TeraSharp.Arbiter.Persistence.StarterBlob.MoneyBlockEnd];
+        Hex.True(TeraSharp.Arbiter.Persistence.StarterBlob.WriteLevel(blob, 70)
+                 && TeraSharp.Arbiter.Persistence.StarterBlob.ReadLevel(blob) == 70,
+            "the stamp round-trips");
+        Hex.True(!TeraSharp.Arbiter.Persistence.StarterBlob.WriteLevel(blob, 0)
+                 && TeraSharp.Arbiter.Persistence.StarterBlob.ReadLevel(blob) == 70,
+            "level 0 means 'unknown' and must not wipe a blob that already has one");
+        Hex.True(!TeraSharp.Arbiter.Persistence.StarterBlob.WriteLevel(new byte[8], 70)
+                 && !TeraSharp.Arbiter.Persistence.StarterBlob.WriteLevel(null, 70),
+            "a short or missing blob is not an error, it is just not stamped");
+
+        // Exp is deliberately unstamped - no capture separates it from hp/mp.
+        Hex.True(TeraSharp.Arbiter.Persistence.StarterBlob.ExpOffset == -1,
+            "exp has no pinned offset yet");
+    }
+
     /// <summary>SDB_REGISTER_CARD's payload: <c>DlmId@0, AccountDbId@4 (i64), CardTemplateId@12,
     /// Amount@16</c> - 20 bytes, the length of seq 7032.</summary>
     static byte[] CardRegister(long accountId, int cardTemplateId, int amount)

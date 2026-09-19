@@ -410,6 +410,49 @@ public static class StarterBlob
     /// never writes this field back, which is why it has to live in its own column.
     /// </summary>
     public const int MoneyOffset = 448;
+
+    /// <summary>
+    /// T105. i32 character level at blob offset 204 (0xCC), the field the real Arbiter binds its
+    /// <c>userLevel</c> column to when it fills the enter-world record (Arb_part_032.c:17801,
+    /// three slots after <c>gender</c> at +0xC4 and <c>class</c> at +0xC8 - our
+    /// <see cref="GenderOffset"/> / <see cref="ClassOffset"/> - and in the same call list as
+    /// <c>money</c> at +0x1C0).
+    /// <para>Pinned across six real 0x2738 blobs in cap_newchar.log and cap_social4.log: 1, 1, 1
+    /// for three fresh characters, 8 for two that had levelled, and 70 for "dob" after
+    /// /@perfect_level. The neighbours move with it and are NOT level - +208 is hp
+    /// (1953 at level 1, 2878 at 8, 85956 at 70) and +216 is mp.</para>
+    /// <para>Like money, World never writes this back in a way we can rely on: a GM command that
+    /// changes the row leaves the saved blob at the old level, which is why the lobby showed 70
+    /// and enter-world served 3 (live 2026-09-19).</para>
+    /// </summary>
+    public const int LevelOffset = 204;
+    /// <summary>Smallest blob that carries the level field.</summary>
+    public const int LevelBlockEnd = LevelOffset + 4;
+
+    /// <summary>Level as a blob carries it; 0 when the buffer is too short.</summary>
+    public static int ReadLevel(byte[]? blob) =>
+        blob == null || blob.Length < LevelBlockEnd ? 0 : BitConverter.ToInt32(blob, LevelOffset);
+
+    /// <summary>
+    /// Stamp the row's level into a blob on its way out, exactly as <see cref="WriteMoney"/>
+    /// does. A level of 0 is not written - that is "we do not know", not "level 0" - so a row
+    /// that predates the level column cannot wipe a blob that has the right value already.
+    /// </summary>
+    public static bool WriteLevel(byte[]? blob, int level)
+    {
+        if (blob == null || blob.Length < LevelBlockEnd || level <= 0) return false;
+        BitConverter.TryWriteBytes(blob.AsSpan(LevelOffset, 4), level);
+        return true;
+    }
+
+    /// <summary>
+    /// T105. Exp has NO pinned offset. The same six blobs cannot separate it: /@perfect_level
+    /// leaves exp at the level's base, so the level-1 and level-70 blobs of the same character
+    /// differ in 640 runs and none of them reads as a total-exp counter. Guessing an offset here
+    /// would overwrite hp or mp, so the row's exp column stays unstamped until a capture of a
+    /// character that EARNED its way up pins it.
+    /// </summary>
+    public const int ExpOffset = -1;
     /// <summary>Smallest blob that carries the money field.</summary>
     public const int MoneyBlockEnd = MoneyOffset + 8;
 
@@ -1373,6 +1416,62 @@ CREATE TABLE IF NOT EXISTS watched_movies_account (
         AddColumnIfMissing("characters", "crest_ex_point", "INTEGER NOT NULL DEFAULT 0");
 
         MigrateCardsToAccount();
+        MigrateSharedStarterItemIds();
+    }
+
+    /// <summary>
+    /// T105. Every character used to be seeded with the SAME starter item ids (7..12, the ids
+    /// the capture allocated for the first character ever created). Since T44 made the bag real
+    /// rows, <see cref="UpsertItem"/>'s <c>ON CONFLICT(item_db_id)</c> then MOVED those rows to
+    /// whoever logged in last, and the loser came back with an empty bag - which
+    /// <c>SDB_USER_LOAD_INVENTORY</c> re-seeded, stealing them back. That is the live
+    /// 2026-09-19 "player 3 -&gt; 6 starter items ... seeded 6 starter row(s)" for a character
+    /// that had played.
+    ///
+    /// <para>New seeds now take ids from <see cref="ReserveItemIds"/>. This renumbers the rows
+    /// already in the file - anything below <see cref="FirstItemId"/>, which only a starter seed
+    /// can have produced - so an existing database stops colliding too. The owner is not
+    /// touched: whoever holds the row keeps it. The item's own record blob carries the id at
+    /// offset 0 (BagItems.RecordIdOffset), so that is patched with it, otherwise the rebuilt
+    /// 0x27A4 would hand World the old id.</para>
+    /// </summary>
+    private void MigrateSharedStarterItemIds()
+    {
+        var legacy = new List<(int Id, long Owner)>();
+        using (var find = _db.CreateCommand())
+        {
+            find.CommandText = "SELECT item_db_id, owner_db_id FROM items WHERE item_db_id < $f ORDER BY item_db_id";
+            find.Parameters.AddWithValue("$f", FirstItemId);
+            using var r = find.ExecuteReader();
+            while (r.Read()) legacy.Add((r.GetInt32(0), r.GetInt64(1)));
+        }
+        if (legacy.Count == 0) return;
+
+        int first = ReserveItemIds(legacy.Count);
+        for (int i = 0; i < legacy.Count; i++)
+        {
+            int fresh = first + i;
+            using var move = _db.CreateCommand();
+            move.CommandText = "UPDATE items SET item_db_id = $new WHERE item_db_id = $old";
+            move.Parameters.AddWithValue("$new", fresh);
+            move.Parameters.AddWithValue("$old", legacy[i].Id);
+            move.ExecuteNonQuery();
+
+            using var read = _db.CreateCommand();
+            read.CommandText = "SELECT record FROM items WHERE item_db_id = $id";
+            read.Parameters.AddWithValue("$id", fresh);
+            if (read.ExecuteScalar() is byte[] rec && rec.Length >= 4)
+            {
+                BitConverter.TryWriteBytes(rec.AsSpan(0, 4), fresh);
+                using var put = _db.CreateCommand();
+                put.CommandText = "UPDATE items SET record = $r WHERE item_db_id = $id";
+                put.Parameters.AddWithValue("$r", rec);
+                put.Parameters.AddWithValue("$id", fresh);
+                put.ExecuteNonQuery();
+            }
+        }
+        _log.LogWarning("T105: renumbered {N} shared starter item id(s) below {F} - they were "
+            + "the same on every character and were being re-owned on each login", legacy.Count, FirstItemId);
     }
 
     /// <summary>
@@ -3049,6 +3148,8 @@ DELETE FROM restrictions      WHERE character_id = $id;";
             Money = r.GetInt64(r.GetOrdinal("money")),
         };
         StarterBlob.WriteMoney(c.WorldBlob, c.Money);
+        // T105: the row is the truth for level, the same way it is for money.
+        StarterBlob.WriteLevel(c.WorldBlob, c.Level);
         return c;
     }
 
