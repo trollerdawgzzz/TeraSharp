@@ -79,8 +79,11 @@ public static class HandlerRegistry
                 s.Send(ArbiterClientHandlers.BuildVisitedSectionListFor(s));   // T75/T79: FIRST in the burst, as frame 257 - S_VISITED_SECTION_LIST from visited_sections (stops the intro cutscene replaying)
                 s.Send(ArbiterClientHandlers.BuildCrestInfoFor(s));            // T83: crest points + learned crests (frames 304/314)
                 s.Send(ArbiterClientHandlers.BuildChangeCardPreset());         // T83: card preset (frames 329/375)
-                s.Send(ArbiterClientHandlers.BuildAdminHoldCharacter());       // T89: frame 402
-                s.Send(ArbiterClientHandlers.BuildAdminGmSkill(0, on: true));  // T89: frame 99
+                if (GmCommandHandlers.LevelOf(s, Program.Store) >= 1)   // T107: the real server sends these only to GMs
+                {
+                    s.Send(ArbiterClientHandlers.BuildAdminHoldCharacter());       // T89: frame 402
+                    s.Send(ArbiterClientHandlers.BuildAdminGmSkill(0, on: true));  // T89: frame 99
+                }
                 s.Send(ArbiterClientHandlers.BuildPvpLeaderBoardInfo());       // T91: frame 288
                 s.Send(ArbiterClientHandlers.BuildPveLeaderBoardInfo());       // T91: frame 289
                 Program.World?.SendFrame(WorldBridge.OpUpdateVisitedSection,
@@ -231,6 +234,7 @@ public static class HandlerRegistry
         Reg("C_ADMIN_GM_SKILL", 12,                (s, b) => GmAdminTool.OnGmSkill(s, b, misc));
         Reg("C_ADMIN_REQUEST_USERINFO",   22, (s, b) => GmAdminTool.OnRequestUserInfo(s, b, misc));     // T91
         Reg("C_ADMIN_REQUEST_USERACTION", 18, (s, b) => GmAdminTool.OnRequestUserAction(s, b, misc));   // T91
+        Reg("C_REQUEST_SERVER_ADMINTOOL_AWESOMIUM_URL", 0, (s,b) => ArbiterClientHandlers.OnRequestAdminToolUrl(s,b,misc));   // T107: Alt+A waits for this reply
         // T99: GM tool tail
         Reg("C_ADMIN_GM_TELEPORT",              GmAdminTool.GmTeleportBodySize,     (s,b) => GmAdminTool.OnGmTeleport(s,b,misc));
         Reg("C_ADMIN_GM_MAPTELEPORT",           GmAdminTool.GmMapTeleportBodySize,  (s,b) => GmAdminTool.OnGmMapTeleport(s,b,misc));
