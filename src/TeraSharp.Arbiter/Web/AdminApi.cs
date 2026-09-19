@@ -60,6 +60,13 @@ public sealed class AdminApi
     /// <summary>Send a system message to everyone in world. Returns how many got it.</summary>
     public Func<string, int>? Announce { get; set; }
 
+    /// <summary>T106: what the Status tab reports about the World link - (links, ready, online).
+    /// A delegate again, so this file still knows nothing about WorldBridge.</summary>
+    public Func<(int Links, bool Ready, int Online)>? WorldStatus { get; set; }
+
+    /// <summary>T106: when the process started, for uptime. Set once by the wiring.</summary>
+    public DateTimeOffset StartedAt { get; set; } = DateTimeOffset.UtcNow;
+
     /// <summary>True when the tool is usable at all. False means TERASHARP_ADMIN_TOKEN is unset.</summary>
     public bool Enabled => _token != null;
 
@@ -85,20 +92,29 @@ public sealed class AdminApi
 
         if (!Enabled)
             return Json(503, ResultRefused, "TERASHARP_ADMIN_TOKEN is not set - the admin tool is disabled");
+
+        // T106: the PAGE is served without a token. It has to be - a browser typing
+        // http://127.0.0.1:8050/ has nowhere to put a header, and T101's 401 meant the tool was
+        // only usable through curl. The page is a static shell that carries no data: it prompts
+        // for the token, keeps it in this browser, and sends it as X-Admin-Token on every API
+        // call below, each of which is still gated. The listener is bound to 127.0.0.1 and
+        // Serve() re-checks the peer is loopback, so serving it costs nothing.
+        if (method == "GET" && (path == "/" || path == "/index.html"))
+            return new AdminResponse(200, "text/html; charset=utf-8", AdminPage.Html);
+
         if (!TokenOk(token))
         {
             _log.LogWarning("admin: bad token from {Ip} for {Path}", sourceIp ?? "?", path);
             return Json(401, ResultRefused, "bad or missing token");
         }
 
-        if (method == "GET" && (path == "/" || path == "/index.html"))
-            return new AdminResponse(200, "text/html; charset=utf-8", AdminPage.Html);
-
         if (method == "GET" && path == "/api/accounts") return Accounts(query);
         if (method == "GET" && path == "/api/character") return Character(query);
         if (method == "GET" && path == "/api/online") return Online();
         if (method == "GET" && path == "/api/admin-log") return AdminLog(query);
         if (method == "GET" && path == "/api/deleted") return Deleted(query);
+        if (method == "GET" && path == "/api/status") return Status();
+        if (method == "GET" && path == "/api/log") return LogTail(query);
         if (method == "POST" && path == "/api/restore-character") return RestoreCharacter(body, sourceIp);
 
         // ---- phase 2 (T101b) ----
@@ -441,6 +457,66 @@ public sealed class AdminApi
         {
             if (i > 0) sb.Append(',');
             sb.Append(CharacterBrief(rows[i]));
+        }
+        sb.Append("]}");
+        return new AdminResponse(200, "application/json; charset=utf-8", sb.ToString());
+    }
+
+    // ------------------------------------------------------------------------- T106: status
+
+    /// <summary>
+    /// GET /api/status - what the Status tab shows: uptime, the World link, who is online and
+    /// what the process is holding. Everything that is not the store comes through
+    /// <see cref="WorldStatus"/>, so this file still has no idea what a WorldBridge is.
+    /// </summary>
+    private AdminResponse Status()
+    {
+        var up = DateTimeOffset.UtcNow - StartedAt;
+        var w = WorldStatus?.Invoke() ?? (0, false, 0);
+        long managed = GC.GetTotalMemory(false);
+        long working = 0;
+        try { working = Environment.WorkingSet; } catch (Exception) { }
+
+        var sb = new StringBuilder();
+        sb.Append("{\"result\":").Append(ResultOk)
+          .Append(",\"uptimeSeconds\":").Append((long)up.TotalSeconds)
+          .Append(",\"startedAt\":").Append(Str(StartedAt.ToString("o", CultureInfo.InvariantCulture)))
+          .Append(",\"worldLinks\":").Append(w.Item1)
+          .Append(",\"worldReady\":").Append(w.Item2 ? "true" : "false")
+          .Append(",\"online\":").Append(w.Item3)
+          .Append(",\"managedBytes\":").Append(managed)
+          .Append(",\"workingSetBytes\":").Append(working)
+          .Append(",\"gc0\":").Append(GC.CollectionCount(0))
+          .Append(",\"gc2\":").Append(GC.CollectionCount(2))
+          .Append(",\"threads\":").Append(System.Diagnostics.Process.GetCurrentProcess().Threads.Count)
+          .Append(",\"logFile\":").Append(Str(ArbiterLogProvider.CurrentPath))
+          .Append(",\"consoleLevel\":").Append(Str(ArbiterLogProvider.ConsoleLevel().ToString()))
+          .Append('}');
+        return new AdminResponse(200, "application/json; charset=utf-8", sb.ToString());
+    }
+
+    /// <summary>The Status tab's tail size, and the ceiling on ?lines=.</summary>
+    public const int DefaultTailLines = 200, MaxTailLines = 2000;
+
+    /// <summary>
+    /// GET /api/log?lines=N - the newest N log lines, oldest first, straight out of
+    /// <see cref="ArbiterLogProvider"/>'s ring. It never touches the file, so a 2-second poll
+    /// costs nothing and cannot collide with the writer.
+    /// </summary>
+    private AdminResponse LogTail(IReadOnlyDictionary<string, string> q)
+    {
+        int lines = DefaultTailLines;
+        string? l = Get(q, "lines");
+        if (l != null && int.TryParse(l, NumberStyles.Integer, CultureInfo.InvariantCulture, out int n))
+            lines = n < 1 ? 1 : (n > MaxTailLines ? MaxTailLines : n);
+
+        var rows = ArbiterLogProvider.Tail(lines);
+        var sb = new StringBuilder();
+        sb.Append("{\"result\":").Append(ResultOk).Append(",\"lines\":[");
+        for (int i = 0; i < rows.Count; i++)
+        {
+            if (i > 0) sb.Append(',');
+            sb.Append(Str(rows[i]));
         }
         sb.Append("]}");
         return new AdminResponse(200, "application/json; charset=utf-8", sb.ToString());

@@ -833,3 +833,42 @@ not race.
 * Byte-exact pins for the apply flow: the def-driven builders would need a registry fixture like
   `CreateT82Defs`. Ground truth is now available — c3 2920, 2938, 2996, 3014, 3016, 3017, 3019;
   c4 2781, 2789, 2822, 2835.
+
+## T106 - S_CURRENT_ELECTION_STATE, the last lobby packet TeraSharp never sent
+
+T104's GM-lobby diff turned up three packets the real Arbiter sends and TeraSharp did not.
+T89b had since added two of them; this is the third.
+
+**S_CURRENT_ELECTION_STATE (0xFAEB, 64235), 26 bytes, and the whole packet is a constant:**
+
+```
+1A 00 EB FA 00 00 00 00 00 00 00 00 00 00 00 00 00 00 A9 42 B7 6A 00 00 00 00
+```
+
+All five captures carry those identical bytes - cap_final_client **46**, cap_final_client2 **124**,
+cap_final_gm_client2 **49**, cap_social_client **45**, cap_newchar_client **99** - *including* the
+trailing i64, which reads `0x6AB742A9` (1790035625) in every one. The captures are days apart, so
+that field is **not a clock**: it is a fixed deadline off the politics sheet, and the right
+implementation is the constant, not `now + something`. Everything ahead of it is zero in all five,
+so the field boundaries in the first 18 bytes are unknowable from the wire and are left unnamed.
+
+It is a pure push - no `C_CURRENT_ELECTION_STATE` exists in any capture. In cap_final_client the
+Arbiter sends it itself, directly after its own `S_BROCAST_GUILD_FLAG` (45 -> 46); in the captures
+where World drives the hand-off it lands inside World's post-select burst instead.
+
+`ArbiterClientHandlers.BuildCurrentElectionState()` / `SendCurrentElectionState(s)`.
+
+The other two were already correct:
+
+* **frame 13, S_DECO_UI_INFO (0x57B3)** - 8 bytes, body all zero. `LoginHandlers` sends exactly
+  that (T89b).
+* **frame 15, S_CONFIRM_INVITE_CODE_BUTTON (0xD41D)** - 17 bytes,
+  `[u16 strOff=0x0F][u8 1][i64 unix][wchar terminator]`. The fixed part is byte-identical.
+
+  **The i64 is not what TeraSharp sends, though.** `LoginHandlers` writes `UtcNow`; the real
+  server writes a FUTURE expiry. Four of the five captures read `0x6AB74EE2` = 1790398178 =
+  2026-09-26 04:49 UTC, about **9 days after** the 2026-09-17 capture, and cap_final_client reads
+  1790598150 (2026-09-28), 2.3 days later again - so it is neither a clock nor a constant, but an
+  invite-code deadline that is recomputed now and then. Sending `now` makes the button's countdown
+  read as already expired. Not fixed here: `LoginHandlers.cs` is human-owned, and one more capture
+  would settle whether the offset is per-account or per-server-config before anyone hard-codes it.

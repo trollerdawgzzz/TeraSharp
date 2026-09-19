@@ -10982,6 +10982,198 @@ bool   isGuildWarAcceptable
         finally { Environment.SetEnvironmentVariable(GmAccounts.EnvVariable, saved); }
     }
 
+    // =======================================================================================
+    // T106 - the admin web's second pass, the last lobby packet, and the logging split.
+    // =======================================================================================
+
+    /// <summary>
+    /// T106.1 - the PAGE is served without a token; every API path still is not.
+    ///
+    /// <para>T101 put the page behind the same 401 as the data, which made the tool unusable
+    /// from a browser: typing http://127.0.0.1:8050/ has nowhere to put a header, so the only
+    /// way in was curl. The page carries no data - it prompts for the token, keeps it in that
+    /// browser, and sends it as X-Admin-Token on every call.</para>
+    /// </summary>
+    [Test] public static void T106_the_admin_page_is_served_without_a_token()
+    {
+        using var store = StoreWithTwoAccounts();
+        var api = NewAdminApi(store);
+
+        foreach (var path in new[] { "/", "/index.html" })
+        {
+            var page = api.Handle("GET", path);
+            Hex.True(page.Status == 200 && page.ContentType.StartsWith("text/html"),
+                $"{path} with no token at all: {page.Status}");
+        }
+        Hex.True(api.Handle("GET", "/", token: "wrong").Status == 200,
+            "and a wrong token does not make the page itself fail either");
+
+        // The data behind it is untouched.
+        foreach (var path in new[] { "/api/online", "/api/status", "/api/log", "/api/accounts" })
+            Hex.True(api.Handle("GET", path).Status == 401,
+                $"{path} with no token is still 401");
+        Hex.True(api.Handle("POST", "/api/set-money", body: "{\"id\":1,\"money\":1}").Status == 401,
+            "and so is every write");
+
+        // The whole tool off is still 503, page included - an admin surface with no token
+        // configured must not serve anything at all.
+        var off = NewAdminApi(store, token: null);
+        Hex.True(off.Handle("GET", "/").Status == 503, "TERASHARP_ADMIN_TOKEN unset serves nothing");
+
+        // The page has to actually send the header the server now reads.
+        Hex.True(AdminServer.TokenHeader == "X-Admin-Token"
+                 && AdminPage.Html.Contains("X-Admin-Token"),
+            "the page and the listener agree on the header name");
+        Hex.True(!AdminPage.Html.Contains("\""),
+            "and the page still has no double quote in it - it lives in a verbatim string");
+    }
+
+    /// <summary>T106.4 - the Status tab's two read endpoints.</summary>
+    [Test] public static void T106_status_and_log_endpoints_answer_the_status_tab()
+    {
+        using var store = StoreWithTwoAccounts();
+        var api = NewAdminApi(store);
+        api.StartedAt = DateTimeOffset.UtcNow.AddSeconds(-4000);
+        api.WorldStatus = () => (2, true, 7);
+
+        var st = api.Handle("GET", "/api/status", token: T101Token);
+        Hex.True(st.Status == 200 && st.Body.Contains("\"worldLinks\":2")
+                 && st.Body.Contains("\"worldReady\":true") && st.Body.Contains("\"online\":7"),
+            $"the World line comes through the delegate: {st.Body}");
+        Hex.True(st.Body.Contains("\"uptimeSeconds\":4") && st.Body.Contains("\"workingSetBytes\":")
+                 && st.Body.Contains("\"managedBytes\":") && st.Body.Contains("\"threads\":"),
+            $"uptime, memory and threads are all there: {st.Body}");
+
+        // Unwired, it reports no World rather than pretending - the same shape kick uses.
+        var bare = NewAdminApi(store).Handle("GET", "/api/status", token: T101Token);
+        Hex.True(bare.Body.Contains("\"worldLinks\":0") && bare.Body.Contains("\"worldReady\":false"),
+            "no delegate means no World");
+
+        // The tail comes out of the ring, oldest first, and JSON-escapes whatever was logged.
+        for (int i = 0; i < 5; i++)
+            TeraSharp.Arbiter.Web.ArbiterLogProvider.Append("line " + i);
+        TeraSharp.Arbiter.Web.ArbiterLogProvider.Append("a \"quoted\" line\twith a tab");
+        var tail = api.Handle("GET", "/api/log",
+            new Dictionary<string, string> { ["lines"] = "3" }, token: T101Token);
+        Hex.True(tail.Status == 200 && tail.Body.Contains("\"line 3\"") && tail.Body.Contains("\"line 4\"")
+                 && !tail.Body.Contains("\"line 2\""),
+            $"?lines=3 is the newest three, oldest first: {tail.Body}");
+        Hex.True(tail.Body.Contains("\\\"quoted\\\"") && tail.Body.Contains("\\t"),
+            $"and a log line with a quote in it cannot break the JSON: {tail.Body}");
+
+        var capped = api.Handle("GET", "/api/log",
+            new Dictionary<string, string> { ["lines"] = "999999" }, token: T101Token);
+        Hex.True(capped.Status == 200, "a silly line count is clamped, not refused");
+    }
+
+    /// <summary>
+    /// T106.3 - the logging split. The CONSOLE is Warning unless TERASHARP_LOG_LEVEL says
+    /// otherwise; the FILE takes everything from Debug up, which is why the two are separate
+    /// sinks rather than one minimum level.
+    /// </summary>
+    [Test] public static void T106_console_defaults_to_warning_and_the_file_takes_everything()
+    {
+        Hex.True(TeraSharp.Arbiter.Web.ArbiterLogProvider.DefaultConsoleLevel == Microsoft.Extensions.Logging.LogLevel.Warning,
+            "Program.cs asked for Debug on the console, and a live server drowned it");
+        Hex.True(TeraSharp.Arbiter.Web.ArbiterLogProvider.ConsoleLevel(null) == Microsoft.Extensions.Logging.LogLevel.Warning
+                 && TeraSharp.Arbiter.Web.ArbiterLogProvider.ConsoleLevel("") == Microsoft.Extensions.Logging.LogLevel.Warning
+                 && TeraSharp.Arbiter.Web.ArbiterLogProvider.ConsoleLevel("nonsense") == Microsoft.Extensions.Logging.LogLevel.Warning,
+            "unset, empty or unparseable all fall back - a typo must not turn logging off");
+        Hex.True(TeraSharp.Arbiter.Web.ArbiterLogProvider.ConsoleLevel("Information") == Microsoft.Extensions.Logging.LogLevel.Information
+                 && TeraSharp.Arbiter.Web.ArbiterLogProvider.ConsoleLevel("debug") == Microsoft.Extensions.Logging.LogLevel.Debug
+                 && TeraSharp.Arbiter.Web.ArbiterLogProvider.ConsoleLevel("None") == Microsoft.Extensions.Logging.LogLevel.None,
+            "and the override is case-insensitive");
+
+        Hex.True(TeraSharp.Arbiter.Web.ArbiterLogProvider.FileNameFor(new DateTime(2026, 9, 7))
+                 == "arbiter-2026-09-07.log",
+            "the file rolls by day, zero-padded so it sorts");
+
+        var line = TeraSharp.Arbiter.Web.ArbiterLogProvider.Format(
+            new DateTime(2026, 9, 21, 4, 5, 6, 789), Microsoft.Extensions.Logging.LogLevel.Warning,
+            "TeraSharp.Arbiter.World.WorldBridge", "link #1 closed", null);
+        Hex.True(line == "2026-09-21 04:05:06.789 WARN  WorldBridge: link #1 closed",
+            $"one line, level padded to five so the column lines up: {line}");
+        var withError = TeraSharp.Arbiter.Web.ArbiterLogProvider.Format(
+            new DateTime(2026, 9, 21, 4, 5, 6, 789), Microsoft.Extensions.Logging.LogLevel.Error, "X", "boom",
+            new InvalidOperationException("no"));
+        Hex.True(withError.EndsWith("boom | InvalidOperationException: no"),
+            $"and an exception is appended rather than swallowed: {withError}");
+    }
+
+    /// <summary>
+    /// T106.3 - the seven harmless pushes stop shouting. <c>WorldBridge</c> logs one Information
+    /// line per W-&gt;A frame and these arrive by the hundred; they go to Debug, so the file still
+    /// has every one.
+    ///
+    /// <para><b>0x1562 is why this is a set of its own.</b>
+    /// <c>SA_CLEAR_BATTLE_FIELD_ENTER_COUNT</c> has a real <c>AS_</c> reply (0x1563) and a real
+    /// handler - putting it in <c>OneWayFromWorld</c> to quieten it would seal a frame that must
+    /// be answered.</para>
+    /// </summary>
+    [Test] public static void T106_the_noisy_world_pushes_log_at_debug()
+    {
+        ushort[] quiet = { 0x13FA, 0x159A, 0x1598, 0x13CC, 0x1562, 0x1626, 0x2927 };
+        foreach (var op in quiet)
+            Hex.True(WorldReplayTable.LogsAtDebug(op), $"0x{op:X4} should be quiet");
+
+        // The four WorldBridge used to suppress with an inline literal list are folded in, so
+        // there is one place to look.
+        foreach (ushort op in new ushort[] { 0x138A, 0x15A8, 0x1436, 0x164D })
+            Hex.True(WorldReplayTable.LogsAtDebug(op), $"0x{op:X4} was already suppressed inline");
+
+        Hex.True(!WorldReplayTable.OneWayFromWorld.Contains(0x1562),
+            "0x1562 is answered with 0x1563 - quiet is not the same as one-way");
+        Hex.True(!WorldReplayTable.LogsAtDebug(DbProxyHandlers.SDB_USER_ENTERWORLD)
+                 && !WorldReplayTable.LogsAtDebug(0x13F7),
+            "and nothing that matters got swept in - enter-world and the tunnel still log");
+    }
+
+    /// <summary>
+    /// T106.2 - S_CURRENT_ELECTION_STATE, the last of the three lobby packets T104 found
+    /// missing. S_DECO_UI_INFO (frame 13) and S_CONFIRM_INVITE_CODE_BUTTON (frame 15) were
+    /// already being sent by T89b; this one was not.
+    ///
+    /// <para>The whole 26 bytes are a constant: all five captures - cap_final_client 46,
+    /// cap_final_client2 124, cap_final_gm_client2 49, cap_social_client 45, cap_newchar_client
+    /// 99 - are byte-identical INCLUDING the trailing i64, across captures taken days apart. So
+    /// the deadline is sheet data, not a clock.</para>
+    /// </summary>
+    [Test] public static void T106_current_election_state_is_byte_exact()
+    {
+        Hex.Eq(ArbiterClientHandlers.BuildCurrentElectionState(),
+            "1A 00 EB FA 00 00 00 00 00 00 00 00 00 00 00 00 00 00 A9 42 B7 6A 00 00 00 00",
+            "cap_final_client frame 46, and the same bytes in four other captures");
+
+        var p = ArbiterClientHandlers.BuildCurrentElectionState();
+        Hex.True(p.Length == ArbiterClientHandlers.CurrentElectionStateSize
+                 && BitConverter.ToUInt16(p, 0) == 26
+                 && BitConverter.ToUInt16(p, 2) == ArbiterClientHandlers.S_CURRENT_ELECTION_STATE,
+            "26 bytes of 0xFAEB");
+        Hex.True(BitConverter.ToInt64(p, ArbiterClientHandlers.ElectionDeadlineOffset)
+                 == ArbiterClientHandlers.ElectionDeadline
+                 && ArbiterClientHandlers.ElectionDeadline == 1790035625L,
+            "the deadline is the only non-zero field, at +18");
+        Hex.True(p[4..ArbiterClientHandlers.ElectionDeadlineOffset].All(x => x == 0),
+            "everything ahead of it is zero in all five captures, so its fields stay unnamed");
+
+        // The offset is proved, not assumed.
+        Hex.Eq(ArbiterClientHandlers.BuildCurrentElectionState(1),
+            "1A 00 EB FA 00 00 00 00 00 00 00 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00",
+            "a different deadline moves that i64 and nothing else");
+
+        // And the two T89b already sends. Frame 15's fixed part matches; its i64 does NOT - the
+        // real server writes an invite-code EXPIRY about nine days out (1790398178 in four of the
+        // five captures) where LoginHandlers writes UtcNow, so the countdown reads as expired.
+        // See status/CLIENT-REJECTS.md, T106.
+        Hex.Eq(Hex.B("08 00 B3 57 00 00 00 00"), "08 00 B3 57 00 00 00 00",
+            "frame 13 S_DECO_UI_INFO - eight bytes, body all zero, as LoginHandlers sends it");
+        var invite = Hex.B("11 00 1D D4 0F 00 01 E2 4E B7 6A 00 00 00 00 00 00");
+        Hex.True(invite.Length == 17 && BitConverter.ToUInt16(invite, 2) == 0xD41D
+                 && BitConverter.ToUInt16(invite, 4) == 0x0F && invite[6] == 1
+                 && invite[15] == 0 && invite[16] == 0,
+            "frame 15 S_CONFIRM_INVITE_CODE_BUTTON: [u16 strOff=0x0F][u8 1][i64 unix][wchar terminator]");
+    }
+
     // ---- The rules ----
 
     [Test] public static void T30_system_message_format_matches_the_capture()
