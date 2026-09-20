@@ -86,11 +86,12 @@ public static class HandlerRegistry
                 }
                 s.Send(ArbiterClientHandlers.BuildPvpLeaderBoardInfo());       // T91: frame 288
                 s.Send(ArbiterClientHandlers.BuildPveLeaderBoardInfo());       // T91: frame 289
-                Program.World?.SendFrame(WorldBridge.OpUpdateVisitedSection,
+                // T112: AS_UPDATE_VISITED_SECTION_LIST goes to the World this player is in.
+                Program.World?.SendFrame(s.CurrentWorldId, WorldBridge.OpUpdateVisitedSection,
                     ArbiterClientHandlers.BuildUpdateVisitedSectionList(s.PlayerId,
                         Program.Store?.GetVisitedSections((int)s.SelectedCharacter!.Id)
                             ?? Array.Empty<TeraSharp.Arbiter.Persistence.CharacterStore.VisitedSection>()));
-                Program.World?.NotifyTopoLoaded(s.PlayerId);
+                Program.World?.NotifyTopoLoaded(s.CurrentWorldId, s.PlayerId);
                 // Real Arbiter sends these to the client right after C_LOAD_TOPO_FIN (lobby_proxy.log
                 // 263-268), in this order. S_LOAD_CLIENT_USER_SETTING here is what makes the chat
                 // window process S_CHAT; sent at character select it is discarded on zone load.

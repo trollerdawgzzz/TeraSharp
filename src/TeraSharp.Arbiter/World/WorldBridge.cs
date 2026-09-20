@@ -87,8 +87,16 @@ public sealed class WorldBridge
     private readonly object _lock = new();
     private int _nextLinkId;
 
+    /// <summary>T108: IsReady + the game-id counter, one per World (MULTIWORLD-DESIGN.md s4.3).</summary>
+    private readonly PerWorld<WorldRuntime> _worlds = new(() => new WorldRuntime());
+
     private readonly object _reorderLock = new();
-    private readonly Dictionary<uint, TunnelReorderBuffer> _tunnels = new();
+    /// <summary>
+    /// T111: keyed by (World, Ticket), not Ticket alone. A Ticket indexes ONE World's bypass
+    /// slots, so two Worlds hand out the same numbers and a flat map would deliver world 13's
+    /// packet to a world 0 player (MULTIWORLD-DESIGN.md section 4 item 5).
+    /// </summary>
+    private readonly Dictionary<(int World, uint Ticket), TunnelReorderBuffer> _tunnels = new();
     private const int StallMs = 150;
 
     /// <summary>
@@ -97,7 +105,8 @@ public sealed class WorldBridge
     /// clients logged in together World saw both as one ticket ("SpawnMe twice", both stuck at
     /// 100% loading, 2026-09-15 00:04).
     /// </summary>
-    private readonly TicketAllocator _tickets = new();
+    /// <summary>T103: one allocator per World - a Ticket indexes THAT World's bypass slots.</summary>
+    private readonly PerWorld<TicketAllocator> _tickets = new(() => new TicketAllocator());
 
     /// <summary>
     /// In-world players keyed by gameId, for control-message routing (e.g. SA_LEAVE_WORLD
@@ -107,20 +116,27 @@ public sealed class WorldBridge
     private readonly object _playersLock = new();
 
     /// <summary>Allocate a unique tunnel Ticket for a new player session.</summary>
-    internal uint AllocateTunnelKey() => _tickets.Allocate();
+    internal uint AllocateTunnelKey() => AllocateTunnelKey(WorldRegistration.DefaultWorldId);
+
+    /// <summary>The same, in one World's ticket space.</summary>
+    internal uint AllocateTunnelKey(int worldId) => _tickets.For(worldId).Allocate();
 
     public void RegisterPlayer(GameSession s)
     {
         lock (_playersLock) _players[s.GameId] = s;
         lock (_reorderLock)
-            _tunnels[s.TunnelKey] = new TunnelReorderBuffer { Deliver = p => Handlers.ArbiterClientHandlers.DeliverTunnelled(s, p) };   // T121: inject S_ADMIN_GM_SKILL before the tunnelled S_LOAD_TOPO
+            _tunnels[(s.CurrentWorldId, s.TunnelKey)] = new TunnelReorderBuffer { Deliver = p => Handlers.ArbiterClientHandlers.DeliverTunnelled(s, p) };   // T121: inject S_ADMIN_GM_SKILL before the tunnelled S_LOAD_TOPO
     }
 
     public void UnregisterPlayer(ulong gameId, uint tunnelKey)
+        => UnregisterPlayer(gameId, WorldRegistration.DefaultWorldId, tunnelKey);
+
+    /// <summary>T111: the Ticket is freed in its own World's space and unkeyed with it.</summary>
+    public void UnregisterPlayer(ulong gameId, int worldId, uint tunnelKey)
     {
         lock (_playersLock) _players.Remove(gameId);
-        lock (_reorderLock) _tunnels.Remove(tunnelKey);
-        _tickets.Free(tunnelKey);
+        lock (_reorderLock) _tunnels.Remove((worldId, tunnelKey));
+        _tickets.For(worldId).Free(tunnelKey);
     }
 
     /// <summary>The session that owns a tunnel Ticket, or null (ActionDispatcher / party / chat).</summary>
@@ -133,6 +149,18 @@ public sealed class WorldBridge
 
     /// <summary>Registered World links (T106 status tab).</summary>
     public int LinkCount { get { lock (_lock) return _links.Count; } }
+
+    /// <summary>T103: every link of one World, in connect order.</summary>
+    public List<WorldLink> LinksOf(int worldId)
+    {
+        lock (_lock) return _links.Where(l => l.WorldId == worldId).ToList();
+    }
+
+    /// <summary>T111: whether a World has any link at all - the guard on every routed send.</summary>
+    public bool HasLinks(int worldId)
+    {
+        lock (_lock) return _links.Any(l => l.WorldId == worldId);
+    }
 
     /// <summary>The in-world session for a character db id, or null (guild/chat/party actions address by player id).</summary>
     public GameSession? SessionForPlayerId(int playerId)
@@ -150,15 +178,23 @@ public sealed class WorldBridge
 
     /// <summary>Register a tunnel route by key with a custom callback (test-facing).</summary>
     internal void RegisterTunnelRoute(uint key, Action<byte[]> callback)
+        => RegisterTunnelRoute(WorldRegistration.DefaultWorldId, key, callback);
+
+    /// <summary>The same, in one World's ticket space.</summary>
+    internal void RegisterTunnelRoute(int worldId, uint key, Action<byte[]> callback)
     {
         lock (_reorderLock)
-            _tunnels[key] = new TunnelReorderBuffer { Deliver = callback };
+            _tunnels[(worldId, key)] = new TunnelReorderBuffer { Deliver = callback };
     }
 
     /// <summary>Remove a tunnel route by key (test-facing).</summary>
     internal void UnregisterTunnelRoute(uint key)
+        => UnregisterTunnelRoute(WorldRegistration.DefaultWorldId, key);
+
+    /// <summary>The same, in one World's ticket space.</summary>
+    internal void UnregisterTunnelRoute(int worldId, uint key)
     {
-        lock (_reorderLock) _tunnels.Remove(key);
+        lock (_reorderLock) _tunnels.Remove((worldId, key));
     }
 
     private GameSession? FindPlayer(ulong gameId)
@@ -173,19 +209,33 @@ public sealed class WorldBridge
     public DbProxyHandlers? DbProxy { get; set; }
 
     /// <summary>True once WorldServer has completed the startup handshake and can accept players.</summary>
-    public bool IsReady { get; private set; }
+    public bool IsReady => IsReadyFor(WorldRegistration.DefaultWorldId);
+
+    /// <summary>T108: the same, per World.</summary>
+    public bool IsReadyFor(int worldId) => _worlds.For(worldId).IsReady;
 
     /// <summary>gameId low part is a per-login counter that restarts at 1 with each World process
     /// (cap_newchar.log: fresh World, playerId 2 -> 0x80000AF00001; lobby_tap.log: ...0001 then ...0002).
     /// It is NOT derived from playerId. Reset when the World handshake completes.</summary>
-    private int _gameIdSeq;
-    public ulong AllocateGameId() => 0x80000AF00000UL | (ulong)(uint)Interlocked.Increment(ref _gameIdSeq);
+    public ulong AllocateGameId() => AllocateGameId(WorldRegistration.DefaultWorldId);
+
+    /// <summary>T108: each World process restarts its own counter, so each gets its own.</summary>
+    public ulong AllocateGameId(int worldId) => _worlds.For(worldId).AllocateGameId();
     public bool IsConnected { get { lock (_lock) return _links.Count > 0; } }
 
     public WorldBridge(WorldReplayTable replay, ILogger log)
     {
         _replay = replay;
         _log = log;
+        // T108: let the Cowork-owned routing in World/WorldInstances.cs see the per-World link
+        // sets. Until these are set every link reads as world 0, no World is live, and nothing
+        // can be routed - which is the single-World tree exactly as it was.
+        WorldRouting.WorldIdOfLink = l => l.WorldId;
+        WorldRouting.SendToWorld = (w, op, p) => SendFrame(w, op, p);
+        WorldRouting.HasLinks = HasLinks;
+        // T111: ServerConfig.xml's WorldServerList is the whole allocator - one continent, one
+        // World (MULTIWORLD-DESIGN.md section 7.1). A missing file seeds nothing.
+        WorldServerList.SeedDefault(DungeonRouting.Channels, log);
     }
 
     /// <summary>Reset every reorder buffer (World restarted).</summary>
@@ -204,10 +254,14 @@ public sealed class WorldBridge
 
     /// <summary>Reset ONE player's reorder buffer (their re-enter), leaving the others' queues alone.</summary>
     public void ResetTunnelSequence(uint tunnelKey)
+        => ResetTunnelSequence(WorldRegistration.DefaultWorldId, tunnelKey);
+
+    /// <summary>The same, in one World's ticket space.</summary>
+    public void ResetTunnelSequence(int worldId, uint tunnelKey)
     {
         lock (_reorderLock)
         {
-            if (!_tunnels.TryGetValue(tunnelKey, out var buf)) return;
+            if (!_tunnels.TryGetValue((worldId, tunnelKey), out var buf)) return;
             buf.Pending.Clear();
             buf.NextSeq = 0;
             buf.LastDelivery = DateTime.UtcNow;
@@ -221,6 +275,10 @@ public sealed class WorldBridge
     /// we don't recognise yet ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â the two-login capture will clarify).
     /// </summary>
     internal void RouteToClient(uint key, byte[] packet)
+        => RouteToClient(WorldRegistration.DefaultWorldId, key, packet);
+
+    /// <summary>The same, in one World's ticket space (T111).</summary>
+    internal void RouteToClient(int worldId, uint key, byte[] packet)
     {
         // Unknown ticket: with exactly one session registered, deliver to it (a frame World
         // sends before RegisterPlayer ran - the single-player behaviour that always worked);
@@ -231,19 +289,20 @@ public sealed class WorldBridge
         lock (_reorderLock)
         {
             count = _tunnels.Count;
-            if (_tunnels.TryGetValue(key, out var buf)) deliver = buf.Deliver;
+            if (_tunnels.TryGetValue((worldId, key), out var buf)) deliver = buf.Deliver;
             else if (count == 1) foreach (var b in _tunnels.Values) { deliver = b.Deliver; break; }
         }
         if (deliver != null) { deliver(packet); return; }
-        _log.LogDebug("Tunnel ticket {Key} unknown with {N} session(s) - dropped", key, count);
+        _log.LogDebug("Tunnel ticket {Key} on world {W} unknown with {N} session(s) - dropped",
+            key, worldId, count);
     }
 
-    private void RouteToClientLegacyBroadcast(uint key, byte[] packet)
+    private void RouteToClientLegacyBroadcast(int worldId, uint key, byte[] packet)
     {
         Action<byte[]>? deliver = null;
         lock (_reorderLock)
         {
-            if (_tunnels.TryGetValue(key, out var buf))
+            if (_tunnels.TryGetValue((worldId, key), out var buf))
                 deliver = buf.Deliver;
         }
         if (deliver != null)
@@ -282,12 +341,20 @@ public sealed class WorldBridge
             _log.LogInformation("WorldServer link #{Id} connected ({N} active)", link.Id, _links.Count);
             _ = link.RunAsync(ct).ContinueWith(_ =>
             {
-                int remaining;
-                lock (_lock) { _links.Remove(link); remaining = _links.Count; }
-                if (remaining == 0)
+                int remaining, mine;
+                lock (_lock)
                 {
-                    IsReady = false;
-                    _log.LogWarning("WorldServer fully disconnected - not ready");
+                    _links.Remove(link);
+                    remaining = _links.Count;
+                    mine = _links.Count(l => l.WorldId == link.WorldId);
+                }
+                if (mine == 0)
+                {
+                    // T108: only THIS World stops taking players, and its instances go with it.
+                    _worlds.For(link.WorldId).MarkDisconnected();
+                    DungeonRouting.Channels.ForgetWorld(link.WorldId);
+                    DungeonRouting.Transfers.ForgetWorld(link.WorldId);
+                    _log.LogWarning("World {W} fully disconnected - not ready", link.WorldId);
                 }
                 _log.LogInformation("WorldServer link #{Id} closed ({N} active)", link.Id, remaining);
             }, ct);
@@ -300,7 +367,7 @@ public sealed class WorldBridge
         while (!ct.IsCancellationRequested)
         {
             await Task.Delay(50, ct);
-            List<(uint key, byte[] pkt)>? flush = null;
+            List<((int World, uint Ticket) key, byte[] pkt)>? flush = null;
             lock (_reorderLock)
             {
                 foreach (var (key, buf) in _tunnels)
@@ -309,8 +376,8 @@ public sealed class WorldBridge
                         (DateTime.UtcNow - buf.LastDelivery).TotalMilliseconds > StallMs)
                     {
                         var first = buf.Pending.Keys.First();
-                        _log.LogWarning("Tunnel key={Key} seq stall: expected {Exp}, have {Have} - skipping",
-                            key, buf.NextSeq, first);
+                        _log.LogWarning("Tunnel world={W} key={Key} seq stall: expected {Exp}, "
+                            + "have {Have} - skipping", key.World, key.Ticket, buf.NextSeq, first);
                         buf.NextSeq = first;
                         flush ??= new();
                         flush.AddRange(DrainInOrder(key, buf));
@@ -318,13 +385,14 @@ public sealed class WorldBridge
                 }
             }
             if (flush != null)
-                foreach (var (k, p) in flush) RouteToClient(k, p);
+                foreach (var (k, p) in flush) RouteToClient(k.World, k.Ticket, p);
         }
     }
 
-    private static List<(uint key, byte[] pkt)> DrainInOrder(uint key, TunnelReorderBuffer buf)
+    private static List<((int World, uint Ticket) key, byte[] pkt)> DrainInOrder(
+        (int World, uint Ticket) key, TunnelReorderBuffer buf)
     {
-        var outp = new List<(uint, byte[])>();
+        var outp = new List<((int, uint), byte[])>();
         while (buf.Pending.TryGetValue(buf.NextSeq, out var pkt))
         {
             buf.Pending.Remove(buf.NextSeq);
@@ -339,6 +407,29 @@ public sealed class WorldBridge
     {
         switch (op)
         {
+            case WorldRegistration.SA_REGISTER:
+            {
+                // T103. Until now this fell through to the replay table, so every link on every
+                // World was handed world 0's CAPTURED answer - captured WorldId and BypassIndex
+                // included, which tells world 13 it is world 0.
+                var info = WorldRegistration.Parse(payload);
+                if (info == null)
+                {
+                    _log.LogWarning("SA_REGISTER on link #{Id}: {Len} B - PDL version mismatch",
+                        link.Id, payload.Length);
+                    return;
+                }
+                link.WorldId = info.Value.WorldId;
+                link.PlanetId = info.Value.PlanetId;
+                link.BypassIndex = info.Value.BypassIndex;
+                link.Registered = true;
+                link.SendFrame(WorldRegistration.AS_REGISTER, WorldRegistration.Reply(info.Value));
+                _log.LogInformation("Link #{Id} is world {W} bypass {B} of {N} (result {R})",
+                    link.Id, info.Value.WorldId, info.Value.BypassIndex,
+                    info.Value.TotalBypassCount, WorldRegistration.ResultFor(info.Value));
+                return;
+            }
+
             case OpHeartbeat6:
                 return;
 
@@ -365,7 +456,7 @@ public sealed class WorldBridge
                 }
                 bool solo = frame.Recipients.Count == 1;
                 foreach (var r in frame.Recipients)
-                    DeliverTunnelPacket(r.Ticket, r.Sequence,
+                    DeliverTunnelPacket(link.WorldId, r.Ticket, r.Sequence,
                         solo ? frame.ClientPacket : (byte[])frame.ClientPacket.Clone());
                 return;
             }
@@ -398,22 +489,36 @@ public sealed class WorldBridge
                         _log.LogInformation("A->W #{Id} 0x{Op:X4} len={Len}", link.Id, rop, rbody.Length + 6);
                     link.SendFrame(rop, rbody);
                 }
-                if (op == OpHandshakeDone && !IsReady)
+                // T108: MarkReady is the old `&& !IsReady` guard, per World - so OnWorldReady
+                // still fires once per World and not once per link, and world 13's handshake no
+                // longer zeroes world 0's game-id counter under live players.
+                if (op == OpHandshakeDone && _worlds.For(link.WorldId).MarkReady())
                 {
-                    IsReady = true;
-                    Interlocked.Exchange(ref _gameIdSeq, 0);
                     DbProxy?.OnWorldReady(link);   // real Arbiter: ~100 x 0x1581 dungeon-open pushes, 1 s after READY
-                    _log.LogInformation("WorldServer handshake complete - READY for players");
+                    _log.LogInformation("World {W} handshake complete - READY for players", link.WorldId);
                 }
                 return;
         }
     }
 
     public void SendFrame(ushort op, byte[] payload)
+        => SendFrame(WorldRegistration.DefaultWorldId, op, payload);
+
+    /// <summary>
+    /// T108. There is no worldId field on the wire - the destination World is chosen by which
+    /// socket the Arbiter writes to (MULTIWORLD-DESIGN.md section 2). With one World this picks
+    /// the same link the old `_links[0]` primary did.
+    /// </summary>
+    public void SendFrame(int worldId, ushort op, byte[] payload)
     {
         WorldLink? primary;
-        lock (_lock) primary = _links.Count > 0 ? _links[0] : null;
-        primary?.SendFrame(op, payload);
+        lock (_lock) primary = _links.FirstOrDefault(l => l.WorldId == worldId);
+        if (primary == null)
+        {
+            _log.LogWarning("0x{Op:X4}: world {W} has no links - frame dropped", op, worldId);
+            return;
+        }
+        primary.SendFrame(op, payload);
     }
 
     /// <summary>
@@ -421,31 +526,35 @@ public sealed class WorldBridge
     /// and drain in sequence order. An unknown Ticket goes through <see cref="RouteToClient"/>'s
     /// single-session fallback (or is dropped).
     /// </summary>
-    private void DeliverTunnelPacket(uint ticket, uint seq, byte[] clientPkt)
+    private void DeliverTunnelPacket(int worldId, uint ticket, uint seq, byte[] clientPkt)
     {
-        List<(uint k, byte[] p)>? deliver = null;
+        List<((int World, uint Ticket) k, byte[] p)>? deliver = null;
         lock (_reorderLock)
         {
             TunnelReorderBuffer? buf = null;
-            if (!_tunnels.TryGetValue(ticket, out buf) && _tunnels.Count == 1)
+            if (!_tunnels.TryGetValue((worldId, ticket), out buf) && _tunnels.Count == 1)
                 foreach (var b in _tunnels.Values) { buf = b; break; }
             if (buf != null)
             {
                 buf.Pending[seq] = clientPkt;
-                deliver = DrainInOrder(ticket, buf);
+                deliver = DrainInOrder((worldId, ticket), buf);
             }
         }
-        if (deliver != null) { foreach (var (k, p) in deliver) RouteToClient(k, p); return; }
-        RouteToClient(ticket, clientPkt);   // logs + drops with 2+ sessions
+        if (deliver != null) { foreach (var (k, p) in deliver) RouteToClient(k.World, k.Ticket, p); return; }
+        RouteToClient(worldId, ticket, clientPkt);   // logs + drops with 2+ sessions
     }
 
     public void TunnelFromClient(ulong gameId, byte[] clientPacket)
+        => TunnelFromClient(WorldRegistration.DefaultWorldId, gameId, clientPacket);
+
+    /// <summary>The same, to the World the session is in (T111).</summary>
+    public void TunnelFromClient(int worldId, ulong gameId, byte[] clientPacket)
     {
         // The real Arbiter refuses to tunnel a packet of 0x1F41+ bytes and kicks instead.
         if (!TunnelFrames.IsTunnellable(clientPacket)) return;
         ushort cop = clientPacket.Length >= 4 ? (ushort)(clientPacket[2] | (clientPacket[3] << 8)) : (ushort)0;
         _log.LogTrace("TUNNEL C->W client-op={Cop} len={Len}", cop, clientPacket.Length);
-        SendFrame(OpTunnelFromClient,
+        SendFrame(worldId, OpTunnelFromClient,
             TunnelFrames.BuildBypassToWorld(gameId, clientPacket, (ulong)Environment.TickCount64));
     }
 
@@ -456,10 +565,15 @@ public sealed class WorldBridge
     /// World replies by spawning the player (S_SPAWN_ME via tunnel).
     /// </summary>
     public void NotifyTopoLoaded(uint playerId)
+        => NotifyTopoLoaded(WorldRegistration.DefaultWorldId, playerId);
+
+    /// <summary>T112: to the World the player is in, not whichever one connected first.</summary>
+    public void NotifyTopoLoaded(int worldId, uint playerId)
     {
-        SendFrame(OpForceEnterDungeonId, new byte[] { 1,0,0,0, 0,0,0,0 });
-        SendFrame(OpLoadTopoFin, BitConverter.GetBytes(playerId));
-        _log.LogInformation("Sent AS_FORCE_ENTER_DUNGEON_ID + AS_LOAD_TOPO_FIN (0x138F) for player {Id}", playerId);
+        SendFrame(worldId, OpForceEnterDungeonId, new byte[] { 1,0,0,0, 0,0,0,0 });
+        SendFrame(worldId, OpLoadTopoFin, BitConverter.GetBytes(playerId));
+        _log.LogInformation("Sent AS_FORCE_ENTER_DUNGEON_ID + AS_LOAD_TOPO_FIN (0x138F) "
+            + "for player {Id} on world {W}", playerId, worldId);
     }
 
     /// <summary>
@@ -517,12 +631,20 @@ public sealed class WorldBridge
     /// finally SA_LEAVE_WORLD (0x1393).
     /// </summary>
     public void NotifyPlayerLeave(ulong gameId, uint playerId, LeaveMode mode)
+        => NotifyPlayerLeave(WorldRegistration.DefaultWorldId, gameId, playerId, mode);
+
+    /// <summary>
+    /// T112: to the World the player is in. Both frames address the user by id inside THAT
+    /// World - AS_LEAVE_WORLD on the wrong World is the "Critical Error LeaveWorld" crash the
+    /// LeaveValues comment above is about, with the user simply not there.
+    /// </summary>
+    public void NotifyPlayerLeave(int worldId, ulong gameId, uint playerId, LeaveMode mode)
     {
-        SendFrame(OpCancelSkillStrictly, BitConverter.GetBytes(playerId));
-        SendFrame(OpLeaveWorld, BuildLeaveWorldPayload(gameId, playerId, mode));
+        SendFrame(worldId, OpCancelSkillStrictly, BitConverter.GetBytes(playerId));
+        SendFrame(worldId, OpLeaveWorld, BuildLeaveWorldPayload(gameId, playerId, mode));
         var (type, reason) = LeaveValues(mode);
-        _log.LogInformation("Sent AS_CANCEL_SKILL_STRICTLY (0x1460) + AS_LEAVE_WORLD (0x1392) gameId={G:X} type={T} reason={R}",
-            gameId, type, reason);
+        _log.LogInformation("Sent AS_CANCEL_SKILL_STRICTLY (0x1460) + AS_LEAVE_WORLD (0x1392) "
+            + "on world {W} gameId={G:X} type={T} reason={R}", worldId, gameId, type, reason);
     }
 
     /// <summary>AS_ARBITER_USER_DELETE (0x1433) payload: [u64 gameId][u64 gameId] (FUN_140832f20).</summary>
@@ -572,6 +694,21 @@ public sealed class WorldBridge
 public sealed class WorldLink
 {
     public int Id { get; }
+
+    // --- T103: the link's identity, from its own SA_REGISTER. A link that has not registered
+    // reads as world 0, which is what every single-World deployment is. ---
+
+    /// <summary>SA_REGISTER payload +5.</summary>
+    public int WorldId { get; internal set; } = WorldRegistration.DefaultWorldId;
+
+    /// <summary>SA_REGISTER payload +1. Low 32 bits of every PDId the Arbiter builds.</summary>
+    public int PlanetId { get; internal set; }
+
+    /// <summary>SA_REGISTER payload +13. -1 on the control link, 0..N-1 on the bypass links.</summary>
+    public int BypassIndex { get; internal set; } = WorldRegistration.ControlBypassIndex;
+
+    /// <summary>Whether this link has sent its SA_REGISTER yet.</summary>
+    public bool Registered { get; internal set; }
     private readonly Socket _sock;
     private readonly WorldBridge _bridge;
     private readonly ILogger _log;

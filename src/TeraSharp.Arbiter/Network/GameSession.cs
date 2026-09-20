@@ -26,6 +26,14 @@ public sealed class GameSession : IDisposable
     /// sent to World in AS_ENTER_WORLD [80..83] and echoed in 0x13F7 headers.</summary>
     public uint TunnelKey { get; set; }
 
+    /// <summary>
+    /// T111. Which World this session is in. The Ticket above indexes THAT World's bypass slots
+    /// and the bridge's tunnel map is keyed (WorldId, Ticket), so the two travel together.
+    /// WorldEntry sets it before allocating the Ticket; it stays
+    /// <see cref="WorldRegistration.DefaultWorldId"/> on a single-World server.
+    /// </summary>
+    public int CurrentWorldId { get; set; } = WorldRegistration.DefaultWorldId;
+
     /// <summary>True once the player has been handed to WorldServer; traffic tunnels through it.</summary>
     public bool InWorld { get; private set; }
 
@@ -90,7 +98,7 @@ public sealed class GameSession : IDisposable
         var w = Program.World;
         if (w == null || !InWorld) { FinishLeaveToClient(); return; }
 
-        w.NotifyPlayerLeave(GameId, PlayerId, PendingLeaveMode);
+        w.NotifyPlayerLeave(CurrentWorldId, GameId, PlayerId, PendingLeaveMode);
 
         // Safety net: if World never sends SA_LEAVE_WORLD, release the client anyway.
         _leaveFallback = new CancellationTokenSource();
@@ -119,10 +127,11 @@ public sealed class GameSession : IDisposable
             // the delete so World releases the character. Harmless if World already deleted it.
             if (!worldConfirmed)
             {
-                w.SendFrame(WorldBridge.OpArbiterUserDelete, WorldBridge.BuildArbiterUserDeletePayload(GameId));
+                w.SendFrame(CurrentWorldId, WorldBridge.OpArbiterUserDelete,
+                    WorldBridge.BuildArbiterUserDeletePayload(GameId));
                 _log.LogWarning("Session {Id}: forcing AS_ARBITER_USER_DELETE (World never sent SA_LEAVE_WORLD)", Id);
             }
-            w.UnregisterPlayer(GameId, TunnelKey);
+            w.UnregisterPlayer(GameId, CurrentWorldId, TunnelKey);
         }
         Handlers.SocialHandlers.UnregisterChat(this);   // T47: leave private channels, go offline for whisper
         InWorld = false;
@@ -161,8 +170,8 @@ public sealed class GameSession : IDisposable
         var w = Program.World;
         if (w != null)
         {
-            w.UnregisterPlayer(GameId, TunnelKey);
-            w.NotifyPlayerLeave(GameId, PlayerId, LeaveMode.Disconnect);
+            w.UnregisterPlayer(GameId, CurrentWorldId, TunnelKey);
+            w.NotifyPlayerLeave(CurrentWorldId, GameId, PlayerId, LeaveMode.Disconnect);
         }
         Handlers.SocialHandlers.UnregisterChat(this);   // T47
     }
@@ -170,7 +179,7 @@ public sealed class GameSession : IDisposable
     public void ForwardToWorld(byte[] packet)
     {
         var w = Program.World;
-        if (w != null && InWorld) w.TunnelFromClient(GameId, packet);
+        if (w != null && InWorld) w.TunnelFromClient(CurrentWorldId, GameId, packet);
     }
 
     // ---- Lifecycle ----

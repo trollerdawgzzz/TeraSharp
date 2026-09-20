@@ -38,20 +38,27 @@ public static class WorldEntry
                 ["content"] = contents[i], ["disabled"] = disabled[i],
             });
 
-        // 2. Allocate a unique tunnel key for this session; World echoes it in
-        //    0x13F7 headers so we can route packets to the right client.
-        s.TunnelKey = w.AllocateTunnelKey();
+        // 2. Build AS_ENTER_WORLD with no Ticket yet, and read the destination World out of it.
+        //    T111: the Ticket indexes THAT World's bypass slots and the tunnel map is keyed
+        //    (WorldId, Ticket), so the World has to be settled first. WorldForEnterWorld reads
+        //    the continent at payload 48 and the instance at 52, checks the configured owner
+        //    (ServerConfig.xml, MULTIWORLD-DESIGN.md section 7.1) and only routes there if that
+        //    World is actually connected - so on a single-World server this is always world 0.
+        var record = Program.Store?.GetCharacter((int)chr.Id);
+        var enterPayload = BuildEnterWorldPayload(s.GameId, chr, record?.WorldBlob, tunnelKey: 0,
+            GmCommandHandlers.LevelOf(s, Program.Store));
+        s.CurrentWorldId = DungeonRouting.WorldForEnterWorld(enterPayload);
+        s.TunnelKey = w.AllocateTunnelKey(s.CurrentWorldId);
+        DungeonRouting.StampTicket(enterPayload, s.TunnelKey);
 
         // 3. Switch to tunnel mode BEFORE telling World, so nothing is missed.
-        //    RegisterPlayer (inside EnterWorld) creates a fresh reorder buffer.
+        //    RegisterPlayer (inside EnterWorld) creates a fresh reorder buffer, keyed with
+        //    CurrentWorldId - which is why step 2 runs first.
         s.EnterWorld();
         SocialHandlers.RegisterChat(s);   // T47: whisper/private channels need the live roster
 
         // 4. Tell World about the player â€” built from character data, not replayed.
-        var record = Program.Store?.GetCharacter((int)chr.Id);
-        var enterPayload = BuildEnterWorldPayload(s.GameId, chr, record?.WorldBlob, s.TunnelKey,
-            GmCommandHandlers.LevelOf(s, Program.Store));
-        w.SendFrame(WorldBridge.OpPlayerEnter, enterPayload);
+        w.SendFrame(s.CurrentWorldId, WorldBridge.OpPlayerEnter, enterPayload);
 
         // 5. Send character data (world blob) to World.
         // (removed) A pre-emptive 0x2738 with playerId in the DLM-id slot completed the WRONG DLM item on a
@@ -278,7 +285,7 @@ public static class WorldEntry
         log.LogWarning("EnterWorld retry for '{Name}': continent {C} refused, falling back to "
             + "zone {Z} ({X:F0}, {Y:F0}, {Zz:F0})", chr.Name, f.ContinuousDungeonId,
             back.Zone, back.X, back.Y, back.Z);
-        w.SendFrame(WorldBridge.OpPlayerEnter, retry);
+        w.SendFrame(s.CurrentWorldId, WorldBridge.OpPlayerEnter, retry);
     }
 
     /// <summary>
