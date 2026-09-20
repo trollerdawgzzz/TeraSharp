@@ -82,7 +82,7 @@ public static class HandlerRegistry
                 if (GmCommandHandlers.LevelOf(s, Program.Store) >= 1)   // T107: the real server sends these only to GMs
                 {
                     s.Send(ArbiterClientHandlers.BuildAdminHoldCharacter());       // T89: frame 402
-                    s.Send(ArbiterClientHandlers.BuildAdminGmSkill(0, on: true));  // T89: frame 99
+                    // S_ADMIN_GM_SKILL moved to the S_LOGIN burst (T120: frame 99, before S_LOAD_TOPO - the Alt+A gate)
                 }
                 s.Send(ArbiterClientHandlers.BuildPvpLeaderBoardInfo());       // T91: frame 288
                 s.Send(ArbiterClientHandlers.BuildPveLeaderBoardInfo());       // T91: frame 289

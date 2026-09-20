@@ -141,7 +141,7 @@ public sealed class LoginHandlers
     private static void SendContentFlags(GameSession s)
     {
         int[] contents = { 2, 3, 4, 8, 9, 22, 23, 20, 21, 34 };
-        bool[] disabled = { false, false, false, false, true, false, false, false, false, false };   // EXPERIMENT: id 8 enabled (was disabled) - looking for the mode-select gate
+        bool[] disabled = { false, false, false, true, true, false, false, false, false, false };   // as captured (flag-8 experiment had no effect on the mode screen)
         for (int i = 0; i < contents.Length; i++)
             s.SendByDef("S_UPDATE_CONTENTS_ON_OFF", new Dictionary<string, object>
             {
@@ -230,6 +230,7 @@ public sealed class LoginHandlers
         s.SendByDef("S_MOVE_DISTANCE_DELTA", new Dictionary<string, object>());
         s.SendByDef("S_MY_DESCRIPTION", new Dictionary<string, object>());
         s.SendByDef("S_FESTIVAL_LIST", new Dictionary<string, object>());
+        ArbiterClientHandlers.SendAdminGmSkillIfOperator(s, GmCommandHandlers.LevelOf(s, Program.Store));   // T120: frame 99 - the Alt+A gate, before S_LOAD_TOPO
 
         s.SendByDef("S_LOAD_TOPO", new Dictionary<string, object>
         {
