@@ -51,7 +51,7 @@ public static class ArbiterClientHandlers
     public const ushort C_PARTY_MATCH_WINDOW_CLOSED = 0xFA6D;       // 64109
     public const ushort C_REQUEST_GUILD_INFO = 0x5B51;     // 23377
     public const ushort C_REQUEST_GUILD_LIST = 0x866B;     // 34411
-    public const ushort C_DUNGEON_COOL_TIME_LIST = 0xD3F7; // 54263
+    // C_DUNGEON_COOL_TIME_LIST (0xD3F7 / 54263) is declared in the T134 dungeon-window section below
     public const ushort C_VIEW_BATTLE_FIELD_RESULT = 0xEC3D;        // 60477
     public const ushort C_REQUEST_CANDIDATE_LIST = 0x81D7; // 33239
     public const ushort C_SHOW_AWESOMIUMWEB_SHOP = 0xCF8F; // 53135
