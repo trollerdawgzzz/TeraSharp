@@ -2222,6 +2222,72 @@ public static class ArbiterClientHandlers
         return sb.ToString();
     }
 
+    /// <summary>
+    /// The 14 dungeon ids every captured S_DUNGEON_CLEAR_COUNT_LIST answers with, in capture
+    /// order (classic_live2 records 13158, 13164, 15365, 15847, ...). The roster is the same for
+    /// every character - a character with 10 clears of 9830 and 34 of 9739 still gets all
+    /// fourteen rows, the other twelve at 0 - so it is client-side content, not a row set, and it
+    /// lives here beside the builder rather than in the store.
+    /// </summary>
+    public static readonly int[] DungeonClearCountRoster =
+    {
+        9068, 9056, 9168, 9156, 9507, 9043, 9768, 9756, 9868, 9856, 9830, 9810, 9739, 9075,
+    };
+
+    /// <summary>
+    /// C_DUNGEON_CLEAR_COUNT_LIST (0x5C98) -> S_DUNGEON_CLEAR_COUNT_LIST (0x9D66). T134b.
+    ///
+    /// <para>The request names a CHARACTER, not the sender: classic_live2 record 13156 asks for
+    /// "cat" (the player's own) and record 19419 asks for a party member, which is why the reply
+    /// carries a pid at all. An empty or unknown name falls back to the session's own character
+    /// rather than answering about nobody - the window is never useful empty, and a name that
+    /// does not resolve should show your own counts, not a silent failure.</para>
+    ///
+    /// <para><c>pid</c> is the character db id: <c>LoginHandlers</c> sets
+    /// <c>s.PlayerId = chr.Id</c> on select, so the same value works for the session's own
+    /// character and for anyone else's row.</para>
+    ///
+    /// <para>The merge is the whole job: every id in <see cref="DungeonClearCountRoster"/> gets a
+    /// row, <c>clears</c> from <c>dungeon_cooldowns.clear_count</c> or 0, and
+    /// <c>rookie = clears == 0</c> - exactly what the capture shows, rookie set on the twelve at
+    /// zero and clear on 9830 and 9739.</para>
+    /// </summary>
+    public static bool OnDungeonClearCountList(GameSession s, ReadOnlyMemory<byte> body)
+    {
+        var store = Program.Store;
+        string name = ReadDungeonClearCountName(body.ToArray());
+
+        var self = s.SelectedCharacter;
+        int ownerId = self != null ? (int)self.Id : (int)s.PlayerId;
+        uint pid = s.PlayerId;
+        if (store != null && name.Length > 0)
+        {
+            var who = store.GetCharacterByName(name);
+            if (who != null) { ownerId = who.Id; pid = (uint)who.Id; }
+        }
+
+        var counts = store?.GetDungeonClearCounts(ownerId);
+        var rows = new DungeonClears[DungeonClearCountRoster.Length];
+        for (int i = 0; i < rows.Length; i++)
+        {
+            int id = DungeonClearCountRoster[i];
+            int clears = 0;
+            if (counts != null)
+            {
+                for (int k = 0; k < counts.Count; k++)
+                {
+                    if (counts[k].DungeonId != id) continue;
+                    clears = counts[k].Clears;
+                    break;
+                }
+            }
+            rows[i] = new DungeonClears(id, clears, clears == 0);
+        }
+
+        s.Send(BuildDungeonClearCountList(pid, rows));
+        return true;
+    }
+
     /// <summary>S_VERSION_INFO (0xB767). T131. Opcode only - the frame is built below.</summary>
     public const ushort S_VERSION_INFO = 0xB767;
 

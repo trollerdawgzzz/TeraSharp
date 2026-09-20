@@ -393,7 +393,26 @@ below are directly comparable to ours.
 | `S_INSTANCE_ARROW` | `0xC644` | 961 | 48/64/80/96/112 B bodies - two arrays, the second carrying `vec3` waypoints. Pure world content |
 | `S_AVAILABLE_EVENT_MATCHING_LIST` | `0x810D` | 3 | 1882 B, all three the same size. `.2.def` decodes it: 12 `uint32`, 3 bytes, 2 `uint32`, `vanguardCredits`, 3 bytes, 4 limit ints, level, then a `quests` array whose elements nest four more arrays |
 
-### Not implemented, and why
+### CORRECTION: classic_live2's matchmaking frames are the MEMBER side
+
+The capture is from a PARTY MEMBER. The LEADER queued both the battleground and the dungeon, so
+every matchmaking frame above is a push the member received - `S_ADD_INTER_PARTY_MATCH_POOL` and
+`S_MATCH_PROGRESS` included. The leader's `C_` request and the pool-add as it looked on HIS session
+were never on this wire.
+
+That changes what the table above is evidence for. It pins the REPLY half of the contract - what a
+party member is told while the leader queues - and pins nothing about the request half. In
+particular it explains why `S_ADD_INTER_PARTY_MATCH_POOL` carries the member's own pid (24468, the
+same pid `S_DUNGEON_CLEAR_COUNT_LIST` answers with): it is describing the pool to him, not echoing
+his request.
+
+**Still needed: a LEADER-SIDE capture** - you queue, from your own client - for
+`C_ADD_INTER_PARTY_MATCH_POOL`, `C_DEL_INTER_PARTY_MATCH_POOL` and whatever the leader's own
+`S_ADD_INTER_PARTY_MATCH_POOL` looks like. Until that exists, do not infer the request layout from
+the frames above, and treat the `.1.def` mismatch noted below as unresolved rather than as evidence
+about this build.
+
+### Not implemented, and why
 
 `S_FIN_INTER_PARTY_MATCH` and the instance hand-off need a real match server: the Arbiter does not
 decide when a pool fills, and `zone` in FIN is the instance the client is then told to load. Same
@@ -449,3 +468,23 @@ needs the DateTime -> `cooldown` seconds rule and the daily-reset boundary, neit
 capture pins. Until then `BuildDungeonCoolTimeList()` is called with no entries, which is what the
 live server sent in all nine samples - correct for an account with nothing locked, and honest about
 the rest.
+
+### T134b - the clear-count reply is wired
+
+`ArbiterClientHandlers.OnDungeonClearCountList(GameSession, ReadOnlyMemory<byte>)` now does the
+whole job: read the name, resolve the character (falling back to the session's own on an empty or
+unknown name), merge `DungeonClearCountRoster` with `CharacterStore.GetDungeonClearCounts`, and
+send. `pid` is the character db id - `LoginHandlers` sets `s.PlayerId = chr.Id` on select, so one
+value serves both the session's own character and anyone else's row.
+
+The roster lives in `ArbiterClientHandlers.DungeonClearCountRoster` because it is the same fourteen
+ids for every character in every captured reply - client content, not a row set.
+
+**STILL NOT APPLIED - `Handlers/HandlerRegistry.cs` is human-owned.** One line, beside the
+cool-time line already there at :285:
+
+```
+        Reg("C_DUNGEON_CLEAR_COUNT_LIST", 0, (s, b) => ArbiterClientHandlers.OnDungeonClearCountList(s, b));
+```
+
+The cool-time half was applied by hand at :285 and needs nothing further.
