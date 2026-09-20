@@ -11852,6 +11852,37 @@ bool   isGuildWarAcceptable
         }
     }
 
+    /// <summary>
+    /// T120 - Alt+A. The whole diff of cap_ts_gm_client.log against cap_final_gm_client2.log,
+    /// C_SELECT_USER to the first C_ADMIN_*, comes down to one packet's position.
+    /// </summary>
+    [Test] public static void T120_admin_gm_skill_rides_the_enter_world_burst()
+    {
+        // The three things that are NOT the difference - byte-identical in both sessions.
+        Hex.Eq(ArbiterClientHandlers.BuildAdminToolUrl(), "0C 00 CE F2 08 00 0A 00 00 00 00 00",
+            "cap_final_gm_client2 frame 412 AND cap_ts_gm_client frame 1078 - the real Arbiter "
+            + "answers with an empty Title and an empty Url too, so T107's reply was never the gate");
+        Hex.Eq(ArbiterClientHandlers.BuildAdminGmSkill(0, on: true), "09 00 BE 64 00 00 00 00 01",
+            "frame 99 in the real capture, 975 in ours - same nine bytes");
+        Hex.Eq(ArbiterClientHandlers.BuildAdminHoldCharacter(), "05 00 0E A3 00",
+            "frame 402 in the real capture, 974 in ours - same five bytes");
+
+        // The difference: the slot. Real 98 S_FESTIVAL_LIST -> 99 S_ADMIN_GM_SKILL ->
+        // 100 S_LOAD_TOPO; ours went 773 S_FESTIVAL_LIST -> 774 S_LOAD_TOPO and only reached
+        // S_ADMIN_GM_SKILL at 975, after C_LOAD_TOPO_FIN (970).
+        Hex.True(ArbiterClientHandlers.AdminGmSkillFollows == "S_FESTIVAL_LIST"
+                 && ArbiterClientHandlers.AdminGmSkillPrecedes == "S_LOAD_TOPO",
+            "inside the S_LOGIN burst, not on C_LOAD_TOPO_FIN - the client has already built "
+            + "the in-game UI by the time the topo-fin burst arrives");
+
+        // And it stays gated: no capture of a non-GM carries one (cap_final_client,
+        // _client2 and _gm_client - the last of which is status 31 - have zero).
+        Hex.True(!ArbiterClientHandlers.OperatorGetsGmSkillPush(0)
+                 && ArbiterClientHandlers.OperatorGetsGmSkillPush(1)
+                 && ArbiterClientHandlers.OperatorGetsGmSkillPush(GmAccounts.GmAdminLevel),
+            "level 1 is the gate everywhere in the binary, and 5 is what set_go on writes");
+    }
+
     // ---- The rules ----
 
     [Test] public static void T30_system_message_format_matches_the_capture()

@@ -381,3 +381,58 @@ pass a URL and it goes in the first slot.
 * Ordering: the real server pushes `S_ADMIN_GM_SKILL` at frame 99, *before* `S_LOAD_TOPO` (100) and
   170 frames before `C_LOAD_TOPO_FIN` (271); TeraSharp pushes it after. No capture proves that
   matters, and the URL reply is sufficient on its own, so this is left alone.
+
+---
+
+## T120 - and it was the ordering after all
+
+`cap_ts_gm_client.log` is the experiment T107 did not have: a TeraSharp session with status 33, a
+byte-identical `S_RESPONSE_SERVER_ADMINTOOL_AWESOMIUM_URL`, and **the panel still shut**. T107's
+last note above - "the URL reply is sufficient on its own, so this is left alone" - is wrong, and
+this is the capture that shows it.
+
+**The diff.** `cap_ts_gm_client.log` against `cap_final_gm_client2.log`, C_SELECT_USER to the
+first `C_ADMIN_*`, as an ordered sequence of S->C names. Everything is equal except world content
+the two sessions could not share (different characters, different zone). The one Arbiter-owned
+difference:
+
+| | real (gm_client2) | TeraSharp (cap_ts_gm_client) |
+|---|---|---|
+| `C_SELECT_USER` | 36 | 731 |
+| `S_LOGIN` | 50 | 750 |
+| `S_USER_ITEM_EQUIP_CHANGER` | 97 | 772 |
+| `S_FESTIVAL_LIST` | 98 | 773 |
+| **`S_ADMIN_GM_SKILL`** | **99** | **975** |
+| `S_LOAD_TOPO` | 100 | 774 |
+| `C_LOAD_TOPO_FIN` | 271 | 970 |
+| `S_SPAWN_ME` | 296 | 986 |
+| `S_ADMIN_HOLD_CHARACTER` | 402 | 974 |
+
+The real Arbiter sends `S_ADMIN_GM_SKILL` **inside the `S_LOGIN` burst, in the slot between
+`S_FESTIVAL_LIST` and `S_LOAD_TOPO`**, and does it again on the next topo load (546 -> 549).
+TeraSharp sends it on `C_LOAD_TOPO_FIN` - 201 frames later and on the far side of the topo
+transition, after the client has built the in-game UI.
+
+**The three things that are NOT the difference**, all checked byte for byte:
+
+* `S_LOGIN_ARBITER.status` - `01 00 21 00 ...` (33) at frame 7 in both. T89b's fix holds.
+* `S_RESPONSE_SERVER_ADMINTOOL_AWESOMIUM_URL` - `08 00 0A 00 00 00 00 00` in both. **The real
+  Arbiter answers with an empty Title and an empty Url as well.** Its PDL dumper
+  (`Arb_part_022.c:13286`, guard `7 < len`) names the two `u16` refs *Title* and *Url*, and the
+  offsets 8 and 10 point at two bare terminators. There is no
+  `Handler_C_REQUEST_SERVER_ADMINTOOL_AWESOMIUM_URL` in any of the 96 decompile parts, so on a
+  real stack this reply comes from **World**, not the Arbiter - T107's local answer is harmless
+  but was never load-bearing.
+* `S_ADMIN_HOLD_CHARACTER` - `05 00 0E A3 00` in both, and the real one arrives ~106 frames
+  *after* `S_SPAWN_ME` (402, 675, 914). It is not part of the enter-world burst at all.
+
+**The control.** `cap_final_gm_client` is the fourth capture and the one nobody used: a GM account
+that pressed Alt+A (frame 323), got the same empty reply (438) - and got **no panel**. Its
+`S_LOGIN_ARBITER.status` is `0x1F` = 31, and it carries **zero** `S_ADMIN_GM_SKILL`. So across
+four real captures, the panel opened in exactly the session that received `S_ADMIN_GM_SKILL`
+before `S_LOAD_TOPO`, and in no other.
+
+**The fix.** `ArbiterClientHandlers.SendAdminGmSkillIfOperator(s, level)` (T120) plus the two
+constants `AdminGmSkillFollows` / `AdminGmSkillPrecedes` that name the slot. Two human-owned
+one-liners put it there - see the T120 report. T107's `LevelOf(s, store) >= 1` gate moves with it,
+so the "not fixed here" note above is now closed on both counts.
