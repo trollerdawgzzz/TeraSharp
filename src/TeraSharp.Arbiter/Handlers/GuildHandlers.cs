@@ -178,6 +178,13 @@ public sealed class GuildHandlers
         GuildPackets.C_CHANGE_GUILDNAME => true,
         C_REQUEST_UPDATE_ANNOUNCE => true,
         C_REQUEST_UPDATE_INTRODUCE => true,
+        // T135, the guild-quest board. This predicate - not the dispatch switch - is the
+        // declared set: GuildWiring registers from ClientOpcodes and T51 compares the two, so
+        // a case without an entry here reads as "registered but unanswered" and every one of
+        // those three would have come back to the player as a rejection.
+        GuildPackets.C_REQUEST_START_GUILD_QUEST => true,
+        GuildPackets.C_REQUEST_FINISH_GUILD_QUEST => true,
+        GuildPackets.C_REQUEST_CANCEL_GUILD_QUEST => true,
         _ => false,
     };
 
