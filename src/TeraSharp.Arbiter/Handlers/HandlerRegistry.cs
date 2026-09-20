@@ -270,7 +270,7 @@ public static class HandlerRegistry
         GmAdminTool.OnlineSessions = () => Program.World?.InWorldSessions() ?? new List<GameSession>();
         foreach (var name in new[]
         {
-            "C_DUNGEON_COOL_TIME_LIST", "C_VIEW_BATTLE_FIELD_RESULT",
+            "C_VIEW_BATTLE_FIELD_RESULT",
             "C_REQUEST_CANDIDATE_LIST", "C_SHOW_AWESOMIUMWEB_SHOP", "C_RESET_ALL_DUNGEON",
             "C_UPDATE_CONTENTS_PLAYTIME", "C_EVENT_GUIDE",
             // T97: real handlers that parse nothing / store nothing / reply nothing
@@ -281,6 +281,8 @@ public static class HandlerRegistry
         })
             Reg(name, 0, (s, b) => ArbiterClientHandlers.OnAcceptSilently(s, b, misc));
 
+        // T134: dungeon cool-time window (all 9 live replies are empty). Clear-count needs the 14-id roster merge - T134b.
+        Reg("C_DUNGEON_COOL_TIME_LIST", 0, (s, body) => { s.Send(ArbiterClientHandlers.BuildDungeonCoolTimeList()); return true; });
         // --- T97: party extras, event/VIP windows, reports, profile ---
         Reg("C_REQUEST_PARTY_NAME",                     MiscClientPackets.RequestPartyNameBodySize,      (s,b) => MiscClientPackets.OnRequestPartyName(s,b,misc));
         Reg("C_VIEW_PARTY_INVITE",                      0,                                              (s,b) => MiscClientPackets.OnViewPartyInvite(s,b,misc));
