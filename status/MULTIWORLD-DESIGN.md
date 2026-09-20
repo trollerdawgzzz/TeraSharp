@@ -594,3 +594,100 @@ layout with 90 and 160 quest ids - the full vanguard roster. The builder handles
 (read the ids, look up the party, send the pair of frames) are the obvious next slice, and they
 are small now that every frame is pinned. Wiring `C_MATCH_ADD` before the hand-off exists is the
 one that should wait; `C_MATCH_PROGRESS` and `C_MATCH_ROOM_LIST` are read-only and safe.
+
+## T137 - the hand-off capture does NOT contain a cross-server hand-off
+
+`D:\packetlogs\cap_multiworld.log` (tap, 1207 reframed frames) plus `cap_multiworld_client.log`
+(14349 client records). The brief's premise was that a player entered a dungeon instance on a
+SECOND linked World and was handed over. **The capture does not show that.** Everything below is
+measured, and it changes what parts 2 and 3 of T137 can honestly be.
+
+### The links
+
+| link | frames | window | what it is |
+|---|---|---|---|
+| **#1** | 1087 | 15:52:00 - 16:17:01 | the main World. All gameplay, and **all ten hand-off frames**. |
+| **#3** | 117 | 15:56:13 - 16:17:01 | the second server. Gets the full link-up burst (`0x27CF` -> `0x27ED`/`0x27D0`/`0x27D1`/`0x27D2`/`0x27D3`, `0x1592`/`0x1595`, `0x1582`) that #1 got at 15:52:00, then only broadcasts: `0x1581` x34, `0x1453` x8, `0x15FF`/`0x1600` x7. |
+| #2, #4, #6 | 1 each | - | `0x164C` twice, `0x27CF` once. Stubs of aborted connections. |
+
+**Link #3 never receives a single per-player frame.** The DungeonServer is linked and idle for the
+whole capture. Not one of `0x13BE`, `0x13BF`, `0x13C0`, `0x13C1`, `0x13C5`, `0x13C6`, `0x1460` went
+to it.
+
+### What actually happened, byte-exact
+
+All frames below are link **#1**, main World.
+
+| time | dir | op | body (first 32 B) |
+|---|---|---|---|
+| 16:10:40.824 | A->W#1 | `0x1460` | `01 00 00 00` |
+| 16:15:12.446 | W->A#1 | `0x13BE` (215 B) | `20 00 AC CC 7A 02 00 00 63 26 00 00 01 00 00 00 ...` |
+| 16:15:12.446 | A->W#1 | `0x13BF` (215 B) | `F0 0A 00 00 01 00 00 00 63 26 00 00 01 00 00 00 ...` |
+| 16:15:12.446 | W->A#1 | `0x13C5` (38 B) | `63 26 00 00 08 00 F0 0A 00 00 00 00 ...` |
+| 16:15:12.446 | W->A#1 | `0x13C0` (214 B) | same prefix as `0x13BF` |
+| 16:15:12.448 | A->W#1 | `0x13C1` (214 B) | same prefix as `0x13BF` |
+| 16:16:36.012 | W->A#1 | `0x13C6` (14 B) | `63 26 00 00 08 00 F0 0A` |
+| 16:16:55.368 | W->A#1 | `0x13BE` | as above |
+| 16:16:55.369 | A->W#1 | `0x13BF` | as above |
+| 16:16:55.369 | W->A#1 | `0x13C5` | `63 26 00 00 09 00 F0 0A 00 00 00 00 00 00 00 00 00 00 00 6A ...` |
+| 16:16:55.369 | W->A#1 | `0x13C0` | as above |
+| 16:16:55.369 | A->W#1 | `0x13C1` | as above |
+
+Decoded:
+
+* `0x13C5` **SA_ADD_DUNGEON_CHANNEL** = `i32 dungeonId / u16 channel / u16 planetId` + 24 B tail.
+  `63 26 00 00` = **9827**, the dungeon. Channel **8** the first time, **9** the second.
+  `F0 0A` = 2800, the planet.
+* `0x13C6` is its counterpart, **REMOVE**: the same `dungeonId / channel / planetId` and nothing
+  else - 8 B of body. Channel 8 is added at 16:15:12 and removed at 16:16:36, then 9 is added.
+* `0x13BE` -> `0x13BF` and `0x13C0` -> `0x13C1` are two request/reply PAIRS, both on link #1, both
+  carrying the same `63 26 00 00` dungeon and `F0 0A 00 00` planet. `0x13BF` and `0x13C1` are the
+  Arbiter's replies and go back **to the same link the request came from**.
+* `0x1460` fires once, 4.5 minutes before any dungeon, body `01 00 00 00`. It is not part of the
+  per-entry sequence.
+
+### What the client saw - and this is the proof
+
+The client stayed on ONE connection the whole time. It entered the dungeon three times:
+
+```
+[10471] S_LOAD_TOPO       zone 63 26 00 00 = 9827   coords 00 B8 3D C6 / 00 1C D9 C6 / 00 48 89 C5
+[10481] C_LOAD_TOPO_FIN
+[10486] S_CURRENT_CHANNEL 63 26 00 00 | 09 00 F0 0A | 00 00 00 00 | 01 00 00 00
+...     back to zone 05 00 00 00, channel 01 00 00 00
+[12218] S_CURRENT_CHANNEL 63 26 00 00 | 0A 00 F0 0A | ...      channel 10
+[14217] S_CURRENT_CHANNEL 63 26 00 00 | 0B 00 F0 0A | ...      channel 11
+```
+
+`S_CURRENT_CHANNEL`'s second int32 is a COMPOSITE: low u16 = channel, high u16 = planet id.
+Overworld frames carry a plain `01 00 00 00` there; dungeon frames carry `09 00 F0 0A`,
+`0A 00 F0 0A`, `0B 00 F0 0A`. That is the only packet that tells the client which dungeon channel
+it is in, and an ordinary `S_LOAD_TOPO` is what moves it.
+
+**There is no second S_LOAD_TOPO to another address, no reconnect, and no S_SELECT_USER in the
+middle.** Entering a dungeon on this stack is a zone change inside the main World, plus a channel
+number. The World creates the channel and TELLS the Arbiter about it (`0x13C5`); the Arbiter does
+not route the player anywhere.
+
+### Consequences for parts 2 and 3 of T137 - NOT DONE, on purpose
+
+* **`status/MULTIWORLD-PATCH.diff` cannot be corrected against this capture.** The patch predicts a
+  cross-link hand-off; the capture contains none, so there is nothing here to check its bytes
+  against. Correcting it from this evidence would mean inventing the disagreement. The patch is
+  left exactly as it is.
+* **`WorldBridge` / `WorldEntry` / `GameSession` / `HandlerRegistry` are unchanged.** There is no
+  corrected patch to apply, and those four are human-owned in any case.
+* **`MatchWiring.OnMatchAdd` still refuses and still never emits FIN.** T136b's guard was that FIN
+  must not fire until the instance hand-off exists. This capture does not supply it - it shows
+  something simpler and different - so the guard stands unchanged.
+
+### What a real cross-server capture would need
+
+The DungeonServer has to actually host something. In this session it linked at 15:56:13 and then
+sat idle, so either the box routes all instances to the main World by configuration, or the
+dungeon the player picked (9827) is not one the DungeonServer is configured to own. Before
+re-capturing, check `Executable\DeploymentConfig.xml`'s `DungeonServerConfig` /
+`ArbiterServerList` against which dungeon ids each server claims, then enter one the DungeonServer
+owns. If every instance really does run on the main World here, then the same-link sequence above
+IS the hand-off, and TeraSharp's single-World design already matches it - in which case
+MULTIWORLD-PATCH.diff is solving a problem this deployment does not have.
