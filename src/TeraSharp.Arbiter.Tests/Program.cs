@@ -22690,6 +22690,166 @@ string message
         }
     }
 
+
+    // ===================== T116: the admin game-log page =====================
+
+    /// <summary>A store with two characters and a handful of game_log rows to search.</summary>
+    static TeraSharp.Arbiter.Persistence.CharacterStore T116Store()
+    {
+        var store = StoreWithTwoAccounts();      // acct1/t30_1 (id 1), acct2/t30_2 (id 2)
+        store.AddGameLog(GameLogPackets.CategoryPvp, "pvp.kill", 0, 1, 2, 0, 0, 0, 0, null, 1000);
+        store.AddGameLog(GameLogPackets.CategoryPvp, "pk.kill", 0, 2, 1, 0, 0, 0, 0, null, 2000);
+        store.AddGameLog(GameLogPackets.CategoryTrade, "trade.send", 0, 1, 2, 0, 0, 0, 7500,
+            GameLogPackets.Json(("dlmId", "9")), 3000);
+        store.AddGameLog(GameLogPackets.CategoryTrade, "trade.recv", 0, 2, 1, 0, 0, 0, 0, null, 4000);
+        store.AddGameLog(GameLogPackets.CategoryItem, "cash.item", 0, 1, 0, 0, 170003, 3, 0, null, 5000);
+        return store;
+    }
+
+    /// <summary>
+    /// T116. The endpoint: every filter, the resolved subject, the total, and the paging the
+    /// page draws its "n of m" from.
+    /// </summary>
+    [Test] public static void T116_the_game_log_endpoint_filters_and_pages()
+    {
+        using var store = T116Store();
+        var api = NewAdminApi(store);
+
+        var all = api.Handle("GET", "/api/game-log", new Dictionary<string, string>(), token: T101Token);
+        Hex.True(all.Status == 200, $"the endpoint answers: {all.Status}");
+        Hex.True(all.Body.Contains("\"total\":5"), $"five rows in the store: {all.Body[..80]}");
+        Hex.True(all.Body.IndexOf("cash.item", StringComparison.Ordinal)
+                 < all.Body.IndexOf("pvp.kill", StringComparison.Ordinal),
+            "newest first, so the cash row is ahead of the first kill");
+
+        // categories ride along so the dropdown is built from the code, not from the HTML.
+        foreach (var c in GameLogPackets.Categories)
+            Hex.True(all.Body.Contains("\"" + c + "\""), $"category {c} is offered");
+
+        var byName = api.Handle("GET", "/api/game-log",
+            new Dictionary<string, string> { ["who"] = "t30_1" }, token: T101Token);
+        Hex.True(byName.Body.Contains("\"total\":5"),
+            "character 1 is the actor three times and the target twice");
+        Hex.True(byName.Body.Contains("\"who\":\"character t30_1\""),
+            $"and the page is told what the box resolved to: {byName.Body[..120]}");
+
+        var byId = api.Handle("GET", "/api/game-log",
+            new Dictionary<string, string> { ["who"] = "2" }, token: T101Token);
+        Hex.True(byId.Body.Contains("\"who\":\"character t30_2\""),
+            "digits are a character id before they are an account id");
+
+        var cat = api.Handle("GET", "/api/game-log",
+            new Dictionary<string, string> { ["category"] = GameLogPackets.CategoryTrade },
+            token: T101Token);
+        Hex.True(cat.Body.Contains("\"total\":2"), "the category narrows it to the two trade rows");
+
+        var act = api.Handle("GET", "/api/game-log",
+            new Dictionary<string, string> { ["action"] = "trade" }, token: T101Token);
+        Hex.True(act.Body.Contains("\"total\":2"),
+            "the action box is a prefix - trade finds trade.send and trade.recv");
+        var act2 = api.Handle("GET", "/api/game-log",
+            new Dictionary<string, string> { ["action"] = "trade.recv" }, token: T101Token);
+        Hex.True(act2.Body.Contains("\"total\":1"), "and a full action finds the one row");
+
+        var window = api.Handle("GET", "/api/game-log",
+            new Dictionary<string, string> { ["from"] = "2000", ["to"] = "4000" }, token: T101Token);
+        Hex.True(window.Body.Contains("\"total\":3"), "the time window is inclusive at both ends");
+
+        var page0 = api.Handle("GET", "/api/game-log",
+            new Dictionary<string, string> { ["size"] = "2", ["page"] = "0" }, token: T101Token);
+        var page2 = api.Handle("GET", "/api/game-log",
+            new Dictionary<string, string> { ["size"] = "2", ["page"] = "2" }, token: T101Token);
+        var page3 = api.Handle("GET", "/api/game-log",
+            new Dictionary<string, string> { ["size"] = "2", ["page"] = "3" }, token: T101Token);
+        Hex.True(page0.Body.Contains("\"total\":5") && page0.Body.Contains("\"page\":0")
+                 && page0.Body.Contains("\"size\":2"),
+            "the total is of the whole match, not of the page");
+        Hex.True(page2.Body.Contains("\"logId\"") && !page2.Body.Contains("\"log\":[]"),
+            "five rows at two a page leaves one on the third page");
+        Hex.True(page3.Body.Contains("\"log\":[]") && page3.Body.Contains("\"total\":5"),
+            "the fourth page is empty and still reports the whole total");
+    }
+
+    /// <summary>
+    /// T116. The parts of the row the page renders: the actor and target names, the item name
+    /// from ItemNames, and the extra JSON carried through as an opaque string.
+    /// </summary>
+    [Test] public static void T116_the_game_log_rows_name_the_actor_target_and_item()
+    {
+        using var store = T116Store();
+        var api = NewAdminApi(store);
+
+        var r = api.Handle("GET", "/api/game-log",
+            new Dictionary<string, string> { ["action"] = "trade.send" }, token: T101Token);
+        Hex.True(r.Body.Contains("\"actor\":\"t30_1\"") && r.Body.Contains("\"target\":\"t30_2\""),
+            $"both ends are named, not just numbered: {r.Body}");
+        Hex.True(r.Body.Contains("\"money\":7500"), "money comes through");
+        Hex.True(r.Body.Contains("\\\"dlmId\\\":\\\"9\\\""),
+            "and the extra JSON is escaped into the reply as a string, not re-parsed");
+
+        var cash = api.Handle("GET", "/api/game-log",
+            new Dictionary<string, string> { ["action"] = "cash.item" }, token: T101Token);
+        Hex.True(cash.Body.Contains("\"item\":{\"templateId\":170003"),
+            $"the template rides in its own object so the page can show id and name: {cash.Body}");
+        Hex.True(cash.Body.Contains("\"amount\":3"), "amount comes through");
+        Hex.True(cash.Body.Contains("\"target\":\"\""),
+            "a row with no target names nobody rather than inventing one");
+    }
+
+    /// <summary>
+    /// T116. The refusals. An unknown subject is 2/404 rather than the whole log - an audit
+    /// tool that silently widens its own filter is worse than one that says no - and the page
+    /// and the endpoint sit behind the same token gate as everything else.
+    /// </summary>
+    [Test] public static void T116_the_game_log_endpoint_refuses_cleanly()
+    {
+        using var store = T116Store();
+        var api = NewAdminApi(store);
+
+        var nobody = api.Handle("GET", "/api/game-log",
+            new Dictionary<string, string> { ["who"] = "nosuchname" }, token: T101Token);
+        Hex.True(nobody.Status == 404 && nobody.Body.Contains("\"result\":" + AdminApi.ResultNotFound),
+            $"an unknown name is not found, not everything: {nobody.Status} {nobody.Body}");
+
+        Hex.True(api.Handle("GET", "/api/game-log").Status == 401, "no token is 401");
+        Hex.True(NewAdminApi(store, token: null).Handle("GET", "/api/game-log",
+            token: T101Token).Status == 503, "and with no token configured the tool is off");
+
+        var huge = api.Handle("GET", "/api/game-log",
+            new Dictionary<string, string> { ["size"] = "100000", ["page"] = "99999999" },
+            token: T101Token);
+        Hex.True(huge.Status == 200
+                 && huge.Body.Contains("\"size\":"
+                     + TeraSharp.Arbiter.Persistence.CharacterStore.GameLogMaxPageSize),
+            $"the page size is clamped, not honoured: {huge.Body[..90]}");
+        Hex.True(huge.Body.Contains("\"log\":[]"), "and an absurd page is empty, not an error");
+
+        var junk = api.Handle("GET", "/api/game-log",
+            new Dictionary<string, string> { ["from"] = "not-a-date", ["page"] = "-4" },
+            token: T101Token);
+        Hex.True(junk.Status == 200 && junk.Body.Contains("\"total\":5") && junk.Body.Contains("\"page\":0"),
+            "unparsable numbers are simply absent filters");
+    }
+
+    /// <summary>
+    /// T116. The page itself: one nav entry for both logs, and the admin-log view moved in
+    /// beside the game log rather than duplicated.
+    /// </summary>
+    [Test] public static void T116_the_admin_page_carries_both_logs_in_one_tab()
+    {
+        Hex.True(AdminPage.Html.Contains("data-tab='logs'"), "the Logs tab is in the nav");
+        Hex.True(!AdminPage.Html.Contains("data-tab='audit'"),
+            "and the old Admin log entry is gone, not left showing the same table twice");
+        Hex.True(AdminPage.Html.Contains("id='t-logs'") && AdminPage.Html.Contains("id='lp-game'")
+                 && AdminPage.Html.Contains("id='lp-admin'"),
+            "one section, two panels");
+        Hex.True(AdminPage.Html.Contains("id='auresult'") && AdminPage.Html.Contains("loadAudit()"),
+            "the admin-log view kept its element id and its loader");
+        Hex.True(AdminPage.Html.Contains("/api/game-log?"), "and the page calls the new endpoint");
+        Hex.True(!AdminPage.Html.Contains("\""),
+            "the page literal still has no double quote in it - CLAUDE.md's verbatim-string rule");
+    }
+
     // ===================== T111: multi-world step 3 =====================
 
     /// <summary>

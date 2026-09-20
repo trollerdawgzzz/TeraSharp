@@ -815,3 +815,32 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   `WorldReplayTable.OneWayFromWorld` to make it work (a sealed opcode never reaches a handler),
   which is the same invariant T108b tripped over; `T115_the_log_opcodes_are_handlers_not_sealed`
   now pins it for all five.
+
+- T116 (admin web: game log search). `GET /api/game-log` on `AdminApi` - **no Program.cs
+  change**, the route hangs off `Handle` and `AdminServer` already dispatches there - plus the
+  page. status/GAME-LOG.md section 6.
+
+  One `who` box takes an account name, a character name, an account id or a character id;
+  digits resolve as a **character id first** and only then as an account id, because every one
+  of the five decoded frames names a character and only some name an account. A term that
+  matches nothing answers 404 / result 2 rather than quietly returning the whole log. The reply
+  carries `total` from `CountGameLog` with the same clauses in the same order, `who` as
+  resolved, `categories` from `GameLogPackets.Categories` so the dropdown is not a second copy
+  of the list, and per row the actor and target NAMES beside their ids, `item` as
+  `{templateId, name}` through `Protocol.ItemNames`, amount, money and the extra JSON as an
+  opaque string.
+
+  `QueryGameLog` / `CountGameLog` gained an `action` filter - `LIKE <prefix>%` with
+  `ESCAPE '\'`, since SQLite has no default escape character and without it an action
+  containing a percent sign would still act as a wildcard. Both take the same six filters now,
+  so the page's total and its pages cannot disagree. Every existing call site passes named
+  arguments, so inserting the parameter moved nothing.
+
+  The page grows one nav entry, **Logs**, with two panels: the game-log search (who / category /
+  action / date range / page size, prev-next paging) and the admin-log viewer, which moves in
+  from its own tab rather than being duplicated. The page literal still has zero double quotes.
+
+  Tests: `T116_the_game_log_endpoint_filters_and_pages`,
+  `T116_the_game_log_rows_name_the_actor_target_and_item`,
+  `T116_the_game_log_endpoint_refuses_cleanly` (unknown subject, no token, token unset, clamped
+  size, absurd page, unparsable numbers) and `T116_the_admin_page_carries_both_logs_in_one_tab`.
