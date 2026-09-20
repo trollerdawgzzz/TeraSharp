@@ -172,8 +172,8 @@ if ($off -ne $bytes.Length) {
 # They are two logs of the same session, not two copies of one log: Noctenium is
 # a proxy, so a packet a mod rewrites or injects reaches the packet view without
 # ever being on the socket. Saying how far they agree is the whole point.
-$wireBytes  = ($wire  | Measure-Object -Property { $_.Data.Length } -Sum).Sum
-$splitBytes = ($split | Measure-Object -Property { $_.Data.Length } -Sum).Sum
+$wireBytes  = ($wire  | ForEach-Object { $_.Data.Length } | Measure-Object -Sum).Sum
+$splitBytes = ($split | ForEach-Object { $_.Data.Length } | Measure-Object -Sum).Sum
 
 function Compare-View([string] $dir) {
     $a = @($wire  | Where-Object { $_.Dir -eq $dir })
