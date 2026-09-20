@@ -1,17 +1,23 @@
-# status/MULTIWORLD-PATCH.diff - the cumulative T103 + T108 + T111 patch for the three
-# human-owned files multi-world needs: WorldBridge.cs, WorldEntry.cs and GameSession.cs.
+# status/MULTIWORLD-PATCH.diff - the cumulative T103 + T108 + T111 + T112 patch for the four
+# human-owned files multi-world needs: WorldBridge.cs, WorldEntry.cs, HandlerRegistry.cs and
+# GameSession.cs.
 #
 # Cowork never edits those, so this is the proposal. Regenerated against master as of
-# 2026-09-20 (WorldBridge.cs 631 lines, WorldEntry.cs 316, GameSession.cs 355) and verified to
-# apply with BOTH `patch -p1` and `git apply -p1`, with the applied result compared byte for
-# byte against the intended files.
+# 2026-09-20 - WorldBridge.cs 631 lines, Handlers/WorldEntry.cs 316, Handlers/HandlerRegistry.cs
+# 408, Network/GameSession.cs 355 - and verified to apply with the applied result compared byte
+# for byte against the intended files.
 #
 #   cd D:\v100\TERA_SERVER.100\TeraSharp-cowork2
-#   git apply status/MULTIWORLD-PATCH.diff        (or: patch -p1 < status\MULTIWORLD-PATCH.diff)
+#   git apply status/MULTIWORLD-PATCH.diff
+#
+# USE `git apply`. This file is stored with CRLF line endings throughout, because its context
+# lines come from CRLF sources; GNU patch strips the trailing CRs by default and then every hunk
+# fails with "different line endings". If you want patch, it is `patch -p1 --binary <
+# status\MULTIWORLD-PATCH.diff`. Both were checked; plain `patch -p1` was not, and does not work.
 #
 # It needs nothing else: World/WorldInstances.cs, World/WorldRegistration.cs and
-# World/WorldServerList.cs are already on the branch from T103, T108 and T111, and every symbol
-# named here is public or internal there.
+# World/WorldServerList.cs are already on the branch from T103, T108, T111 and T112, and every
+# symbol named here is public or internal there.
 #
 # WHAT IT DOES (status/MULTIWORLD-DESIGN.md sections 6, 7, 7.1 and 7.2)
 #   T103  WorldLink gains WorldId / PlanetId / BypassIndex / Registered, filled from its own
@@ -29,30 +35,39 @@
 #         WorldServerList into the continent map. That is the whole allocator: one continent,
 #         one World (section 7.1).
 #   T111  GameSession.CurrentWorldId, and the tunnel map keyed (WorldId, Ticket) instead of
-#         Ticket alone - design doc section 4 item 5. Every uint-keyed entry point keeps its old
-#         signature as an overload onto world 0, so the existing tunnel tests are untouched.
+#         Ticket alone - design doc section 4 item 5.
 #   T111  WorldEntry builds AS_ENTER_WORLD with no Ticket, reads the destination World out of
-#         it, allocates the Ticket in THAT World's space and stamps it at payload 80. Same
-#         bytes: tunnelKey is written in exactly one place and EnterWorldTicketOffset is the
-#         constant T21's retry builder already uses.
+#         it, allocates the Ticket in THAT World's space and stamps it at payload 80.
+#   T112  The six per-player CONTROL frames now go to the player's own World, threaded from
+#         GameSession.CurrentWorldId:
+#             0x1460 AS_CANCEL_SKILL_STRICTLY   } NotifyPlayerLeave(worldId, ...)
+#             0x1392 AS_LEAVE_WORLD             }
+#             0x1390 AS_FORCE_ENTER_DUNGEON_ID  } NotifyTopoLoaded(worldId, ...)
+#             0x138F AS_LOAD_TOPO_FIN           }
+#             0x1439 AS_UPDATE_VISITED_SECTION_LIST - HandlerRegistry's C_LOAD_TOPO_FIN arm
+#             0x1433 AS_ARBITER_USER_DELETE - already right: the SA_LEAVE_WORLD reply goes out
+#                    on the arriving link, and GameSession's copy took CurrentWorldId in T111.
+#         Each frame addresses the user by id INSIDE that World, so the wrong World means "user
+#         not found" - for 0x1392 that is the "Critical Error LeaveWorld" crash path.
 #
-# SINGLE-WORLD BEHAVIOUR IS UNCHANGED, and now by two guards rather than one. An unregistered
-# link reads as world 0; SendFrame(op, ..) resolves to the first world-0 link, which with one
-# World is the old _links[0] primary; world 0's runtime starts not-ready with the counter at 0,
-# so the first game id is still 0x80000AF00001. On top of that, WorldRouting.IsLive means a
-# continent whose configured owner is not running stays with the catch-all World - so seeding
-# ServerConfig.xml on a server where only world 0 was started changes nothing at all.
+# EVERY NEW SIGNATURE IS AN OVERLOAD. The old uint / no-worldId forms all remain and delegate to
+# world 0, so nothing outside this patch has to change and no existing test moves.
+#
+# SINGLE-WORLD BEHAVIOUR IS UNCHANGED, by two guards. An unregistered link reads as world 0;
+# SendFrame(op, ..) resolves to the first world-0 link, which with one World is the old
+# _links[0] primary; world 0's runtime starts not-ready with the counter at 0, so the first game
+# id is still 0x80000AF00001. On top of that, WorldRouting.IsLive means a continent whose
+# configured owner is not running stays with the catch-all World - so seeding ServerConfig.xml
+# on a server where only world 0 was started changes nothing at all.
 #
 # The one behaviour that DOES change on a single-World server is SA_REGISTER: the reply is built
 # rather than replayed. All 25 captured pairs reproduce byte for byte
 # (T103_the_world_registration_reply_is_byte_exact).
 #
-# STILL NOT DONE, on purpose: the per-player CONTROL frames still go out on world 0 -
-# AS_CANCEL_SKILL_STRICTLY (0x1460), AS_LEAVE_WORLD (0x1392), AS_ARBITER_USER_DELETE (0x1433),
-# AS_LOAD_TOPO_FIN (0x138F), AS_FORCE_ENTER_DUNGEON_ID (0x1390) and
-# AS_UPDATE_VISITED_SECTION_LIST (0x1439). Each is a one-line method on WorldBridge that needs
-# a worldId parameter threaded from the session; none of them matters until a player is actually
-# in a second World. That is step 4.
+# STILL ON WORLD 0, on purpose: AS_USER_REQUEST_EXIT (0x14FF) and AS_USER_CANCEL_REQUEST_EXIT
+# (0x1500). They are the same one-line change, but one of their callers -
+# Handlers/ArbiterClientHandlers.cs:1896 - is Cowork-owned, so giving them a worldId parameter
+# here would break the build until this patch lands. They move in the same commit as that file.
 #
 # APPLY IT AFTER THE DUNGEON CAPTURE (design doc section 5) - point 5 of that plan, whether
 # world 0's and world 13's Tickets overlap, is now answered in the code by the compound key, but
@@ -443,7 +458,51 @@
              TunnelFrames.BuildBypassToWorld(gameId, clientPacket, (ulong)Environment.TickCount64));
      }
  
-@@ -568,6 +677,21 @@
+@@ -456,10 +565,15 @@
+     /// World replies by spawning the player (S_SPAWN_ME via tunnel).
+     /// </summary>
+     public void NotifyTopoLoaded(uint playerId)
++        => NotifyTopoLoaded(WorldRegistration.DefaultWorldId, playerId);
++
++    /// <summary>T112: to the World the player is in, not whichever one connected first.</summary>
++    public void NotifyTopoLoaded(int worldId, uint playerId)
+     {
+-        SendFrame(OpForceEnterDungeonId, new byte[] { 1,0,0,0, 0,0,0,0 });
+-        SendFrame(OpLoadTopoFin, BitConverter.GetBytes(playerId));
+-        _log.LogInformation("Sent AS_FORCE_ENTER_DUNGEON_ID + AS_LOAD_TOPO_FIN (0x138F) for player {Id}", playerId);
++        SendFrame(worldId, OpForceEnterDungeonId, new byte[] { 1,0,0,0, 0,0,0,0 });
++        SendFrame(worldId, OpLoadTopoFin, BitConverter.GetBytes(playerId));
++        _log.LogInformation("Sent AS_FORCE_ENTER_DUNGEON_ID + AS_LOAD_TOPO_FIN (0x138F) "
++            + "for player {Id} on world {W}", playerId, worldId);
+     }
+ 
+     /// <summary>
+@@ -517,12 +631,20 @@
+     /// finally SA_LEAVE_WORLD (0x1393).
+     /// </summary>
+     public void NotifyPlayerLeave(ulong gameId, uint playerId, LeaveMode mode)
++        => NotifyPlayerLeave(WorldRegistration.DefaultWorldId, gameId, playerId, mode);
++
++    /// <summary>
++    /// T112: to the World the player is in. Both frames address the user by id inside THAT
++    /// World - AS_LEAVE_WORLD on the wrong World is the "Critical Error LeaveWorld" crash the
++    /// LeaveValues comment above is about, with the user simply not there.
++    /// </summary>
++    public void NotifyPlayerLeave(int worldId, ulong gameId, uint playerId, LeaveMode mode)
+     {
+-        SendFrame(OpCancelSkillStrictly, BitConverter.GetBytes(playerId));
+-        SendFrame(OpLeaveWorld, BuildLeaveWorldPayload(gameId, playerId, mode));
++        SendFrame(worldId, OpCancelSkillStrictly, BitConverter.GetBytes(playerId));
++        SendFrame(worldId, OpLeaveWorld, BuildLeaveWorldPayload(gameId, playerId, mode));
+         var (type, reason) = LeaveValues(mode);
+-        _log.LogInformation("Sent AS_CANCEL_SKILL_STRICTLY (0x1460) + AS_LEAVE_WORLD (0x1392) gameId={G:X} type={T} reason={R}",
+-            gameId, type, reason);
++        _log.LogInformation("Sent AS_CANCEL_SKILL_STRICTLY (0x1460) + AS_LEAVE_WORLD (0x1392) "
++            + "on world {W} gameId={G:X} type={T} reason={R}", worldId, gameId, type, reason);
+     }
+ 
+     /// <summary>AS_ARBITER_USER_DELETE (0x1433) payload: [u64 gameId][u64 gameId] (FUN_140832f20).</summary>
+@@ -568,6 +690,21 @@
  public sealed class WorldLink
  {
      public int Id { get; }
@@ -512,6 +571,23 @@
      }
  
      /// <summary>
+--- a/src/TeraSharp.Arbiter/Handlers/HandlerRegistry.cs
++++ b/src/TeraSharp.Arbiter/Handlers/HandlerRegistry.cs
+@@ -86,11 +86,12 @@
+                 }
+                 s.Send(ArbiterClientHandlers.BuildPvpLeaderBoardInfo());       // T91: frame 288
+                 s.Send(ArbiterClientHandlers.BuildPveLeaderBoardInfo());       // T91: frame 289
+-                Program.World?.SendFrame(WorldBridge.OpUpdateVisitedSection,
++                // T112: AS_UPDATE_VISITED_SECTION_LIST goes to the World this player is in.
++                Program.World?.SendFrame(s.CurrentWorldId, WorldBridge.OpUpdateVisitedSection,
+                     ArbiterClientHandlers.BuildUpdateVisitedSectionList(s.PlayerId,
+                         Program.Store?.GetVisitedSections((int)s.SelectedCharacter!.Id)
+                             ?? Array.Empty<TeraSharp.Arbiter.Persistence.CharacterStore.VisitedSection>()));
+-                Program.World?.NotifyTopoLoaded(s.PlayerId);
++                Program.World?.NotifyTopoLoaded(s.CurrentWorldId, s.PlayerId);
+                 // Real Arbiter sends these to the client right after C_LOAD_TOPO_FIN (lobby_proxy.log
+                 // 263-268), in this order. S_LOAD_CLIENT_USER_SETTING here is what makes the chat
+                 // window process S_CHAT; sent at character select it is discarded on zone load.
 --- a/src/TeraSharp.Arbiter/Network/GameSession.cs
 +++ b/src/TeraSharp.Arbiter/Network/GameSession.cs
 @@ -26,6 +26,14 @@
@@ -529,6 +605,15 @@
      /// <summary>True once the player has been handed to WorldServer; traffic tunnels through it.</summary>
      public bool InWorld { get; private set; }
  
+@@ -90,7 +98,7 @@
+         var w = Program.World;
+         if (w == null || !InWorld) { FinishLeaveToClient(); return; }
+ 
+-        w.NotifyPlayerLeave(GameId, PlayerId, PendingLeaveMode);
++        w.NotifyPlayerLeave(CurrentWorldId, GameId, PlayerId, PendingLeaveMode);
+ 
+         // Safety net: if World never sends SA_LEAVE_WORLD, release the client anyway.
+         _leaveFallback = new CancellationTokenSource();
 @@ -119,10 +127,11 @@
              // the delete so World releases the character. Harmless if World already deleted it.
              if (!worldConfirmed)
@@ -543,15 +628,17 @@
          }
          Handlers.SocialHandlers.UnregisterChat(this);   // T47: leave private channels, go offline for whisper
          InWorld = false;
-@@ -161,7 +170,7 @@
+@@ -161,8 +170,8 @@
          var w = Program.World;
          if (w != null)
          {
 -            w.UnregisterPlayer(GameId, TunnelKey);
+-            w.NotifyPlayerLeave(GameId, PlayerId, LeaveMode.Disconnect);
 +            w.UnregisterPlayer(GameId, CurrentWorldId, TunnelKey);
-             w.NotifyPlayerLeave(GameId, PlayerId, LeaveMode.Disconnect);
++            w.NotifyPlayerLeave(CurrentWorldId, GameId, PlayerId, LeaveMode.Disconnect);
          }
          Handlers.SocialHandlers.UnregisterChat(this);   // T47
+     }
 @@ -170,7 +179,7 @@
      public void ForwardToWorld(byte[] packet)
      {
