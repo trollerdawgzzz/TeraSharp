@@ -682,3 +682,42 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   `DungeonChannels.MapContinent` at startup and cross-World entry works on the first attempt.
   0x164D stays dropped until MatchServer exists - answering it would mean sending 0x4670 to a
   session that is not there.
+
+- T111 (multi-world step 3, MULTIWORLD-DESIGN.md section 7.2). New
+  `World/WorldServerList.cs` reads ServerConfig.xml's `<WorldServerList>` - the six rows, their
+  `<Continent>` children and `loadAllContinents` - into `DungeonChannels.MapContinent`: 16
+  continents mapped (world 10 gets 102/103/110/112/113/115/116/117/118/1200, world 12 gets
+  9920/3023/3027/3126/3026, world 31 gets 156), catch-all world 0, and continent 9827 - the
+  dungeon in cap_newchar - is in no row, so it stays with the catch-all. **That file is the
+  whole allocator** (section 7.1): a continent claimed twice keeps the first owner and logs,
+  because the real Arbiter asserts at `WorldSessionManager.cpp(356)` and routes it nowhere, and
+  stranding players on a config typo is worse. A missing file seeds nothing.
+
+  `WorldForContinent` now prefers the **configured** owner over an announced channel, mirroring
+  `WorldSessionManager::GetDataSession`. `WorldForChannel` is unchanged - config decides the
+  continent, the channel table still says which instance a World announced.
+
+  A third hook, `WorldRouting.IsLive`, guards every routing decision, and it is what makes
+  seeding the config safe: ServerConfig.xml hands continent 102 to world 10 whether or not
+  anyone started world 10, and routing AS_ENTER_WORLD to a World with no sockets means the
+  player never loads. Unlive target -> the asker, or the catch-all World. With no per-World link
+  sets nothing is live, so **the tree before the patch behaves exactly as it did.**
+
+  `status/MULTIWORLD-PATCH.diff` regenerated against master of 2026-09-20: 24 hunks over
+  `WorldBridge.cs` (631 lines), `Handlers/WorldEntry.cs` (316) and now `Network/GameSession.cs`
+  (355), `git apply --check -p1` and `patch -p1` both clean, applied result byte-compared.
+  New beyond T109: `GameSession.CurrentWorldId`; the tunnel map keyed **(WorldId, Ticket)**
+  (section 4 item 5) with every uint-keyed entry point kept as an overload onto world 0 so no
+  tunnel test moves; and WorldEntry building AS_ENTER_WORLD with no Ticket, reading the
+  destination World out of it, allocating in that World's space and stamping the Ticket at
+  payload 80 - the same bytes, since `tunnelKey` is written in exactly one place.
+
+  Tests: `T111_the_world_server_list_seeds_one_owner_per_continent` (six rows, 16 continents,
+  duplicate claim, id past the 0x20 ceiling, unparsable config),
+  `T111_the_configured_owner_beats_an_announced_channel`,
+  `T111_two_links_route_0x13BE_to_the_owner_and_0x13C1_back` (0x13BF to world 13, 0x13C1 back to
+  world 0, then the same two with world 13 not running and both staying on the asker).
+
+  **Step 4**: the per-player control frames still go out on world 0 - 0x1460, 0x1392, 0x1433,
+  0x138F, 0x1390, 0x1439. Each is a one-line WorldBridge method needing a worldId from the
+  session; none matters until a player is actually in a second World.
