@@ -25064,4 +25064,117 @@ string message
             "and with a width it is the server's half-open [base, base+width)");
     }
 
+
+    // ===================== T128: the GM visibility toggle =====================
+
+    /// <summary>
+    /// The switch itself, both ways, against the two states cap_final_gm_client2 holds.
+    /// <c>S_ADMIN_GM_SKILL</c> is <c>[i32 skill][u8 enabled]</c>: skill 0 is Invisible, per
+    /// <c>C_ADMIN_GM_SKILL.1.def</c>'s own comment, and <c>enabled</c> is its new state.
+    /// </summary>
+    [Test] public static void T128_the_visibility_switch_is_frames_99_and_546()
+    {
+        Hex.Eq(ArbiterClientHandlers.BuildAdminGmSkill(
+                   ArbiterClientHandlers.GmSkillInvisible, on: true),
+            "09 00  BE 64  00 00 00 00  01",
+            "frame 99 / 2445 - the enter-world push, which is why a GM spawns vaporized");
+        Hex.Eq(ArbiterClientHandlers.BuildAdminGmSkill(
+                   ArbiterClientHandlers.GmSkillInvisible, on: false),
+            "09 00  BE 64  00 00 00 00  00",
+            "frame 546 - the reply that turned it off, and what /@vis now sends");
+
+        Hex.True(ArbiterClientHandlers.GmSkillInvisible == 0
+                 && ArbiterClientHandlers.GmSkillInvincible == 1
+                 && ArbiterClientHandlers.GmSkillHideFromMobs == 2,
+            "the three skill indices the .def names");
+        Hex.True(GmAdminTool.GmSkillOffMessage == 1436
+                 && GmAdminTool.GmSkillHideFromMobsMessage == 1439,
+            "the two system-message ids the capture pairs with them (547, 1211)");
+
+        // There is no client-facing vaporize packet to send instead: SDB_USER_VAPORIZED
+        // (0x282D) is World->DbProxy, `i32 userDbId, u8 vaporized`, and never reaches a client.
+        Hex.True(DbProxyOpcodeNames.Name(0x282D) == "SDB_USER_VAPORIZED",
+            "0x282D is an inter-server opcode, which is why /@vaporize alone never took");
+    }
+
+    /// <summary>
+    /// The per-player state. It defaults to visible, the enter-world push is what makes it
+    /// invisible, and leaving the world clears it - so the next spawn is invisible again
+    /// rather than inheriting whatever the last session toggled.
+    /// </summary>
+    [Test] public static void T128_the_toggle_state_is_per_player_and_resets_on_world_entry()
+    {
+        const int pid = 4242;
+        ArbiterClientHandlers.ResetGmSkillPush(pid);
+        Hex.True(!ArbiterClientHandlers.IsGmInvisible(pid),
+            "an unknown player is not invisible - the default is an ordinary player");
+
+        ArbiterClientHandlers.SetGmInvisible(pid, true);
+        Hex.True(ArbiterClientHandlers.IsGmInvisible(pid), "the enter-world push records ON");
+        ArbiterClientHandlers.SetGmInvisible(pid, false);
+        Hex.True(!ArbiterClientHandlers.IsGmInvisible(pid), "/@vis records OFF");
+        ArbiterClientHandlers.SetGmInvisible(pid, true);
+
+        ArbiterClientHandlers.ResetGmSkillPush(pid);
+        Hex.True(!ArbiterClientHandlers.IsGmInvisible(pid),
+            "SDB_USER_ENTERWORLD re-arms the push AND forgets the toggle, so the default "
+            + "spawn state stays invisible");
+
+        Hex.True(!ArbiterClientHandlers.IsGmInvisible(0)
+                 && !ArbiterClientHandlers.IsGmInvisible(-1),
+            "player id 0 is nobody, and a negative one is not a key either");
+        ArbiterClientHandlers.SetGmInvisible(0, true);
+        Hex.True(!ArbiterClientHandlers.IsGmInvisible(0), "and nobody cannot be made invisible");
+
+        // Two players do not share the flag.
+        const int other = 4243;
+        ArbiterClientHandlers.ResetGmSkillPush(other);
+        ArbiterClientHandlers.SetGmInvisible(pid, true);
+        Hex.True(ArbiterClientHandlers.IsGmInvisible(pid)
+                 && !ArbiterClientHandlers.IsGmInvisible(other),
+            "one GM going visible does not reveal another");
+        ArbiterClientHandlers.ResetGmSkillPush(pid);
+    }
+
+    /// <summary>
+    /// The command wiring. All four names route to <see cref="GmDispatch.Local"/> - they are
+    /// in <c>Implemented</c>, which <c>Classify</c> checks before the catalogue - and the two
+    /// that World also owns are forwarded on top, so <c>/@vaporize</c> keeps doing whatever it
+    /// did to World before and gains the client-side switch.
+    /// </summary>
+    [Test] public static void T128_vis_and_invis_are_arbiter_side_commands()
+    {
+        GmCommandCatalog.Set(
+            arbiter: new[] { "set_admin_level" },
+            world: new[] { "vaporize", "invisible", "add_exp" });
+
+        foreach (var name in new[] { "vis", "invis", "vaporize", "invisible" })
+        {
+            Hex.True(GmCommandHandlers.Implemented.Contains(name),
+                $"/@{name} is Arbiter-side");
+            Hex.True(GmCommandHandlers.Classify(true, 1, GmCommandParser.Parse(name))
+                     == GmDispatch.Local,
+                $"/@{name} runs here even though the catalogue calls it World's");
+            Hex.True(GmCommandHandlers.Classify(true, 0, GmCommandParser.Parse(name))
+                     == GmDispatch.NotAuthorised,
+                $"/@{name} is still behind the admin-level gate");
+            Hex.True(GmCommandHandlers.Classify(false, 5, GmCommandParser.Parse(name))
+                     == GmDispatch.NoUser,
+                $"/@{name} needs a character - the switch is per player");
+        }
+
+        Hex.True(GmCommandHandlers.AlsoForwarded.Contains("vaporize")
+                 && GmCommandHandlers.AlsoForwarded.Contains("invisible"),
+            "the two World names keep their forward: the world-side vaporize is still World's");
+        Hex.True(!GmCommandHandlers.AlsoForwarded.Contains("vis")
+                 && !GmCommandHandlers.AlsoForwarded.Contains("invis"),
+            "/@vis and /@invis are ours alone - World has no such command to forward to");
+        Hex.True(GmCommandHandlers.AlsoForwarded.Count == 2,
+            $"and nothing else forwards twice: {GmCommandHandlers.AlsoForwarded.Count}");
+
+        // Case does not matter: the dispatcher lower-cases and both sets are ordinal-ignore-case.
+        Hex.True(GmCommandHandlers.Classify(true, 1, GmCommandParser.Parse("VIS"))
+                 == GmDispatch.Local, "/@VIS is /@vis");
+    }
+
 }

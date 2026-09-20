@@ -1003,3 +1003,46 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   `T126_the_user_ranking_companion_is_byte_exact`,
   `T126_self_finds_the_requesters_row_on_the_whole_board`, plus the two T119 byte-exact tests
   updated to the corrected element and the PvP one extended with the def/writer disagreement.
+
+- T128: **GM invisibility is a toggle now** - `/@vis`, `/@invis`, and `/@vaporize` fixed.
+
+  A GM spawns vaporized because the Arbiter pushes `S_ADMIN_GM_SKILL 00 00 00 00 01` at
+  enter-world (T120/T121, cap_final_gm_client2 frames 99 and 2445). Nothing turned it back
+  off except Alt+A: `/@vaporize` and `/@invisible` are WORLD commands and never touch this
+  client-side switch.
+
+  **The switch, pinned.** `S_ADMIN_GM_SKILL` (0x64BE) is `[i32 skill][u8 enabled]`; `skill` is
+  the index `C_ADMIN_GM_SKILL.1.def` names (`0 = Invisible, 1 = Invincible, 2 = Hide from
+  Mobs`) and `enabled` is that skill's new state. Frame 546 - `09 00 BE 64 00 00 00 00 00` -
+  is the real Arbiter answering the tool's 542, and it is exactly what `/@vis` now sends.
+
+  **There is no client-facing vaporize packet.** `SDB_USER_VAPORIZED` (0x282D) is
+  World->DbProxy (`i32 userDbId, u8 vaporized`) and never reaches a client; nothing else in
+  the 376012 map carries visibility. `S_ADMIN_GM_SKILL` is the whole client-side story, which
+  is why `/@vaporize` alone could not work.
+
+  **Wiring.** `vis` / `invis` / `vaporize` / `invisible` join
+  `GmCommandHandlers.Implemented`, so `Classify` returns `Local` before the catalogue is
+  consulted. `/@vis` sends enabled 0, `/@invis` enabled 1, and `/@vaporize` + `/@invisible`
+  FLIP the tracked state - what Alt+A does - and are **also still forwarded to World**
+  (`GmCommandHandlers.AlsoForwarded`), because being hidden from other players is World's and
+  nothing that worked before should stop. `/@vis` and `/@invis` are ours alone and are not
+  forwarded. `Execute` took a `commandType` parameter to do that. **HandlerRegistry is
+  unchanged.**
+
+  State lives in `ArbiterClientHandlers.GmInvisible`, keyed by the same `s.PlayerId` the
+  push's one-shot uses, and `ResetGmSkillPush` (SDB_USER_ENTERWORLD and leave-world) clears
+  it - so **the default spawn stays invisible** and no toggle survives a relog.
+
+  **T89's C_ADMIN_GM_SKILL handler was wrong and is fixed.** It read the trailing i32 as an
+  enable flag and replied `skill=0, enabled=(value != 0)`. It is the skill INDEX, and the
+  packet is a toggle: frame 546 came out right only because skill 0 and value 0 are both
+  zero, while pressing "Hide from Mobs" (1210, `skill=2`) made TeraSharp answer
+  `enabled=1` for INVISIBILITY. Now skill 0 toggles the tracked state, answers
+  `S_ADMIN_GM_SKILL` plus `S_SYSTEM_MESSAGE @1436` (547 / 2949), skill 2 answers `@1439`
+  alone (1211 sends no S_ADMIN_GM_SKILL), and skill 1 - which has no sample - answers
+  nothing rather than a message id we would be inventing.
+
+  Tests: `T128_the_visibility_switch_is_frames_99_and_546`,
+  `T128_the_toggle_state_is_per_player_and_resets_on_world_entry`,
+  `T128_vis_and_invis_are_arbiter_side_commands`.
