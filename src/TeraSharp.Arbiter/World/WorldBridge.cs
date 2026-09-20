@@ -433,6 +433,48 @@ public sealed class WorldBridge
             case OpHeartbeat6:
                 return;
 
+            // ---- T138b: the cross-World hand-off (status/MULTIWORLD-DESIGN.md T137c) ----
+            case 0x164D:   // SA_WORLD_SERVER_STATUS: this link's continent roster -> the continent table
+            {
+                int n = WorldContinentList.Apply(DungeonRouting.Channels, payload, _log);
+                _log.LogInformation("Link #{Id} world {W}: {N} continent(s) rostered", link.Id, link.WorldId, n);
+                return;   // the real Arbiter only relays this to MatchServer; nothing to answer
+            }
+            case ContinentHandoff.SA_REQUEST_ENTER_CONTINENT:   // 0x13BE: main World asks
+            {
+                int? continent = ContinentHandoff.ContinentOf(payload);
+                var reply = ContinentHandoff.EnterReply(payload);
+                if (continent == null || reply == null)
+                {
+                    _log.LogWarning("0x13BE on link #{Id}: {Len} B - too short", link.Id, payload.Length);
+                    return;
+                }
+                int owner = DungeonRouting.Channels.WorldForContinent(continent.Value) ?? link.WorldId;
+                if (owner != link.WorldId && LinksOf(owner).Count == 0) owner = link.WorldId;   // owner not linked: keep it on the asker
+                _log.LogInformation("0x13BE continent {C} from world {From} -> 0x13BF to world {To}", continent, link.WorldId, owner);
+                if (owner == link.WorldId) link.SendFrame(ContinentHandoff.AS_ENTER_CONTINENT, reply);
+                else SendFrame(owner, ContinentHandoff.AS_ENTER_CONTINENT, reply);
+                return;
+            }
+            case ContinentHandoff.SA_CONTINENT_READY:   // 0x13C0: owning World is ready -> 0x13C1 back to the main World
+            {
+                var reply = ContinentHandoff.ReadyReply(payload);
+                if (reply == null) return;
+                var mains = LinksOf(0);
+                if (link.WorldId != 0 && mains.Count > 0) SendFrame(0, ContinentHandoff.AS_CONTINENT_READY, reply);
+                else link.SendFrame(ContinentHandoff.AS_CONTINENT_READY, reply);
+                return;
+            }
+            case 0x13C5:   // SA_ADD_DUNGEON_CHANNEL: the owner registers the instance channel
+            {
+                var ch = DungeonRouting.Channels.Add(link.WorldId, payload);
+                if (ch != null) _log.LogInformation("Link #{Id} world {W}: dungeon channel added {Ch}", link.Id, link.WorldId, ch);
+                return;
+            }
+            case 0x13C6:   // SA_REMOVE_DUNGEON_CHANNEL
+                DungeonRouting.Channels.Remove(link.WorldId, payload);
+                return;
+
             case OpHeartbeat14:
                 // DSA_DUNGEON_TIMELINE_OPEN_INFO. 909 of the 911 frames across the four captures
                 // are the empty 14-byte form - a real heartbeat - but the first one after World
