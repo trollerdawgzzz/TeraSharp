@@ -12223,6 +12223,50 @@ bool   isGuildWarAcceptable
             "ordered by dungeon id, and a 0 count is not a row the window needs");
     }
 
+    /// <summary>
+    /// T134b - the wired reply. T134 proved the builder against the capture from literals; this
+    /// proves the MERGE OnDungeonClearCountList does, from rows in dungeon_cooldowns. The session
+    /// plumbing (name -> character -> pid) is not exercised: nothing in this suite can stand up a
+    /// GameSession, so the pid is passed in.
+    /// </summary>
+    [Test] public static void T134b_clear_count_reply_merges_the_roster_with_the_store()
+    {
+        Hex.True(ArbiterClientHandlers.DungeonClearCountRoster.Length == 14
+                 && ArbiterClientHandlers.DungeonClearCountRoster[0] == 9068
+                 && ArbiterClientHandlers.DungeonClearCountRoster[10] == 9830
+                 && ArbiterClientHandlers.DungeonClearCountRoster[12] == 9739
+                 && ArbiterClientHandlers.DungeonClearCountRoster[13] == 9075,
+            "classic_live2's 14 ids, in the order every captured reply lists them");
+
+        using var store = StoreWithTwoAccounts();
+        store.SetDungeonClearCount(1, 9830, 10);
+        store.SetDungeonClearCount(1, 9739, 34);
+
+        // Exactly what the handler does: roster order, counts from the store, rookie = clears == 0.
+        var counts = store.GetDungeonClearCounts(1);
+        var rows = new ArbiterClientHandlers.DungeonClears[ArbiterClientHandlers.DungeonClearCountRoster.Length];
+        for (int i = 0; i < rows.Length; i++)
+        {
+            int id = ArbiterClientHandlers.DungeonClearCountRoster[i];
+            int clears = 0;
+            foreach (var c in counts)
+            {
+                if (c.DungeonId != id) continue;
+                clears = c.Clears;
+                break;
+            }
+            rows[i] = new ArbiterClientHandlers.DungeonClears(id, clears, clears == 0);
+        }
+
+        Hex.Eq(ArbiterClientHandlers.BuildDungeonClearCountList(24468, rows),
+            "C2 00 66 9D 0E 00 0C 00 94 5F 00 00 0C 00 19 00 6C 23 00 00 00 00 00 00 01 19 00 26 00 60 23 00 00 00 00 00 00 01 26 00 33 00 D0 23 00 00 00 00 00 00 01 33 00 40 00 C4 23 00 00 00 00 00 00 01 40 00 4D 00 23 25 00 00 00 00 00 00 01 4D 00 5A 00 53 23 00 00 00 00 00 00 01 5A 00 67 00 28 26 00 00 00 00 00 00 01 67 00 74 00 1C 26 00 00 00 00 00 00 01 74 00 81 00 8C 26 00 00 00 00 00 00 01 81 00 8E 00 80 26 00 00 00 00 00 00 01 8E 00 9B 00 66 26 00 00 0A 00 00 00 00 9B 00 A8 00 52 26 00 00 00 00 00 00 01 A8 00 B5 00 0B 26 00 00 22 00 00 00 00 B5 00 00 00 73 23 00 00 00 00 00 00 01",
+            "classic_live2 record 13158, rebuilt out of dungeon_cooldowns instead of out of literals");
+
+        // A character with nothing stored still gets all fourteen rows, all rookie.
+        var empty = store.GetDungeonClearCounts(2);
+        Hex.True(empty.Count == 0, "no rows for a character that has cleared nothing");
+    }
+
     // ---- The rules ----
 
     [Test] public static void T30_system_message_format_matches_the_capture()
