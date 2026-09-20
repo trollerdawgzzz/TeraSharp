@@ -484,3 +484,76 @@ Cost: two bytes compared and one dictionary miss per tunnelled packet; the admin
 **Still to remove**: `HandlerRegistry.cs:85`'s `BuildAdminGmSkill` push on `C_LOAD_TOPO_FIN` (~200
 frames too late), and `WorldEntry.cs:33`'s pre-hand-off call (too early). `LoginHandlers.cs:233`
 stays - standalone has no World to tunnel through.
+
+---
+
+## T123 - found it: `S_LOGIN_ACCOUNT_INFO.apiServerAuthToken` is empty
+
+The first capture pair that isolates the panel: **`cap_final_gm_client2`** (real Arbiter, status
+33, client sends `C_ADMIN_REQUEST_CUSTOM_BOOKMARK` at 524 - **panel opened**) against
+**`cap_classic_client`** (TeraSharp, status 33, no `C_ADMIN_REQUEST_*` ever - **panel did not
+open**). Both GM, both status `0x21`. Diffing every S->C frame from `S_LOGIN_ARBITER` (7) to the
+first `C_ADMIN_REQUEST_*` / `C_REQUEST_PVE_RANKING`, with World content filtered out, the
+account-scoped gap is one packet - and it is the **second** frame of the session.
+
+```
+S_LOGIN_ACCOUNT_INFO.3.def   (majorPatchVersion >= 100 - this build)
+    uint64 accountId
+    int32  antiCheatChecksumSeed
+    string dbServerName
+    string apiServerAddress
+    string apiServerAuthToken
+```
+
+| field | real (frame 8, 544 B) | TeraSharp (frame 8, 64 B) |
+|---|---|---|
+| accountId | 1 | 1 |
+| antiCheatChecksumSeed | 619351 | **0** |
+| dbServerName | `PlanetDB_2800` | `TeraSharp` |
+| apiServerAddress | `127.0.0.1:8800` | `127.0.0.1` - **no port** |
+| apiServerAuthToken | a 231-char JWT | **empty string** |
+
+The token is an HS256 JWS the Arbiter mints per login:
+
+```
+header  {"alg":"HS256","typ":"JWS"}
+payload {"accountDbId":1,"aud":"api","exp":1789619471,"iat":1789619351,
+         "iss":"arbiter","nbf":1789619351,"planetId":2800}
+```
+
+`iss: arbiter`, `aud: api`, **120-second lifetime**, carrying the account db id and the planet id.
+`127.0.0.1:8800` is tera-api's **gateway API** (`API_GATEWAY_LISTEN_PORT`,
+`src/servers/gatewayApi.server.js`), not the arbiter API on 8080.
+
+**Why this is the gate.** The In-Game Operation Tool is an embedded Awesomium web view. T120
+proved the address does **not** come from `S_RESPONSE_SERVER_ADMINTOOL_AWESOMIUM_URL` - the real
+server answers that with an empty Title and an empty Url too. It comes from these two fields, which
+is exactly why the `.3` def (patch >= 100) added them over `.2`. With no port and no credential the
+view has nothing to open, so nothing opens, and the client never reaches the packets the tool
+sends. Across all four real captures the account fields are populated and only `status` varies -
+`cap_final_gm_client` has the token and status **31**, and got no panel either. So the gate is
+**status 33 AND a usable `apiServerAddress` + `apiServerAuthToken`**; TeraSharp has had the first
+since T89b and neither of the others ever.
+
+**The work this implies** (not done here - T123 is analysis):
+
+* TeraSharp must mint the JWT with the same secret tera-api verifies, or fetch one from tera-api
+  per login. It cannot be faked: HS256 with a key only tera-api holds.
+* `apiServerAddress` must carry the port (`127.0.0.1:8800`), and the gateway API component has to
+  be running - it is a separate tera-api component from the arbiter API that `TERASHARP_AUTH` uses.
+* The 120 s expiry means the token is minted at `C_LOGIN_ARBITER` time, not cached at startup.
+* `antiCheatChecksumSeed` is 0 in TeraSharp. Harmless while the proxy runs with
+  `"integrity": false` (`status/PROXY-DESIGN.md` section 1), but it is the same packet and the same
+  fix.
+
+**Second, unrelated bug found in the same diff.** `S_SELECT_USER` (`byte unk1 / uint16 unk2 /
+uint64 unk3`, 11-byte body) is the same length in both and differently laid out:
+
+```
+real     37   01 | 01 00 | 00 00 00 00 00 00 00 00      unk1=1 unk2=1 unk3=0
+TeraSharp 33  01 | 00 00 | 00 00 00 00 00 01 01         unk1=1 unk2=0 unk3=0x0101000000000000
+```
+
+TeraSharp writes the two trailing bytes at the end of `unk3` instead of into `unk2` - the fields
+are being emitted out of declaration order. Not the Alt+A gate (the panel is decided long before
+`S_SELECT_USER`), but it is wrong bytes on the wire and should be its own task.
