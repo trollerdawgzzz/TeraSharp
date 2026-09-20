@@ -100,6 +100,7 @@ public static class HandlerRegistry
                 SocialHandlers.SendUpdateFriendInfo(s);      // real Arbiter sends it too (cap_newchar_client frame 307)
                 ClientSettingsHandlers.SendAccountSetting(s);
                 ClientSettingsHandlers.SendUserSetting(s);
+                s.Send(ArbiterClientHandlers.BuildVersionInfo());   // T131: cap frame 286, before the parcel status
                 ParcelHandlers.SendReadRecvStatus(s);        // T42: 13-byte S_PARCEL_READ_RECV_STATUS (cap frame 312)
                 return true;
             }
