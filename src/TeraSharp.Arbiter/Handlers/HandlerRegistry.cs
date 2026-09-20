@@ -330,6 +330,12 @@ public static class HandlerRegistry
             Reg(chatName, ChatManager.MinBodyLength(chatOp),
                 (s, b) => ChatManager.OnClientPacket(s, chatOp, b));
 
+        // T136b: the instance-matching window. Read-only pair answered for real; the queue pair
+        // refused until the instance hand-off exists. World/MatchWiring.cs.
+        foreach (var (matchName, matchOp) in MatchWiring.ClientOpcodes)
+            Reg(matchName, MatchWiring.MinBodyLength(matchOp),
+                (s, body) => MatchWiring.OnClientPacket(s, matchOp, body));
+
         // --- Inventory window ---
         Reg("C_SHOW_ITEMLIST", 0, (s, body) =>
         {
