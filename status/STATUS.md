@@ -920,3 +920,46 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   Tests: `T122_the_lobby_shows_the_stored_level_not_the_login_snapshot` (level 11 from the row,
   then 8 after `UpdateLevelAndExp`, with T76's five fields still landing and an unknown id
   changing nothing) and `T122_the_lobby_hp_and_mp_come_from_the_saved_blob`.
+
+- T119: **the leaderboard answers from our own data** (`status/LEADERBOARD.md` section 6).
+  T118 left both ranking replies as empty forms; they are now filled. New
+  `World/RankingBoards.cs` builds `S_PVE_RANKING_LIST` (0xBEDC) and `S_PVP_RANKING_LIST`
+  (0x62FA), and `CharacterStore` gained the two sources.
+
+  **No capture exists** - the real Arbiter never answers `C_REQUEST_P*_RANKING` on 100.02,
+  confirmed live - so the PvP layout is the shipped def and the PvE layout is read off the
+  writer `PVERankingSystemManager::SendRankList` (Arb_part_050.c:9747, stamping 0xBEDC at
+  :9758), whose own def has no fields at all: 31 fixed bytes, then a NUL-terminated UTF-16
+  name.
+
+  **Sources.** PvE = `SUM(dungeon_cooldowns.clear_count)`, which `SA_UPDATE_DUNGEON_CLEAR_COUNT`
+  (0x13B7) writes on every clear. PvP = `game_log` rows with `category='pvp'` and
+  `action='pvp.kill'`, counted per actor (`pk.kill` is the outlaw counter and is not the
+  board). The brief asked for a game_log **dungeon** category: there is none - T115 created
+  eight and no decoded log opcode carries a clear - so the clear counter is the nearest real
+  source rather than an invented one, and a test says so.
+
+  **Three PvE scalars have no name** in the def, any dumper or any capture. The binary gives
+  only the relation: `IsRookie(int,int,int)` is `(myLevel < B + A) && (B <= myLevel)` over the
+  +11 and +7 values, so those two are a level band, not the entry's level. Our choice is
+  written down in `BuildPveRankingList`: +15 rank, +19 score (i64), +27 class, +11 the entry's
+  level, +7 a band width of 0, and the rookie flag computed from what we wrote - so it is
+  always 0, which is "we do not model the rookie band" rather than a flag that means nothing.
+
+  Dense ranks, ties broken by character id, class filter on T118's range (`0..14` exact, `0x10`
+  aggregate), 50 a page, and the requester's own row appended when the page does not hold it.
+  The request has no page field, so the handler sends page 0 plus that row. Only
+  `season == 1` - the season `S_P*_LEADER_BOARD_INFO` advertises (T91) - has rows; anything
+  else is an empty board rather than a wrong one. Both queries drop deleted characters and
+  zero scores and cap at `RankingScoreLimit = 500`.
+
+  Registry unchanged: both opcodes still point at `LeaderboardPackets.OnRequestPveRanking` /
+  `OnRequestPvpRanking`.
+
+  Tests: `T119_the_pve_list_is_the_writers_thirty_one_byte_element`,
+  `T119_the_pvp_list_matches_its_def_through_the_writer` (the same rows written through the
+  shared `DefinitionWriter` must be byte-identical - the only independent witness this packet
+  has), `T119_an_empty_board_is_the_form_t118_already_sent`,
+  `T119_ranks_are_dense_stable_and_class_filtered`,
+  `T119_the_page_always_carries_the_requesters_own_row`,
+  `T119_the_two_boards_come_from_real_stored_progress`.

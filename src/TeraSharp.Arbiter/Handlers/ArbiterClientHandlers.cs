@@ -2,6 +2,7 @@
 using TeraSharp.Arbiter.Game;
 using TeraSharp.Arbiter.Network;
 using TeraSharp.Arbiter.Persistence;
+using TeraSharp.Arbiter.World;
 
 namespace TeraSharp.Arbiter.Handlers;
 
@@ -4751,7 +4752,8 @@ public static class LeaderboardPackets
             BitConverter.ToInt32(b[ClassOffset..]));
 
     /// <summary>
-    /// C_REQUEST_PVE_RANKING (0xA024) -&gt; S_PVE_RANKING_LIST (0xBEDC), empty list.
+    /// C_REQUEST_PVE_RANKING (0xA024) -&gt; S_PVE_RANKING_LIST (0xBEDC), built from
+    /// <c>dungeon_cooldowns.clear_count</c> (T119).
     /// An out-of-range class is refused here rather than forwarded: TeraSharp does not index
     /// anything with it, but answering it as if it were valid would teach a probing client that
     /// the value is accepted, and the same value against the real Arbiter is the crash.
@@ -4759,7 +4761,8 @@ public static class LeaderboardPackets
     public static bool OnRequestPveRanking(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
         => Ranking(s, body, log, "S_PVE_RANKING_LIST", pve: true);
 
-    /// <summary>C_REQUEST_PVP_RANKING (0x573B) -&gt; S_PVP_RANKING_LIST (0x62FA), empty array.</summary>
+    /// <summary>C_REQUEST_PVP_RANKING (0x573B) -&gt; S_PVP_RANKING_LIST (0x62FA), built from
+    /// the game log's pvp.kill rows (T119).</summary>
     public static bool OnRequestPvpRanking(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
         => Ranking(s, body, log, "S_PVP_RANKING_LIST", pve: false);
 
@@ -4781,14 +4784,25 @@ public static class LeaderboardPackets
                 reply, season, id, cls, MaxRankingClass, AllRankingClasses);
             return true;
         }
-        log.LogInformation("{Reply}: season={S} id={I} class={C} - empty list until T119",
-            reply, season, id, cls);
+        // T119: answered from our own data. The request carries no page - there is nowhere in
+        // its three fields to put one - so this is always page 0 plus the requester's own row.
+        int me = (int)(s.SelectedCharacter?.Id ?? 0);
+        int myLevel = s.SelectedCharacter?.Level ?? 0;
+        var store = Program.Store;
 
-        if (pve) s.Send(BuildPveRankingList());
-        else s.SendByDef(reply, new Dictionary<string, object>
-        {
-            ["players"] = new List<Dictionary<string, object>>(),
-        });
+        // Only the season we advertised in S_P*_LEADER_BOARD_INFO has rows. The real handler
+        // answers `== current` from the live tree and `< current` from an archive we do not
+        // keep, and does nothing at all above it - so anything but the current season is an
+        // empty board rather than a wrong one.
+        var scores = season == RankingBoards.CurrentSeason && store != null
+            ? (pve ? store.GetPveRankingScores() : store.GetPvpRankingScores())
+            : new List<CharacterStore.RankingScore>();
+        var page = RankingBoards.Page(RankingBoards.Rank(scores, cls), 0, me);
+
+        log.LogInformation("{Reply}: season={S} id={I} class={C} - {N} row(s) for player {Me}",
+            reply, season, id, cls, page.Count, me);
+        s.Send(pve ? RankingBoards.BuildPveRankingList(page, myLevel)
+                   : RankingBoards.BuildPvpRankingList(page));
         return true;
     }
 

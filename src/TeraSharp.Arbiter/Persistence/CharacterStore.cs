@@ -5216,6 +5216,64 @@ DELETE FROM restrictions      WHERE character_id = $id;";
     // T115 - the game log. status/GAME-LOG.md.
     // =====================================================================
 
+    // =====================================================================
+    // T119 - the two leaderboard sources. status/LEADERBOARD.md section 6.
+    // =====================================================================
+
+    /// <summary>One character's score on one board, before it is ranked.</summary>
+    public readonly record struct RankingScore(
+        int CharacterId, string Name, int Class, int Level, long Score);
+
+    /// <summary>How many characters either board will consider. Far above any population this
+    /// server will see, and a bound on the query rather than on the frame.</summary>
+    public const int RankingScoreLimit = 500;
+
+    /// <summary>
+    /// The PvE board: total dungeon clears per character.
+    ///
+    /// <para><c>dungeon_cooldowns.clear_count</c> is the only dungeon progress TeraSharp
+    /// stores, and it is live - <c>SA_UPDATE_DUNGEON_CLEAR_COUNT</c> (0x13B7) writes it through
+    /// <see cref="SetDungeonClearCount"/> on every clear. The T119 brief asked for a
+    /// <c>game_log</c> dungeon category; there is no such category (T115 created eight, and
+    /// none of the five log opcodes carries a dungeon clear), so this is the nearest real
+    /// source rather than an invented one.</para>
+    /// </summary>
+    public List<RankingScore> GetPveRankingScores(int limit = RankingScoreLimit)
+        => RankingScores(
+            "SELECT c.id, c.name, c.class, c.level, SUM(d.clear_count) AS score " +
+            "FROM dungeon_cooldowns d JOIN characters c ON c.id = d.owner_id " +
+            "WHERE c.deleted_at = 0 GROUP BY c.id HAVING score > 0 " +
+            "ORDER BY score DESC, c.id LIMIT $take", limit);
+
+    /// <summary>
+    /// The PvP board: kills per character, counted out of the game log T115 fills from
+    /// <c>SDB_ADD_PVP_USER_LOG</c> (0x27FE). Only rows where the character is the ACTOR count -
+    /// being the target of a kill is the other player's score, not yours.
+    /// </summary>
+    public List<RankingScore> GetPvpRankingScores(int limit = RankingScoreLimit)
+        => RankingScores(
+            "SELECT c.id, c.name, c.class, c.level, COUNT(*) AS score " +
+            "FROM game_log g JOIN characters c ON c.id = g.character_id " +
+            "WHERE g.category = 'pvp' AND g.action = 'pvp.kill' AND c.deleted_at = 0 " +
+            "GROUP BY c.id HAVING score > 0 ORDER BY score DESC, c.id LIMIT $take", limit);
+
+    private List<RankingScore> RankingScores(string sql, int limit)
+    {
+        if (limit <= 0 || limit > RankingScoreLimit) limit = RankingScoreLimit;
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = sql;
+            cmd.Parameters.AddWithValue("$take", limit);
+            var rows = new List<RankingScore>();
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                rows.Add(new RankingScore(r.GetInt32(0), r.GetString(1), r.GetInt32(2),
+                                          r.GetInt32(3), r.GetInt64(4)));
+            return rows;
+        }
+    }
+
     /// <summary>One <c>game_log</c> row, as <see cref="QueryGameLog"/> returns it.</summary>
     public sealed record GameLogRow(
         long LogId, long LoggedAt, string Category, string Action, long AccountId,

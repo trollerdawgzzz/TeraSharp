@@ -24582,4 +24582,243 @@ string message
             "S_VISIT_NEW_SECTION, cap_social_client frame 374");
     }
 
+
+    // ===================== T119: the two leaderboards, from our own data =====================
+
+    /// <summary>
+    /// S_PVE_RANKING_LIST (0xBEDC), byte-exact against the writer's own stores.
+    /// <c>PVERankingSystemManager::SendRankList</c> (Arb_part_050.c:9747) lays down
+    /// <c>here/next/nameOffset</c> as u16, then a u8 at +6 and scalars at +7/+11/+15/+19/+27,
+    /// bumps the cursor by 0x1F and writes the name - so the element is 31 fixed bytes plus a
+    /// NUL-terminated UTF-16 name, and every offset below is that function's.
+    /// <para>There is no capture: the real Arbiter never answers this packet on 100.02.</para>
+    /// </summary>
+    [Test] public static void T119_the_pve_list_is_the_writers_thirty_one_byte_element()
+    {
+        Hex.Eq(RankingBoards.BuildPveRankingList(T119Rows(1)), T119PveOne,
+            "one row: name at +0x27, rank at +15, the i64 score at +19, class at +27");
+        Hex.Eq(RankingBoards.BuildPveRankingList(T119Rows(2)), T119PveTwo,
+            "two rows: element 1 starts at 0x2B, which is element 0's name end");
+
+        // The offsets the test bytes encode, named so a future edit cannot quietly move one.
+        Hex.True(RankingBoards.PveElementFixedSize == 0x1F,
+            $"the writer's own `*local_b0 += 0x1f`: {RankingBoards.PveElementFixedSize}");
+        Hex.True(RankingBoards.PveRookieOffset == 6 && RankingBoards.PveBandWidthOffset == 7
+                 && RankingBoards.PveBandBaseOffset == 11 && RankingBoards.PveRankOffset == 15
+                 && RankingBoards.PveScoreOffset == 19 && RankingBoards.PveClassOffset == 27,
+            "the six stores after the three u16 slots");
+
+        // IsRookie(myLevel, base, width) = (myLevel < base + width) && (base <= myLevel).
+        // We send width 0, so the flag is always 0 - "we do not model the rookie band" rather
+        // than a flag that means nothing. A viewer at the entry's own level must not flip it.
+        var atSameLevel = RankingBoards.BuildPveRankingList(T119Rows(1), viewerLevel: 60);
+        Hex.True(atSameLevel[RankingBoards.HeaderSize + RankingBoards.ListHeadSize
+                             + RankingBoards.PveRookieOffset] == 0,
+            "a zero-width band is never a rookie band, whoever is looking");
+    }
+
+    /// <summary>
+    /// S_PVP_RANKING_LIST (0x62FA), byte-exact - and cross-checked against the shipped .def
+    /// through the shared DefinitionWriter, which is the only independent witness this packet
+    /// has. If the hand-rolled element and the def's encoding ever disagree, this fails.
+    /// </summary>
+    [Test] public static void T119_the_pvp_list_matches_its_def_through_the_writer()
+    {
+        Hex.Eq(RankingBoards.BuildPvpRankingList(T119Rows(1)), T119PvpOne,
+            "one row: 23 fixed bytes, name at +0x1F");
+        Hex.Eq(RankingBoards.BuildPvpRankingList(T119Rows(2)), T119PvpTwo,
+            "two rows, each terminating its own link");
+
+        var reg = LoadDefinitionsOrSkip();
+        if (reg == null) return;
+        for (int n = 0; n <= 2; n++)
+        {
+            var rows = T119Rows(n);
+            var players = new List<Dictionary<string, object>>();
+            foreach (var r in rows)
+                players.Add(new Dictionary<string, object>
+                {
+                    ["unk"] = 0, ["unk2"] = (byte)0, ["rank"] = r.Rank,
+                    ["rating"] = (int)r.Score, ["class"] = r.Class, ["name"] = r.Name,
+                });
+            var byDef = WriteByDef(reg, "S_PVP_RANKING_LIST",
+                new Dictionary<string, object> { ["players"] = players });
+            var mine = RankingBoards.BuildPvpRankingList(rows);
+            Hex.Eq(byDef, mine[4..], $"{n} row(s): our body is the def's body");
+        }
+    }
+
+    /// <summary>Two rows, fixed, so the byte strings above mean something on their own.</summary>
+    static List<RankingRow> T119Rows(int n)
+    {
+        var all = new List<RankingRow>
+        {
+            new RankingRow(1, 41, "a", 3, 60, 7),
+            new RankingRow(2, 42, "bb", 7, 44, 3),
+        };
+        return all.GetRange(0, n);
+    }
+
+    const string T119PveOne =
+        "2B 00  DC BE  01 00  08 00"
+        + "  08 00  00 00  27 00  00  00 00 00 00  3C 00 00 00  01 00 00 00"
+        + "  07 00 00 00 00 00 00 00  03 00 00 00  61 00 00 00";
+
+    const string T119PveTwo =
+        "50 00  DC BE  02 00  08 00"
+        + "  08 00  2B 00  27 00  00  00 00 00 00  3C 00 00 00  01 00 00 00"
+        + "  07 00 00 00 00 00 00 00  03 00 00 00  61 00 00 00"
+        + "  2B 00  00 00  4A 00  00  00 00 00 00  2C 00 00 00  02 00 00 00"
+        + "  03 00 00 00 00 00 00 00  07 00 00 00  62 00 62 00 00 00";
+
+    const string T119PvpOne =
+        "23 00  FA 62  01 00  08 00"
+        + "  08 00  00 00  1F 00  00 00 00 00  00  01 00 00 00  07 00 00 00  03 00 00 00"
+        + "  61 00 00 00";
+
+    const string T119PvpTwo =
+        "40 00  FA 62  02 00  08 00"
+        + "  08 00  23 00  1F 00  00 00 00 00  00  01 00 00 00  07 00 00 00  03 00 00 00"
+        + "  61 00 00 00"
+        + "  23 00  00 00  3A 00  00 00 00 00  00  02 00 00 00  03 00 00 00  07 00 00 00"
+        + "  62 00 62 00 00 00";
+
+    /// <summary>
+    /// An empty board is exactly the frame T118 shipped. That form is the one thing about
+    /// these two packets that has been in front of a live client, so T119 must not change it.
+    /// </summary>
+    [Test] public static void T119_an_empty_board_is_the_form_t118_already_sent()
+    {
+        Hex.Eq(RankingBoards.BuildPveRankingList(null),
+            LeaderboardPackets.BuildPveRankingList(),
+            "the empty PvE list is byte-identical to T118's");
+        Hex.Eq(RankingBoards.BuildPvpRankingList(new List<RankingRow>()),
+            "08 00  FA 62  00 00  00 00",
+            "and the empty PvP list is the def's own empty array, with the header");
+        Hex.True(RankingBoards.S_PVE_RANKING_LIST == LeaderboardPackets.S_PVE_RANKING_LIST
+                 && RankingBoards.S_PVP_RANKING_LIST == 0x62FA,
+            "both opcodes are data.json's 376012 map");
+        Hex.True(RankingBoards.CurrentSeason == 1,
+            "and the season is the one S_P*_LEADER_BOARD_INFO advertises (T91)");
+    }
+
+    /// <summary>
+    /// Ranking: score descending, ties share a dense rank, the id breaks the tie so two calls
+    /// give the same order, a zero score is not on the board at all, and the class filter is
+    /// the one T118 pinned - 0..14 exact, 0x10 aggregate.
+    /// </summary>
+    [Test] public static void T119_ranks_are_dense_stable_and_class_filtered()
+    {
+        var scores = new List<TeraSharp.Arbiter.Persistence.CharacterStore.RankingScore>
+        {
+            new(7, "seven", 3, 60, 5),
+            new(2, "two",   3, 60, 9),
+            new(5, "five",  8, 60, 5),
+            new(9, "nine",  3, 60, 0),
+        };
+
+        var all = RankingBoards.Rank(scores, RankingBoards.AllClasses);
+        Hex.True(all.Count == 3, $"the zero score is off the board: {all.Count}");
+        Hex.True(all[0].CharacterId == 2 && all[0].Rank == 1, "9 clears leads");
+        Hex.True(all[1].CharacterId == 5 && all[1].Rank == 2,
+            "the tie is broken by id, so 5 comes before 7");
+        Hex.True(all[2].CharacterId == 7 && all[2].Rank == 2,
+            "and both halves of the tie are rank 2 - dense, not competition ranking");
+
+        var warriors = RankingBoards.Rank(scores, 3);
+        Hex.True(warriors.Count == 2 && warriors[0].CharacterId == 2
+                 && warriors[1].CharacterId == 7, "class 3 keeps 2 and 7, drops the class-8 row");
+        Hex.True(warriors[1].Rank == 2,
+            "and ranks are recomputed inside the filter, not carried over from the full board");
+
+        Hex.True(RankingBoards.ClassMatches(RankingBoards.AllClasses, 14)
+                 && RankingBoards.ClassMatches(0, 0) && !RankingBoards.ClassMatches(0, 1),
+            "0x10 admits everything; every other filter is an exact class");
+        Hex.True(RankingBoards.Rank(new List<TeraSharp.Arbiter.Persistence.CharacterStore
+                                        .RankingScore>(), 0).Count == 0,
+            "an empty source ranks to an empty board");
+    }
+
+    /// <summary>
+    /// Paging, and the one rule the leaderboard window actually depends on: your own row is in
+    /// the frame even when it is nowhere near the page you were sent.
+    /// </summary>
+    [Test] public static void T119_the_page_always_carries_the_requesters_own_row()
+    {
+        var all = new List<RankingRow>();
+        for (int i = 1; i <= 5; i++) all.Add(new RankingRow(i, i, "c" + i, 3, 60, 100 - i));
+
+        var first = RankingBoards.Page(all, 0, selfId: 0, pageSize: 2);
+        Hex.True(first.Count == 2 && first[0].CharacterId == 1, "page 0 of 2 is the top two");
+        Hex.True(RankingBoards.Page(all, 2, 0, 2).Count == 1, "five rows leave one on page 2");
+        Hex.True(RankingBoards.Page(all, 3, 0, 2).Count == 0,
+            "and page 3 is empty rather than clamped - a wrong page is not a wrong board");
+
+        var withSelf = RankingBoards.Page(all, 0, selfId: 5, pageSize: 2);
+        Hex.True(withSelf.Count == 3 && withSelf[2].CharacterId == 5 && withSelf[2].Rank == 5,
+            "the requester is appended, keeping the rank it has on the full board");
+        var onPage = RankingBoards.Page(all, 0, selfId: 1, pageSize: 2);
+        Hex.True(onPage.Count == 2, "and is not appended twice when the page already holds it");
+        Hex.True(RankingBoards.Page(all, 0, selfId: 99, pageSize: 2).Count == 2,
+            "an unranked requester adds nothing - there is no row to append");
+
+        // The page index comes off the wire in the general case; it must not overflow.
+        Hex.True(RankingBoards.Page(all, int.MaxValue, 0, 2).Count == 0
+                 && RankingBoards.Page(all, 0, 0, 0).Count == 5
+                 && RankingBoards.Page(all, 0, 0, -1).Count == 5,
+            "a huge page is empty rather than an overflowed index, and a nonsense page "
+            + "size falls back to the 50 of PageSize, which holds all five");
+    }
+
+    /// <summary>
+    /// Both boards, out of the store, against real stored progress: PvE sums
+    /// <c>dungeon_cooldowns.clear_count</c> (what SA_UPDATE_DUNGEON_CLEAR_COUNT 0x13B7 writes)
+    /// and PvP counts the game log's <c>pvp.kill</c> rows.
+    /// <para>The brief asked for a game_log dungeon category; there is none - T115 created
+    /// eight categories and no log opcode carries a dungeon clear - so the clear counter is
+    /// the nearest real source, and this test is what says so.</para>
+    /// </summary>
+    [Test] public static void T119_the_two_boards_come_from_real_stored_progress()
+    {
+        using var store = StoreWithTwoAccounts();      // id 1 = t30_1, id 2 = t30_2
+
+        Hex.True(store.GetPveRankingScores().Count == 0
+                 && store.GetPvpRankingScores().Count == 0,
+            "a fresh store has no board at all, not a board of zeroes");
+
+        store.SetDungeonClearCount(1, 9920, 3);
+        store.SetDungeonClearCount(1, 3023, 4);
+        store.SetDungeonClearCount(2, 9920, 5);
+        var pve = store.GetPveRankingScores();
+        Hex.True(pve.Count == 2, $"two characters have cleared something: {pve.Count}");
+        Hex.True(pve[0].CharacterId == 1 && pve[0].Score == 7,
+            $"character 1's two dungeons sum to 7: {pve[0].Score}");
+        Hex.True(pve[1].CharacterId == 2 && pve[1].Score == 5, "and 2 is behind on 5");
+        Hex.True(pve[0].Name == "t30_1" && pve[0].Class == 12 && pve[0].Level == 11,
+            "the row carries the name, class and level the frame needs");
+
+        store.SetDungeonClearCount(1, 3027, 0);
+        Hex.True(store.GetPveRankingScores()[0].Score == 7,
+            "an entry with no clears adds nothing");
+
+        store.AddGameLog(GameLogPackets.CategoryPvp, "pvp.kill", 0, 2, 1, 0, 0, 0, 0, null, 1000);
+        store.AddGameLog(GameLogPackets.CategoryPvp, "pvp.kill", 0, 2, 1, 0, 0, 0, 0, null, 1001);
+        store.AddGameLog(GameLogPackets.CategoryPvp, "pk.kill", 0, 1, 2, 0, 0, 0, 0, null, 1002);
+        var pvp = store.GetPvpRankingScores();
+        Hex.True(pvp.Count == 1 && pvp[0].CharacterId == 2 && pvp[0].Score == 2,
+            "two kills for character 2; pk.kill is the outlaw counter and is not the board");
+        Hex.True(store.GetPvpRankingScores(0).Count == 1
+                 && store.GetPvpRankingScores(-5).Count == 1
+                 && store.GetPvpRankingScores(int.MaxValue).Count == 1,
+            "and a nonsense limit falls back to the cap rather than to no rows");
+
+        // End to end: the store's rows, ranked and framed, are the frame the handler sends.
+        var frame = RankingBoards.BuildPveRankingList(
+            RankingBoards.Page(RankingBoards.Rank(pve, RankingBoards.AllClasses), 0, selfId: 2));
+        Hex.True(BitConverter.ToUInt16(frame, 2) == RankingBoards.S_PVE_RANKING_LIST
+                 && BitConverter.ToUInt16(frame, 4) == 2
+                 && BitConverter.ToUInt16(frame, 0) == frame.Length,
+            "0xBEDC, two rows, and a length field that is the frame's own length");
+    }
+
 }
