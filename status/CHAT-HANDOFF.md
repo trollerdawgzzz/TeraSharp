@@ -124,6 +124,27 @@ and look for the next caller.
 
 ## Next steps (in order)
 
+**Checkpoint 2026-09-20 (late) - 854 tests, T125-T138a merged, ticket patch APPLIED.** Captures:
+classic_live/2/3 (Noctenium .npcap from the live Classic+ server via tools/npcap-to-capture.ps1 -
+leaderboard populated, BG+dungeon queue as member and leader, guild quests), cap_multiworld/2/3 (tap
+with DungeonServer --id=13; #3 is the definitive cross-World hand-off: 0x13BE on main -> 0x13BF on
+owner link, 0x13C5/0x13C0 on owner -> 0x13C1 back, SDB_USER_ENTERWORLD on the owner link, client channel
+= internal+1, client sees a plain zone change). DONE: leaderboard validated + my-record (T126/T133),
+guild quests (T135), matchmaking window (T134/T136/T136b - queue refused until hand-off), dungeon
+cool-time/clear-count windows, /@vis /@invis GM visibility (T128), ContinentRouting from 0x294E/0x164D
+(T138), per-World ticket patch on master (T138a - apply with --ignore-whitespace: master is CRLF,
+patch LF). IN FLIGHT: T138b = wire the crossing pairs at WorldBridge.HandleFrame + matchmaker (1/1/3
+roles, party slots kept, BG random fill with per-BG composition table, rating +/-5..12 cosmetic, no MMR).
+OPS LESSONS: ServerConfig.xml MUST keep its UTF-8 BOM (WriteAllText with UTF8Encoding($true)) or the
+real Arbiter exits 1 silently; SpeedHack turnOn=false for GM testing; two Worlds fit in 32 GB only
+with the low-mem config; start order for the real Arbiter = hub -> hub_gw -> arb_gw -> tap ->
+Arbiter -> World --id=1 -> --id=13 (AccountId:0 logins = gateway started after the Arbiter); tap link
+numbers climb on every World reconnect. Alt+A: S_LOGIN_ACCOUNT_INFO's apiServerAddress is
+DeploymentConfig <APIServer port=8800 ttl=120> = the retail admin-tool HTTP endpoint; the probe
+(TERASHARP_API_GATEWAY_SERVE=1 on 8800, urlacl + firewall done) has NOT been pressed yet - one press
+settles it. After T138b: deploy with WorldServer --id=1 and --id=13 against TeraSharp, walk into
+Velik's Sanctuary (9781), queue a dungeon and a BG, then docs/GO-LIVE.md.
+
 **Checkpoint 2026-09-20 - 832 tests, T113-T124b merged.** Live session with the Classic+ client (the
 `D:\Tera 100` client doesn't exercise leaderboard/Alt+A; Classic+ does - run it via the rust launcher
 at D:\tera-rust-launcher-local which auths to tera-api, path=D:\Tera 100). FIXED LIVE THIS ROUND:
