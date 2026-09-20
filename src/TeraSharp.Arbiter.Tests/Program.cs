@@ -12398,116 +12398,80 @@ bool   isGuildWarAcceptable
     }
 
     /// <summary>
-    /// T138 - the cross-World hand-off, replayed against two fake links with the exact bytes
-    /// cap_multiworld3 carries. Link 11 is the main World (id 0), link 14 the DungeonServer
-    /// (id 13) that owns Velik's Sanctuary, 9781.
+    /// <summary>
+    /// T138b - the cross-World hand-off, replayed with the exact bytes cap_multiworld3 carries.
+    /// World 0 is the main World; world 13 is the DungeonServer that owns Velik's Sanctuary,
+    /// 9781. After the T138b fold this exercises the ONE home - WorldContinentList feeding
+    /// DungeonChannels, and ContinentHandoff for the two crossing replies.
     /// </summary>
-    [Test] public static void T138_continent_routing_replays_the_capture()
+    [Test] public static void T138b_continent_handoff_replays_the_capture()
     {
-        ContinentRouting.Reset();
-
-        // ---- 0x294E: two shapes, and the id is where it is ----
-        Hex.True(ContinentRouting.ReadServerId(
-                     Hex.B("01 00 00 00 12 00 00 00 00 00 00 00 12 00 00 00 00 00 00 00 01 00 00 00")) == 0,
-            "link #11's 24-byte form is the main World, id 0");
-        Hex.True(ContinentRouting.ReadServerId(Hex.B("00 00 00 00 00 00 00 00 0D 00 00 00")) == 13
-                 && ContinentRouting.ReadServerId(Hex.B("00 00 00 00 00 00 00 00 0C 00 00 00")) == 12,
-            "the 12-byte form carries the id at +8 - 13 on #14, 12 on #4");
-        Hex.True(ContinentRouting.ReadServerId(Hex.B("00 00")) == null,
-            "anything else is not a registration");
-
         // ---- 0x164D: header then 16-byte rows, the continent at row+8 ----
-        // The real prefix of link #14's roster, truncated to its first two rows.
-        var roster14 = ContinentRouting.ReadRoster(Hex.B(
+        // Link #14's real roster prefix, truncated to its first row and the row for 9781.
+        var roster13 = WorldContinentList.Parse(Hex.B(
             "02 00 00 00 16 00 00 00 F0 0A 00 00 0D 00 00 00 "     // count 2, unk 22, planet 2800, world 13
-            + "16 00 00 00 26 00 00 00 D6 0B 00 00 00 00 00 00 "   // rows 22-38 -> continent 3030
-            + "E6 01 00 00 F6 01 00 00 35 26 00 00 00 00 00 00"));  // rows 486-502 -> continent 9781
-        Hex.True(roster14 != null && roster14!.WorldId == 13 && roster14.PlanetId == 2800
-                 && roster14.Continents.Count == 2
-                 && roster14.Continents[0].ContinentId == 3030
-                 && roster14.Continents[1].ContinentId == 9781
-                 && roster14.Continents[1].MinLevel == 486 && roster14.Continents[1].MaxLevel == 502,
+            + "16 00 00 00 26 00 00 00 D6 0B 00 00 00 00 00 00 "   // levels 22-38 -> continent 3030
+            + "E6 01 00 00 F6 01 00 00 35 26 00 00 00 00 00 00")); // levels 486-502 -> continent 9781
+        Hex.True(roster13 != null && roster13!.WorldId == 13 && roster13.PlanetId == 2800
+                 && roster13.Rows.Count == 2
+                 && roster13.Rows[0].ContinentId == 3030
+                 && roster13.Rows[1].ContinentId == 9781
+                 && roster13.Rows[1].MinLevel == 486 && roster13.Rows[1].MaxLevel == 502,
             "cap_multiworld3 link #14 - 9781 is row 29 of 34, levels 486-502");
-        var roster11 = ContinentRouting.ReadRoster(Hex.B(
+        var roster0 = WorldContinentList.Parse(Hex.B(
             "01 00 00 00 16 00 00 00 F0 0A 00 00 00 00 00 00 "
             + "16 00 00 00 26 00 00 00 34 08 00 00 00 00 00 00"));
-        Hex.True(roster11 != null && roster11!.WorldId == 0 && roster11.Continents[0].ContinentId == 2100,
-            "link #11 - the main World's roster starts at 2100 and never lists 9781");
-        Hex.True(ContinentRouting.ReadRoster(Hex.B("05 00 00 00 16 00 00 00")) == null,
-            "a count that overruns the body is refused, not read past");
+        Hex.True(roster0 != null && roster0!.WorldId == 0 && roster0.Rows[0].ContinentId == 2100,
+            "the main World's roster starts at 2100 and never lists 9781");
+        Hex.True(WorldContinentList.Parse(Hex.B("05 00 00 00 16 00 00 00")) == null,
+            "a count that overruns the payload is refused, not read past");
 
-        // ---- part 1: 9781 resolves to the owner, everything else to main ----
-        ContinentRouting.RegisterRoster(11, roster11!);
-        ContinentRouting.RegisterRoster(14, roster14!);
-        Hex.True(ContinentRouting.LinkForContinent(9781) == 14, "9781 belongs to the DungeonServer link");
-        Hex.True(ContinentRouting.LinkForContinent(2100) == 11, "2100 belongs to the main link");
-        Hex.True(ContinentRouting.LinkForContinent(7005) == 11,
-            "and a continent NOBODY claimed falls through to main - the catch-all");
-        Hex.True(ContinentRouting.IsCrossWorld(9781, 11) && !ContinentRouting.IsCrossWorld(2100, 11),
-            "only 9781 crosses");
+        // ---- it feeds the SAME table WorldServerList seeds from config ----
+        var channels = new DungeonChannels();
+        Hex.True(channels.WorldForContinent(9781) == null,
+            "nothing claimed yet - and an empty map is a single-World server");
+        Hex.True(WorldContinentList.Apply(channels, Hex.B(
+                "01 00 00 00 16 00 00 00 F0 0A 00 00 0D 00 00 00 "
+                + "E6 01 00 00 F6 01 00 00 35 26 00 00 00 00 00 00")) == 1,
+            "one continent claimed");
+        Hex.True(channels.WorldForContinent(9781) == 13, "9781 now routes to world 13");
+        Hex.True(channels.WorldForContinent(2100) == null,
+            "and a continent nobody claimed stays unclaimed - the caller falls back to main");
 
-        // ---- single-World unchanged: one link, everything routes to it ----
-        ContinentRouting.Reset();
-        ContinentRouting.RegisterRoster(11, roster11!);
-        Hex.True(ContinentRouting.LinkForContinent(9781) == 11
-                 && ContinentRouting.LinkForContinent(2100) == 11
-                 && !ContinentRouting.IsCrossWorld(9781, 11),
-            "with one World linked nothing ever crosses - today's behaviour, exactly");
+        // ---- single-World unchanged: no roster, no claims, nothing ever routes away ----
+        var solo = new DungeonChannels();
+        Hex.True(solo.WorldForContinent(9781) == null && solo.ConfiguredContinents == 0,
+            "with one World linked the map stays empty - today's behaviour, exactly");
 
-        // ---- part 2: the two crossing replies ----
-        ContinentRouting.Reset();
-        ContinentRouting.RegisterRoster(11, roster11!);
-        ContinentRouting.RegisterRoster(14, roster14!);
-
+        // ---- the two crossing replies ----
         var request = Hex.B("20 00 92 CA 6A 02 00 00 35 26 00 00 01 00 00 00 00 00 00 00 00 00 00 00");
-        Hex.True(ContinentRouting.ContinentInRequest(request) == 9781,
-            "the continent sits right after the 8-byte handle");
-        Hex.Eq(ContinentRouting.BuildEnterContinentBody(request)!,
+        Hex.True(ContinentHandoff.ContinentOf(request) == 9781,
+            "the continent sits right after the 8-byte handle - it picks the destination link");
+        Hex.Eq(ContinentHandoff.EnterReply(request)!,
             "F0 0A 00 00 01 00 00 00 35 26 00 00 01 00 00 00 00 00 00 00 00 00 00 00",
             "0x13BE -> 0x13BF: 8 bytes swapped, the rest copied (cap_multiworld3 17:35:38.020)");
-        Hex.True(ContinentRouting.BuildEnterContinentBody(Hex.B("00 00")) == null,
-            "a body too short for the prefix is refused");
+        Hex.True(ContinentHandoff.EnterReply(Hex.B("00 00")) == null,
+            "a payload too short for the prefix is refused");
 
         var ready = Hex.B("F0 0A 00 00 01 00 00 00 35 26 00 00 01 00 00 00");
-        Hex.Eq(ContinentRouting.BuildContinentReadyBody(ready), ready,
+        Hex.Eq(ContinentHandoff.ReadyReply(ready)!, ready,
             "0x13C0 -> 0x13C1 is a pure relay - the captured pair is 208 B and identical");
 
-        // ---- the channel register/release, and the client's off-by-one ----
-        var add = ContinentRouting.ReadAddChannel(
-            Hex.B("35 26 00 00 0D 00 F0 0A 00 00 00 00 00 00 00 00 00 00 00 00 F0 0A 00 00 01 00 00 00 00 00 00 00"), 14);
-        Hex.True(add != null && add!.Value.ContinentId == 9781 && add.Value.Channel == 13
-                 && add.Value.PlanetId == 2800 && add.Value.Link == 14,
-            "0x13C5 at 17:35:38.021 - continent 9781, channel 13, planet 2800, on the owner's link");
-        ContinentRouting.AddChannel(add.Value);
-        Hex.True(ContinentRouting.NewestChannel(9781)?.Channel == 13, "the channel is live");
-
-        Hex.True(ContinentRouting.ClientChannel(13) == 14 && ContinentRouting.ClientChannel(12) == 13
-                 && ContinentRouting.ClientChannel(15) == 16,
+        // ---- the channel, and the packing the fold reconciled ----
+        var add = channels.Add(13, Hex.B(
+            "35 26 00 00 0D 00 F0 0A 00 00 00 00 00 00 00 00 00 00 00 00 F0 0A 00 00 01 00 00 00 00 00 00 00"));
+        Hex.True(add != null && add!.Value.ContinentId == 9781 && add.Value.WorldId == 13,
+            "0x13C5 at 17:35:38.021 - continent 9781, announced by world 13");
+        Hex.True(ContinentHandoff.ChannelOf(add.Value.ChannelId) == 13
+                 && ContinentHandoff.PlanetOf(add.Value.ChannelId) == 2800,
+            "the +4 int32 is packed: 0D 00 F0 0A = channel 13 | planet 2800 << 16");
+        Hex.True(ContinentHandoff.ClientChannel(13) == 14 && ContinentHandoff.ClientChannel(12) == 13
+                 && ContinentHandoff.ClientChannel(15) == 16,
             "S_CURRENT_CHANNEL carries internal + 1 - four samples across two captures");
 
-        var del = ContinentRouting.ReadDelChannel(Hex.B("35 26 00 00 0D 00 F0 0A"));
-        Hex.True(del != null && del!.Value.ContinentId == 9781 && del.Value.Channel == 13,
-            "0x13C6 at 17:36:06.142 - the same triple, 8 bytes, and nothing else");
-        Hex.True(ContinentRouting.ReleaseChannel(9781, 13)
-                 && ContinentRouting.NewestChannel(9781) == null
-                 && !ContinentRouting.ReleaseChannel(9781, 13),
-            "release once, idempotent after");
-
-        // ---- the counter increments per entry and the newest wins ----
-        ContinentRouting.AddChannel(new ContinentRouting.DungeonChannel(9781, 13, 2800, 14));
-        ContinentRouting.AddChannel(new ContinentRouting.DungeonChannel(9781, 14, 2800, 14));
-        ContinentRouting.AddChannel(new ContinentRouting.DungeonChannel(9781, 15, 2800, 16));
-        Hex.True(ContinentRouting.NewestChannel(9781)?.Channel == 15
-                 && ContinentRouting.NewestChannel(9781)?.Link == 16
-                 && ContinentRouting.LiveChannels().Count == 3,
-            "cap_multiworld3's three entries: 13 on #14, 14 on #14, 15 on #16");
-
-        // ---- a reconnect re-points the continent at the new link ----
-        ContinentRouting.RegisterRoster(16, roster14!);
-        Hex.True(ContinentRouting.LinkForContinent(9781) == 16,
-            "the DungeonServer came back as #16 and the newest registration wins");
-
-        ContinentRouting.Reset();
+        Hex.True(channels.Remove(13, Hex.B("35 26 00 00 0D 00 F0 0A")),
+            "0x13C6 at 17:36:06.142 - the same triple, 8 bytes of payload");
+        Hex.True(!channels.Remove(13, Hex.B("35 26 00 00 0D 00 F0 0A")), "and it is gone");
     }
 
     // ---- The rules ----
