@@ -126,8 +126,9 @@ public static class WorldServerList
             {
                 if (owner.TryGetValue(continentId, out int first))
                 {
+                    // CA2017: one placeholder per argument - {A} may not appear twice.
                     log?.LogWarning("WorldServerList: continent {C} is claimed by world {A} and "
-                        + "world {B} - the real Arbiter asserts on this; keeping {A}",
+                        + "world {B} - the real Arbiter asserts on this; the first one keeps it",
                         continentId, first, e.WorldId);
                     continue;
                 }

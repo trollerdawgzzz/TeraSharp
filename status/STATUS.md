@@ -721,3 +721,31 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   **Step 4**: the per-player control frames still go out on world 0 - 0x1460, 0x1392, 0x1433,
   0x138F, 0x1390, 0x1439. Each is a one-line WorldBridge method needing a worldId from the
   session; none matters until a player is actually in a second World.
+
+- T112 (multi-world step 4, MULTIWORLD-DESIGN.md section 7.2). The six per-player control
+  frames now go to the player's own World, threaded from `GameSession.CurrentWorldId`:
+  `NotifyPlayerLeave(worldId, ...)` for 0x1460 + 0x1392, `NotifyTopoLoaded(worldId, ...)` for
+  0x1390 + 0x138F, and `SendFrame(s.CurrentWorldId, ...)` for 0x1439 in HandlerRegistry's
+  C_LOAD_TOPO_FIN arm. 0x1433 needed nothing: the SA_LEAVE_WORLD reply already goes out on the
+  arriving link and GameSession's copy took CurrentWorldId in T111. Each frame addresses the
+  user by id INSIDE that World, so the wrong World is a lookup miss, not a misroute - for
+  0x1392 it is the `Critical Error LeaveWorld` crash path. Every new signature is an overload;
+  the old no-worldId forms delegate to world 0, so nothing outside the patch moves.
+
+  `status/MULTIWORLD-PATCH.diff` regenerated: **four** human-owned files now -
+  `Handlers/HandlerRegistry.cs` joins WorldBridge (631 lines), WorldEntry (316) and
+  GameSession (355) - 28 hunks, applied result byte-compared against the intended files.
+
+  **Two findings worth keeping.** (1) The patch must be applied with `git apply`. The file is
+  stored all-CRLF (its context lines come from CRLF sources, and the write path normalises the
+  rest), and GNU patch strips trailing CRs by default and then fails every hunk with
+  `different line endings`; `git apply` and `patch -p1 --binary` both work, and both are now
+  checked on every regeneration against a copy normalised the way it lands on disk. The T109
+  and T111 headers recommended plain `patch -p1`, which would not have worked. (2) 0x14FF and
+  0x1500 stay on world 0 on purpose: same one-line change, but one caller
+  (`Handlers/ArbiterClientHandlers.cs:1896`) is Cowork-owned, so adding the parameter in the
+  patch would break the build for everyone until the patch lands. They move with that file.
+
+  Also: CA2017 in `World/WorldServerList.cs` - the duplicate-continent warning had four
+  placeholders (`{A}` twice) for three arguments. Reworded to three. Every Log* call in that
+  file re-checked: placeholders == arguments throughout.

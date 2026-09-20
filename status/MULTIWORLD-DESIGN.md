@@ -333,3 +333,37 @@ T109:
 `AS_UPDATE_VISITED_SECTION_LIST` (0x1439). Each is a one-line `WorldBridge` method that needs a
 worldId threaded from the session, and none of them matters until a player is actually in a
 second World.
+
+#### T112 - the control frames, and a note on applying the patch
+
+Step 4 from the end of 7.2 is done, in the patch. The six per-player control frames now carry
+`GameSession.CurrentWorldId`:
+
+| Op | Name | Where it goes now |
+|---|---|---|
+| 0x1460 | `AS_CANCEL_SKILL_STRICTLY` | `NotifyPlayerLeave(worldId, ...)` |
+| 0x1392 | `AS_LEAVE_WORLD` | same call |
+| 0x1390 | `AS_FORCE_ENTER_DUNGEON_ID` | `NotifyTopoLoaded(worldId, ...)` |
+| 0x138F | `AS_LOAD_TOPO_FIN` | same call |
+| 0x1439 | `AS_UPDATE_VISITED_SECTION_LIST` | `HandlerRegistry`'s C_LOAD_TOPO_FIN arm, `SendFrame(s.CurrentWorldId, ...)` |
+| 0x1433 | `AS_ARBITER_USER_DELETE` | **already right** - the SA_LEAVE_WORLD reply goes out on the arriving link, and GameSession's copy took CurrentWorldId in T111 |
+
+Every one addresses the user by id *inside* that World, so the wrong World is not a misroute but
+a lookup miss; for 0x1392 that is the `Critical Error LeaveWorld` crash path the `LeaveValues`
+comment in WorldBridge already warns about. All the new signatures are overloads - the old
+no-worldId forms remain and delegate to world 0, so nothing outside the patch changes.
+
+That adds `Handlers/HandlerRegistry.cs` to the patch: four human-owned files now (WorldBridge
+631 lines, WorldEntry 316, HandlerRegistry 408, GameSession 355), 28 hunks.
+
+**Still on world 0, deliberately:** `AS_USER_REQUEST_EXIT` (0x14FF) and
+`AS_USER_CANCEL_REQUEST_EXIT` (0x1500). Same one-line change, but one of their callers -
+`Handlers/ArbiterClientHandlers.cs:1896` - is Cowork-owned. Giving them a worldId parameter in
+the patch would break the build for everyone between now and the moment the patch is applied,
+so they move in the same commit as that file.
+
+**Apply the patch with `git apply`, not `patch`.** The file is stored with CRLF throughout,
+because its context lines come from CRLF sources. GNU patch strips trailing CRs by default and
+then reports `different line endings` on every hunk; `git apply` handles it, and so does
+`patch -p1 --binary`. Both of those are checked on every regeneration, against a copy normalised
+the way the file actually lands on disk.
