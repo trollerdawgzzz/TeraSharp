@@ -120,8 +120,10 @@ Both queries drop `deleted_at != 0` characters and a zero score, cap at
 
 ### 6.2 Ranking, filtering, paging
 
-`RankingBoards.Rank` gives **dense** ranks - equal scores share a rank - and breaks ties by
-character id so two calls give the same order. The class filter is T118's range: `0..14` is an
+`RankingBoards.Rank` gives **competition** ranks - equal scores share a rank and the next row
+skips past the whole tied group (1, 1, 3) - and breaks ties by character id so two calls give
+the same order. T119's comments called this "dense"; section 8.2 corrects that against the
+live board, whose ranks run 1, 11, 21. The class filter is T118's range: `0..14` is an
 exact class, `0x10` is the aggregate. Anything else never gets here; the handler refuses it.
 
 `RankingBoards.Page` returns one page of 50 and **appends the requester's own row** when the
@@ -312,9 +314,17 @@ because every frame we send has both as 0. The live rows decide it: across all n
 frames, +6 is 0 on 315 rows and 1 on exactly one, and the i32 at +7 runs -17..+12 around 0 -
 a rank delta. Read the def's way the same bytes are 768, 256, -256 with a trailing 0 or 255.
 
-**A dungeon record belongs to a party.** In 5856 five rows share rank 1 and the same
-clearTime and differ only in class and name. Dense ranking - equal scores, equal rank - is
-already what `RankingBoards.Rank` does.
+**A dungeon record belongs to the group, and the board is competition-ranked** (corrected in
+T133b - the first reading of 5856 guessed at both halves of this and got both wrong). Ten
+rows share rank 1 and the same 359952 ms, and two of their classes appear twice, so it is a
+ten-player raid record and not "one row per class". The next rank is **11**, not 2: the
+ranks run 1, 11, 21, 31, 41, 51, 61, 69, 78, 87, 96 - each group pushes the next rank past
+all of it, and the short steps (69, 78) are groups of eight and nine. That is competition
+ranking, and it is what `RankingBoards.Rank` already does - `rank = i + 1` on a change of
+score - whatever the older comments called it.
+
+The `rookie` byte is also real: 315 of classic_live's 316 rows carry 0 and exactly one
+carries 1 - row 97 of frame 5818, rank 96, "BFG", up seven places.
 
 ### 8.3 The self-rank frame is conditional
 

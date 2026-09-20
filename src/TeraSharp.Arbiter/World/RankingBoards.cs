@@ -3,7 +3,8 @@ using TeraSharp.Arbiter.Persistence;
 namespace TeraSharp.Arbiter.World;
 
 /// <summary>One line of a leaderboard, already ranked.</summary>
-/// <param name="Rank">1-based, dense: equal scores share a rank.</param>
+/// <param name="Rank">1-based, competition ranking: equal scores share a rank and the next
+/// row skips past the whole tied group, which is what classic_live frame 5856 does (T133b).</param>
 /// <param name="Score">Dungeon clears for PvE, kills for PvP.</param>
 public readonly record struct RankingRow(
     int Rank, int CharacterId, string Name, int Class, int Level, long Score);
@@ -165,7 +166,12 @@ public static class RankingBoards
 
     /// <summary>
     /// Rank a scored list: order by score descending, then by character id so the order is
-    /// stable between two calls, and give equal scores the same (dense) rank.
+    /// stable between two calls, and give equal scores the same rank.
+    ///
+    /// <para>This is COMPETITION ranking, not dense: <c>rank = i + 1</c> on a change of score,
+    /// so ten rows tied at 1 are followed by 11. T119's comments called it dense, which was
+    /// only ever right about the tie itself; classic_live frame 5856 settles it - its ranks
+    /// run 1, 11, 21, 31 (T133b).</para>
     /// </summary>
     public static List<RankingRow> Rank(IEnumerable<CharacterStore.RankingScore> scores,
                                         int classFilter)
