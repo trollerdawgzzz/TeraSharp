@@ -1,4 +1,4 @@
-# Leaderboard, step 1 (T118)
+# Leaderboard (T118 step 1, T119 step 2)
 
 ## 1. The brief's premise, corrected
 
@@ -78,8 +78,8 @@ form its .def gives, bounds-checked:
 
 | Request | Reply |
 |---|---|
-| `C_REQUEST_PVE_RANKING` | `S_PVE_RANKING_LIST` empty list (hand-built - see below) |
-| `C_REQUEST_PVP_RANKING` | `S_PVP_RANKING_LIST`, empty `players` |
+| `C_REQUEST_PVE_RANKING` | `S_PVE_RANKING_LIST` empty list (hand-built - see below); **now filled, section 6** |
+| `C_REQUEST_PVP_RANKING` | `S_PVP_RANKING_LIST`, empty `players`; **now filled, section 6** |
 | `C_VIEW_INTER_PARTY_MATCH_DUNGEON_LIST` | `S_..._DUNGEON_LIST` {0,0,0} |
 | `C_VIEW_INTER_PARTY_MATCH_BATTLEFIELD_LIST` | `S_..._BATTLEFIELD_LIST` {0,0} |
 | `C_REQUEST_PARTY_MATCH_INFO_PAGE` | ack - no S_ opcode exists; page still clamped (T48) |
@@ -95,3 +95,90 @@ def's field-less form would be a 4-byte frame, four bytes short of the header th
 An out-of-range `class` is refused by TeraSharp too. Nothing here indexes with it, but answering
 it as though it were valid would teach a probing client that the value is accepted, and the same
 value against the real Arbiter is the crash in section 2.
+
+## 6. Answering from our own data (T119)
+
+The real Arbiter never answers `C_REQUEST_P*_RANKING` on 100.02 - confirmed live, no capture
+exists. So both frames are built from the binary and the shipped defs, and both are filled from
+TeraSharp's own tables.
+
+### 6.1 Where the two boards come from
+
+| Board | Source | Fed by |
+|---|---|---|
+| PvE | `SUM(dungeon_cooldowns.clear_count)` per character | `SA_UPDATE_DUNGEON_CLEAR_COUNT` (0x13B7) |
+| PvP | `COUNT(*)` of `game_log` rows with `category='pvp' AND action='pvp.kill'` | `SDB_ADD_PVP_USER_LOG` (0x27FE), T115 |
+
+The brief asked for a `game_log` **dungeon** category. There is none: T115 created eight
+categories (user, item, trade, guild, party, mail, warehouse, pvp) and none of the five decoded
+log opcodes carries a dungeon clear. `clear_count` is the only dungeon progress TeraSharp
+stores, and it is live, so it is the board. `pk.kill` is the outlaw counter and is **not**
+counted - only rows where the character is the actor score.
+
+Both queries drop `deleted_at != 0` characters and a zero score, cap at
+`CharacterStore.RankingScoreLimit` (500), and order `score DESC, id`.
+
+### 6.2 Ranking, filtering, paging
+
+`RankingBoards.Rank` gives **dense** ranks - equal scores share a rank - and breaks ties by
+character id so two calls give the same order. The class filter is T118's range: `0..14` is an
+exact class, `0x10` is the aggregate. Anything else never gets here; the handler refuses it.
+
+`RankingBoards.Page` returns one page of 50 and **appends the requester's own row** when the
+page does not already hold it, which is what "my rank" on the leaderboard window means. The
+request has no page field - it is `season`/`id`/`class` and nothing else - so the handler always
+sends page 0 plus that row.
+
+`season` must equal `RankingBoards.CurrentSeason` (1), the season
+`S_P*_LEADER_BOARD_INFO` advertises (T91). The real handler serves `== current` from the live
+tree and `< current` from an archive we do not keep, and does nothing at all above it, so any
+other season is an empty board rather than a wrong one.
+
+### 6.3 S_PVE_RANKING_LIST (0xBEDC) - 31-byte element
+
+`S_PVE_RANKING_LIST.1.def` has **no fields**, so the layout is read off the writer,
+`PVERankingSystemManager::SendRankList` (Arb_part_050.c:9747, stamping 0xBEDC at :9758):
+
+| Offset | Size | Writer's store | We send |
+|---|---|---|---|
+| +0 | u16 | `*puVar24` | here |
+| +2 | u16 | `puVar24[1]` | next (0 = last) |
+| +4 | u16 | `puVar24[2]` | name offset |
+| +6 | u8 | `IsRookie(..)` | computed from +7/+11 (always 0, see below) |
+| +7 | i32 | `rankInfo+0x1C` | 0 - level-band **width** |
+| +11 | i32 | `rankInfo+0x18` | the entry's level - level-band **base** |
+| +15 | i32 | `rankInfo+0x08` | rank |
+| +19 | i64 | `rankInfo+0x10` | score (clears) |
+| +27 | i32 | `node+0x18` | class |
+| +31 | | | NUL-terminated UTF-16 name |
+
+Three of those scalars have no name anywhere - not in the def, not in a dumper, not in a
+capture. What the binary does say is the relation:
+`PVERankingSystemManager::IsRookie(int,int,int)` is `(myLevel < B + A) && (B <= myLevel)` over
+the +11 and +7 values, so those two are a level **band**, not the entry's own level. We are the
+data source, so the choice is ours and it is written down rather than guessed at: width 0, base
+= the entry's level, and the rookie flag computed the way the server computes it from what we
+wrote - so the frame is self-consistent whatever the client does with it.
+
+### 6.4 S_PVP_RANKING_LIST (0x62FA) - 23-byte element
+
+From the shipped def (`int32 unk; byte unk2; int32 rank; int32 rating; int32 class; string
+name`): here/next/nameRef, then `unk` at +6, `unk2` at +10, rank +11, rating +15, class +19,
+name at +23. `rating` carries the kill count. The def's own comments call `unk` "probably
+previous rank" and `unk2` the up/down icon; we send 0 for both, because we keep no history and
+an invented arrow is worse than none.
+
+This one has an independent witness: the test writes the same rows through the shared
+`DefinitionWriter` and asserts the def's body is byte-identical to the hand-built one.
+
+### 6.5 What changed from T118
+
+| Request | T118 | T119 |
+|---|---|---|
+| `C_REQUEST_PVE_RANKING` | empty list | ranked clears, byte-exact to the writer |
+| `C_REQUEST_PVP_RANKING` | empty `players` | ranked kills, cross-checked against the def |
+
+The registry is unchanged - both opcodes still point at
+`LeaderboardPackets.OnRequestPveRanking` / `OnRequestPvpRanking`. An **empty** board is still
+byte-identical to the frame T118 shipped, which is the only form of these two packets that has
+been in front of a live client; a test asserts that.
