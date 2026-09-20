@@ -5268,7 +5268,7 @@ DELETE FROM restrictions      WHERE character_id = $id;";
     /// result and never a runaway read.</para>
     /// </summary>
     public List<GameLogRow> QueryGameLog(long accountId = 0, long characterId = 0,
-                                         string? category = null, long fromUnix = 0,
+                                         string? category = null, string? action = null, long fromUnix = 0,
                                          long toUnix = 0, int page = 0, int pageSize = 50)
     {
         if (pageSize <= 0) pageSize = 50;
@@ -5279,6 +5279,7 @@ DELETE FROM restrictions      WHERE character_id = $id;";
         if (accountId != 0) where.Add("account_id = $acc");
         if (characterId != 0) where.Add("character_id = $chr OR target_id = $chr");
         if (!string.IsNullOrEmpty(category)) where.Add("category = $cat");
+        if (!string.IsNullOrEmpty(action)) where.Add("action LIKE $act ESCAPE '\\'");
         if (fromUnix > 0) where.Add("logged_at >= $from");
         if (toUnix > 0) where.Add("logged_at <= $to");
 
@@ -5296,6 +5297,7 @@ DELETE FROM restrictions      WHERE character_id = $id;";
             if (accountId != 0) cmd.Parameters.AddWithValue("$acc", accountId);
             if (characterId != 0) cmd.Parameters.AddWithValue("$chr", characterId);
             if (!string.IsNullOrEmpty(category)) cmd.Parameters.AddWithValue("$cat", category);
+            if (!string.IsNullOrEmpty(action)) cmd.Parameters.AddWithValue("$act", action.Replace("\\", "\\\\").Replace("%", "\\%").Replace("_", "\\_") + "%");
             if (fromUnix > 0) cmd.Parameters.AddWithValue("$from", fromUnix);
             if (toUnix > 0) cmd.Parameters.AddWithValue("$to", toUnix);
             cmd.Parameters.AddWithValue("$take", pageSize);
@@ -5312,7 +5314,7 @@ DELETE FROM restrictions      WHERE character_id = $id;";
     }
 
     /// <summary>How many rows a <see cref="QueryGameLog"/> with the same filters would match.</summary>
-    public long CountGameLog(long accountId = 0, long characterId = 0, string? category = null)
+    public long CountGameLog(long accountId = 0, long characterId = 0, string? category = null, string? action = null, long fromUnix = 0, long toUnix = 0)
     {
         lock (_lock)
         {
@@ -5321,6 +5323,9 @@ DELETE FROM restrictions      WHERE character_id = $id;";
             if (accountId != 0) where.Add("account_id = $acc");
             if (characterId != 0) where.Add("character_id = $chr OR target_id = $chr");
             if (!string.IsNullOrEmpty(category)) where.Add("category = $cat");
+            if (!string.IsNullOrEmpty(action)) where.Add("action LIKE $act ESCAPE '\\'");
+            if (fromUnix > 0) where.Add("logged_at >= $from");
+            if (toUnix > 0) where.Add("logged_at <= $to");
             var sql = new System.Text.StringBuilder("SELECT COUNT(*) FROM game_log");
             for (int i = 0; i < where.Count; i++)
                 sql.Append(i == 0 ? " WHERE (" : " AND (").Append(where[i]).Append(')');
@@ -5328,6 +5333,9 @@ DELETE FROM restrictions      WHERE character_id = $id;";
             if (accountId != 0) cmd.Parameters.AddWithValue("$acc", accountId);
             if (characterId != 0) cmd.Parameters.AddWithValue("$chr", characterId);
             if (!string.IsNullOrEmpty(category)) cmd.Parameters.AddWithValue("$cat", category);
+            if (!string.IsNullOrEmpty(action)) cmd.Parameters.AddWithValue("$act", action.Replace("\\", "\\\\").Replace("%", "\\%").Replace("_", "\\_") + "%");
+            if (fromUnix > 0) cmd.Parameters.AddWithValue("$from", fromUnix);
+            if (toUnix > 0) cmd.Parameters.AddWithValue("$to", toUnix);
             return Convert.ToInt64(cmd.ExecuteScalar());
         }
     }

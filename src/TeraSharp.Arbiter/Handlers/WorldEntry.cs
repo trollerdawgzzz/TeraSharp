@@ -30,7 +30,6 @@ public static class WorldEntry
         });
         s.SendByDef("S_BROCAST_GUILD_FLAG", new Dictionary<string, object>());
         ArbiterClientHandlers.SendCurrentElectionState(s);   // T106
-        ArbiterClientHandlers.SendAdminGmSkillIfOperator(s, GmCommandHandlers.LevelOf(s, Program.Store));   // T120: must precede S_LOAD_TOPO (World sends that) - the Alt+A gate
         int[] contents = { 2, 3, 4, 8, 9, 22, 23, 20, 21, 34 };
         bool[] disabled = { false, false, false, true, true, false, false, false, false, false };
         for (int i = 0; i < contents.Length; i++)

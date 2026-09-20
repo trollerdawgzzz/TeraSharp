@@ -113,7 +113,7 @@ public sealed class WorldBridge
     {
         lock (_playersLock) _players[s.GameId] = s;
         lock (_reorderLock)
-            _tunnels[s.TunnelKey] = new TunnelReorderBuffer { Deliver = s.Send };
+            _tunnels[s.TunnelKey] = new TunnelReorderBuffer { Deliver = p => Handlers.ArbiterClientHandlers.DeliverTunnelled(s, p) };   // T121: inject S_ADMIN_GM_SKILL before the tunnelled S_LOAD_TOPO
     }
 
     public void UnregisterPlayer(ulong gameId, uint tunnelKey)
