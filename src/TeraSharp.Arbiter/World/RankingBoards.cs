@@ -6,8 +6,12 @@ namespace TeraSharp.Arbiter.World;
 /// <param name="Rank">1-based, competition ranking: equal scores share a rank and the next
 /// row skips past the whole tied group, which is what classic_live frame 5856 does (T133b).</param>
 /// <param name="Score">Dungeon clears for PvE, kills for PvP.</param>
+/// <param name="Rating">T138c. What S_PVP_RANKING_LIST's <c>rating</c> field carries when it
+/// is set - <c>characters.bg_rating</c>. <c>null</c> keeps T119's behaviour, where the field
+/// carried the score, which is why every existing five-argument row still frames byte for
+/// byte. It changes no ORDER: the board is still ranked by <see cref="Score"/>.</param>
 public readonly record struct RankingRow(
-    int Rank, int CharacterId, string Name, int Class, int Level, long Score);
+    int Rank, int CharacterId, string Name, int Class, int Level, long Score, int? Rating = null);
 
 /// <summary>
 /// T119. The two leaderboards, built from our own data, and the two packets that carry them.
@@ -190,7 +194,8 @@ public static class RankingBoards
         {
             if (kept[i].Score != lastScore) { rank = i + 1; lastScore = kept[i].Score; }
             rows.Add(new RankingRow(rank, kept[i].CharacterId, kept[i].Name,
-                                    kept[i].Class, kept[i].Level, kept[i].Score));
+                                    kept[i].Class, kept[i].Level, kept[i].Score,
+                                    kept[i].Rating));
         }
         return rows;
     }
@@ -269,8 +274,17 @@ public static class RankingBoards
 
     /// <summary>
     /// S_PVP_RANKING_LIST (0x62FA): rookie, changedRank, rank, rating, class, name.
-    /// <c>rating</c> carries the kill count. <c>changedRank</c> is 0 - no previous season to
-    /// diff against - and <c>rookie</c> follows from it, as on the PvE board.
+    /// <c>changedRank</c> is 0 - no previous season to diff against - and <c>rookie</c> follows
+    /// from it, as on the PvE board.
+    ///
+    /// <para><b>T138c: what <c>rating</c> carries.</b> A row's own
+    /// <see cref="RankingRow.Rating"/> when it has one - <c>characters.bg_rating</c>, the
+    /// number every battleground result moves by 5..12 - and otherwise the score, which is what
+    /// T119 shipped and what keeps the old frames byte-identical. The board is still ORDERED by
+    /// the score (kills), so a player with a rating and no kills is not on it; making the
+    /// rating the ranking key as well is a one-line change in
+    /// <see cref="CharacterStore.GetPvpRankingScores"/> and deliberately not made here, because
+    /// it would empty the board on a server where nobody has finished a battleground yet.</para>
     /// </summary>
     public static byte[] BuildPvpRankingList(IReadOnlyList<RankingRow>? rows, int viewerRank = 0)
     {
@@ -302,7 +316,7 @@ public static class RankingBoards
             p[at + PvpRookieOffset] = IsRookie(viewerRank, r.Rank, changedRank);
             BitConverter.GetBytes(changedRank).CopyTo(p, at + PvpChangedRankOffset);
             BitConverter.GetBytes(r.Rank).CopyTo(p, at + PvpRankOffset);
-            BitConverter.GetBytes((int)Math.Clamp(r.Score, int.MinValue, int.MaxValue))
+            BitConverter.GetBytes(r.Rating ?? (int)Math.Clamp(r.Score, int.MinValue, int.MaxValue))
                 .CopyTo(p, at + PvpRatingOffset);
             BitConverter.GetBytes(r.Class).CopyTo(p, at + PvpClassOffset);
             names[i].CopyTo(p, nameAt);

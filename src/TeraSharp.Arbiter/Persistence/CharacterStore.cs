@@ -774,6 +774,11 @@ CREATE TABLE IF NOT EXISTS characters (
   return_x REAL NOT NULL DEFAULT 0, return_y REAL NOT NULL DEFAULT 0, return_z REAL NOT NULL DEFAULT 0,
   dungeon_id INTEGER NOT NULL DEFAULT 0,
   instance_pdid INTEGER NOT NULL DEFAULT 0,
+  -- T138c: the battleground rating. Every S_BATTLE_FIELD_RESULT moves it by a random 5..12,
+  -- up on a win and down on a loss, floored at 0 - see World/BattlegroundRating.cs. It is a
+  -- LEADERBOARD number and nothing else: S_PVP_RANKING_LIST's `rating` field renders it, and
+  -- the matchmaker never reads it (the T138 brief: "no MMR").
+  bg_rating INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS ix_characters_account ON characters(account_id);
@@ -1440,6 +1445,8 @@ CREATE INDEX IF NOT EXISTS ix_game_log_time ON game_log(logged_at);
         AddColumnIfMissing("characters", "return_z", "REAL NOT NULL DEFAULT 0");
         AddColumnIfMissing("characters", "dungeon_id", "INTEGER NOT NULL DEFAULT 0");
         AddColumnIfMissing("characters", "instance_pdid", "INTEGER NOT NULL DEFAULT 0");
+        // T138c: the battleground rating. See the schema comment and BattlegroundRating.
+        AddColumnIfMissing("characters", "bg_rating", "INTEGER NOT NULL DEFAULT 0");
         // T30: friends carry a group and the requester's greeting; blocks carry a note; the
         // character carries the profile message the friend panel shows and the once-only flag
         // behind dbo.spIsProvideSampleFriendGroup.
@@ -5272,9 +5279,14 @@ DELETE FROM restrictions      WHERE character_id = $id;";
     // T119 - the two leaderboard sources. status/LEADERBOARD.md section 6.
     // =====================================================================
 
-    /// <summary>One character's score on one board, before it is ranked.</summary>
+    /// <summary>
+    /// One character's score on one board, before it is ranked. <paramref name="Rating"/> is
+    /// T138c's <c>characters.bg_rating</c>: it is what S_PVP_RANKING_LIST's <c>rating</c> field
+    /// renders and it takes no part in the ORDER, which is still the score. It is a trailing
+    /// optional so every five-argument construction still compiles.
+    /// </summary>
     public readonly record struct RankingScore(
-        int CharacterId, string Name, int Class, int Level, long Score);
+        int CharacterId, string Name, int Class, int Level, long Score, int Rating = 0);
 
     /// <summary>How many characters either board will consider. Far above any population this
     /// server will see, and a bound on the query rather than on the frame.</summary>
@@ -5304,7 +5316,7 @@ DELETE FROM restrictions      WHERE character_id = $id;";
     /// </summary>
     public List<RankingScore> GetPvpRankingScores(int limit = RankingScoreLimit)
         => RankingScores(
-            "SELECT c.id, c.name, c.class, c.level, COUNT(*) AS score " +
+            "SELECT c.id, c.name, c.class, c.level, COUNT(*) AS score, c.bg_rating " +
             "FROM game_log g JOIN characters c ON c.id = g.character_id " +
             "WHERE g.category = 'pvp' AND g.action = 'pvp.kill' AND c.deleted_at = 0 " +
             "GROUP BY c.id HAVING score > 0 ORDER BY score DESC, c.id LIMIT $take", limit);
@@ -5321,8 +5333,71 @@ DELETE FROM restrictions      WHERE character_id = $id;";
             using var r = cmd.ExecuteReader();
             while (r.Read())
                 rows.Add(new RankingScore(r.GetInt32(0), r.GetString(1), r.GetInt32(2),
-                                          r.GetInt32(3), r.GetInt64(4)));
+                                          r.GetInt32(3), r.GetInt64(4),
+                                          r.FieldCount > 5 && !r.IsDBNull(5) ? r.GetInt32(5) : 0));
             return rows;
+        }
+    }
+
+    // =====================================================================
+    // T138c - the battleground rating. status/MULTIWORLD-DESIGN.md section T138c.
+    // =====================================================================
+
+    /// <summary>
+    /// <c>characters.bg_rating</c>, or 0 for a character that has never finished a
+    /// battleground (and for one that does not exist - a missing row is a zero rating, not an
+    /// exception, because the leaderboard asks about ids it got from elsewhere).
+    /// </summary>
+    public int GetBgRating(int characterId)
+    {
+        if (characterId <= 0) return 0;
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT bg_rating FROM characters WHERE id = $id";
+            cmd.Parameters.AddWithValue("$id", characterId);
+            var v = cmd.ExecuteScalar();
+            return v == null || v == DBNull.Value ? 0 : Convert.ToInt32(v);
+        }
+    }
+
+    /// <summary>Set the rating outright, floored at 0. GM and test path.</summary>
+    public void SetBgRating(int characterId, int rating)
+    {
+        if (characterId <= 0) return;
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE characters SET bg_rating = $r WHERE id = $id";
+            cmd.Parameters.AddWithValue("$r", Math.Max(0, rating));
+            cmd.Parameters.AddWithValue("$id", characterId);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>
+    /// Move the rating by <paramref name="delta"/> and return what it became. The floor is 0
+    /// and it is applied IN SQL - <c>MAX(0, bg_rating + $d)</c> - rather than by reading,
+    /// clamping and writing back, so two results landing at once cannot lose one another's
+    /// move. Both statements run inside the store's own lock.
+    /// </summary>
+    public int AdjustBgRating(int characterId, int delta)
+    {
+        if (characterId <= 0) return 0;
+        lock (_lock)
+        {
+            using (var up = _db.CreateCommand())
+            {
+                up.CommandText = "UPDATE characters SET bg_rating = MAX(0, bg_rating + $d) WHERE id = $id";
+                up.Parameters.AddWithValue("$d", delta);
+                up.Parameters.AddWithValue("$id", characterId);
+                up.ExecuteNonQuery();
+            }
+            using var read = _db.CreateCommand();
+            read.CommandText = "SELECT bg_rating FROM characters WHERE id = $id";
+            read.Parameters.AddWithValue("$id", characterId);
+            var v = read.ExecuteScalar();
+            return v == null || v == DBNull.Value ? 0 : Convert.ToInt32(v);
         }
     }
 

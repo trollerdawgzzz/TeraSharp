@@ -30,6 +30,7 @@ public sealed class SocialHandlers
         _log = log;
         UseChatLogger(log);   // T47: the chat manager logs through the same sink
         PartyWiring.UsePartyLogger(log);   // T49: and so does the party manager
+        MatchWiring.UseMatchLogger(log);    // T138c: and the instance matcher
         GuildWiring.UseGuildLogger(log);    // T51: and the guild handler
         PartyMatchManager.UseLogger(log);   // T78: and the party board
         GuildWarManager.UseLogger(log);     // T80: and guild war
@@ -224,6 +225,9 @@ public sealed class SocialHandlers
         // with S_LOGOUT_PARTY_MEMBER - so this has to run on the same two leave paths
         // GameSession already calls UnregisterChat from (OnWorldLeaveConfirmed and LeaveWorld).
         PartyWiring.Unregister(session);
+        // T138c: a QUEUE does not survive a logout the way a party does - there is nobody left
+        // to put in the group - so the whole entry goes, leader or member.
+        MatchWiring.Unregister(session);
         // T51: the GUILD MEMBERSHIP survives a logout - only GuildMemberData+0x70 moves - so
         // this is a state flip plus a stored logout time, never a row delete.
         GuildWiring.Unregister(session);

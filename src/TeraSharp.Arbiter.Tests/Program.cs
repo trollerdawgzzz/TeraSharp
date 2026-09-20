@@ -12369,8 +12369,10 @@ bool   isGuildWarAcceptable
 
         Hex.True(MatchWiring.MinBodyLength(MatchQueueManager.C_MATCH_PROGRESS) == 4
                  && MatchWiring.MinBodyLength(MatchQueueManager.C_MATCH_ROOM_LIST) == 4
-                 && MatchWiring.MinBodyLength(MatchQueueManager.C_MATCH_ADD) == 0,
-            "the readers need their 4-byte array header; the refused pair needs no guard");
+                 && MatchWiring.MinBodyLength(MatchQueueManager.C_MATCH_DEL) == 4
+                 && MatchWiring.MinBodyLength(MatchQueueManager.C_MATCH_ADD) == 10,
+            "the readers need their 4-byte array header; T138c parses C_MATCH_ADD too, and it "
+            + "carries two array heads and a scalar before any element");
 
         // Every one of the four is the Arbiter's - none may fall through to World.
         var owned = ArbiterClientHandlers.ArbiterOwned;
@@ -12397,7 +12399,6 @@ bool   isGuildWarAcceptable
         MatchQueueManager.Reset();
     }
 
-    /// <summary>
     /// <summary>
     /// T138b - the cross-World hand-off, replayed with the exact bytes cap_multiworld3 carries.
     /// World 0 is the main World; world 13 is the DungeonServer that owns Velik's Sanctuary,
@@ -26146,6 +26147,401 @@ string message
         // Finishing something that is not running is refused rather than paid.
         Hex.True(guilds.OnClientPacket(1, GuildPackets.C_REQUEST_FINISH_GUILD_QUEST,
             T135QuestBody(10001)).Rejected != null, "nothing is running, so nothing can be finished");
+    }
+
+
+    // =========================================================================================
+    // T138c - the matchmaker, the battleground composition table and the rating.
+    // =========================================================================================
+
+    /// <summary>A Random that alternates 0,1,0,1... so the battleground's "random side" is a
+    /// deterministic side in a test without pinning any particular seed algorithm.</summary>
+    sealed class T138cAlternating : Random
+    {
+        private int _n;
+        public override int Next(int maxValue) => maxValue <= 0 ? 0 : _n++ % maxValue;
+    }
+
+    /// <summary>One solo queuer.</summary>
+    static MatchQueueManager.Queuer T138cQ(uint id, int cls, int level = 70)
+        => new(id, (int)id, cls, level);
+
+    /// <summary>Queue one entry and return its leader id.</summary>
+    static uint T138cQueue(uint leader, int instance, params MatchQueueManager.Queuer[] members)
+    {
+        MatchQueueManager.Add(leader, new[] { instance }, members,
+            DateTimeOffset.UnixEpoch.AddSeconds(leader));
+        return leader;
+    }
+
+    /// <summary>
+    /// T138c. The brief said to take the roles out of C_MATCH_ADD's "class fields". The packet
+    /// has none: four captured frames carry a second array whose two elements hold the SAME
+    /// first int32, and that int32 is the queuing player's own id - S_ADD_INTER_PARTY_MATCH_POOL
+    /// record 8662 echoes 4742 as the pool player. This walks the real frame with the real
+    /// readers and then rebuilds record 8662 out of what they returned, which is the whole
+    /// round trip in one assertion.
+    /// </summary>
+    [Test] public static void T138c_match_add_carries_no_class_only_the_queuers_own_id()
+    {
+        // classic_live3 record 8643 - the leader queues Kelsaik (9739).
+        var add = Hex.B(
+            "37 00 5F CE 01 00 0E 00 02 00 1F 00 00 00 0E 00 00 00 0B 26 00 00 00 00 00 00 "
+          + "00 00 00 00 00 1F 00 2B 00 86 12 00 00 01 00 00 00 2B 00 00 00 86 12 00 00 01 00 00 00");
+        var body = new ReadOnlyMemory<byte>(add, 4, add.Length - 4);
+
+        var ids = MatchQueueManager.ReadInstanceIds(body);
+        Hex.True(ids.Count == 1 && ids[0] == 9739,
+            $"one instance, Kelsaik's Nest: [{string.Join(",", ids)}]");
+        Hex.True(MatchQueueManager.ReadQueueFlag(body) == 1,
+            "the second array's trailing int32 is 1 on this queue");
+
+        // Record 10322 is the same frame with that flag cleared - the only byte that moves.
+        var again = Hex.B(
+            "37 00 5F CE 01 00 0E 00 02 00 1F 00 00 00 0E 00 00 00 0B 26 00 00 00 00 00 00 "
+          + "00 00 00 00 00 1F 00 2B 00 86 12 00 00 00 00 00 00 2B 00 00 00 86 12 00 00 00 00 00 00");
+        Hex.True(MatchQueueManager.ReadQueueFlag(
+            new ReadOnlyMemory<byte>(again, 4, again.Length - 4)) == 0,
+            "and 0 on the second queue - which is exactly what the pool-add tail carries back");
+
+        // The answer, from those two fields plus the queuer's own id: record 8662, byte for byte.
+        Hex.Eq(MatchQueueManager.BuildAddInterPartyMatchPool(ids[0],
+                new[] { new MatchQueueManager.PoolPlayer(PartyPackets.PlanetId, 4742, 0, 1) }),
+            "31 00 30 C7 01 00 0C 00 00 00 00 00 0C 00 00 00 01 00 20 00 0B 26 00 00 00 00 00 00 "
+          + "00 00 00 00 20 00 00 00 F0 0A 00 00 86 12 00 00 00 01 00 00 00",
+            "classic_live3 record 8662 rebuilt from record 8643's own fields");
+    }
+
+    /// <summary>
+    /// T138c. The class-to-role table is <c>DungeonMatching.xml</c>'s <c>&lt;ClassPosition&gt;</c>
+    /// and not a guess: Lancer and Fighter tank, Priest and Elementalist heal, Warrior and
+    /// Berserker can tank as a SECOND position, and Berserker's is gated at level 65.
+    /// </summary>
+    [Test] public static void T138c_roles_and_templates_come_from_the_datasheet()
+    {
+        Hex.True(MatchComposition.RoleOf(1) == MatchRole.Tank
+                 && MatchComposition.RoleOf(10) == MatchRole.Tank
+                 && MatchComposition.RoleOf(6) == MatchRole.Healer
+                 && MatchComposition.RoleOf(7) == MatchRole.Healer
+                 && MatchComposition.RoleOf(0) == MatchRole.Dps
+                 && MatchComposition.RoleOf(12) == MatchRole.Dps,
+            "Lancer and Fighter tank, Priest and Elementalist heal, the rest DPS by default");
+        Hex.True(MatchComposition.RoleOf(-1) == MatchRole.Dps
+                 && MatchComposition.RoleOf(99) == MatchRole.Dps,
+            "a class id off the end is a body, not a crash");
+
+        Hex.True(MatchComposition.CanFill(0, MatchRole.Tank, 1),
+            "Warrior's second position is tank with no level gate");
+        Hex.True(!MatchComposition.CanFill(3, MatchRole.Tank, 64)
+                 && MatchComposition.CanFill(3, MatchRole.Tank, 65),
+            "Berserker's tank position is gated at secondPositionLevel=65");
+        Hex.True(!MatchComposition.CanFill(6, MatchRole.Dps, 70)
+                 && !MatchComposition.CanFill(6, MatchRole.Tank, 70),
+            "a Priest is a healer and nothing else, at any level");
+
+        var five = MatchComposition.DungeonTemplate(5);
+        Hex.True(five.Tanks == 1 && five.Healers == 1 && five.Dps == 3 && five.Size == 5,
+            $"a party is 1/1/3: {five.Tanks}/{five.Healers}/{five.Dps}");
+        var ten = MatchComposition.DungeonTemplate(10);
+        var twenty = MatchComposition.DungeonTemplate(20);
+        Hex.True(ten.Tanks == 2 && ten.Healers == 2 && ten.Dps == 6
+                 && twenty.Tanks == 4 && twenty.Healers == 4 && twenty.Dps == 12,
+            "raids keep the ratio by their counts - 2/2/6 at ten, 4/4/12 at twenty");
+        Hex.True(MatchComposition.DungeonTemplate(0).Size == 0,
+            "and a size of nothing asks for nobody");
+
+        Hex.True(MatchQueueManager.IsBattleground(37) && MatchQueueManager.IsBattleground(10)
+                 && !MatchQueueManager.IsBattleground(9739) && !MatchQueueManager.IsBattleground(0),
+            "every BattleFieldData id is under 1000 and every DungeonMatching id is over 9000");
+    }
+
+    /// <summary>
+    /// T138c. Formation: a solo pool fills 1 tank / 1 healer / 3 DPS in queue order, a party
+    /// keeps its slots and the rest come from soloists, and a pool that cannot make the shape
+    /// forms nothing at all rather than something wrong.
+    /// </summary>
+    [Test] public static void T138c_the_pool_forms_one_tank_one_healer_and_three_dps()
+    {
+        const int Kelsaik = 9739;
+        var now = DateTimeOffset.UnixEpoch.AddHours(1);
+
+        // ---- five soloists, exactly the shape ----
+        MatchQueueManager.Reset();
+        T138cQueue(1, Kelsaik, T138cQ(1, 1));    // Lancer
+        T138cQueue(2, Kelsaik, T138cQ(2, 6));    // Priest
+        T138cQueue(3, Kelsaik, T138cQ(3, 2));    // Slayer
+        T138cQueue(4, Kelsaik, T138cQ(4, 5));    // Archer
+        T138cQueue(5, Kelsaik, T138cQ(5, 4));    // Sorcerer
+        var g = MatchQueueManager.TryForm(Kelsaik, now);
+        Hex.True(g != null && g.Members.Count == 5 && g.InstanceId == Kelsaik,
+            "five soloists with one of each make one group");
+        int tanks = 0, healers = 0;
+        foreach (var m in g!.Members)
+        {
+            if (MatchComposition.RoleOf(m.CharacterClass) == MatchRole.Tank) tanks++;
+            if (MatchComposition.RoleOf(m.CharacterClass) == MatchRole.Healer) healers++;
+        }
+        Hex.True(tanks == 1 && healers == 1, $"one tank and one healer: {tanks}/{healers}");
+        foreach (var e in g.Entries)
+            Hex.True(e.State == MatchQueueManager.MatchState.Matched, "every entry is marked");
+
+        // ---- a party of three keeps its slots, two soloists fill the rest ----
+        MatchQueueManager.Reset();
+        T138cQueue(10, Kelsaik, T138cQ(10, 1), T138cQ(11, 6), T138cQ(12, 2)); // Lancer/Priest/Slayer
+        T138cQueue(20, Kelsaik, T138cQ(20, 5));     // Archer
+        T138cQueue(21, Kelsaik, T138cQ(21, 4));     // Sorcerer
+        T138cQueue(22, Kelsaik, T138cQ(22, 11));    // Assassin, one too many
+        var party = MatchQueueManager.TryForm(Kelsaik, now);
+        Hex.True(party != null && party.Members.Count == 5 && party.Entries.Count == 3,
+            "the party is one entry and the two soloists behind it are the other two");
+        bool has10 = false, has11 = false, has12 = false;
+        foreach (var m in party!.Members)
+        {
+            if (m.PlayerId == 10) has10 = true;
+            if (m.PlayerId == 11) has11 = true;
+            if (m.PlayerId == 12) has12 = true;
+        }
+        Hex.True(has10 && has11 && has12, "a party that queued together is never split");
+        var left = MatchQueueManager.Find(22);
+        Hex.True(left != null && left.State == MatchQueueManager.MatchState.Waiting,
+            "the soloist who queued last is still waiting, not half-matched");
+
+        // ---- five priests are five healers, and four of them have nowhere to stand ----
+        MatchQueueManager.Reset();
+        for (uint i = 1; i <= 5; i++) T138cQueue(i, Kelsaik, T138cQ(i, 6));
+        Hex.True(MatchQueueManager.TryForm(Kelsaik, now) == null,
+            "a pool that cannot make the shape makes nothing");
+        Hex.True(MatchQueueManager.Find(1)!.State == MatchQueueManager.MatchState.Waiting,
+            "and a failed pass changes nothing - every entry is still queued");
+
+        // ---- leaving, by either door ----
+        Hex.True(MatchQueueManager.RemoveByPlayer(1), "the leader's own id removes the entry");
+        MatchQueueManager.Reset();
+        T138cQueue(30, Kelsaik, T138cQ(30, 1), T138cQ(31, 6));
+        Hex.True(MatchQueueManager.RemoveByPlayer(31) && MatchQueueManager.Find(30) == null,
+            "and a MEMBER dropping takes the whole entry with them");
+
+        // ---- the timeout ----
+        MatchQueueManager.Reset();
+        T138cQueue(40, Kelsaik, T138cQ(40, 1));
+        Hex.True(MatchQueueManager.SweepTimeouts(DateTimeOffset.UnixEpoch.AddSeconds(40)).Count == 0,
+            "nothing expires while it is still inside the window");
+        var expired = MatchQueueManager.SweepTimeouts(
+            DateTimeOffset.UnixEpoch.AddSeconds(40 + MatchQueueManager.QueueTimeoutSeconds));
+        Hex.True(expired.Count == 1 && expired[0].State == MatchQueueManager.MatchState.TimedOut,
+            "and past it the entry is marked - but LEFT, so the leader can still be told");
+        Hex.True(MatchQueueManager.Find(40) != null,
+            "a swept entry is not silently vanished out of the dictionary");
+        MatchQueueManager.Reset();
+    }
+
+    /// <summary>
+    /// T138c. The battleground table. Skyring is three a side with exactly one healer and at
+    /// most one lancer; Corsairs is fifteen a side with a floor of three healers and will not
+    /// start without them; Fraywind caps lancers at two; and a battleground with no row of its
+    /// own falls back to the two environment caps.
+    /// </summary>
+    [Test] public static void T138c_battleground_teams_obey_the_composition_table()
+    {
+        var now = DateTimeOffset.UnixEpoch.AddHours(2);
+        const int Skyring = 37, Corsairs = 26, Fraywind = 10;
+
+        var sky = MatchComposition.RuleFor(Skyring);
+        Hex.True(sky.TeamSize == 3 && sky.MinHealers == 1 && sky.MaxHealers == 1
+                 && sky.MaxLancers == 1 && sky.MaxPerClass == 2,
+            "Round_PvP 37 is 3v3 - BattleFieldData.xml maxTeamMember - with the stated rule");
+        Hex.True(MatchComposition.RuleFor(Corsairs).TeamSize == 15
+                 && MatchComposition.RuleFor(Corsairs).MinHealers == 3,
+            "StrongholdOccupation 26 is 15v15 with a floor of three healers");
+        Hex.True(MatchComposition.RuleFor(Fraywind).TeamSize == 20
+                 && MatchComposition.RuleFor(Fraywind).MaxLancers == 2,
+            "Cannon 10 is 20v20 with at most two lancers a side");
+
+        // Skyring: two of each, and the caps push the duplicates onto the other side.
+        MatchQueueManager.Reset();
+        uint id = 1;
+        foreach (int cls in new[] { 6, 6, 1, 1, 2, 2 }) { T138cQueue(id, Skyring, T138cQ(id, cls)); id++; }
+        var g = MatchQueueManager.TryForm(Skyring, now, new T138cAlternating());
+        Hex.True(g != null && g.TeamA.Count == 3 && g.TeamB.Count == 3 && g.Members.Count == 6,
+            "six queuers make two full teams of three");
+        foreach (var team in new[] { g!.TeamA, g.TeamB })
+        {
+            int healers = 0, lancers = 0;
+            foreach (var q in team)
+            {
+                if (MatchComposition.RoleOf(q.CharacterClass) == MatchRole.Healer) healers++;
+                if (q.CharacterClass == MatchComposition.ClassLancer) lancers++;
+            }
+            Hex.True(healers == 1 && lancers == 1,
+                $"each Skyring team gets exactly one healer and one lancer: {healers}/{lancers}");
+        }
+
+        // Corsairs: thirty bodies with only four healers is not a match.
+        MatchQueueManager.Reset();
+        id = 1;
+        for (int i = 0; i < 30; i++, id++) T138cQueue(id, Corsairs, T138cQ(id, i < 4 ? 6 : 2));
+        Hex.True(MatchQueueManager.TryForm(Corsairs, now, new T138cAlternating()) == null,
+            "two healers a side is below Corsairs' floor of three, so nothing starts");
+
+        // With six it is.
+        MatchQueueManager.Reset();
+        id = 1;
+        for (int i = 0; i < 30; i++, id++) T138cQueue(id, Corsairs, T138cQ(id, i < 6 ? 6 : 2));
+        var big = MatchQueueManager.TryForm(Corsairs, now, new T138cAlternating());
+        Hex.True(big != null && big.TeamA.Count == 15 && big.TeamB.Count == 15,
+            "thirty bodies with six healers make two full fifteens");
+        foreach (var team in new[] { big!.TeamA, big.TeamB })
+        {
+            int healers = 0;
+            foreach (var q in team)
+                if (MatchComposition.RoleOf(q.CharacterClass) == MatchRole.Healer) healers++;
+            Hex.True(healers >= 3, $"and each side clears the floor: {healers} healers");
+        }
+
+        // Fraywind's lancer cap and healer floor, checked directly - a 40-body formation test
+        // would assert the same two rules through twenty times as much setup.
+        var fray = MatchComposition.RuleFor(Fraywind);
+        Hex.True(MatchComposition.TeamAccepts(fray, MatchComposition.ClassLancer, 2, 1, 1)
+                 && !MatchComposition.TeamAccepts(fray, MatchComposition.ClassLancer, 2, 2, 2),
+            "a third lancer is refused; a second is not");
+        Hex.True(!MatchComposition.TeamSatisfies(fray, new[] { 6, 2, 2 })
+                 && MatchComposition.TeamSatisfies(fray, new[] { 6, 7, 2 }),
+            "and Fraywind wants two healers a side");
+
+        // Skyring's other half: every other class may double, but not treble.
+        Hex.True(MatchComposition.TeamAccepts(sky, 2, 0, 0, 0, sameClass: 1)
+                 && !MatchComposition.TeamAccepts(sky, 2, 0, 0, 0, sameClass: 2),
+            "doubles yes, triples no");
+
+        // No row of its own: the two environment caps, read fresh on every call.
+        Environment.SetEnvironmentVariable(MatchComposition.MaxHealersVariable, "1");
+        Environment.SetEnvironmentVariable(MatchComposition.MaxTanksVariable, "4");
+        try
+        {
+            var other = MatchComposition.RuleFor(909, teamSize: 8);
+            Hex.True(!MatchComposition.HasRule(909) && other.MaxHealers == 1
+                     && other.TeamSize == 8 && MatchComposition.FallbackMaxTanks() == 4,
+                "an unlisted battleground takes TERASHARP_BG_MAX_HEALERS/TANKS");
+            Hex.True(!MatchComposition.TeamAccepts(other, 6, healers: 1, tanks: 0, lancers: 0),
+                "and the cap bites");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(MatchComposition.MaxHealersVariable, null);
+            Environment.SetEnvironmentVariable(MatchComposition.MaxTanksVariable, null);
+        }
+        Hex.True(MatchComposition.RuleFor(909).MaxHealers == MatchComposition.DefaultMaxHealers
+                 && MatchComposition.FallbackMaxTanks() == MatchComposition.DefaultMaxTanks,
+            "and with nothing set it is the brief's 2 and 3");
+        MatchQueueManager.Reset();
+    }
+
+    /// <summary>
+    /// T138c. FIN goes to EVERY member of a formed group, not just the leaders, and the formed
+    /// entries leave the pool. The delivery seam stands in for the sessions the test has not
+    /// got.
+    /// </summary>
+    [Test] public static void T138c_formation_fins_every_member()
+    {
+        const int Kelsaik = 9739;
+        MatchQueueManager.Reset();
+        var sent = new List<(uint Player, string Hex)>();
+        var keep = MatchWiring.Deliver;
+        MatchWiring.Deliver = (q, p) => sent.Add((q.PlayerId, BitConverter.ToString(p)));
+        try
+        {
+            T138cQueue(1, Kelsaik, T138cQ(1, 1), T138cQ(2, 6));   // a duo
+            T138cQueue(3, Kelsaik, T138cQ(3, 2));
+            T138cQueue(4, Kelsaik, T138cQ(4, 5));
+            T138cQueue(5, Kelsaik, T138cQ(5, 4));
+            var g = MatchWiring.TryFormAndFinish(Kelsaik, DateTimeOffset.UnixEpoch.AddHours(3));
+            Hex.True(g != null && sent.Count == 5, $"five members, five FINs: {sent.Count}");
+            string fin = BitConverter.ToString(MatchQueueManager.BuildFinInterPartyMatch(Kelsaik));
+            foreach (var (_, hex) in sent)
+                Hex.True(hex == fin, "and every one of them is record 10585's frame");
+            Hex.True(MatchQueueManager.Find(1) == null && MatchQueueManager.Find(5) == null,
+                "a formed entry leaves the pool");
+        }
+        finally { MatchWiring.Deliver = keep; MatchQueueManager.Reset(); }
+    }
+
+    /// <summary>
+    /// T138c. The rating. S_BATTLE_FIELD_RESULT is byte-exact against classic_live2 record
+    /// 325115 - the only capture of it - the roll stays inside the stated band, the floor
+    /// holds, and the number reaches both the store and S_PVP_RANKING_LIST's rating field.
+    /// </summary>
+    [Test] public static void T138c_battle_field_result_and_the_rating_round_trip()
+    {
+        // The capture, and the delta that is the only field its .def names.
+        var cap = "28 00 5F 76 01 00 10 00 01 00 18 00 F8 FF FF FF 10 00 00 00 02 00 00 00 "
+                + "18 00 00 00 D0 02 00 00 00 00 00 00 00 00 00 00";
+        Hex.Eq(BattlegroundRating.Build(-8), cap,
+            "classic_live2 record 325115 - two arrays, then the signed rating");
+        var frame = Hex.B(cap);
+        Hex.True(BattlegroundRating.IsResult(frame) && BattlegroundRating.ReadDelta(frame) == -8,
+            "the live frame reads back as a loss of 8");
+        Hex.True(BattlegroundRating.WriteDelta(frame, 11)
+                 && BattlegroundRating.ReadDelta(frame) == 11,
+            "and the delta is rewritable in place, which is how the tunnel hook works");
+        Hex.True(!BattlegroundRating.IsResult(Hex.B("10 00 E0 68 00 00 00 00 01 00 00 00 02 00 00 00")),
+            "and nothing else is mistaken for it");
+
+        // The band: 5..12 either way, never 0, over enough draws to see both ends.
+        var rng = new Random(20260913);
+        int lo = int.MaxValue, hi = int.MinValue;
+        for (int i = 0; i < 2000; i++)
+        {
+            int up = BattlegroundRating.Roll(true, rng);
+            int down = BattlegroundRating.Roll(false, rng);
+            Hex.True(up >= BattlegroundRating.MinDelta && up <= BattlegroundRating.MaxDelta,
+                $"a win moves up by 5..12, not {up}");
+            Hex.True(down <= -BattlegroundRating.MinDelta && down >= -BattlegroundRating.MaxDelta,
+                $"a loss moves down by 5..12, not {down}");
+            lo = Math.Min(lo, up); hi = Math.Max(hi, up);
+        }
+        Hex.True(lo == BattlegroundRating.MinDelta && hi == BattlegroundRating.MaxDelta,
+            $"and both ends of the band are reachable: {lo}..{hi}");
+
+        // The column, the floor, and the fact that the floor is applied in SQL.
+        using var store = StoreWithTwoAccounts();
+        Hex.True(store.GetBgRating(1) == 0 && store.GetBgRating(999) == 0,
+            "a character who has never finished a battleground is at 0, and so is one who is not there");
+        Hex.True(store.AdjustBgRating(1, 7) == 7 && store.GetBgRating(1) == 7,
+            "a win lands");
+        Hex.True(store.AdjustBgRating(1, -20) == 0 && store.GetBgRating(1) == 0,
+            "and a loss cannot push it below the floor");
+        store.SetBgRating(1, 40);
+        var r = BattlegroundRating.Apply(store, 1, win: false, rng: new Random(7));
+        Hex.True(r.Previous == 40 && r.Delta < 0 && r.Rating == 40 + r.Delta
+                 && store.GetBgRating(1) == r.Rating,
+            $"Apply rolls, stores and reports the same number: {r.Previous} -> {r.Rating} ({r.Delta})");
+        var last = BattlegroundRating.LastResultFor(1);
+        Hex.True(last != null && last.Value.Rating == r.Rating,
+            "and it is kept, so S_VIEW_BATTLE_FIELD_RESULT's previousrating/rating are there "
+            + "the day that frame gets a capture");
+
+        // The leaderboard: the rating field carries bg_rating when a row has one, and the
+        // score when it does not - which is why every T119 frame is still byte-identical.
+        var withRating = new List<RankingRow>
+            { new(1, 5, "t138c", 3, 60, Score: 7, Rating: 42) };
+        var without = new List<RankingRow> { new(1, 5, "t138c", 3, 60, Score: 7) };
+        int at = RankingBoards.HeaderSize + RankingBoards.ListHeadSize + RankingBoards.PvpRatingOffset;
+        Hex.True(BitConverter.ToInt32(RankingBoards.BuildPvpRankingList(withRating), at) == 42,
+            "S_PVP_RANKING_LIST's +15 carries the battleground rating");
+        Hex.True(BitConverter.ToInt32(RankingBoards.BuildPvpRankingList(without), at) == 7,
+            "and falls back to the score, which is what T119 shipped");
+
+        // And the store hands the rating to the board beside the kills.
+        store.SetBgRating(2, 33);
+        store.AddGameLog(GameLogPackets.CategoryPvp, "pvp.kill", 0, 2, 1, 0, 0, 0, 0, null, 1000);
+        var scores = store.GetPvpRankingScores();
+        Hex.True(scores.Count == 1 && scores[0].CharacterId == 2 && scores[0].Score == 1
+                 && scores[0].Rating == 33,
+            "one kill and a rating of 33 - the ORDER is still the kills");
+        var ranked = RankingBoards.Rank(scores, RankingBoards.AllClasses);
+        Hex.True(ranked.Count == 1 && ranked[0].Rating == 33,
+            "and Rank carries it through to the row the frame is built from");
+        BattlegroundRating.Reset();
     }
 
 }

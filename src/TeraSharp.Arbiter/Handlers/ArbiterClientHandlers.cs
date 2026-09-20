@@ -2680,7 +2680,8 @@ public static class ArbiterClientHandlers
 
     /// <summary>
     /// Every W-&gt;A tunnelled client packet for this session, on its way out. Forwards
-    /// verbatim, and slips the enter-world GM-skill push in front of the first S_LOAD_TOPO.
+    /// verbatim except for T138c's battleground-result rewrite, and slips the enter-world
+    /// GM-skill push in front of the first S_LOAD_TOPO.
     ///
     /// <para>Wired as the tunnel's delivery action in <c>WorldBridge.RegisterPlayer</c>, so
     /// the injected packet and the anchor go out through the same <c>GameSession.Send</c> on
@@ -2692,6 +2693,11 @@ public static class ArbiterClientHandlers
     {
         ArgumentNullException.ThrowIfNull(s);
         ArgumentNullException.ThrowIfNull(clientPacket);
+        // T138c: a battleground result on its way past. The sender's SIGN says won or lost,
+        // our own roll replaces the magnitude, characters.bg_rating moves by it and the frame
+        // is rewritten so the client shows the number the database now holds. Every other
+        // packet pays one u16 compare. World/BattlegroundRating.cs.
+        BattlegroundRating.OnTunnelled(s, clientPacket, s.Log);
         if (IsLoadTopo(clientPacket)
             && !GmSkillPushed.ContainsKey((int)s.PlayerId)
             && OperatorGetsGmSkillPush(GmCommandHandlers.LevelOf(s, Program.Store))
