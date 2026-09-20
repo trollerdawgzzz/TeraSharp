@@ -128,6 +128,7 @@ public static class Program
             .Select(s => new TeraSharp.Arbiter.Web.AdminOnlineRow((int)(s.SelectedCharacter?.Id ?? 0),
                 s.SelectedCharacter?.Name ?? "", s.SelectedCharacter?.Level ?? 0,
                 s.SelectedCharacter?.Zone ?? 0, s.Account.Name)).ToList(), log);
+        var apiGateway = TeraSharp.Arbiter.Web.ApiGatewayServer.TryStart(log);   // T132: probe listener at apiServerAddress (TERASHARP_API_GATEWAY_SERVE)
         if (admin != null)
         {
             admin.Api.StartedAt = DateTimeOffset.UtcNow;
