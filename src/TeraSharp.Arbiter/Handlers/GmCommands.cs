@@ -371,7 +371,7 @@ public sealed class GmCommandHandlers
                 return true;
 
             case GmDispatch.Local:
-                Execute(s, store!, chr!, line);
+                Execute(s, store!, chr!, line, commandType);
                 return true;
 
             case GmDispatch.NotImplemented:
@@ -423,8 +423,20 @@ public sealed class GmCommandHandlers
 
     /// <summary>The Arbiter-side commands TeraSharp actually runs.</summary>
     public static readonly IReadOnlySet<string> Implemented = new HashSet<string>(
-        new[] { "set_admin_level", "create_user", "testitem", "clear_inven", "warehousegold_max", "query_point" },
+        new[] { "set_admin_level", "create_user", "testitem", "clear_inven", "warehousegold_max", "query_point",
+                "vis", "invis", "vaporize", "invisible" },
         StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// T128. The two World names this class now ALSO handles locally. They stay in
+    /// <see cref="Implemented"/> so <see cref="Classify"/> routes them here, and
+    /// <see cref="Execute"/> forwards them to World afterwards anyway: the
+    /// client-side switch is ours, the world-side vaporize is World's, and a GM typing
+    /// <c>/@vaporize</c> wants both. <c>vis</c> and <c>invis</c> are ours alone - World has no
+    /// such command and would only log an unknown one - so they are not in this set.
+    /// </summary>
+    public static readonly IReadOnlySet<string> AlsoForwarded = new HashSet<string>(
+        new[] { "vaporize", "invisible" }, StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
     /// The account's effective admin level: the higher of the stored row and what the
@@ -518,7 +530,8 @@ public sealed class GmCommandHandlers
 
     // ---- The six Arbiter-side commands ----
 
-    private void Execute(GameSession s, CharacterStore store, FakeCharacter chr, GmCommandLine line)
+    private void Execute(GameSession s, CharacterStore store, FakeCharacter chr, GmCommandLine line,
+                         int commandType)
     {
         switch (line.Name.ToLowerInvariant())
         {
@@ -528,7 +541,42 @@ public sealed class GmCommandHandlers
             case "clear_inven":     ClearInven(s, chr); break;
             case "warehousegold_max": WarehouseGoldMaxCommand(s, line); break;
             case "query_point":     QueryPoint(s); break;
+
+            // T128 - the visibility toggle. /@vis and /@invis set it; /@vaporize and
+            // /@invisible flip it, which is what the client's own Alt+A does, and are
+            // forwarded to World as well so nothing that worked before stops working.
+            case "vis":       Visibility(s, invisible: false); break;
+            case "invis":     Visibility(s, invisible: true); break;
+            case "vaporize":
+            case "invisible": Visibility(s, !ArbiterClientHandlers.IsGmInvisible((int)s.PlayerId)); break;
         }
+
+        if (AlsoForwarded.Contains(line.Name)) ForwardToWorld(s, line, commandType);
+    }
+
+
+    /// <summary>
+    /// T128. Flip the client-side GM visibility switch and say so.
+    ///
+    /// <para>This is the frame cap_final_gm_client2 546 carries - <c>09 00 BE 64 00 00 00 00 00</c>,
+    /// S_ADMIN_GM_SKILL with skill 0 and enabled 0 - which is the reply the real Arbiter sent
+    /// when the tool asked to turn invisibility off at 542. Sending it directly is what makes
+    /// the toggle take without Alt+A.</para>
+    ///
+    /// <para><b>What this does not do.</b> S_ADMIN_GM_SKILL is the CLIENT-side switch: it is
+    /// what lets the GM cast and stops the client drawing itself vaporized. Being hidden from
+    /// other players is World's, and it has no client-facing packet of its own -
+    /// <c>SDB_USER_VAPORIZED</c> (0x282D) is World-&gt;DbProxy persistence. That is why
+    /// <c>/@vaporize</c> still goes to World as well.</para>
+    /// </summary>
+    private void Visibility(GameSession s, bool invisible)
+    {
+        ArbiterClientHandlers.SendGmInvisible(s, invisible);
+        _log.LogInformation("GM visibility: account '{Acct}' player {Id} is now {State}",
+            s.Account.Name, s.PlayerId, invisible ? "INVISIBLE" : "visible");
+        SendCustom(s, invisible
+            ? "You are now invisible. You cannot cast while invisible.\n"
+            : "You are now visible and can cast.\n");
     }
 
     /// <summary>
@@ -1097,14 +1145,61 @@ public static class GmAdminTool
         return true;
     }
 
-    /// <summary>C_ADMIN_GM_SKILL (0x8949), frames 542 and 1210:
-    /// <c>[pdid 8][i32 value]</c>.</summary>
+    /// <summary>The message id skill 0 answers with (frames 547 and 2949).</summary>
+    public const int GmSkillOffMessage = 1436;
+    /// <summary>The message id skill 2 answers with (frame 1211). Skill 1 has no sample.</summary>
+    public const int GmSkillHideFromMobsMessage = 1439;
+
+    /// <summary>
+    /// C_ADMIN_GM_SKILL (0x8949): <c>[u64 gameId][i32 skill]</c>, a 12-byte body. Alt+A, and
+    /// the tool's GM-skill buttons.
+    ///
+    /// <para><b>T128 corrected this.</b> The trailing i32 is the skill INDEX, not an enable
+    /// flag - <c>C_ADMIN_GM_SKILL.1.def</c> says <c>0 = Invisible, 1 = Invincible,
+    /// 2 = Hide from Mobs</c> - and the packet is a TOGGLE, not a set. T89 read it as a flag
+    /// and answered <c>skill=0, enabled=(value != 0)</c>, which got frame 546 right by
+    /// accident (skill 0 and value 0 both being zero) and everything else wrong: pressing
+    /// "Hide from Mobs" answered <c>enabled=1</c> for INVISIBILITY.</para>
+    ///
+    /// <para>cap_final_gm_client2 has three requests and they settle it:</para>
+    /// <list type="bullet">
+    /// <item>542 <c>skill=0</c> -&gt; 546 <c>S_ADMIN_GM_SKILL 00 00 00 00 00</c> + 547
+    /// <c>S_SYSTEM_MESSAGE @1436</c>. Invisibility had been ON since the enter-world push at
+    /// 99, so the toggle turned it off.</item>
+    /// <item>2942 <c>skill=0</c> -&gt; 2948 / 2949, the same pair on the second character.</item>
+    /// <item>1210 <c>skill=2</c> -&gt; 1211 <c>S_SYSTEM_MESSAGE @1439</c> and <b>nothing
+    /// else</b>. The S_ADMIN_GM_SKILL echo belongs to skill 0 alone.</item>
+    /// </list>
+    ///
+    /// <para>Skill 1 has no sample, so it gets neither frame - a log line and silence, rather
+    /// than a message id we would be inventing. The state is tracked so <c>/@vis</c> and the
+    /// tool agree about which way the next toggle goes.</para>
+    /// </summary>
     public static bool OnGmSkill(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
     {
         if (!Allowed(s, log, "C_ADMIN_GM_SKILL")) return true;
         var b = body.Span;
-        int value = b.Length >= 12 ? BitConverter.ToInt32(b[8..]) : 0;
-        s.Send(ArbiterClientHandlers.BuildAdminGmSkill(0, value != 0));
+        int skill = b.Length >= 12 ? BitConverter.ToInt32(b[8..]) : ArbiterClientHandlers.GmSkillInvisible;
+        int playerId = (int)s.PlayerId;   // the key the enter-world push uses
+
+        if (skill == ArbiterClientHandlers.GmSkillInvisible)
+        {
+            bool now = !ArbiterClientHandlers.IsGmInvisible(playerId);
+            ArbiterClientHandlers.SendGmInvisible(s, now);
+            Smt(s, GmSkillOffMessage);
+            log.LogInformation("C_ADMIN_GM_SKILL: invisibility toggled {State} for player {Id}",
+                now ? "ON" : "OFF", playerId);
+            return true;
+        }
+
+        if (skill == ArbiterClientHandlers.GmSkillHideFromMobs) { Smt(s, GmSkillHideFromMobsMessage); return true; }
+
+        log.LogInformation("C_ADMIN_GM_SKILL: skill {Skill} has no captured reply - answering nothing",
+            skill);
         return true;
     }
+
+    /// <summary>One S_SYSTEM_MESSAGE carrying a bare <c>@id</c>, the form frames 547 and 1211 use.</summary>
+    private static void Smt(GameSession s, int id)
+        => s.SendByDef("S_SYSTEM_MESSAGE", new Dictionary<string, object> { ["message"] = "@" + id });
 }

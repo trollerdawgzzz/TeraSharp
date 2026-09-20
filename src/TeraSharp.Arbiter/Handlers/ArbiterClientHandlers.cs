@@ -2241,9 +2241,28 @@ public static class ArbiterClientHandlers
         return p;
     }
 
-    /// <summary>S_ADMIN_GM_SKILL (0x64BE), frames 99 and 546: <c>[i32][u8]</c>. The push at
-    /// enter-world carries 0 / 1 and the reply to the tool's request carries 0 / 0 for a
-    /// requested value of 0 - two samples, so the reply mirrors "did you ask for something".</summary>
+    /// <summary>
+    /// S_ADMIN_GM_SKILL (0x64BE): <c>[i32 skill][u8 enabled]</c>, 9 bytes, per its own .def.
+    ///
+    /// <para><b>T128 re-read the four samples in cap_final_gm_client2 and the meaning is now
+    /// pinned.</b> <c>skill</c> is the GM skill INDEX - the def spells it out on the C_ side:
+    /// <c>0 = Invisible, 1 = Invincible, 2 = Hide from Mobs</c> - and <c>enabled</c> is that
+    /// skill's new state:</para>
+    /// <list type="bullet">
+    /// <item>99 and 2445: <c>00 00 00 00 01</c> - the enter-world push, one per world entry,
+    /// each right after S_FESTIVAL_LIST and before S_LOAD_TOPO. Invisibility ON, which is why
+    /// a GM spawns vaporized.</item>
+    /// <item>542 -&gt; 546: the tool sends <c>C_ADMIN_GM_SKILL [u64 gameId][i32 skill=0]</c> and
+    /// the server answers <c>00 00 00 00 00</c> - invisibility OFF - plus S_SYSTEM_MESSAGE
+    /// <c>@1436</c>. 2942 -&gt; 2948/2949 is the same exchange on the second character.</item>
+    /// <item>1210: <c>skill=2</c> (Hide from Mobs) gets S_SYSTEM_MESSAGE <c>@1439</c> and
+    /// <b>no S_ADMIN_GM_SKILL at all</b> - the echo belongs to skill 0.</item>
+    /// </list>
+    /// <para>So this frame is the client-facing visibility switch, and 0/0 is what makes a GM
+    /// visible and able to cast without pressing Alt+A. There is no client-facing "vaporize"
+    /// packet: <c>SDB_USER_VAPORIZED</c> (0x282D, <c>i32 userDbId, u8 vaporized</c>) is
+    /// World-&gt;DbProxy persistence and never reaches a client.</para>
+    /// </summary>
     public static byte[] BuildAdminGmSkill(int value = 0, bool on = false)
     {
         var p = new byte[9];
@@ -2302,7 +2321,7 @@ public static class ArbiterClientHandlers
     public static void SendAdminGmSkillIfOperator(GameSession s, int adminLevel)
     {
         ArgumentNullException.ThrowIfNull(s);
-        if (OperatorGetsGmSkillPush(adminLevel)) s.Send(BuildAdminGmSkill(0, on: true));
+        if (OperatorGetsGmSkillPush(adminLevel)) SendGmInvisible(s, invisible: true);
     }
 
     // ------------------------------------------------ T121: the SAME slot, on the World path
@@ -2349,7 +2368,50 @@ public static class ArbiterClientHandlers
     /// <summary>Arm the push again. Called from SDB_USER_ENTERWORLD, and on leave-world.</summary>
     public static void ResetGmSkillPush(int playerId)
     {
-        if (playerId > 0) GmSkillPushed.TryRemove(playerId, out _);
+        if (playerId > 0) { GmSkillPushed.TryRemove(playerId, out _); GmInvisible.TryRemove(playerId, out _); }
+    }
+
+    // ------------------------------------------------------------------- T128: the toggle
+    // The push above is one-way: a GM spawns invisible and the only way back was Alt+A, whose
+    // C_ADMIN_GM_SKILL the tool sends. /@vaporize and /@invisible are World commands and do
+    // not touch this client-side switch, so they never took. Tracking the state here lets
+    // GmCommands flip it with the same frame the tool's own exchange uses (542 -> 546).
+
+    /// <summary>Player ids whose invisibility (GM skill 0) is currently ON.</summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, byte> GmInvisible = new();
+
+    /// <summary>GM skill 0 - Invisible - per <c>C_ADMIN_GM_SKILL.1.def</c>.</summary>
+    public const int GmSkillInvisible = 0;
+    /// <summary>GM skill 1 - Invincible.</summary>
+    public const int GmSkillInvincible = 1;
+    /// <summary>GM skill 2 - Hide from Mobs.</summary>
+    public const int GmSkillHideFromMobs = 2;
+
+    /// <summary>
+    /// Is this player invisible right now? Default false: a session that has not had the
+    /// enter-world push is an ordinary player, and a player id of 0 is nobody.
+    /// </summary>
+    public static bool IsGmInvisible(int playerId)
+        => playerId > 0 && GmInvisible.ContainsKey(playerId);
+
+    /// <summary>Record the new state. Called wherever the switch is actually sent.</summary>
+    public static void SetGmInvisible(int playerId, bool invisible)
+    {
+        if (playerId <= 0) return;
+        if (invisible) GmInvisible[playerId] = 1; else GmInvisible.TryRemove(playerId, out _);
+    }
+
+    /// <summary>
+    /// Send the switch and remember it. Returns the frame so a caller without a session (the
+    /// tests) can check the bytes. <paramref name="invisible"/> false is frame 546 exactly.
+    /// </summary>
+    public static byte[] SendGmInvisible(GameSession s, bool invisible)
+    {
+        ArgumentNullException.ThrowIfNull(s);
+        var frame = BuildAdminGmSkill(GmSkillInvisible, on: invisible);
+        SetGmInvisible((int)s.PlayerId, invisible);
+        s.Send(frame);
+        return frame;
     }
 
     /// <summary>
@@ -2370,7 +2432,10 @@ public static class ArbiterClientHandlers
             && !GmSkillPushed.ContainsKey((int)s.PlayerId)
             && OperatorGetsGmSkillPush(GmCommandHandlers.LevelOf(s, Program.Store))
             && TryTakeGmSkillPush((int)s.PlayerId))
-            s.Send(BuildAdminGmSkill(0, on: true));
+        {
+            s.Send(BuildAdminGmSkill(GmSkillInvisible, on: true));
+            SetGmInvisible((int)s.PlayerId, true);   // T128: the default spawn state, recorded
+        }
         s.Send(clientPacket);
     }
 
