@@ -12023,7 +12023,6 @@ bool   isGuildWarAcceptable
             "the three strings decode back at their packet offsets minus the header");
     }
 
-    /// <summary>UTF-16LE, null-terminated, at an index into the buffer it is given.</summary>
     /// <summary>[u16 totalLength][u16 opcode][body] - what GameSession.Send puts on the wire.</summary>
     static byte[] Framed(ushort opcode, byte[] body)
     {
@@ -12034,6 +12033,7 @@ bool   isGuildWarAcceptable
         return p;
     }
 
+    /// <summary>UTF-16LE, null-terminated, at an index into the buffer it is given.</summary>
     static string WStringAt(byte[] p, int off)
     {
         var sb = new System.Text.StringBuilder();
