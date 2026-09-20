@@ -2247,6 +2247,75 @@ public static class ArbiterClientHandlers
         if (OperatorGetsGmSkillPush(adminLevel)) s.Send(BuildAdminGmSkill(0, on: true));
     }
 
+    // ------------------------------------------------ T121: the SAME slot, on the World path
+    //
+    // T120 put the push between S_FESTIVAL_LIST and S_LOAD_TOPO in LoginHandlers.OnSelectUser.
+    // That burst is the STANDALONE path: with a World link up, OnSelectUser returns at
+    // `if (WorldEntry.EnterWorld(s, _log)) return true;` and every frame from S_LOGIN to
+    // S_LOAD_TOPO arrives through the tunnel instead. So on a live server the T120 line never
+    // runs, and WorldEntry's pre-hand-off call fires BEFORE World has sent S_LOGIN - the
+    // client has no user object yet and drops it.
+    //
+    // The anchor is therefore the tunnelled S_LOAD_TOPO itself: inject immediately before
+    // forwarding it and the client sees ... S_FESTIVAL_LIST, S_ADMIN_GM_SKILL, S_LOAD_TOPO ...,
+    // which is cap_final_gm_client2 98 / 99 / 100 exactly. Anchoring on the packet we must
+    // PRECEDE rather than the one we must follow also survives World dropping S_FESTIVAL_LIST;
+    // the reverse would fail silently.
+    //
+    // ONCE PER WORLD ENTRY, not per topo load. cap_final_gm_client2's second S_ADMIN_GM_SKILL
+    // (546) is NOT a second push: it is the reply to the tool's own C_ADMIN_GM_SKILL at 542,
+    // and the /@teleport right after it (548 S_FESTIVAL_LIST, 549 S_LOAD_TOPO) carries NO
+    // push. Pushing on every S_LOAD_TOPO would re-enable GM skill on every zone change and
+    // undo the toggle the GM had just turned off. The one-shot is cleared by
+    // DbProxyHandlers.OnUserEnterWorld (SDB_USER_ENTERWORLD), which a zone change does not
+    // raise and a relog does.
+
+    /// <summary>S_LOAD_TOPO (0xE828) - World's, and the frame the push has to get in front of.</summary>
+    public const ushort S_LOAD_TOPO = 0xE828;
+
+    /// <summary>Player ids that have had their enter-world push since the last SDB_USER_ENTERWORLD.</summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, byte> GmSkillPushed = new();
+
+    /// <summary>Is this tunnelled client packet an S_LOAD_TOPO? Header only - [u16 len][u16 op].</summary>
+    public static bool IsLoadTopo(ReadOnlySpan<byte> clientPacket)
+        => clientPacket.Length >= 4 && BitConverter.ToUInt16(clientPacket[2..]) == S_LOAD_TOPO;
+
+    /// <summary>
+    /// Take the one-shot. True exactly once per world entry, for the first caller; every later
+    /// call returns false until <see cref="ResetGmSkillPush"/> runs. Same shape as T113's
+    /// TakeSessionSeconds, and for the same reason - two topo loads must not bank it twice.
+    /// </summary>
+    public static bool TryTakeGmSkillPush(int playerId)
+        => playerId > 0 && GmSkillPushed.TryAdd(playerId, 1);
+
+    /// <summary>Arm the push again. Called from SDB_USER_ENTERWORLD, and on leave-world.</summary>
+    public static void ResetGmSkillPush(int playerId)
+    {
+        if (playerId > 0) GmSkillPushed.TryRemove(playerId, out _);
+    }
+
+    /// <summary>
+    /// Every W-&gt;A tunnelled client packet for this session, on its way out. Forwards
+    /// verbatim, and slips the enter-world GM-skill push in front of the first S_LOAD_TOPO.
+    ///
+    /// <para>Wired as the tunnel's delivery action in <c>WorldBridge.RegisterPlayer</c>, so
+    /// the injected packet and the anchor go out through the same <c>GameSession.Send</c> on
+    /// the same thread, in this order. The opcode test is two bytes and the one-shot is a
+    /// dictionary miss, so the common case costs nothing; the admin-level lookup (which reads
+    /// the accounts row) only runs on an S_LOAD_TOPO that has not pushed yet.</para>
+    /// </summary>
+    public static void DeliverTunnelled(GameSession s, byte[] clientPacket)
+    {
+        ArgumentNullException.ThrowIfNull(s);
+        ArgumentNullException.ThrowIfNull(clientPacket);
+        if (IsLoadTopo(clientPacket)
+            && !GmSkillPushed.ContainsKey((int)s.PlayerId)
+            && OperatorGetsGmSkillPush(GmCommandHandlers.LevelOf(s, Program.Store))
+            && TryTakeGmSkillPush((int)s.PlayerId))
+            s.Send(BuildAdminGmSkill(0, on: true));
+        s.Send(clientPacket);
+    }
+
     // =========================================================================================
     // 16. The tool's user-info replies, and the two leaderboard pushes                  (T91)
     // =========================================================================================

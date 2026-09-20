@@ -409,7 +409,7 @@ difference:
 | `S_ADMIN_HOLD_CHARACTER` | 402 | 974 |
 
 The real Arbiter sends `S_ADMIN_GM_SKILL` **inside the `S_LOGIN` burst, in the slot between
-`S_FESTIVAL_LIST` and `S_LOAD_TOPO`**, and does it again on the next topo load (546 -> 549).
+`S_FESTIVAL_LIST` and `S_LOAD_TOPO`**.
 TeraSharp sends it on `C_LOAD_TOPO_FIN` - 201 frames later and on the far side of the topo
 transition, after the client has built the in-game UI.
 
@@ -436,3 +436,51 @@ before `S_LOAD_TOPO`, and in no other.
 constants `AdminGmSkillFollows` / `AdminGmSkillPrecedes` that name the slot. Two human-owned
 one-liners put it there - see the T120 report. T107's `LevelOf(s, store) >= 1` gate moves with it,
 so the "not fixed here" note above is now closed on both counts.
+
+### T121 - correction, and where the push actually has to go
+
+**T120 read frame 546 wrong.** It is not a second enter-world push. Frames 542-549 read:
+
+```
+542 C->S C_ADMIN_GM_SKILL        02 00 F0 0A 00 80 00 00 00 00 00 00   <- the GM toggles it in the tool
+546 S->C S_ADMIN_GM_SKILL        00 00 00 00 00                        <- the REPLY, enabled = 0
+547 S->C S_SYSTEM_MESSAGE
+548 S->C S_FESTIVAL_LIST                                               <- a /@teleport starts here
+549 S->C S_LOAD_TOPO
+```
+
+546 answers 542 (`GmCommands.cs:1107` already does this), and the teleport at 548/549 carries **no
+push at all**. So the real Arbiter pushes `S_ADMIN_GM_SKILL` **once per world entry**, not once per
+topo load - and a per-topo push would re-enable a skill toggle the GM had just turned off.
+
+**And T120's fix site is unreachable on a live server.** `LoginHandlers.OnSelectUser` returns at
+`if (WorldEntry.EnterWorld(s, _log)) return true;`, so the whole `S_LOGIN` ... `S_FESTIVAL_LIST`
+... `S_LOAD_TOPO` burst below that line is the **standalone** path. With a World link up those
+frames come from World through `SA_BYPASS_TO_CLIENT`, and the T120 line never runs.
+`WorldEntry`'s pre-hand-off call does run, but it fires before World has sent `S_LOGIN` - the
+client has no user object yet and drops it.
+
+**The fix (T121): inject in front of the tunnelled `S_LOAD_TOPO`.**
+
+`ArbiterClientHandlers.DeliverTunnelled(s, packet)` becomes the tunnel's delivery action, so every
+W->A client packet for a session passes through it on its way to `GameSession.Send`. When the
+packet is an `S_LOAD_TOPO` (0xE828), the session is an operator, and the one-shot has not been
+taken since the last `SDB_USER_ENTERWORLD`, it sends `S_ADMIN_GM_SKILL` first and then forwards.
+The client sees `... S_FESTIVAL_LIST, S_ADMIN_GM_SKILL, S_LOAD_TOPO ...` - cap_final_gm_client2
+98 / 99 / 100 exactly.
+
+Two design notes worth keeping:
+
+* **Anchor on the packet you must precede, not the one you must follow.** `S_FESTIVAL_LIST` is
+  where frame 99 sits *after*, but if World ever stops sending it the push silently disappears;
+  anchoring on `S_LOAD_TOPO` cannot fail that way, and it is the frame the client acts on.
+* **The one-shot is cleared in `DbProxyHandlers.OnUserEnterWorld`**, beside T113's
+  `MarkEnteredWorld`. That is the one event a zone change does not raise and a relog does - which
+  is precisely the 99-versus-548/549 distinction above.
+
+Cost: two bytes compared and one dictionary miss per tunnelled packet; the admin-level lookup
+(which reads the accounts row) only runs on an `S_LOAD_TOPO` that has not pushed yet.
+
+**Still to remove**: `HandlerRegistry.cs:85`'s `BuildAdminGmSkill` push on `C_LOAD_TOPO_FIN` (~200
+frames too late), and `WorldEntry.cs:33`'s pre-hand-off call (too early). `LoginHandlers.cs:233`
+stays - standalone has no World to tunnel through.
