@@ -1209,3 +1209,53 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   `DbProxyStaticData.cs` from an earlier session instead of staging the file this session, and
   the stale copy predated T98. CLAUDE.md already says to read every file in the session it is
   changed; it applies just as much to a file only being READ to decide whether something exists.
+
+- T139: **open-source release prep** - the audit, the scaffolding, and a gate that keeps it
+  that way. `bin/` and `obj/` turned out to be gitignored already, so no build output was ever
+  tracked; the `.gitignore` that did it was four lines long and is now a full one.
+
+  **Added.** `LICENSE` (MIT, plus a paragraph saying what the licence does not cover: no
+  assets, no executables, no datasheets, no captured traffic), root `README.md`,
+  `docs/SETUP.md` (clone to a character in the world, and a symptom table), `.env.example`
+  (every `TERASHARP_*` variable, placeholders only), `deploy.example.ps1`, `data/README.md`,
+  a rewritten `data/classic-live/README.md`, `tools/make-tsis.ps1`, `tools/audit-release.ps1`.
+
+  **Redacted, in place.** `Tests/Program.cs` line 12128 - the one routable IPv4 in a test
+  string is now `203.0.113.9` (RFC 5737). `status/CHAT-HANDOFF.md` line 21 - the build host's
+  address is now "the build host". Both were the operator's own infrastructure.
+
+  **`tools/audit-release.ps1`** keys on the SHA-256 of all 19 capture-derived blobs, so
+  renaming `starter_blob.bin` does not get it past the gate; it also refuses datasheets,
+  `.def`, `.npcap`, credentials assigned to literals, private keys, `.env`, `deploy.ps1`, any
+  routable public IPv4 (loopback, RFC1918, CGNAT and the RFC 5737 ranges pass), and build
+  junk. Verified both ways: 245 findings on the current worktree - 237 RETAIL, 3 PII,
+  4 ADDRESS, 1 JUNK - and 0 blocking on a simulated clean tree.
+
+  **`tools/make-tsis.ps1`** is what makes "regenerate the fixtures yourself" true rather than
+  a slogan: reframer output in, a TSIS container out. Verified by unpacking `cap_t26.bin`,
+  re-adding the 6-byte header to each of its 11 payloads, writing a synthetic `_frames.txt`
+  and rebuilding - byte-identical to the original.
+
+  **Cowork cannot delete files, so these are left for the human**: `data/*.bin` (14),
+  `data/classic-live/*.hex` (5), `data/*.md` (11 fixture notes), `data/dbproxy_opcodes.txt`,
+  `data/proxy-defs/`, `ship.ps1` (hardcodes `D:\v100\...` and a 7-Zip path;
+  `deploy.example.ps1` replaces it), `src/TeraSharp.Arbiter.Tests/Program.cs.bak`,
+  `status/T105-fail.txt`.
+
+  **The one item with a reason beyond copyright**: `data/classic-live/*.hex` carries roughly
+  114 real character names and guild names captured from a live third-party server. It is the
+  clearest must-not-ship thing in the tree and `audit-release.ps1` files it as `PII`, not
+  `RETAIL`.
+
+  **Open, deliberately.** 198 `REVIEW` findings remain - lines of verbatim decompiler output
+  pasted into comments. Mostly `status/` (MULTIPLAYER-DESIGN 36, GUILD-DESIGN 23, PARTY-DESIGN
+  22, ENTER-WORLD-FALLBACK 16, HANDSHAKE-DATA 14, WORLD-PARTIAL-LOAD 13), and a few source
+  comments (PartyManager 6, ParcelDbHandlers 5, RankingBoards 4, ArbiterClientHandlers 4).
+  Offsets, opcode numbers and `FUN_` addresses cited in prose are facts and stay; pasted
+  Ghidra is a separate pass over 32 files. The gate reports them and does not fail on them
+  until someone passes `-Strict`.
+
+  Two correctable claims I made before building the tool: I first read the tree as having
+  committed `bin/`/`obj/` (it does not - they are ignored), and I first concluded there was no
+  verbatim decompiled C anywhere. A 4-consecutive-lines heuristic said so; a
+  two-identifiers-on-one-line rule found 198. The tool is right and the eyeball was not.

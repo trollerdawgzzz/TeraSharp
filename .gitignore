@@ -1,4 +1,76 @@
+# ---- build output -----------------------------------------------------------
 bin/
 obj/
-*.7z
+[Dd]ebug/
+[Rr]elease/
+*.user
+*.suo
+.vs/
+.vscode/
+.idea/
 TeraSharp-publish/
+publish/
+
+# ---- secrets and local configuration ----------------------------------------
+# .env.example is tracked; .env and every variant of it is not.
+.env
+.env.*
+!.env.example
+secrets.*
+*.pfx
+*.p12
+*.key
+*.pem
+id_rsa*
+deploy.ps1
+!deploy.example.ps1
+
+# ---- databases --------------------------------------------------------------
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+backups/
+
+# ---- logs -------------------------------------------------------------------
+*.log
+logs/
+arbiter-*.log
+packetlogs/
+
+# ---- captures and anything derived from them --------------------------------
+# No captured traffic in this repository. data/ holds fixtures and runtime blobs
+# that each operator regenerates from their own server (see data/README.md).
+*.npcap
+*.pcap
+*.pcapng
+*.cap
+data/*.bin
+data/*.hex
+data/**/*.bin
+data/**/*.hex
+data/*_ctl.txt
+data/proxy-defs/
+!data/README.md
+!data/**/README.md
+
+# ---- retail material that must never be committed ---------------------------
+*.decompiled.c
+*_decompiled/
+Arb_part_*.c
+*ArbiterServer.exe*
+*WorldServer.exe*
+Datasheet/
+DatasheetAside/
+StrSheet_*.xml
+tera_v100_MASTER_FINAL/
+tera-server-proxy/
+
+# ---- archives and strays ----------------------------------------------------
+*.7z
+*.zip
+*.bak
+*.orig
+*.rej
+*.tmp

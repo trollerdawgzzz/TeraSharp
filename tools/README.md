@@ -354,3 +354,63 @@ Opcode names come from `data.json` (`-Protocol`, default 376012), never from the
 record still parses and `reframe-client.ps1` can rename it. On `classic_live.npcap` every one
 of the 6 467 frames resolved and `reframe-client.ps1` reported **no rejects and no renames**,
 which is also how we know the live Classic+ server speaks the same 376012 map this build does.
+
+---
+
+## `make-tsis.ps1` — frames in, a `data\*.bin` fixture out (T139)
+
+The byte-exact tests read TSIS containers out of `data/`. None of them are in the repository
+any more — each is generated from the operator's own capture. This is the last step of that:
+
+```powershell
+.\reframe-tap.ps1 -Log <tap log> -Opcodes 0x2890,0x2891,0x2909,0x2910
+.\make-tsis.ps1   -Frames <tap log>_frames.txt -Out ..\data\cap_t26.bin -Seq 336,413,376,511,2068
+```
+
+It parses the `=== <seq> ... 0x<OP> ... len=<n>` / hex-line pairs a reframer writes, strips
+`-HeaderBytes` off the front of each frame (**6** for a tap frame, **4** for a client packet,
+**0** to keep it whole — `cap_client_settings.bin` is the one that keeps whole frames), and
+writes `"TSIS"`, `u32 count`, then `u32 seq | u16 opcode | u32 len | payload` per record, all
+little-endian.
+
+`-Seq` throws rather than writing a short file when a frame number is not in the listing, so a
+typo cannot quietly produce a fixture that half-tests something. Omit it to take every frame.
+
+Verified by rebuilding an existing container from its own bytes: unpack `cap_t26.bin`, re-add
+the 6-byte header to each of its 11 payloads, write a synthetic `_frames.txt`, run the script
+over it — the output is byte-identical to `cap_t26.bin`.
+
+### A third PowerShell trap
+
+Two were already listed above. This one cost an hour:
+
+- **`@($list)` on a `[System.Collections.Generic.List[T]]` throws "Argument types do not
+  match".** The array subexpression accepts a pipeline, not a generic list. Use
+  `$list.ToArray()`. `@($list | Where-Object { ... })` is fine, because that is a pipeline.
+- **A local `$out` silently overwrites an `[string] $Out` parameter.** Variable names are
+  case-insensitive, so every `$out.AddRange(...)` then fails on a string. The local here is
+  called `$blob`.
+
+---
+
+## `audit-release.ps1` — the gate before a public push (T139)
+
+```powershell
+.\audit-release.ps1                        # walk the working tree
+.\audit-release.ps1 -Tracked                # only what git tracks, for CI
+.\audit-release.ps1 -AllowAddress 52.199.108.189
+```
+
+Exits non-zero on anything that must not be published:
+
+| Severity | What | Blocking |
+|---|---|---|
+| `RETAIL` | a file whose SHA-256 is a known capture-derived blob (under any name), plus datasheets, decompiles, `.def`, `.npcap` | yes |
+| `PII` | a captured ranking frame — a list of other people's character names | yes |
+| `SECRET` | a credential assigned to a literal, a private key, `.env`, `deploy.ps1` | yes |
+| `ADDRESS` | a routable public IPv4. Loopback, RFC1918, CGNAT and the RFC 5737 documentation ranges pass | yes |
+| `JUNK` | `bin/`, `obj/`, databases, logs, archives, `.bak`/`.orig` | yes |
+| `REVIEW` | a line of verbatim decompiler output — two or more Ghidra identifiers on one line. Citing an address in prose is fine and is not reported | no, unless `-Strict` |
+
+The hash list is the point: renaming `starter_blob.bin` does not get it past the check. Add a
+line when a new blob is identified; never remove one.

@@ -12125,7 +12125,7 @@ bool   isGuildWarAcceptable
         // not the thing the client is pointed at. Only the host is overridable.
         Hex.True(ApiGatewayServer.PrefixFor("127.0.0.1:8800", "") == "http://127.0.0.1:8800/",
             "loopback, unchanged");
-        Hex.True(ApiGatewayServer.PrefixFor("159.195.17.172:8800", "0.0.0.0") == "http://+:8800/"
+        Hex.True(ApiGatewayServer.PrefixFor("203.0.113.9:8800", "0.0.0.0") == "http://+:8800/"
                  && ApiGatewayServer.PrefixFor("10.0.0.5:9000", "*") == "http://+:9000/"
                  && ApiGatewayServer.PrefixFor("10.0.0.5:9000", "+") == "http://+:9000/",
             "0.0.0.0, * and + all mean the HttpListener wildcard");
