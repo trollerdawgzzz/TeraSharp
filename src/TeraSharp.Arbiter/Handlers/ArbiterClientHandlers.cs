@@ -177,6 +177,12 @@ public static class ArbiterClientHandlers
         // stayed shut. The lobby was already byte-equal to the capture (T104/T106); the gate was
         // here, 350 frames later.
         C_REQUEST_SERVER_ADMINTOOL_AWESOMIUM_URL,
+        // T136b - the instance-matching window. Two are answered for real
+        // (C_MATCH_PROGRESS, C_MATCH_ROOM_LIST) and two are refused until the instance
+        // hand-off exists (C_MATCH_ADD, C_MATCH_DEL) - but all four are the ARBITER's, so
+        // none of them may fall through to World. See World/MatchWiring.cs.
+        World.MatchQueueManager.C_MATCH_PROGRESS, World.MatchQueueManager.C_MATCH_ROOM_LIST,
+        World.MatchQueueManager.C_MATCH_ADD, World.MatchQueueManager.C_MATCH_DEL,
     };
 
     // =========================================================================================
