@@ -1392,6 +1392,32 @@ public static class GuildPackets
     public const ushort C_REQUEST_GUILD_INFO_BEFORE_APPLY_GUILD = 0xC046;
     public const ushort C_REQUEST_COOLTIME_TO_JOIN_GUILD = 0xC9C4;
 
+    // ---- the guild-quest board's three verbs (T135, classic_live2) ----
+    // classic_live2 and classic_live3 between them contain FINISH only - three complete
+    // exchanges - and no client in either capture ever sent START or CANCEL, so those two are
+    // their .def and nothing more. All three bodies are a bare i32 quest id, which is what the
+    // defs say and what the captured finish (frame 12185, `11 27 00 00`) confirms.
+    public const ushort C_REQUEST_START_GUILD_QUEST = 0x77A9;
+    public const ushort C_REQUEST_FINISH_GUILD_QUEST = 0xA332;
+    public const ushort C_REQUEST_CANCEL_GUILD_QUEST = 0xA6D1;
+
+    /// <summary>S_START_GUILD_QUEST - <c>byte result, int32 questId, string guildName</c>.
+    /// classic_live2 frame 12254, 35 B. The string is the GUILD's name, not the starter's.</summary>
+    public const ushort S_START_GUILD_QUEST = 0x503D;
+    /// <summary>S_FINISH_GUILD_QUEST - <c>byte result, int32 questId</c>. Frame 12218, 9 B.</summary>
+    public const ushort S_FINISH_GUILD_QUEST = 0x7CBA;
+    /// <summary>S_FAIL_GUILD_QUEST - <c>int32 questId</c>. In the 376012 map, in no capture.</summary>
+    public const ushort S_FAIL_GUILD_QUEST = 0xD1A6;
+
+    // The three economy pushes a finish produces: frames 12220 / 12221 / 12222, and again at
+    // 13326-28 and 64929-31. Each matches its .def byte for byte.
+    /// <summary><c>int32 guildDbId, int32 newLevel, int64 newExp, byte isLevelUp</c>, 21 B.</summary>
+    public const ushort S_GUILD_LEVEL_INFO_CHANGED = 0xF96B;
+    /// <summary><c>int32 guildDbId, int64 newPoint</c>, 16 B.</summary>
+    public const ushort S_GUILD_POINT_INFO_CHANGED = 0xC642;
+    /// <summary><c>int32 guildDbId, int64 newMoney</c>, 16 B.</summary>
+    public const ushort S_GUILD_MONEY_INFO_CHANGED = 0xE4DB;
+
     // ---- client -> WorldServer (NO Arbiter handler; World turns these into SA_ frames) ----
     public const ushort C_LEAVE_GUILD = 0x7C83;
     public const ushort C_BANISH_GUILD_MEMBER = 0xE303;
@@ -1708,6 +1734,10 @@ public static class GuildPackets
         C_SET_GUILD_JOIN_CONDITION => 0x16,
         C_REQUEST_GUILD_INFO_BEFORE_APPLY_GUILD => 0x0A,
         C_REQUEST_COOLTIME_TO_JOIN_GUILD => 0x04,
+        // T135: [u16 len][u16 op][i32 questId]. The captured finish is exactly 8 B.
+        C_REQUEST_START_GUILD_QUEST => 0x08,
+        C_REQUEST_FINISH_GUILD_QUEST => 0x08,
+        C_REQUEST_CANCEL_GUILD_QUEST => 0x08,
         _ => 0,
     };
 

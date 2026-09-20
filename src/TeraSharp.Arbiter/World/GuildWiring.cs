@@ -126,6 +126,11 @@ public static class GuildWiring
         ("C_CHANGE_GUILDNAME",                     GuildPackets.C_CHANGE_GUILDNAME),
         ("C_REQUEST_UPDATE_ANNOUNCE",              GuildHandlers.C_REQUEST_UPDATE_ANNOUNCE),
         ("C_REQUEST_UPDATE_INTRODUCE",             GuildHandlers.C_REQUEST_UPDATE_INTRODUCE),
+        // T135, the guild-quest board. Registration is this table plus GuildPackets
+        // .MinClientLength - HandlerRegistry loops it and needs no change of its own.
+        ("C_REQUEST_START_GUILD_QUEST",            GuildPackets.C_REQUEST_START_GUILD_QUEST),
+        ("C_REQUEST_FINISH_GUILD_QUEST",           GuildPackets.C_REQUEST_FINISH_GUILD_QUEST),
+        ("C_REQUEST_CANCEL_GUILD_QUEST",           GuildPackets.C_REQUEST_CANCEL_GUILD_QUEST),
     };
 
     /// <summary>A client packet's <c>[u16 length][u16 opcode]</c> header. The decompile's guards

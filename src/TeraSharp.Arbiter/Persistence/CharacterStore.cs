@@ -4740,6 +4740,28 @@ DELETE FROM restrictions      WHERE character_id = $id;";
         }
     }
 
+    /// <summary>
+    /// T135. The reward a finished guild quest pays, applied in one statement so the two
+    /// columns cannot drift apart. Both deltas are read off classic_live2: across its three
+    /// finishes the guild exp went 157620 -&gt; 157640 -&gt; 157660 and the funds 711 -&gt; 712 -&gt;
+    /// 713, so +20 and +1, while <c>point</c> stayed 14 throughout - the point push after a
+    /// finish is a refresh, not a reward, and this does not touch it.
+    /// </summary>
+    public bool AddGuildQuestReward(int guildId, long expDelta, long moneyDelta)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "UPDATE guilds SET exp = MAX(0, exp + $x), money = MAX(0, money + $m) " +
+                "WHERE guild_id = $g";
+            cmd.Parameters.AddWithValue("$x", expDelta);
+            cmd.Parameters.AddWithValue("$m", moneyDelta);
+            cmd.Parameters.AddWithValue("$g", guildId);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
     /// <summary>Unix second of this guild s last money incentive, 0 when it has never had one.</summary>
     public long GetGuildIncentiveTime(int guildId)
     {

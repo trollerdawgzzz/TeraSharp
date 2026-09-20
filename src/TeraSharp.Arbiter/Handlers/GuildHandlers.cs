@@ -221,6 +221,9 @@ public sealed class GuildHandlers
             case GuildPackets.C_CHANGE_GUILDNAME: return ChangeGuildName(a, characterId, body);
             case C_REQUEST_UPDATE_ANNOUNCE: return UpdateAnnounce(a, characterId, body);
             case C_REQUEST_UPDATE_INTRODUCE: return UpdateIntroduce(a, characterId, body);
+            case GuildPackets.C_REQUEST_START_GUILD_QUEST: return StartGuildQuest(a, characterId, body);
+            case GuildPackets.C_REQUEST_FINISH_GUILD_QUEST: return FinishGuildQuest(a, characterId, body);
+            case GuildPackets.C_REQUEST_CANCEL_GUILD_QUEST: return CancelGuildQuest(a, characterId, body);
             default:
                 return a.Reject(GuildPackets.ArbiterHandlesClientPacket(opcode)
                     ? $"0x{opcode:X4} is Arbiter-side but needs routing - T39 does not answer it"
@@ -863,6 +866,160 @@ public sealed class GuildHandlers
     private void SendGuildQuestList(GuildActions a, int characterId, CharacterStore.GuildRow g)
         => a.Client(GuildClientAction.Raw(characterId, "S_GUILD_QUEST_LIST",
             BuildGuildQuestList(g, DateTimeOffset.UtcNow.ToUnixTimeSeconds())));
+
+    /// <summary>
+    /// T135: the same board to the whole guild, built once. Every quest verb ends here -
+    /// classic_live2 pushes S_GUILD_QUEST_LIST after each of its three finishes (12223, and
+    /// again at 13330 and 64933), because the board's own row changed.
+    /// </summary>
+    private void BroadcastGuildQuestList(GuildActions a, CharacterStore.GuildRow g)
+    {
+        var frame = BuildGuildQuestList(g, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        foreach (var m in _store.GetGuildMembers(g.GuildId))
+            a.Client(GuildClientAction.Raw(m.UserDbId, "S_GUILD_QUEST_LIST", frame));
+    }
+
+    // =======================================================================================
+    // T135. The three guild-quest verbs. status/GUILD-DESIGN.md section 12.
+    //
+    // WHAT IS CAPTURED AND WHAT IS NOT. classic_live2 and classic_live3 together hold three
+    // complete FINISH exchanges and nothing else: no client in either capture ever sent
+    // C_REQUEST_START_GUILD_QUEST or C_REQUEST_CANCEL_GUILD_QUEST. So finish is byte-for-byte
+    // the live server's, down to the reward, and the other two are their .def plus the one
+    // rule every verb shares - the board is re-pushed afterwards. Each is marked below.
+    // =======================================================================================
+
+    /// <summary>The guild exp one finished quest pays. classic_live2's three finishes moved the
+    /// guild exp 157620 -&gt; 157640 -&gt; 157660, so 20 each.</summary>
+    public const long GuildQuestExpReward = 20;
+    /// <summary>The funds one finished quest pays: 711 -&gt; 712 -&gt; 713 across the same three.</summary>
+    public const long GuildQuestMoneyReward = 1;
+    /// <summary>guild_quests.status - the two T98 defined.</summary>
+    public const int GuildQuestAvailable = 0, GuildQuestRunning = 1;
+
+    /// <summary>All three verbs carry the same body: a bare i32 quest id (frame 12185 is
+    /// <c>11 27 00 00</c>, quest 10001). Null when the body is short.</summary>
+    public static int? ParseQuestId(byte[] body)
+        => body == null || body.Length < 4 ? null : BitConverter.ToInt32(body, 0);
+
+    private static GuildPackets.GuildQuestRow? Catalogue(int questId)
+    {
+        foreach (var q in GuildPackets.GuildQuestCatalogue) if (q.QuestId == questId) return q;
+        return null;
+    }
+
+    /// <summary>
+    /// C_REQUEST_START_GUILD_QUEST (0x77A9). <b>Not captured</b> - the .def is one i32 and the
+    /// reply S_START_GUILD_QUEST IS captured (frame 12254), so the frame we send is real even
+    /// though the request that triggers it never was.
+    ///
+    /// <para>One quest runs at a time: T98's table has a single row at status 1 and
+    /// <c>GetRunningGuildQuest</c> is what the board reads. The countdown is the catalogue
+    /// row's own <c>RemainSec</c> (43200 = the 720 minutes its totalTime field carries).</para>
+    /// </summary>
+    private GuildActions StartGuildQuest(GuildActions a, int characterId, byte[] body)
+    {
+        if (ParseQuestId(body) is not int questId) return a.Reject("C_REQUEST_START_GUILD_QUEST: short body");
+        var g = MyGuild(characterId);
+        if (g == null) return a.Reject("C_REQUEST_START_GUILD_QUEST: not in a guild");
+        var row = Catalogue(questId);
+        if (row == null) return a.Reject($"C_REQUEST_START_GUILD_QUEST: {questId} is not on the board");
+
+        var running = _store.GetRunningGuildQuest(g.GuildId);
+        if (running != null)
+            return a.Reject($"C_REQUEST_START_GUILD_QUEST: quest {running.QuestId} is already running");
+
+        long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        _store.SetGuildQuest(g.GuildId, questId, GuildQuestRunning, now, now + row.RemainSec,
+            characterId, progress: 0);
+
+        // Frame 12254's string is the GUILD's name - all three of its S_START_GUILD_QUEST
+        // frames carry "Candlelight" while three different members were involved.
+        var fields = new Dictionary<string, object>
+        {
+            ["result"] = (byte)1, ["questId"] = questId, ["guildName"] = g.Name,
+        };
+        foreach (var m in _store.GetGuildMembers(g.GuildId))
+            a.Client(GuildClientAction.Def(m.UserDbId, "S_START_GUILD_QUEST", fields));
+        BroadcastGuildQuestList(a, g);
+        return a;
+    }
+
+    /// <summary>
+    /// C_REQUEST_FINISH_GUILD_QUEST (0xA332). <b>Fully captured</b>, three times: 12185 -&gt;
+    /// 12218 / 12220 / 12221 / 12222 / 12223, and the same shape at 13322 and 64897.
+    ///
+    /// <para>The order below is the capture's: the reply to the requester first, then the three
+    /// economy pushes, then the board. Point is pushed but never changes - 14 through all three
+    /// finishes - so it is a refresh and not a reward, and <c>AddGuildQuestReward</c> leaves it
+    /// alone.</para>
+    /// </summary>
+    private GuildActions FinishGuildQuest(GuildActions a, int characterId, byte[] body)
+    {
+        if (ParseQuestId(body) is not int questId) return a.Reject("C_REQUEST_FINISH_GUILD_QUEST: short body");
+        var g = MyGuild(characterId);
+        if (g == null) return a.Reject("C_REQUEST_FINISH_GUILD_QUEST: not in a guild");
+
+        var running = _store.GetRunningGuildQuest(g.GuildId);
+        if (running == null || running.QuestId != questId)
+            return a.Reject($"C_REQUEST_FINISH_GUILD_QUEST: {questId} is not the running quest");
+
+        _store.SetGuildQuest(g.GuildId, questId, GuildQuestAvailable, 0, 0, 0, progress: 0);
+        _store.AddGuildQuestReward(g.GuildId, GuildQuestExpReward, GuildQuestMoneyReward);
+        var after = _store.GetGuild(g.GuildId) ?? g;
+
+        a.Client(GuildClientAction.Def(characterId, "S_FINISH_GUILD_QUEST",
+            new Dictionary<string, object> { ["result"] = (byte)1, ["questId"] = questId }));
+
+        var level = new Dictionary<string, object>
+        {
+            ["guildDbId"] = after.GuildId, ["newLevel"] = after.Level,
+            ["newExp"] = after.Exp, ["isLevelUp"] = (byte)0,
+        };
+        var point = new Dictionary<string, object>
+        {
+            ["guildDbId"] = after.GuildId, ["newPoint"] = after.Point,
+        };
+        var money = new Dictionary<string, object>
+        {
+            ["guildDbId"] = after.GuildId, ["newMoney"] = after.Money,
+        };
+        foreach (var m in _store.GetGuildMembers(after.GuildId))
+        {
+            a.Client(GuildClientAction.Def(m.UserDbId, "S_GUILD_LEVEL_INFO_CHANGED", level));
+            a.Client(GuildClientAction.Def(m.UserDbId, "S_GUILD_POINT_INFO_CHANGED", point));
+            a.Client(GuildClientAction.Def(m.UserDbId, "S_GUILD_MONEY_INFO_CHANGED", money));
+        }
+        BroadcastGuildQuestList(a, after);
+        return a;
+    }
+
+    /// <summary>
+    /// C_REQUEST_CANCEL_GUILD_QUEST (0xA6D1). <b>Not captured, and it has no reply of its
+    /// own</b>: the 376012 map has no S_CANCEL_GUILD_QUEST, only S_FAIL_GUILD_QUEST, which is
+    /// a failure notice rather than an acknowledgement. So the board refresh IS the answer.
+    ///
+    /// <para>Who may cancel is not in any capture either. Giving it to every member would let
+    /// one of them throw away the guild's twelve-hour timer, so it is the starter or the chief
+    /// - the narrowest rule that still lets the guild undo a mistake. If a capture ever shows
+    /// otherwise, this is the line to change.</para>
+    /// </summary>
+    private GuildActions CancelGuildQuest(GuildActions a, int characterId, byte[] body)
+    {
+        if (ParseQuestId(body) is not int questId) return a.Reject("C_REQUEST_CANCEL_GUILD_QUEST: short body");
+        var g = MyGuild(characterId);
+        if (g == null) return a.Reject("C_REQUEST_CANCEL_GUILD_QUEST: not in a guild");
+
+        var running = _store.GetRunningGuildQuest(g.GuildId);
+        if (running == null || running.QuestId != questId)
+            return a.Reject($"C_REQUEST_CANCEL_GUILD_QUEST: {questId} is not the running quest");
+        if (running.StarterDbId != characterId && g.ChiefDbId != characterId)
+            return a.Reject("C_REQUEST_CANCEL_GUILD_QUEST: only the starter or the chief may cancel");
+
+        _store.SetGuildQuest(g.GuildId, questId, GuildQuestAvailable, 0, 0, 0, progress: 0);
+        BroadcastGuildQuestList(a, g);
+        return a;
+    }
 
     private void SendGuildInfo(GuildActions a, int characterId, CharacterStore.GuildRow g)
     {

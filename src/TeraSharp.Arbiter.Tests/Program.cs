@@ -25858,4 +25858,215 @@ string message
             "frame 5819 exactly - rank 1, rating 1145, the same numbers as row 1 of 5818");
     }
 
+
+    // ===================== T135: the guild-quest board's three verbs =====================
+
+    /// <summary>A guild with three members, the chief on 1, and quest 10001 already running.</summary>
+    static (TeraSharp.Arbiter.Persistence.CharacterStore Store, GuildHandlers Guilds, int GuildId)
+        T135Guild(bool running = true)
+    {
+        var store = GuildStore(3);
+        var create = new GuildActions();
+        var guilds = new GuildHandlers(store, QuietLog());
+        int guildId = guilds.CreateGuild(create, 1, "Candlelight");
+        Hex.True(guildId != 0, "the guild is created");
+        foreach (int id in new[] { 2, 3 })
+        {
+            var m = store.GetCharacter(id)!;
+            store.AddGuildMember(guildId, id, m.Name, m.Race, m.Class, m.Gender, m.Level,
+                m.AccountId, guildGroupId: 2);
+        }
+        if (running)
+        {
+            long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            store.SetGuildQuest(guildId, 10001, GuildHandlers.GuildQuestRunning, now,
+                now + 43200, starterDbId: 2, progress: 0);
+        }
+        return (store, guilds, guildId);
+    }
+
+    static byte[] T135QuestBody(int questId) => BitConverter.GetBytes(questId);
+
+    /// <summary>Every def-driven packet one action produced, in order, as name:body pairs.</summary>
+    static List<(string Name, byte[] Body)> T135Bodies(GuildActions a, DefinitionRegistry reg,
+                                                       string packetName)
+    {
+        var outp = new List<(string, byte[])>();
+        foreach (var c in a.ToClients)
+        {
+            if (c.PacketName != packetName) continue;
+            outp.Add((c.PacketName, c.IsRaw ? c.RawBody! : WriteByDef(reg, c.PacketName,
+                new Dictionary<string, object>(c.Fields!))));
+        }
+        return outp;
+    }
+
+    /// <summary>
+    /// The five reply frames, byte-exact against classic_live2. Only the FINISH exchange was
+    /// ever captured - 12185 -&gt; 12218 / 12220 / 12221 / 12222 - but its reply and the three
+    /// economy pushes pin four of the five, and frame 12254 pins S_START_GUILD_QUEST even
+    /// though no client in either live capture ever sent the request that triggers it.
+    /// </summary>
+    [Test] public static void T135_the_guild_quest_frames_match_classic_live2()
+    {
+        var reg = LoadDefinitionsOrSkip();
+        if (reg == null) return;
+
+        Hex.Eq(WriteByDef(reg, "S_FINISH_GUILD_QUEST", new Dictionary<string, object>
+            { ["result"] = (byte)1, ["questId"] = 10001 }),
+            "01  11 27 00 00",
+            "frame 12218 - result 1, quest 10001");
+
+        Hex.Eq(WriteByDef(reg, "S_START_GUILD_QUEST", new Dictionary<string, object>
+            { ["result"] = (byte)1, ["questId"] = 10001, ["guildName"] = "Candlelight" }),
+            "0B 00  01  11 27 00 00  43 00 61 00 6E 00 64 00 6C 00 65 00 6C 00 69 00 67 00 68 00 74 00 00 00",
+            "frame 12254 - and the string is the GUILD's name: all three of the capture's "
+            + "S_START_GUILD_QUEST frames say 'Candlelight'");
+
+        Hex.Eq(WriteByDef(reg, "S_GUILD_LEVEL_INFO_CHANGED", new Dictionary<string, object>
+            { ["guildDbId"] = 71, ["newLevel"] = 180, ["newExp"] = 157620L, ["isLevelUp"] = (byte)0 }),
+            "47 00 00 00  B4 00 00 00  B4 67 02 00 00 00 00 00  00",
+            "frame 12220 - guild 71 at level 180, and isLevelUp 0");
+        Hex.Eq(WriteByDef(reg, "S_GUILD_POINT_INFO_CHANGED", new Dictionary<string, object>
+            { ["guildDbId"] = 71, ["newPoint"] = 14L }),
+            "47 00 00 00  0E 00 00 00 00 00 00 00", "frame 12221");
+        Hex.Eq(WriteByDef(reg, "S_GUILD_MONEY_INFO_CHANGED", new Dictionary<string, object>
+            { ["guildDbId"] = 71, ["newMoney"] = 711L }),
+            "47 00 00 00  C7 02 00 00 00 00 00 00", "frame 12222");
+
+        // The request side: one i32, and frame 12185's body is exactly it.
+        Hex.True(GuildHandlers.ParseQuestId(Hex.B("11 27 00 00")) == 10001,
+            "frame 12185 asks for quest 10001");
+        Hex.True(GuildHandlers.ParseQuestId(Hex.B("13 27 00 00")) == 10003,
+            "and frames 13322 / 64897 for 10003");
+        Hex.True(GuildHandlers.ParseQuestId(new byte[3]) == null
+                 && GuildHandlers.ParseQuestId(System.Array.Empty<byte>()) == null
+                 && GuildHandlers.ParseQuestId(null!) == null,
+            "a short body is refused rather than read past");
+
+        Hex.True(GuildPackets.C_REQUEST_START_GUILD_QUEST == 0x77A9
+                 && GuildPackets.C_REQUEST_FINISH_GUILD_QUEST == 0xA332
+                 && GuildPackets.C_REQUEST_CANCEL_GUILD_QUEST == 0xA6D1,
+            "the three verbs, from data.json's 376012 map");
+        Hex.True(GuildPackets.MinClientLength(GuildPackets.C_REQUEST_FINISH_GUILD_QUEST) == 8,
+            "and the 8-byte guard frame 12185's own length gives");
+    }
+
+    /// <summary>
+    /// Finish, end to end. The capture's order is the reply to the requester, then the three
+    /// economy pushes, then the board - and the reward is read straight off it: across the
+    /// three finishes the guild exp went 157620 / 157640 / 157660 and the funds 711 / 712 /
+    /// 713, so +20 and +1, with the point pushed unchanged at 14 every time.
+    /// </summary>
+    [Test] public static void T135_finishing_a_quest_pays_the_captured_reward()
+    {
+        var (store, guilds, guildId) = T135Guild();
+        using var _ = store;
+        long expBefore = store.GetGuild(guildId)!.Exp;
+        long moneyBefore = store.GetGuild(guildId)!.Money;
+        long pointBefore = store.GetGuild(guildId)!.Point;
+
+        var a = guilds.OnClientPacket(2, GuildPackets.C_REQUEST_FINISH_GUILD_QUEST,
+            T135QuestBody(10001));
+        Hex.True(a.Rejected == null, $"the running quest can be finished: {a.Rejected}");
+
+        var g = store.GetGuild(guildId)!;
+        Hex.True(g.Exp == expBefore + GuildHandlers.GuildQuestExpReward
+                 && GuildHandlers.GuildQuestExpReward == 20,
+            $"+20 guild exp: {expBefore} -> {g.Exp}");
+        Hex.True(g.Money == moneyBefore + GuildHandlers.GuildQuestMoneyReward
+                 && GuildHandlers.GuildQuestMoneyReward == 1,
+            $"+1 in the vault: {moneyBefore} -> {g.Money}");
+        Hex.True(g.Point == pointBefore,
+            "and the point is untouched - the capture pushes it at 14 all three times");
+
+        Hex.True(store.GetRunningGuildQuest(guildId) == null,
+            "the board has no running quest again");
+
+        var names = new List<string>();
+        foreach (var c in a.ToClients) names.Add($"{c.CharacterId}:{c.PacketName}");
+        Hex.True(a.ToClients[0].CharacterId == 2
+                 && a.ToClients[0].PacketName == "S_FINISH_GUILD_QUEST",
+            $"the reply goes to the requester first: {string.Join(",", names)}");
+        int levels = 0, points = 0, monies = 0, lists = 0;
+        foreach (var c in a.ToClients)
+            switch (c.PacketName)
+            {
+                case "S_GUILD_LEVEL_INFO_CHANGED": levels++; break;
+                case "S_GUILD_POINT_INFO_CHANGED": points++; break;
+                case "S_GUILD_MONEY_INFO_CHANGED": monies++; break;
+                case "S_GUILD_QUEST_LIST": lists++; break;
+            }
+        Hex.True(levels == 3 && points == 3 && monies == 3 && lists == 3,
+            $"the economy and the board reach all three members: {string.Join(",", names)}");
+
+        // The reply's bytes are the capture's, for the quest this store actually ran.
+        var reg = LoadDefinitionsOrSkip();
+        if (reg == null) return;
+        var reply = T135Bodies(a, reg, "S_FINISH_GUILD_QUEST");
+        Hex.Eq(reply[0].Body, "01  11 27 00 00", "byte for byte, frame 12218");
+    }
+
+    /// <summary>
+    /// Start and cancel. Neither request is in any live capture, so what is asserted here is
+    /// the state machine and the one frame that IS captured (S_START_GUILD_QUEST, 12254) -
+    /// not an invented reply. Cancel has no S_ opcode at all in the 376012 map, so the board
+    /// refresh is its only answer.
+    /// </summary>
+    [Test] public static void T135_start_and_cancel_move_the_running_row()
+    {
+        var (store, guilds, guildId) = T135Guild(running: false);
+        using var _ = store;
+
+        var start = guilds.OnClientPacket(3, GuildPackets.C_REQUEST_START_GUILD_QUEST,
+            T135QuestBody(10001));
+        Hex.True(start.Rejected == null, $"a member may start: {start.Rejected}");
+        var run = store.GetRunningGuildQuest(guildId);
+        Hex.True(run != null && run.QuestId == 10001 && run.StarterDbId == 3
+                 && run.Status == GuildHandlers.GuildQuestRunning,
+            "the running row names the quest and who started it");
+        Hex.True(run!.EndsAt - run.StartedAt == 43200,
+            $"the countdown is the catalogue row's own 43200 s: {run.EndsAt - run.StartedAt}");
+
+        int starts = 0, lists = 0;
+        foreach (var c in start.ToClients)
+        {
+            if (c.PacketName == "S_START_GUILD_QUEST") starts++;
+            if (c.PacketName == "S_GUILD_QUEST_LIST") lists++;
+        }
+        Hex.True(starts == 3 && lists == 3, "the notice and the board go to the whole guild");
+
+        // One quest at a time - T98's table keeps a single row at status 1.
+        var second = guilds.OnClientPacket(3, GuildPackets.C_REQUEST_START_GUILD_QUEST,
+            T135QuestBody(10002));
+        Hex.True(second.Rejected != null, "a second quest cannot start while one runs");
+        Hex.True(guilds.OnClientPacket(3, GuildPackets.C_REQUEST_START_GUILD_QUEST,
+            T135QuestBody(99999)).Rejected != null, "and a quest that is not on the board never starts");
+
+        // Cancel: the starter may, a bystander may not, the chief may.
+        Hex.True(guilds.OnClientPacket(2, GuildPackets.C_REQUEST_CANCEL_GUILD_QUEST,
+            T135QuestBody(10001)).Rejected != null,
+            "member 2 neither started it nor is the chief");
+        var cancel = guilds.OnClientPacket(3, GuildPackets.C_REQUEST_CANCEL_GUILD_QUEST,
+            T135QuestBody(10001));
+        Hex.True(cancel.Rejected == null && store.GetRunningGuildQuest(guildId) == null,
+            $"the starter may cancel: {cancel.Rejected}");
+        int cancelLists = 0, replies = 0;
+        foreach (var c in cancel.ToClients)
+        {
+            if (c.PacketName == "S_GUILD_QUEST_LIST") cancelLists++; else replies++;
+        }
+        Hex.True(cancelLists == 3 && replies == 0,
+            "the refresh IS the answer - the 376012 map has no S_CANCEL_GUILD_QUEST");
+
+        // The chief's own cancel, on a quest somebody else started.
+        guilds.OnClientPacket(2, GuildPackets.C_REQUEST_START_GUILD_QUEST, T135QuestBody(10003));
+        Hex.True(guilds.OnClientPacket(1, GuildPackets.C_REQUEST_CANCEL_GUILD_QUEST,
+            T135QuestBody(10003)).Rejected == null, "the chief may cancel anyone's");
+
+        // Finishing something that is not running is refused rather than paid.
+        Hex.True(guilds.OnClientPacket(1, GuildPackets.C_REQUEST_FINISH_GUILD_QUEST,
+            T135QuestBody(10001)).Rejected != null, "nothing is running, so nothing can be finished");
+    }
+
 }
