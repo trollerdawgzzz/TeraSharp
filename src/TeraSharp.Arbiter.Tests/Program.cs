@@ -11984,27 +11984,56 @@ bool   isGuildWarAcceptable
         Hex.True(TeraSharp.Arbiter.Auth.ApiGatewayToken.ChecksumSeed(1_000_000L) != 0,
             "and it is never 0, which is the one value the client could read as absent");
 
-        // Now the packet. Fixed part is 4 + three u16 refs + u64 + i32 = 22, so the first
-        // string starts at 22 - refs 22 / 50 / 80 in the capture, 22 / 42 / 62 in the old stub.
+        // Now the packet. DefinitionWriter.Write returns the BODY - GameSession.SendByDef adds
+        // the [u16 len][u16 opcode] header - but the ref offsets inside it are PACKET-relative
+        // (DefinitionWriter.PacketOffset = _buf.Count + 4). So a field at packet offset N lives
+        // at body index N - 4, and the three refs read 22 / 50 / 80 while sitting at body 0/2/4.
+        // T124 read them at packet indices and compared a body length against 544; both wrong,
+        // and the packet itself was right the whole time.
+        //
+        //   body   0  ref dbServerName        = 22   (packet 4)
+        //          2  ref apiServerAddress    = 50   (packet 6)
+        //          4  ref apiServerAuthToken  = 80   (packet 8)
+        //          6  uint64 accountId              (packet 10)
+        //         14  int32  antiCheatChecksumSeed  (packet 18)
+        //         18  the strings                   (packet 22)
         var defs = LoadDefinitionsOrSkip();
         if (defs == null) return;
         var def = defs.Get("S_LOGIN_ACCOUNT_INFO");
         Hex.True(def != null, "S_LOGIN_ACCOUNT_INFO.3.def is present");
-        var pkt = new DefinitionWriter().Write(def!, ArbiterClientHandlers.BuildLoginAccountInfoFields(
+        var body = new DefinitionWriter().Write(def!, ArbiterClientHandlers.BuildLoginAccountInfoFields(
             1UL, Iat, "PlanetDB_2800", "127.0.0.1:8800", tok));
-        Hex.True(BitConverter.ToUInt16(pkt, 0) == pkt.Length, "self-consistent length");
-        Hex.True(BitConverter.ToUInt16(pkt, 4) == 22, "dbServerName ref is 22");
-        Hex.True(BitConverter.ToUInt16(pkt, 6) == 50, "apiServerAddress ref is 50 - PlanetDB_2800 is 13 chars");
-        Hex.True(BitConverter.ToUInt16(pkt, 8) == 80, "apiServerAuthToken ref is 80 - 127.0.0.1:8800 is 14");
-        Hex.True(BitConverter.ToUInt64(pkt, 10) == 1UL, "accountId");
-        Hex.True(BitConverter.ToInt32(pkt, 18) == 619351, "antiCheatChecksumSeed, not 0");
-        Hex.True(pkt.Length == 544, $"544 bytes, the same as the capture: {pkt.Length}");
-        Hex.True(WStringAt(pkt, 22) == "PlanetDB_2800" && WStringAt(pkt, 50) == "127.0.0.1:8800"
-                 && WStringAt(pkt, 80) == tok,
-            "the three strings decode back");
+
+        const int Header = 4;   // what the transport prepends
+        int frameLen = body.Length + Header;
+        Hex.True(frameLen == 544,
+            $"the frame is 544 bytes like capture frame 8: body {body.Length} + {Header} = {frameLen}");
+        Hex.True(BitConverter.ToUInt16(body, 0) == 22,
+            $"dbServerName ref is packet 22: {BitConverter.ToUInt16(body, 0)}");
+        Hex.True(BitConverter.ToUInt16(body, 2) == 50,
+            $"apiServerAddress ref is packet 50 - PlanetDB_2800 is 13 chars: {BitConverter.ToUInt16(body, 2)}");
+        Hex.True(BitConverter.ToUInt16(body, 4) == 80,
+            $"apiServerAuthToken ref is packet 80 - 127.0.0.1:8800 is 14: {BitConverter.ToUInt16(body, 4)}");
+        Hex.True(BitConverter.ToUInt64(body, 6) == 1UL, "accountId");
+        Hex.True(BitConverter.ToInt32(body, 14) == 619351,
+            $"antiCheatChecksumSeed, not 0: {BitConverter.ToInt32(body, 14)}");
+        Hex.True(WStringAt(body, 22 - Header) == "PlanetDB_2800"
+                 && WStringAt(body, 50 - Header) == "127.0.0.1:8800"
+                 && WStringAt(body, 80 - Header) == tok,
+            "the three strings decode back at their packet offsets minus the header");
     }
 
-    /// <summary>UTF-16LE, null-terminated, at a packet-relative offset.</summary>
+    /// <summary>UTF-16LE, null-terminated, at an index into the buffer it is given.</summary>
+    /// <summary>[u16 totalLength][u16 opcode][body] - what GameSession.Send puts on the wire.</summary>
+    static byte[] Framed(ushort opcode, byte[] body)
+    {
+        var p = new byte[body.Length + 4];
+        BitConverter.GetBytes((ushort)p.Length).CopyTo(p, 0);
+        BitConverter.GetBytes(opcode).CopyTo(p, 2);
+        body.CopyTo(p, 4);
+        return p;
+    }
+
     static string WStringAt(byte[] p, int off)
     {
         var sb = new System.Text.StringBuilder();
@@ -12032,9 +12061,16 @@ bool   isGuildWarAcceptable
 
         var defs = LoadDefinitionsOrSkip();
         if (defs == null) return;
-        Hex.Eq(WriteByDef(defs, "S_SELECT_USER", f),
+
+        // WriteByDef returns the 11-byte BODY; the [u16 len][u16 opcode] header is the
+        // transport's. Assert the body against the capture's body, then frame it and assert
+        // the whole 15 bytes, so the link to frame 37 stays visible.
+        var selectBody = WriteByDef(defs, "S_SELECT_USER", f);
+        Hex.Eq(selectBody, "01 01 00 00 00 00 00 00 00 00 00",
+            "cap_final_gm_client2 frame 37 (and 2408) body: unk1 = 1, unk2 = 1, unk3 = 0");
+        Hex.Eq(Framed(ArbiterClientHandlers.S_SELECT_USER, selectBody),
             "0F 00 FB 8A 01 01 00 00 00 00 00 00 00 00 00",
-            "cap_final_gm_client2 frame 37 (and 2408), 15 bytes of 0x8AFB");
+            "and the frame the client sees - 15 bytes of 0x8AFB");
     }
 
     // ---- The rules ----

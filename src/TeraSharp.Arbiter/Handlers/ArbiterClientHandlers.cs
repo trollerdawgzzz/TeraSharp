@@ -1626,6 +1626,10 @@ public static class ArbiterClientHandlers
             ["apiServerAuthToken"] = token ?? Auth.ApiGatewayToken.Mint((long)accountId, nowUnix),
         };
 
+    /// <summary>S_SELECT_USER (0x8AFB). Opcode only - the body is the def's.
+    /// T124b: the tests frame a body with it; nothing sends by opcode here.</summary>
+    public const ushort S_SELECT_USER = 0x8AFB;
+
     /// <summary>
     /// S_SELECT_USER (<c>byte unk1 / uint16 unk2 / uint64 unk3</c>). T123: we were sending
     /// <c>unk2 = 0, unk3 = 72339069014638592</c> (0x0101000000000000), which puts the two
