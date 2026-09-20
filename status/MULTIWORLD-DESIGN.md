@@ -883,3 +883,232 @@ Not done in this task. The remaining work, in order:
    patch already does**, so apply it as-is first.
 5. Only then wire `MatchWiring.OnMatchAdd` to emit FIN, because only then does FIN lead anywhere.
    The T136b guard stays until step 4 is in.
+
+---
+
+## T138c - the matchmaker, the battleground table and the rating
+
+Three parts, and three of the brief's premises turned out to be wrong. They are corrected first
+because the implementation follows from the corrections.
+
+### Correction 1: C_MATCH_ADD carries no class
+
+The brief said to form "1 tank / 1 healer / 3 DPS from C_MATCH_ADD's class fields". The frame is
+55 bytes in all four captured instances and has no class in it:
+
+| capture | record | instances | second array |
+|---|---|---|---|
+| classic_live3 | 8643 | [9739] | (4742, 1) **twice** |
+| classic_live3 | 10322 | [9739] | (4742, 0) **twice** |
+| cap_multiworld_client | 3889 | [9047] | (1, 1) twice |
+| cap_social4_client | 5294 | [9047] | (1003, 1) twice |
+
+```
+body 0  u16 count instances = 1      body 2  u16 offset = 14
+body 4  u16 count players   = 2      body 6  u16 offset = 31
+body 8  u16 scalar = 0
+instance element 17 B: u16 here / u16 next / i32 id / i32 / i32 / byte
+player   element 12 B: u16 here / u16 next / i32 id / i32 flag
+```
+
+Both elements of the second array carry the **same** first int32, and that int32 is the queuing
+player's own id: `S_ADD_INTER_PARTY_MATCH_POOL` record 8662, the reply to record 8643, carries
+planet 2800 and player `86 12 00 00` = 4742. Two party members cannot share a player id, so this
+is not a member list; the frames where it reads 1 and 1003 are TeraSharp's own small player ids.
+The trailing int32 is 1 on the first queue and 0 on the second, and the server **echoes it** into
+the pool player's tail (record 8662 tail 1, record 10333 tail 0). That is all it is used for.
+
+So the roles are resolved server-side from `characters.class`, which the client cannot forge, and
+the class-to-role table is not invented either - it is
+`Executable\Datasheet\DungeonMatching.xml`'s own `<ClassPosition>` block:
+
+```
+<!-- 1은 딜러, 0는 탱커, 2은 힐러 -->            1 = DPS, 0 = TANK, 2 = HEALER
+Warrior      1 / 0 / 1                          Lancer       0 / 0 / 0
+Slayer       1 / 1 / 1                          Berserker    1 / 0 / 1  secondPositionLevel=65
+Sorcerer     1 / 1 / 1                          Archer       1 / 1 / 1
+Priest       2 / 2 / 2                          Elementalist 2 / 2 / 2
+Soulless     1 / 1 / 1                          Engineer     1 / 1 / 1
+Fighter      0 / 1 / 0  secondPositionLevel=69  Assassin     1 / 1 / 1
+Glaiver      1 / 1 / 1
+```
+
+`MatchComposition.RoleOf` is the default position; `CanFill` is the whole row including the level
+gate, which is why a level-64 Berserker cannot take the tank slot and a level-70 one can.
+
+**What is still ours:** each `<Dungeon>` row carries a `matchingRoleId` (17 for 53 of the 82 rows,
+then 23, 32, 26, 29 and eleven one-offs) and the table those ids index lives inside the MatchServer
+binary this stack does not have. The rows carry id, name, levels and `minItemLevel` and **no member
+count**. So the composition is our rule: five is 1/1/3, and larger groups keep the one-in-five ratio
+(`MatchComposition.DungeonTemplate` - ten is 2/2/6, twenty is 4/4/12). `MatchQueueManager.RaidSizes`
+is the one knob that says which instances are larger than a party; it is empty by default.
+
+### Correction 2: a match does not move anybody
+
+The brief said to "trigger the same entry the walk-in path uses". classic_live3 shows there is
+nothing to trigger:
+
+```
+10585  S->C  S_FIN_INTER_PARTY_MATCH   instance 9739
+10586  S->C  S_PRIVATE_CHAT
+10587  S->C  S_SYS_PARTY_INFO (488 B)  the matched party
+10588+ S->C  S_CHANGE_RELATION x14, S_HIDE_HP x9
+11521  C->S  C_ENTER_DUNGEON (0x9A6C, 8 B: i32 9739)   <-- the PLAYER presses enter
+12091  S->C  S_LOAD_TOPO
+```
+
+FIN closes the matching window and forms a party. The player then walks in like anyone else, and
+`C_ENTER_DUNGEON` forwards to World, which raises `SA_REQUEST_ENTER_DUNGEON` (0x13BE) and lands in
+the T137c routing this doc already specifies. **There is no Arbiter->World "put this player in an
+instance" frame.** `AS_FORCE_ENTER_DUNGEON_ID` (0x1390) sounds like one and is not:
+
+```
+Handler_AS_FORCE_ENTER_DUNGEON_ID   WorldServer.exe.c:2987079
+  if (param_3 < 0xe) ...                        frame length >= 14, so payload = 8 bytes
+  FUN_1407e2810(.., session+0x108, *(u32*)(frame+6))     find the user by id
+  *(u32 *)(user + 0xb528) = *(u32 *)(frame+10)           store the dungeon id. That is all.
+```
+
+It stamps a field and returns. The Arbiter's own sender (ArbiterServer.exe.c:592667,
+`SendToSession<PKT_AS_FORCE_ENTER_DUNGEON_ID_WRITE,int,int>`) writes `[i32 User+0x120][i32
+User+0x4024]`, and `User+0x4024` is set by `Handler_SA_RESPONSE_ENTER_DUNGEON` - it is a re-entry
+hint, not a teleport. And the real FIN path confirms it from the other side: on
+`MA_FIN_PARTY_MATCH` the Arbiter FINs each member, relays `AA_DO_FIN_PARTY_MATCH` (0x1787) to the
+peer Arbiter and asks the BattleField server for `ABS_CREATE_BATTLE_FIELD_NEW`
+(ArbiterServer.exe.c:1583372-1583460) - it never tells World to move anyone.
+
+So T136b's refusal is lifted. `MatchWiring.OnMatchAdd` pools, forms and FINs, and that is the whole
+job.
+
+**Naming note.** 0x13BE/0x13BF/0x13C0/0x13C1 are `SA_REQUEST_ENTER_DUNGEON` /
+`AS_REQUEST_ENTER_DUNGEON` / `SA_RESPONSE_ENTER_DUNGEON` / `AS_RESPONSE_ENTER_DUNGEON`
+(`D:\packetlogs\world_opcodes.txt` lines 54-57). T138b's `ContinentHandoff` calls them
+`SA_REQUEST_ENTER_CONTINENT` / `AS_ENTER_CONTINENT` / `SA_CONTINENT_READY` / `AS_CONTINENT_READY`.
+The bytes are pinned and unchanged; only the names are ours, and the real ones are recorded here.
+
+### Correction 3: "no MMR" is now literal, and the rating has a capture
+
+The T138 brief asked for MMR; T138c's says no MMR. Nothing in `MatchQueueManager` or
+`MatchComposition` reads a rating. `S_BATTLE_FIELD_RESULT` has exactly one capture -
+classic_live2 record 325115 - and `BattlegroundRating.Build` reproduces it byte for byte:
+
+```
+28 00 5F 76                      len 40, opcode 0x765F
+04  01 00  10 00                 array A: count 1, offset 16
+08  01 00  18 00                 array B: count 1, offset 24
+0C  F8 FF FF FF                  i32 rating = -8            <-- the delta
+10  10 00 00 00  02 00 00 00     A[0],  8 B: here 16, next 0, i32 2
+18  18 00 00 00  D0 02 00 00
+    00 00 00 00  00 00 00 00     B[0], 16 B: here 24, next 0, i32 720, i32 0, i32 0
+```
+
+and the writer agrees on the shape (WorldServer.exe.c:2015570-2015590: four u16 ref slots, then one
+i32, filling an 8-byte-stride vector and a 16-byte-stride vector). Only the scalar is named - the
+shipped def calls it `int32 rating # positive for winning, negative(signed bit) for losing` - so
+A[0]'s 2 and B[0]'s 720 are passed through as opaque numbers. The live sample is **-8**, which sits
+inside the 5..12 band the brief asked for.
+
+### Part 1: the pool
+
+One pool per instance id, and the id says which kind: every `BattleFieldData.xml` id is under 1000
+and every `DungeonMatching.xml` id is over 9000, so `MatchQueueManager.IsBattleground` is a range
+test. Both kinds really do share the queue - classic_live2's FIN frames carry 9075 (Kelsaik's Nest)
+and 10 (Fraywind Canyon).
+
+`TryForm` walks the pool in queue order and takes **whole entries**: a party that queued together is
+never split, which is what "party-queued groups keep slots and fill from solo queuers" means. Each
+member takes their default position when one is free and any position `CanFill` allows otherwise,
+least-flexible member first, so a Lancer never loses the tank slot to a Warrior who could have
+DPSed. An entry that cannot be seated whole is skipped and stays in the pool; a pass that cannot
+fill the template changes nothing at all.
+
+`C_MATCH_DEL` and a logout both call `RemoveByPlayer`, which drops the entry whether the caller led
+it or sat in it - a party of four queued as five is not the group anyone asked for.
+
+Timeouts are **swept, not ticked**: there is no scheduler in the Arbiter, so `MatchWiring.Sweep`
+runs at the top of every match packet. The window is 600s - `BattleFieldData.xml`'s
+`<MatchingTimeDisplay standardTime="600">`, the same number the client's own window counts to. A
+swept entry is marked `TimedOut` and **left** in the dictionary so its members can be told before
+the row goes.
+
+### Part 2: the battleground table
+
+Ids and team sizes are `BattleFieldData.xml`'s `<BattleField id>` and `<CommonData maxTeamMember>`;
+the healer and lancer numbers are the stated rules.
+
+| battleground | type | ids | a side | rule |
+|---|---|---|---|---|
+| Champions' Skyring | `Round_PvP` | 37, 38 | 3 | exactly 1 healer, <=1 lancer, <=2 of any class |
+| Champions' Skyring | `Round_PvP` | 39, 40 | 5 | same |
+| Corsairs' Stronghold | `StrongholdOccupation` | 26, 27, 28, 29 | 15 | >=3 healers |
+| Fraywind Canyon | `Cannon` | 10, 11 | 20 | <=2 lancers, >=2 healers |
+
+"1 mystic or 1 priest per team" is one healer slot shared by both healer classes, which is what
+`MaxHealers = 1` says. "Every other class can have doubles" is `MaxPerClass = 2`, and it is Skyring
+only - at 15 and 20 a side, capping every class at two would leave most queues unstartable.
+
+Fill is random side in queue order: each entry picks a side at random and falls to the other if the
+first will not take it. Caps are checked as each body is added; **floors** cannot be checked one
+player at a time, so they are checked once both sides are full, and a pair of teams that misses one
+is not started - fifteen people do not get dropped into Corsairs with one healer.
+
+A battleground with no row of its own falls back to `TERASHARP_BG_MAX_HEALERS` (default 2) and
+`TERASHARP_BG_MAX_TANKS` (default 3), read fresh on every call.
+
+### Part 3: the rating
+
+`characters.bg_rating`, migrated with `AddColumnIfMissing`. Each result rolls 5..12, up on a win
+and down on a loss, floored at 0 - and the floor is applied in SQL (`MAX(0, bg_rating + $d)`) so
+two results landing at once cannot lose one another's move.
+
+The hook is the tunnel. Nothing in TeraSharp emits `S_BATTLE_FIELD_RESULT` - there is no BattleField
+server - but every W->A client packet for a session already passes through
+`ArbiterClientHandlers.DeliverTunnelled`, so `BattlegroundRating.OnTunnelled` sits there: the
+incoming **sign** says won or lost, our roll replaces the **magnitude**, the row moves by it, and
+the frame is rewritten so the client shows the number the database now holds. Every other packet
+pays one u16 compare.
+
+`S_PVP_RANKING_LIST`'s `rating` field (+15) carries `bg_rating` when a row has one and the score
+otherwise, which is why every T119 frame is still byte-identical. The board is still **ordered** by
+the score (kills): making the rating the ranking key is a one-line change in
+`CharacterStore.GetPvpRankingScores` and is deliberately not made, because it would empty the board
+on a server where nobody has finished a battleground yet.
+
+`S_VIEW_BATTLE_FIELD_RESULT` has a def with `uint32 previousrating` and `uint32 rating` and **no
+capture**, so the packet is not built. `BattlegroundRating.LastResultFor` keeps the two numbers it
+wants, so building it later is a layout problem and not a data problem.
+
+### What T138c did NOT do
+
+**The matched party.** The real server sends `S_SYS_PARTY_INFO` and the relation frames after FIN,
+so five matched strangers arrive as a party. Ours arrive as five soloists who each walk in and get
+their own channel - which is the one place the result still differs from the capture. The machinery
+exists: `PartyManager.JoinCore` creates a party and emits `AS_DO_CREATE_PARTY`, and
+`PartyWiring.Dispatcher(null, log).Dispatch(actions, "match-party")` carries the actions. What is
+missing is a public `PartyManager.FormMatchedParty(IReadOnlyList<int> userDbIds, bool raid)` seam
+that loops `JoinCore` over the formed members. That is the next task.
+
+**`S_MATCH_ROOM_LIST` rows.** Still the empty form: ten rows from one capture are not enough to name
+the 44-byte row's three trailing flags (T136).
+
+### Files
+
+| file | what |
+|---|---|
+| `World/MatchComposition.cs` | new. Roles from `<ClassPosition>`, templates, the battleground table |
+| `World/MatchQueueManager.cs` | `Queuer`, `MatchState`, pooling, `TryForm*`, `SweepTimeouts`, `ReadQueueFlag` |
+| `World/MatchWiring.cs` | `OnMatchAdd` for real, `TryFormAndFinish`, `Unregister`, `Sweep` |
+| `World/BattlegroundRating.cs` | new. The 0x765F pin, the roll, the tunnel hook |
+| `World/RankingBoards.cs` | `RankingRow.Rating` into `S_PVP_RANKING_LIST`'s +15 |
+| `Persistence/CharacterStore.cs` | `bg_rating` column, `Get`/`Set`/`AdjustBgRating`, rating on the PvP board |
+| `Handlers/ArbiterClientHandlers.cs` | one line in `DeliverTunnelled` |
+| `Handlers/SocialHandlers.cs` | `MatchWiring.UseMatchLogger` and `MatchWiring.Unregister` |
+| `Handlers/HandlerRegistry.cs` | the registry comment - the foreach was already correct |
+
+The registry loop is unchanged and still the only wiring the four opcodes need:
+
+```csharp
+foreach (var (matchName, matchOp) in MatchWiring.ClientOpcodes)
+    Reg(matchName, MatchWiring.MinBodyLength(matchOp),
+        (s, body) => MatchWiring.OnClientPacket(s, matchOp, body));
+```
