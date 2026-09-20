@@ -17017,8 +17017,9 @@ string message
     /// </summary>
     [Test] public static void T51_guild_registrations_use_the_body_length_not_the_frame_length()
     {
-        Hex.True(GuildWiring.ClientOpcodes.Length == 19,
-            $"nineteen Arbiter-answered guild opcodes after T52, got {GuildWiring.ClientOpcodes.Length}");
+        Hex.True(GuildWiring.ClientOpcodes.Length == 22,
+            "nineteen after T52, plus T135's three guild-quest verbs: "
+            + $"got {GuildWiring.ClientOpcodes.Length}");
         Hex.True(GuildWiring.ClientHeaderSize == 4, "the client header is [u16 len][u16 opcode]");
 
         foreach (var (name, op) in GuildWiring.ClientOpcodes)
@@ -17201,7 +17202,8 @@ string message
             "GuildWiring registers these but GuildHandlers has no case, so every one would answer "
             + "the player with a rejection: " + string.Join(", ", extra.Select(o => $"0x{o:X4}")));
 
-        Hex.True(answered.Count == 19, $"nineteen answered opcodes after T52, saw {answered.Count}");
+        Hex.True(answered.Count == 22,
+            $"nineteen after T52, plus T135's start / finish / cancel, saw {answered.Count}");
     }
 
     /// <summary>
