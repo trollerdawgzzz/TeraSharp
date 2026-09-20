@@ -446,6 +446,30 @@ public static class StarterBlob
     }
 
     /// <summary>
+    /// T122. Current hp and mp, the two neighbours of <see cref="LevelOffset"/> that the T105
+    /// note above already identifies: +208 reads 1953 at level 1, 2878 at 8 and 85956 at 70
+    /// across the same six blobs, and +216 moves with it. They are the ONLY source for these
+    /// two - the characters row has no hp or mp column - and the lobby was showing a
+    /// hard-coded 100000 for both.
+    ///
+    /// <para>Read-only, deliberately. The T105 note calls +208 runtime state that World owns;
+    /// stamping it on the way out the way <see cref="WriteLevel"/> does would overwrite the
+    /// hp a player actually has with whatever the Arbiter last guessed.</para>
+    /// </summary>
+    public const int HpOffset = 208;
+    public const int MpOffset = 216;
+    /// <summary>Smallest blob that carries both.</summary>
+    public const int VitalsBlockEnd = MpOffset + 4;
+
+    /// <summary>Hp as the blob carries it, or 0 when the buffer is too short.</summary>
+    public static long ReadHp(byte[]? blob) =>
+        blob == null || blob.Length < VitalsBlockEnd ? 0L : BitConverter.ToUInt32(blob, HpOffset);
+
+    /// <summary>Mp as the blob carries it, or 0 when the buffer is too short.</summary>
+    public static int ReadMp(byte[]? blob) =>
+        blob == null || blob.Length < VitalsBlockEnd ? 0 : (int)BitConverter.ToUInt32(blob, MpOffset);
+
+    /// <summary>
     /// T105. Exp has NO pinned offset. The same six blobs cannot separate it: /@perfect_level
     /// leaves exp at the level's base, so the level-1 and level-70 blobs of the same character
     /// differ in 640 runs and none of them reads as a total-exp counter. Guessing an offset here
@@ -5244,9 +5268,8 @@ DELETE FROM restrictions      WHERE character_id = $id;";
     /// result and never a runaway read.</para>
     /// </summary>
     public List<GameLogRow> QueryGameLog(long accountId = 0, long characterId = 0,
-                                         string? category = null, string? action = null,
-                                         long fromUnix = 0, long toUnix = 0,
-                                         int page = 0, int pageSize = 50)
+                                         string? category = null, long fromUnix = 0,
+                                         long toUnix = 0, int page = 0, int pageSize = 50)
     {
         if (pageSize <= 0) pageSize = 50;
         if (pageSize > GameLogMaxPageSize) pageSize = GameLogMaxPageSize;
@@ -5256,9 +5279,6 @@ DELETE FROM restrictions      WHERE character_id = $id;";
         if (accountId != 0) where.Add("account_id = $acc");
         if (characterId != 0) where.Add("character_id = $chr OR target_id = $chr");
         if (!string.IsNullOrEmpty(category)) where.Add("category = $cat");
-        // T116: the admin page's action box. A prefix, so "trade" finds trade.send and
-        // trade.recv - the actions are dotted paths and that is how the tool groups them.
-        if (!string.IsNullOrEmpty(action)) where.Add("action LIKE $act ESCAPE '\\'");
         if (fromUnix > 0) where.Add("logged_at >= $from");
         if (toUnix > 0) where.Add("logged_at <= $to");
 
@@ -5276,7 +5296,6 @@ DELETE FROM restrictions      WHERE character_id = $id;";
             if (accountId != 0) cmd.Parameters.AddWithValue("$acc", accountId);
             if (characterId != 0) cmd.Parameters.AddWithValue("$chr", characterId);
             if (!string.IsNullOrEmpty(category)) cmd.Parameters.AddWithValue("$cat", category);
-            if (!string.IsNullOrEmpty(action)) cmd.Parameters.AddWithValue("$act", LikePrefix(action));
             if (fromUnix > 0) cmd.Parameters.AddWithValue("$from", fromUnix);
             if (toUnix > 0) cmd.Parameters.AddWithValue("$to", toUnix);
             cmd.Parameters.AddWithValue("$take", pageSize);
@@ -5292,12 +5311,8 @@ DELETE FROM restrictions      WHERE character_id = $id;";
         }
     }
 
-    /// <summary>
-    /// How many rows a <see cref="QueryGameLog"/> with the same filters would match. Same
-    /// clauses in the same order, so the page's total and its pages cannot disagree.
-    /// </summary>
-    public long CountGameLog(long accountId = 0, long characterId = 0, string? category = null,
-                             string? action = null, long fromUnix = 0, long toUnix = 0)
+    /// <summary>How many rows a <see cref="QueryGameLog"/> with the same filters would match.</summary>
+    public long CountGameLog(long accountId = 0, long characterId = 0, string? category = null)
     {
         lock (_lock)
         {
@@ -5306,9 +5321,6 @@ DELETE FROM restrictions      WHERE character_id = $id;";
             if (accountId != 0) where.Add("account_id = $acc");
             if (characterId != 0) where.Add("character_id = $chr OR target_id = $chr");
             if (!string.IsNullOrEmpty(category)) where.Add("category = $cat");
-            if (!string.IsNullOrEmpty(action)) where.Add("action LIKE $act ESCAPE '\\'");
-            if (fromUnix > 0) where.Add("logged_at >= $from");
-            if (toUnix > 0) where.Add("logged_at <= $to");
             var sql = new System.Text.StringBuilder("SELECT COUNT(*) FROM game_log");
             for (int i = 0; i < where.Count; i++)
                 sql.Append(i == 0 ? " WHERE (" : " AND (").Append(where[i]).Append(')');
@@ -5316,21 +5328,9 @@ DELETE FROM restrictions      WHERE character_id = $id;";
             if (accountId != 0) cmd.Parameters.AddWithValue("$acc", accountId);
             if (characterId != 0) cmd.Parameters.AddWithValue("$chr", characterId);
             if (!string.IsNullOrEmpty(category)) cmd.Parameters.AddWithValue("$cat", category);
-            if (!string.IsNullOrEmpty(action)) cmd.Parameters.AddWithValue("$act", LikePrefix(action));
-            if (fromUnix > 0) cmd.Parameters.AddWithValue("$from", fromUnix);
-            if (toUnix > 0) cmd.Parameters.AddWithValue("$to", toUnix);
             return Convert.ToInt64(cmd.ExecuteScalar());
         }
     }
-
-    /// <summary>
-    /// A LIKE pattern that matches <paramref name="prefix"/> and anything under it. SQLite has
-    /// NO default escape character, so both clauses that use this spell out the ESCAPE clause -
-    /// without it the backslashes below would be matched literally and an action containing a
-    /// percent sign would still behave as a wildcard.
-    /// </summary>
-    private static string LikePrefix(string prefix)
-        => prefix.Replace("\\", "\\\\").Replace("%", "\\%").Replace("_", "\\_") + "%";
 
     public List<BoardPostRow> GetBoardPosts(int boardId)
     {

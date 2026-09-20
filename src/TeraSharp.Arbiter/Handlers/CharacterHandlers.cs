@@ -613,11 +613,51 @@ public sealed class CharacterHandlers
         ArgumentNullException.ThrowIfNull(element);
         var r = store?.GetCharacter(characterId);
         if (r == null) return;
+
+        // ---- T76: location, last played, rested xp ----
         element["worldId"] = r.LastWorld;
         element["guardId"] = r.LastGuard;
         element["sectionId"] = r.LastSection;
         element["lastLogoutTime"] = UnixSeconds(r.LastLogout);
         element["restBonusXp"] = r.RestBonus;
+
+        // ---- T122: everything else the ROW owns ----
+        //
+        // The caller fills this element from s.Account.Characters, which is a snapshot taken
+        // by FakeAccount.LoadFromStore at LOGIN. Anything that changed while the player was in
+        // world - levelling, a GM command, moving, a gear change - changed the row and not the
+        // snapshot, so character select kept showing the login-time values: level 8 in world,
+        // level 1 on the way back out (live 2026-09-20).
+        //
+        // Rather than refresh the cache, this refreshes the ELEMENT. It is the same
+        // GetCharacter call T76 already made per entry, so the fix costs no extra query and
+        // needs no change in the human-owned LoginHandlers.OnGetUserList.
+        element["level"] = r.Level;
+        element["name"] = r.Name;
+        element["position"] = r.Position;
+        element["gender"] = r.Gender;
+        element["race"] = r.Race;
+        element["class"] = r.Class;
+        element["weapon"] = r.Weapon;
+        element["body"] = r.Body;
+        element["hand"] = r.Hand;
+        element["feet"] = r.Feet;
+        if (r.Appearance is { Length: StarterBlob.AppearanceSize }) element["appearance"] = r.Appearance;
+        if (r.Details is { Length: StarterBlob.DetailsSize }) element["details"] = r.Details;
+        if (r.Shape is { Length: StarterBlob.ShapeSize }) element["shape"] = r.Shape;
+
+        // hp and mp have no column - the saved world blob is their only source (T105 pinned
+        // +208 and +216 next to the level at +204). A blob too short to hold them, or a
+        // character that has never entered the world, leaves the caller's template values
+        // alone rather than showing 0 hp in the lobby.
+        long hp = StarterBlob.ReadHp(r.WorldBlob);
+        int mp = StarterBlob.ReadMp(r.WorldBlob);
+        if (hp > 0) element["hp"] = hp;
+        if (mp > 0) element["mp"] = mp;
+
+        // NOT refreshed, on purpose: `isNewCharacter` (the caller hard-codes true and nothing
+        // in the row says otherwise yet), `maxRestBonusXp` (RestBonusDataSheet, which we do not
+        // load - see the note above), and exp, which S_GET_USER_LIST has no field for.
     }
 
     /// <summary>
