@@ -235,6 +235,15 @@ public static class HandlerRegistry
         Reg("C_ADMIN_REQUEST_USERINFO",   22, (s, b) => GmAdminTool.OnRequestUserInfo(s, b, misc));     // T91
         Reg("C_ADMIN_REQUEST_USERACTION", 18, (s, b) => GmAdminTool.OnRequestUserAction(s, b, misc));   // T91
         Reg("C_REQUEST_SERVER_ADMINTOOL_AWESOMIUM_URL", 0, (s,b) => ArbiterClientHandlers.OnRequestAdminToolUrl(s,b,misc));   // T107: Alt+A waits for this reply
+        // T118: the leaderboard and the leftovers (status/LEADERBOARD.md). C_REQUEST_MY_PARTY_MATCH_INFO stays with PartyMatchManager.
+        Reg("C_REQUEST_PVE_RANKING",       LeaderboardPackets.RankingBodySize,        (s,b) => LeaderboardPackets.OnRequestPveRanking(s, b, log));
+        Reg("C_REQUEST_PVP_RANKING",       LeaderboardPackets.RankingBodySize,        (s,b) => LeaderboardPackets.OnRequestPvpRanking(s, b, log));
+        Reg("C_VIEW_INTER_PARTY_MATCH_DUNGEON_LIST",     LeaderboardPackets.NoBodySize, (s,b) => LeaderboardPackets.OnViewInterPartyMatchDungeonList(s, b, log));
+        Reg("C_VIEW_INTER_PARTY_MATCH_BATTLEFIELD_LIST", LeaderboardPackets.NoBodySize, (s,b) => LeaderboardPackets.OnViewInterPartyMatchBattlefieldList(s, b, log));
+        Reg("C_REQUEST_PARTY_MATCH_INFO_PAGE",  LeaderboardPackets.PartyMatchPageBodySize, (s,b) => LeaderboardPackets.OnRequestPartyMatchInfoPage(s, b, log));
+        Reg("C_REQUEST_CHANGE_PARTY_MATCH_RULE",LeaderboardPackets.PartyMatchRuleBodySize, (s,b) => LeaderboardPackets.OnRequestChangePartyMatchRule(s, b, log));
+        Reg("C_GROUP_DUEL_RECORD",              LeaderboardPackets.NoBodySize,             (s,b) => LeaderboardPackets.OnGroupDuelRecord(s, b, log));
+        Reg("C_CHANGE_USER_NAME",               LeaderboardPackets.ChangeUserNameBodySize, (s,b) => LeaderboardPackets.OnChangeUserName(s, b, log));
         // T99: GM tool tail
         Reg("C_ADMIN_GM_TELEPORT",              GmAdminTool.GmTeleportBodySize,     (s,b) => GmAdminTool.OnGmTeleport(s,b,misc));
         Reg("C_ADMIN_GM_MAPTELEPORT",           GmAdminTool.GmMapTeleportBodySize,  (s,b) => GmAdminTool.OnGmMapTeleport(s,b,misc));
