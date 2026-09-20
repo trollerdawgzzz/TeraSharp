@@ -367,3 +367,85 @@ because its context lines come from CRLF sources. GNU patch strips trailing CRs 
 then reports `different line endings` on every hunk; `git apply` handles it, and so does
 `patch -p1 --binary`. Both of those are checked on every regeneration, against a copy normalised
 the way the file actually lands on disk.
+
+## T134 - matchmaking and the battleground lifecycle (classic_live2)
+
+Source: `D:\packetlogs\classic_live2.log` - a LIVE Classic+ reference, 364273 records, carrying a
+Corsairs battleground queue -> enter -> play -> leave and a Kelsaik dungeon queue. Its opcode map is
+the same 376012 map our 100.02 captures use (spot-checked on nine known opcodes), so the frames
+below are directly comparable to ours.
+
+### Decoded
+
+| packet | op | n | decode |
+|---|---|---|---|
+| `C_DUNGEON_COOL_TIME_LIST` | `0xD3F7` | 9 | EMPTY body - the 4-byte frame is the packet |
+| `S_DUNGEON_COOL_TIME_LIST` | `0xD768` | 9 | `array dungeons{u32 id,u32 type,u32 cooldown,i16 entriesDay,i16 entriesWeek}` + `array battlegrounds{u32 id,u16 entries}`. **All nine replies are empty** (`00 00 00 00 00 00 00 00`) |
+| `C_DUNGEON_CLEAR_COUNT_LIST` | `0x5C98` | 17 | `string name` - a CHARACTER NAME ("cat"), so the window can be opened on somebody else |
+| `S_DUNGEON_CLEAR_COUNT_LIST` | `0x9D66` | 17 | `u32 pid` + `array{i32 id,i32 clears,byte rookie}`. Record 13158 = pid 24468, the fixed 14-id roster; record 19420 = pid 108865, one row |
+| `C_MATCH_PROGRESS` | `0xF7B8` | 8 | `array{i32 a,i32 b,i32 c}`, always one element `-10001, 1, 0`. No def ships for it |
+| `S_MATCH_PROGRESS` | `0x8BE4` | 8 | `array{i32 x6}`, one element. Record 9386 `10,1,0,1,0,1`; record 12554 `10,1,0,8,17,8` - fields 4 and 5 are **current of total** (8 of 17 in the pool), field 6 tracks field 4 |
+| `S_MATCH_ROOM_DELETE` | `0x74F5` | 125 | 16 B body: `array{i32 roomId}` - one room id per frame, a steady drip as other people's rooms close |
+| `S_FIN_INTER_PARTY_MATCH` | `0x6470` | 2 | 12 B body `i32 zone / i32 unk1 / i32 unk2`. Record 19524 `10,1,0` (the BG), record 326748 `9075,0,0` (Kelsaik). **The shipped def declares only `int32 zone` and under-declares the other two** |
+| `S_ADD_INTER_PARTY_MATCH_POOL` | `0xC730` | 2 | 62 / 79 B. The shipped `.1.def` does NOT decode this build's frame (it yields `type = 2097154`), so the layout is NOT pinned - see below |
+| `S_BATTLE_FIELD_USER_LOAD_INFO` | `0xD687` | 58 | 127 B body, fixed size, one per participant during the load screen. Leading `i32 gameId`-ish, then four `i32` ids, then a 4-byte id and a fixed tail |
+| `S_RETURN_USER` | `0x6C50` | 9 | **EMPTY** - the 4-byte frame is the whole packet. Fires at logout/zone-out boundaries |
+| `S_INSTANCE_ARROW` | `0xC644` | 961 | 48/64/80/96/112 B bodies - two arrays, the second carrying `vec3` waypoints. Pure world content |
+| `S_AVAILABLE_EVENT_MATCHING_LIST` | `0x810D` | 3 | 1882 B, all three the same size. `.2.def` decodes it: 12 `uint32`, 3 bytes, 2 `uint32`, `vanguardCredits`, 3 bytes, 4 limit ints, level, then a `quests` array whose elements nest four more arrays |
+
+### Not implemented, and why
+
+`S_FIN_INTER_PARTY_MATCH` and the instance hand-off need a real match server: the Arbiter does not
+decide when a pool fills, and `zone` in FIN is the instance the client is then told to load. Same
+for `S_ADD_INTER_PARTY_MATCH_POOL` and `S_MATCH_PROGRESS` - the numbers in them (avg wait, 8 of 17)
+are match-server state. They are decoded above as the CLIENT-SIDE CONTRACT: what the client expects
+to receive, so that when a match server exists it has a specification rather than a guess.
+
+`S_ADD_INTER_PARTY_MATCH_POOL` is the one gap. Its `.1.def` does not fit this build - decoding
+record 9335 with it gives `type = 2097154` and an empty `players` array, while the frame plainly
+contains `F0 0A 00 00` (planet 2800) twice and `94 5F 00 00` (pid 24468, the same pid
+S_DUNGEON_CLEAR_COUNT_LIST carries). Do not implement it from that def. It needs either a newer def
+or a hand trace against `Handler_C_ADD_INTER_PARTY_MATCH_POOL`.
+
+`S_AVAILABLE_EVENT_MATCHING_LIST` decodes, but it is 1882 bytes of vanguard-quest content with a
+four-deep nested array. It is a content table, not Arbiter state; serving it means modelling the
+vanguard system, which is its own task.
+
+### Implemented (T134)
+
+`ArbiterClientHandlers.BuildDungeonCoolTimeList` and `BuildDungeonClearCountList`, plus
+`ReadDungeonClearCountName` and `CharacterStore.GetDungeonClearCounts`. Byte-exact against records
+13163 (empty cool time), 13158 (14 rows) and 19420 (1 row).
+
+**NOT APPLIED - `Handlers/HandlerRegistry.cs` is human-owned.** Two lines:
+
+```
+        Reg("C_DUNGEON_COOL_TIME_LIST", 0, (s, body) =>
+        {
+            s.Send(ArbiterClientHandlers.BuildDungeonCoolTimeList());      // T134: all 9 live replies are empty
+            return true;
+        });
+        Reg("C_DUNGEON_CLEAR_COUNT_LIST", 0, (s, body) =>
+        {
+            var who = Program.Store?.FindCharacterByName(
+                ArbiterClientHandlers.ReadDungeonClearCountName(body));     // name -> the character asked about
+            ...
+            s.Send(ArbiterClientHandlers.BuildDungeonClearCountList(pid, rows));
+            return true;
+        });
+```
+
+The clear-count reply needs the fixed 14-id roster the client expects (9068, 9056, 9168, 9156,
+9507, 9043, 9768, 9756, 9868, 9856, 9830, 9810, 9739, 9075) merged with
+`GetDungeonClearCounts(ownerId)`: every id in the roster gets a row, `clears` from the store or 0,
+`rookie = clears == 0`. The roster is client content, so it belongs beside the other static tables
+rather than in the store.
+
+### Cool time: what is still missing
+
+The stored `dungeon_cooldowns.record` is the 52-byte World element
+(`status/DUNGEON-COOLTIME.md` section 2), not the client's 20-byte one. Mapping one to the other
+needs the DateTime -> `cooldown` seconds rule and the daily-reset boundary, neither of which any
+capture pins. Until then `BuildDungeonCoolTimeList()` is called with no entries, which is what the
+live server sent in all nine samples - correct for an account with nothing locked, and honest about
+the rest.

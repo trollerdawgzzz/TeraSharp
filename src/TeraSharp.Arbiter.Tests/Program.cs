@@ -12166,6 +12166,63 @@ bool   isGuildWarAcceptable
             "it prints the claims and never the signature");
     }
 
+    /// <summary>
+    /// T134 - the two dungeon windows, byte-exact against classic_live2 (live Classic+ reference,
+    /// 364273 records). The client fires both requests together when the window opens; 9
+    /// cool-time pairs and 17 clear-count pairs are in the capture.
+    /// </summary>
+    [Test] public static void T134_dungeon_windows_are_byte_exact()
+    {
+        // ---- cool time. All NINE captured replies are the empty form. ----
+        Hex.Eq(ArbiterClientHandlers.BuildDungeonCoolTimeList(),
+            "0C 00 68 D7 00 00 00 00 00 00 00 00",
+            "classic_live2 records 13163, 15363, 15853, 16027, 16094, 16118, 19110, 326006, 326219");
+
+        // The element layout comes from S_DUNGEON_COOL_TIME_LIST.2.def, which no capture exercises
+        // - so this pins the WRITER, not a frame, and says so. 4 + 8 + 20 + 10 = 42.
+        var cool = ArbiterClientHandlers.BuildDungeonCoolTimeList(
+            new[] { new ArbiterClientHandlers.DungeonCoolTime(9075, 0, 3600, -1, 2) },
+            new[] { new ArbiterClientHandlers.BattlegroundEntries(1, 3) });
+        Hex.Eq(cool,
+            "2A 00 68 D7 01 00 0C 00 01 00 20 00 0C 00 00 00 73 23 00 00 00 00 00 00 10 0E 00 00 "
+            + "FF FF 02 00 20 00 00 00 01 00 00 00 03 00",
+            "two arrays, 20 B and 10 B elements, offsets packet-relative and the last next = 0");
+
+        // ---- clear count. Record 13158: pid 24468, the fixed 14-dungeon roster. ----
+        int[] ids = { 9068, 9056, 9168, 9156, 9507, 9043, 9768, 9756, 9868, 9856, 9830, 9810, 9739, 9075 };
+        int[] clears = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 0, 34, 0 };
+        var rows = new ArbiterClientHandlers.DungeonClears[ids.Length];
+        for (int i = 0; i < ids.Length; i++)
+            rows[i] = new ArbiterClientHandlers.DungeonClears(ids[i], clears[i], clears[i] == 0);
+        Hex.Eq(ArbiterClientHandlers.BuildDungeonClearCountList(24468, rows),
+            "C2 00 66 9D 0E 00 0C 00 94 5F 00 00 0C 00 19 00 6C 23 00 00 00 00 00 00 01 19 00 26 00 60 23 00 00 00 00 00 00 01 26 00 33 00 D0 23 00 00 00 00 00 00 01 33 00 40 00 C4 23 00 00 00 00 00 00 01 40 00 4D 00 23 25 00 00 00 00 00 00 01 4D 00 5A 00 53 23 00 00 00 00 00 00 01 5A 00 67 00 28 26 00 00 00 00 00 00 01 67 00 74 00 1C 26 00 00 00 00 00 00 01 74 00 81 00 8C 26 00 00 00 00 00 00 01 81 00 8E 00 80 26 00 00 00 00 00 00 01 8E 00 9B 00 66 26 00 00 0A 00 00 00 00 9B 00 A8 00 52 26 00 00 00 00 00 00 01 A8 00 B5 00 0B 26 00 00 22 00 00 00 00 B5 00 00 00 73 23 00 00 00 00 00 00 01",
+            "classic_live2 record 13158 - rookie is set on every dungeon with 0 clears");
+
+        // Record 19420: the one-row form, for a party member the window was opened on.
+        Hex.Eq(ArbiterClientHandlers.BuildDungeonClearCountList(108865,
+                new[] { new ArbiterClientHandlers.DungeonClears(9075, 0, true) }),
+            "19 00 66 9D 01 00 0C 00 41 A9 01 00 0C 00 00 00 73 23 00 00 00 00 00 00 01",
+            "classic_live2 record 19420 - one element, next = 0");
+
+        // ---- the request carries a NAME, which is why the reply carries a pid at all. ----
+        Hex.True(ArbiterClientHandlers.ReadDungeonClearCountName(
+                     Hex.B("06 00 63 00 61 00 74 00 00 00")) == "cat",
+            "classic_live2 record 13156 body - offset 6 is packet-relative, so body index 2");
+        Hex.True(ArbiterClientHandlers.ReadDungeonClearCountName(Array.Empty<byte>()) == ""
+                 && ArbiterClientHandlers.ReadDungeonClearCountName(Hex.B("FF FF 00 00")) == "",
+            "a malformed body reads as empty, never as an exception");
+
+        // ---- and the store read that feeds it ----
+        using var store = StoreWithTwoAccounts();
+        store.SetDungeonClearCount(1, 9830, 10);
+        store.SetDungeonClearCount(1, 9739, 34);
+        store.SetDungeonClearCount(1, 9075, 0);
+        var got = store.GetDungeonClearCounts(1);
+        Hex.True(got.Count == 2 && got[0].DungeonId == 9739 && got[0].Clears == 34
+                 && got[1].DungeonId == 9830 && got[1].Clears == 10,
+            "ordered by dungeon id, and a 0 count is not a row the window needs");
+    }
+
     // ---- The rules ----
 
     [Test] public static void T30_system_message_format_matches_the_capture()

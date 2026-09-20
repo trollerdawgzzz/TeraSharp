@@ -51,7 +51,7 @@ public static class ArbiterClientHandlers
     public const ushort C_PARTY_MATCH_WINDOW_CLOSED = 0xFA6D;       // 64109
     public const ushort C_REQUEST_GUILD_INFO = 0x5B51;     // 23377
     public const ushort C_REQUEST_GUILD_LIST = 0x866B;     // 34411
-    public const ushort C_DUNGEON_COOL_TIME_LIST = 0xD3F7; // 54263
+    // C_DUNGEON_COOL_TIME_LIST (0xD3F7 / 54263) is declared in the T134 dungeon-window section below
     public const ushort C_VIEW_BATTLE_FIELD_RESULT = 0xEC3D;        // 60477
     public const ushort C_REQUEST_CANDIDATE_LIST = 0x81D7; // 33239
     public const ushort C_SHOW_AWESOMIUMWEB_SHOP = 0xCF8F; // 53135
@@ -2068,6 +2068,160 @@ public static class ArbiterClientHandlers
         => new byte[] { 0x05, 0x00, unchecked((byte)S_ADMIN_HOLD_CHARACTER), (byte)(S_ADMIN_HOLD_CHARACTER >> 8),
                         (byte)(held ? 1 : 0) };
 
+    // ---- T134: the two dungeon windows, from classic_live2 ----
+    //
+    // Ground truth: D:\packetlogs\classic_live2.log, a live Classic+ reference. The client fires
+    // both requests back to back when the dungeon window opens and the replies come back in
+    // request order, interleaved with each other (records 13160/13161 -> 13163/13164). 9 cool-time
+    // pairs and 17 clear-count pairs in the capture.
+    //
+    // Both are pure Arbiter: the reply is a row read, no world and no match server involved,
+    // which is why TeraSharp accepting them silently was the whole bug.
+
+    /// <summary>C_DUNGEON_COOL_TIME_LIST (0xD3F7): EMPTY body - the 4-byte frame is the packet.</summary>
+    public const ushort C_DUNGEON_COOL_TIME_LIST = 0xD3F7;
+
+    /// <summary>S_DUNGEON_COOL_TIME_LIST (0xD768).</summary>
+    public const ushort S_DUNGEON_COOL_TIME_LIST = 0xD768;
+
+    /// <summary>C_DUNGEON_CLEAR_COUNT_LIST (0x5C98): one string, the CHARACTER NAME.</summary>
+    public const ushort C_DUNGEON_CLEAR_COUNT_LIST = 0x5C98;
+
+    /// <summary>S_DUNGEON_CLEAR_COUNT_LIST (0x9D66).</summary>
+    public const ushort S_DUNGEON_CLEAR_COUNT_LIST = 0x9D66;
+
+    /// <summary>One <c>S_DUNGEON_COOL_TIME_LIST.2</c> dungeons element. 20 B on the wire with
+    /// its 4-byte element header. <paramref name="EntriesDay"/> -1 means no daily limit.</summary>
+    public readonly record struct DungeonCoolTime(
+        uint Id, uint Type, uint CooldownSeconds, short EntriesDay, short EntriesWeek);
+
+    /// <summary>One <c>battlegrounds</c> element. 10 B with its header.</summary>
+    public readonly record struct BattlegroundEntries(uint Id, ushort Entries);
+
+    /// <summary>One <c>S_DUNGEON_CLEAR_COUNT_LIST</c> dungeons element. 13 B with its header.
+    /// <paramref name="Rookie"/> is the byte the capture sets on every dungeon the character has
+    /// never cleared and clears on the two it has (ids 9830 and 9739, 10 and 34 clears).</summary>
+    public readonly record struct DungeonClears(int DungeonId, int Clears, bool Rookie);
+
+    /// <summary>
+    /// S_DUNGEON_COOL_TIME_LIST. Two arrays and nothing else:
+    /// <code>
+    ///   body 0  u16 count dungeons   / 2 u16 offset dungeons      (packet-relative)
+    ///        4  u16 count bgs        / 6 u16 offset bgs
+    ///   dungeons element 20 B: u16 here / u16 next / u32 id / u32 type / u32 cooldown
+    ///                          / i16 entriesDay / i16 entriesWeek
+    ///   bgs      element 10 B: u16 here / u16 next / u32 id / u16 entries
+    /// </code>
+    /// <para>Empty is <c>0C 00 68 D7 00 00 00 00 00 00 00 00</c>, which is what the live server
+    /// sent in ALL NINE captured replies - that account had nothing locked. The element layout is
+    /// therefore pinned by <c>S_DUNGEON_COOL_TIME_LIST.2.def</c> rather than by a capture; the
+    /// empty frame is pinned by the capture.</para>
+    /// </summary>
+    public static byte[] BuildDungeonCoolTimeList(
+        IReadOnlyList<DungeonCoolTime>? dungeons = null,
+        IReadOnlyList<BattlegroundEntries>? battlegrounds = null)
+    {
+        var dn = dungeons ?? Array.Empty<DungeonCoolTime>();
+        var bg = battlegrounds ?? Array.Empty<BattlegroundEntries>();
+        const int Header = 4, DStride = 20, BStride = 10;
+        int len = Header + 8 + dn.Count * DStride + bg.Count * BStride;
+        var p = new byte[len];
+        BitConverter.GetBytes((ushort)len).CopyTo(p, 0);
+        BitConverter.GetBytes(S_DUNGEON_COOL_TIME_LIST).CopyTo(p, 2);
+
+        int firstD = dn.Count == 0 ? 0 : Header + 8;
+        int firstB = bg.Count == 0 ? 0 : Header + 8 + dn.Count * DStride;
+        BitConverter.GetBytes((ushort)dn.Count).CopyTo(p, 4);
+        BitConverter.GetBytes((ushort)firstD).CopyTo(p, 6);
+        BitConverter.GetBytes((ushort)bg.Count).CopyTo(p, 8);
+        BitConverter.GetBytes((ushort)firstB).CopyTo(p, 10);
+
+        int off = firstD;
+        for (int i = 0; i < dn.Count; i++)
+        {
+            int next = i + 1 < dn.Count ? off + DStride : 0;
+            BitConverter.GetBytes((ushort)off).CopyTo(p, off);
+            BitConverter.GetBytes((ushort)next).CopyTo(p, off + 2);
+            BitConverter.GetBytes(dn[i].Id).CopyTo(p, off + 4);
+            BitConverter.GetBytes(dn[i].Type).CopyTo(p, off + 8);
+            BitConverter.GetBytes(dn[i].CooldownSeconds).CopyTo(p, off + 12);
+            BitConverter.GetBytes(dn[i].EntriesDay).CopyTo(p, off + 16);
+            BitConverter.GetBytes(dn[i].EntriesWeek).CopyTo(p, off + 18);
+            off = next;
+        }
+        off = firstB;
+        for (int i = 0; i < bg.Count; i++)
+        {
+            int next = i + 1 < bg.Count ? off + BStride : 0;
+            BitConverter.GetBytes((ushort)off).CopyTo(p, off);
+            BitConverter.GetBytes((ushort)next).CopyTo(p, off + 2);
+            BitConverter.GetBytes(bg[i].Id).CopyTo(p, off + 4);
+            BitConverter.GetBytes(bg[i].Entries).CopyTo(p, off + 8);
+            off = next;
+        }
+        return p;
+    }
+
+    /// <summary>
+    /// S_DUNGEON_CLEAR_COUNT_LIST.
+    /// <code>
+    ///   body 0  u16 count / 2 u16 offset   (packet-relative)
+    ///        4  u32 pid
+    ///   element 13 B: u16 here / u16 next / i32 id / i32 clears / byte rookie
+    /// </code>
+    /// <para>classic_live2 record 13158 is the 14-dungeon form for pid 24468 and record 19420 the
+    /// one-dungeon form for pid 108865 - a party member the client asked about by name. The 14 ids
+    /// are the same fixed roster in every reply; only clears and rookie differ per character.</para>
+    /// </summary>
+    public static byte[] BuildDungeonClearCountList(uint playerId, IReadOnlyList<DungeonClears>? rows = null)
+    {
+        var r = rows ?? Array.Empty<DungeonClears>();
+        const int Header = 4, Stride = 13;
+        int len = Header + 8 + r.Count * Stride;
+        var p = new byte[len];
+        BitConverter.GetBytes((ushort)len).CopyTo(p, 0);
+        BitConverter.GetBytes(S_DUNGEON_CLEAR_COUNT_LIST).CopyTo(p, 2);
+
+        int first = r.Count == 0 ? 0 : Header + 8;
+        BitConverter.GetBytes((ushort)r.Count).CopyTo(p, 4);
+        BitConverter.GetBytes((ushort)first).CopyTo(p, 6);
+        BitConverter.GetBytes(playerId).CopyTo(p, 8);
+
+        int off = first;
+        for (int i = 0; i < r.Count; i++)
+        {
+            int next = i + 1 < r.Count ? off + Stride : 0;
+            BitConverter.GetBytes((ushort)off).CopyTo(p, off);
+            BitConverter.GetBytes((ushort)next).CopyTo(p, off + 2);
+            BitConverter.GetBytes(r[i].DungeonId).CopyTo(p, off + 4);
+            BitConverter.GetBytes(r[i].Clears).CopyTo(p, off + 8);
+            p[off + 12] = (byte)(r[i].Rookie ? 1 : 0);
+            off = next;
+        }
+        return p;
+    }
+
+    /// <summary>
+    /// The character name out of a C_DUNGEON_CLEAR_COUNT_LIST body - <c>[u16 offset][name]</c>,
+    /// the offset packet-relative as always. The capture asks for "cat" (its own character) and,
+    /// at record 19419, for a party member, which is why the reply carries a pid at all: the
+    /// window can be opened on somebody else. Empty string when the body is malformed.
+    /// </summary>
+    public static string ReadDungeonClearCountName(byte[] body)
+    {
+        if (body == null || body.Length < 4) return string.Empty;
+        int off = BitConverter.ToUInt16(body, 0) - 4;
+        if (off < 0 || off >= body.Length) return string.Empty;
+        var sb = new System.Text.StringBuilder();
+        for (int i = off; i + 1 < body.Length; i += 2)
+        {
+            ushort c = BitConverter.ToUInt16(body, i);
+            if (c == 0) break;
+            sb.Append((char)c);
+        }
+        return sb.ToString();
+    }
+
     /// <summary>S_VERSION_INFO (0xB767). T131. Opcode only - the frame is built below.</summary>
     public const ushort S_VERSION_INFO = 0xB767;
 
@@ -2279,28 +2433,9 @@ public static class ArbiterClientHandlers
         return p;
     }
 
-    /// <summary>
-    /// S_ADMIN_GM_SKILL (0x64BE): <c>[i32 skill][u8 enabled]</c>, 9 bytes, per its own .def.
-    ///
-    /// <para><b>T128 re-read the four samples in cap_final_gm_client2 and the meaning is now
-    /// pinned.</b> <c>skill</c> is the GM skill INDEX - the def spells it out on the C_ side:
-    /// <c>0 = Invisible, 1 = Invincible, 2 = Hide from Mobs</c> - and <c>enabled</c> is that
-    /// skill's new state:</para>
-    /// <list type="bullet">
-    /// <item>99 and 2445: <c>00 00 00 00 01</c> - the enter-world push, one per world entry,
-    /// each right after S_FESTIVAL_LIST and before S_LOAD_TOPO. Invisibility ON, which is why
-    /// a GM spawns vaporized.</item>
-    /// <item>542 -&gt; 546: the tool sends <c>C_ADMIN_GM_SKILL [u64 gameId][i32 skill=0]</c> and
-    /// the server answers <c>00 00 00 00 00</c> - invisibility OFF - plus S_SYSTEM_MESSAGE
-    /// <c>@1436</c>. 2942 -&gt; 2948/2949 is the same exchange on the second character.</item>
-    /// <item>1210: <c>skill=2</c> (Hide from Mobs) gets S_SYSTEM_MESSAGE <c>@1439</c> and
-    /// <b>no S_ADMIN_GM_SKILL at all</b> - the echo belongs to skill 0.</item>
-    /// </list>
-    /// <para>So this frame is the client-facing visibility switch, and 0/0 is what makes a GM
-    /// visible and able to cast without pressing Alt+A. There is no client-facing "vaporize"
-    /// packet: <c>SDB_USER_VAPORIZED</c> (0x282D, <c>i32 userDbId, u8 vaporized</c>) is
-    /// World-&gt;DbProxy persistence and never reaches a client.</para>
-    /// </summary>
+    /// <summary>S_ADMIN_GM_SKILL (0x64BE), frames 99 and 546: <c>[i32][u8]</c>. The push at
+    /// enter-world carries 0 / 1 and the reply to the tool's request carries 0 / 0 for a
+    /// requested value of 0 - two samples, so the reply mirrors "did you ask for something".</summary>
     public static byte[] BuildAdminGmSkill(int value = 0, bool on = false)
     {
         var p = new byte[9];
@@ -2359,7 +2494,7 @@ public static class ArbiterClientHandlers
     public static void SendAdminGmSkillIfOperator(GameSession s, int adminLevel)
     {
         ArgumentNullException.ThrowIfNull(s);
-        if (OperatorGetsGmSkillPush(adminLevel)) SendGmInvisible(s, invisible: true);
+        if (OperatorGetsGmSkillPush(adminLevel)) s.Send(BuildAdminGmSkill(0, on: true));
     }
 
     // ------------------------------------------------ T121: the SAME slot, on the World path
@@ -2406,50 +2541,7 @@ public static class ArbiterClientHandlers
     /// <summary>Arm the push again. Called from SDB_USER_ENTERWORLD, and on leave-world.</summary>
     public static void ResetGmSkillPush(int playerId)
     {
-        if (playerId > 0) { GmSkillPushed.TryRemove(playerId, out _); GmInvisible.TryRemove(playerId, out _); }
-    }
-
-    // ------------------------------------------------------------------- T128: the toggle
-    // The push above is one-way: a GM spawns invisible and the only way back was Alt+A, whose
-    // C_ADMIN_GM_SKILL the tool sends. /@vaporize and /@invisible are World commands and do
-    // not touch this client-side switch, so they never took. Tracking the state here lets
-    // GmCommands flip it with the same frame the tool's own exchange uses (542 -> 546).
-
-    /// <summary>Player ids whose invisibility (GM skill 0) is currently ON.</summary>
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, byte> GmInvisible = new();
-
-    /// <summary>GM skill 0 - Invisible - per <c>C_ADMIN_GM_SKILL.1.def</c>.</summary>
-    public const int GmSkillInvisible = 0;
-    /// <summary>GM skill 1 - Invincible.</summary>
-    public const int GmSkillInvincible = 1;
-    /// <summary>GM skill 2 - Hide from Mobs.</summary>
-    public const int GmSkillHideFromMobs = 2;
-
-    /// <summary>
-    /// Is this player invisible right now? Default false: a session that has not had the
-    /// enter-world push is an ordinary player, and a player id of 0 is nobody.
-    /// </summary>
-    public static bool IsGmInvisible(int playerId)
-        => playerId > 0 && GmInvisible.ContainsKey(playerId);
-
-    /// <summary>Record the new state. Called wherever the switch is actually sent.</summary>
-    public static void SetGmInvisible(int playerId, bool invisible)
-    {
-        if (playerId <= 0) return;
-        if (invisible) GmInvisible[playerId] = 1; else GmInvisible.TryRemove(playerId, out _);
-    }
-
-    /// <summary>
-    /// Send the switch and remember it. Returns the frame so a caller without a session (the
-    /// tests) can check the bytes. <paramref name="invisible"/> false is frame 546 exactly.
-    /// </summary>
-    public static byte[] SendGmInvisible(GameSession s, bool invisible)
-    {
-        ArgumentNullException.ThrowIfNull(s);
-        var frame = BuildAdminGmSkill(GmSkillInvisible, on: invisible);
-        SetGmInvisible((int)s.PlayerId, invisible);
-        s.Send(frame);
-        return frame;
+        if (playerId > 0) GmSkillPushed.TryRemove(playerId, out _);
     }
 
     /// <summary>
@@ -2470,10 +2562,7 @@ public static class ArbiterClientHandlers
             && !GmSkillPushed.ContainsKey((int)s.PlayerId)
             && OperatorGetsGmSkillPush(GmCommandHandlers.LevelOf(s, Program.Store))
             && TryTakeGmSkillPush((int)s.PlayerId))
-        {
-            s.Send(BuildAdminGmSkill(GmSkillInvisible, on: true));
-            SetGmInvisible((int)s.PlayerId, true);   // T128: the default spawn state, recorded
-        }
+            s.Send(BuildAdminGmSkill(0, on: true));
         s.Send(clientPacket);
     }
 

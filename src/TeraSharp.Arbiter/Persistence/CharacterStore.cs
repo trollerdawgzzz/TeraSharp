@@ -851,8 +851,10 @@ CREATE INDEX IF NOT EXISTS ix_achievements_done_owner ON achievements_done(owner
 -- SA_UPDATE_DUNGEON_COOLTIME (0x13B6), kept verbatim and handed straight back in
 -- DBS_LOAD_DUNGEON_COOL_TIME (0x2868) list 0 and in the AS_CACHE_DUNGEON_COOL_TIME_TO_WORLD
 -- (0x148D) pushes. `clear_count` is the separate scalar SA_UPDATE_DUNGEON_CLEAR_COUNT (0x13B7)
--- carries; it is stored but not yet served, because no capture has ever shown a non-empty
--- ClearCountList and its element layout is therefore unverified. status/DUNGEON-COOLTIME.md.
+-- carries. T134 finally observed the client-facing list: classic_live2 records 13158 and
+-- 19420 pin S_DUNGEON_CLEAR_COUNT_LIST, so GetDungeonClearCounts below now serves it. The
+-- World-side ClearCountList inside DBS_LOAD_DUNGEON_COOL_TIME is still unobserved and still
+-- answered empty. status/DUNGEON-COOLTIME.md, status/MULTIWORLD-DESIGN.md.
 CREATE TABLE IF NOT EXISTS dungeon_cooldowns (
   owner_id    INTEGER NOT NULL REFERENCES characters(id),
   dungeon_id  INTEGER NOT NULL,
@@ -2646,6 +2648,34 @@ SELECT last_insert_rowid();";
             cmd.Parameters.AddWithValue("$o", ownerId);
             using var r = cmd.ExecuteReader();
             while (r.Read()) list.Add((byte[])r["record"]);
+            return list;
+        }
+    }
+
+    /// <summary>One row of the T134 clear-count window.</summary>
+    public readonly record struct DungeonClearCount(int DungeonId, int Clears);
+
+    /// <summary>
+    /// Every dungeon this character has a clear count for, ordered by dungeon id so the reply is
+    /// reproducible. T134: this is what S_DUNGEON_CLEAR_COUNT_LIST serves.
+    ///
+    /// <para>The capture's reply carries a FIXED roster of 14 dungeon ids whether or not the
+    /// character has cleared them - a character with ten clears of 9830 and thirty-four of 9739
+    /// still gets all fourteen rows, the other twelve at 0. That roster is client-side content,
+    /// not a row set, so the caller supplies it and this only supplies the counts.</para>
+    /// </summary>
+    public List<DungeonClearCount> GetDungeonClearCounts(int ownerId)
+    {
+        lock (_lock)
+        {
+            var list = new List<DungeonClearCount>();
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT dungeon_id, clear_count FROM dungeon_cooldowns "
+                            + "WHERE owner_id = $o AND clear_count > 0 ORDER BY dungeon_id";
+            cmd.Parameters.AddWithValue("$o", ownerId);
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                list.Add(new DungeonClearCount(Convert.ToInt32(r["dungeon_id"]), Convert.ToInt32(r["clear_count"])));
             return list;
         }
     }
