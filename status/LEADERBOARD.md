@@ -1,4 +1,4 @@
-# Leaderboard (T118 step 1, T119 step 2)
+# Leaderboard (T118 step 1, T119 step 2, T126 corrections)
 
 ## 1. The brief's premise, corrected
 
@@ -136,6 +136,9 @@ other season is an empty board rather than a wrong one.
 
 ### 6.3 S_PVE_RANKING_LIST (0xBEDC) - 31-byte element
 
+> **Superseded by section 7.2.** The offsets below are right; three of the *assignments* were
+> not - +11 is the rank and +15 the stageLevel, not the other way round. T126 names all six.
+
 `S_PVE_RANKING_LIST.1.def` has **no fields**, so the layout is read off the writer,
 `PVERankingSystemManager::SendRankList` (Arb_part_050.c:9747, stamping 0xBEDC at :9758):
 
@@ -162,6 +165,9 @@ wrote - so the frame is self-consistent whatever the client does with it.
 
 ### 6.4 S_PVP_RANKING_LIST (0x62FA) - 23-byte element
 
+> **See section 7.3**: the def and the writer disagree on the first two scalars. The bytes we
+> send are unchanged; the field shape is corrected.
+
 From the shipped def (`int32 unk; byte unk2; int32 rank; int32 rating; int32 class; string
 name`): here/next/nameRef, then `unk` at +6, `unk2` at +10, rank +11, rating +15, class +19,
 name at +23. `rating` carries the kill count. The def's own comments call `unk` "probably
@@ -182,3 +188,81 @@ The registry is unchanged - both opcodes still point at
 `LeaderboardPackets.OnRequestPveRanking` / `OnRequestPvpRanking`. An **empty** board is still
 byte-identical to the frame T118 shipped, which is the only form of these two packets that has
 been in front of a live client; a test asserts that.
+
+## 7. The class dropdown, and what was actually wrong (T126)
+
+### 7.1 Nothing on the wire populates a class list
+
+The reported symptom was a class dropdown showing `undefined`. It is not server data. Four
+places were checked and none carries class names or a filter list:
+
+| Source | Result |
+|---|---|
+| `data.json` map 376012 | 29 `RANK`/`LEADER` opcodes; none is a class list |
+| The full def set (4550 defs) | no def declares a class array; `S_PVE_RANKING_LIST` still has **no fields** |
+| Both `S_PVE_RANKING_LIST` writers (`SendNowSeasonRank` Arb_part_050.c:9759, `SendPrevSeasonRank` :10594) | the header is `[u16 count][u16 firstElementOffset]` and nothing else - there is no room for one |
+| `cap_final_gm_client2`, every S->C packet | no packet with a class or name list anywhere in the capture |
+
+`S_P*_LEADER_BOARD_INFO` **is** a selector feed, but it is the *board* selector: PvE ids
+3126 / 3203 / 9126 (dungeons), PvP 10 / 30 / 37 (battlegrounds), and frame 1989 of the capture
+shows the client echoing one straight back as `id` (`0x0C83` = 3203). TeraSharp already sends
+both, byte-identical to the capture (T91).
+
+So the class dropdown is client-side, and there is **no packet change that can fill it**.
+
+### 7.2 What the same research did find: three slots in the wrong place
+
+T119 said three PvE scalars had no name. They do. The element source is a
+`ReturnRankInfo<T>`, and the two boards share its shape:
+
+```
+ReturnRankInfo<int>        0x10 B:  ?(+0)  int score(+4)                    a(+8)     b(+0xC)
+ReturnRankInfo<LevelTime>  0x20 B:  ?(+0)  int level(+8)  i64 time(+0x10)   a(+0x18)  b(+0x1C)
+```
+
+Both writers copy those four the same way - `score -> +0x0F`, `a -> +0x0B`, `b -> +0x07`
+(Arb_part_050.c:9812-9821 and :10266-10270). The PvP `.def` names two of them: `rank` at +11
+and `rating` at +15. **So +11 is the rank and +15 is the score, on both boards** - and T119
+shipped them the other way round on the PvE board.
+
+The i64 at +19 is `LevelTime.time`. `S_USER_PVE_RANKING`'s def - the companion packet, written
+from the same `Score()` call (`*(lVar18+0x38)` i32 then `*(+0x40)` i64, :10054-10058) - names
+that pair `stageLevel` and `clearTime`. So the corrected PvE element is:
+
+| Offset | Size | Field | We send |
+|---|---|---|---|
+| +0 / +2 / +4 | u16 | here / next / nameOffset | |
+| +6 | u8 | `rookie` | `IsRookie(viewerRank, rank, changedRank)` - always 0 |
+| +7 | i32 | `changedRank` | 0 - no previous season to diff against |
+| +11 | i32 | `rank` | **moved from +15** |
+| +15 | i32 | `stageLevel` | the character's level (**moved from +11**) |
+| +19 | i64 | `clearTime` | the clear COUNT - see below |
+| +27 | i32 | `class` | |
+| +31 | | NUL-terminated UTF-16 name | |
+
+`clearTime` is the one field whose units the client will read differently from how we mean
+them: the retail PvE board ranks by fastest clear time, and TeraSharp stores clear counts.
+That is stated in the code rather than hidden.
+
+### 7.3 The PvP def and the PvP writer disagree
+
+`S_PVP_RANKING_LIST.1.def` declares `int32 unk; byte unk2`, which encodes as i32@6 + u8@10.
+The writer stores the **byte first**: `*(u8 *)(puVar27 + 3)` at +6 and `*(u32 *)(+7)` at +7
+(:10266-10267). The decompile wins, so the byte sits at +6 and `changedRank` at +7. Both
+fields are 0 in every frame we send, so the bytes are unchanged and the def cross-check in the
+tests still passes - only the shape is corrected.
+
+### 7.4 The missing second frame
+
+`SendNowSeasonRank` sends **two** packets, not one: the list, then the requester's own line.
+T119 sent only the first, so the "my record" row under the board had nothing to fill it.
+
+| Packet | Opcode | Layout (def + writer, in agreement) | Size |
+|---|---|---|---|
+| `S_USER_PVE_RANKING` | 0xE748 | `byte rookie, i32 changedRank, i32 rank, i32 stageLevel, i64 clearTime` | 25 B |
+| `S_USER_PVP_RANKING` | 0xC844 | `byte rookie, i32 changedRank, i32 rank, i32 score` | 17 B |
+
+Written at Arb_part_050.c:10074 and :10518, as
+`SendToSession<PKT_S_USER_PVE_RANKING_WRITE, bool, int&, int&, int&, __int64&>` and the PvP
+four-argument form. An unranked requester gets rank 0 and zeroes rather than no frame, which
+is what the server does when `Rank()` misses its tree.
