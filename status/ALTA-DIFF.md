@@ -243,3 +243,68 @@ client was built against and costs nothing.
 NOT CHECKED: `D:\Tera 100\S1Game\Config` and the client exe. That folder is not connected to this
 session and a folder-access request for it was refused, so the client-side half of the question is
 answered from the server config only. To confirm against the exe, connect `D:\Tera 100`.
+
+## T132 - serving apiServerAddress: what the research found, and what was built
+
+### What the client asks for: STILL UNKNOWN, and here is every place it is not
+
+The Alt+A URL is built IN THE CLIENT from `apiServerAddress` + `apiServerAuthToken`. Four sources
+were checked and none of them carries the path:
+
+| Source | What is actually there |
+|---|---|
+| `ArbiterServer.exe.c` (59 MB, grepped) | No admin-tool path. Its ONLY URL is `L"http://%s/Default.aspx?v=%s"` at line 1440066, filled with the hardcoded `"52.199.108.189:80"` and `"Live-100.02 TW #9 (Gold)"` and fired through `InternetOpenUrlW` as `ArbiterServer` - a retail phone-home at startup, unrelated to Alt+A. (Worth blocking before going public.) |
+| `WebApp\ContentsControl\Awesomium\*` | A DIFFERENT feature. `AwesomiumUrlControl.aspx` is a GM page managing a per-server (Title, Url) list - the in-game web panel. All logic is compiled into `WebApp\bin\*.dll`; the .aspx files are markup only. |
+| `S_RESPONSE_SERVER_ADMINTOOL_AWESOMIUM_URL` | Serves that same list. Body in the working capture is `08 00 0A 00 00 00 00 00` = TWO string refs at packet 8 and 10, BOTH EMPTY. The panel opened with an empty admin-tool URL, which is the proof the URL does not come from this packet. (The shipped def declares only `string title` - it under-declares the second string.) |
+| `tera-api` | `API_GATEWAY_LISTEN_PORT=8040`, and its own `.env.example` calls it the API "for receiving connections from the external website (like billing)". Not an admin tool. |
+
+The one source that would answer it - the client install, `D:\Tera 100\S1Game\Config` and the exe -
+is not connected to this session and a folder-access request for it was refused (T131). **So 8040
+was wrong twice over: wrong port AND wrong service.**
+
+### What was built: a probe, not the finished tool
+
+`Web/ApiGatewayServer.cs` serves EVERY path at `TERASHARP_API_GATEWAY`'s port, logs the request in
+full - method, path, query, every header, cookies, user-agent - reports whether a token arrived and
+whether it verifies against `TERASHARP_API_JWT_SECRET`, and returns a minimal no-script HTML page
+so an Awesomium shell has a document to load. One Alt+A press turns the unknown above into a
+measured fact, and T133 can then serve the real page at the path the log names.
+
+It reads the token from all three carriers because we do not yet know which the client uses:
+`Authorization: Bearer`, then the query (`token`, `authKey`, `apiServerAuthToken`, `jwt`, ... ),
+then `Cookie`. Whichever one fires is what the log reports.
+
+```
+  TERASHARP_API_GATEWAY_SERVE=1              required - off by default, because it binds a port
+  TERASHARP_API_GATEWAY=<reachable ip>:8800  the SAME value the client is told
+  TERASHARP_API_GATEWAY_BIND=0.0.0.0         only when the client is not on this box
+  TERASHARP_API_JWT_SECRET=<key>             so the log can say VERIFIED rather than just PRESENT
+```
+
+Unlike `AdminServer` (127.0.0.1 only, always) this can bind beyond loopback - the client that has
+to reach it is usually another machine - which is exactly why it is opt-in. A `+` / `0.0.0.0`
+prefix needs `netsh http add urlacl url=http://+:8800/ user=%USERNAME%` or an elevated process;
+the bind failure is logged with that command, never thrown.
+
+### The default port moved: 8040 -> 8800
+
+`ApiGatewayToken.DefaultAddress` is now `127.0.0.1:8800`, matching `DeploymentConfig.xml`'s
+`<APIServer ip=127.0.0.1 port=8800 protocol=http ttl=120 />`. T124's two `Address()` assertions
+that expected 8040 were updated with it.
+
+### NOT APPLIED - one wiring line, `Program.cs` is human-owned
+
+Beside the existing `AdminServer.TryStart(...)`:
+
+```
+        var apiGateway = ApiGatewayServer.TryStart(log);   // T132: the listener at apiServerAddress
+```
+
+and dispose it with the other servers. When `TERASHARP_API_GATEWAY_SERVE` is unset it logs one
+line saying nothing is serving the address and returns null, so adding it is safe either way.
+
+### What to do next
+
+1. Add the wiring line, set the four env vars, restart.
+2. Press Alt+A on a GM account and read the `api-gateway probe:` log line.
+3. That line is T133's specification: the path, the query, and where the token rides.

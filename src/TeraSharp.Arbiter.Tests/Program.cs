@@ -11971,10 +11971,10 @@ bool   isGuildWarAcceptable
             "and neither does a swapped account id");
 
         // The address must carry a port - '127.0.0.1' with none is exactly what did not work.
-        Hex.True(TeraSharp.Arbiter.Auth.ApiGatewayToken.Address("127.0.0.1") == "127.0.0.1:8040",
-            "a portless value is repaired, not passed on");
+        Hex.True(TeraSharp.Arbiter.Auth.ApiGatewayToken.Address("127.0.0.1") == "127.0.0.1:8800",
+            "a portless value is repaired, not passed on - and T132 moved the default to 8800");
         Hex.True(TeraSharp.Arbiter.Auth.ApiGatewayToken.Address("http://10.0.0.5:8800/") == "10.0.0.5:8800"
-                 && TeraSharp.Arbiter.Auth.ApiGatewayToken.Address(" ") == "127.0.0.1:8040",
+                 && TeraSharp.Arbiter.Auth.ApiGatewayToken.Address(" ") == "127.0.0.1:8800",
             "a pasted URL is reduced to host:port, and blank falls back to the box default");
 
         // antiCheatChecksumSeed: 0 is what we sent before. The capture's 619351 is its own
@@ -12107,6 +12107,63 @@ bool   isGuildWarAcceptable
         Hex.Eq(Framed(ArbiterClientHandlers.S_VERSION_INFO, body),
             "0D 00 67 B7 0B 00 00 00 00 00 01 00 00",
             "the def writes the same 13 bytes the builder does");
+    }
+
+    /// <summary>
+    /// T132 - the listener that sits at apiServerAddress. The PATH the client asks for is decided
+    /// in the client and T132 could not read it (the install is not reachable), so what is tested
+    /// here is the part that does not depend on knowing it: the prefix is built from the SAME
+    /// address the client is told, and a token is found wherever the client chose to put it.
+    /// </summary>
+    [Test] public static void T132_api_gateway_probe_reads_the_token_from_any_carrier()
+    {
+        // The default follows DeploymentConfig's <APIServer port=8800>, not tera-api's 8040.
+        Hex.True(TeraSharp.Arbiter.Auth.ApiGatewayToken.DefaultAddress == "127.0.0.1:8800",
+            "8040 is tera-api's billing gateway; 8800 is what the retail Arbiter sends");
+
+        // The port always comes from the address the client is told - a probe on another port is
+        // not the thing the client is pointed at. Only the host is overridable.
+        Hex.True(ApiGatewayServer.PrefixFor("127.0.0.1:8800", "") == "http://127.0.0.1:8800/",
+            "loopback, unchanged");
+        Hex.True(ApiGatewayServer.PrefixFor("159.195.17.172:8800", "0.0.0.0") == "http://+:8800/"
+                 && ApiGatewayServer.PrefixFor("10.0.0.5:9000", "*") == "http://+:9000/"
+                 && ApiGatewayServer.PrefixFor("10.0.0.5:9000", "+") == "http://+:9000/",
+            "0.0.0.0, * and + all mean the HttpListener wildcard");
+        Hex.True(ApiGatewayServer.PrefixFor("10.0.0.5", "") == "http://10.0.0.5:8800/",
+            "a portless address is repaired by Address() before the prefix is built");
+
+        // The JWT round trip: mint one, hand it over the way each carrier would, get it back
+        // whole, and check it still verifies. url-encoding in the query has to survive.
+        const long Iat = 1789619351L;
+        var secret = System.Text.Encoding.UTF8.GetBytes("test-secret");
+        string tok = TeraSharp.Arbiter.Auth.ApiGatewayToken.Mint(1, Iat, secret);
+
+        var carried = new[]
+        {
+            ApiGatewayServer.TokenFrom(null, "Bearer " + tok, null),
+            ApiGatewayServer.TokenFrom("?token=" + tok, null, null),
+            ApiGatewayServer.TokenFrom("?server=2800&authKey=" + Uri.EscapeDataString(tok), null, null),
+            ApiGatewayServer.TokenFrom("?apiServerAuthToken=" + tok + "&x=1", null, null),
+            ApiGatewayServer.TokenFrom(null, null, "sid=abc; token=" + tok),
+        };
+        foreach (var got in carried)
+        {
+            Hex.True(got == tok, "the token survives its carrier intact");
+            Hex.True(TeraSharp.Arbiter.Auth.ApiGatewayToken.Verify(got!, secret),
+                "and still verifies afterwards");
+        }
+
+        Hex.True(ApiGatewayServer.TokenFrom("?a=1&b=2", null, "sid=abc") == null,
+            "a request with no token reads as no token, not as an empty one");
+        Hex.True(ApiGatewayServer.TokenFrom("?token=" + tok, "Bearer " + tok + "X", null) == tok + "X",
+            "Authorization wins over the query - the probe reports what the client actually sent");
+
+        Hex.True(ApiGatewayServer.DescribeToken(null).StartsWith("no token")
+                 && ApiGatewayServer.DescribeToken("not.a").StartsWith("malformed token"),
+            "the log line says which of the three cases it is");
+        Hex.True(ApiGatewayServer.DescribeToken(tok).Contains("planetId")
+                 && !ApiGatewayServer.DescribeToken(tok).Contains(tok.Split('.')[2]),
+            "it prints the claims and never the signature");
     }
 
     // ---- The rules ----
