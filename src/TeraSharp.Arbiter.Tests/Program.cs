@@ -24732,25 +24732,26 @@ string message
     [Test] public static void T119_the_pve_list_is_the_writers_thirty_one_byte_element()
     {
         Hex.Eq(RankingBoards.BuildPveRankingList(T119Rows(1)), T119PveOne,
-            "one row: name at +0x27, rank at +15, the i64 score at +19, class at +27");
+            "one row: name at +0x27, rank at +11, stageLevel at +15, clearTime at +19");
         Hex.Eq(RankingBoards.BuildPveRankingList(T119Rows(2)), T119PveTwo,
             "two rows: element 1 starts at 0x2B, which is element 0's name end");
 
         // The offsets the test bytes encode, named so a future edit cannot quietly move one.
         Hex.True(RankingBoards.PveElementFixedSize == 0x1F,
             $"the writer's own `*local_b0 += 0x1f`: {RankingBoards.PveElementFixedSize}");
-        Hex.True(RankingBoards.PveRookieOffset == 6 && RankingBoards.PveBandWidthOffset == 7
-                 && RankingBoards.PveBandBaseOffset == 11 && RankingBoards.PveRankOffset == 15
-                 && RankingBoards.PveScoreOffset == 19 && RankingBoards.PveClassOffset == 27,
-            "the six stores after the three u16 slots");
+        Hex.True(RankingBoards.PveRookieOffset == 6 && RankingBoards.PveChangedRankOffset == 7
+                 && RankingBoards.PveRankOffset == 11 && RankingBoards.PveStageLevelOffset == 15
+                 && RankingBoards.PveClearTimeOffset == 19 && RankingBoards.PveClassOffset == 27,
+            "the six stores after the three u16 slots (T126 re-pointed three of them)");
 
-        // IsRookie(myLevel, base, width) = (myLevel < base + width) && (base <= myLevel).
-        // We send width 0, so the flag is always 0 - "we do not model the rookie band" rather
-        // than a flag that means nothing. A viewer at the entry's own level must not flip it.
-        var atSameLevel = RankingBoards.BuildPveRankingList(T119Rows(1), viewerLevel: 60);
-        Hex.True(atSameLevel[RankingBoards.HeaderSize + RankingBoards.ListHeadSize
-                             + RankingBoards.PveRookieOffset] == 0,
+        // T126: the rookie flag is IsRookie(viewerRank, rank, changedRank), and changedRank is
+        // 0, so the band is empty and the answer is always 0 - including for a viewer sitting
+        // exactly on the entry's own rank, which is the only value that could flip it.
+        var atOwnRank = RankingBoards.BuildPveRankingList(T119Rows(1), viewerRank: 1);
+        Hex.True(atOwnRank[RankingBoards.HeaderSize + RankingBoards.ListHeadSize
+                           + RankingBoards.PveRookieOffset] == 0,
             "a zero-width band is never a rookie band, whoever is looking");
+        Hex.Eq(atOwnRank, T119PveOne, "and it changes no other byte either");
     }
 
     /// <summary>
@@ -24782,6 +24783,16 @@ string message
             var mine = RankingBoards.BuildPvpRankingList(rows);
             Hex.Eq(byDef, mine[4..], $"{n} row(s): our body is the def's body");
         }
+
+        // T126: the def and the writer disagree on the FIRST TWO scalars - the def declares
+        // `int32 unk; byte unk2` (i32@6, u8@10), the writer stores the byte at +6 and the i32
+        // at +7 (Arb_part_050.c:10266). We follow the writer. The cross-check above still
+        // holds because both fields are 0 in every frame we send, so the five bytes 6..10 are
+        // zero either way - it is the SHAPE that differs, not this frame.
+        Hex.True(RankingBoards.PvpRookieOffset == 6 && RankingBoards.PvpChangedRankOffset == 7
+                 && RankingBoards.PvpRankOffset == 11 && RankingBoards.PvpRatingOffset == 15
+                 && RankingBoards.PvpClassOffset == 19,
+            "byte first, then the four i32s the def names rank / rating / class");
     }
 
     /// <summary>Two rows, fixed, so the byte strings above mean something on their own.</summary>
@@ -24795,16 +24806,17 @@ string message
         return all.GetRange(0, n);
     }
 
+    // here / next / nameRef, then rookie, changedRank, rank, stageLevel, clearTime, class.
     const string T119PveOne =
         "2B 00  DC BE  01 00  08 00"
-        + "  08 00  00 00  27 00  00  00 00 00 00  3C 00 00 00  01 00 00 00"
+        + "  08 00  00 00  27 00  00  00 00 00 00  01 00 00 00  3C 00 00 00"
         + "  07 00 00 00 00 00 00 00  03 00 00 00  61 00 00 00";
 
     const string T119PveTwo =
         "50 00  DC BE  02 00  08 00"
-        + "  08 00  2B 00  27 00  00  00 00 00 00  3C 00 00 00  01 00 00 00"
+        + "  08 00  2B 00  27 00  00  00 00 00 00  01 00 00 00  3C 00 00 00"
         + "  07 00 00 00 00 00 00 00  03 00 00 00  61 00 00 00"
-        + "  2B 00  00 00  4A 00  00  00 00 00 00  2C 00 00 00  02 00 00 00"
+        + "  2B 00  00 00  4A 00  00  00 00 00 00  02 00 00 00  2C 00 00 00"
         + "  03 00 00 00 00 00 00 00  07 00 00 00  62 00 62 00 00 00";
 
     const string T119PvpOne =
@@ -24955,6 +24967,101 @@ string message
                  && BitConverter.ToUInt16(frame, 4) == 2
                  && BitConverter.ToUInt16(frame, 0) == frame.Length,
             "0xBEDC, two rows, and a length field that is the frame's own length");
+    }
+
+
+    // ===================== T126: the companion packet, and three re-pointed slots ==========
+
+    /// <summary>
+    /// T126. The three PvE slots T119 could not name, named - and two of them moved.
+    ///
+    /// <para>The element source is a <c>ReturnRankInfo&lt;T&gt;</c> and the two boards share its
+    /// shape: <c>ReturnRankInfo&lt;int&gt;</c> is 0x10 bytes (score at +4, a at +8, b at +0xC) and
+    /// <c>ReturnRankInfo&lt;LevelTime&gt;</c> is 0x20 (level at +8, i64 time at +0x10, a at +0x18,
+    /// b at +0x1C). Both writers copy those the same way: score to +0x0F, a to +0x0B, b to
+    /// +0x07. The PvP def names a and the score - <c>rank</c> at +11, <c>rating</c> at +15 -
+    /// so +11 is the rank and +15 the score on BOTH boards. T119 had them the other way
+    /// round.</para>
+    /// </summary>
+    [Test] public static void T126_the_pve_rank_and_score_slots_were_swapped()
+    {
+        var one = RankingBoards.BuildPveRankingList(T119Rows(1));
+        int e = RankingBoards.HeaderSize + RankingBoards.ListHeadSize;
+
+        // T119Rows(1) is rank 1, level 60, score 7. Read the frame back at the two slots.
+        Hex.True(BitConverter.ToInt32(one, e + 11) == 1,
+            $"+11 is the RANK: {BitConverter.ToInt32(one, e + 11)}");
+        Hex.True(BitConverter.ToInt32(one, e + 15) == 60,
+            $"+15 is the stageLevel: {BitConverter.ToInt32(one, e + 15)}");
+        Hex.True(BitConverter.ToInt64(one, e + 19) == 7L,
+            "+19 is the i64 clearTime, which is where our clear COUNT goes");
+        Hex.True(BitConverter.ToInt32(one, e + 27) == 3, "+27 is still the class");
+        Hex.True(BitConverter.ToInt32(one, e + 7) == 0 && one[e + 6] == 0,
+            "changedRank is 0 and the rookie flag follows from it");
+
+        // The same two slots on the PvP board, where the .def names them outright.
+        var pvp = RankingBoards.BuildPvpRankingList(T119Rows(1));
+        Hex.True(BitConverter.ToInt32(pvp, e + RankingBoards.PvpRankOffset) == 1
+                 && BitConverter.ToInt32(pvp, e + RankingBoards.PvpRatingOffset) == 7,
+            "PvP rank at +11 and rating at +15 - the def's own names, and the pattern the "
+            + "PvE element follows");
+    }
+
+    /// <summary>
+    /// T126. The second frame. <c>PVERankingSystemManager::SendNowSeasonRank</c> sends the
+    /// list and then the requester's own line (Arb_part_050.c:10074; PvP at :10518). T119 sent
+    /// only the list. Both layouts are pinned twice: the writer's argument order and a fully
+    /// named def.
+    /// </summary>
+    [Test] public static void T126_the_user_ranking_companion_is_byte_exact()
+    {
+        // S_USER_PVE_RANKING: byte rookie, i32 changedRank, i32 rank, i32 stageLevel,
+        //                     i64 clearTime.
+        Hex.Eq(RankingBoards.BuildUserPveRanking(rank: 2, stageLevel: 44, clearTime: 3),
+            "19 00  48 E7  00  00 00 00 00  02 00 00 00  2C 00 00 00  03 00 00 00 00 00 00 00",
+            "25 bytes, opcode 0xE748, the five fields in the def's order");
+
+        // S_USER_PVP_RANKING: the same minus the i64.
+        Hex.Eq(RankingBoards.BuildUserPvpRanking(rank: 2, score: 3),
+            "11 00  44 C8  00  00 00 00 00  02 00 00 00  03 00 00 00",
+            "17 bytes, opcode 0xC844");
+
+        Hex.True(RankingBoards.UserPveRankingSize == 25
+                 && RankingBoards.UserPvpRankingSize == 17,
+            "the two sizes the layouts add up to");
+        Hex.True(RankingBoards.S_USER_PVE_RANKING == 0xE748
+                 && RankingBoards.S_USER_PVP_RANKING == 0xC844,
+            "both opcodes are data.json's 376012 map");
+
+        // An unranked requester: rank 0 and nothing else set. This is the same shape the real
+        // server sends when Rank() misses its tree - it does not skip the frame.
+        Hex.Eq(RankingBoards.BuildUserPveRanking(0, 0, 0),
+            "19 00  48 E7  00  00 00 00 00  00 00 00 00  00 00 00 00  00 00 00 00 00 00 00 00",
+            "an unranked player still gets an answer, just an empty one");
+    }
+
+    /// <summary>
+    /// T126. <c>Self</c> - the row the companion frame is built from. It is the FULL board's
+    /// row, not the page's, so a player far down the list still reports their real rank.
+    /// </summary>
+    [Test] public static void T126_self_finds_the_requesters_row_on_the_whole_board()
+    {
+        var all = new List<RankingRow>();
+        for (int i = 1; i <= 5; i++) all.Add(new RankingRow(i, i, "c" + i, 3, 60, 100 - i));
+
+        Hex.True(RankingBoards.Self(all, 4)?.Rank == 4, "row 4 is found with its own rank");
+        Hex.True(RankingBoards.Self(all, 99) == null, "an unranked id has no row");
+        Hex.True(RankingBoards.Self(all, 0) == null && RankingBoards.Self(all, -1) == null,
+            "and no character id means no row rather than the first one");
+        Hex.True(RankingBoards.Self(new List<RankingRow>(), 1) == null,
+            "an empty board has nobody on it");
+
+        // The rookie formula, on its own: a zero width is an empty band at every rank.
+        Hex.True(RankingBoards.IsRookie(5, 5, 0) == 0 && RankingBoards.IsRookie(0, 0, 0) == 0,
+            "width 0 is always false");
+        Hex.True(RankingBoards.IsRookie(5, 5, 1) == 1 && RankingBoards.IsRookie(6, 5, 1) == 0
+                 && RankingBoards.IsRookie(4, 5, 1) == 0,
+            "and with a width it is the server's half-open [base, base+width)");
     }
 
 }

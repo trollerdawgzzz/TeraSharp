@@ -4844,7 +4844,6 @@ public static class LeaderboardPackets
         // T119: answered from our own data. The request carries no page - there is nowhere in
         // its three fields to put one - so this is always page 0 plus the requester's own row.
         int me = (int)(s.SelectedCharacter?.Id ?? 0);
-        int myLevel = s.SelectedCharacter?.Level ?? 0;
         var store = Program.Store;
 
         // Only the season we advertised in S_P*_LEADER_BOARD_INFO has rows. The real handler
@@ -4854,12 +4853,30 @@ public static class LeaderboardPackets
         var scores = season == RankingBoards.CurrentSeason && store != null
             ? (pve ? store.GetPveRankingScores() : store.GetPvpRankingScores())
             : new List<CharacterStore.RankingScore>();
-        var page = RankingBoards.Page(RankingBoards.Rank(scores, cls), 0, me);
+        var all = RankingBoards.Rank(scores, cls);
+        var page = RankingBoards.Page(all, 0, me);
+        var self = RankingBoards.Self(all, me);
+        int myRank = self?.Rank ?? 0;
 
-        log.LogInformation("{Reply}: season={S} id={I} class={C} - {N} row(s) for player {Me}",
-            reply, season, id, cls, page.Count, me);
-        s.Send(pve ? RankingBoards.BuildPveRankingList(page, myLevel)
-                   : RankingBoards.BuildPvpRankingList(page));
+        log.LogInformation("{Reply}: season={S} id={I} class={C} - {N} row(s), player {Me} "
+            + "rank {Rank}", reply, season, id, cls, page.Count, me, myRank);
+
+        // T126: the real handler sends TWO frames - the list, then the requester's own line
+        // (PVERankingSystemManager::SendNowSeasonRank, Arb_part_050.c:10074 / :10518). Sending
+        // only the first leaves the "my record" row under the board with nothing to fill it.
+        if (pve)
+        {
+            s.Send(RankingBoards.BuildPveRankingList(page, myRank));
+            s.Send(RankingBoards.BuildUserPveRanking(myRank, self?.Level ?? 0,
+                                                     self?.Score ?? 0, viewerRank: myRank));
+        }
+        else
+        {
+            s.Send(RankingBoards.BuildPvpRankingList(page, myRank));
+            s.Send(RankingBoards.BuildUserPvpRanking(
+                myRank, (int)Math.Clamp(self?.Score ?? 0, int.MinValue, int.MaxValue),
+                viewerRank: myRank));
+        }
         return true;
     }
 

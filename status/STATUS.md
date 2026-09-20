@@ -963,3 +963,43 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   `T119_ranks_are_dense_stable_and_class_filtered`,
   `T119_the_page_always_carries_the_requesters_own_row`,
   `T119_the_two_boards_come_from_real_stored_progress`.
+
+- T126: **the leaderboard class dropdown is not ours to fill - but three PvE fields were in
+  the wrong slots** (`status/LEADERBOARD.md` section 7).
+
+  **The reported bug is a no-op.** Nothing on the wire carries a class name or filter list:
+  not the 376012 map (29 RANK/LEADER opcodes, none of them a list), not the 4550-def set, not
+  either `S_PVE_RANKING_LIST` writer (the header is `[u16 count][u16 firstElementOffset]` and
+  nothing else), and no S->C packet in `cap_final_gm_client2`. `S_P*_LEADER_BOARD_INFO` is a
+  selector feed, but for the **board** - PvE dungeon ids 3126/3203/9126, PvP battleground ids
+  10/30/37, which the client echoes straight back as `id` (capture frame 1989 sends
+  `0x0C83` = 3203). TeraSharp already sends both byte-identical to the capture. The class
+  dropdown is client-side.
+
+  **What the research did find.** The element source is a `ReturnRankInfo<T>` and the two
+  boards share its shape - `<int>` is 0x10 B (score +4, a +8, b +0xC), `<LevelTime>` is 0x20 B
+  (level +8, i64 time +0x10, a +0x18, b +0x1C) - and both writers copy them the same way:
+  score to +0x0F, a to +0x0B, b to +0x07 (Arb_part_050.c:9812-9821, :10266-10270). The PvP
+  def names two of those: `rank` at +11, `rating` at +15. **So T119 had the PvE rank and score
+  swapped**: +11 is the rank, +15 the stageLevel, +19 the i64 clearTime, +7 changedRank. The
+  names come from `S_USER_PVE_RANKING`'s def, written from the same `Score()` call. Our clear
+  COUNT now goes in `clearTime`, which is the one field whose units the client reads
+  differently from how we mean them - said in the code rather than hidden.
+
+  **The PvP def is misordered.** It declares `int32 unk; byte unk2` (i32@6, u8@10); the writer
+  stores the byte at +6 and the i32 at +7. The decompile wins. Both are 0 in every frame we
+  send, so no byte changes and the def cross-check still passes - only the shape is corrected.
+
+  **The missing second frame.** `SendNowSeasonRank` sends the list AND the requester's own
+  line; T119 sent only the list. Added `S_USER_PVE_RANKING` (0xE748, 25 B: `byte rookie, i32
+  changedRank, i32 rank, i32 stageLevel, i64 clearTime`) and `S_USER_PVP_RANKING` (0xC844,
+  17 B, the same minus the i64), each pinned to both its def and the writer's argument order
+  (:10074 / :10518). An unranked requester gets rank 0 and zeroes rather than no frame, which
+  is what the server does when `Rank()` misses its tree.
+
+  Registry unchanged; the two handlers now send two frames each.
+
+  Tests: `T126_the_pve_rank_and_score_slots_were_swapped`,
+  `T126_the_user_ranking_companion_is_byte_exact`,
+  `T126_self_finds_the_requesters_row_on_the_whole_board`, plus the two T119 byte-exact tests
+  updated to the corrected element and the PvP one extended with the def/writer disagreement.
