@@ -691,3 +691,195 @@ re-capturing, check `Executable\DeploymentConfig.xml`'s `DungeonServerConfig` /
 owns. If every instance really does run on the main World here, then the same-link sequence above
 IS the hand-off, and TeraSharp's single-World design already matches it - in which case
 MULTIWORLD-PATCH.diff is solving a problem this deployment does not have.
+
+## T137b - a real cross-World hand-off exists. Half of it was captured.
+
+`D:\packetlogs\cap_multiworld2_ctl.txt` (216 frames) + `cap_multiworld2_client.log` (1389
+records). The player entered **Velik's Sanctuary, dungeon `35 26 00 00` = 9781**, hosted on the
+DungeonServer. This **supersedes T137's conclusion**: T137 saw dungeon 9827 served by the main
+World and concluded no cross-server hand-off happens on this box. It does - for the dungeons the
+DungeonServer actually owns.
+
+### The DungeonServer is link #3, and it says so
+
+| time | dir | op | what |
+|---|---|---|---|
+| 16:44:44.319 | W->A#3 | `0x27CF` | DungeonServer links up; Arbiter answers with the full static burst ON #3 |
+| 16:44:44.351 | W->A#3 | `0x294E` | body `00 00 00 00 00 00 00 00 \| 0D 00 00 00` - **13**, i.e. `--id=13`. This is how a World announces its server id. |
+| 16:44:45.314 | W->A#3 | `0x164D` (566 B) | `22 00 00 00 16 00 00 00 F0 0A 00 00 **0D 00 00 00** 16 00 00 00 26 00 00 00 D6 0B ...` |
+| 16:44:45.707 | **A->W#3** | `0x13BF` (215 B) | `F0 0A 00 00 01 00 00 00 **35 26 00 00** 01 00 00 00 ...` - the Arbiter **PUSHES** to the DungeonServer |
+| 16:44:45.707 | W->A#3 | `0x13C5` (38 B) | `35 26 00 00 \| 0C 00 \| F0 0A ...` - dungeon 9781, channel **12**, planet 2800 |
+| 16:44:45.708 | W->A#3 | `0x13C0` (214 B) | same prefix as `0x13BF` |
+| 16:44:47.314 | W->A#3 | `0x164D` (38 B) | `01 00 00 00 16 00 00 00 F0 0A 00 00 0D 00 00 00 16 00 00 00 00 00 00 00 35 26 00 00` |
+| 16:44:49.971 | A->W#3 | `0x138E` (189 B) | the Arbiter hands the player's data over |
+| 16:44:49.976 | W->A#3 | `0x2711` | **SDB_USER_ENTERWORLD**: `16 00 00 00 \| 01 00 00 00 \| 01 00 00 00 \| 0C 00 F0 0A 00 00` - userDbId 22, channel 12, planet 2800 |
+| 16:44:49.977+ | A->W#3 | `0x2738`, `0x2830`, `0x27A4`, `0x272D`, `0x27F9`, ... | the **entire** per-player DB load burst, repeated on #3 |
+
+**Correction to T137's reading of `0x13BF`.** On the main-World link it was the Arbiter's REPLY to a
+`W->A 0x13BE` request. Here there is no `0x13BE` on #3 at all - the Arbiter sends `0x13BF`
+unprompted. So `0x13BF` is not "the reply to 13BE"; it is the hand-off push, and on the same-link
+path it merely happens to follow a request.
+
+### What the client saw: ONE socket, one S_LOAD_TOPO, no reconnect
+
+```
+[   2] C->S C_LOGIN_ARBITER      <- the only login in the whole capture
+[  52] S->C S_SELECT_USER
+[ 140] S->C S_LOAD_TOPO          zone 5D 1B 00 00 = 7005 (the overworld)
+[1192] S->C S_LOAD_TOPO          zone 35 26 00 00 = 9781   <- into the dungeon
+[1210] C->S C_LOAD_TOPO_FIN
+[1215] S->C S_CURRENT_CHANNEL    35 26 00 00 | 0D 00 F0 0A | 00 00 00 00 | 01 00 00 00
+```
+
+**No second `C_LOGIN_ARBITER`, no `S_SELECT_USER` in the middle, no reconnect.** The client never
+learns there are two World processes. Crossing to another World is, from the client's side,
+byte-identical to T137's same-World zone change: one `S_LOAD_TOPO` plus one `S_CURRENT_CHANNEL`.
+
+### A number that does not match, and matters
+
+`S_CURRENT_CHANNEL` tells the client channel **13** (`0D 00 F0 0A`). The Arbiter<->World frames
+carry **12** (`0C 00` in both `0x13C5` and `0x2711`). 13 is also the DungeonServer's `--id`
+(`0x294E`). The most likely reading is that the client's field is the **server id**, while the
+`0x13C5`/`0x2711` number is an internal channel index - but that is one sample and the two values
+are adjacent, so it could equally be an off-by-one in one direction. **Do not hard-code either
+until a second dungeon on a differently-numbered server settles it.**
+
+### Parts 2 and 3 still cannot be done - link #1 is not in this capture
+
+`cap_multiworld2_ctl.txt` contains **exactly one frame on link #1**: `W->A#1 0x27CF` at
+16:41:58.879. Nothing else, for the entire 3.5 minutes including the dungeon entry. The Arbiter
+never even answers that `0x27CF` on #1, while the identical request on #3 gets the full burst
+0.002 s later - so the tap lost the #1 stream after its first packet.
+
+That means the capture does not contain:
+
+* the entry request on #1 (whatever the main World sent to start the hand-off),
+* which link `AS_ENTER_WORLD` went to on the sending side,
+* the leave on #1,
+* any Arbiter reply on #1.
+
+So `status/MULTIWORLD-PATCH.diff`'s predictions about **WorldForContinent routing, ticket
+handling, which link gets AS_ENTER_WORLD, and the leave on #1** have nothing to be checked
+against. The patch is left unchanged for the second time, and `WorldBridge` / `WorldEntry` /
+`GameSession` / `HandlerRegistry` are untouched. `MatchWiring.OnMatchAdd` still refuses and still
+never emits FIN.
+
+### To finish this, the tap needs both streams
+
+Re-capture with the tap attached BEFORE the main World connects, and confirm both links carry
+traffic before entering the dungeon - `0x294E` on each link names its server id, so a quick check
+is: both links should show a `0x294E`, one with `00 00 00 00` (main) and one with `0D 00 00 00`.
+Then enter Velik's Sanctuary again. Everything else in this capture is reusable; only the #1 half
+is missing.
+
+## T137c - THE HAND-OFF, both links, complete
+
+`D:\packetlogs\cap_multiworld3.log` (47436 raw chunks -> **19046 frames** after splitting the
+coalesced `[u32 len][u16 op]` stream) + `cap_multiworld3_client.log` (7928 records). The player
+entered **Velik's Sanctuary (9781)** three times and came back each time.
+
+Note: `cap_multiworld3_ctl.txt` was never generated - only the raw `.log` exists. Everything below
+is parsed from the raw stream directly; the chunks are coalesced, so a naive one-frame-per-chunk
+read gets ~5000 of the 19046 frames and misses most of the hand-off.
+
+### Which link is which
+
+`0x294E` is how a World announces itself, and its shape differs by role:
+
+| link | `0x294E` body | role |
+|---|---|---|
+| #1, #7, #11 | `01 00 00 00 12 00 00 00 00 00 00 00 12 00 00 00 00 00 00 00 01 00 00 00` (24 B) | **main World, id 0** |
+| #4 | `00 00 00 00 00 00 00 00 \| 0C 00 00 00` (12 B) | a DungeonServer, **id 12** |
+| #9, #14, #16 | `00 00 00 00 00 00 00 00 \| 0D 00 00 00` (12 B) | the DungeonServer, **id 13** |
+
+The main World reconnected as #1 -> #7 -> #11; the DungeonServer as #9 -> #14 -> #16. The live pair
+for the first full cycle is **#11 (main) and #14 (dungeon)**.
+
+### The complete cycle, 17:35:38 - 17:36:06
+
+```
+17:35:38.020  W->A#11  0x13BE  215  20 00 92 CA 6A 02 00 00 | 35 26 00 00 | 01 00 00 00 ...
+17:35:38.020  A->W#14  0x13BF  215  F0 0A 00 00 01 00 00 00 | 35 26 00 00 | 01 00 00 00 ...
+17:35:38.021  W->A#14  0x13C5   38  35 26 00 00 | 0D 00 | F0 0A | ...
+17:35:38.021  W->A#14  0x13C0  214  F0 0A 00 00 01 00 00 00 | 35 26 00 00 | ...
+17:35:38.022  A->W#11  0x13C1  214  F0 0A 00 00 01 00 00 00 | 35 26 00 00 | ...
+17:35:39.600  W->A#14  0x164D   38  01 00 00 00 16 00 00 00 F0 0A 00 00 0D 00 00 00 ...
+17:35:42.296  A->W#14  0x138E  189
+17:35:42.301  W->A#14  0x2711   24  16 00 00 00 01 00 00 00 01 00 00 00 | 0D 00 F0 0A 00 00
+   ... the player is in the dungeon, on link #14 ...
+17:36:06.142  W->A#14  0x13C6   14  35 26 00 00 0D 00 F0 0A            <- channel released
+17:36:06.186  A->W#11  0x138E  189
+17:36:06.187  W->A#11  0x2711   24  16 00 00 00 4A 00 00 00 01 00 00 00 | 00 00 00 00 00 00
+```
+
+**This is the routing, and it is the thing three captures were trying to show:**
+
+1. The **main World asks** (`0x13BE` on #11). Its first 8 bytes `20 00 92 CA 6A 02 00 00` are the
+   session handle/ticket; then the destination dungeon `35 26 00 00` = 9781.
+2. **The Arbiter answers on a DIFFERENT link.** `0x13BF` goes to **#14**, the DungeonServer that
+   owns 9781 - not back to #11. That one routing decision *is* WorldForContinent.
+3. The receiving World registers a channel (`0x13C5`, channel `0D 00` = 13) and sends `0x13C0`.
+4. **The Arbiter's `0x13C1` goes back to #11**, the link that asked. So a hand-off is two
+   request/reply pairs that cross: `13BE`(#11) -> `13BF`(#14), and `13C0`(#14) -> `13C1`(#11).
+5. `AS_ENTER_WORLD` / `SDB_USER_ENTERWORLD` (`0x2711`) fires **on the destination link**, carrying
+   `0D 00 F0 0A` - the channel and planet. The whole per-player DB burst repeats there.
+6. The leave is the mirror: `0x13C6` on the dungeon link releases the channel, then `0x138E` +
+   `0x2711` with channel `00 00 00 00` **on #11** puts the player back on the main World.
+
+The `0x13BF` body is the `0x13BE` body with its first 8 bytes replaced by `F0 0A 00 00 01 00 00 00`
+(planet 2800, world 1) - the rest, from `35 26 00 00` onwards including the spawn coordinates
+`00 AC 2B 47 / 40 90 03 C8 / 00 1C E3 46`, is copied through unchanged. `0x13C0` and `0x13C1` are
+the same 214 bytes in both directions.
+
+### The channel question - RESOLVED, and T137b's guess was wrong
+
+Three entries in this capture, plus cap_multiworld2:
+
+| entry | `0x13C5` / `0x2711` channel | client `S_CURRENT_CHANNEL` |
+|---|---|---|
+| mw2 16:44 | 12 | 13 |
+| mw3 17:35:38 | 13 | 14 |
+| mw3 17:36:34 | 14 | 15 |
+| mw3 17:50:50 | 15 | 16 |
+
+**The client's number is always the internal channel + 1.** It is a 1-based vs 0-based off-by-one,
+NOT the server id - T137b guessed "server id" off a single sample where 13 happened to be both.
+The counter also increments per entry and is never reused within a session.
+
+`S_CURRENT_CHANNEL` = `i32 zone / u16 channel / u16 planetId / i32 / i32`. Overworld frames are
+`zone 7005, channel 1, planet 0`; dungeon frames `zone 9781, channel 14/15/16, planet 2800`.
+
+### The client, again: one socket, no reconnect
+
+`C_LOGIN_ARBITER` appears once, at record 2. Across three dungeon entries and three returns there
+is no second login, no `S_SELECT_USER`, no reconnect - each move is one `S_LOAD_TOPO` plus one
+`S_CURRENT_CHANNEL`. **The client cannot tell a cross-World move from a same-World zone change.**
+Whatever TeraSharp does here, it must not disturb the client connection.
+
+### Part 2: the patch is not wrong - it is incomplete
+
+`status/MULTIWORLD-PATCH.diff` is unchanged, and this time for a different reason than T137/T137b.
+Grepped for `13BE`, `13BF`, `13C0`, `13C1`, `13C5`, `13C6`, `0x2711`, `WorldForContinent`: **none
+appear in it**. The patch is entirely about ticket-space partitioning - `PerWorld<TicketAllocator>`,
+`_tunnels` keyed `(World, Ticket)`, `GameSession.CurrentWorldId`, `DeliverTunnelPacket(worldId,
+...)`. Nothing the capture shows contradicts any of that; per-World ticket spaces are exactly what
+step 5 above requires once two links carry tunnelled frames for the same player.
+
+So there is nothing to correct. What the patch does NOT contain is the hand-off protocol itself -
+the six-step exchange above. That is a separate, now fully specified piece of work.
+
+### Part 3: what it needs, now that the sequence is pinned
+
+Not done in this task. The remaining work, in order:
+
+1. `WorldBridge`: a `WorldForContinent(int dungeonId)` map built from each link's `0x294E` id plus
+   the `0x164D` roster each World sends (the DungeonServer's 566-byte `0x164D` lists the ids it
+   owns; the main World's is 2790 bytes).
+2. `WorldBridge`: route `0x13BE` from link A to `0x13BF` on link B, and `0x13C0` from B back to
+   `0x13C1` on A. Two cross-link pairs, both byte-copies apart from the 8-byte prefix.
+3. `WorldEntry`: emit `AS_ENTER_WORLD` on the DESTINATION link with the channel from that link's
+   `0x13C5`, and the mirror on leave.
+4. `GameSession.CurrentWorldId` + the `(World, Ticket)` tunnel key - **that is what the existing
+   patch already does**, so apply it as-is first.
+5. Only then wire `MatchWiring.OnMatchAdd` to emit FIN, because only then does FIN lead anywhere.
+   The T136b guard stays until step 4 is in.
