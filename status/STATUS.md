@@ -1085,3 +1085,62 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   Two divergences from what TeraSharp sends, both worth a later task: the live season is
   **15**, not 1, and `S_PVE_LEADER_BOARD_INFO` carries **8** dungeon ids where T91's captured
   frame carried 3.
+
+- T133: **the leaderboard, checked against a server that answers** (`status/LEADERBOARD.md`
+  section 8). T130's `classic_live` is the first populated leaderboard this project has - the
+  real Arbiter on 100.02 never answered `C_REQUEST_P*_RANKING`, so T118-T126 were built from
+  the decompile alone. Five frames now live in `data/classic-live/` and the tests round-trip
+  them.
+
+  **The two pushes were wrong in three ways.** Season 1 where the live server says **15**;
+  three PvP ids where it lists **four** (10, 26, 30, 37); three PvE ids where it lists
+  **eight** (9043, 9056, 9068, 9156, 9168, 9507, 9756, 9768); and one shared time window where
+  each board has its own, both 28 days. Both matter for more than tidiness: the client echoes
+  an id straight back as the request's `id`, so a board we do not list cannot be asked for,
+  and we refuse any season but the one we advertise, so advertising 1 was a silently empty
+  board. `BuildPve/PvpLeaderBoardInfo` now emit frames 5609 / 5608 byte for byte.
+  `RankingBoards.CurrentSeason` is one property behind `TERASHARP_RANKING_SEASON` (default
+  15) driving both the pushes and the handler; T91's 2022 frames are still asserted through
+  the explicit `BuildLeaderBoardInfo` overload.
+
+  **T126's element layouts are confirmed on 316 live rows**, and T119's refuted. Frames 5809
+  (20 rows), 5856 (105, aggregate class 16) and 5818 (100) each decode at T126's offsets and
+  re-encode to the same bytes. Row 1 of 5809 is `rank 1, stageLevel 3, clearTime 173140` - a
+  real 2m53s clear - where T119 would have read the rank as 3.
+
+  **The PvP `.def` is definitively wrong about its first two scalars.** T126 preferred the
+  writer (`u8`@6, `i32`@7) over the def (`i32`@6, `u8`@10) and could not prove it, because we
+  send both as 0. The live rows decide: +6 is 0 on 315 of 316 rows and 1 on exactly one, and
+  the i32 at +7 runs -17..+12 - a rank delta. The def's reading gives 768, 256, -256.
+
+  **The self-rank frame is conditional, and T126 sent it always.** `SendNowSeasonRank` guards
+  it with `param_5 == user.class || param_5 == 0x10` (Arb_part_050.c:9961); all nine live
+  requests agree, including frame 5846, which asked for class 0 from a class-9 player and got
+  the list alone. `RankingBoards.SendsSelfRank` is the rule.
+
+  **Nothing else to send**: every request is answered by `S_P*_RANKING_LIST` then
+  `S_USER_P*_RANKING` and nothing more; the S->C frames around them are ordinary World
+  traffic. Registry unchanged.
+
+  **Left open**: the live server sends the whole board in one frame (100 and 105 rows) and
+  `PageSize` is 50, with no page field in the request to ask for the rest. Raising it moves
+  T119's paging tests, so it is its own task - a test asserts the divergence.
+
+  Tests: `T133_the_leader_board_pushes_match_the_live_frames`,
+  `T133_the_season_is_configurable_and_used_on_both_sides`,
+  `T133_the_live_pve_ranking_list_round_trips`,
+  `T133_the_live_pvp_ranking_list_round_trips`,
+  `T133_the_aggregate_class_sixteen_reply_round_trips`,
+  `T133_the_self_rank_frame_only_follows_your_own_board`, plus T91's two assertions moved onto
+  the explicit overload.
+
+  T133 addendum - `tools\npcap-to-capture.ps1` is **PowerShell 5.1 compatible**. Two things
+  in the T130 cut were pwsh-7-only in practice: `Measure-Object -Property { $_.Data.Length }`
+  (calculated properties on Measure-Object arrived in PS 6), now a `ForEach-Object`
+  projection with an `[int64]` cast so the empty case is 0 rather than `$null`; and
+  `$chosen = if (...) { $wire } else { $split }`, where the pipeline unrolls the
+  `List[object]` and an EMPTY one lands as `$null`, so `$chosen.Count` threw under
+  `Set-StrictMode`. That second one was found by running the tool against a 16-byte
+  header-only .npcap and never showed on a real capture. Re-run on `classic_live.npcap`:
+  byte-identical to the committed `classic_live.log`, and `reframe-client.ps1` still reports
+  6 467 packets with no rejects.

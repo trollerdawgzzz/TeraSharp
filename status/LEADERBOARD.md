@@ -1,4 +1,4 @@
-# Leaderboard (T118 step 1, T119 step 2, T126 corrections)
+# Leaderboard (T118 step 1, T119 step 2, T126 corrections, T133 vs the live server)
 
 ## 1. The brief's premise, corrected
 
@@ -266,3 +266,81 @@ Written at Arb_part_050.c:10074 and :10518, as
 `SendToSession<PKT_S_USER_PVE_RANKING_WRITE, bool, int&, int&, int&, __int64&>` and the PvP
 four-argument form. An unranked requester gets rank 0 and zeroes rather than no frame, which
 is what the server does when `Rank()` misses its tree.
+
+## 8. Against the live Classic+ server (T133)
+
+`D:\packetlogs\classic_live_ctl.txt` (T130) is the first capture of a leaderboard that
+**answers**. The real Arbiter on 100.02 never did, so everything in sections 6 and 7 came from
+the decompile alone. Five frames are kept in `data/classic-live/` and the tests round-trip
+them.
+
+### 8.1 The two pushes now carry the live sets
+
+| | T91 / T119 sent | classic_live sends |
+|---|---|---|
+| season | 1 | **15** |
+| PvP ids | 10, 30, 37 | **10, 26, 30, 37** (frame 5608, 60 B) |
+| PvE ids | 3126, 3203, 9126 | **9043, 9056, 9068, 9156, 9168, 9507, 9756, 9768** (frame 5609, 92 B) |
+| window | one shared pair | **one per board**, both exactly 28 days |
+
+The ids are not decoration: the client echoes one back as `C_REQUEST_P*_RANKING`'s `id`
+(frame 5807 asks for 9768, which is 5609's last entry), so a board we do not list is a board
+the player cannot ask for. The season matters the same way - we advertise it and then refuse
+any other, so advertising 1 while the client asks for 15 is a silently empty board.
+
+`RankingBoards.CurrentSeason` is now one property, read from `TERASHARP_RANKING_SEASON` and
+defaulting to 15, used by both the pushes and the handler. T91's 2022 frames are still
+asserted byte for byte through the explicit `BuildLeaderBoardInfo` overload.
+
+### 8.2 The element layouts, confirmed on 316 real rows
+
+| Frame | Rows | What it settles |
+|---|---|---|
+| 5809, 932 B | 20 | the 31-byte PvE element, class-9 filter |
+| 5856, 4847 B | 105 | the aggregate (class 16) reply |
+| 5818, 3938 B | 100 | the 23-byte PvP element |
+
+Every row decodes at T126's offsets and re-encodes to the same bytes. Row 1 of 5809 is
+`rank 1, stageLevel 3, clearTime 173140` - two minutes fifty-three, a real dungeon clear -
+which is the layout T126 re-pointed to and **not** the `rank@15 / score@19` T119 shipped.
+5809's rows ascend by clearTime (low is good) and 5818's descend by rating; both are what the
+field names say they are.
+
+**The `.def`'s first two PvP scalars are definitively wrong.** T126 chose the writer's order
+(`u8` at +6, `i32` at +7) over the def's (`i32` at +6, `u8` at +10) and could not prove it,
+because every frame we send has both as 0. The live rows decide it: across all nine ranking
+frames, +6 is 0 on 315 rows and 1 on exactly one, and the i32 at +7 runs -17..+12 around 0 -
+a rank delta. Read the def's way the same bytes are 768, 256, -256 with a trailing 0 or 255.
+
+**A dungeon record belongs to a party.** In 5856 five rows share rank 1 and the same
+clearTime and differ only in class and name. Dense ranking - equal scores, equal rank - is
+already what `RankingBoards.Rank` does.
+
+### 8.3 The self-rank frame is conditional
+
+`SendNowSeasonRank` guards the second frame with
+`param_5 == *(int *)(local_80 + 0x2f) || param_5 == 0x10` (Arb_part_050.c:9961): the class
+asked for is the requester's own, or the aggregate. T126 sent it unconditionally. All nine
+requests in classic_live come from a class-9 player and agree:
+
+| Frame | class asked | `S_USER_P*_RANKING`? |
+|---|---|---|
+| 5807, 5817, 5830, 5835, 5867, 5871, 5876 | 9 | yes |
+| 5855 | 16 | yes |
+| **5846** | **0** | **no - the list alone** |
+
+`RankingBoards.SendsSelfRank(classFilter, viewerClass)` is that rule.
+
+### 8.4 Nothing else in the exchange
+
+Every `C_REQUEST_P*_RANKING` in classic_live is answered by exactly
+`S_P*_RANKING_LIST` and then `S_USER_P*_RANKING`, in that order, and nothing else - the other
+S→C frames interleaved around them are ordinary World traffic (`S_NPC_LOCATION`, `S_SOCIAL`,
+`S_UPDATE_GUILD_QUEST_STATUS`). All six leaderboard opcodes are ones we now send.
+
+### 8.5 Open: the live server does not paginate
+
+5818 carries 100 rows and 5856 carries 105, in one frame. `RankingBoards.PageSize` is 50 and
+the request has no page field to ask for the rest, so a 51st row is currently a row nobody can
+see. Raising it moves T119's paging tests, so it is left as its own task; a test asserts the
+divergence rather than letting it be forgotten.

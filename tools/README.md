@@ -343,6 +343,12 @@ them is the one thing that would make the capture lie to you.
 .\reframe-client.ps1 -Log D:\packetlogs\classic_live.log
 ```
 
+Runs on **Windows PowerShell 5.1** as well as pwsh 7. Two things in the first cut did not:
+`Measure-Object -Property { … }` (a calculated property, PS 6+ only) and a `List[object]`
+assigned out of an `if` expression, which the pipeline unrolls — an empty one lands as `$null`
+and `.Count` then throws under `Set-StrictMode`. Both are fixed and commented in place; the
+second only ever showed on a capture with no records.
+
 Opcode names come from `data.json` (`-Protocol`, default 376012), never from the file — an
 `.npcap` stores no names. An opcode the map does not know is written `UNKNOWN_0xNNNN` so the
 record still parses and `reframe-client.ps1` can rename it. On `classic_live.npcap` every one

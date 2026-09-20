@@ -21865,13 +21865,24 @@ string message
     /// </summary>
     [Test] public static void T91_the_two_leaderboard_pushes_are_byte_exact()
     {
-        Hex.Eq(ArbiterClientHandlers.BuildPvpLeaderBoardInfo(),
+        // T133 moved BuildP*LeaderBoardInfo onto the LIVE id sets and season, so the 2022
+        // capture is now asserted through the explicit overload. It is still the frame that
+        // proved this layout, so it is still checked byte for byte.
+        Hex.Eq(ArbiterClientHandlers.BuildLeaderBoardInfo(
+                ArbiterClientHandlers.S_PVP_LEADER_BOARD_INFO,
+                ArbiterClientHandlers.LeaderBoardCapturedPvp, season: 1,
+                start: ArbiterClientHandlers.LeaderBoardCapturedStart,
+                end: ArbiterClientHandlers.LeaderBoardCapturedEnd),
             "34 00 24 B7 03 00 1C 00 01 00 00 00 8E BA F4 62 "
             + "00 00 00 00 8E A4 19 63 00 00 00 00 1C 00 24 00 "
             + "0A 00 00 00 24 00 2C 00 1E 00 00 00 2C 00 00 00 "
             + "25 00 00 00",
             "cap_final_client frame 288");
-        Hex.Eq(ArbiterClientHandlers.BuildPveLeaderBoardInfo(),
+        Hex.Eq(ArbiterClientHandlers.BuildLeaderBoardInfo(
+                ArbiterClientHandlers.S_PVE_LEADER_BOARD_INFO,
+                ArbiterClientHandlers.LeaderBoardCapturedPve, season: 1,
+                start: ArbiterClientHandlers.LeaderBoardCapturedStart,
+                end: ArbiterClientHandlers.LeaderBoardCapturedEnd),
             "34 00 9F 81 03 00 1C 00 01 00 00 00 8E BA F4 62 "
             + "00 00 00 00 8E A4 19 63 00 00 00 00 1C 00 24 00 "
             + "36 0C 00 00 24 00 2C 00 83 0C 00 00 2C 00 00 00 "
@@ -24951,8 +24962,14 @@ string message
         Hex.True(RankingBoards.S_PVE_RANKING_LIST == LeaderboardPackets.S_PVE_RANKING_LIST
                  && RankingBoards.S_PVP_RANKING_LIST == 0x62FA,
             "both opcodes are data.json's 376012 map");
-        Hex.True(RankingBoards.CurrentSeason == 1,
-            "and the season is the one S_P*_LEADER_BOARD_INFO advertises (T91)");
+        // T133: the season moved from a hard-coded 1 to the live 15, behind
+        // TERASHARP_RANKING_SEASON. What has to stay true is not the NUMBER but that one
+        // number drives both sides - the push and the handler's own comparison.
+        RankingBoards.ResetSeason();
+        Hex.True(RankingBoards.CurrentSeason == RankingBoards.DefaultSeason
+                 && BitConverter.ToInt32(ArbiterClientHandlers.BuildPveLeaderBoardInfo(), 8)
+                    == RankingBoards.CurrentSeason,
+            "the season S_P*_LEADER_BOARD_INFO advertises is the season the handler answers");
     }
 
     /// <summary>
@@ -25280,6 +25297,330 @@ string message
         // Case does not matter: the dispatcher lower-cases and both sets are ordinal-ignore-case.
         Hex.True(GmCommandHandlers.Classify(true, 1, GmCommandParser.Parse("VIS"))
                  == GmDispatch.Local, "/@VIS is /@vis");
+    }
+
+
+    // ============ T133: the leaderboard against classic_live, the live Classic+ reference ====
+
+    /// <summary>
+    /// Load one of the frames in <c>data/classic-live/</c>. Null when the folder is not beside
+    /// the binary, which is the normal case for a deployed build - the test then skips rather
+    /// than failing, the same shape as LoadDefinitionsOrSkip.
+    /// </summary>
+    static byte[]? LoadLiveFrame(string name)
+    {
+        var path = FindRepoFile(Path.Combine("data", "classic-live", name));
+        if (path == null) { Console.WriteLine($"        (skipped: data/classic-live/{name} not found)"); return null; }
+        var sb = new Text.StringBuilder();
+        foreach (var line in File.ReadAllLines(path))
+        {
+            var t = line.Trim();
+            if (t.Length == 0 || t[0] == '#') continue;
+            sb.Append(t).Append(' ');
+        }
+        return Hex.B(sb.ToString());
+    }
+
+    /// <summary>One row, as both boards' elements carry it. Score is the i64 on PvE.</summary>
+    readonly record struct LiveRow(int Rank, int Second, long Score, int Class, string Name,
+                                   byte Rookie, int ChangedRank);
+
+    /// <summary>
+    /// Take a live ranking frame apart at T126's offsets. Every assertion here is structural -
+    /// `here` has to be where we are, `next` has to be where the next element starts, and the
+    /// walk has to end exactly at the frame's end - so a wrong offset cannot decode cleanly.
+    /// </summary>
+    static List<LiveRow> DecodeLiveRanking(byte[] f, bool pve)
+    {
+        int fixedSize = pve ? RankingBoards.PveElementFixedSize : RankingBoards.PvpElementFixedSize;
+        int count = BitConverter.ToUInt16(f, 4);
+        int at = BitConverter.ToUInt16(f, 6);
+        var rows = new List<LiveRow>(count);
+        for (int i = 0; i < count; i++)
+        {
+            Hex.True(BitConverter.ToUInt16(f, at) == at,
+                $"element {i}: `here` is {BitConverter.ToUInt16(f, at)}, we are at {at}");
+            int next = BitConverter.ToUInt16(f, at + 2);
+            int nameAt = BitConverter.ToUInt16(f, at + 4);
+            Hex.True(nameAt == at + fixedSize,
+                $"element {i}: the name starts {nameAt - at} B in, not {fixedSize}");
+
+            byte rookie = f[at + RankingBoards.PveRookieOffset];
+            int changed = BitConverter.ToInt32(f, at + RankingBoards.PveChangedRankOffset);
+            int rank = BitConverter.ToInt32(f, at + RankingBoards.PveRankOffset);
+            int second; long score; int cls;
+            if (pve)
+            {
+                second = BitConverter.ToInt32(f, at + RankingBoards.PveStageLevelOffset);
+                score = BitConverter.ToInt64(f, at + RankingBoards.PveClearTimeOffset);
+                cls = BitConverter.ToInt32(f, at + RankingBoards.PveClassOffset);
+            }
+            else
+            {
+                second = 0;
+                score = BitConverter.ToInt32(f, at + RankingBoards.PvpRatingOffset);
+                cls = BitConverter.ToInt32(f, at + RankingBoards.PvpClassOffset);
+            }
+
+            int end = nameAt;
+            while (BitConverter.ToUInt16(f, end) != 0) end += 2;
+            string name = System.Text.Encoding.Unicode.GetString(f, nameAt, end - nameAt);
+            at = end + 2;
+
+            Hex.True(next == (i + 1 < count ? at : 0),
+                $"element {i}: `next` is {next}, the next element starts at {at}");
+            rows.Add(new LiveRow(rank, second, score, cls, name, rookie, changed));
+        }
+        Hex.True(at == f.Length, $"the walk ended at {at} of {f.Length}");
+        return rows;
+    }
+
+    /// <summary>Re-encode, with the live rookie/changedRank put back so the bytes can match.</summary>
+    static byte[] EncodeLiveRanking(IReadOnlyList<LiveRow> rows, bool pve)
+    {
+        var built = new List<RankingRow>(rows.Count);
+        foreach (var r in rows)
+            built.Add(new RankingRow(r.Rank, 0, r.Name, r.Class, r.Second, r.Score));
+        var frame = pve ? RankingBoards.BuildPveRankingList(built)
+                        : RankingBoards.BuildPvpRankingList(built);
+        // The two fields we always send as 0 because we keep no previous season: stamp the
+        // live values back in so the comparison is about the LAYOUT, not about history we do
+        // not have. Everything else - offsets, sizes, links, names - is ours.
+        int at = RankingBoards.HeaderSize + RankingBoards.ListHeadSize;
+        int fixedSize = pve ? RankingBoards.PveElementFixedSize : RankingBoards.PvpElementFixedSize;
+        foreach (var r in rows)
+        {
+            frame[at + RankingBoards.PveRookieOffset] = r.Rookie;
+            BitConverter.GetBytes(r.ChangedRank).CopyTo(frame, at + RankingBoards.PveChangedRankOffset);
+            at += fixedSize + (r.Name.Length + 1) * 2;
+        }
+        return frame;
+    }
+
+    /// <summary>
+    /// The two enter-world pushes, in the live Classic+ shape. Frames 5608 and 5609 of
+    /// classic_live: season 15, four battleground ids and eight dungeon ids, each board with
+    /// its own 28-day window. T119 sent season 1 and T91's three 2022 ids, so the client was
+    /// offered boards the live server does not have and told a season the handler would then
+    /// refuse to answer.
+    /// </summary>
+    [Test] public static void T133_the_leader_board_pushes_match_the_live_frames()
+    {
+        RankingBoards.ResetSeason();
+        var pvp = LoadLiveFrame("S_PVP_LEADER_BOARD_INFO-5608.hex");
+        var pve = LoadLiveFrame("S_PVE_LEADER_BOARD_INFO-5609.hex");
+        if (pvp == null || pve == null) return;
+
+        Hex.Eq(ArbiterClientHandlers.BuildPvpLeaderBoardInfo(), pvp,
+            "classic_live frame 5608, byte for byte");
+        Hex.Eq(ArbiterClientHandlers.BuildPveLeaderBoardInfo(), pve,
+            "classic_live frame 5609, byte for byte");
+
+        Hex.True(pvp.Length == 60 && pve.Length == 92,
+            $"60 B for four ids, 92 B for eight: {pvp.Length} / {pve.Length}");
+        Hex.True(BitConverter.ToInt32(pve, 8) == RankingBoards.DefaultSeason
+                 && RankingBoards.DefaultSeason == 15,
+            "the live season is 15, and that is our default");
+        Hex.True(BitConverter.ToInt64(pve, 20) - BitConverter.ToInt64(pve, 12) == 28L * 86400
+                 && BitConverter.ToInt64(pvp, 20) - BitConverter.ToInt64(pvp, 12) == 28L * 86400,
+            "both windows are 28 days to the second, like T91's");
+        Hex.True(ArbiterClientHandlers.LeaderBoardLivePveStart != ArbiterClientHandlers.LeaderBoardLivePvpStart,
+            "and they are DIFFERENT windows - one shared pair of constants could not say that");
+
+        // The ids are not decoration: the client echoes one back as the request's `id`.
+        Hex.True(ArbiterClientHandlers.LeaderBoardLivePve.Length == 8
+                 && ArbiterClientHandlers.LeaderBoardLivePve[7] == 9768,
+            "9768 is the dungeon frame 5807 then asked for");
+        Hex.True(ArbiterClientHandlers.LeaderBoardLivePvp.Length == 4
+                 && Array.IndexOf(ArbiterClientHandlers.LeaderBoardLivePvp, 26) == 1,
+            "26 is the battleground T91's three-id set was missing");
+    }
+
+    /// <summary>
+    /// The season, and the one rule that keeps it honest: the number we advertise in
+    /// S_P*_LEADER_BOARD_INFO is the number the ranking handler answers, because they are the
+    /// same property. TERASHARP_RANKING_SEASON moves both at once.
+    /// </summary>
+    [Test] public static void T133_the_season_is_configurable_and_used_on_both_sides()
+    {
+        try
+        {
+            Environment.SetEnvironmentVariable(RankingBoards.SeasonEnvVariable, null);
+            RankingBoards.ResetSeason();
+            Hex.True(RankingBoards.CurrentSeason == 15, "the default is the live season");
+
+            Environment.SetEnvironmentVariable(RankingBoards.SeasonEnvVariable, "23");
+            RankingBoards.ResetSeason();
+            Hex.True(RankingBoards.CurrentSeason == 23, "the env wins");
+            Hex.True(BitConverter.ToInt32(ArbiterClientHandlers.BuildPveLeaderBoardInfo(), 8) == 23
+                     && BitConverter.ToInt32(ArbiterClientHandlers.BuildPvpLeaderBoardInfo(), 8) == 23,
+                "and both pushes advertise it, so the client asks for a season we will answer");
+
+            foreach (var junk in new[] { "", "  ", "nine", "0", "-3" })
+            {
+                Environment.SetEnvironmentVariable(RankingBoards.SeasonEnvVariable, junk);
+                RankingBoards.ResetSeason();
+                Hex.True(RankingBoards.CurrentSeason == 15,
+                    $"'{junk}' is not a season - fall back to the default rather than to 0");
+            }
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(RankingBoards.SeasonEnvVariable, null);
+            RankingBoards.ResetSeason();
+        }
+    }
+
+    /// <summary>
+    /// The 31-byte PvE element, against 20 real rows. Frame 5809 is the class-9 board for
+    /// dungeon 9768; decoding it at T126's offsets and building it again with our own writer
+    /// has to give the live frame back byte for byte.
+    ///
+    /// <para>This is what T119 got wrong and T126 fixed: row 1 reads rank 1, stageLevel 3,
+    /// clearTime 173140 - two minutes fifty-three, a real dungeon clear - and T119 would have
+    /// read the rank as 3 and the "score" as a time.</para>
+    /// </summary>
+    [Test] public static void T133_the_live_pve_ranking_list_round_trips()
+    {
+        var f = LoadLiveFrame("S_PVE_RANKING_LIST-5809.hex");
+        if (f == null) return;
+
+        Hex.True(BitConverter.ToUInt16(f, 2) == RankingBoards.S_PVE_RANKING_LIST
+                 && f.Length == 932 && BitConverter.ToUInt16(f, 4) == 20,
+            "0xBEDC, 932 B, 20 rows");
+
+        var rows = DecodeLiveRanking(f, pve: true);
+        Hex.True(rows[0].Rank == 1 && rows[0].Second == 3 && rows[0].Score == 173140L
+                 && rows[0].Class == 9 && rows[0].Name == "Misayuma",
+            $"row 1 is rank {rows[0].Rank}, stage {rows[0].Second}, {rows[0].Score} ms, "
+            + $"class {rows[0].Class}, '{rows[0].Name}'");
+        Hex.True(rows[1].Rank == 2 && rows[1].Score == 180530L && rows[1].Name == "Elvyo",
+            "row 2 is slower and therefore second - the i64 is a TIME, low is good");
+        for (int i = 1; i < rows.Count; i++)
+            Hex.True(rows[i].Score >= rows[i - 1].Score,
+                $"row {i + 1} is not slower than row {i} - the board is not sorted by the i64");
+
+        Hex.Eq(EncodeLiveRanking(rows, pve: true), f,
+            "our writer rebuilds frame 5809 byte for byte");
+    }
+
+    /// <summary>
+    /// The 23-byte PvP element, against 100 real rows - and the only live values of the two
+    /// fields T126 had to guess at. Across all nine ranking frames in classic_live (316 rows)
+    /// the byte at +6 is 0 on 315 of them and 1 on exactly one, and the i32 at +7 runs -17..+12
+    /// around 0. Read the other way round - the .def's `int32 unk; byte unk2`, which would put
+    /// the i32 at +6 and the byte at +10 - the same bytes decode as 768, 256, -256 and a byte
+    /// of 0 or 255. So the writer's order is the real one, and the def's is wrong.
+    /// </summary>
+    [Test] public static void T133_the_live_pvp_ranking_list_round_trips()
+    {
+        var f = LoadLiveFrame("S_PVP_RANKING_LIST-5818.hex");
+        if (f == null) return;
+
+        Hex.True(BitConverter.ToUInt16(f, 2) == RankingBoards.S_PVP_RANKING_LIST
+                 && f.Length == 3938 && BitConverter.ToUInt16(f, 4) == 100,
+            "0x62FA, 3938 B, 100 rows");
+
+        var rows = DecodeLiveRanking(f, pve: false);
+        Hex.True(rows[0].Rank == 1 && rows[0].Score == 1145 && rows[0].Class == 9
+                 && rows[0].Name == "Trump",
+            "row 1: rank 1, rating 1145, class 9 - and the viewer's own S_USER_PVP_RANKING "
+            + "carries the same 1 and 1145, which is how we know who was looking");
+        for (int i = 1; i < rows.Count; i++)
+            Hex.True(rows[i].Score <= rows[i - 1].Score,
+                $"row {i + 1} outrates row {i} - this board IS sorted by its score, descending");
+
+        // The two fields, read at the writer's offsets, are sane; read at the def's, they are not.
+        int rookies = 0, moved = 0, silly = 0;
+        foreach (var r in rows)
+        {
+            if (r.Rookie != 0) rookies++;
+            if (r.ChangedRank != 0) moved++;
+            if (r.ChangedRank < -64 || r.ChangedRank > 64) silly++;
+        }
+        Hex.True(silly == 0 && moved > 0,
+            $"changedRank at +7 is a small signed delta on {moved} of {rows.Count} rows, "
+            + $"never absurd ({silly} outliers)");
+        Hex.True(rookies == 0, "and the flag at +6 is a flag - 0 on every row of this frame");
+
+        Hex.Eq(EncodeLiveRanking(rows, pve: false), f,
+            "our writer rebuilds frame 5818 byte for byte");
+    }
+
+    /// <summary>
+    /// The aggregate reply, class 16. Frame 5856 is 105 rows of dungeon 9043 with no class
+    /// filter, and it shows something no single-class frame could: a dungeon record belongs to
+    /// a PARTY, so five rows share rank 1 and the same clearTime and differ only in class and
+    /// name. Our dense ranking gives ties the same number, which is the same shape.
+    /// </summary>
+    [Test] public static void T133_the_aggregate_class_sixteen_reply_round_trips()
+    {
+        var f = LoadLiveFrame("S_PVE_RANKING_LIST-5856-class16.hex");
+        if (f == null) return;
+
+        Hex.True(f.Length == 4847 && BitConverter.ToUInt16(f, 4) == 105,
+            "4847 B, 105 rows - the largest leaderboard frame we have");
+
+        var rows = DecodeLiveRanking(f, pve: true);
+        int atRankOne = 0;
+        var classes = new HashSet<int>();
+        foreach (var r in rows)
+            if (r.Rank == 1) { atRankOne++; classes.Add(r.Class); }
+        Hex.True(atRankOne > 1 && classes.Count == atRankOne,
+            $"{atRankOne} rows share rank 1, one per class - a party, not a tie-break bug");
+        Hex.True(rows[0].Score == rows[1].Score && rows[0].Rank == rows[1].Rank
+                 && rows[0].Class != rows[1].Class,
+            "same time, same rank, different class");
+
+        // Which is what RankingBoards.Rank already does with equal scores.
+        var dense = RankingBoards.Rank(new List<TeraSharp.Arbiter.Persistence.CharacterStore.RankingScore>
+        {
+            new(1, "a", 11, 60, 5), new(2, "b", 1, 60, 5), new(3, "c", 6, 60, 4),
+        }, RankingBoards.AllClasses);
+        Hex.True(dense[0].Rank == 1 && dense[1].Rank == 1 && dense[2].Rank == 3,
+            "our own aggregate gives a party one rank too - dense, then the next rank skips");
+
+        Hex.Eq(EncodeLiveRanking(rows, pve: true), f,
+            "our writer rebuilds frame 5856 byte for byte");
+
+        // Noted, not fixed: the live server sends the WHOLE board in one frame - 100 rows in
+        // 5818 and 105 here - while RankingBoards.PageSize stops us at 50. The request has no
+        // page field to ask for the rest, so a 51st row is currently a row nobody can see.
+        // Changing it moves T119's paging tests, so it is a task of its own.
+        Hex.True(rows.Count > RankingBoards.PageSize,
+            $"the live board is {rows.Count} rows and our page is {RankingBoards.PageSize} - "
+            + "see status/LEADERBOARD.md section 8");
+    }
+
+    /// <summary>
+    /// The second frame is conditional, and classic_live says exactly when. Nine requests, all
+    /// from a class-9 player: the eight that asked for class 9 or class 16 were answered with
+    /// S_USER_P*_RANKING after the list, and frame 5846 - the one that asked for class 0 - got
+    /// the list alone. That is SendNowSeasonRank's own guard,
+    /// <c>param_5 == user.class || param_5 == 0x10</c> (Arb_part_050.c:9961).
+    /// </summary>
+    [Test] public static void T133_the_self_rank_frame_only_follows_your_own_board()
+    {
+        Hex.True(RankingBoards.SendsSelfRank(9, 9), "frames 5807/5817/5830/5835/5867/5871/5876");
+        Hex.True(RankingBoards.SendsSelfRank(RankingBoards.AllClasses, 9), "frame 5855, class 16");
+        Hex.True(!RankingBoards.SendsSelfRank(0, 9),
+            "frame 5846 asked for class 0 and got the list and nothing else");
+        Hex.True(!RankingBoards.SendsSelfRank(14, 9) && !RankingBoards.SendsSelfRank(9, 14),
+            "your rank on somebody else's class board is not a number that exists");
+        Hex.True(!RankingBoards.SendsSelfRank(9, -1)
+                 && RankingBoards.SendsSelfRank(RankingBoards.AllClasses, -1),
+            "a session with no character has no class, so only the aggregate matches");
+
+        // The frames themselves are unchanged - T126 pinned both against the def and the
+        // writer, and classic_live carries them at exactly those sizes.
+        Hex.True(RankingBoards.UserPveRankingSize == 25 && RankingBoards.UserPvpRankingSize == 17,
+            "frames 5810 (25 B) and 5819 (17 B)");
+        Hex.Eq(RankingBoards.BuildUserPveRanking(0, 0, 0),
+            "19 00  48 E7  00  00 00 00 00  00 00 00 00  00 00 00 00  00 00 00 00 00 00 00 00",
+            "frame 5810 exactly - the live viewer is unranked on the PvE board");
+        Hex.Eq(RankingBoards.BuildUserPvpRanking(rank: 1, score: 1145),
+            "11 00  44 C8  00  00 00 00 00  01 00 00 00  79 04 00 00",
+            "frame 5819 exactly - rank 1, rating 1145, the same numbers as row 1 of 5818");
     }
 
 }

@@ -62,15 +62,53 @@ public readonly record struct RankingRow(
 ///
 /// <para><b>Season.</b> These packets carry none; the season lives in
 /// <c>S_P*_LEADER_BOARD_INFO</c>, which T91 pinned to a real 52-byte capture and which we push
-/// at enter-world with season 1. <see cref="CurrentSeason"/> is that same 1, so the season the
+/// at enter-world with the season <see cref="CurrentSeason"/> names, so the season the
 /// client asks for is the season we advertised - the real handler answers only
 /// <c>season == current</c> (now) or <c>season &lt; current</c> (the last three), and a season
 /// above the current one does nothing at all.</para>
 /// </summary>
 public static class RankingBoards
 {
-    /// <summary>The season <c>ArbiterClientHandlers.BuildP*LeaderBoardInfo</c> advertises.</summary>
-    public const int CurrentSeason = 1;
+    /// <summary>
+    /// The season number the live Classic+ server was on when
+    /// <c>D:\packetlogs\classic_live.npcap</c> was taken (T130): both
+    /// <c>S_P*_LEADER_BOARD_INFO</c> frames carry <c>season = 15</c>, and every
+    /// <c>C_REQUEST_P*_RANKING</c> in that capture asks for 15. T119 assumed 1, which was
+    /// T91's own capture from 2022 and is four years of seasons out of date.
+    /// </summary>
+    public const int DefaultSeason = 15;
+
+    /// <summary>Override for <see cref="CurrentSeason"/>. A whole number; anything else is ignored.</summary>
+    public const string SeasonEnvVariable = "TERASHARP_RANKING_SEASON";
+
+    private static int? _season;
+
+    /// <summary>
+    /// The season <c>ArbiterClientHandlers.BuildP*LeaderBoardInfo</c> advertises and the only
+    /// one the ranking handler answers with rows. Read once from
+    /// <see cref="SeasonEnvVariable"/>, else <see cref="DefaultSeason"/>.
+    ///
+    /// <para>It has to be one number for both: the client asks for whatever season the info
+    /// frame told it about, and the handler compares what it is asked for against this. A
+    /// mismatch is an empty board, silently - which is exactly the bug that would follow from
+    /// bumping one and not the other.</para>
+    /// </summary>
+    public static int CurrentSeason
+    {
+        get
+        {
+            if (_season is int s) return s;
+            int v = DefaultSeason;
+            var raw = Environment.GetEnvironmentVariable(SeasonEnvVariable);
+            if (!string.IsNullOrWhiteSpace(raw) && int.TryParse(raw.Trim(), out int parsed)
+                && parsed > 0) v = parsed;
+            _season = v;
+            return v;
+        }
+    }
+
+    /// <summary>Tests only: forget the cached season so the next read takes the env again.</summary>
+    public static void ResetSeason() => _season = null;
 
     /// <summary>S_PVE_RANKING_LIST, from data.json's 376012 map.</summary>
     public const ushort S_PVE_RANKING_LIST = 0xBEDC;
@@ -331,6 +369,19 @@ public static class RankingBoards
         BitConverter.GetBytes(score).CopyTo(p, 13);
         return p;
     }
+
+    /// <summary>
+    /// T133. Whether the requester's own line (<c>S_USER_P*_RANKING</c>) follows the list.
+    /// <c>SendNowSeasonRank</c> guards it with
+    /// <c>param_5 == *(int *)(local_80 + 0x2f) || param_5 == 0x10</c> (Arb_part_050.c:9961):
+    /// the class asked for is the requester's own, or the aggregate. classic_live agrees on
+    /// all nine of its requests - the one that asked for a class the viewer is not (frame
+    /// 5846, class 0 from a class-9 player) got the list alone.
+    /// <para>A viewer with no character has no class, so <paramref name="viewerClass"/> of -1
+    /// matches only the aggregate.</para>
+    /// </summary>
+    public static bool SendsSelfRank(int classFilter, int viewerClass)
+        => classFilter == AllClasses || classFilter == viewerClass;
 
     /// <summary>The requester's own row on the FULL board, or null when they are not on it.</summary>
     public static RankingRow? Self(IReadOnlyList<RankingRow> all, int selfId)
