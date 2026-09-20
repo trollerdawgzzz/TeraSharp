@@ -18,7 +18,7 @@ Read this file, then `CLAUDE.md`, then `status/HANDOFF.md` §1 (DLMItems), then
   its container) — it verifies bytes with Python; the human builds before merging. Its work today
   has been good (it found a real bug in my 0x13BF builder).
 - **Human:** runs WorldServer + client on a netcup VM (`C:\deploy.ps1` = kill arbiter, curl the 7z
-  from `http://104.62.81.162:8888/`, extract, set env vars incl. `TERASHARP_STARTER_BLOB`, run with
+  from the build host over http, extract, set env vars incl. `TERASHARP_STARTER_BLOB`, run with
   Tee to `C:\TeraSharp-deploy\arbiter.log`). Terse; wants commands, not prose. World takes ~3 min
   to restart; a fresh World process is needed for many tests (see below).
 

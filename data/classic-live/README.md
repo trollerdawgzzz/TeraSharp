@@ -1,21 +1,56 @@
-# data/classic-live - the live Classic+ leaderboard reference (T133)
+# `data/classic-live/` — leaderboard reference frames
 
-Whole client frames, hex, one file per frame, lifted out of
-`D:\packetlogs\classic_live.log` (which T130's `tools\npcap-to-capture.ps1` produced from
-`classic_live.npcap`). They are the **first populated leaderboard** this project has: the
-real Arbiter on 100.02 never answered `C_REQUEST_P*_RANKING` at all, so every byte of
-`RankingBoards` up to T126 came from the decompile alone.
+Empty in a clone. The five `.hex` files that the T133 leaderboard tests read are not in this
+repository and must not be put in it.
 
-| File | Frame | What it pins |
-|---|---|---|
-| `S_PVP_LEADER_BOARD_INFO-5608.hex` | 5608, 60 B | season 15, 4 battleground ids, a 28-day window |
-| `S_PVE_LEADER_BOARD_INFO-5609.hex` | 5609, 92 B | season 15, 8 dungeon ids, its own 28-day window |
-| `S_PVE_RANKING_LIST-5809.hex` | 5809, 932 B | 20 rows, class-9 filter - the 31-byte PvE element |
-| `S_PVE_RANKING_LIST-5856-class16.hex` | 5856, 4847 B | 105 rows, class 16 - the aggregate reply, and parties sharing a rank |
-| `S_PVP_RANKING_LIST-5818.hex` | 5818, 3938 B | 100 rows - the 23-byte PvP element, and the only live `rookie` / `changedRank` values there are |
+## Why this folder has a rule of its own
 
-The tests read these and assert a full decode/re-encode round trip: every row is taken apart
-at T126's offsets and put back, and the result has to be the live frame byte for byte. A
-layout error anywhere - one field at the wrong offset, one length miscounted - breaks it.
+The frames these tests use are `S_*_RANKING_LIST` and `S_*_LEADER_BOARD_INFO` replies. A ranking
+list is, by construction, **a list of other people's character names** — a hundred of them per
+frame, plus guild names. Captured off a public server, that is a roster of third parties who did
+not agree to be in anyone's git history, and it stays out regardless of how small the file is or
+how useful the bytes are.
 
-Lines beginning `#` are comments; everything else is space-separated hex.
+The same applies to any other capture you take on a server that is not yours: fine to test
+against locally, never committed.
+
+## What the tests need
+
+Each file is one server→client frame, whole, as space-separated hex. Blank lines and lines
+starting with `#` are ignored, so a header comment saying where the frame came from is welcome.
+
+| File | Frame |
+|---|---|
+| `S_PVE_LEADER_BOARD_INFO-<n>.hex` | the PvE board header — the dungeon id set and the season window |
+| `S_PVP_LEADER_BOARD_INFO-<n>.hex` | the same for PvP |
+| `S_PVE_RANKING_LIST-<n>.hex` | a PvE ranking page |
+| `S_PVE_RANKING_LIST-<n>-class16.hex` | the aggregate reply for class filter 16 |
+| `S_PVP_RANKING_LIST-<n>.hex` | a PvP ranking page |
+
+`<n>` is the frame number in your own listing; `LoadLiveFrame` takes the exact file name, so if
+you regenerate these, the test's file names have to match what you wrote. Absent, the tests
+print `(skipped: data/classic-live/<name> not found)` and pass.
+
+## Generating them
+
+Capture a session on **your own** server, open a leaderboard in the client, then:
+
+```powershell
+cd tools
+.\npcap-to-capture.ps1 -Npcap <your capture>.npcap -Out <your capture>.log
+.\reframe-client.ps1   -Log  <your capture>.log `
+                       -Packets S_PVE_RANKING_LIST,S_PVP_RANKING_LIST,S_PVE_LEADER_BOARD_INFO,S_PVP_LEADER_BOARD_INFO
+```
+
+`<log>_ctl.txt` lists the frames with their numbers; `<log>_frames.txt` has the full hex. Copy
+the hex line for one frame into a file here and name it as above.
+
+## What the tests assert, so you know what a usable frame looks like
+
+The element layouts are pinned in `World/RankingBoards.cs` and described in
+`status/LEADERBOARD.md`. The decoder walks the list structurally — every element's `here` must
+equal the offset it was found at, every `next` must point at the following element, and the walk
+must end exactly at the frame's end — so a frame from a different build will fail loudly rather
+than decode into nonsense. Ranks are competition ranks (1, 1, 3), not dense.
+
+A page with only your own characters on it is enough to exercise all of that.
