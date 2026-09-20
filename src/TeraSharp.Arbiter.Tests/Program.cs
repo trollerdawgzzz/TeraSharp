@@ -12675,9 +12675,21 @@ some prose with `backticks` that is not a table row
         Hex.True(world.Contains("add_exp"), "add_exp is the World's");
         Hex.True(!world.Contains("set_admin_level"), "and the two lists do not collide on it");
 
-        // Every command we implement must be one the Arbiter really owns.
+        // Every command we implement must be in one catalogue or the other, and T128 decided
+        // which: `vis` and `invis` are TeraSharp's own and were added to the Arbiter file;
+        // `vaporize` and `invisible` are World's (GM-COMMANDS-FULL.md 417 and 194) and are
+        // handled here AND still forwarded, so they must stay on the World side.
         foreach (var name in GmCommandHandlers.Implemented)
-            Hex.True(arbiter.Contains(name), $"{name} must be in the Arbiter catalogue");
+        {
+            if (GmCommandHandlers.AlsoForwarded.Contains(name))
+                Hex.True(world.Contains(name) && !arbiter.Contains(name),
+                    $"{name} is World's and is forwarded there as well as handled here");
+            else
+                Hex.True(arbiter.Contains(name), $"{name} must be in the Arbiter catalogue");
+        }
+
+        Hex.True(arbiter.Contains("vis") && arbiter.Contains("invis"),
+            "T128 added the two visibility commands to the Arbiter catalogue");
     }
 
     [Test] public static void T32_command_literals_are_the_arbiters_own()

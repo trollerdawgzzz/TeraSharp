@@ -221,3 +221,22 @@ Pointing that at arbitrary URLs from a GM command is worth disabling outright.
 
 **Enforcement caveat, again.** Filtering `C_ADMIN` in your proxy only stops GMs using your
 proxy. Real control is who gets QA status at login.
+
+---
+
+## 🟢 C — TeraSharp additions (not in ArbiterServer.exe)
+
+Commands TeraSharp answers Arbiter-side that the retail Arbiter does not register. They are
+listed here because this file is also the catalogue `GmCommandCatalog` loads, and
+`GmCommandHandlers.Implemented` must be a subset of it.
+
+| Command | Args | Korean | English |
+|---|---|---|---|
+| `vis` | — | — | **T128. Make yourself visible and able to cast** — sends `S_ADMIN_GM_SKILL` skill 0 / enabled 0, cap_final_gm_client2 frame 546. |
+| `invis` | — | — | **T128. Make yourself invisible again** — the same frame with enabled 1, which is the enter-world push (frame 99). |
+
+`vaporize` and `invisible` are **not** here: they stay World commands
+(`GM-COMMANDS-FULL.md` lines 417 and 194). T128 handles them Arbiter-side as well — they flip
+the same client-side switch, the way Alt+A does — and then still forwards them to World, since
+being hidden from other players is World's half of the job and has no client-facing packet of
+its own. `GmCommandHandlers.AlsoForwarded` is that list.
