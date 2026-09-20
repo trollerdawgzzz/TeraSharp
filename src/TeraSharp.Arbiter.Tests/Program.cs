@@ -11578,12 +11578,15 @@ bool   isGuildWarAcceptable
         Hex.True(r.Body.Contains("\"tab\":\"account\"") && r.Body.Contains("\"money\":555")
                  && r.Body.Contains("\"templateId\":77001") && r.Body.Contains("\"tab\":\"character\""),
             $"both warehouse tabs, the account one keyed on the ACCOUNT: {r.Body}");
-        Hex.True(r.Body.Contains("\"itemNames\":0"),
-            "and it reports that no name sheet is loaded, so the page shows template ids");
+        // T113: the figure is no longer always 0 - a box with the client's strsheet unpacked
+        // loads 53k names - so assert the FIELD, not a count that depends on the environment.
+        Hex.True(r.Body.Contains("\"itemNames\":"),
+            "and it reports how many names are loaded, so the page knows to show bare ids");
     }
 
     /// <summary>
-    /// T101c - the optional item-name sheet. There is no sheet in the repo: the names live in
+    /// T101c - the optional item-name sheet (T113 added a second source: see
+    /// <see cref="T113_item_strsheet_parses_and_merges"/>). There is no sheet in the repo: the names live in
     /// StrSheet_Item inside the 61 MB client DataCenter, which tera-api parses into an in-memory
     /// Map and serialises to opaque dc_*.bin blobs. So this parses a two-column file instead, and
     /// everything works without one.
@@ -11608,8 +11611,246 @@ bool   isGuildWarAcceptable
                  && map[200997] == "Spring Cake", "tabs, commas and stray whitespace all parse");
         Hex.True(!map.ContainsKey(0) && !map.ContainsKey(12345), "and the junk lines are dropped");
 
-        Hex.True(TeraSharp.Arbiter.Protocol.ItemNames.Lookup(4242) == "",
+        // int.MaxValue rather than a small id: T113 made Lookup load the real strsheet when one
+        // is configured, and 4242 is a template id that sheet could well have.
+        Hex.True(TeraSharp.Arbiter.Protocol.ItemNames.Lookup(int.MaxValue) == "",
             "an unknown template is the empty string, which the page renders as the bare id");
+    }
+
+    // =======================================================================================
+    // T113 - the go-live loose ends: play time, the item strsheet, the auth provider's real
+    // JSON shape, and --check-config.
+    // =======================================================================================
+
+    /// <summary>
+    /// T113.1 - play time. The enter stamp lives beside GameIdByPlayer (the session object is
+    /// human-owned), and leave-world commits the difference to characters.play_seconds and to
+    /// the account in one transaction.
+    /// </summary>
+    [Test] public static void T113_play_time_is_stamped_at_leave_world()
+    {
+        using var store = StoreWithTwoAccounts();
+        var acct = store.GetOrCreateAccount("acct1");
+        Hex.True(store.GetCharacterPlaySeconds(1) == 0 && store.GetAccountPlayTime(acct.Id) == 0,
+            "nothing played yet");
+
+        long t0 = 1_790_000_000L;
+        DbProxyHandlers.MarkEnteredWorld(1, t0);
+        Hex.True(DbProxyHandlers.SecondsInWorld(1, t0 + 90) == 90,
+            "mid-session S_PLAY_TIME reads the live difference without closing anything");
+        Hex.True(DbProxyHandlers.SecondsInWorld(1, t0 + 90) == 90,
+            "and asking twice does not consume it");
+
+        Hex.True(DbProxyHandlers.TakeSessionSeconds(1, t0 + 600) == 600, "leave-world takes 600s");
+        Hex.True(DbProxyHandlers.TakeSessionSeconds(1, t0 + 900) == 0,
+            "and taking it again is 0 - a double leave cannot bank the session twice");
+
+        Hex.True(store.AddCharacterPlaySeconds(1, 600) == 600, "committed to the character");
+        Hex.True(store.GetAccountPlayTime(acct.Id) == 600,
+            "and to the account in the same transaction, so the two cannot drift");
+        store.AddCharacterPlaySeconds(1, 300);
+        Hex.True(store.GetCharacterPlaySeconds(1) == 900 && store.GetAccountPlayTime(acct.Id) == 900,
+            "a second session adds");
+
+        Hex.True(store.AddCharacterPlaySeconds(1, -50) == 900,
+            "a clock that went backwards is ignored, not subtracted");
+        Hex.True(DbProxyHandlers.SecondsInWorld(999, t0) == 0
+                 && DbProxyHandlers.TakeSessionSeconds(999, t0) == 0,
+            "a player who never entered has no session");
+
+        // And the admin page shows it, which is the only place it can be shown: the shipped
+        // S_GET_USER_LIST.18.def has no play-time field at all.
+        var page = NewAdminApi(store).Handle("GET", "/api/character",
+            new Dictionary<string, string> { ["id"] = "1" }, token: T101Token);
+        Hex.True(page.Status == 200 && page.Body.Contains("\"playSeconds\":900"),
+            $"the character page carries the stored total: {page.Body}");
+
+        // The packet the figure feeds. 12 bytes: uint32 totalPlaytime, uint64 localServerTime.
+        var fields = ArbiterClientHandlers.BuildUserPlayTimeFields(900, t0);
+        Hex.True((uint)fields["totalPlaytime"] == 900u && (ulong)fields["localServerTime"] == (ulong)t0,
+            "S_SEND_USER_PLAY_TIME carries the stored total");
+        Hex.Eq(ArbiterClientHandlers.BuildPlayTime(900), "08 00 BE A2 84 03 00 00",
+            "S_PLAY_TIME is [u16 len=8][u16 0xA2BE][u32 seconds]");
+    }
+
+    /// <summary>
+    /// T113.2 - the item strsheet. The client's own <c>StrSheet_Item*.xml</c> is
+    /// <c>&lt;String id= string= toolTip=/&gt;</c>, streamed so the 3.4 MB file never becomes
+    /// 3.4 MB of DOM, and rows with an empty <c>string</c> are unused template ids, not names.
+    /// </summary>
+    [Test] public static void T113_item_strsheet_parses_and_merges()
+    {
+        const string xml =
+            "<StrSheet_Item>"
+            + "<String id=\"150000\" string=\"\" toolTip=\"\"/>"
+            + "<String id=\"150001\" string=\"Practicum Necklace\"/>"
+            + "<String id=\"150003\" string=\"Kelsaik Mask\" toolTip=\"A trophy.\"/>"
+            + "<String id=\"0\" string=\"zero is not a template\"/>"
+            + "<String string=\"no id\"/>"
+            + "<Other id=\"150009\" string=\"not a String element\"/>"
+            + "</StrSheet_Item>";
+        using var reader = System.Xml.XmlReader.Create(new StringReader(xml));
+        var map = TeraSharp.Arbiter.Protocol.ItemNames.ParseStrSheet(reader);
+
+        Hex.True(map.Count == 2, $"two real names out of six elements: {map.Count}");
+        Hex.True(map[150001] == "Practicum Necklace" && map[150003] == "Kelsaik Mask",
+            "the tooltip is skipped and the name is kept");
+        Hex.True(!map.ContainsKey(150000), "string=\"\" is an unused template id, not a name");
+        Hex.True(!map.ContainsKey(0) && !map.ContainsKey(150009),
+            "id 0 and a non-String element are both dropped");
+
+        // The two sheets on this box are DISJOINT - measured against the real files: 34539 ids
+        // in StrSheet_Item.xml, 19110 in StrSheet_Item_NAEU.xml, zero in both. The brief named
+        // only the NAEU one, and the ids TeraSharp's own captures use are in the OTHER file
+        // (88375 Stormcry Axe, 200997 Minor Battle Solution, 10027 Cleavework Sword), so the
+        // loader merges every candidate instead of stopping at the first hit.
+        Hex.True(TeraSharp.Arbiter.Protocol.ItemNames.StrSheetRelativePath.EndsWith("StrSheet_Item_NAEU.xml")
+                 && TeraSharp.Arbiter.Protocol.ItemNames.StrSheetFullRelativePath.EndsWith("StrSheet_Item.xml"),
+            "both sheets are candidates");
+        Hex.True(TeraSharp.Arbiter.Protocol.ItemNames.StrSheetVariable == "TERASHARP_ITEM_STRSHEET",
+            "and an explicit override wins");
+
+        // The TSV path still works, and an unknown template is still the empty string.
+        var tsv = TeraSharp.Arbiter.Protocol.ItemNames.Parse(new[] { "88375\tStormcry Axe" });
+        Hex.True(tsv.Count == 1 && tsv[88375] == "Stormcry Axe", "the hand-made sheet still parses");
+    }
+
+    /// <summary>
+    /// T113.3 - the auth provider against tera-api's actual reply shape,
+    /// <c>{ Return, ReturnCode, Msg }</c> from
+    /// <c>src/controllers/arbiterAuth.controller.js</c>. Accept, refuse, and timeout.
+    /// </summary>
+    [Test] public static void T113_tera_api_auth_accept_refuse_timeout()
+    {
+        // ---- accept
+        var ok = TeraApiAuthProvider.ParseResponse("{\"Return\":true,\"ReturnCode\":0,\"Msg\":\"success\"}");
+        Hex.True(ok.Accepted && ok.Code == 0, $"the success body: {ok.Message}");
+
+        // ---- refuse, every code tera-api actually returns
+        foreach (var (body, code) in new[]
+        {
+            ("{\"Return\":false,\"ReturnCode\":50011,\"Msg\":\"authkey mismatch\"}", AuthResult.CodeAuthKeyMismatch),
+            ("{\"Return\":false,\"ReturnCode\":50000,\"Msg\":\"account not exist\"}", AuthResult.CodeAccountNotExist),
+            ("{\"Return\":false,\"ReturnCode\":50012,\"Msg\":\"banned\"}", AuthResult.CodeAccountBanned),
+            ("{\"Return\":false,\"ReturnCode\":2,\"Msg\":\"invalid parameter\"}", AuthResult.CodeInvalidParameter),
+        })
+        {
+            var r = TeraApiAuthProvider.ParseResponse(body);
+            Hex.True(!r.Accepted && r.Code == code, $"{code}: {r.Accepted} {r.Code}");
+        }
+
+        // Anything that is not an explicit Return:true is a rejection - including the shapes a
+        // proxy or an error page would put in front of tera-api.
+        foreach (var body in new[]
+        {
+            "{\"Return\":\"true\"}",          // the string, not the boolean
+            "{\"ReturnCode\":0}",             // no Return at all
+            "{}", "[]", "<html>502</html>", "",
+        })
+            Hex.True(!TeraApiAuthProvider.ParseResponse(body).Accepted,
+                $"not an explicit Return:true, so refused: {body}");
+
+        // ---- the request body tera-api's express-validator will accept
+        var req = new AuthRequest("2800", 0, "5f1e-uuid", "203.0.113.9", 6, 376012);
+        string sent = TeraApiAuthProvider.BuildRequestBody(req);
+        Hex.True(sent.Contains("\"authKey\":\"5f1e-uuid\"") && sent.Contains("\"clientIP\":\"203.0.113.9\"")
+                 && sent.Contains("\"userNo\":\"2800\""),
+            $"userNo goes out as a STRING - isNumeric() takes it, and every other field is one: {sent}");
+
+        // ---- timeout: the handler throws the way HttpClient does, and it must FAIL CLOSED
+        var timingOut = new System.Net.Http.HttpClient(new ThrowingHandler(
+            () => new TaskCanceledException("The request was canceled due to the configured HttpClient.Timeout")));
+        var provider = new TeraApiAuthProvider("http://127.0.0.1:8080", QuietLog(), timingOut);
+        var timedOut = provider.AuthenticateAsync(req).GetAwaiter().GetResult();
+        Hex.True(!timedOut.Accepted && timedOut.Code == AuthResult.CodeUnreachable,
+            $"a timeout REJECTS - an auth provider that fails open is not one: {timedOut.Message}");
+
+        var refused = new TeraApiAuthProvider("http://127.0.0.1:8080", QuietLog(),
+            new System.Net.Http.HttpClient(new ThrowingHandler(
+                () => new System.Net.Http.HttpRequestException("connection refused"))));
+        Hex.True(!refused.AuthenticateAsync(req).GetAwaiter().GetResult().Accepted,
+            "and so does a refused connection");
+
+        // ---- no ticket, and a name that is not an accountDBID, never reach the network at all
+        var noTicket = provider.AuthenticateAsync(
+            new AuthRequest("2800", 0, "", "", 6, 0)).GetAwaiter().GetResult();
+        Hex.True(!noTicket.Accepted && noTicket.Code == AuthResult.CodeNoTicket, "no ticket, no call");
+        var notAnId = provider.AuthenticateAsync(
+            new AuthRequest("GameMaster", 0, "uuid", "", 6, 0)).GetAwaiter().GetResult();
+        Hex.True(!notAnId.Accepted && notAnId.Code == AuthResult.CodeNoTicket,
+            "a display name is not an accountDBID - the same trap as TERASHARP_GM_ACCOUNTS");
+
+        // ---- and the mode line the startup banner prints
+        string? saved = Environment.GetEnvironmentVariable(AuthProviders.EnableVariable);
+        try
+        {
+            Environment.SetEnvironmentVariable(AuthProviders.EnableVariable, null);
+            Hex.True(AuthProviders.DescribeMode().StartsWith("OPEN"),
+                "unset says OPEN in the first word, because that is the one that matters");
+            Environment.SetEnvironmentVariable(AuthProviders.EnableVariable, "true");
+            Hex.True(AuthProviders.DescribeMode().Contains("tera-api")
+                     && AuthProviders.DescribeMode().Contains(TeraApiAuthProvider.Endpoint),
+                "on, it names the endpoint it will call");
+        }
+        finally { Environment.SetEnvironmentVariable(AuthProviders.EnableVariable, saved); }
+    }
+
+    /// <summary>An HttpMessageHandler that throws what HttpClient throws.</summary>
+    sealed class ThrowingHandler : System.Net.Http.HttpMessageHandler
+    {
+        private readonly Func<Exception> _make;
+        public ThrowingHandler(Func<Exception> make) { _make = make; }
+        protected override Task<System.Net.Http.HttpResponseMessage> SendAsync(
+            System.Net.Http.HttpRequestMessage request, CancellationToken ct)
+            => throw _make();
+    }
+
+    /// <summary>
+    /// T113.4 - --check-config prints what the process resolved, and flags the things that are
+    /// legal, silent and almost always wrong.
+    /// </summary>
+    [Test] public static void T113_check_config_reports_and_warns()
+    {
+        var saved = new Dictionary<string, string?>();
+        foreach (var v in new[] { "TERASHARP_AUTH", "TERASHARP_GM_ACCOUNTS", "TERASHARP_ADMIN_TOKEN",
+                                  "TERASHARP_ADMIN_PORT", "TERASHARP_BIND" })
+            saved[v] = Environment.GetEnvironmentVariable(v);
+        try
+        {
+            Environment.SetEnvironmentVariable("TERASHARP_AUTH", "true");
+            Environment.SetEnvironmentVariable("TERASHARP_GM_ACCOUNTS", "2800,2801");
+            Environment.SetEnvironmentVariable("TERASHARP_ADMIN_TOKEN", new string('x', 48));
+            Environment.SetEnvironmentVariable("TERASHARP_ADMIN_PORT", "8051");
+            Environment.SetEnvironmentVariable("TERASHARP_BIND", "127.0.0.1");
+
+            string clean = SelfTest.BuildConfigReport(new[] { ("db", "D:\\packetlogs\\terasharp.db") });
+            Hex.True(clean.Contains("TERASHARP_GM_ACCOUNTS") && clean.Contains("2800,2801"),
+                "it prints every known variable and its value");
+            Hex.True(clean.Contains("D:\\packetlogs\\terasharp.db"),
+                "and the resolved paths Program computed, rather than re-deriving them here");
+            Hex.True(!clean.Contains(new string('x', 48)) && clean.Contains("(set, 48 chars)"),
+                "the admin token is NEVER printed - a log line gets pasted into bug reports");
+            Hex.True(clean.Contains("(unset)"), "and an unset variable says so rather than being skipped");
+            foreach (var line in clean.Split('\n'))
+                Hex.True(!line.TrimStart().StartsWith("!"), $"a clean config raises no warning: {line}");
+
+            // Now the four traps.
+            Environment.SetEnvironmentVariable("TERASHARP_GM_ACCOUNTS", "GameMaster");
+            Environment.SetEnvironmentVariable("TERASHARP_AUTH", "false");
+            Environment.SetEnvironmentVariable("TERASHARP_ADMIN_TOKEN", "short");
+            Environment.SetEnvironmentVariable("TERASHARP_ADMIN_PORT", "8050");
+            Environment.SetEnvironmentVariable("TERASHARP_BIND", "0.0.0.0");
+            var notes = string.Join("\n", SelfTest.Notes());
+            Hex.True(notes.Contains("accountDBID"), "a display name in GM_ACCOUNTS is called out");
+            Hex.True(notes.Contains("auth is OPEN"), "so is auth being off");
+            Hex.True(notes.Contains("TERASHARP_ADMIN_TOKEN is short"), "so is a weak token");
+            Hex.True(notes.Contains("8050"), "so is the tera-api admin-panel port collision");
+            Hex.True(notes.Contains("loopback"), "so is binding 7701 off loopback");
+        }
+        finally
+        {
+            foreach (var kv in saved) Environment.SetEnvironmentVariable(kv.Key, kv.Value);
+        }
     }
 
     // ---- The rules ----

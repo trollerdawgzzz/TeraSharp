@@ -446,6 +446,115 @@ public static class SelfTest
         return results;
     }
 
+    // =========================================================================================
+    // T113: --check-config. Everything this process resolved, then exit.
+    //
+    // The sibling of --selftest: that one asks whether the DEPLOY is complete, this one asks
+    // what the CONFIGURATION came out as. Almost every go-live mistake is an environment
+    // variable that is unset, set on the wrong account, or set to the wrong kind of value -
+    // TERASHARP_GM_ACCOUNTS holding a display name instead of an accountDBID is the classic -
+    // and none of those show up as an error anywhere. They show up as "it did not work".
+    // =========================================================================================
+
+    /// <summary>Every TERASHARP_* variable, in the order the docs discuss them.</summary>
+    public static readonly string[] KnownVariables =
+    {
+        "TERASHARP_AUTH", "TERASHARP_AUTH_URL",
+        "TERASHARP_GM_ACCOUNTS",
+        "TERASHARP_ADMIN_TOKEN", "TERASHARP_ADMIN_PORT",
+        "TERASHARP_BIND",
+        "TERASHARP_DATA", "TERASHARP_DB", "TERASHARP_LOGS",
+        "TERASHARP_LOG_LEVEL",
+        "TERASHARP_ITEM_STRSHEET", "TERASHARP_ITEM_NAMES",
+        "TERASHARP_DATASHEET", "TERASHARP_STARTER_BLOB", "TERASHARP_STARTER_INVENTORY",
+    };
+
+    /// <summary>Variables whose value must never reach a log or a console.</summary>
+    public static bool IsSecret(string name)
+        => name.EndsWith("_TOKEN", StringComparison.Ordinal)
+        || name.EndsWith("_PASSWORD", StringComparison.Ordinal);
+
+    /// <summary>
+    /// What to show for a variable: the value, <c>(unset)</c>, or - for a secret - its length
+    /// only. Printing an admin token into a log file that gets pasted into a bug report is
+    /// exactly how a loopback-only tool stops being loopback-only.
+    /// </summary>
+    public static string Display(string name, string? value)
+    {
+        if (string.IsNullOrEmpty(value)) return "(unset)";
+        if (IsSecret(name)) return "(set, " + value.Length + " chars)";
+        return value;
+    }
+
+    /// <summary>
+    /// The report. <paramref name="resolved"/> is what Program actually computed - the paths and
+    /// ports after every default and override - because re-deriving them here would be a second
+    /// implementation that could disagree with the first.
+    /// </summary>
+    public static string BuildConfigReport(IReadOnlyList<(string Label, string Value)> resolved)
+    {
+        ArgumentNullException.ThrowIfNull(resolved);
+        var sb = new System.Text.StringBuilder();
+        sb.Append("TeraSharp configuration").Append(Environment.NewLine);
+
+        sb.Append(Environment.NewLine).Append("  environment").Append(Environment.NewLine);
+        foreach (var name in KnownVariables)
+        {
+            string shown = Display(name, Environment.GetEnvironmentVariable(name));
+            sb.Append("    ").Append(name.PadRight(30)).Append(shown).Append(Environment.NewLine);
+        }
+
+        sb.Append(Environment.NewLine).Append("  resolved").Append(Environment.NewLine);
+        foreach (var (label, value) in resolved)
+            sb.Append("    ").Append(label.PadRight(30)).Append(value).Append(Environment.NewLine);
+
+        sb.Append(Environment.NewLine).Append("  notes").Append(Environment.NewLine);
+        foreach (var note in Notes())
+            sb.Append("    ").Append(note).Append(Environment.NewLine);
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// The things that are legal, silent, and almost always a mistake. Each one has cost
+    /// somebody an afternoon.
+    /// </summary>
+    public static IEnumerable<string> Notes()
+    {
+        string? gm = Environment.GetEnvironmentVariable("TERASHARP_GM_ACCOUNTS");
+        if (!string.IsNullOrWhiteSpace(gm))
+        {
+            bool allNumeric = true;
+            foreach (var part in gm.Split(new[] { ',', ';', ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries))
+                if (!long.TryParse(part.Trim(), out _)) { allNumeric = false; break; }
+            if (!allNumeric)
+                yield return "! TERASHARP_GM_ACCOUNTS has a non-numeric entry. The launcher puts the "
+                           + "tera-api accountDBID in C_LOGIN_ARBITER.name, so a display name never "
+                           + "matches and that account silently gets a normal login.";
+        }
+
+        if (!Auth.AuthProviders.EnabledFromEnvironment(Environment.GetEnvironmentVariable("TERASHARP_AUTH")))
+            yield return "! auth is OPEN - every login is accepted. Do not expose this build.";
+
+        string? token = Environment.GetEnvironmentVariable("TERASHARP_ADMIN_TOKEN");
+        if (string.IsNullOrWhiteSpace(token))
+            yield return "- the admin web is OFF (TERASHARP_ADMIN_TOKEN is unset), which fails closed.";
+        else if (token.Length < 24)
+            yield return "! TERASHARP_ADMIN_TOKEN is short. It is the only thing in front of the "
+                       + "write endpoints; use 48 characters of randomness.";
+
+        string? port = Environment.GetEnvironmentVariable("TERASHARP_ADMIN_PORT");
+        if (string.IsNullOrWhiteSpace(port) || port.Trim() == "8050")
+            yield return "! the admin web is on 8050, which !SECURITY_TODO lists as tera-api's own "
+                       + "admin panel. Whichever starts second loses. Set TERASHARP_ADMIN_PORT=8051.";
+
+        string? bind = Environment.GetEnvironmentVariable("TERASHARP_BIND");
+        if (!string.IsNullOrWhiteSpace(bind) && bind.Trim() != "127.0.0.1")
+            yield return "! TERASHARP_BIND is not 127.0.0.1. Port 7701 does not check GM privilege "
+                       + "on C_ADMIN - the proxy on 7801 is the only gate. Keep it on loopback.";
+
+        yield return "auth mode: " + Auth.AuthProviders.DescribeMode();
+    }
+
     /// <summary>One line per check, then a summary. Returns the number of REQUIRED failures.</summary>
     public static int Report(IReadOnlyList<SelfTestResult> results, ILogger log)
     {

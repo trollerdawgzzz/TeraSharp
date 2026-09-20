@@ -706,3 +706,37 @@ Not implemented: `Account::InsertWatchedMoviesWithNoLock` (Arb_part_064.c:16853)
 `ReplayMovieData` datasheet on top of the loaded set - rows whose level or dungeon-clear condition
 the account already meets get marked so the cinematic REPLAY menu offers them. That is the replay
 list, not the first-watch gate, and it needs a sheet TeraSharp does not carry.
+
+## T113 - `characters.play_seconds`, and where the clock runs
+
+```sql
+ALTER TABLE characters ADD COLUMN play_seconds INTEGER NOT NULL DEFAULT 0;   -- AddColumnIfMissing
+```
+
+`accounts.play_time_sec` has existed since T101c and **nothing fed it**. Now one writer feeds both:
+`CharacterStore.AddCharacterPlaySeconds(characterId, delta)` updates the character row and the
+owning account row inside one transaction, so the two cannot drift, and ignores a delta <= 0 - a
+clock that went backwards must not eat a player's history.
+
+The live clock is **not** in the database. The real Arbiter keeps a running counter on the User
+object at `User+0x1E4` and `Handler_C_PLAY_TIME` reads it straight off; TeraSharp keeps the ENTER
+stamp in `DbProxyHandlers.EnteredAt` (a `ConcurrentDictionary<int,long>` beside `GameIdByPlayer`,
+for the same reason: per-player Arbiter state that is not worth a column and is not reachable from
+a handler), and commits the difference once, at leave-world:
+
+| call | what it does |
+| --- | --- |
+| `MarkEnteredWorld(playerId, now)` | stamp, from `SDB_USER_ENTERWORLD` |
+| `SecondsInWorld(playerId, now)` | live difference, **does not clear** - `S_PLAY_TIME` asks mid-session |
+| `TakeSessionSeconds(playerId, now)` | difference and clear; 0 on a second call, so a double leave cannot bank twice |
+| `CommitPlayTime(playerId, now)` | the whole of it: take, add to the row, log |
+
+`OnUserEnterWorld` commits before it stamps, so a previous session that never saw `SA_LEAVE_WORLD`
+(a crash, a dropped link) is closed out at the one moment we are certain the player is not in world
+any more - because they are entering it. A crash therefore costs one session, not the history.
+
+**Where it surfaces.** `S_SEND_USER_PLAY_TIME.totalPlaytime` (`BuildUserPlayTimeFields`),
+`S_PLAY_TIME` via `ArbiterClientHandlers.PlayTimeLookup`, and the admin character page's
+`progress.playSeconds`. **Not** `S_GET_USER_LIST`: the shipped `S_GET_USER_LIST.18.def` has no
+play-time field - `lastLogoutTime`, `deleteTime` and `banEndTime` are the only times in it - so the
+lobby cannot show it however the figure is stored.

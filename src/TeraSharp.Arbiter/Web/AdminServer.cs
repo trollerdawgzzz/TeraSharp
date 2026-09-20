@@ -630,6 +630,7 @@ async function loadCharacter() {
     <div class='tile'><b>${esc(p.zone)}</b><span>zone</span></div>
     <div class='tile'><b>${esc(pr.questsActive)} / ${esc(pr.questsCompleted)}</b><span>quests live / done</span></div>
     <div class='tile'><b>${esc(pr.achievements)}</b><span>achievements</span></div>
+    <div class='tile'><b>${dur(pr.playSeconds || 0)}</b><span>play time</span></div>
   </div>`;
   if (d.deleteAt) h += `<div class='card'><b class='chip off'>delete pending</b> `
     + `<span class='note'>due ${when(d.deleteAt)} - restore it from the Deleted tab</span></div>`;

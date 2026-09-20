@@ -446,7 +446,7 @@ Section 6's catalogue, endpoint by endpoint. Everything is gated on the token ex
 |---|---|---|
 | account: fields, characters, benefits, bans, play time, last login | `GET /api/account?id=\|name=` | bans are the union over its characters - the schema keys restrictions on the character |
 | character: money, guild, position, quests, achievements, EP, cards, restrictions | `GET /api/character?id=\|name=` | one call, one page |
-| character: inventory with item names | same | `name` is `""` when no sheet is loaded - see below |
+| character: inventory with item names | same | T113: the client's own `StrSheet_Item*.xml`, merged and lazy; `name` is `""` when no sheet is found - see 11.1.1 |
 | character: warehouse | same, `warehouse[]` | two tabs: account (inven 1, keyed on the ACCOUNT) and character (inven 9) |
 | restore / undelete | `POST /api/restore-character` | T101b; items come back with the row |
 | rename | `POST /api/rename` | runs `CharacterHandlers.ValidateName`, so the tool cannot write a name the game would reject |
@@ -460,7 +460,11 @@ Section 6's catalogue, endpoint by endpoint. Everything is gated on the token ex
 | admin log viewer | `GET /api/admin-log?limit=` | newest first |
 | server status | `GET /api/status`, `GET /api/log?lines=` | T106 |
 
-### 11.1 Item names: why there is no sheet in the box
+### 11.1 Item names: the sheet, and why T101c could not find it
+
+> **T113 supersedes this section's conclusion.** There IS an unpacked strsheet on this box -
+> `WebApp\AppResource\ItemData\StrSheet_Item*.xml` - and `ItemNames` now reads it. The
+> DataCenter paragraphs below still explain why T101c concluded otherwise; 11.1.1 is current.
 
 The brief asks for names "from the item strsheet". There is no strsheet TeraSharp can read:
 
@@ -489,9 +493,55 @@ require('fs').writeFileSync('item_names.tsv',
   [...model.getAll()].map(r => r.itemTemplateId + '\t' + r.string).join('\n'));
 ```
 
+#### 11.1.1 T113: the client's own strsheet, streamed and merged
+
+`WebApp\AppResource\ItemData\` holds the item strsheet already unpacked, as plain XML - the source
+T101c went looking for. No DataCenter parser is needed.
+
+```xml
+<String id="150001" string="Practicum Necklace" toolTip="..."/>
+```
+
+**The two files are DISJOINT, and the brief named the wrong one.** Measured against the real files:
+
+| file | `<String>` elements | usable names |
+| --- | --- | --- |
+| `StrSheet_Item_NAEU.xml` | 19,320 | 19,110 (210 carry `string=""`) |
+| `StrSheet_Item.xml` | - | 34,539 |
+| **ids in both** | | **0** |
+
+The ids TeraSharp's own captures use are in the **full** sheet, not the NAEU one that the brief
+named: 88375 Stormcry Axe, 200997 Minor Battle Solution, 310010 Card Fragment - Legate Mureksark,
+10027 Cleavework Sword. 150001 Practicum Necklace is only in NAEU. Loading one file would have
+labelled roughly half the catalogue and none of the items in the captures, so `Load` **merges every
+candidate** instead of stopping at the first hit; earlier candidates win a conflict, so an explicit
+override still overrides.
+
+Candidates, in order: `$TERASHARP_ITEM_STRSHEET`, `$TERASHARP_ITEM_NAMES`, then under
+`ItemNames.DataRoot`: `WebApp\AppResource\ItemData\StrSheet_Item_NAEU.xml`, the same folder's
+`StrSheet_Item.xml`, `data\item_names.tsv`, and finally `data\item_names.tsv` beside the exe.
+
+Two deliberate choices:
+
+* **Streamed, not a DOM.** `XmlReader` with `DtdProcessing.Prohibit` and `XmlResolver = null`, one
+  element at a time. `toolTip` is most of the bytes and is never read. Holding 3.4 MB of DOM to
+  label one column on a low-memory VPS is the wrong trade - and a data file must never be able to
+  make the Arbiter fetch a DTD.
+* **Lazy.** The first `Lookup` (or the first read of `Count`) loads; a server that never opens the
+  admin page never pays for it. `Reset()` exists for tests.
+
+`string=""` rows are unused template ids, not names, and are dropped - that is the 210.
+
 ### 11.2 Play time
 
-`accounts.play_time_sec` and `GetAccountPlayTime` / `AddAccountPlayTime` exist, and the account
-page reports them. **Nothing feeds the column yet**: T87 made `C_PLAY_TIME` and
-`C_REQUEST_PLAYTIME` plain acks, so a session-length counter has to call `AddAccountPlayTime` on
-leave-world before the figure means anything. It reads 0 until then, which is honest.
+**T113 wired it.** `characters.play_seconds` is stamped at leave-world and
+`AddCharacterPlaySeconds` updates the character row and `accounts.play_time_sec` in one
+transaction, so the account page and the character page cannot disagree. The enter stamp lives in
+`DbProxyHandlers.EnteredAt`, not the database - see `status/PERSISTENCE-MAP.md`, "T113".
+
+The character page carries it as `progress.playSeconds`. The account page's figure is the same
+number summed by the account row. `S_SEND_USER_PLAY_TIME` and `S_PLAY_TIME` both report it.
+
+**`S_GET_USER_LIST` cannot.** The brief asked for it there; the shipped `S_GET_USER_LIST.18.def`
+has no play-time field at all - `lastLogoutTime`, `deleteTime` and `banEndTime` are the only times
+in it - so there is nowhere in the lobby packet to put the figure.

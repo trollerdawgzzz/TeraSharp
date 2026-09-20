@@ -1377,8 +1377,10 @@ CREATE TABLE IF NOT EXISTS watched_movies_account (
         AddColumnIfMissing("guilds", "last_incentive_at", "INTEGER NOT NULL DEFAULT 0");
         // T101b: the soft delete. delete_at (T88) is WHEN the row goes; these two are the
         // audit half - that it went, and who sent it there.
-        // T101c: the account page's play-time figure. Nothing feeds it yet - see AddAccountPlayTime.
+        // T101c: the account page's play-time figure, now fed by rolling up the characters.
         AddColumnIfMissing("accounts", "play_time_sec", "INTEGER NOT NULL DEFAULT 0");
+        // T113: seconds this CHARACTER has spent in world, stamped at leave-world.
+        AddColumnIfMissing("characters", "play_seconds", "INTEGER NOT NULL DEFAULT 0");
         AddColumnIfMissing("characters", "deleted_at", "INTEGER NOT NULL DEFAULT 0");
         AddColumnIfMissing("characters", "deleted_by", "TEXT NOT NULL DEFAULT ('')");
         AddColumnIfMissing("characters", "return_zone", "INTEGER NOT NULL DEFAULT 0");
@@ -4433,13 +4435,65 @@ DELETE FROM restrictions      WHERE character_id = $id;";
         }
     }
 
+    // -------------------------------------------------------- T113: character play time
+
+    /// <summary>
+    /// Seconds this character has spent in world. <c>S_SEND_USER_PLAY_TIME.totalPlaytime</c> and
+    /// <c>S_PLAY_TIME</c> both report it; the real Arbiter keeps the live counter at User+0x1E4
+    /// and we keep the committed total here.
+    /// </summary>
+    public long GetCharacterPlaySeconds(int characterId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT play_seconds FROM characters WHERE id=$id";
+            cmd.Parameters.AddWithValue("$id", characterId);
+            var v = cmd.ExecuteScalar();
+            return v == null || v is DBNull ? 0L : Convert.ToInt64(v);
+        }
+    }
+
+    /// <summary>
+    /// Add a finished session to the character AND to its account, in one transaction. Returns
+    /// the character's new total. A negative or zero delta is ignored rather than rolled back -
+    /// a clock that went backwards must not eat a player's history.
+    /// </summary>
+    public long AddCharacterPlaySeconds(int characterId, long deltaSeconds)
+    {
+        if (deltaSeconds <= 0) return GetCharacterPlaySeconds(characterId);
+        lock (_lock)
+        {
+            using var tx = _db.BeginTransaction();
+            using (var chr = _db.CreateCommand())
+            {
+                chr.Transaction = tx;
+                chr.CommandText = "UPDATE characters SET play_seconds = play_seconds + $d WHERE id=$id";
+                chr.Parameters.AddWithValue("$d", deltaSeconds);
+                chr.Parameters.AddWithValue("$id", characterId);
+                if (chr.ExecuteNonQuery() != 1) { tx.Rollback(); return 0L; }
+            }
+            using (var acct = _db.CreateCommand())
+            {
+                acct.Transaction = tx;
+                acct.CommandText =
+                    "UPDATE accounts SET play_time_sec = play_time_sec + $d " +
+                    "WHERE id = (SELECT account_id FROM characters WHERE id=$id)";
+                acct.Parameters.AddWithValue("$d", deltaSeconds);
+                acct.Parameters.AddWithValue("$id", characterId);
+                acct.ExecuteNonQuery();
+            }
+            tx.Commit();
+        }
+        return GetCharacterPlaySeconds(characterId);
+    }
+
     // -------------------------------------------------------- T101c: account play time
 
     /// <summary>
-    /// Seconds this account has been in world. <b>Nothing feeds this yet</b> - T87 made
-    /// <c>C_PLAY_TIME</c> and <c>C_REQUEST_PLAYTIME</c> acks, and neither stores anything, so the
-    /// account page reports 0 until a session-length counter calls
-    /// <see cref="AddAccountPlayTime"/> on leave-world.
+    /// Seconds this account has been in world - the sum of its characters' <c>play_seconds</c>.
+    /// T113 wired it: <see cref="AddCharacterPlaySeconds"/> adds to both in one transaction when
+    /// a session ends, so this and the per-character figure cannot drift.
     /// </summary>
     public long GetAccountPlayTime(long accountId)
     {

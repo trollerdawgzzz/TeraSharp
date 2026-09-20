@@ -4389,6 +4389,57 @@ public sealed class DbProxyHandlers
 
     // ---- Static-data handler builder ----
 
+    // =========================================================================================
+    // T113: play time. Keyed on playerId, beside GameIdByPlayer, for the same reason - the
+    // Arbiter's per-player state that is not worth a column and not reachable from a handler.
+    //
+    // The real Arbiter keeps a live counter at User+0x1E4 and S_PLAY_TIME reads it straight off.
+    // We keep the ENTER stamp here and commit the difference to characters.play_seconds at
+    // leave-world, so a crash costs one session rather than the whole history.
+    // =========================================================================================
+
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, long> EnteredAt = new();
+
+    /// <summary>Stamp the moment this player entered the world. Called from SDB_USER_ENTERWORLD.</summary>
+    public static void MarkEnteredWorld(int playerId, long nowUnix)
+    {
+        if (playerId > 0) EnteredAt[playerId] = nowUnix;
+    }
+
+    /// <summary>Seconds since the enter stamp, or 0 when there is none (never entered, or
+    /// already closed out). Does NOT clear the stamp - S_PLAY_TIME asks mid-session.</summary>
+    public static long SecondsInWorld(int playerId, long nowUnix)
+    {
+        if (playerId <= 0 || !EnteredAt.TryGetValue(playerId, out long since)) return 0;
+        long secs = nowUnix - since;
+        return secs > 0 ? secs : 0;
+    }
+
+    /// <summary>
+    /// Close the session out: take the stamp, clear it, and return the seconds to commit.
+    /// Returns 0 when there was no open session, so calling this twice adds nothing twice.
+    /// </summary>
+    public static long TakeSessionSeconds(int playerId, long nowUnix)
+    {
+        if (playerId <= 0 || !EnteredAt.TryRemove(playerId, out long since)) return 0;
+        long secs = nowUnix - since;
+        return secs > 0 ? secs : 0;
+    }
+
+    /// <summary>
+    /// The whole of it: close the session out and add it to the row. Safe to call for a player
+    /// who never entered. This is what the leave-world path calls.
+    /// </summary>
+    public long CommitPlayTime(int playerId, long nowUnix)
+    {
+        long secs = TakeSessionSeconds(playerId, nowUnix);
+        if (secs <= 0) return 0;
+        long total = _store.AddCharacterPlaySeconds(playerId, secs);
+        _log.LogInformation("play time: player {Id} played {Secs}s this session, {Total}s total",
+            playerId, secs, total);
+        return secs;
+    }
+
     /// <summary>
     /// Clones a captured reply template and patches the live reqId at the documented offset.
     /// Used for data-bearing handlers where the rest of the payload is character-specific
@@ -4424,6 +4475,13 @@ public sealed class DbProxyHandlers
         if (p.Length < 18) { _log.LogWarning("SDB_USER_ENTERWORLD too short ({Len})", p.Length); return false; }
         uint replyId = U32(p, 10);
         int playerId = (int)U32(p, 14);
+
+        // T113: a previous session that never saw SA_LEAVE_WORLD (a crash, a dropped link) is
+        // closed out here rather than lost - this is the one point we are certain the player is
+        // not in world any more, because they are entering it.
+        long enterUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        CommitPlayTime(playerId, enterUnix);
+        MarkEnteredWorld(playerId, enterUnix);
 
         var chr = _store.GetCharacter(playerId);
         bool found = chr?.WorldBlob != null && chr.WorldBlob.Length == WorldBlobSize;
