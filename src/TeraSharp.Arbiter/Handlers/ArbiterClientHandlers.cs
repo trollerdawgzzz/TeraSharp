@@ -2196,6 +2196,57 @@ public static class ArbiterClientHandlers
         return p;
     }
 
+    // ---------------------------------------------------------------- T120: where it goes
+    //
+    // Alt+A did not open even with status 33 and a byte-identical
+    // S_RESPONSE_SERVER_ADMINTOOL_AWESOMIUM_URL. Diffing cap_ts_gm_client.log against
+    // cap_final_gm_client2.log packet by packet from C_SELECT_USER to the first C_ADMIN_*
+    // leaves exactly one difference: WHERE this push sits.
+    //
+    //   real   ... 97 S_USER_ITEM_EQUIP_CHANGER, 98 S_FESTIVAL_LIST,
+    //          99 S_ADMIN_GM_SKILL, 100 S_LOAD_TOPO, ... 271 C_LOAD_TOPO_FIN, 296 S_SPAWN_ME
+    //   ours   ... 772 S_USER_ITEM_EQUIP_CHANGER, 773 S_FESTIVAL_LIST, 774 S_LOAD_TOPO,
+    //          ... 970 C_LOAD_TOPO_FIN, 975 S_ADMIN_GM_SKILL, 986 S_SPAWN_ME
+    //
+    // Every other packet in 94..101 matches name for name. The real Arbiter sends this one
+    // INSIDE the S_LOGIN burst, in the slot immediately before S_LOAD_TOPO, and does it again
+    // on the next topo load (frames 546 -> 549). T107 put it on C_LOAD_TOPO_FIN instead, which
+    // is ~200 frames later and on the far side of the topo transition, so the client has
+    // already built the in-game UI by the time the flag arrives.
+    //
+    // The other three candidates are ruled out by the same diff:
+    //   * S_LOGIN_ARBITER.status is 33 in both, byte for byte (frame 7 in each).
+    //   * S_RESPONSE_SERVER_ADMINTOOL_AWESOMIUM_URL is 08 00 0A 00 00 00 00 00 in both - the
+    //     real Arbiter answers with an EMPTY Title and an EMPTY Url too. Its PDL dumper
+    //     (Arb_part_022.c:13286, guard 7 < len) names the two u16 refs Title and Url; there is
+    //     no Handler_C_REQUEST_SERVER_ADMINTOOL_AWESOMIUM_URL anywhere in the 96 decompile
+    //     parts, so on a real stack the reply comes from World, not here.
+    //   * S_ADMIN_HOLD_CHARACTER is 05 00 0E A3 00 in both; the real one arrives ~106 frames
+    //     AFTER S_SPAWN_ME (402, 675, 914), never in this burst.
+    // And cap_final_gm_client - the one GM capture where the panel did NOT open - has
+    // status 31 and no S_ADMIN_GM_SKILL at all.
+
+    /// <summary>The packet the enter-world GM-skill push follows (cap_final_gm_client2 98).</summary>
+    public const string AdminGmSkillFollows = "S_FESTIVAL_LIST";
+
+    /// <summary>The packet it must precede (cap_final_gm_client2 100). Not C_LOAD_TOPO_FIN.</summary>
+    public const string AdminGmSkillPrecedes = "S_LOAD_TOPO";
+
+    /// <summary>Who gets it: nobody below the gate, and no capture of a non-GM has one.</summary>
+    public static bool OperatorGetsGmSkillPush(int adminLevel)
+        => adminLevel >= GmAccounts.MinimumAdminLevel;
+
+    /// <summary>
+    /// The enter-world push, in the real Arbiter's slot. Call it from the S_LOGIN burst
+    /// between <see cref="AdminGmSkillFollows"/> and <see cref="AdminGmSkillPrecedes"/>,
+    /// and again wherever a later S_LOAD_TOPO is sent. Silent for a non-operator.
+    /// </summary>
+    public static void SendAdminGmSkillIfOperator(GameSession s, int adminLevel)
+    {
+        ArgumentNullException.ThrowIfNull(s);
+        if (OperatorGetsGmSkillPush(adminLevel)) s.Send(BuildAdminGmSkill(0, on: true));
+    }
+
     // =========================================================================================
     // 16. The tool's user-info replies, and the two leaderboard pushes                  (T91)
     // =========================================================================================
