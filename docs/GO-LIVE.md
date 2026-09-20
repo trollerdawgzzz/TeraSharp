@@ -20,6 +20,33 @@ If you take one item from this document, take that one.
 
 ---
 
+## 0.5 Check what the process actually resolved
+
+Before every other step, and again after the last one:
+
+```
+TeraSharp.Arbiter.exe --check-config
+```
+
+It prints every `TERASHARP_*` variable, the paths and ports the process resolved from
+them, and a short notes block - then exits without touching the database or a socket.
+The admin token is printed as `(set, 48 chars)`, never as itself.
+
+Lines beginning `!` are the traps that are legal, silent and almost always wrong:
+
+- `TERASHARP_GM_ACCOUNTS` holding a display name instead of an accountDBID
+- auth OPEN
+- a short or unset `TERASHARP_ADMIN_TOKEN`
+- the admin web still on 8050, where tera-api's own panel lives
+- `TERASHARP_BIND` off `127.0.0.1`
+
+A clean config prints no `!` line. `--selftest` is the sibling: that one asks whether the
+DEPLOY is complete, this one asks what the CONFIGURATION came out as.
+
+- [ ] `--check-config` run on the server itself, and no `!` line left
+
+---
+
 ## 1. Turn auth on
 
 Off by default, which is right for a laptop and wrong for the internet.
@@ -119,6 +146,18 @@ The box is a VPS. The defaults assume a workstation.
 setx /M TERASHARP_LOG_LEVEL Warning
 setx /M TERASHARP_LOGS D:\packetlogs
 ```
+
+Item names in the admin web come from the client's own strsheet, loaded lazily on the
+first lookup. Both files under `WebApp\AppResource\ItemData\` are read and merged -
+they cover different id ranges and neither is a superset - so nothing needs generating:
+
+```
+setx /M TERASHARP_ITEM_STRSHEET D:\v100\TERA_SERVER.100\WebApp\AppResource\ItemData\StrSheet_Item.xml
+```
+
+Only needed if `TERASHARP_DATA` does not point at the folder holding `WebApp\`. Roughly
+9 MB of strings once something opens an inventory page; a server whose admin web is never
+opened never loads it.
 
 Console is `Warning` by default since T106; the daily file under `TERASHARP_LOGS`
 still gets everything from Debug. Set `Information` only while chasing something,
@@ -235,10 +274,11 @@ Start-Process -FilePath (Join-Path $root 'Executable\WorldServer.exe') `
 
 These are known and unfixed, not oversights:
 
-- **Play time** (`accounts.play_time_sec`) reads 0. Nothing feeds it - `C_PLAY_TIME`
-  is an ack. See `status/WEBADMIN-DESIGN.md` 11.2.
-- **Item names** in the admin web show template ids unless you generate
-  `data/item_names.tsv`. See `status/WEBADMIN-DESIGN.md` 11.1.
+- ~~**Play time** reads 0~~ - **fixed (T113)**: stamped at leave-world into
+  `characters.play_seconds` and `accounts.play_time_sec`. It cannot appear in the lobby
+  though: `S_GET_USER_LIST.18.def` has no play-time field.
+- ~~**Item names** show template ids~~ - **fixed (T113)**: read from the client's own
+  `StrSheet_Item*.xml`. See `status/WEBADMIN-DESIGN.md` 11.1.1.
 - **`S_ADMIN_GM_SKILL` and `S_ADMIN_HOLD_CHARACTER` are pushed to every player**, not
   just GMs (`HandlerRegistry.cs`, T89). The real server sends neither to a non-GM.
   It is not what opens Alt+A, so it is not a privilege hole - but it should be gated.

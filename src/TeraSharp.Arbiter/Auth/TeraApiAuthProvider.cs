@@ -114,6 +114,11 @@ public sealed class TeraApiAuthProvider : IAuthProvider
         {
             using var doc = JsonDocument.Parse(payload);
             var root = doc.RootElement;
+            // A JSON array or a bare scalar is still valid JSON, and TryGetProperty throws on
+            // one - a reverse proxy that answers [] must reject the login, not crash the call.
+            if (root.ValueKind != JsonValueKind.Object)
+                return AuthResult.Reject(AuthResult.CodeUnreachable,
+                    "tera-api sent a " + root.ValueKind + ", not an object");
             bool ok = root.TryGetProperty("Return", out var ret)
                       && ret.ValueKind == JsonValueKind.True;
             int code = root.TryGetProperty("ReturnCode", out var rc) && rc.TryGetInt32(out int c) ? c : 0;

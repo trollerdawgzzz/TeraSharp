@@ -238,7 +238,11 @@ public sealed class AdminApi
           .Append(",\"questsActive\":").Append(_store.CountQuests(c.Id))
           .Append(",\"questsCompleted\":").Append(_store.GetCompletedQuestIds(c.Id).Count)
           .Append(",\"achievements\":").Append(_store.GetAccomplishedAchievements(c.Id).Count)
-          .Append(",\"sectionsVisited\":").Append(_store.GetVisitedSections(c.Id).Count).Append('}');
+          .Append(",\"sectionsVisited\":").Append(_store.GetVisitedSections(c.Id).Count)
+          // T113: play time has a real figure now - stamped at leave-world. S_GET_USER_LIST has
+          // no field for it (checked the def: lastLogoutTime, deleteTime and banEndTime are the
+          // only times in it), so the admin page is where it can actually be shown.
+          .Append(",\"playSeconds\":").Append(_store.GetCharacterPlaySeconds(c.Id)).Append('}');
 
         // T101d: null until the ep_* columns have actually been written.
         //

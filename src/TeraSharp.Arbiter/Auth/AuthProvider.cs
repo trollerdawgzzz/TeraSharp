@@ -88,10 +88,37 @@ public static class AuthProviders
     /// </summary>
     public static IAuthProvider FromEnvironment(ILogger log)
     {
+        ArgumentNullException.ThrowIfNull(log);
         bool enabled = EnabledFromEnvironment(Environment.GetEnvironmentVariable(EnableVariable));
-        if (!enabled) return new AcceptAllAuthProvider();
+        if (!enabled)
+        {
+            // T113: say it loudly, and say it here rather than in Program, so it is true
+            // wherever the provider is built from. A server that went public with this line in
+            // its log is a server anyone can log into as anyone.
+            log.LogWarning(
+                "AUTH IS OFF - every C_LOGIN_ARBITER is accepted, whatever ticket it carries. "
+                + "Set {Var}=true before this server is reachable from the internet.",
+                EnableVariable);
+            return new AcceptAllAuthProvider();
+        }
         string url = Environment.GetEnvironmentVariable(UrlVariable) ?? DefaultUrl;
+        log.LogInformation(
+            "auth: tera-api at {Url}{Endpoint} - fail closed (a timeout, a non-200 or an "
+            + "unparseable body all reject the login)",
+            url.TrimEnd('/'), TeraApiAuthProvider.Endpoint);
         return new TeraApiAuthProvider(url, log);
+    }
+
+    /// <summary>
+    /// The one-line description <c>--check-config</c> and the startup banner print. Kept beside
+    /// the factory so the two can never disagree about what the process is doing.
+    /// </summary>
+    public static string DescribeMode()
+    {
+        bool enabled = EnabledFromEnvironment(Environment.GetEnvironmentVariable(EnableVariable));
+        if (!enabled) return "OPEN - every login accepted (" + EnableVariable + " is not true)";
+        string url = (Environment.GetEnvironmentVariable(UrlVariable) ?? DefaultUrl).TrimEnd('/');
+        return "tera-api " + url + TeraApiAuthProvider.Endpoint + " (fail closed)";
     }
 
     /// <summary>
