@@ -8,16 +8,24 @@ Read order for anyone new: `CLAUDE.md` (workspace rules at the top) -> `status/H
 (every per-user W->A opcode and how it is answered) -> this file.
 
 Build: `dotnet build TeraSharp.sln` — 0 warnings, 0 errors.
-Tests: `dotnet run --project src\TeraSharp.Arbiter.Tests` — **605**.
+Tests: `dotnet run --project src\TeraSharp.Arbiter.Tests` — **808** `[Test]` methods.
 Deploy check: `TeraSharp.Arbiter.exe --selftest` — one PASS/FAIL line per data dependency (T37).
+Config check: `TeraSharp.Arbiter.exe --check-config` — every `TERASHARP_*`, the resolved paths
+and ports, and the four settings that are legal, silent and wrong (T113).
+One page on processes, ports, the file map and the env: `docs/ARCHITECTURE.md` (T114).
 
-**Where the project is (2026-09-15).** T1-T51 are merged. Two accounts on two clients have been in
-the world at once, seeing each other and chatting (the multiplayer milestone, 2026-09-15 00:25), and
-a single player's whole loop — create, play, loot, quest, teleport, exit, relog — is live-verified.
-Everything merged since that milestone (T45-T51: whisper, the 18 Arbiter-owned client packets,
-parties, guilds, GM forwarding, AdminLevel, the security audit) is **implemented, unit-tested and
-live-untested**. `status/LIVE-CHECKLIST.md` is the pass that closes that gap and is the next thing
-to do.
+**Where the project is (2026-09-20).** T1-T113 are merged. The single-player loop and two players
+in one world are live-verified; so are the T105 fixes that came out of a real session (the starter
+kit was handing every character the same six item db ids, and `/@perfect_level` wrote a row the blob
+then overwrote). Since T64 the work has been **breadth**: every client packet the real Arbiter
+handles is now either registered or deliberately left out — 201 of 273, with the remaining 72 listed
+in `status/MISSING-HANDLERS.txt` and all of them belonging to systems nobody has started (lord and
+city war, petitions, guild quests, the TBA battlepass, rankings, name and appearance change).
+
+Almost all of that breadth is **live-untested**. `status/LIVE-CHECKLIST.md` is still the pass that
+closes the gap, and `docs/GO-LIVE.md` is the ordered checklist for putting this in front of players.
+The one piece of finished work that is not in master is `status/MULTIWORLD-PATCH.diff` — T103/T108/
+T111/T112's changes to the four human-owned files — which waits on the section 5 capture.
 
 ---
 
@@ -42,7 +50,7 @@ exist, nothing routes to it.
 | Friends, friend groups, memos, block list — two-step requests, all from rows | **live** (T30) |
 | Character delete, cascading every per-character table | **live** |
 | Multiple players — TicketAllocator, N-recipient `SA_BYPASS_TO_CLIENT`, per-ticket reorder | **live** (T38 routing) |
-| Account auth | **live** as accept-all; tera-api validation behind `TERASHARP_AUTH=true` (T31) |
+| Account auth | **live** as accept-all; tera-api validation behind `TERASHARP_AUTH=true` (T31), its reply shape and fail-closed timeout tested, startup banner names the mode (T113) |
 | GM `/@` recognised by the client (`S_LOGIN_ARBITER.status` 31) | **live** (T32) |
 | Whisper through `ChatManager`, recipients via `WorldBridge.SessionForPlayerId` | **wired** (T43/T47) |
 | The 18 client packets World rejects — tooltip reply, visited sections, client log, small acks | **wired** (T45) |
@@ -55,9 +63,22 @@ exist, nothing routes to it.
 | GM World forward (anything not Arbiter-owned -> `AS_ADMIN_COMMAND` 0x2829) + `AS_ENTER_WORLD[111]` AdminLevel | **wired** (T46/T47) |
 | Packet-handling security — bounds, pagination, allocate-by-count, 37k-input fuzz suite | **wired** (T48/T50), 2 human-owned items open |
 | Private chat channels — the channel object, join/leave/kick/password | **designed** (T43), no client packet ever seen |
-| Trade broker — 57 opcodes mapped, codec, 4 corrected `.def`s; the 5 DLM requests answered with the refusal form; 15 `C_` packets answer empty | **half real** (T53 research, T55 answers). No listings table — waits on a capture |
-| Lord / election / city war, petitions, rankings, appearance & name change, TBA battlepass | **not started** |
-| Multi-World / multi-planet | **not started** |
+| Trade broker — 57 opcodes mapped, codec, 4 corrected `.def`s, the 5 DLM requests answered | **wired** (T53/T55/T71/T72/T74/T81). Search, my-listings and sold tabs are served from real `BrokerListed`/`BrokerSold` rows; only the seller-side capture of T81 pinned the last two layouts |
+| Lord / election / city war, petitions, guild quests, rankings, appearance & name change, TBA battlepass | **not started** — and these are precisely the 72 in `status/MISSING-HANDLERS.txt` |
+| Multi-World / multi-planet | **designed** (T103/T108/T109/T111/T112) — the Cowork-owned half is in master; the four human-owned files are not, and wait as `status/MULTIWORLD-PATCH.diff` |
+| Cards and crests — `cards` per ACCOUNT, `card_mounts` per character, `crests` from `SA_LEARN_ALL_CREST_ACQUIRABLE` | **wired** (T83/T85/T85b/T86) |
+| Guild perks, crest windows, the guild board, guild search, level ranking, the flag image | **wired** (T83/T95) |
+| The In-Game Operation Tool (Alt+A) — 9 `C_ADMIN_*`, user-info tabs, the 400-byte inventory record, bookmarks, the panel's own URL reply | **wired** (T89/T91/T93/T99/T107) |
+| The lobby, packet for packet — `S_LOGIN_ARBITER.status` 31/33, `S_DECO_UI_INFO`, `S_CONFIRM_INVITE_CODE_BUTTON`, `S_CURRENT_ELECTION_STATE` | **wired** (T89b/T104/T106/T106b/T106c) |
+| The ack / small-reply batch — 26 packets read out of their own `Handler_C_*`, none in any capture | **wired** (T97) |
+| Item strings, board posts, item preview, trade log, dungeon ranking, the GM tool tail | **wired** (T99) |
+| Watched movies — stored per ACCOUNT, so the intro cutscene stops replaying every relog | **wired** (T104) |
+| Admin web — account and character pages, search, online list, grants, bans, announces, admin log, status tab with a live log tail | **wired** (T101/T101b/T101c/T101d/T106), served on loopback behind `TERASHARP_ADMIN_TOKEN` |
+| Item names in the admin web — the client's own `StrSheet_Item*.xml`, both sheets merged, loaded lazily | **wired** (T101c/T113) |
+| Play time — `characters.play_seconds` stamped at leave-world, account total in the same transaction | **wired** (T113). Not in `S_GET_USER_LIST`: that def has no field for it |
+| Logging — console at Warning, a daily `arbiter-<date>.log` taking everything, the spam pushes at Debug | **wired** (T106) |
+| Starter kit item db ids drawn from the shared counter instead of a fixed 7..12 | **live** (T105, found and fixed from a real session) |
+| Go-live kit — default-deny firewall, scheduled SQLite backup with a verified restore, the checklist | **wired** (`tools/harden-netcup.ps1`, `tools/backup-db.ps1`, `docs/GO-LIVE.md`) |
 ## Where the truth lives
 
 | Question | File |
@@ -96,6 +117,10 @@ exist, nothing routes to it.
 | Why a fresh mailbox showed 12 blank rows, and the 35-byte empty `DBS_LIST_PARCEL` | `status/CLIENT-REJECTS.md` section 4 |
 | Whisper, private channels, the slot-not-an-id trap, and the chat .def corrections | `status/CHAT-DESIGN.md` |
 | The `SocialHandlers.OnWhisper` -> `ChatManager` swap, and what it changes for blocked users | `status/CHAT-DESIGN.md` section 7.2 |
+| What runs, on which port, and which file owns which system | `docs/ARCHITECTURE.md` |
+| Which client packets are still unregistered, and how that number is produced | `status/MISSING-HANDLERS.txt`, `tools/count-handlers.ps1` |
+| Turning this on for real players, in order | `docs/GO-LIVE.md` |
+| Multi-World: the design, and the patch the human-owned files still need | `status/MULTIWORLD-DESIGN.md`, `status/MULTIWORLD-PATCH.diff` |
 
 ## The three rules that cost the most to learn
 
@@ -126,24 +151,27 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   `src/TeraSharp.Arbiter.Tests/`, `status/*.md`, `data/*` — plus any new file a task brief names
   explicitly. That last clause is how `World/ChatManager.cs`, `World/ActionDispatcher.cs`,
   `World/ParcelDbHandlers.cs`, `World/PartyWiring.cs`, `World/GuildWiring.cs`,
-  `Handlers/GuildHandlers.cs` and `Handlers/ArbiterClientHandlers.cs` came to exist; once created
-  they stay editable.
+  `Handlers/GuildHandlers.cs`, `Handlers/ArbiterClientHandlers.cs`, `World/GuildWarManager.cs`,
+  `World/WorldRegistration.cs`, `World/WorldInstances.cs`, `World/WorldServerList.cs`,
+  `Web/AdminApi.cs`, `Web/AdminServer.cs`, `Web/ArbiterLog.cs`, `Protocol/ItemNames.cs`,
+  `tools/*` and `docs/*` came to exist; once created they stay editable.
 - **Human-owned — describe the change, never edit:** `World/WorldBridge.cs`,
   `World/TunnelFrames.cs`, `Network/*`, `Handlers/WorldEntry.cs`, `Handlers/HandlerRegistry.cs`,
   `Handlers/LoginHandlers.cs`, `Program.cs`.
 
 ## Cowork task queue
 
-- [x] **T1-T51 merged.** `git log --oneline` is the record; the last merge is
-  `Merge cowork T48+T50: security audit + fuzz suite (37k hostile inputs green)`.
-- [ ] **T52** — guild `SA_` direction + `C_INVITE_USER_TO_GUILD` (in flight).
-- [x] **T53** — trade broker research + codec (`status/BROKER-DESIGN.md`, `World/BrokerPackets.cs`).
-- [x] **T55** — broker DLM answers: the five `SDB_TRADE_BROKER_*` that carry a DlmId are
-  answered, so opening the broker no longer wedges the character. Needs the one
-  `HandlerRegistry` loop (`status/BROKER-DESIGN.md` §8.2).
-- [ ] **T54** — docs and the live checklist brought up to master (this pass).
-- [ ] The live pass itself: `status/LIVE-CHECKLIST.md` sections 5-11, two clients.
+- [x] **T1-T113 merged.** `git log --oneline` is the record; the last merge is
+  `Merge cowork T113 + wiring: play time, item names, check-config`.
+- [x] **T114** — docs refreshed from git: this table, `CLAUDE.md` section 0,
+  `status/MISSING-HANDLERS.txt` (regenerated, 126 -> 72) and `docs/ARCHITECTURE.md`.
+- [ ] **The live pass.** `status/LIVE-CHECKLIST.md` sections 5-11, two clients, ~45 minutes.
+  It has been the next thing to do since T51 and the untested surface has grown every task
+  since; almost everything in the table above marked **wired** is waiting on it.
+- [ ] **Apply `status/MULTIWORLD-PATCH.diff`** (`git apply`, not `patch -p1` — T112) once the
+  `status/CAPTURE-PLAN.md` section 5 capture settles the ticket-overlap question.
 - [ ] Then the two capture sessions in `status/CAPTURE-PLAN.md`, in that order.
+- [ ] **Go live**: `docs/GO-LIVE.md`, in order, ending at the firewall.
 
 ## Open
 
