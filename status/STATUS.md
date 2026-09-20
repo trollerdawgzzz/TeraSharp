@@ -1046,3 +1046,42 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   Tests: `T128_the_visibility_switch_is_frames_99_and_546`,
   `T128_the_toggle_state_is_per_player_and_resets_on_world_entry`,
   `T128_vis_and_invis_are_arbiter_side_commands`.
+
+- T130: **Noctenium `.npcap` converter** (`tools/npcap-to-capture.ps1`, `tools/README.md`).
+  `D:\packetlogs\classic_live.npcap` is a client-side capture of the **live Classic+ server** -
+  the first working non-GM reference this project has had - and nothing could read it.
+
+  **The container, reversed from the first records and then verified over all 7 391:**
+
+  ```
+  file header 16 B:  "NPCP" | u32 version=2 | u64 capture start, UNIX NANOSECONDS
+  record      14 B:  u16 type | u64 ns since client start | u32 payloadLen | payload
+  ```
+
+  `type` is direction AND view: 0 = S->C wire, 1 = C->S wire, 2 = S->C packet, 3 = C->S
+  packet. A **wire** record is one socket read and holds zero or more whole frames back to
+  back; a **packet** record is exactly one frame. The chain covers the file to the byte, the
+  u64s are monotonic with no exceptions, and the header's `1789912872310233200` ns decodes to
+  `2026-09-20 14:01:12 UTC` - the `-100112` in the file's own name at UTC-4, which is what
+  pins the field as nanoseconds rather than ticks or FILETIME.
+
+  **The two views are not copies.** Noctenium is a proxy, so a packet a mod rewrites or
+  injects is in the packet view and never on the socket. Here they are byte-identical for the
+  first 5 433 S->C frames and 27 C->S frames, then diverge: 6 467 packet frames vs 6 441 wire.
+  The script walks both whichever you ask for and prints where they part.
+
+  **Ran it.** 7 391 records -> `classic_live.log`, 6 467 frames (6 300 S->C, 167 C->S);
+  `reframe-client.ps1` on that: **6 467 packets, no rejects, no renames**, so the live
+  Classic+ server speaks the same 376012 map this build does.
+
+  **It confirms T126 and refutes T119.** The live `S_PVE_RANKING_LIST` element reads
+  `here=8 next=57 nameRef=39 rookie=0 changedRank=0 rank=1 stageLevel=3 clearTime=173140
+  class=9` - rank at +11 and the i64 at +19 being a real clear time (2m53s), exactly the
+  layout T126 re-pointed to and not the rank@15 / score@19 T119 shipped. `S_PVP_RANKING_LIST`
+  likewise: rank at +11, rating at +15, class at +19, 23-byte element. `S_USER_PVE_RANKING`
+  is 25 B and `S_USER_PVP_RANKING` 17 B, the sizes T126 built, and the PvE one is all zeroes
+  for an unranked viewer - the "answer with rank 0 rather than skip the frame" T126 chose.
+
+  Two divergences from what TeraSharp sends, both worth a later task: the live season is
+  **15**, not 1, and `S_PVE_LEADER_BOARD_INFO` carries **8** dungeon ids where T91's captured
+  frame carried 3.
