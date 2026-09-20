@@ -777,7 +777,7 @@ CREATE TABLE IF NOT EXISTS characters (
   -- T138c: the battleground rating. Every S_BATTLE_FIELD_RESULT moves it by a random 5..12,
   -- up on a win and down on a loss, floored at 0 - see World/BattlegroundRating.cs. It is a
   -- LEADERBOARD number and nothing else: S_PVP_RANKING_LIST's `rating` field renders it, and
-  -- the matchmaker never reads it (the T138 brief: "no MMR").
+  -- the matchmaker never reads it (the T138 brief: no MMR).
   bg_rating INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
