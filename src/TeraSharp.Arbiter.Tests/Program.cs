@@ -12073,6 +12073,42 @@ bool   isGuildWarAcceptable
             "and the frame the client sees - 15 bytes of 0x8AFB");
     }
 
+    /// <summary>
+    /// T131 - S_VERSION_INFO, byte-exact against cap_final_gm_client2 records 286 and 2648.
+    /// T129's diff found it is the only non-content S_ opcode the real Arbiter sends that we
+    /// never did. Both captured logins put it in the same slot of the post-C_LOAD_TOPO_FIN
+    /// burst: after S_LOAD_CLIENT_USER_SETTING, immediately before S_PARCEL_READ_RECV_STATUS.
+    /// </summary>
+    [Test] public static void T131_version_info_is_byte_exact()
+    {
+        Hex.Eq(ArbiterClientHandlers.BuildVersionInfo(),
+            "0D 00 67 B7 0B 00 00 00 00 00 01 00 00",
+            "cap_final_gm_client2 record 286 (and 2648) - 13 bytes of 0xB767");
+
+        // The two fixed-width fields move, and nothing else does. revision is 0 in the capture,
+        // NOT the 376056 S_SERVER_BUILD_INFO carries, so the default has to stay 0.
+        Hex.Eq(ArbiterClientHandlers.BuildVersionInfo(376056, display: false),
+            "0D 00 67 B7 0B 00 F8 BC 05 00 00 00 00",
+            "revision at body 2, display at body 6");
+
+        // And the hand-built frame agrees with the def, so the layout claim is not just a story
+        // about the capture: the one string ref leads, then the scalars, and the ref reads 11 -
+        // packet-relative, so body index 7.
+        var defs = LoadDefinitionsOrSkip();
+        if (defs == null) return;
+        var def = defs.Get("S_VERSION_INFO");
+        Hex.True(def != null, "S_VERSION_INFO.1.def is present");
+        var body = new DefinitionWriter().Write(def!, new Dictionary<string, object>
+        {
+            ["revision"] = 0,
+            ["description"] = "",
+            ["display"] = 1,
+        });
+        Hex.Eq(Framed(ArbiterClientHandlers.S_VERSION_INFO, body),
+            "0D 00 67 B7 0B 00 00 00 00 00 01 00 00",
+            "the def writes the same 13 bytes the builder does");
+    }
+
     // ---- The rules ----
 
     [Test] public static void T30_system_message_format_matches_the_capture()
