@@ -212,3 +212,65 @@ pins that against the same capture bytes the T10 tests use.
    Ticket alone. Whether that needs a compound key is section 5 point 5, unanswered.
 3. **`GameSession` has no `CurrentWorldId`.** Until it does, the leave/enter hand-off cannot name
    its source World, and `TunnelFromClient` still sends to world 0.
+
+### 7.1 There is no allocator - 0x164C/0x164D feeds MatchServer, not the Arbiter
+
+Section 7's open item 1 said "nobody allocates an instance" and pointed at the per-World load
+feed. That was the wrong guess. **The Arbiter does not balance anything: a continent belongs to
+exactly one World, from config.**
+
+`WorldSessionManager::GetDataSession(int continentId)` (Arb_part_046.c:2545) is the lookup
+`Handler_SA_REQUEST_ENTER_DUNGEON` uses to pick the target World, and it is a config read:
+
+| Step | Behaviour |
+|---|---|
+| hash the continentId in the PlanetInfo registry | miss -> `GetDataSession(%d): invalid continentId`, null |
+| read that continent's `worldServerInfo` list | empty -> `GetDataSession(%d): no worldServerInfo in PlanetInfo`, null |
+| **count != 1** | assert at `WorldSessionManager.cpp(356)`, null - **one continent, one World** |
+| `worldServerInfo[0]` | the worldId, guarded `< 0x20`, else `GetDataSession(%d): invalid worldServerId=%d` |
+| | then the World session for that id |
+
+(There is a fourth path for `TBA` worlds: `TBA world session should be accessed through worldId,
+not continentId`.)
+
+The only health notion the Arbiter keeps is boolean. `WorldSessionManager` holds a fixed **32-slot
+array** (base +0x30, stride 0x38); `GetWorldServerStatus(worldId)` is `slot.state == 2`, and 2 is
+written in exactly one place - Arb_part_046.c:9455, when a World's last bypass session registers,
+next to `WorldServerSession Registered [id=%2d]`. That 0x20 ceiling is the same one T103 pinned in
+`Handler_SA_REGISTER`.
+
+**So what is the status feed for?** MatchServer.
+
+| Op | Dir | Shape |
+|---|---|---|
+| 0x164C `AS_REQUEST_WORLD_SERVER_STATUS` | A->W | **no payload at all** - 6-byte frame. Its dumper (FUN_140191710, Arb_part_011.c:19764) writes the name and returns. |
+| 0x164D `SA_WORLD_SERVER_STATUS` | W->A | guard `param_3 < 0x16` -> min frame 22. `+6 i32 (list count, the handler never reads it)`, `+0x0A i32 first element offset (frame-relative)`, `+0x0E i32 PlanetId`, `+0x12 i32 WorldId`, then N x 16-byte `InstanceList` elements `[i32 here][i32 next][i32 A][i32 B]` |
+| 0x4670 `AM_WORLD_SERVER_STATUS` | A->Match | what the handler actually produces |
+
+The Arbiter sends 0x164C from two places and stores nothing from the answer:
+
+1. **Arb_part_046.c:9494** - one shot on that World's own link, the instant its last bypass
+   session registers and the slot goes to state 2.
+2. **Arb_part_070.c:8723** - broadcast to every World session when the MatchServer link comes up
+   (it sits immediately after an `AM_COMMAND` 0x4669 send).
+
+`Handler_SA_WORLD_SERVER_STATUS` (Arb_part_062.c:18812) looks up the MatchServer session, returns
+0 and sends nothing if there is none, and otherwise writes
+`[i32 count][i32 firstOffset][i32 ourPlanetId = DAT_140e2d020 = 0x0AF0][i32 PlanetId]
+[i32 WorldId][i32 2]` plus every InstanceList element copied through as `[here][next][A][B]`.
+It is a relay. Nothing in the Arbiter consumes the numbers.
+
+**What this changes for TeraSharp**
+
+1. `DungeonChannels.MapContinent` is the **primary** mechanism, not a fallback. Load it from
+   `ServerConfig.xml/WorldServerList` at startup and cross-World dungeon entry works on the first
+   attempt, with no announced channel and no allocator. That is now the next step, and it needs no
+   capture - the file is on disk.
+2. `WorldForContinent` prefers an announced channel over the configured owner. The two can only
+   disagree in a configuration the real Arbiter rejects outright (two Worlds on one continent), so
+   it is harmless; swap the two lookups if we ever want to mirror the binary exactly.
+3. **Do not implement 0x164D yet.** Dropping it (it is in `QuietInLog` today) costs nothing while
+   there is no MatchServer, and answering it would mean sending 0x4670 to a session that does not
+   exist. It is the right shape to build with MatchServer, not before.
+4. Still unknown, and still the capture's job: the two i32s in each `InstanceList` element, and
+   whether a dungeon World sends a populated list at all.

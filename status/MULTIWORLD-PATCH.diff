@@ -1,0 +1,275 @@
+# status/MULTIWORLD-PATCH.diff - the cumulative T103 + T108 WorldBridge / WorldEntry patch.
+#
+# Both files are human-owned, so Cowork never edits them; this is the proposal, generated
+# against master as of 2026-09-20 (WorldBridge.cs 631 lines, WorldEntry.cs 313 lines) and
+# verified to apply cleanly with BOTH `patch -p1` and `git apply -p1`.
+#
+#   cd D:\v100\TERA_SERVER.100\TeraSharp-cowork2
+#   git apply status/MULTIWORLD-PATCH.diff        (or: patch -p1 < status\MULTIWORLD-PATCH.diff)
+#
+# It needs nothing else: World/WorldInstances.cs and World/WorldRegistration.cs (WorldRuntime,
+# PerWorld, DefaultWorldId, WorldRouting, DungeonRouting) are already on the branch from T103
+# and T108, and every symbol this patch names is public or internal there.
+#
+# WHAT IT DOES (status/MULTIWORLD-DESIGN.md sections 6 and 7)
+#   T103  WorldLink gains WorldId / PlanetId / BypassIndex / Registered, filled from its own
+#         SA_REGISTER (0x138A), which is now answered for real instead of replayed - today
+#         every link on every World is handed world 0's CAPTURED reply.
+#   T103  One TicketAllocator per World. A Ticket indexes THAT World's bypass slots, so two
+#         Worlds hand out the same numbers and one global allocator collides.
+#   T108  One WorldRuntime per World: IsReady, the game-id counter and the one-shot MarkReady
+#         that DbProxy.OnWorldReady hangs off. Today world 13's handshake would zero world 0's
+#         game-id counter under live players (design doc section 4 item 3).
+#   T108  SendFrame(worldId, op, payload); the old two-argument form delegates to world 0.
+#         LinksOf(worldId). A World's last link closing tears down only that World, and drops
+#         its dungeon channels and in-flight transfers.
+#   T108  The constructor fills WorldRouting's two hooks, which is what switches the already
+#         committed dungeon routing in World/WorldInstances.cs from "always the arriving link"
+#         to real cross-World routing. WorldEntry then targets AS_ENTER_WORLD at the World that
+#         owns the instance.
+#
+# SINGLE-WORLD BEHAVIOUR IS UNCHANGED. An unregistered link reads as world 0; SendFrame(op, ..)
+# resolves to the first world-0 link, which with one World is the old _links[0] primary; world
+# 0's runtime starts not-ready with the counter at 0, so the first game id is still
+# 0x80000AF00001; and both routing tables start empty. The one behaviour that DOES change on a
+# single-World server is SA_REGISTER: the reply is built rather than replayed. All 25 captured
+# pairs reproduce byte for byte (T103_the_world_registration_reply_is_byte_exact).
+#
+# APPLY IT AFTER THE DUNGEON CAPTURE (design doc section 5), not before - point 5 of that plan,
+# whether world 0's and world 13's Tickets overlap, is the one question that could still change
+# the shape of the tunnel map, and it is cheaper to answer before this lands than after.
+
+--- a/src/TeraSharp.Arbiter/World/WorldBridge.cs
++++ b/src/TeraSharp.Arbiter/World/WorldBridge.cs
+@@ -87,6 +87,9 @@
+     private readonly object _lock = new();
+     private int _nextLinkId;
+ 
++    /// <summary>T108: IsReady + the game-id counter, one per World (MULTIWORLD-DESIGN.md s4.3).</summary>
++    private readonly PerWorld<WorldRuntime> _worlds = new(() => new WorldRuntime());
++
+     private readonly object _reorderLock = new();
+     private readonly Dictionary<uint, TunnelReorderBuffer> _tunnels = new();
+     private const int StallMs = 150;
+@@ -97,7 +100,8 @@
+     /// clients logged in together World saw both as one ticket ("SpawnMe twice", both stuck at
+     /// 100% loading, 2026-09-15 00:04).
+     /// </summary>
+-    private readonly TicketAllocator _tickets = new();
++    /// <summary>T103: one allocator per World - a Ticket indexes THAT World's bypass slots.</summary>
++    private readonly PerWorld<TicketAllocator> _tickets = new(() => new TicketAllocator());
+ 
+     /// <summary>
+     /// In-world players keyed by gameId, for control-message routing (e.g. SA_LEAVE_WORLD
+@@ -107,7 +111,10 @@
+     private readonly object _playersLock = new();
+ 
+     /// <summary>Allocate a unique tunnel Ticket for a new player session.</summary>
+-    internal uint AllocateTunnelKey() => _tickets.Allocate();
++    internal uint AllocateTunnelKey() => AllocateTunnelKey(WorldRegistration.DefaultWorldId);
++
++    /// <summary>The same, in one World's ticket space.</summary>
++    internal uint AllocateTunnelKey(int worldId) => _tickets.For(worldId).Allocate();
+ 
+     public void RegisterPlayer(GameSession s)
+     {
+@@ -120,7 +127,9 @@
+     {
+         lock (_playersLock) _players.Remove(gameId);
+         lock (_reorderLock) _tunnels.Remove(tunnelKey);
+-        _tickets.Free(tunnelKey);
++        // Until GameSession carries a CurrentWorldId this is world 0's space - which is where
++        // AllocateTunnelKey() with no argument took it from, so the pair still matches.
++        _tickets.For(WorldRegistration.DefaultWorldId).Free(tunnelKey);
+     }
+ 
+     /// <summary>The session that owns a tunnel Ticket, or null (ActionDispatcher / party / chat).</summary>
+@@ -134,6 +143,12 @@
+     /// <summary>Registered World links (T106 status tab).</summary>
+     public int LinkCount { get { lock (_lock) return _links.Count; } }
+ 
++    /// <summary>T103: every link of one World, in connect order.</summary>
++    public List<WorldLink> LinksOf(int worldId)
++    {
++        lock (_lock) return _links.Where(l => l.WorldId == worldId).ToList();
++    }
++
+     /// <summary>The in-world session for a character db id, or null (guild/chat/party actions address by player id).</summary>
+     public GameSession? SessionForPlayerId(int playerId)
+     {
+@@ -173,19 +188,28 @@
+     public DbProxyHandlers? DbProxy { get; set; }
+ 
+     /// <summary>True once WorldServer has completed the startup handshake and can accept players.</summary>
+-    public bool IsReady { get; private set; }
++    public bool IsReady => IsReadyFor(WorldRegistration.DefaultWorldId);
++
++    /// <summary>T108: the same, per World.</summary>
++    public bool IsReadyFor(int worldId) => _worlds.For(worldId).IsReady;
+ 
+     /// <summary>gameId low part is a per-login counter that restarts at 1 with each World process
+     /// (cap_newchar.log: fresh World, playerId 2 -> 0x80000AF00001; lobby_tap.log: ...0001 then ...0002).
+     /// It is NOT derived from playerId. Reset when the World handshake completes.</summary>
+-    private int _gameIdSeq;
+-    public ulong AllocateGameId() => 0x80000AF00000UL | (ulong)(uint)Interlocked.Increment(ref _gameIdSeq);
++    public ulong AllocateGameId() => AllocateGameId(WorldRegistration.DefaultWorldId);
++
++    /// <summary>T108: each World process restarts its own counter, so each gets its own.</summary>
++    public ulong AllocateGameId(int worldId) => _worlds.For(worldId).AllocateGameId();
+     public bool IsConnected { get { lock (_lock) return _links.Count > 0; } }
+ 
+     public WorldBridge(WorldReplayTable replay, ILogger log)
+     {
+         _replay = replay;
+         _log = log;
++        // T108: let the Cowork-owned routing in World/WorldInstances.cs see the per-World link
++        // sets. Until these are set every link reads as world 0 and nothing can be routed.
++        WorldRouting.WorldIdOfLink = l => l.WorldId;
++        WorldRouting.SendToWorld = (w, op, p) => SendFrame(w, op, p);
+     }
+ 
+     /// <summary>Reset every reorder buffer (World restarted).</summary>
+@@ -282,12 +306,20 @@
+             _log.LogInformation("WorldServer link #{Id} connected ({N} active)", link.Id, _links.Count);
+             _ = link.RunAsync(ct).ContinueWith(_ =>
+             {
+-                int remaining;
+-                lock (_lock) { _links.Remove(link); remaining = _links.Count; }
+-                if (remaining == 0)
++                int remaining, mine;
++                lock (_lock)
+                 {
+-                    IsReady = false;
+-                    _log.LogWarning("WorldServer fully disconnected - not ready");
++                    _links.Remove(link);
++                    remaining = _links.Count;
++                    mine = _links.Count(l => l.WorldId == link.WorldId);
++                }
++                if (mine == 0)
++                {
++                    // T108: only THIS World stops taking players, and its instances go with it.
++                    _worlds.For(link.WorldId).MarkDisconnected();
++                    DungeonRouting.Channels.ForgetWorld(link.WorldId);
++                    DungeonRouting.Transfers.ForgetWorld(link.WorldId);
++                    _log.LogWarning("World {W} fully disconnected - not ready", link.WorldId);
+                 }
+                 _log.LogInformation("WorldServer link #{Id} closed ({N} active)", link.Id, remaining);
+             }, ct);
+@@ -339,6 +371,29 @@
+     {
+         switch (op)
+         {
++            case WorldRegistration.SA_REGISTER:
++            {
++                // T103. Until now this fell through to the replay table, so every link on every
++                // World was handed world 0's CAPTURED answer - captured WorldId and BypassIndex
++                // included, which tells world 13 it is world 0.
++                var info = WorldRegistration.Parse(payload);
++                if (info == null)
++                {
++                    _log.LogWarning("SA_REGISTER on link #{Id}: {Len} B - PDL version mismatch",
++                        link.Id, payload.Length);
++                    return;
++                }
++                link.WorldId = info.Value.WorldId;
++                link.PlanetId = info.Value.PlanetId;
++                link.BypassIndex = info.Value.BypassIndex;
++                link.Registered = true;
++                link.SendFrame(WorldRegistration.AS_REGISTER, WorldRegistration.Reply(info.Value));
++                _log.LogInformation("Link #{Id} is world {W} bypass {B} of {N} (result {R})",
++                    link.Id, info.Value.WorldId, info.Value.BypassIndex,
++                    info.Value.TotalBypassCount, WorldRegistration.ResultFor(info.Value));
++                return;
++            }
++
+             case OpHeartbeat6:
+                 return;
+ 
+@@ -398,22 +453,36 @@
+                         _log.LogInformation("A->W #{Id} 0x{Op:X4} len={Len}", link.Id, rop, rbody.Length + 6);
+                     link.SendFrame(rop, rbody);
+                 }
+-                if (op == OpHandshakeDone && !IsReady)
++                // T108: MarkReady is the old `&& !IsReady` guard, per World - so OnWorldReady
++                // still fires once per World and not once per link, and world 13's handshake no
++                // longer zeroes world 0's game-id counter under live players.
++                if (op == OpHandshakeDone && _worlds.For(link.WorldId).MarkReady())
+                 {
+-                    IsReady = true;
+-                    Interlocked.Exchange(ref _gameIdSeq, 0);
+                     DbProxy?.OnWorldReady(link);   // real Arbiter: ~100 x 0x1581 dungeon-open pushes, 1 s after READY
+-                    _log.LogInformation("WorldServer handshake complete - READY for players");
++                    _log.LogInformation("World {W} handshake complete - READY for players", link.WorldId);
+                 }
+                 return;
+         }
+     }
+ 
+     public void SendFrame(ushort op, byte[] payload)
++        => SendFrame(WorldRegistration.DefaultWorldId, op, payload);
++
++    /// <summary>
++    /// T108. There is no worldId field on the wire - the destination World is chosen by which
++    /// socket the Arbiter writes to (MULTIWORLD-DESIGN.md section 2). With one World this picks
++    /// the same link the old `_links[0]` primary did.
++    /// </summary>
++    public void SendFrame(int worldId, ushort op, byte[] payload)
+     {
+         WorldLink? primary;
+-        lock (_lock) primary = _links.Count > 0 ? _links[0] : null;
+-        primary?.SendFrame(op, payload);
++        lock (_lock) primary = _links.FirstOrDefault(l => l.WorldId == worldId);
++        if (primary == null)
++        {
++            _log.LogWarning("0x{Op:X4}: world {W} has no links - frame dropped", op, worldId);
++            return;
++        }
++        primary.SendFrame(op, payload);
+     }
+ 
+     /// <summary>
+@@ -568,6 +637,21 @@
+ public sealed class WorldLink
+ {
+     public int Id { get; }
++
++    // --- T103: the link's identity, from its own SA_REGISTER. A link that has not registered
++    // reads as world 0, which is what every single-World deployment is. ---
++
++    /// <summary>SA_REGISTER payload +5.</summary>
++    public int WorldId { get; internal set; } = WorldRegistration.DefaultWorldId;
++
++    /// <summary>SA_REGISTER payload +1. Low 32 bits of every PDId the Arbiter builds.</summary>
++    public int PlanetId { get; internal set; }
++
++    /// <summary>SA_REGISTER payload +13. -1 on the control link, 0..N-1 on the bypass links.</summary>
++    public int BypassIndex { get; internal set; } = WorldRegistration.ControlBypassIndex;
++
++    /// <summary>Whether this link has sent its SA_REGISTER yet.</summary>
++    public bool Registered { get; internal set; }
+     private readonly Socket _sock;
+     private readonly WorldBridge _bridge;
+     private readonly ILogger _log;
+--- a/src/TeraSharp.Arbiter/Handlers/WorldEntry.cs
++++ b/src/TeraSharp.Arbiter/Handlers/WorldEntry.cs
+@@ -51,7 +51,10 @@
+         var record = Program.Store?.GetCharacter((int)chr.Id);
+         var enterPayload = BuildEnterWorldPayload(s.GameId, chr, record?.WorldBlob, s.TunnelKey,
+             GmCommandHandlers.LevelOf(s, Program.Store));
+-        w.SendFrame(WorldBridge.OpPlayerEnter, enterPayload);
++        // T108: AS_ENTER_WORLD carries no worldId - the destination is the socket we write to,
++        // so it is resolved from the continent and instance in the payload just built.
++        w.SendFrame(DungeonRouting.WorldForEnterWorld(enterPayload),
++            WorldBridge.OpPlayerEnter, enterPayload);
+ 
+         // 5. Send character data (world blob) to World.
+         // (removed) A pre-emptive 0x2738 with playerId in the DLM-id slot completed the WRONG DLM item on a
+@@ -278,7 +281,7 @@
+         log.LogWarning("EnterWorld retry for '{Name}': continent {C} refused, falling back to "
+             + "zone {Z} ({X:F0}, {Y:F0}, {Zz:F0})", chr.Name, f.ContinuousDungeonId,
+             back.Zone, back.X, back.Y, back.Z);
+-        w.SendFrame(WorldBridge.OpPlayerEnter, retry);
++        w.SendFrame(DungeonRouting.WorldForEnterWorld(retry), WorldBridge.OpPlayerEnter, retry);
+     }
+ 
+     /// <summary>

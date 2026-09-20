@@ -651,3 +651,34 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   `WorldLink.WorldId/PlanetId/BypassIndex`, 0x138A answered before the replay lookup,
   `SendFrame(worldId, ...)`, `PerWorld<WorldRuntime>`, `AllocateTunnelKey(worldId)`, and the two
   `WorldRouting` hooks). Until it lands, nothing behaves differently.
+
+- T109 (multi-world, proposal + research). Two things, no production code changed.
+
+  **`status/MULTIWORLD-PATCH.diff`** is the cumulative T103 + T108 `WorldBridge` / `WorldEntry`
+  patch as a file, generated against master of 2026-09-20 and verified to apply cleanly with
+  **both** `git apply -p1` and `patch -p1` (and the applied result compared byte for byte against
+  the intended files). It is 12 hunks: `WorldLink.WorldId/PlanetId/BypassIndex/Registered` from a
+  real SA_REGISTER instead of the replayed one, `PerWorld<TicketAllocator>`,
+  `PerWorld<WorldRuntime>` for IsReady + the game-id counter, `SendFrame(worldId, ...)` with the
+  old form delegating to world 0, `LinksOf`, per-World teardown on the last link, the two
+  `WorldRouting` hooks in the constructor, and the one `WorldEntry` line that targets
+  AS_ENTER_WORLD at the World owning the instance. Its header says what it does and, in one line,
+  that it should land **after** the section 5 capture, because the ticket-overlap question is the
+  one thing that could still change the tunnel map.
+
+  **MULTIWORLD-DESIGN.md section 7.1** - and it corrects section 7's open item 1. **There is no
+  allocator.** `WorldSessionManager::GetDataSession(continentId)` (Arb_part_046.c:2545), the
+  lookup `Handler_SA_REQUEST_ENTER_DUNGEON` routes on, is a config read: the continent's
+  `worldServerInfo` list from PlanetInfo, and a count other than exactly 1 is an assert at
+  `WorldSessionManager.cpp(356)`. One continent, one World, from `ServerConfig.xml`. The only
+  health state the Arbiter keeps is a 32-slot array whose entry is `== 2` once a World's last
+  bypass link registered - the same 0x20 ceiling T103 pinned.
+
+  0x164C/0x164D is therefore **not** an allocator feed. 0x164C has no payload at all (6-byte
+  frame); 0x164D is `[count][firstOffset][PlanetId][WorldId]` + N x 16 B InstanceList elements,
+  min frame 22; and `Handler_SA_WORLD_SERVER_STATUS` stores none of it - it relays the lot to
+  MatchServer as 0x4670 `AM_WORLD_SERVER_STATUS` and sends nothing at all if no MatchServer
+  session exists. **Next step needs no capture**: load `WorldServerList` into
+  `DungeonChannels.MapContinent` at startup and cross-World entry works on the first attempt.
+  0x164D stays dropped until MatchServer exists - answering it would mean sending 0x4670 to a
+  session that is not there.
