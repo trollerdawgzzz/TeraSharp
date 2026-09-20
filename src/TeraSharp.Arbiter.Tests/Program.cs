@@ -25728,7 +25728,8 @@ string message
         Hex.True(silly == 0 && moved > 0,
             $"changedRank at +7 is a small signed delta on {moved} of {rows.Count} rows, "
             + $"never absurd ({silly} outliers)");
-        Hex.True(rookies == 0, "and the flag at +6 is a flag - 0 on every row of this frame");
+        // T133b: the +6 byte IS a flag - exactly one of the 100 rows (index 96: rank 96, rating 969) has it set.
+        Hex.True(rookies == 1, $"the flag at +6 is a flag - set on exactly one row of this frame ({rookies} set)");
 
         Hex.Eq(EncodeLiveRanking(rows, pve: false), f,
             "our writer rebuilds frame 5818 byte for byte");
@@ -25753,8 +25754,11 @@ string message
         var classes = new HashSet<int>();
         foreach (var r in rows)
             if (r.Rank == 1) { atRankOne++; classes.Add(r.Class); }
-        Hex.True(atRankOne > 1 && classes.Count == atRankOne,
-            $"{atRankOne} rows share rank 1, one per class - a party, not a tie-break bug");
+        // T133b: a ten-player raid record - 10 rows tied at rank 1 (8 distinct classes; 8 and 2 appear
+        // twice), all with the group's clear time; the next rank is 11 (competition ranking, not dense).
+        Hex.True(atRankOne == 10 && classes.Count == 8,
+            $"{atRankOne} rows share rank 1 across {classes.Count} classes - a raid record, not one per class");
+        Hex.True(rows.Count > 10 && rows[10].Rank == 11, $"the rank after the tied group is 11 (competition), got {(rows.Count > 10 ? rows[10].Rank : -1)}");
         Hex.True(rows[0].Score == rows[1].Score && rows[0].Rank == rows[1].Rank
                  && rows[0].Class != rows[1].Class,
             "same time, same rank, different class");
