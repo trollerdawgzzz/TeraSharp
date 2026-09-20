@@ -886,3 +886,37 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   `T118_the_leftover_replies_write_through_their_defs` (every reply written with the real
   registry, which is what catches a mistyped field name),
   `T118_the_two_acks_send_nothing_and_change_nothing`.
+
+- T122 (live 2026-09-20): **character select showed the login snapshot, not the row** - level 8
+  in world, level 1 on the way back out. `LoginHandlers.OnGetUserList` builds each
+  S_GET_USER_LIST element from `s.Account.Characters`, which `FakeAccount.LoadFromStore`
+  snapshots once at login; everything that happened in world changed the `characters` row and
+  left the snapshot alone.
+
+  Fixed in `CharacterHandlers.FillLobbyFields` - the per-element `GetCharacter` call T76 already
+  made - so it refreshes the ELEMENT rather than the cache: **no change to the human-owned
+  `OnGetUserList`, and no extra query.** It now also sets level, name, position, gender/race/
+  class, weapon/body/hand/feet and the appearance/details/shape blobs from the row, on top of
+  T76's worldId/guardId/sectionId/lastLogoutTime/restBonusXp. A character id the store does not
+  know still leaves every field alone rather than zeroing the entry.
+
+  **hp and mp have no column**, so the saved world blob is their only source: `StarterBlob`
+  gains `HpOffset = 208` / `MpOffset = 216` and read-only `ReadHp` / `ReadMp`, the two
+  neighbours of `LevelOffset` that the T105 note already identified (+208 reads 1953 at level 1,
+  2878 at 8, 85956 at 70 across the same six blobs). Read-only on purpose - that note calls +208
+  runtime state World owns, and stamping it out would overwrite the hp a player actually has.
+  A missing or short blob leaves the caller's template values, so a character who has never
+  entered the world does not appear with 0 hp.
+
+  **Not refreshed, with the reason**: `isNewCharacter` (the caller hard-codes true and no column
+  contradicts it), `maxRestBonusXp` (RestBonusDataSheet, which we do not load - T76's note
+  stands), and exp, which S_GET_USER_LIST has no field for. The character SET still comes from
+  the cache, which is correct: create and delete both update it.
+
+  One existing assertion changed: `T76_lobby_fields_match_the_captured_user_list` asserted "and
+  no other field is touched" against `level`, which is exactly what T122 now touches - it checks
+  the row's level instead.
+
+  Tests: `T122_the_lobby_shows_the_stored_level_not_the_login_snapshot` (level 11 from the row,
+  then 8 after `UpdateLevelAndExp`, with T76's five fields still landing and an unknown id
+  changing nothing) and `T122_the_lobby_hp_and_mp_come_from_the_saved_blob`.

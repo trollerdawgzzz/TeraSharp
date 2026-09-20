@@ -9102,7 +9102,12 @@ array    friends
             Hex.Eq(loc, wire, $"frame 11 element +52..64 for character {id}");
             Hex.True(Convert.ToInt64(element["maxRestBonusXp"]) == 419L,
                 "maxRestBonusXp is left alone - it comes from RestBonusDataSheet, which we do not load");
-            Hex.True(Convert.ToInt32(element["level"]) == 1, "and no other field is touched");
+            // T122 changed this line: FillLobbyFields now also refreshes the level from the
+            // row, which is the whole point of that task. StoreWithTwoAccounts makes the two
+            // characters level 11 and 12, and the stale element above says 1.
+            int refreshed = Convert.ToInt32(element["level"]);
+            Hex.True(refreshed == 10 + id,
+                $"the level comes from the row now, not from the login snapshot: {refreshed}");
         }
 
         Hex.Eq(BitConverter.GetBytes(CharacterHandlers.UnixSeconds(
@@ -22722,6 +22727,110 @@ string message
     }
 
 
+
+
+    // ===================== T122: character select shows the row, not the snapshot =====================
+
+    /// <summary>
+    /// The live bug: level 8 in world, level 1 on the way back to character select.
+    /// <c>LoginHandlers.OnGetUserList</c> builds each element from
+    /// <c>s.Account.Characters</c>, which <c>FakeAccount.LoadFromStore</c> snapshotted at
+    /// LOGIN; everything that happened in world changed the row and not the snapshot.
+    ///
+    /// <para>The fix is in <see cref="CharacterHandlers.FillLobbyFields"/> - the per-element
+    /// GetCharacter call T76 already made - so it needs no change in the human-owned
+    /// OnGetUserList, and it costs no extra query.</para>
+    /// </summary>
+    [Test] public static void T122_the_lobby_shows_the_stored_level_not_the_login_snapshot()
+    {
+        using var store = StoreWithTwoAccounts();   // t30_1 is id 1, stored level 11
+
+        // Exactly what OnGetUserList builds from the cached FakeCharacter: a login-time
+        // snapshot that says level 1, plus the template hp/mp the FakeCharacter defaults to.
+        Dictionary<string, object> Stale() => new()
+        {
+            ["level"] = 1, ["name"] = "stale", ["position"] = 9,
+            ["gender"] = 0, ["race"] = 0, ["class"] = 0,
+            ["weapon"] = 0, ["body"] = 0, ["hand"] = 0, ["feet"] = 0,
+            ["hp"] = 100000L, ["mp"] = 100000,
+            ["worldId"] = 0, ["guardId"] = 0, ["sectionId"] = 0,
+            ["lastLogoutTime"] = 0L, ["restBonusXp"] = 0L, ["maxRestBonusXp"] = 419L,
+        };
+
+        var first = Stale();
+        CharacterHandlers.FillLobbyFields(first, store, 1);
+        Hex.True(Convert.ToInt32(first["level"]) == 11,
+            $"the row's level, not the snapshot's 1: {Convert.ToInt32(first["level"])}");
+        Hex.True((string)first["name"] == "t30_1", $"and the row's name: {first["name"]}");
+        Hex.True(Convert.ToInt32(first["position"]) == 1, "and the row's slot");
+
+        // Now play: the character levels to 8 while the snapshot still says 1.
+        Hex.True(store.UpdateLevelAndExp(1, 8, 1234), "the row moves to level 8");
+        var second = Stale();
+        CharacterHandlers.FillLobbyFields(second, store, 1);
+        Hex.True(Convert.ToInt32(second["level"]) == 8,
+            $"character select follows it without a relog: {Convert.ToInt32(second["level"])}");
+
+        // T76's five fields still land, and maxRestBonusXp is still left alone.
+        Hex.True(store.SetLastSection(1, 1, 25, 599001) && store.SetRestBonus(1, 419),
+            "the T76 columns");
+        var third = Stale();
+        CharacterHandlers.FillLobbyFields(third, store, 1);
+        Hex.True(Convert.ToInt32(third["worldId"]) == 1 && Convert.ToInt32(third["guardId"]) == 25
+                 && Convert.ToInt32(third["sectionId"]) == 599001,
+            "T76's location trio survives T122");
+        Hex.True(Convert.ToInt64(third["restBonusXp"]) == 419L
+                 && Convert.ToInt64(third["maxRestBonusXp"]) == 419L,
+            "so does the rested xp, and the max is still not ours to compute");
+
+        // A character the store does not know leaves every field alone rather than zeroing it.
+        var unknown = Stale();
+        CharacterHandlers.FillLobbyFields(unknown, store, 99999);
+        Hex.True(Convert.ToInt32(unknown["level"]) == 1 && (string)unknown["name"] == "stale",
+            "no row, no refresh - the caller's values stand");
+    }
+
+    /// <summary>
+    /// hp and mp have no column: the saved world blob is their only source. T105 pinned them
+    /// either side of the level - +208 hp, +216 mp - and until T122 the lobby showed the
+    /// FakeCharacter template's hard-coded 100000 for every character.
+    /// </summary>
+    [Test] public static void T122_the_lobby_hp_and_mp_come_from_the_saved_blob()
+    {
+        using var store = StoreWithTwoAccounts();
+
+        Dictionary<string, object> Stale() => new()
+        {
+            ["hp"] = 100000L, ["mp"] = 100000, ["level"] = 1, ["name"] = "stale",
+            ["position"] = 1, ["gender"] = 0, ["race"] = 0, ["class"] = 0,
+            ["weapon"] = 0, ["body"] = 0, ["hand"] = 0, ["feet"] = 0,
+        };
+
+        // No blob yet: the template values stand rather than showing a character with 0 hp.
+        var none = Stale();
+        CharacterHandlers.FillLobbyFields(none, store, 1);
+        Hex.True(Convert.ToInt64(none["hp"]) == 100000L && Convert.ToInt32(none["mp"]) == 100000,
+            "a character that has never entered the world keeps the template vitals");
+
+        var blob = new byte[TeraSharp.Arbiter.Persistence.StarterBlob.Size];
+        BitConverter.GetBytes(2878u).CopyTo(blob, TeraSharp.Arbiter.Persistence.StarterBlob.HpOffset);
+        BitConverter.GetBytes(4210u).CopyTo(blob, TeraSharp.Arbiter.Persistence.StarterBlob.MpOffset);
+        store.SaveWorldBlob(1, blob);
+
+        var withBlob = Stale();
+        CharacterHandlers.FillLobbyFields(withBlob, store, 1);
+        Hex.True(Convert.ToInt64(withBlob["hp"]) == 2878L,
+            $"2878 is the level-8 hp of the T105 blobs: {Convert.ToInt64(withBlob["hp"])}");
+        Hex.True(Convert.ToInt32(withBlob["mp"]) == 4210, "and mp follows from +216");
+
+        Hex.True(TeraSharp.Arbiter.Persistence.StarterBlob.HpOffset == 208
+                 && TeraSharp.Arbiter.Persistence.StarterBlob.MpOffset == 216,
+            "the two offsets the T105 note already named");
+        Hex.True(TeraSharp.Arbiter.Persistence.StarterBlob.ReadHp(null) == 0
+                 && TeraSharp.Arbiter.Persistence.StarterBlob.ReadHp(new byte[8]) == 0
+                 && TeraSharp.Arbiter.Persistence.StarterBlob.ReadMp(new byte[219]) == 0,
+            "a short buffer reads 0, which the caller treats as unknown and skips");
+    }
 
     // ===================== T118: the leaderboard, step 1 =====================
 
