@@ -1167,3 +1167,45 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   `status/LEADERBOARD.md` 6.2 and the STATUS entry was wrong, and is corrected. The test
   name `T119_ranks_are_dense_stable_and_class_filtered` is left alone so its history stays
   findable; its comments no longer claim the wrong thing.
+
+- T135: **the guild-quest board can be played** - start, finish and cancel
+  (`status/GUILD-DESIGN.md`, the T135 section). T98 built the board, the `guild_quests` table
+  and `S_GUILD_QUEST_LIST`, and its own DDL comment said start and finish were "not modelled -
+  the capture never exercised them". `classic_live2` exercises finish.
+
+  **The brief expected three captured verbs; there is one.** Across `classic_live2` and
+  `classic_live3` the only guild-quest packet any client sent is
+  `C_REQUEST_FINISH_GUILD_QUEST`, three times. No start, no cancel - they happened outside the
+  window, or accept goes through the guild NPC on this build. So finish is byte-for-byte the
+  live server's and the other two are their `.def` plus the board refresh, marked as such at
+  each handler.
+
+  **Finish, whole:** `12185 -> 12218 / 12220 / 12221 / 12222 / 12223`, again at 13322 and
+  64897. All five reply frames match their defs byte for byte. The reward comes out of the
+  deltas rather than a guess: guild exp `157620 -> 157640 -> 157660` and funds
+  `711 -> 712 -> 713`, so **+20 exp and +1 funds**, while point sat at 14 through all three -
+  the point push is a refresh, and `CharacterStore.AddGuildQuestReward` leaves it alone.
+
+  **`S_START_GUILD_QUEST`'s string is the GUILD's name** ("Candlelight" in all three), and the
+  frame arrives ~35 frames AFTER each finish carrying the id just finished, with no client
+  request before it - the server re-arming the board, not a reply to an accept.
+
+  One quest runs per guild (T98's single status-1 row). Start refuses a second, refuses an id
+  not in `GuildQuestCatalogue`, and takes its countdown from the catalogue row's own 43200 s.
+  Cancel has **no S_ opcode in the 376012 map at all** - the board refresh is the answer - and
+  is restricted to the starter or the chief, which is a choice and is labelled as one.
+
+  **Registry: `HandlerRegistry` unchanged.** Guild registration is the
+  `GuildWiring.ClientOpcodes` table it already loops; T135 adds three rows and three
+  `GuildPackets.MinClientLength` guards (8 B each - `[u16 len][u16 op][i32 questId]`, which is
+  frame 12185's own length).
+
+  Tests: `T135_the_guild_quest_frames_match_classic_live2` (all five replies byte-exact plus
+  the request parse), `T135_finishing_a_quest_pays_the_captured_reward`,
+  `T135_start_and_cancel_move_the_running_row`.
+
+  **My error, worth recording**: I first reported this task blocked because
+  `GuildQuestCatalogue` and friends looked missing. They were not - I grepped an upload of
+  `DbProxyStaticData.cs` from an earlier session instead of staging the file this session, and
+  the stale copy predated T98. CLAUDE.md already says to read every file in the session it is
+  changed; it applies just as much to a file only being READ to decide whether something exists.

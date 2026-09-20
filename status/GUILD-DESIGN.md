@@ -1603,3 +1603,79 @@ The board is pushed at two moments, and T98b wired both:
 
 Start / finish / cancel were **never captured** — a 7-day cooldown kept them out of the session —
 so `SetGuildQuest` is the seam a later task drives and nothing about those packets is guessed.
+
+## T135 — the guild-quest board's three verbs
+
+T98 built the board and its table and said so in the DDL: *"Start and finish are not modelled -
+the capture never exercised them."* `classic_live2` (T130's converter, the live Classic+ server)
+exercises **finish**, three times, and nothing else.
+
+### 12.1 What the captures actually contain
+
+Every client-side guild packet across `classic_live2` and `classic_live3`:
+
+| | |
+|---|---|
+| `C_REQUEST_GUILD_INFO` 30 | `C_NPCGUILD_LIST` 4 |
+| **`C_REQUEST_FINISH_GUILD_QUEST` 3** | `C_OPEN_GUILD_WAR_WINDOW` 3 |
+| `C_CHECK_TO_DECLARE_GUILD_WAR` 2 | `C_REQUEST_GUILD_PERK_LIST` 2 |
+
+No `C_REQUEST_START_GUILD_QUEST` and no `C_REQUEST_CANCEL_GUILD_QUEST`, in either file. The
+brief expected all three; the accept and the cancel produced no packet at all - they happened
+outside the window, or accept on this build goes through the guild NPC. **Finish is therefore
+pinned to real bytes and the other two are their `.def` plus the board refresh**, and the code
+says which is which at each handler.
+
+### 12.2 The finish exchange, frame by frame
+
+```
+12185 C->S C_REQUEST_FINISH_GUILD_QUEST  11 27 00 00          questId 10001
+12218 S->C S_FINISH_GUILD_QUEST          01 11 27 00 00       result 1
+12220 S->C S_GUILD_LEVEL_INFO_CHANGED    guild 71, level 180, exp 157620, isLevelUp 0
+12221 S->C S_GUILD_POINT_INFO_CHANGED    guild 71, point 14
+12222 S->C S_GUILD_MONEY_INFO_CHANGED    guild 71, money 711
+12223 S->C S_GUILD_QUEST_LIST  x7
+12254 S->C S_START_GUILD_QUEST  0B 00 | 01 | 11 27 00 00 | "Candlelight"
+```
+
+Repeated at 13322 / 13324 / 13326-28 / 13338 and 64897 / 64927 / 64929-31 / 65241, for quest
+10003. All five reply frames match their `.def` byte for byte.
+
+**The reward is the deltas across those three finishes**, not a guess:
+
+| | 1st | 2nd | 3rd | per finish |
+|---|---|---|---|---|
+| guild exp | 157620 | 157640 | 157660 | **+20** |
+| funds | 711 | 712 | 713 | **+1** |
+| point | 14 | 14 | 14 | **unchanged** |
+
+So the point push after a finish is a refresh, not a reward, and `AddGuildQuestReward` does not
+touch it.
+
+**`S_START_GUILD_QUEST`'s string is the GUILD's name.** All three of its frames say
+"Candlelight" - the def calls the field `guildName`, and the capture agrees. It also arrives
+~35 frames *after* each finish carrying the id that was just finished, with no client request
+anywhere before it, so on this build it is the server re-arming the board rather than a reply
+to an accept.
+
+### 12.3 What T135 implements
+
+| Verb | Reply | Evidence |
+|---|---|---|
+| start | `S_START_GUILD_QUEST` to the guild, then the board | reply captured (12254); **request not** |
+| finish | `S_FINISH_GUILD_QUEST` to the requester, then level / point / money to the guild, then the board | **whole exchange captured, three times** |
+| cancel | the board, and nothing else | **neither captured**; the 376012 map has no `S_CANCEL_GUILD_QUEST` at all, only `S_FAIL_GUILD_QUEST` |
+
+One quest runs per guild - T98's table keeps a single row at status 1, which is what
+`GetRunningGuildQuest` and the board read. Start refuses a second, refuses a quest that is not
+in `GuildQuestCatalogue`, and sets `ends_at` from the catalogue row's own `RemainSec` (43200 s,
+the 720 minutes its `totalTime` carries). Finish refuses anything but the running quest.
+
+**Who may cancel is in no capture.** Letting any member throw away the guild's twelve-hour
+timer is the wrong default, so it is the starter or the chief - the narrowest rule that still
+lets a guild undo a mistake. That is a choice, not a finding, and it is one line to change.
+
+### 12.4 Registration
+
+`HandlerRegistry` needs no change: guild registration is the `GuildWiring.ClientOpcodes` table
+it already loops, plus `GuildPackets.MinClientLength`. T135 adds three rows and three guards.
