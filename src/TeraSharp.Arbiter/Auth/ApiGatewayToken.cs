@@ -33,14 +33,23 @@ namespace TeraSharp.Arbiter.Auth;
 // panel opens, and it would fail a real check, which is the honest failure mode.
 // =============================================================================================
 
-/// <summary>The per-login credential the client hands to tera-api's gateway API.</summary>
+/// <summary>The per-login credential the client hands to whatever serves apiServerAddress.</summary>
 public static class ApiGatewayToken
 {
-    /// <summary>Host:port of tera-api's GATEWAY API - not the arbiter API that TERASHARP_AUTH uses.</summary>
+    /// <summary>Host:port the client is told to load the Alt+A panel from. NOT the arbiter API
+    /// that TERASHARP_AUTH uses, and (T132) NOT tera-api's gateway API either.</summary>
     public const string AddressVariable = "TERASHARP_API_GATEWAY";
 
-    /// <summary>tera-api's <c>API_GATEWAY_LISTEN_PORT</c> on this box.</summary>
-    public const string DefaultAddress = "127.0.0.1:8040";
+    /// <summary>
+    /// What the retail Arbiter sends, measured: <c>Executable\DeploymentConfig.xml</c> carries
+    /// <c>&lt;APIServer ip=127.0.0.1 port=8800 protocol=http ttl=120 /&gt;</c> and the untouched
+    /// <c>.orig</c> has the same 8800, so it is the vendor default, not this box's localisation.
+    /// The <c>ttl=120</c> is the same 120 seconds as this token's <c>exp - iat</c>.
+    /// <para>T124 used 8040 because that is tera-api's <c>API_GATEWAY_LISTEN_PORT</c>. T132 found
+    /// that port is the wrong SERVICE - tera-api's own .env.example calls it the API "for
+    /// receiving connections from the external website (like billing)".</para>
+    /// </summary>
+    public const string DefaultAddress = "127.0.0.1:8800";
 
     /// <summary>The name the client shows for the account database.</summary>
     public const string DbServerNameVariable = "TERASHARP_DB_SERVER_NAME";

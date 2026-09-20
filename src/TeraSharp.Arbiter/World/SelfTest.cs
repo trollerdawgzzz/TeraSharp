@@ -469,6 +469,7 @@ public static class SelfTest
         "TERASHARP_DATASHEET", "TERASHARP_STARTER_BLOB", "TERASHARP_STARTER_INVENTORY",
         "TERASHARP_START_OVERRIDE",
         "TERASHARP_API_GATEWAY", "TERASHARP_DB_SERVER_NAME", "TERASHARP_API_JWT_SECRET",   // T124: Alt+A
+        "TERASHARP_API_GATEWAY_SERVE", "TERASHARP_API_GATEWAY_BIND",                       // T132: the probe at that address
     };
 
     /// <summary>Variables whose value must never reach a log or a console.</summary>
