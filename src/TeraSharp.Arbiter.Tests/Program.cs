@@ -12353,6 +12353,50 @@ bool   isGuildWarAcceptable
         MatchQueueManager.Reset();
     }
 
+    /// <summary>
+    /// T136b - the wiring table and the two answers that are safe to give today. The refusal
+    /// path is asserted too, because "never emit FIN" is the whole point of the split.
+    /// </summary>
+    [Test] public static void T136b_match_wiring_answers_only_what_it_can()
+    {
+        Hex.True(MatchWiring.ClientOpcodes.Length == 4
+                 && MatchWiring.Handles(MatchQueueManager.C_MATCH_PROGRESS)
+                 && MatchWiring.Handles(MatchQueueManager.C_MATCH_ROOM_LIST)
+                 && MatchWiring.Handles(MatchQueueManager.C_MATCH_ADD)
+                 && MatchWiring.Handles(MatchQueueManager.C_MATCH_DEL)
+                 && !MatchWiring.Handles(0x1234),
+            "all four opcodes, and nothing else");
+
+        Hex.True(MatchWiring.MinBodyLength(MatchQueueManager.C_MATCH_PROGRESS) == 4
+                 && MatchWiring.MinBodyLength(MatchQueueManager.C_MATCH_ROOM_LIST) == 4
+                 && MatchWiring.MinBodyLength(MatchQueueManager.C_MATCH_ADD) == 0,
+            "the readers need their 4-byte array header; the refused pair needs no guard");
+
+        // Every one of the four is the Arbiter's - none may fall through to World.
+        var owned = ArbiterClientHandlers.ArbiterOwned;
+        foreach (var (name, op) in MatchWiring.ClientOpcodes)
+            Hex.True(owned.Contains(op), "ArbiterOwned contains " + name);
+
+        // The empty room list: count 0, offset 0, then the capture's two trailing int32.
+        Hex.Eq(MatchQueueManager.BuildEmptyMatchRoomList(),
+            "10 00 E0 68 00 00 00 00 01 00 00 00 02 00 00 00",
+            "no rooms is the honest answer - classic_live3 record 8838's header with no elements");
+
+        // Progress with nothing queued names what was asked for and carries zeroes.
+        MatchQueueManager.Reset();
+        var none = MatchQueueManager.Progress(null, 9739);
+        Hex.True(none.Instance == 9739 && none.Waiting == 0 && none.Needed == 0,
+            "an empty pool reports zero waiting against the instance the client named");
+
+        // And with something queued it reports that entry, including through the -9999 sentinel.
+        var e = MatchQueueManager.Add(4742, new[] { 9739 }, new uint[] { 4742 },
+            DateTimeOffset.UnixEpoch, out _);
+        var some = MatchQueueManager.Progress(e, MatchQueueManager.AnyInstance);
+        Hex.True(some.Instance == 9739 && some.Waiting == 1,
+            "-9999 resolves to the entry's own instance");
+        MatchQueueManager.Reset();
+    }
+
     // ---- The rules ----
 
     [Test] public static void T30_system_message_format_matches_the_capture()

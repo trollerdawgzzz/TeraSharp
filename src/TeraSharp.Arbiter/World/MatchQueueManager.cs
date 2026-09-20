@@ -247,6 +247,34 @@ public static class MatchQueueManager
         return p;
     }
 
+    public const ushort S_MATCH_ROOM_LIST = 0x68E0;
+
+    /// <summary>
+    /// S_MATCH_ROOM_LIST. classic_live3 record 8838 is the ten-room form, 456 B:
+    /// <code>
+    ///   body 0  u16 count rooms / 2 u16 offset rooms
+    ///        4  i32 unk1   (1 in the capture)
+    ///        8  i32 unk2   (2 in the capture)
+    ///   element 44 B, starting at packet 16
+    /// </code>
+    /// <para>The row stride and its id fields are clear - room id, a dungeon id, a timestamp -
+    /// but three trailing int32 flags are not, and ten rows from one capture is not enough to
+    /// name them (see status/MULTIWORLD-DESIGN.md). So only the EMPTY form is built here, which
+    /// is all TeraSharp can honestly answer: we have no rooms. A browse window with no rows is a
+    /// true statement; a row with guessed flags is not.</para>
+    /// </summary>
+    public static byte[] BuildEmptyMatchRoomList(int unk1 = 1, int unk2 = 2)
+    {
+        var p = new byte[16];
+        BitConverter.GetBytes((ushort)16).CopyTo(p, 0);
+        BitConverter.GetBytes(S_MATCH_ROOM_LIST).CopyTo(p, 2);
+        BitConverter.GetBytes((ushort)0).CopyTo(p, 4);
+        BitConverter.GetBytes((ushort)0).CopyTo(p, 6);
+        BitConverter.GetBytes(unk1).CopyTo(p, 8);
+        BitConverter.GetBytes(unk2).CopyTo(p, 12);
+        return p;
+    }
+
     /// <summary>One player inside S_ADD_INTER_PARTY_MATCH_POOL. 17 B with its element header.</summary>
     public readonly record struct PoolPlayer(int PlanetId, int PlayerId, byte Flag, int Tail);
 
