@@ -5307,9 +5307,6 @@ DELETE FROM restrictions      WHERE character_id = $id;";
             return Convert.ToInt64(cmd.ExecuteScalar());
         }
     }
-'''
-rep(P,
-'''    /// <summary>One <c>game_log</c> row placeholder</summary>
 
     public List<BoardPostRow> GetBoardPosts(int boardId)
     {

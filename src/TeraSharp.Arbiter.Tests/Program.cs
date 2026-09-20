@@ -20470,10 +20470,12 @@ string message
     /// </summary>
     [Test] public static void T74_the_two_audit_log_writes_are_sealed()
     {
-        Hex.True(WorldReplayTable.OneWayFromWorld.Contains(0x27DD), "SDB_ITEM_TRADE_LOG");
-        Hex.True(WorldReplayTable.OneWayFromWorld.Contains(0x288C), "SDB_CASH_ITEM_LOG");
-        Hex.True(!DbProxyHandlers.IsHandledRequest(0x27DD) && !DbProxyHandlers.IsHandledRequest(0x288C),
-            "and neither is allow-listed - sealed is not the same as answered");
+        // T115 turned both into stored game_log writes (still no reply); the invariant is now
+        // "handler, not sealed" - a sealed opcode never reaches a handler.
+        Hex.True(!WorldReplayTable.OneWayFromWorld.Contains(0x27DD), "SDB_ITEM_TRADE_LOG is a handler since T115");
+        Hex.True(!WorldReplayTable.OneWayFromWorld.Contains(0x288C), "SDB_CASH_ITEM_LOG is a handler since T115");
+        Hex.True(DbProxyHandlers.IsHandledRequest(0x27DD) && DbProxyHandlers.IsHandledRequest(0x288C),
+            "both allow-listed: stored in game_log, no reply");
     }
 
     /// <summary>
