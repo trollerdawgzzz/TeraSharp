@@ -4539,3 +4539,248 @@ public static class ItemBoardPackets
         return true;
     }
 }
+
+// =============================================================================================
+// T118 - the leaderboard and the seven small leftovers. status/LEADERBOARD.md.
+//
+// None of these nine opcodes was registered before this task, so the client's leaderboard and
+// party-match windows opened onto silence. Step 1 answers each with the EMPTY form its .def
+// gives - real rows come with the capture in status/LEADERBOARD.md section 4 - and, for the
+// two ranking packets, applies the bounds the real Arbiter's own crash path demands.
+// =============================================================================================
+
+/// <summary>
+/// The two leaderboard requests plus the seven leftovers, all answered from the .def's empty
+/// form for now.
+///
+/// <para><b>The ranking crash.</b> <c>Handler_C_REQUEST_PVE_RANKING</c> (Arb_part_041.c:9474)
+/// and <c>_PVP_</c> (:9543) read three i32 at body +0/+4/+8 behind a <c>param_3 &lt; 0x10</c>
+/// guard and queue <c>PVERankingSystemManager::SendRank(int,int,int,enum ClassType)</c>
+/// (Arb_part_050.c:10910). Of the three, only the LAST - the field the .def calls
+/// <c>class</c> - is dangerous, and the mod that guards this today checks the wrong one:</para>
+/// <list type="bullet">
+/// <item><c>season</c>: guarded <c>&gt; 0</c> in SendRankValidate; equal to the current season
+/// takes the now-path, less than it takes the past-season path (itself gated to the last three
+/// seasons), greater than it does nothing at all.</item>
+/// <item><c>id</c>: guarded <c>&gt; 0</c>, then <c>DungeonDataSheet::GetDungeonTemplate(int)</c>
+/// (Arb_part_003.c:3388) - a red-black-tree find that RETURNS 0 for an unknown key, and the
+/// caller checks it. Safe.</item>
+/// <item><c>class</c>: on the past-season path
+/// (Arb_part_050.c:10630) it is <c>puVar13 + ((longlong)param_5 + 1) * 3</c> - a raw pointer
+/// index, 24-byte stride, <b>no bounds check at all</b>. On the current-season path it reaches
+/// <c>RankTree&lt;...&gt;::ClassRank(enum ClassType,int)</c> (Arb_part_049.c:11647) whose
+/// <c>if (0xe &lt; (ulonglong)(int)param_2)</c> calls a function Ghidra marks
+/// <c>Subroutine does not return</c> - a fatal abort, and the cast sign-extends, so a negative
+/// class aborts too. <c>0x10</c> takes the aggregate branch in both and skips the
+/// indexing.</item>
+/// </list>
+/// <para>Hence <see cref="IsSafeRankingClass"/>: 0..14, or 16. There is no page and no size on
+/// either packet - the paginated neighbours are C_REQUEST_PARTY_MATCH_INFO_PAGE below and
+/// C_VIEW_GUILD_WAR, which the mod already bounds.</para>
+/// </summary>
+public static class LeaderboardPackets
+{
+    // Body sizes are each handler's own guard less the 4-byte client header.
+    /// <summary>Guard <c>param_3 &lt; 0x10</c>: [i32 season][i32 id][i32 class].</summary>
+    public const int RankingBodySize = 0x10 - 4;
+    public const int SeasonOffset = 0;
+    public const int IdOffset = 4;
+    public const int ClassOffset = 8;
+
+    /// <summary>The highest class index <c>RankTree::ClassRank</c> will accept before it aborts.</summary>
+    public const int MaxRankingClass = 0xE;
+
+    /// <summary>The aggregate ("all classes") selector, which skips the array index entirely.</summary>
+    public const int AllRankingClasses = 0x10;
+
+    /// <summary>
+    /// The safe set the crash analysis gives: an index the real server will not run off the end
+    /// of, or the aggregate selector. Everything else is the crash vector.
+    /// </summary>
+    public static bool IsSafeRankingClass(int cls)
+        => (cls >= 0 && cls <= MaxRankingClass) || cls == AllRankingClasses;
+
+    /// <summary>Season and id carry the handler's own <c>&gt; 0</c> guard; mirror it.</summary>
+    public static bool IsSafeRankingRequest(int season, int id, int cls)
+        => season > 0 && id > 0 && IsSafeRankingClass(cls);
+
+    /// <summary>S_PVE_RANKING_LIST, from data.json's 376012 map.</summary>
+    public const ushort S_PVE_RANKING_LIST = 0xBEDC;
+
+    /// <summary>
+    /// S_PVE_RANKING_LIST with an empty list: the 4-byte header plus
+    /// <c>[u16 count = 0][u16 firstElementOffset = 0]</c>.
+    ///
+    /// <para>Built by hand rather than from the .def because the shipped
+    /// <c>S_PVE_RANKING_LIST.1.def</c> has NO fields at all - it says so in a comment - while
+    /// the writer lays down exactly these two u16 back-patch slots before any element
+    /// (Arb_part_050.c:10593, right where the opcode 0xBEDC is stamped, which is also what
+    /// confirms that function is this packet's writer). Sending the def's field-less form would
+    /// be an 4-byte frame, four bytes short of the header the client then reads.</para>
+    /// </summary>
+    public static byte[] BuildPveRankingList()
+    {
+        var p = new byte[8];
+        BitConverter.GetBytes((ushort)8).CopyTo(p, 0);
+        BitConverter.GetBytes(S_PVE_RANKING_LIST).CopyTo(p, 2);
+        return p;
+    }
+
+    private static (int Season, int Id, int Class) ReadRanking(ReadOnlySpan<byte> b)
+        => (BitConverter.ToInt32(b[SeasonOffset..]), BitConverter.ToInt32(b[IdOffset..]),
+            BitConverter.ToInt32(b[ClassOffset..]));
+
+    /// <summary>
+    /// C_REQUEST_PVE_RANKING (0xA024) -&gt; S_PVE_RANKING_LIST (0xBEDC), empty list.
+    /// An out-of-range class is refused here rather than forwarded: TeraSharp does not index
+    /// anything with it, but answering it as if it were valid would teach a probing client that
+    /// the value is accepted, and the same value against the real Arbiter is the crash.
+    /// </summary>
+    public static bool OnRequestPveRanking(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+        => Ranking(s, body, log, "S_PVE_RANKING_LIST", pve: true);
+
+    /// <summary>C_REQUEST_PVP_RANKING (0x573B) -&gt; S_PVP_RANKING_LIST (0x62FA), empty array.</summary>
+    public static bool OnRequestPvpRanking(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+        => Ranking(s, body, log, "S_PVP_RANKING_LIST", pve: false);
+
+    private static bool Ranking(GameSession s, ReadOnlyMemory<byte> body, ILogger log,
+                                string reply, bool pve)
+    {
+        var b = body.Span;
+        if (b.Length < RankingBodySize)
+        {
+            log.LogWarning("{Reply}: {Len} B body, the handler guard is {Need}",
+                reply, b.Length, RankingBodySize);
+            return true;
+        }
+        var (season, id, cls) = ReadRanking(b);
+        if (!IsSafeRankingRequest(season, id, cls))
+        {
+            log.LogWarning("{Reply}: refused season={S} id={I} class={C} - outside the range "
+                + "the real Arbiter survives (class 0..{Max} or {All})",
+                reply, season, id, cls, MaxRankingClass, AllRankingClasses);
+            return true;
+        }
+        log.LogInformation("{Reply}: season={S} id={I} class={C} - empty list until T119",
+            reply, season, id, cls);
+
+        if (pve) s.Send(BuildPveRankingList());
+        else s.SendByDef(reply, new Dictionary<string, object>
+        {
+            ["players"] = new List<Dictionary<string, object>>(),
+        });
+        return true;
+    }
+
+    // ----------------------------- the seven leftovers -----------------------------
+
+    /// <summary>Guard: the bare frame. Both inter-party-match list requests carry no body.</summary>
+    public const int NoBodySize = 0;
+
+    /// <summary>[i16 page][i32 unk1][i32 unk2] - the one paginated packet of the nine.</summary>
+    public const int PartyMatchPageBodySize = 10;
+
+    /// <summary>[i32 type][u8 result].</summary>
+    public const int PartyMatchRuleBodySize = 5;
+
+    /// <summary>[i32 userDbId][u16 nameOffset] + the string.</summary>
+    public const int ChangeUserNameBodySize = 6;
+
+    /// <summary>
+    /// C_VIEW_INTER_PARTY_MATCH_DUNGEON_LIST (0xBA83) -&gt; S_..._DUNGEON_LIST (0xF732),
+    /// three zero bytes: an empty user pool, an empty party pool, and the dungeon-work UI off.
+    /// </summary>
+    public static bool OnViewInterPartyMatchDungeonList(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        s.SendByDef("S_VIEW_INTER_PARTY_MATCH_DUNGEON_LIST", new Dictionary<string, object>
+        {
+            ["userPool"] = (byte)0, ["partyPool"] = (byte)0, ["isShowDungeonWorkUI"] = (byte)0,
+        });
+        return true;
+    }
+
+    /// <summary>C_VIEW_INTER_PARTY_MATCH_BATTLEFIELD_LIST (0x9830) -&gt; 0x7A2C, two empty pools.</summary>
+    public static bool OnViewInterPartyMatchBattlefieldList(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        s.SendByDef("S_VIEW_INTER_PARTY_MATCH_BATTLEFIELD_LIST", new Dictionary<string, object>
+        {
+            ["userPool"] = (byte)0, ["partyPool"] = (byte)0,
+        });
+        return true;
+    }
+
+    /// <summary>
+    /// C_REQUEST_PARTY_MATCH_INFO_PAGE (0xA25F). There is NO S_ opcode for this in the 376012
+    /// map, so it is an ack - the board is redrawn by whatever the page request would have
+    /// listed, and with no listings there is nothing to redraw.
+    ///
+    /// <para>The page is still clamped. It is an i16 off the wire and the list it will index
+    /// once T119 fills it is the one place a page arithmetic bug would live - the same shape as
+    /// C_VIEW_GUILD_WAR's <c>count + page * -10 + 9</c>, which is the crash the proxy mod
+    /// already bounds. Clamping here, before there is anything to index, is free.</para>
+    /// </summary>
+    public static bool OnRequestPartyMatchInfoPage(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        var b = body.Span;
+        if (b.Length < PartyMatchPageBodySize) return true;
+        int page = GuildHandlers.ClampPage(BitConverter.ToInt16(b), 1);
+        log.LogInformation("C_REQUEST_PARTY_MATCH_INFO_PAGE page {Page} - no listings yet", page);
+        return true;
+    }
+
+    /// <summary>C_REQUEST_MY_PARTY_MATCH_INFO - a bare frame, and an ack: this character has
+    /// no listing of its own to describe.</summary>
+    public static bool OnRequestMyPartyMatchInfo(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+        => true;
+
+    /// <summary>
+    /// C_REQUEST_CHANGE_PARTY_MATCH_RULE (0xBE34) -&gt; S_REQUEST_CHANGE_PARTY_MATCH_RULE
+    /// (0xBCA0), which carries only the type - echoed, so the client's radio button settles on
+    /// what the player picked.
+    /// </summary>
+    public static bool OnRequestChangePartyMatchRule(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        var b = body.Span;
+        int type = b.Length >= 4 ? BitConverter.ToInt32(b) : 0;
+        s.SendByDef("S_REQUEST_CHANGE_PARTY_MATCH_RULE", new Dictionary<string, object>
+        {
+            ["type"] = type,
+        });
+        return true;
+    }
+
+    /// <summary>
+    /// C_GROUP_DUEL_RECORD (0x86CB) -&gt; S_GROUP_DUEL_RECORD (0xCF7C). No duel is running, so
+    /// every field is its zero and the awakened array is empty; `finish` stays 0 because a
+    /// finished duel with no winner would put the result window on screen.
+    /// </summary>
+    public static bool OnGroupDuelRecord(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        s.SendByDef("S_GROUP_DUEL_RECORD", new Dictionary<string, object>
+        {
+            ["countOfKillAsObjective"] = 0, ["limitSec"] = 0,
+            ["masterIsBlueTeam"] = (byte)0, ["materSlotIndex"] = 0,
+            ["finish"] = (byte)0, ["blueTeamWin"] = (byte)0, ["redTeamWin"] = (byte)0,
+            ["fixedBlueTeamBettingMoney"] = 0L, ["fixedRedTeamBettingMoney"] = 0L,
+            ["yourBettingMoney"] = 0L,
+            ["awakened"] = new List<Dictionary<string, object>>(),
+        });
+        return true;
+    }
+
+    /// <summary>
+    /// C_CHANGE_USER_NAME (0xAE31). No S_ opcode in the 376012 map, so an ack. The rename that
+    /// DOES answer is C_ASK_CHANGE_CHAR_NAME / C_DO_CHANGE_CHAR_NAME (T88, through the store);
+    /// this one is the GM tool's direct form and is logged, not applied - applying a rename
+    /// from an unauthenticated client packet is the one thing this handler must not do.
+    /// </summary>
+    public static bool OnChangeUserName(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+    {
+        var b = body.Span;
+        if (b.Length < ChangeUserNameBodySize) return true;
+        log.LogWarning("C_CHANGE_USER_NAME from player {Pid} for db id {Target} - logged, not "
+            + "applied; the rename path is C_ASK_CHANGE_CHAR_NAME (T88)",
+            s.PlayerId, BitConverter.ToInt32(b));
+        return true;
+    }
+}

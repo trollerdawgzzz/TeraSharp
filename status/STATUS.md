@@ -844,3 +844,45 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   `T116_the_game_log_rows_name_the_actor_target_and_item`,
   `T116_the_game_log_endpoint_refuses_cleanly` (unknown subject, no token, token unset, clamped
   size, absurd page, unparsable numbers) and `T116_the_admin_page_carries_both_logs_in_one_tab`.
+
+- T118 (leaderboard, step 1). status/LEADERBOARD.md. **The brief's premise was wrong and the
+  live proxy mod was guarding the wrong field** - both corrected, with citations.
+
+  There is no page and no size on `C_REQUEST_PVE_RANKING` / `C_REQUEST_PVP_RANKING`: both defs
+  are `int32 season / int32 id / int32 class` and the handlers (Arb_part_041.c:9474 / :9543)
+  read exactly those behind a `param_3 < 0x10` guard. The `count + page*(-10) + 9` pagination
+  crash is `C_VIEW_GUILD_WAR`, which the mod already bounds.
+
+  Of the three fields, `id` (+8) - the one the mod validated - is **safe**: it goes to
+  `DungeonDataSheet::GetDungeonTemplate` (Arb_part_003.c:3388), a red-black-tree find that
+  returns 0 for an unknown key, checked by the caller. The crash is `class` (+0xC), unchecked:
+  the past-season path does `puVar13 + ((longlong)param_5 + 1) * 3` (Arb_part_050.c:10630) - a
+  raw pointer index, 24-byte stride, no bound - and the current-season path reaches
+  `RankTree<..>::ClassRank` (Arb_part_049.c:11647) whose `if (0xe < (ulonglong)(int)param_2)`
+  calls a no-return function, with a sign-extending cast so negatives abort too. **Safe set:
+  0..14 or 16** - 16, not the 15 the mod allowed, and 15 is an index the past-season path walks
+  off the end with. (The writer at :10593 stamps 0xBEDC = S_PVE_RANKING_LIST, which is what
+  identifies the function.)
+
+  `status/EXPLOIT-FIX-RANKING.diff` (2 hunks, applies with **`patch -p1`** - index.js is
+  LF-only and the file lands all-CRLF, so plain patch's CR-stripping is what makes it match;
+  `git apply` needs `--ignore-whitespace`, `--binary` fails; applied result byte-compared and
+  `node --check`ed) makes both packets take the same field check and logs pass and drop.
+  `data/proxy-defs/C_REQUEST_PVE_RANKING.1.def` is the 34 bytes to copy into the proxy's
+  `data\definitions\` - it exists in tera_v100_MASTER_FINAL, which is why the "no def, drop all
+  PVE" rationale was stale.
+
+  New `LeaderboardPackets` in `Handlers/ArbiterClientHandlers.cs` answers all nine opcodes,
+  none of which was registered: the two ranking requests (class-validated, empty lists), the
+  two inter-party-match lists, the match rule (type echoed), the group-duel record (all zero),
+  and three acks - the party-match page and `C_REQUEST_MY_PARTY_MATCH_INFO`, plus
+  `C_CHANGE_USER_NAME`, which is **logged and not applied**: no S_ opcode exists for it and the
+  rename path with checks is T88's. `S_PVE_RANKING_LIST` is hand-built because its .def has no
+  fields while the writer emits a `[u16 count][u16 offset]` header.
+
+  Tests: `T118_the_ranking_class_range_is_the_one_the_arbiter_survives`,
+  `T118_the_pve_ranking_list_is_an_empty_client_list`,
+  `T118_the_body_sizes_are_the_handler_guards`,
+  `T118_the_leftover_replies_write_through_their_defs` (every reply written with the real
+  registry, which is what catches a mistyped field name),
+  `T118_the_two_acks_send_nothing_and_change_nothing`.

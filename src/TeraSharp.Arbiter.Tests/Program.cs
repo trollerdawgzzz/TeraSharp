@@ -22691,6 +22691,146 @@ string message
     }
 
 
+
+    // ===================== T118: the leaderboard, step 1 =====================
+
+    /// <summary>
+    /// The crash analysis, as a range. The mod that guards the live server checked the wrong
+    /// field for two years of uptime; this is the one that matters, and both of its bounds come
+    /// from a named function in the decompile rather than from a guessed class list.
+    /// </summary>
+    [Test] public static void T118_the_ranking_class_range_is_the_one_the_arbiter_survives()
+    {
+        // RankTree<..>::ClassRank (Arb_part_049.c:11647): if (0xe < (ulonglong)(int)cls) -> abort.
+        for (int cls = 0; cls <= 14; cls++)
+            Hex.True(LeaderboardPackets.IsSafeRankingClass(cls), $"class {cls} is indexable");
+        Hex.True(LeaderboardPackets.IsSafeRankingClass(0x10),
+            "0x10 is the aggregate branch and never reaches the index");
+
+        Hex.True(!LeaderboardPackets.IsSafeRankingClass(15),
+            "15 is NOT safe - the old mod allowed it, and the past-season path indexes with it");
+        Hex.True(!LeaderboardPackets.IsSafeRankingClass(17)
+                 && !LeaderboardPackets.IsSafeRankingClass(99)
+                 && !LeaderboardPackets.IsSafeRankingClass(int.MaxValue),
+            "above the aggregate is off the end of the array");
+        Hex.True(!LeaderboardPackets.IsSafeRankingClass(-1)
+                 && !LeaderboardPackets.IsSafeRankingClass(int.MinValue),
+            "and negatives sign-extend past 0xe, which is the same abort");
+
+        // SendRankValidate's own two guards, mirrored so we never forward a refusal.
+        Hex.True(LeaderboardPackets.IsSafeRankingRequest(1, 1, 0), "season 1 id 1 class 0 is fine");
+        Hex.True(!LeaderboardPackets.IsSafeRankingRequest(0, 1, 0)
+                 && !LeaderboardPackets.IsSafeRankingRequest(-1, 1, 0), "season must be > 0");
+        Hex.True(!LeaderboardPackets.IsSafeRankingRequest(1, 0, 0), "id must be > 0");
+        Hex.True(!LeaderboardPackets.IsSafeRankingRequest(1, 1, 15), "and the class still decides");
+    }
+
+    /// <summary>
+    /// S_PVE_RANKING_LIST, byte-exact. Its shipped .def has no fields at all, so this one is
+    /// built by hand: the writer stamps 0xBEDC and then lays down two u16 back-patch slots
+    /// before any element (Arb_part_050.c:10593), which is also what identifies that function
+    /// as this packet's writer.
+    /// </summary>
+    [Test] public static void T118_the_pve_ranking_list_is_an_empty_client_list()
+    {
+        Hex.Eq(LeaderboardPackets.BuildPveRankingList(),
+            "08 00 DC BE 00 00 00 00",
+            "four-byte header, then count 0 and firstElementOffset 0");
+        Hex.True(LeaderboardPackets.S_PVE_RANKING_LIST == 0xBEDC,
+            "the opcode is data.json's, and the writer stamps the same value");
+    }
+
+    /// <summary>
+    /// The body sizes are each handler's own length guard less the 4-byte client header, and
+    /// the three ranking fields sit where the dumper reads them.
+    /// </summary>
+    [Test] public static void T118_the_body_sizes_are_the_handler_guards()
+    {
+        Hex.True(LeaderboardPackets.RankingBodySize == 12,
+            $"guard param_3 < 0x10 leaves a 12-byte body: {LeaderboardPackets.RankingBodySize}");
+        Hex.True(LeaderboardPackets.SeasonOffset == 0 && LeaderboardPackets.IdOffset == 4
+                 && LeaderboardPackets.ClassOffset == 8,
+            "season/id/class, in the .def's order");
+        Hex.True(LeaderboardPackets.PartyMatchPageBodySize == 10,
+            "C_REQUEST_PARTY_MATCH_INFO_PAGE is [i16 page][i32][i32]");
+        Hex.True(LeaderboardPackets.PartyMatchRuleBodySize == 5,
+            "C_REQUEST_CHANGE_PARTY_MATCH_RULE is [i32 type][u8 result]");
+        Hex.True(LeaderboardPackets.ChangeUserNameBodySize == 6,
+            "C_CHANGE_USER_NAME is [i32 userDbId] + a string reference");
+        Hex.True(LeaderboardPackets.NoBodySize == 0,
+            "both inter-party-match list requests are bare frames");
+    }
+
+    /// <summary>
+    /// Every reply this task sends through a .def, written with the real registry. This is the
+    /// test that catches a mistyped field name: DefinitionWriter throws on one, and an empty
+    /// form that does not round-trip is an empty form the client cannot read.
+    /// </summary>
+    [Test] public static void T118_the_leftover_replies_write_through_their_defs()
+    {
+        var reg = LoadDefinitionsOrSkip();
+        if (reg == null) return;
+
+        var pvp = WriteByDef(reg, "S_PVP_RANKING_LIST", new Dictionary<string, object>
+        {
+            ["players"] = new List<Dictionary<string, object>>(),
+        });
+        Hex.True(pvp.Length == 4, $"an empty players array is a bare list header: {pvp.Length}");
+
+        var dungeon = WriteByDef(reg, "S_VIEW_INTER_PARTY_MATCH_DUNGEON_LIST",
+            new Dictionary<string, object>
+            {
+                ["userPool"] = (byte)0, ["partyPool"] = (byte)0, ["isShowDungeonWorkUI"] = (byte)0,
+            });
+        Hex.True(dungeon.Length == 3, $"three bytes, three fields: {dungeon.Length}");
+
+        var bf = WriteByDef(reg, "S_VIEW_INTER_PARTY_MATCH_BATTLEFIELD_LIST",
+            new Dictionary<string, object> { ["userPool"] = (byte)0, ["partyPool"] = (byte)0 });
+        Hex.True(bf.Length == 2, $"two pools, two bytes: {bf.Length}");
+
+        var rule = WriteByDef(reg, "S_REQUEST_CHANGE_PARTY_MATCH_RULE",
+            new Dictionary<string, object> { ["type"] = 7 });
+        Hex.True(rule.Length == 4 && BitConverter.ToInt32(rule, 0) == 7,
+            "the rule reply is the echoed type and nothing else");
+
+        var duel = WriteByDef(reg, "S_GROUP_DUEL_RECORD", new Dictionary<string, object>
+        {
+            ["countOfKillAsObjective"] = 0, ["limitSec"] = 0,
+            ["masterIsBlueTeam"] = (byte)0, ["materSlotIndex"] = 0,
+            ["finish"] = (byte)0, ["blueTeamWin"] = (byte)0, ["redTeamWin"] = (byte)0,
+            ["fixedBlueTeamBettingMoney"] = 0L, ["fixedRedTeamBettingMoney"] = 0L,
+            ["yourBettingMoney"] = 0L,
+            ["awakened"] = new List<Dictionary<string, object>>(),
+        });
+        Hex.True(duel.Length > 0, $"the idle duel record writes ({duel.Length} B)");
+        bool allZero = true;
+        foreach (var b in duel) if (b != 0) { allZero = false; break; }
+        Hex.True(allZero,
+            "and every byte of it is zero - an idle record invents no winner, no bet and no "
+            + "finish flag, any of which would put a result window on the player's screen");
+    }
+
+    /// <summary>
+    /// The two acks. Neither C_REQUEST_PARTY_MATCH_INFO_PAGE nor C_CHANGE_USER_NAME has an S_
+    /// opcode in the 376012 map, so answering them at all would mean inventing a packet; and
+    /// C_CHANGE_USER_NAME must not be applied - a client-supplied rename is the T88 path's job,
+    /// behind its own checks.
+    /// </summary>
+    [Test] public static void T118_the_two_acks_send_nothing_and_change_nothing()
+    {
+        var defs = LoadDefinitionsOrSkip();
+        if (defs == null) return;
+        Hex.True(defs.Get("S_REQUEST_PARTY_MATCH_INFO_PAGE") == null,
+            "there is no S_REQUEST_PARTY_MATCH_INFO_PAGE to answer with");
+        Hex.True(defs.Get("S_CHANGE_USER_NAME") == null,
+            "and no S_CHANGE_USER_NAME either - both are acks by absence, not by choice");
+
+        // The page is still clamped before it can ever index anything (T48).
+        Hex.True(GuildHandlers.ClampPage(short.MaxValue, 1) == 1
+                 && GuildHandlers.ClampPage(-1, 1) == 1 && GuildHandlers.ClampPage(0, 1) == 1,
+            "an i16 page off the wire cannot escape a one-page list");
+    }
+
     // ===================== T116: the admin game-log page =====================
 
     /// <summary>A store with two characters and a handful of game_log rows to search.</summary>
