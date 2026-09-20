@@ -396,3 +396,170 @@ public static class DungeonRouting
         link.SendFrame(send.Opcode, send.Payload);
     }
 }
+
+/// <summary>
+/// SA_WORLD_CONTINENT_LIST (0x164D) - the roster a World sends right after SA_REGISTER, saying
+/// which continents it loads. T138b: this is the LIVE half of "who owns this continent", and it
+/// feeds the same <see cref="DungeonChannels.MapContinent"/> table that
+/// <see cref="WorldServerList.SeedDefault"/> seeds from config. Live data wins because it arrives
+/// later; config is the fallback for a World that never sends one.
+///
+/// <para>Layout, pinned against D:\packetlogs\cap_multiworld3.log (T137c). Payload-relative:</para>
+/// <code>
+///   0   i32 count / 4 i32 unk (22 in every captured frame) / 8 i32 planetId / 12 i32 worldId
+///   16  count x 16 B:  i32 minLevel / i32 maxLevel / i32 continentId / i32 unk
+/// </code>
+/// <para>It consumes the payload EXACTLY on all three captured links - the main World 173 rows in
+/// 2784 B, world 13 34 rows in 560 B, world 12 5 rows in 96 B - which is what makes the stride
+/// certain rather than plausible. Velik's Sanctuary (9781) is in world 13's roster and in neither
+/// of the others; that one fact is the whole of continent routing.</para>
+/// </summary>
+public static class WorldContinentList
+{
+    public const ushort SA_WORLD_CONTINENT_LIST = 0x164D;
+
+    /// <summary>Header is four int32; anything shorter is not this frame.</summary>
+    public const int MinPayload = 16;
+
+    /// <summary>One row: a continent and the level band it is offered at.</summary>
+    public readonly record struct Row(int MinLevel, int MaxLevel, int ContinentId);
+
+    /// <summary>What one World declared.</summary>
+    public sealed class Roster
+    {
+        public int WorldId { get; init; }
+        public int PlanetId { get; init; }
+        public IReadOnlyList<Row> Rows { get; init; } = Array.Empty<Row>();
+    }
+
+    /// <summary>Parse, or null for a short payload or a count that overruns it.</summary>
+    public static Roster? Parse(byte[]? payload)
+    {
+        if (payload == null || payload.Length < MinPayload) return null;
+        int count = BitConverter.ToInt32(payload, 0);
+        if (count < 0 || MinPayload + count * 16 > payload.Length) return null;
+        var rows = new Row[count];
+        for (int i = 0; i < count; i++)
+        {
+            int o = MinPayload + i * 16;
+            rows[i] = new Row(BitConverter.ToInt32(payload, o),
+                              BitConverter.ToInt32(payload, o + 4),
+                              BitConverter.ToInt32(payload, o + 8));
+        }
+        return new Roster
+        {
+            WorldId = BitConverter.ToInt32(payload, 12),
+            PlanetId = BitConverter.ToInt32(payload, 8),
+            Rows = rows,
+        };
+    }
+
+    /// <summary>
+    /// Fold a roster into the continent table. Returns the number of continents claimed, or 0 for
+    /// a frame that did not parse. A World that reconnects simply re-claims its continents, which
+    /// is what cap_multiworld3 needs: the DungeonServer came back as link #9, then #14, then #16.
+    /// </summary>
+    public static int Apply(DungeonChannels channels, byte[]? payload, ILogger? log = null)
+    {
+        if (channels == null) return 0;
+        var roster = Parse(payload);
+        if (roster == null) return 0;
+        foreach (var row in roster.Rows) channels.MapContinent(row.ContinentId, roster.WorldId);
+        log?.LogInformation("World {W} claims {N} continents (planet {P})",
+            roster.WorldId, roster.Rows.Count, roster.PlanetId);
+        return roster.Rows.Count;
+    }
+}
+
+/// <summary>
+/// The cross-World dungeon hand-off, as cap_multiworld3 performs it. T138b.
+///
+/// <para>Two request/reply pairs that CROSS links - that crossing is the whole mechanism:</para>
+/// <code>
+///   W->A 0x13BE  on the MAIN link       "this player wants continent 9781"
+///   A->W 0x13BF  on the OWNER's link    <- WorldForContinent decides this
+///   W->A 0x13C5  on the OWNER's link    the owner registers a channel
+///   W->A 0x13C0  on the OWNER's link    ready
+///   A->W 0x13C1  on the MAIN link       <- back to whoever asked
+///   W->A 0x2711  on the OWNER's link    SDB_USER_ENTERWORLD, carrying the channel
+///   ... play ...
+///   W->A 0x13C6  on the OWNER's link    channel released
+///   W->A 0x2711  on the MAIN link       re-entry, channel 0
+/// </code>
+/// <para>Both replies are near-copies, which is what makes this implementable without knowing
+/// what the 200-odd bytes mean: 0x13BF is 8 fixed bytes plus the whole of 0x13BE from offset 8
+/// on (verified on all three captured entries), and 0x13C1 is 0x13C0 byte for byte, 208 B.</para>
+/// </summary>
+public static class ContinentHandoff
+{
+    /// <summary>Main World -> Arbiter: a player wants a continent somebody else may own.</summary>
+    public const ushort SA_REQUEST_ENTER_CONTINENT = 0x13BE;
+
+    /// <summary>Arbiter -> the OWNING World. The reply that crosses.</summary>
+    public const ushort AS_ENTER_CONTINENT = 0x13BF;
+
+    /// <summary>Owning World -> Arbiter: ready.</summary>
+    public const ushort SA_CONTINENT_READY = 0x13C0;
+
+    /// <summary>Arbiter -> the link that asked. The second crossing.</summary>
+    public const ushort AS_CONTINENT_READY = 0x13C1;
+
+    /// <summary>The 8-byte handle at the head of 0x13BE, and the continent right after it.</summary>
+    public const int HandleSize = 8;
+
+    /// <summary>Shortest 0x13BE that still names a continent.</summary>
+    public const int MinPayload = 12;
+
+    /// <summary>
+    /// What 0x13BF carries where the request carried a session handle: planet 2800, then 1.
+    /// Identical in all three captured entries. The 1 is NOT the destination world id (that is 13
+    /// in the same capture), so it is copied as the observed constant rather than computed from
+    /// something we would be guessing at.
+    /// </summary>
+    public static readonly byte[] EnterReplyPrefix = { 0xF0, 0x0A, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00 };
+
+    /// <summary>The continent a 0x13BE names - it decides which link gets the reply.</summary>
+    public static int? ContinentOf(byte[]? request)
+        => request == null || request.Length < MinPayload ? null : BitConverter.ToInt32(request, HandleSize);
+
+    /// <summary>
+    /// 0x13BE -> 0x13BF. Swap the handle, copy everything else verbatim - destination continent,
+    /// spawn coordinates and all. Null for a payload too short to hold the prefix.
+    /// </summary>
+    public static byte[]? EnterReply(byte[]? request)
+    {
+        if (request == null || request.Length < HandleSize) return null;
+        var reply = new byte[request.Length];
+        EnterReplyPrefix.CopyTo(reply, 0);
+        Array.Copy(request, HandleSize, reply, HandleSize, request.Length - HandleSize);
+        return reply;
+    }
+
+    /// <summary>
+    /// 0x13C0 -> 0x13C1. The captured pair is 208 B and identical, so this is a pure relay. It is
+    /// a named method anyway, because "it is a pure relay" is a fact about this build that a
+    /// future capture could contradict.
+    /// </summary>
+    public static byte[]? ReadyReply(byte[]? ready) => ready == null ? null : (byte[])ready.Clone();
+
+    /// <summary>
+    /// The channel number the CLIENT is told in S_CURRENT_CHANNEL, which is the internal channel
+    /// PLUS ONE. Four samples settle it: 12 -> 13 in cap_multiworld2, then 13 -> 14, 14 -> 15,
+    /// 15 -> 16 across cap_multiworld3's three entries.
+    /// </summary>
+    public static int ClientChannel(int internalChannel) => internalChannel + 1;
+
+    /// <summary>
+    /// The low half of <see cref="DungeonChannels"/>'s packed ChannelId. T138b reconciliation:
+    /// 0x13C5's +4 field really is one int32, as the decompile says - but the capture shows it is
+    /// PACKED, <c>channel | (planetId &lt;&lt; 16)</c>. cap_multiworld3's first entry is
+    /// <c>0D 00 F0 0A</c> = 0x0AF0000D: channel 13, planet 2800. That is the same packing
+    /// S_CURRENT_CHANNEL's second int32 uses. DungeonChannels keeps the packed value because it
+    /// only ever needs it to be unique; these two helpers are for anything that has to show or
+    /// compare the halves.
+    /// </summary>
+    public static int ChannelOf(int packedChannelId) => packedChannelId & 0xFFFF;
+
+    /// <summary>The high half of the same packed field: the planet id.</summary>
+    public static int PlanetOf(int packedChannelId) => (packedChannelId >> 16) & 0xFFFF;
+}
