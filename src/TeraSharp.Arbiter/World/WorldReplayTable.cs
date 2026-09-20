@@ -115,8 +115,12 @@ public sealed class WorldReplayTable
         // answers it either, so World cannot be waiting on it. What sealing them actually buys is
         // the other half: an unsealed request makes the replay table attribute the NEXT A->W frame
         // to it as a response, which is how 0x156F nearly stole 0x273B's reply (see above).
-        0x27DD, // SDB_ITEM_TRADE_LOG  - written after a completed player trade (122 B live)
-        0x288C, // SDB_CASH_ITEM_LOG
+        //
+        // T115 UNSEALED both, and 0x27FE below with them: they are DbProxy handlers now
+        // (GameLogPackets -> the game_log table), and a sealed opcode never reaches a handler.
+        // The one-way behaviour is unchanged - FileGameLog stores and answers nothing - and the
+        // attribution risk the paragraph above describes is gone with it, because TryHandle
+        // returns true before WorldBridge ever reaches the replay lookup.
 
         // --- T77, cap_social4.log. Neither carries a DlmId and neither draws a reply: two
         // SDB_PUBLISH_INVITE_CODE and three SA_DARK_RIFT_EVENT_OPEN arrive and no A->W frame
@@ -186,7 +190,7 @@ public sealed class WorldReplayTable
         // Handler_SDB_ADD_PVP_USER_LOG (Arb_part_062.c:19349) reads the killer and victim db ids
         // at frame 6 and 10, looks both users up and writes a log row - no SendToSession. It was
         // briefed as the cinematic-seen flag; it is not (that is C_WATCHED_MOVIES, Arbiter-owned).
-        0x27FE, // SDB_ADD_PVP_USER_LOG
+        // T115: unsealed - it decodes into game_log now. See the note above 0x1499.
         0x15FA, // one-way push, once per session
     };
 

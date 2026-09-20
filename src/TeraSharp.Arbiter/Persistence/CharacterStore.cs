@@ -1366,6 +1366,31 @@ CREATE TABLE IF NOT EXISTS watched_movies_account (
   watched_at TEXT    NOT NULL DEFAULT (datetime('now')),
   PRIMARY KEY (account_id, movie_id)
 );
+
+-- T115: the LogDB writes World sends and the Arbiter used to throw away - SDB_ITEM_TRADE_LOG,
+-- SDB_ADD_PVP_USER_LOG, SDB_ADD_PK_USER_LOG, SDB_ADD_GROUP_DUEL_USER_LOG and SDB_CASH_ITEM_LOG.
+-- One normalized row per logged event, in the shape the retail log tool groups by, so a new
+-- log opcode adds an action and not a table. `extra` is a flat JSON object for whatever that
+-- frame carried that has no column - GameLogPackets.Json writes it.
+-- status/GAME-LOG.md.
+CREATE TABLE IF NOT EXISTS game_log (
+  log_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+  logged_at    INTEGER NOT NULL DEFAULT 0,
+  category     TEXT    NOT NULL DEFAULT '',
+  action       TEXT    NOT NULL DEFAULT '',
+  account_id   INTEGER NOT NULL DEFAULT 0,
+  character_id INTEGER NOT NULL DEFAULT 0,
+  target_id    INTEGER NOT NULL DEFAULT 0,
+  item_db_id   INTEGER NOT NULL DEFAULT 0,
+  template_id  INTEGER NOT NULL DEFAULT 0,
+  amount       INTEGER NOT NULL DEFAULT 0,
+  money        INTEGER NOT NULL DEFAULT 0,
+  extra        TEXT    NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS ix_game_log_char ON game_log(character_id, log_id);
+CREATE INDEX IF NOT EXISTS ix_game_log_acct ON game_log(account_id, log_id);
+CREATE INDEX IF NOT EXISTS ix_game_log_cat ON game_log(category, log_id);
+CREATE INDEX IF NOT EXISTS ix_game_log_time ON game_log(logged_at);
 ");
         // CREATE TABLE IF NOT EXISTS does nothing to a DB that already has `characters`, so
         // columns added later need their own idempotent step. terasharp.db predates `exp`.
@@ -5163,6 +5188,129 @@ DELETE FROM restrictions      WHERE character_id = $id;";
     }
 
     /// <summary>Every post on a board, oldest first.</summary>
+    // =====================================================================
+    // T115 - the game log. status/GAME-LOG.md.
+    // =====================================================================
+
+    /// <summary>One <c>game_log</c> row, as <see cref="QueryGameLog"/> returns it.</summary>
+    public sealed record GameLogRow(
+        long LogId, long LoggedAt, string Category, string Action, long AccountId,
+        long CharacterId, long TargetId, long ItemDbId, int TemplateId, long Amount,
+        long Money, string Extra);
+
+    /// <summary>The largest page <see cref="QueryGameLog"/> will hand back in one call.</summary>
+    public const int GameLogMaxPageSize = 200;
+
+    /// <summary>
+    /// File one decoded log line. <paramref name="loggedAt"/> 0 means now - the frames carry no
+    /// timestamp of their own, so arrival time is the only honest one, and it is recorded
+    /// rather than derived at query time.
+    /// </summary>
+    public long AddGameLog(string category, string action, long accountId, long characterId,
+                           long targetId, long itemDbId, int templateId, long amount,
+                           long money, string? extra, long loggedAt = 0)
+    {
+        if (loggedAt <= 0) loggedAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "INSERT INTO game_log (logged_at, category, action, account_id, character_id, " +
+                "target_id, item_db_id, template_id, amount, money, extra) " +
+                "VALUES ($t, $c, $a, $acc, $chr, $tgt, $item, $tpl, $amt, $money, $x); " +
+                "SELECT last_insert_rowid();";
+            cmd.Parameters.AddWithValue("$t", loggedAt);
+            cmd.Parameters.AddWithValue("$c", category ?? string.Empty);
+            cmd.Parameters.AddWithValue("$a", action ?? string.Empty);
+            cmd.Parameters.AddWithValue("$acc", accountId);
+            cmd.Parameters.AddWithValue("$chr", characterId);
+            cmd.Parameters.AddWithValue("$tgt", targetId);
+            cmd.Parameters.AddWithValue("$item", itemDbId);
+            cmd.Parameters.AddWithValue("$tpl", templateId);
+            cmd.Parameters.AddWithValue("$amt", amount);
+            cmd.Parameters.AddWithValue("$money", money);
+            cmd.Parameters.AddWithValue("$x", extra ?? string.Empty);
+            return Convert.ToInt64(cmd.ExecuteScalar());
+        }
+    }
+
+    /// <summary>
+    /// Read the log back, newest first.
+    ///
+    /// <para>Every filter is optional: 0 / null means "any". <paramref name="fromUnix"/> and
+    /// <paramref name="toUnix"/> are inclusive. <paramref name="page"/> is zero-based and
+    /// checked as UNSIGNED, and <paramref name="pageSize"/> is clamped to
+    /// <see cref="GameLogMaxPageSize"/>, so a hostile page number can only produce an empty
+    /// result and never a runaway read.</para>
+    /// </summary>
+    public List<GameLogRow> QueryGameLog(long accountId = 0, long characterId = 0,
+                                         string? category = null, long fromUnix = 0,
+                                         long toUnix = 0, int page = 0, int pageSize = 50)
+    {
+        if (pageSize <= 0) pageSize = 50;
+        if (pageSize > GameLogMaxPageSize) pageSize = GameLogMaxPageSize;
+        if ((uint)page > int.MaxValue / pageSize) return new List<GameLogRow>();
+
+        var where = new List<string>();
+        if (accountId != 0) where.Add("account_id = $acc");
+        if (characterId != 0) where.Add("character_id = $chr OR target_id = $chr");
+        if (!string.IsNullOrEmpty(category)) where.Add("category = $cat");
+        if (fromUnix > 0) where.Add("logged_at >= $from");
+        if (toUnix > 0) where.Add("logged_at <= $to");
+
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            var sql = new System.Text.StringBuilder(
+                "SELECT log_id, logged_at, category, action, account_id, character_id, " +
+                "target_id, item_db_id, template_id, amount, money, extra FROM game_log");
+            for (int i = 0; i < where.Count; i++)
+                sql.Append(i == 0 ? " WHERE (" : " AND (").Append(where[i]).Append(')');
+            sql.Append(" ORDER BY log_id DESC LIMIT $take OFFSET $skip");
+            cmd.CommandText = sql.ToString();
+
+            if (accountId != 0) cmd.Parameters.AddWithValue("$acc", accountId);
+            if (characterId != 0) cmd.Parameters.AddWithValue("$chr", characterId);
+            if (!string.IsNullOrEmpty(category)) cmd.Parameters.AddWithValue("$cat", category);
+            if (fromUnix > 0) cmd.Parameters.AddWithValue("$from", fromUnix);
+            if (toUnix > 0) cmd.Parameters.AddWithValue("$to", toUnix);
+            cmd.Parameters.AddWithValue("$take", pageSize);
+            cmd.Parameters.AddWithValue("$skip", (long)page * pageSize);
+
+            var rows = new List<GameLogRow>();
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                rows.Add(new GameLogRow(r.GetInt64(0), r.GetInt64(1), r.GetString(2),
+                    r.GetString(3), r.GetInt64(4), r.GetInt64(5), r.GetInt64(6),
+                    r.GetInt64(7), r.GetInt32(8), r.GetInt64(9), r.GetInt64(10), r.GetString(11)));
+            return rows;
+        }
+    }
+
+    /// <summary>How many rows a <see cref="QueryGameLog"/> with the same filters would match.</summary>
+    public long CountGameLog(long accountId = 0, long characterId = 0, string? category = null)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            var where = new List<string>();
+            if (accountId != 0) where.Add("account_id = $acc");
+            if (characterId != 0) where.Add("character_id = $chr OR target_id = $chr");
+            if (!string.IsNullOrEmpty(category)) where.Add("category = $cat");
+            var sql = new System.Text.StringBuilder("SELECT COUNT(*) FROM game_log");
+            for (int i = 0; i < where.Count; i++)
+                sql.Append(i == 0 ? " WHERE (" : " AND (").Append(where[i]).Append(')');
+            cmd.CommandText = sql.ToString();
+            if (accountId != 0) cmd.Parameters.AddWithValue("$acc", accountId);
+            if (characterId != 0) cmd.Parameters.AddWithValue("$chr", characterId);
+            if (!string.IsNullOrEmpty(category)) cmd.Parameters.AddWithValue("$cat", category);
+            return Convert.ToInt64(cmd.ExecuteScalar());
+        }
+    }
+'''
+rep(P,
+'''    /// <summary>One <c>game_log</c> row placeholder</summary>
+
     public List<BoardPostRow> GetBoardPosts(int boardId)
     {
         lock (_lock)

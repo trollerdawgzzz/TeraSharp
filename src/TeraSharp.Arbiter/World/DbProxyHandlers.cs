@@ -1273,6 +1273,14 @@ public sealed class DbProxyHandlers
             // either) and were falling through to a replay lookup that has nothing for them. ---
             case DungeonChannels.SA_ADD_DUNGEON_CHANNEL:     // 0x13C5
             case DungeonChannels.SA_REMOVE_DUNGEON_CHANNEL:  // 0x13C6
+            // --- T115: the five LogDB writes. All one-way - every Handler_SDB_*LOG* runs to
+            // `return 1` with no packet writer - so handling them changes nothing on the wire;
+            // it only stops the bytes being dropped. status/GAME-LOG.md. ---
+            case GameLogPackets.SDB_ITEM_TRADE_LOG:           // 0x27DD
+            case GameLogPackets.SDB_ADD_PVP_USER_LOG:         // 0x27FE
+            case GameLogPackets.SDB_ADD_PK_USER_LOG:          // 0x27FF
+            case GameLogPackets.SDB_ADD_GROUP_DUEL_USER_LOG:  // 0x2800
+            case GameLogPackets.SDB_CASH_ITEM_LOG:            // 0x288C
             // --- T26: the last two per-character login loads, rebuilt from rows. ---
             case SDB_REPUTATION_LIST:             // 0x2890 from the stored 0x2891 records
             case SDB_FATIGABILITY_LIST:           // 0x2909 from the account's fatigue row
@@ -1554,6 +1562,19 @@ public sealed class DbProxyHandlers
 
             // --- Remaining login-time: programmatic builders ---
             case SDB_LOAD_2867: return OnLoadDungeonCoolTime(link, payload);
+            case GameLogPackets.SDB_ITEM_TRADE_LOG:
+                return FileGameLog(GameLogPackets.ParseItemTradeLog(payload), "SDB_ITEM_TRADE_LOG");
+            case GameLogPackets.SDB_ADD_PVP_USER_LOG:
+                return FileGameLog(GameLogPackets.ParseDuelUserLog(payload, "pvp.kill"),
+                    "SDB_ADD_PVP_USER_LOG");
+            case GameLogPackets.SDB_ADD_PK_USER_LOG:
+                return FileGameLog(GameLogPackets.ParseDuelUserLog(payload, "pk.kill"),
+                    "SDB_ADD_PK_USER_LOG");
+            case GameLogPackets.SDB_ADD_GROUP_DUEL_USER_LOG:
+                return FileGameLog(GameLogPackets.ParseGroupDuelUserLog(payload),
+                    "SDB_ADD_GROUP_DUEL_USER_LOG");
+            case GameLogPackets.SDB_CASH_ITEM_LOG:
+                return FileGameLog(GameLogPackets.ParseCashItemLog(payload), "SDB_CASH_ITEM_LOG");
             case DungeonChannels.SA_ADD_DUNGEON_CHANNEL:    return OnAddDungeonChannel(link, payload);
             case DungeonChannels.SA_REMOVE_DUNGEON_CHANNEL: return OnRemoveDungeonChannel(link, payload);
             case SA_UPDATE_DUNGEON_COOLTIME:    return OnUpdateDungeonCoolTime(payload);
@@ -4087,6 +4108,30 @@ public sealed class DbProxyHandlers
         if (playerId <= 0)
             _log.LogWarning("{What}: no live session owns gameId 0x{G:X} - not stored", what, gameId);
         return playerId;
+    }
+
+    /// <summary>
+    /// T115. Store decoded log lines and answer nothing, which is what the real Arbiter does:
+    /// every <c>Handler_SDB_*LOG*</c> ends at <c>return 1</c> with no packet writer in it, and
+    /// cap_social2/3/4 show four 0x288C frames with no A-&gt;W frame after any of them. Returning
+    /// true only keeps the replay table out of it.
+    ///
+    /// <para>A frame shorter than the handler's own guard decodes to nothing and is dropped
+    /// with a warning - the same thing the Arbiter does, minus the PDL-mismatch shutdown.</para>
+    /// </summary>
+    private bool FileGameLog(IReadOnlyList<GameLogPackets.GameLogEntry> rows, string what)
+    {
+        if (rows.Count == 0)
+        {
+            _log.LogWarning("{What}: frame too short for the handler guard - dropped", what);
+            return true;
+        }
+        if (_store is null) return true;
+        foreach (var e in rows)
+            _store.AddGameLog(e.Category, e.Action, e.AccountId, e.CharacterId, e.TargetId,
+                e.ItemDbId, e.TemplateId, e.Amount, e.Money, e.Extra);
+        _log.LogInformation("{What}: {N} game_log row(s) filed", what, rows.Count);
+        return true;
     }
 
     /// <summary>

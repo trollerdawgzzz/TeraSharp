@@ -2142,10 +2142,9 @@ array items
             0x15F9,
             // T42: SDB_MOVE_WAREHOUSE_ITEM is a ten-line stub in the real Arbiter that sends nothing.
             0x2754,
-            // T62: SDB_ADD_PVP_USER_LOG, sent at logout, no SendToSession in its handler.
-            0x27FE,
-            // T74: SDB_ITEM_TRADE_LOG / SDB_CASH_ITEM_LOG - audit writes, handlers end at return 1, no writer.
-            0x27DD, 0x288C,
+            // T62 / T74 put 0x27FE, 0x27DD and 0x288C here. T115 took all three out: they are
+            // DbProxy handlers now (GameLogPackets -> game_log), still one-way, and an opcode
+            // may not be in both places - see T115_the_log_opcodes_are_handlers_not_sealed.
             // T77: SDB_UPDATE_EP_DAILY_LIMIT-style write with no reply, and the festival push.
             0x28B8, 0x14CE,
             // T47 sealed the through-Arbiter contract family here (0x2809, 0x280C, 0x280D,
@@ -22496,6 +22495,198 @@ string message
             "world 13 dropping leaves world 0 taking players");
     }
 
+
+
+    // ===================== T115: the game log =====================
+
+    /// <summary>
+    /// SDB_CASH_ITEM_LOG (0x288C) as the real World sent it: cap_social2.log seq 1849, a 54-byte
+    /// frame = 8-byte list reference + one 40-byte CashItemLog. cap_social3 seq 1037/1364 and
+    /// cap_social4 seq 8660 are the same shape with different ids.
+    /// </summary>
+    static readonly byte[] Cap288CPayload = Hex.B(@"
+        0E 00 00 00 28 00 00 00 00 00 00 00 00 00 00 00
+        00 00 00 00 00 00 00 00 EB 03 00 00 00 00 00 00
+        13 98 02 00 01 00 00 00 00 00 00 00 02 00 00 00");
+
+    /// <summary>
+    /// The only one of the five logs with a capture. The record size is pinned from both ends -
+    /// WorldServer's CashItemLog vector strides 0x28, and 54 - 6 - 8 is 40 exactly - and the
+    /// field offsets come from the producer, DBIncreaseUserInvenSize::ExecuteCommitSQL.
+    /// </summary>
+    [Test] public static void T115_the_cash_item_log_decodes_the_captured_frame()
+    {
+        var rows = GameLogPackets.ParseCashItemLog(Cap288CPayload);
+        Hex.True(rows.Count == 1, $"one CashItemLog in a 54-byte frame: {rows.Count}");
+        var r = rows[0];
+        Hex.True(r.Category == GameLogPackets.CategoryItem && r.Action == "cash.item",
+            $"filed under item: {r.Category}/{r.Action}");
+        Hex.True(r.TemplateId == 170003, $"template 170003 (item+0x360): {r.TemplateId}");
+        Hex.True(r.Amount == 1, $"amount 1 (item+0x50): {r.Amount}");
+        Hex.True(r.ItemDbId == 0, $"item db id 0 in this capture (item+0x358): {r.ItemDbId}");
+        Hex.True(r.CharacterId == 1003, $"the producer's user id: {r.CharacterId}");
+        Hex.True(r.Extra != null && r.Extra.Contains("\"reason\":\"2\"")
+                 && r.Extra.Contains("\"rawUserId\":\"1003\""),
+            $"reason 2 is DBIncreaseUserInvenSize's literal, and the raw id is kept: {r.Extra}");
+
+        // End to end: through the real handler, into the table, and back out - and NO reply.
+        using var store = GuildStore(1);
+        var frames = RunHandler(GameLogPackets.SDB_CASH_ITEM_LOG, Cap288CPayload, 0, store);
+        Hex.True(frames.Count == 0, $"0x288C is one-way - the real handler sends nothing: {frames.Count}");
+        var stored = store.QueryGameLog(category: GameLogPackets.CategoryItem);
+        Hex.True(stored.Count == 1 && stored[0].TemplateId == 170003 && stored[0].Amount == 1,
+            $"and the row is in game_log: {stored.Count}");
+    }
+
+    /// <summary>
+    /// SDB_ITEM_TRADE_LOG (0x27DD), from the dumper (Arb_part_017.c:9342, guard 0x41). No
+    /// capture has this frame, so the four item lists are counted, not decoded - see
+    /// GameLogPackets.ParseItemTradeLog.
+    /// </summary>
+    [Test] public static void T115_the_item_trade_log_decodes_both_sides()
+    {
+        var p = new byte[GameLogPackets.ItemTradeLogMinPayload];
+        BitConverter.GetBytes(66).CopyTo(p, GameLogPackets.TradeRequestorSendRef);      // frame end
+        BitConverter.GetBytes(0).CopyTo(p, GameLogPackets.TradeRequestorSendRef + 4);
+        BitConverter.GetBytes(7u).CopyTo(p, GameLogPackets.TradeDlmId);
+        BitConverter.GetBytes(11u).CopyTo(p, GameLogPackets.TradeOwnerDbId);
+        BitConverter.GetBytes(12u).CopyTo(p, GameLogPackets.TradeTargetDbId);
+        BitConverter.GetBytes(5000L).CopyTo(p, GameLogPackets.TradeRequestorMoney);
+        BitConverter.GetBytes(250L).CopyTo(p, GameLogPackets.TradeRequesteeMoney);
+
+        var rows = GameLogPackets.ParseItemTradeLog(p);
+        Hex.True(rows.Count == 2, $"one row per side so either character finds it: {rows.Count}");
+        Hex.True(rows[0].CharacterId == 11 && rows[0].TargetId == 12 && rows[0].Money == 5000,
+            $"the requestor sent 5000: {rows[0]}");
+        Hex.True(rows[1].CharacterId == 12 && rows[1].TargetId == 11 && rows[1].Money == 250,
+            $"the requestee sent 250: {rows[1]}");
+        Hex.True(rows[0].Category == GameLogPackets.CategoryTrade
+                 && rows[0].Action == "trade.send" && rows[1].Action == "trade.recv",
+            "both under the trade category");
+        Hex.True(rows[0].Extra != null && rows[0].Extra.Contains("\"dlmId\":\"7\""),
+            $"and the DlmId is kept even though nothing answers it: {rows[0].Extra}");
+    }
+
+    /// <summary>
+    /// SDB_ADD_PVP_USER_LOG (0x27FE) and SDB_ADD_PK_USER_LOG (0x27FF). Byte-identical frames -
+    /// both dumpers read UserDbId at frame 6 and OpponentDbId at frame 10 behind the same
+    /// guard - so one decoder, two actions.
+    /// </summary>
+    [Test] public static void T115_the_pvp_and_pk_logs_share_one_layout()
+    {
+        var p = new byte[GameLogPackets.DuelLogMinPayload];
+        BitConverter.GetBytes(21u).CopyTo(p, GameLogPackets.DuelUserDbId);
+        BitConverter.GetBytes(22u).CopyTo(p, GameLogPackets.DuelOpponentDbId);
+
+        var pvp = GameLogPackets.ParseDuelUserLog(p, "pvp.kill");
+        var pk = GameLogPackets.ParseDuelUserLog(p, "pk.kill");
+        Hex.True(pvp.Count == 1 && pk.Count == 1, "one row each");
+        Hex.True(pvp[0].CharacterId == 21 && pvp[0].TargetId == 22
+                 && pvp[0].Category == GameLogPackets.CategoryPvp,
+            $"killer 21, victim 22, under pvp: {pvp[0]}");
+        Hex.True(pvp[0].Action == "pvp.kill" && pk[0].Action == "pk.kill",
+            "only the action tells them apart");
+    }
+
+    /// <summary>
+    /// SDB_ADD_GROUP_DUEL_USER_LOG (0x2800), guard 0x29. Two wstring references (one i32 each)
+    /// then two list references (two i32 each) then the leader ids - the stride is what pins
+    /// the wstrings at frame 6 and 10 and the lists at 0x0E and 0x16.
+    /// </summary>
+    [Test] public static void T115_the_group_duel_log_decodes_both_leaders()
+    {
+        // Payload, then the two leader names appended past the fixed part.
+        var blue = System.Text.Encoding.Unicode.GetBytes("Blue\0");
+        var red = System.Text.Encoding.Unicode.GetBytes("Red\0");
+        int fixedLen = GameLogPackets.GroupDuelLogMinPayload;
+        var p = new byte[fixedLen + blue.Length + red.Length];
+        blue.CopyTo(p, fixedLen);
+        red.CopyTo(p, fixedLen + blue.Length);
+        BitConverter.GetBytes(fixedLen + 6).CopyTo(p, GameLogPackets.GroupBlueLeaderNameRef);
+        BitConverter.GetBytes(fixedLen + blue.Length + 6).CopyTo(p, GameLogPackets.GroupRedLeaderNameRef);
+        BitConverter.GetBytes(31u).CopyTo(p, GameLogPackets.GroupBlueLeaderDbId);
+        BitConverter.GetBytes(32u).CopyTo(p, GameLogPackets.GroupRedLeaderDbId);
+
+        var rows = GameLogPackets.ParseGroupDuelUserLog(p);
+        Hex.True(rows.Count == 2, $"one row per team leader: {rows.Count}");
+        Hex.True(rows[0].CharacterId == 31 && rows[0].TargetId == 32
+                 && rows[1].CharacterId == 32 && rows[1].TargetId == 31,
+            "each leader's row names the other as the target");
+        Hex.True(rows[0].Extra != null && rows[0].Extra.Contains("\"leader\":\"Blue\"")
+                 && rows[0].Extra.Contains("\"opponent\":\"Red\""),
+            $"and the wstring references resolve: {rows[0].Extra}");
+        Hex.True(GameLogPackets.ReadWString(p, GameLogPackets.GroupBlueLeaderNameRef) == "Blue",
+            "the reader stops at the NUL, not at the end of the payload");
+    }
+
+    /// <summary>
+    /// The refusal path. Every one of the five dumpers substitutes a null frame pointer below
+    /// its guard; we decode to nothing instead, and the handler still answers nothing.
+    /// </summary>
+    [Test] public static void T115_a_log_frame_below_the_guard_decodes_to_nothing()
+    {
+        Hex.True(GameLogPackets.ParseItemTradeLog(
+            new byte[GameLogPackets.ItemTradeLogMinPayload - 1]).Count == 0, "0x27DD at 59 bytes");
+        Hex.True(GameLogPackets.ParseDuelUserLog(
+            new byte[GameLogPackets.DuelLogMinPayload - 1], "pvp.kill").Count == 0, "0x27FE at 7");
+        Hex.True(GameLogPackets.ParseGroupDuelUserLog(
+            new byte[GameLogPackets.GroupDuelLogMinPayload - 1]).Count == 0, "0x2800 at 35");
+        Hex.True(GameLogPackets.ParseCashItemLog(
+            new byte[GameLogPackets.CashItemLogMinPayload - 1]).Count == 0, "0x288C at 7");
+        // A reference that points outside the payload is refused, not read.
+        var bad = new byte[GameLogPackets.CashItemLogMinPayload];
+        BitConverter.GetBytes(14).CopyTo(bad, 0);
+        BitConverter.GetBytes(4096).CopyTo(bad, 4);
+        Hex.True(GameLogPackets.ParseCashItemLog(bad).Count == 0,
+            "a list reference longer than the frame decodes to nothing");
+        Hex.True(!GameLogPackets.TryReadListRef(bad, 0, out _, out _), "and TryReadListRef says so");
+    }
+
+    /// <summary>
+    /// QueryGameLog: every filter optional, newest first, and a character matches whether it is
+    /// the actor or the target - a trade a character received has to show up on their page.
+    /// </summary>
+    [Test] public static void T115_the_game_log_query_filters_and_pages()
+    {
+        using var store = GuildStore(1);
+        store.AddGameLog(GameLogPackets.CategoryPvp, "pvp.kill", 0, 7, 9, 0, 0, 0, 0, null, 100);
+        store.AddGameLog(GameLogPackets.CategoryPvp, "pvp.kill", 0, 9, 7, 0, 0, 0, 0, null, 200);
+        store.AddGameLog(GameLogPackets.CategoryItem, "cash.item", 0, 1003, 0, 0, 170003, 1, 0, null, 300);
+        store.AddGameLog(GameLogPackets.CategoryTrade, "trade.send", 0, 7, 8, 0, 0, 0, 5000, null, 400);
+
+        Hex.True(store.QueryGameLog().Count == 4, "no filter is everything");
+        Hex.True(store.QueryGameLog()[0].Action == "trade.send", "newest first");
+        Hex.True(store.QueryGameLog(characterId: 7).Count == 3,
+            "character 7 acted twice and was the target once");
+        Hex.True(store.QueryGameLog(characterId: 7, category: GameLogPackets.CategoryPvp).Count == 2,
+            "the category narrows it without swallowing the actor-or-target OR");
+        Hex.True(store.QueryGameLog(fromUnix: 150, toUnix: 350).Count == 2, "the time window is inclusive");
+        Hex.True(store.QueryGameLog(pageSize: 2, page: 0).Count == 2
+                 && store.QueryGameLog(pageSize: 2, page: 1).Count == 2
+                 && store.QueryGameLog(pageSize: 2, page: 2).Count == 0,
+            "paging walks off the end into an empty page, not an error");
+        Hex.True(store.QueryGameLog(pageSize: 1000).Count == 4
+                 && store.QueryGameLog(page: int.MaxValue, pageSize: 50).Count == 0,
+            $"pageSize is clamped to {TeraSharp.Arbiter.Persistence.CharacterStore.GameLogMaxPageSize} "
+            + "and an absurd page cannot overflow the offset");
+        Hex.True(store.CountGameLog(characterId: 7) == 3, "CountGameLog agrees with the query");
+    }
+
+    /// <summary>
+    /// The invariant T108b and T115 both tripped over: an opcode may not be BOTH sealed in
+    /// WorldReplayTable.OneWayFromWorld and handled in DbProxyHandlers, because the replay
+    /// table drops a sealed frame before any handler sees it.
+    /// </summary>
+    [Test] public static void T115_the_log_opcodes_are_handlers_not_sealed()
+    {
+        foreach (var op in GameLogPackets.Opcodes)
+        {
+            Hex.True(DbProxyHandlers.IsHandledRequest(op),
+                $"0x{op:X4} must be in the TryHandle allow-list");
+            Hex.True(!WorldReplayTable.OneWayFromWorld.Contains(op),
+                $"0x{op:X4} is in OneWayFromWorld AND handled - pick one");
+        }
+    }
 
     // ===================== T111: multi-world step 3 =====================
 

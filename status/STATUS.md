@@ -749,3 +749,41 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   Also: CA2017 in `World/WorldServerList.cs` - the duplicate-continent warning had four
   placeholders (`{A}` twice) for three arguments. Reworded to three. Every Log* call in that
   file re-checked: placeholders == arguments throughout.
+
+- T115 (game log). The five LogDB writes World sends and the Arbiter threw away now decode into
+  a `game_log` table. New `World/GameLogPackets.cs` + `status/GAME-LOG.md`.
+
+  **The set is exactly five** - grepping the Arbiter for `Handler_SDB_*LOG*` finds
+  SDB_ITEM_TRADE_LOG (0x27DD), SDB_ADD_PVP_USER_LOG (0x27FE), SDB_ADD_PK_USER_LOG (0x27FF),
+  SDB_ADD_GROUP_DUEL_USER_LOG (0x2800) and SDB_CASH_ITEM_LOG (0x288C);
+  SDB_INIT_LOSS_LOGINTIME_REVISION_SECOND matches the grep and is not a log. SA_LOG_QUEST_END
+  and SA_RELAY_LOG are the SA_ family, outside 0x27xx-0x29xx.
+
+  Two reference shapes run through these frames, and the group-duel dumper's strides (6, 10,
+  0x0E, 0x16) are what separate them: a **list ref** is `[i32 firstOffset][i32 byteLength]`, a
+  **wstring ref** is one `i32` offset. 0x27FE and 0x27FF are byte-identical frames and share a
+  decoder. **0x288C is the only one with a capture** - cap_social2 seq 1849, cap_social3 seq
+  1037/1364, cap_social4 seq 8660, all 54 bytes - and its 40-byte CashItemLog is pinned from
+  both ends: WorldServer's vector strides 0x28 and 54 - 6 - 8 is 40. Field names come from the
+  producer, DBIncreaseUserInvenSize::ExecuteCommitSQL.
+
+  `game_log(logged_at, category, action, account_id, character_id, target_id, item_db_id,
+  template_id, amount, money, extra)`, indexed four ways, `extra` a flat JSON object. The frames
+  carry no timestamp, so `logged_at` is arrival time, recorded at insert.
+  `QueryGameLog(account, character, category, from, to, page, pageSize)` - all optional, newest
+  first, pageSize clamped to 200, page checked unsigned, and a character matches **actor or
+  target** so a received trade shows on their page.
+
+  **Not decoded, with the reason.** The item lists inside 0x27DD and 0x2800 are recorded as byte
+  counts: no capture has either frame and both dumpers hand the list to the generic reference
+  printer without naming an element, so a layout would be invention. And `CashItemLog +16` -
+  `FUN_1404ce180(user)` - reads 1003, 2, 1003, 1 across the captures, and 1003 matches no
+  character in those sessions; it is stored as character_id AND echoed to `extra.rawUserId`, so
+  a capture that settles it can re-file without re-decoding. Guessing it into account_id would
+  mis-file every cash row.
+
+  **Still one-way** - every handler ends at `return 1` with no writer, and the four captured
+  0x288C frames draw no A->W frame. 0x27DD, 0x27FE and 0x288C came OUT of
+  `WorldReplayTable.OneWayFromWorld` to make it work (a sealed opcode never reaches a handler),
+  which is the same invariant T108b tripped over; `T115_the_log_opcodes_are_handlers_not_sealed`
+  now pins it for all five.
