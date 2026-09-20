@@ -4528,6 +4528,11 @@ public sealed class DbProxyHandlers
         CommitPlayTime(playerId, enterUnix);
         MarkEnteredWorld(playerId, enterUnix);
 
+        // T121: arm the Alt+A push again. This is the one event a zone change does NOT raise
+        // and a relog does, which is exactly the difference between cap_final_gm_client2's
+        // enter-world push (frame 99) and its /@teleport (548/549, no push).
+        Handlers.ArbiterClientHandlers.ResetGmSkillPush(playerId);
+
         var chr = _store.GetCharacter(playerId);
         bool found = chr?.WorldBlob != null && chr.WorldBlob.Length == WorldBlobSize;
         if (!found)

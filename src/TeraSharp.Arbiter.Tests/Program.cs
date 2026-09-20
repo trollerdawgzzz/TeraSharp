@@ -11888,6 +11888,55 @@ bool   isGuildWarAcceptable
             "level 1 is the gate everywhere in the binary, and 5 is what set_go on writes");
     }
 
+    /// <summary>
+    /// T121 - the same slot, on the World path. With a World link up, S_LOGIN through
+    /// S_LOAD_TOPO arrive through the tunnel, so the push has to be injected in front of the
+    /// tunnelled S_LOAD_TOPO rather than sent from the (standalone-only) OnSelectUser burst.
+    /// </summary>
+    [Test] public static void T121_gm_skill_is_injected_in_front_of_the_tunnelled_load_topo()
+    {
+        // The anchor, from cap_final_gm_client2 frame 100: [u16 len=21][u16 0xE828][zone 5]...
+        var loadTopo = Hex.B("15 00 28 E8 05 00 00 00 D3 50 83 46 A3 0A 9D 44 A2 5E 8A C5 00");
+        Hex.True(ArbiterClientHandlers.S_LOAD_TOPO == 0xE828
+                 && BitConverter.ToUInt16(loadTopo, 2) == ArbiterClientHandlers.S_LOAD_TOPO,
+            "S_LOAD_TOPO is 0xE828 in the 376012 map and in every capture");
+        Hex.True(ArbiterClientHandlers.IsLoadTopo(loadTopo), "the anchor is recognised");
+
+        // Frame 98 (S_FESTIVAL_LIST) and frame 296 (S_SPAWN_ME) are not the anchor, and a
+        // runt cannot be - the opcode lives at +2.
+        Hex.True(!ArbiterClientHandlers.IsLoadTopo(Hex.B("08 00 4E 8F 00 00 00 00"))
+                 && !ArbiterClientHandlers.IsLoadTopo(Hex.B("1C 00 65 83 01 00 F0 0A"))
+                 && !ArbiterClientHandlers.IsLoadTopo(Hex.B("15 00 28"))
+                 && !ArbiterClientHandlers.IsLoadTopo(System.Array.Empty<byte>()),
+            "S_FESTIVAL_LIST, S_SPAWN_ME and a 3-byte fragment are all ignored");
+
+        // ONE push per world entry. The second S_ADMIN_GM_SKILL in the capture (546) is the
+        // reply to the tool's own C_ADMIN_GM_SKILL at 542, and the /@teleport right after it
+        // (548 S_FESTIVAL_LIST, 549 S_LOAD_TOPO) carries no push at all - so a zone change
+        // must not re-enable a skill toggle the GM just turned off.
+        const int pid = 121121;
+        ArbiterClientHandlers.ResetGmSkillPush(pid);
+        Hex.True(ArbiterClientHandlers.TryTakeGmSkillPush(pid), "first S_LOAD_TOPO takes it");
+        Hex.True(!ArbiterClientHandlers.TryTakeGmSkillPush(pid)
+                 && !ArbiterClientHandlers.TryTakeGmSkillPush(pid),
+            "the teleport's S_LOAD_TOPO, and every one after it, does not");
+
+        // SDB_USER_ENTERWORLD arms it again - a relog gets the push, a zone change does not.
+        ArbiterClientHandlers.ResetGmSkillPush(pid);
+        Hex.True(ArbiterClientHandlers.TryTakeGmSkillPush(pid), "re-armed at enter-world");
+        ArbiterClientHandlers.ResetGmSkillPush(pid);
+
+        Hex.True(!ArbiterClientHandlers.TryTakeGmSkillPush(0), "a session with no player id never pushes");
+
+        // And the gate is unchanged: the bytes are T120's, and only an operator gets them.
+        Hex.Eq(ArbiterClientHandlers.BuildAdminGmSkill(0, on: true), "09 00 BE 64 00 00 00 00 01",
+            "cap_final_gm_client2 frame 99 - the frame that goes in front of the anchor");
+        Hex.True(!ArbiterClientHandlers.OperatorGetsGmSkillPush(0)
+                 && ArbiterClientHandlers.OperatorGetsGmSkillPush(1)
+                 && ArbiterClientHandlers.AdminGmSkillPrecedes == "S_LOAD_TOPO",
+            "still gated on admin level 1, still immediately before S_LOAD_TOPO");
+    }
+
     // ---- The rules ----
 
     [Test] public static void T30_system_message_format_matches_the_capture()
