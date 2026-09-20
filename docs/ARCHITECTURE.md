@@ -141,6 +141,9 @@ warnings for the four settings that are legal, silent and almost always wrong.
 | `TERASHARP_STARTER_BLOB` | `data\starter_blob.bin` | new-character blob |
 | `TERASHARP_STARTER_INVENTORY` | `data\starter_inventory.bin` | starter kit payload |
 | `TERASHARP_START_OVERRIDE` | unset | `"zone,x,y,z"` — forces where a new character starts. Experiment knob |
+| `TERASHARP_API_GATEWAY` | `127.0.0.1:8040` | tera-api's **gateway** API, host:port — one half of the Alt+A gate (T124) |
+| `TERASHARP_DB_SERVER_NAME` | `PlanetDB_2800` | `S_LOGIN_ACCOUNT_INFO.dbServerName` |
+| `TERASHARP_API_JWT_SECRET` | **none** | HS256 key for the Alt+A token; set it to tera-api's `API_PORTAL_SECRET`. Unset = a per-process key |
 
 ---
 

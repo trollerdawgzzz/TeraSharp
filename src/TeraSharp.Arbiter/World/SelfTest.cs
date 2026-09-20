@@ -467,12 +467,18 @@ public static class SelfTest
         "TERASHARP_LOG_LEVEL",
         "TERASHARP_ITEM_STRSHEET", "TERASHARP_ITEM_NAMES",
         "TERASHARP_DATASHEET", "TERASHARP_STARTER_BLOB", "TERASHARP_STARTER_INVENTORY",
+        "TERASHARP_START_OVERRIDE",
+        "TERASHARP_API_GATEWAY", "TERASHARP_DB_SERVER_NAME", "TERASHARP_API_JWT_SECRET",   // T124: Alt+A
     };
 
     /// <summary>Variables whose value must never reach a log or a console.</summary>
     public static bool IsSecret(string name)
         => name.EndsWith("_TOKEN", StringComparison.Ordinal)
-        || name.EndsWith("_PASSWORD", StringComparison.Ordinal);
+        || name.EndsWith("_PASSWORD", StringComparison.Ordinal)
+        // T124: TERASHARP_API_JWT_SECRET is an HS256 signing key. Without this suffix
+        // --check-config printed it in full, which is the leak this predicate exists to stop.
+        || name.EndsWith("_SECRET", StringComparison.Ordinal)
+        || name.EndsWith("_KEY", StringComparison.Ordinal);
 
     /// <summary>
     /// What to show for a variable: the value, <c>(unset)</c>, or - for a secret - its length
@@ -552,7 +558,15 @@ public static class SelfTest
             yield return "! TERASHARP_BIND is not 127.0.0.1. Port 7701 does not check GM privilege "
                        + "on C_ADMIN - the proxy on 7801 is the only gate. Keep it on loopback.";
 
+        // T124: the two fields that open the In-Game Operation Tool. Not a failure - nothing
+        // on this stack verifies the token - but an unset key is worth one line.
+        if (!Auth.ApiGatewayToken.HasConfiguredSecret)
+            yield return "- " + Auth.ApiGatewayToken.SecretVariable + " is unset, so the Alt+A token is "
+                       + "signed with a per-process key. The panel still opens (tera-api has no "
+                       + "jwt.verify); set it to API_PORTAL_SECRET before enabling verification.";
+
         yield return "auth mode: " + Auth.AuthProviders.DescribeMode();
+        yield return Auth.ApiGatewayToken.DescribeMode();
     }
 
     /// <summary>One line per check, then a summary. Returns the number of REQUIRED failures.</summary>

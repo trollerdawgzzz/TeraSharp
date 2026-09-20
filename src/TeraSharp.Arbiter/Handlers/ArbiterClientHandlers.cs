@@ -1595,6 +1595,59 @@ public static class ArbiterClientHandlers
         return new Dictionary<string, object> { ["accountBenefits"] = rows };
     }
 
+    // ------------------------------------------------- T124: the two Alt+A fields, for real
+    //
+    // S_LOGIN_ACCOUNT_INFO.3 (majorPatchVersion >= 100) - the SECOND frame of the session, and
+    // the packet T123 identified as the gate. Codec layout, which the two captures confirm:
+    // three string refs first (u16 each), then the scalars in declaration order, then the
+    // string data, so the fixed part is 4 + 6 + 8 + 4 = 22 and the first string starts there.
+    //
+    //   real (cap_final_gm_client2 frame 8, 544 B)   refs 22 / 50 / 80
+    //     PlanetDB_2800 | 127.0.0.1:8800 | <231-char JWS>
+    //   ours before this (cap_classic_client frame 8, 64 B)   refs 22 / 42 / 62
+    //     TeraSharp | 127.0.0.1 | <empty>
+    //
+    // The address needs the PORT and the token needs to exist; see Auth/ApiGatewayToken.cs for
+    // why the signature is real even though nothing on this stack checks it.
+
+    /// <summary>
+    /// S_LOGIN_ACCOUNT_INFO.3. <paramref name="nowUnix"/> is the login instant: it is both the
+    /// token's <c>iat</c> and (low six digits) the <c>antiCheatChecksumSeed</c>, which is how
+    /// the capture's 619351 relates to its own iat of 1789619351.
+    /// </summary>
+    public static Dictionary<string, object> BuildLoginAccountInfoFields(
+        ulong accountId, long nowUnix, string? dbServerName = null, string? apiAddress = null, string? token = null)
+        => new()
+        {
+            ["accountId"] = accountId,
+            ["antiCheatChecksumSeed"] = Auth.ApiGatewayToken.ChecksumSeed(nowUnix),
+            ["dbServerName"] = Auth.ApiGatewayToken.DbServerName(dbServerName),
+            ["apiServerAddress"] = Auth.ApiGatewayToken.Address(apiAddress),
+            ["apiServerAuthToken"] = token ?? Auth.ApiGatewayToken.Mint((long)accountId, nowUnix),
+        };
+
+    /// <summary>
+    /// S_SELECT_USER (<c>byte unk1 / uint16 unk2 / uint64 unk3</c>). T123: we were sending
+    /// <c>unk2 = 0, unk3 = 72339069014638592</c> (0x0101000000000000), which puts the two
+    /// bytes the capture has in <c>unk2</c> at the TOP of <c>unk3</c> instead:
+    ///
+    /// <code>
+    /// real      37   01 | 01 00 | 00 00 00 00 00 00 00 00
+    /// ours      33   01 | 00 00 | 00 00 00 00 00 00 01 01
+    /// </code>
+    ///
+    /// <para>Same length, so nothing ever complained. The capture reads unk1 = 1, unk2 = 1,
+    /// unk3 = 0. Only the accepted form is captured; the World-not-ready refusal keeps unk1 = 0
+    /// and the same constants, because guessing a second shape from no sample is worse.</para>
+    /// </summary>
+    public static Dictionary<string, object> BuildSelectUserFields(bool accepted = true)
+        => new()
+        {
+            ["unk1"] = accepted ? 1 : 0,
+            ["unk2"] = (ushort)1,
+            ["unk3"] = 0UL,
+        };
+
     /// <summary>
     /// S_ACCOUNT_BENEFIT_LIST from the same rows. The five slots the shipped def calls unk2..unk5
     /// are 0 in every captured element; <c>unk1</c> is the row s stored value.
