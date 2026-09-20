@@ -28,6 +28,20 @@ public static class WorldRouting
     /// <summary>Send a frame on a given World's links. Null hook = no cross-World send.</summary>
     public static Action<int, ushort, byte[]>? SendToWorld;
 
+    /// <summary>
+    /// T111. Whether a World has any connected link. Null hook = nothing is live, which is what
+    /// keeps a process with no per-World link sets on the default World whatever the config says.
+    ///
+    /// <para>This is the guard that makes seeding the continent map safe. ServerConfig.xml gives
+    /// continent 102 to world 10; on a server where world 10 was never started, routing there
+    /// would put AS_ENTER_WORLD on a socket that does not exist and the player would simply
+    /// never load. Liveness first, config second.</para>
+    /// </summary>
+    public static Func<int, bool>? HasLinks;
+
+    /// <summary>True when that World is connected and can be routed to.</summary>
+    public static bool IsLive(int worldId) => HasLinks?.Invoke(worldId) ?? false;
+
     /// <summary>The World a frame arrived from, or <see cref="WorldRegistration.DefaultWorldId"/>.</summary>
     public static int WorldIdOf(WorldLink? link)
         => link == null ? WorldRegistration.DefaultWorldId
@@ -43,7 +57,7 @@ public static class WorldRouting
     }
 
     /// <summary>Tests only - put both hooks back the way a fresh process has them.</summary>
-    internal static void ResetForTest() { WorldIdOfLink = null; SendToWorld = null; }
+    internal static void ResetForTest() { WorldIdOfLink = null; SendToWorld = null; HasLinks = null; }
 }
 
 /// <summary>One announced dungeon instance: a channel of a continent, owned by one World.</summary>
@@ -121,17 +135,25 @@ public sealed class DungeonChannels
     }
 
     /// <summary>
-    /// The World that can host this continent: a World that has already announced a channel on
-    /// it, else the configured owner, else null (= "the one asking"). Announced channels win
-    /// because a World that is running an instance of a continent is certainly loaded for it.
+    /// The World that hosts this continent: **the configured owner first**, then a World that has
+    /// announced a channel on it, else null (= "the one asking", i.e. the catch-all World).
+    ///
+    /// <para>T111 put config first, mirroring the binary. The Arbiter's own lookup,
+    /// <c>WorldSessionManager::GetDataSession(continentId)</c> (Arb_part_046.c:2545), reads the
+    /// continent's <c>worldServerInfo</c> list out of PlanetInfo and asserts at
+    /// <c>WorldSessionManager.cpp(356)</c> when the count is anything but 1 - so a continent has
+    /// exactly one owner and it comes from <c>ServerConfig.xml</c>, never from what a World
+    /// happens to have announced. The two can only disagree in a configuration the real server
+    /// refuses to run (MULTIWORLD-DESIGN.md section 7.1).</para>
     /// </summary>
     public int? WorldForContinent(int continentId)
     {
         lock (_gate)
         {
+            if (_continents.TryGetValue(continentId, out int configured)) return configured;
             foreach (var (key, world) in _channels)
                 if (key.Continent == continentId) return world;
-            return _continents.TryGetValue(continentId, out int w) ? w : null;
+            return null;
         }
     }
 
@@ -140,6 +162,15 @@ public sealed class DungeonChannels
     {
         lock (_gate) _continents[continentId] = worldId;
     }
+
+    /// <summary>How many continents the config named. 0 before the seed, and on a bare tree.</summary>
+    public int ConfiguredContinents { get { lock (_gate) return _continents.Count; } }
+
+    /// <summary>
+    /// The World that owns every continent nobody claimed - <c>loadAllContinents="true"</c> in
+    /// ServerConfig.xml, which is <c>&lt;WorldServer id="0"&gt;</c> on this deployment.
+    /// </summary>
+    public int CatchAllWorldId { get; set; } = WorldRegistration.DefaultWorldId;
 
     /// <summary>Every announced channel, for the status tab and for tests.</summary>
     public IReadOnlyList<DungeonChannel> Snapshot()
@@ -167,7 +198,15 @@ public sealed class DungeonChannels
     public int Count { get { lock (_gate) return _channels.Count; } }
 
     /// <summary>Drop every channel and every configured continent (World restart, and tests).</summary>
-    public void Clear() { lock (_gate) { _channels.Clear(); _continents.Clear(); } }
+    public void Clear()
+    {
+        lock (_gate)
+        {
+            _channels.Clear();
+            _continents.Clear();
+            CatchAllWorldId = WorldRegistration.DefaultWorldId;
+        }
+    }
 }
 
 /// <summary>
@@ -255,7 +294,9 @@ public static class DungeonRouting
         int continentId = request.Length >= DbProxyHandlers.DungeonCtxDungeonId + 4
             ? BitConverter.ToInt32(request, DbProxyHandlers.DungeonCtxDungeonId)
             : 0;
-        int target = channels.WorldForContinent(continentId) ?? fromWorldId;
+        int target = channels.WorldForContinent(continentId) is int owner && WorldRouting.IsLive(owner)
+            ? owner
+            : fromWorldId;
         if (forward.Length >= 8) transfers.Remember(BitConverter.ToUInt64(forward, 0), fromWorldId);
         return new WorldSend(target, DbProxyHandlers.AS_REQUEST_ENTER_DUNGEON, forward);
     }
@@ -273,11 +314,15 @@ public static class DungeonRouting
         return new WorldSend(target, DbProxyHandlers.AS_RESPONSE_ENTER_DUNGEON, forward);
     }
 
-    /// <summary>AS_ENTER_WORLD frame 0x36 -&gt; payload 48: the continent the player enters.</summary>
-    public const int EnterWorldContinentOffset = 0x36 - 6;
+    // AS_ENTER_WORLD payload offsets. DbProxyHandlers already owns these three - T21 pinned
+    // them for the retry builder - so they are aliased, not re-derived: frame 0x36/0x3A/0x56
+    // minus the 6-byte header is 48/52/80.
 
-    /// <summary>AS_ENTER_WORLD frame 0x3A -&gt; payload 52: the instance, or -1 for the open world.</summary>
-    public const int EnterWorldChannelInstanceOffset = 0x3A - 6;
+    /// <summary>Payload 48: the continent the player enters.</summary>
+    public const int EnterWorldContinentOffset = DbProxyHandlers.EnterWorldContinentIdOffset;
+
+    /// <summary>Payload 52: the instance, or -1 for the open world.</summary>
+    public const int EnterWorldChannelInstanceOffset = DbProxyHandlers.EnterWorldChannelInstanceIdOffset;
 
     /// <summary>The ChannelInstanceId WorldEntry sends for a character who is not in an instance.</summary>
     public const uint OpenWorldChannelInstance = 0xFFFFFFFF;
@@ -293,16 +338,39 @@ public static class DungeonRouting
     /// </summary>
     public static int WorldForEnterWorld(byte[]? enterPayload)
     {
+        int fallback = Channels.CatchAllWorldId;
         if (enterPayload == null || enterPayload.Length < EnterWorldChannelInstanceOffset + 4)
-            return WorldRegistration.DefaultWorldId;
+            return fallback;
         int continentId = BitConverter.ToInt32(enterPayload, EnterWorldContinentOffset);
         uint instance = BitConverter.ToUInt32(enterPayload, EnterWorldChannelInstanceOffset);
-        if (instance != OpenWorldChannelInstance)
-        {
-            int? owner = Channels.WorldForChannel(continentId, unchecked((int)instance));
-            if (owner is int w) return w;
-        }
-        return Channels.WorldForContinent(continentId) ?? WorldRegistration.DefaultWorldId;
+
+        // The configured owner (or an announced channel) only wins if that World is actually
+        // connected. ServerConfig.xml hands continent 102 to world 10 whether or not anyone
+        // started world 10 - T111. With no per-World link sets nothing is live and this is the
+        // catch-all World, which is the single-World tree exactly as it was.
+        if (instance != OpenWorldChannelInstance
+            && Channels.WorldForChannel(continentId, unchecked((int)instance)) is int owner
+            && WorldRouting.IsLive(owner))
+            return owner;
+        if (Channels.WorldForContinent(continentId) is int host && WorldRouting.IsLive(host))
+            return host;
+        return fallback;
+    }
+
+    /// <summary>Payload 80: the Ticket (our tunnel key).</summary>
+    public const int EnterWorldTicketOffset = DbProxyHandlers.EnterWorldTicketOffset;
+
+    /// <summary>
+    /// Write the Ticket into an AS_ENTER_WORLD payload that was built without one. The Ticket
+    /// indexes the DESTINATION World's bypass slots, so it cannot be allocated until the World
+    /// is known, and the World is read out of the payload - hence the two steps. Same trick
+    /// <c>DbProxyHandlers.BuildEnterWorldRetryPayload</c> already uses for the retry.
+    /// </summary>
+    public static bool StampTicket(byte[]? enterPayload, uint ticket)
+    {
+        if (enterPayload == null || enterPayload.Length < EnterWorldTicketOffset + 4) return false;
+        BitConverter.TryWriteBytes(enterPayload.AsSpan(EnterWorldTicketOffset, 4), ticket);
+        return true;
     }
 
     /// <summary>
@@ -312,7 +380,8 @@ public static class DungeonRouting
     /// </summary>
     public static void Dispatch(WorldLink? link, int fromWorldId, WorldSend send, ILogger? log)
     {
-        if (send.WorldId != fromWorldId && WorldRouting.TrySend(send.WorldId, send.Opcode, send.Payload))
+        if (send.WorldId != fromWorldId && WorldRouting.IsLive(send.WorldId)
+            && WorldRouting.TrySend(send.WorldId, send.Opcode, send.Payload))
         {
             log?.LogInformation("0x{Op:X4}: world {From} -> world {To} ({Len} B)",
                 send.Opcode, fromWorldId, send.WorldId, send.Payload.Length + 6);

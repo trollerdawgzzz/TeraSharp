@@ -274,3 +274,62 @@ It is a relay. Nothing in the Arbiter consumes the numbers.
    exist. It is the right shape to build with MatchServer, not before.
 4. Still unknown, and still the capture's job: the two i32s in each `InstanceList` element, and
    whether a dungeon World sends a populated list at all.
+
+### 7.2 Step 3 (T111): the config seed, owner preference, and the reviewed patch
+
+**The allocator is now wired.** New `World/WorldServerList.cs` parses ServerConfig.xml's
+`<WorldServerList>` and seeds `DungeonChannels.MapContinent`. The deployment's own list, and
+what the seed makes of it:
+
+| Row | type | continents | effect |
+|---|---|---|---|
+| id 0 `loadAllContinents="true"` | - | none listed | becomes `CatchAllWorldId` |
+| id 10 | battlefield | 102 103 110 112 113 115 116 117 118 1200 | 10 mappings |
+| id 11 | partyMatching | none | owns nothing |
+| id 12 | dungeon | 9920 3023 3027 3126 3026 | 5 mappings |
+| id 13 | dungeon | none | owns nothing |
+| id 31 | battlefield | 156 | 1 mapping |
+
+16 continents mapped, catch-all world 0. A continent claimed twice keeps the FIRST owner and
+logs; the real Arbiter asserts at `WorldSessionManager.cpp(356)` and routes the continent
+nowhere, which would strand players on a config typo. An id past the `0x20` ceiling
+`Handler_SA_REGISTER` enforces is ignored. A missing or unparsable file seeds nothing - that is
+a single-World server, not an error. The path is `TERASHARP_SERVERCONFIG`, else
+`<TERASHARP_DATA>\Executable\ServerConfig.xml`; the default mirrors `Program.DataRoot`, which is
+human-owned, so it is spelled out a second time rather than threaded through a constructor.
+
+**`WorldForContinent` now prefers the configured owner** over an announced channel, which is
+what section 7.1 said the binary does. The channel table is still exact about *which* instance a
+World announced (`WorldForChannel`); it is only the continent-level question that config wins.
+
+**A third hook, and the reason for it.** `WorldRouting.IsLive(worldId)` - `WorldBridge.HasLinks`
+once the patch lands, and `false` for everything before it. Seeding the config without it would
+be a live regression: ServerConfig.xml gives continent 102 to world 10 whether or not anyone
+started world 10, and routing AS_ENTER_WORLD to a World with no sockets means the player simply
+never loads. Every routing decision - `RouteRequest`, `Dispatch`, `WorldForEnterWorld` - now
+requires the target to be connected and otherwise stays with the asker or the catch-all. That is
+what makes "seed the config on a single-World server" a no-op rather than a gamble.
+
+**`status/MULTIWORLD-PATCH.diff` is regenerated** against master of 2026-09-20 and now covers
+three human-owned files: `WorldBridge.cs` (631 lines), `Handlers/WorldEntry.cs` (316) and
+`Network/GameSession.cs` (355). 24 hunks, `git apply --check -p1` and `patch -p1 --dry-run`
+both clean, and the applied result byte-compared against the intended files. New in it beyond
+T109:
+
+- `GameSession.CurrentWorldId`, defaulting to world 0, set by `WorldEntry` before the Ticket is
+  allocated and carried into `UnregisterPlayer` and `TunnelFromClient`.
+- **The tunnel map is keyed `(WorldId, Ticket)`** - section 4 item 5. Every `uint`-keyed entry
+  point (`RegisterTunnelRoute`, `UnregisterTunnelRoute`, `ResetTunnelSequence`, `RouteToClient`,
+  `UnregisterPlayer`, `TunnelFromClient`) keeps its old signature as an overload onto world 0,
+  so no existing tunnel test moves.
+- `WorldEntry` builds AS_ENTER_WORLD with no Ticket, reads the destination World out of it
+  (continent at payload 48, instance at 52), allocates the Ticket in that World's space and
+  stamps it at payload 80. The bytes are unchanged: `tunnelKey` is written in exactly one place,
+  and `EnterWorldTicketOffset` is the constant T21's retry builder already uses.
+
+**Step 4, and it is small.** The per-player control frames still go out on world 0:
+`AS_CANCEL_SKILL_STRICTLY` (0x1460), `AS_LEAVE_WORLD` (0x1392), `AS_ARBITER_USER_DELETE`
+(0x1433), `AS_LOAD_TOPO_FIN` (0x138F), `AS_FORCE_ENTER_DUNGEON_ID` (0x1390) and
+`AS_UPDATE_VISITED_SECTION_LIST` (0x1439). Each is a one-line `WorldBridge` method that needs a
+worldId threaded from the session, and none of them matters until a player is actually in a
+second World.

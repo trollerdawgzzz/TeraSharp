@@ -22131,6 +22131,11 @@ string message
         var reg = new DungeonChannels();
         var transfers = new DungeonTransfers();
         reg.Add(13, T108ChannelPayload(9827, 4, DungeonChannels.AddMinPayload));
+        try
+        {
+        // T111: a World is only routed to while it has links. Both are up for this test; the
+        // dead-World fallback is in T111_two_links_route_0x13BE_to_the_owner_and_0x13C1_back.
+        WorldRouting.HasLinks = w => w is 0 or 13;
 
         var forward = DbProxyHandlers.BuildAsRequestEnterDungeon(Cap13BEReq)!;
         var ask = DungeonRouting.RouteRequest(reg, transfers, 0, Cap13BEReq, forward);
@@ -22151,7 +22156,6 @@ string message
             "a 0x13C0 with no request on file falls back to the World that sent it");
 
         var seen = new List<(int world, ushort op)>();
-        try
         {
             WorldRouting.SendToWorld = (w, op, _) => seen.Add((w, op));
             DungeonRouting.Dispatch(null, 0, ask, null);
@@ -22172,6 +22176,7 @@ string message
             Hex.True(DungeonRouting.WorldForEnterWorld(enter) == 13
                      && DungeonRouting.WorldForEnterWorld(new byte[8]) == WorldRegistration.DefaultWorldId,
                 "the continent alone still resolves it; a payload too short to read is world 0");
+        }
         }
         finally { DungeonRouting.ResetForTest(); }
     }
@@ -22248,6 +22253,159 @@ string message
         worlds.For(13).MarkDisconnected();
         Hex.True(!worlds.For(13).IsReady && worlds.For(0).IsReady,
             "world 13 dropping leaves world 0 taking players");
+    }
+
+
+    // ===================== T111: multi-world step 3 =====================
+
+    /// <summary>
+    /// D:\v100\TERA_SERVER.100\Executable\ServerConfig.xml's WorldServerList, verbatim except
+    /// that the attribute quotes are single - a double quote cannot appear inside a C# verbatim
+    /// string, and XML accepts either. Six rows, sixteen continents, catch-all world 0.
+    /// </summary>
+    const string T111ServerConfig = @"<ServerConfig>
+  <WorldServerList>
+    <WorldServer id='0' loadAllContinents='true' />
+    <WorldServer id='10' type='battlefield'>
+      <Continent id='102' /><Continent id='103' /><Continent id='110' />
+      <Continent id='112' /><Continent id='113' /><Continent id='115' />
+      <Continent id='116' /><Continent id='117' /><Continent id='118' />
+      <Continent id='1200' />
+    </WorldServer>
+    <WorldServer id='11' type='partyMatching' />
+    <WorldServer id='12' type='dungeon'>
+      <Continent id='9920' /><Continent id='3023' /><Continent id='3027' />
+      <Continent id='3126' /><Continent id='3026' />
+    </WorldServer>
+    <WorldServer id='13' type='dungeon' />
+    <WorldServer id='31' type='battlefield'>
+      <Continent id='156' />
+    </WorldServer>
+  </WorldServerList>
+</ServerConfig>";
+
+    /// <summary>
+    /// The seed. MULTIWORLD-DESIGN.md section 7.1: this file IS the allocator - the Arbiter's
+    /// own lookup reads the continent's worldServerInfo list and asserts if the count is not
+    /// exactly 1 - so parsing it is what makes the first cross-World entry work.
+    /// </summary>
+    [Test] public static void T111_the_world_server_list_seeds_one_owner_per_continent()
+    {
+        var rows = WorldServerList.Parse(T111ServerConfig);
+        Hex.True(rows.Count == 6, $"six WorldServer rows: {rows.Count}");
+        Hex.True(rows[0].WorldId == 0 && rows[0].LoadAllContinents && rows[0].Continents.Count == 0,
+            "world 0 is the catch-all and names no continent of its own");
+        Hex.True(rows[1].WorldId == 10 && rows[1].Type == "battlefield" && rows[1].Continents.Count == 10,
+            $"world 10 is the battlefield World with ten continents: {rows[1].Continents.Count}");
+        Hex.True(rows[4].WorldId == 13 && rows[4].Type == "dungeon" && rows[4].Continents.Count == 0,
+            "world 13 is a dungeon World that lists none - so it owns none");
+
+        var reg = new DungeonChannels();
+        int mapped = WorldServerList.Seed(reg, rows);
+        Hex.True(mapped == 16 && reg.ConfiguredContinents == 16, $"sixteen continents mapped: {mapped}");
+        Hex.True(reg.CatchAllWorldId == 0, $"loadAllContinents picks the catch-all: {reg.CatchAllWorldId}");
+        Hex.True(reg.WorldForContinent(102) == 10 && reg.WorldForContinent(9920) == 12
+                 && reg.WorldForContinent(156) == 31,
+            "102 -> 10, 9920 -> 12, 156 -> 31");
+        Hex.True(reg.WorldForContinent(9827) == null,
+            "and 9827 - the dungeon in cap_newchar - is in no row, so it falls to the catch-all");
+
+        // A continent claimed twice: the real Arbiter asserts at WorldSessionManager.cpp(356).
+        // We keep the first owner rather than strand players on a config typo.
+        var clash = WorldServerList.Parse(T111ServerConfig.Replace("<Continent id='156' />",
+            "<Continent id='102' /><Continent id='156' />"));
+        var reg2 = new DungeonChannels();
+        Hex.True(WorldServerList.Seed(reg2, clash) == 16 && reg2.WorldForContinent(102) == 10,
+            "the second claim on 102 is refused and world 10 keeps it");
+
+        // Past the 0x20 ceiling Handler_SA_REGISTER enforces - the row cannot be routed to.
+        var tooHigh = WorldServerList.Parse(
+            @"<ServerConfig><WorldServerList><WorldServer id='32'><Continent id='77' />"
+            + @"</WorldServer></WorldServerList></ServerConfig>");
+        var reg3 = new DungeonChannels();
+        Hex.True(WorldServerList.Seed(reg3, tooHigh) == 0 && reg3.WorldForContinent(77) == null,
+            "world 32 is past the ceiling and maps nothing");
+
+        Hex.True(WorldServerList.Parse("not xml at all").Count == 0
+                 && WorldServerList.Parse(@"<ServerConfig />").Count == 0
+                 && WorldServerList.SeedFromFile(new DungeonChannels(), "/nonexistent/x.xml") == 0,
+            "a missing or unparsable config is a single-World server, not an error");
+    }
+
+    /// <summary>
+    /// T111 item 2. The configured owner wins over an announced channel, mirroring
+    /// <c>WorldSessionManager::GetDataSession</c>: the continent's owner comes from
+    /// ServerConfig.xml, never from what a World happens to have announced.
+    /// </summary>
+    [Test] public static void T111_the_configured_owner_beats_an_announced_channel()
+    {
+        var reg = new DungeonChannels();
+        reg.Add(13, T108ChannelPayload(3023, 7, DungeonChannels.AddMinPayload));
+        Hex.True(reg.WorldForContinent(3023) == 13, "with no config, an announced channel answers");
+
+        reg.MapContinent(3023, 12);
+        Hex.True(reg.WorldForContinent(3023) == 12,
+            "once the config names an owner it wins - one continent, one World");
+        Hex.True(reg.WorldForChannel(3023, 7) == 13,
+            "the channel table is still exact about WHICH instance world 13 announced");
+    }
+
+    /// <summary>
+    /// T111 item 3, end to end: two links, world 0 and world 13, continent 9827 configured to
+    /// world 13. 0x13BE from world 0 goes out as 0x13BF on world 13; the 0x13C0 that comes back
+    /// from world 13 goes out as 0x13C1 on world 0. And with world 13 NOT connected, both stay
+    /// on the asking link - the guard that lets the config be seeded on a single-World server.
+    /// </summary>
+    [Test] public static void T111_two_links_route_0x13BE_to_the_owner_and_0x13C1_back()
+    {
+        try
+        {
+            DungeonRouting.ResetForTest();
+            WorldServerList.Seed(DungeonRouting.Channels, WorldServerList.Parse(T111ServerConfig));
+            DungeonRouting.Channels.MapContinent(9827, 13);   // the capture's dungeon, on world 13
+
+            var sent = new List<(int world, ushort op, byte[] body)>();
+            WorldRouting.SendToWorld = (w, op, p) => sent.Add((w, op, p));
+            WorldRouting.HasLinks = w => w is 0 or 13;
+
+            var forward = DbProxyHandlers.BuildAsRequestEnterDungeon(Cap13BEReq)!;
+            DungeonRouting.Dispatch(null, 0, DungeonRouting.RouteRequest(
+                DungeonRouting.Channels, DungeonRouting.Transfers, 0, Cap13BEReq, forward), null);
+            Hex.True(sent.Count == 1 && sent[0].world == 13
+                     && sent[0].op == DbProxyHandlers.AS_REQUEST_ENTER_DUNGEON,
+                $"0x13BF goes to world 13: {sent.Count} frame(s)");
+            Hex.Eq(sent[0].body, forward, "byte for byte what the capture-pinned builder made");
+
+            var back = DbProxyHandlers.BuildAsResponseEnterDungeon(Cap13C0Req)!;
+            DungeonRouting.Dispatch(null, 13,
+                DungeonRouting.RouteResponse(DungeonRouting.Transfers, 13, back), null);
+            Hex.True(sent.Count == 2 && sent[1].world == 0
+                     && sent[1].op == DbProxyHandlers.AS_RESPONSE_ENTER_DUNGEON,
+                $"0x13C1 goes back to world 0: world {(sent.Count > 1 ? sent[1].world : -1)}");
+            Hex.Eq(sent[1].body, back, "and it is the echo Handler_SA_RESPONSE_ENTER_DUNGEON sends");
+
+            // The enter-world that follows lands on the same World.
+            var enter = new byte[84];
+            BitConverter.GetBytes(9827).CopyTo(enter, DungeonRouting.EnterWorldContinentOffset);
+            BitConverter.GetBytes(DungeonRouting.OpenWorldChannelInstance)
+                .CopyTo(enter, DungeonRouting.EnterWorldChannelInstanceOffset);
+            Hex.True(DungeonRouting.WorldForEnterWorld(enter) == 13, "AS_ENTER_WORLD follows to world 13");
+            Hex.True(DungeonRouting.StampTicket(enter, 9)
+                     && BitConverter.ToUInt32(enter, DungeonRouting.EnterWorldTicketOffset) == 9,
+                "and the Ticket is stamped in world 13's space at payload 80");
+
+            // Now world 13 is not running. Nothing may be routed to it.
+            sent.Clear();
+            WorldRouting.HasLinks = w => w == 0;
+            var ask = DungeonRouting.RouteRequest(
+                DungeonRouting.Channels, DungeonRouting.Transfers, 0, Cap13BEReq, forward);
+            Hex.True(ask.WorldId == 0, $"a dead owner keeps the asker: world {ask.WorldId}");
+            DungeonRouting.Dispatch(null, 0, ask, null);
+            Hex.True(sent.Count == 0, "and nothing goes through the bridge hook");
+            Hex.True(DungeonRouting.WorldForEnterWorld(enter) == DungeonRouting.Channels.CatchAllWorldId,
+                "enter-world falls back to the catch-all World, which is what world 0 is");
+        }
+        finally { DungeonRouting.ResetForTest(); }
     }
 
     // ===================== T105: the live 2026-09-19 regressions =====================
