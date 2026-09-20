@@ -25311,7 +25311,7 @@ string message
     {
         var path = FindRepoFile(Path.Combine("data", "classic-live", name));
         if (path == null) { Console.WriteLine($"        (skipped: data/classic-live/{name} not found)"); return null; }
-        var sb = new Text.StringBuilder();
+        var sb = new System.Text.StringBuilder();
         foreach (var line in File.ReadAllLines(path))
         {
             var t = line.Trim();
