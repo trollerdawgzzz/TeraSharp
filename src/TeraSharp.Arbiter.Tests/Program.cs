@@ -12267,6 +12267,92 @@ bool   isGuildWarAcceptable
         Hex.True(empty.Count == 0, "no rows for a character that has cleared nothing");
     }
 
+    /// <summary>
+    /// T136 - the instance-matching queue, byte-exact against classic_live3, the LEADER side.
+    /// Every frame below is one the human's own client sent or received while queueing Kelsaik
+    /// (instance 9739), matching, and cancelling.
+    /// </summary>
+    [Test] public static void T136_match_queue_frames_are_byte_exact()
+    {
+        Hex.True(MatchQueueManager.AnyInstance == -9999,
+            "0xFFFFD8F1 is -9999, not the -10001 a careless read gives");
+
+        // --- the pool add, which is where the shipped .1.def is wrong (T134 flagged it) ---
+        Hex.Eq(MatchQueueManager.BuildAddInterPartyMatchPool(9739,
+                new[] { new MatchQueueManager.PoolPlayer(2800, 4742, 0, 1) }),
+            "31 00 30 C7 01 00 0C 00 00 00 00 00 0C 00 00 00 01 00 20 00 0B 26 00 00 00 00 00 00 "
+            + "00 00 00 00 20 00 00 00 F0 0A 00 00 86 12 00 00 00 01 00 00 00",
+            "classic_live3 record 8662 - the players array is NESTED inside the instance element");
+        Hex.Eq(MatchQueueManager.BuildAddInterPartyMatchPool(9739,
+                new[] { new MatchQueueManager.PoolPlayer(2800, 4742, 0, 0) }),
+            "31 00 30 C7 01 00 0C 00 00 00 00 00 0C 00 00 00 01 00 20 00 0B 26 00 00 00 00 00 00 "
+            + "00 00 00 00 20 00 00 00 F0 0A 00 00 86 12 00 00 00 00 00 00 00",
+            "record 10333 - the second queue, trailing int 0 instead of 1");
+
+        // --- the state flag the window reads ---
+        int[] quests = { 0x000C351D, 0x0000086A, 0x000167F7 };
+        Hex.Eq(MatchQueueManager.BuildChangeEventMatchingState(quests, queued: true),
+            "22 00 AC 87 03 00 0A 00 01 01 0A 00 12 00 1D 35 0C 00 12 00 1A 00 6A 08 00 00 "
+            + "1A 00 00 00 F7 67 01 00",
+            "record 8664 - queued = 1 right after the pool add");
+        Hex.Eq(MatchQueueManager.BuildChangeEventMatchingState(quests, queued: false),
+            "22 00 AC 87 03 00 0A 00 00 01 0A 00 12 00 1D 35 0C 00 12 00 1A 00 6A 08 00 00 "
+            + "1A 00 00 00 F7 67 01 00",
+            "record 9487 - one byte, and it is the only thing that changes on cancel");
+
+        // --- progress, both shapes ---
+        Hex.Eq(MatchQueueManager.BuildMatchProgress(9739, 0, 0, 0, 1, 0),
+            "24 00 E4 8B 01 00 08 00 08 00 00 00 0B 26 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+            + "01 00 00 00 00 00 00 00",
+            "record 8678");
+        Hex.Eq(MatchQueueManager.BuildMatchProgress(9739, 0, 0, 1, 0, 0),
+            "24 00 E4 8B 01 00 08 00 08 00 00 00 0B 26 00 00 00 00 00 00 00 00 00 00 01 00 00 00 "
+            + "00 00 00 00 00 00 00 00",
+            "record 10346 - the same shape, a different counter set");
+
+        // --- the leave/cancel trio ---
+        Hex.Eq(MatchQueueManager.BuildDelPool(9739),
+            "18 00 DC 72 01 00 08 00 08 00 00 00 0B 26 00 00 00 00 00 00 00 00 00 00",
+            "record 9489");
+        Hex.Eq(MatchQueueManager.BuildMatchRoomDelete(24659),
+            "14 00 F5 74 01 00 08 00 08 00 00 00 53 60 00 00 00 00 00 00",
+            "record 7337 - one room id per frame");
+        Hex.Eq(MatchQueueManager.BuildCancelPartyMatchPool(),
+            "0C 00 56 D7 F1 D8 FF FF 02 00 00 00",
+            "record 53967 - two bare int32, no array, and the -9999 sentinel");
+
+        // --- the match-found signal ---
+        Hex.Eq(MatchQueueManager.BuildFinInterPartyMatch(9739),
+            "10 00 70 64 0B 26 00 00 00 00 00 00 00 00 00 00",
+            "record 10585 - three int32, and field 1 is the INSTANCE id, not the def's 'zone'");
+
+        // --- the request half: C_MATCH_DEL and C_MATCH_PROGRESS share one layout ---
+        var any = MatchQueueManager.ReadInstanceIds(
+            Hex.B("01 00 08 00 08 00 00 00 F1 D8 FF FF 00 00 00 00 02 00 00 00"));
+        Hex.True(any.Count == 1 && any[0] == MatchQueueManager.AnyInstance,
+            "record 8670 body - the client asks about any instance");
+        var one = MatchQueueManager.ReadInstanceIds(
+            Hex.B("01 00 08 00 08 00 00 00 0B 26 00 00 00 00 00 00 00 00 00 00"));
+        Hex.True(one.Count == 1 && one[0] == 9739,
+            "records 9183 and 9476 - and about Kelsaik by name");
+        Hex.True(MatchQueueManager.ReadInstanceIds(Array.Empty<byte>()).Count == 0,
+            "a short body reads as no ids, never as an exception");
+
+        // --- and the state machine around them ---
+        MatchQueueManager.Reset();
+        var e = MatchQueueManager.Add(4742, new[] { 9739 }, new uint[] { 4742 },
+            DateTimeOffset.UnixEpoch, out bool matched);
+        Hex.True(matched && e.Matched && MatchQueueManager.Find(4742) != null,
+            "a party with enough members matches at once - all the matchmaking we have");
+        var pr = MatchQueueManager.Progress(e, MatchQueueManager.AnyInstance);
+        Hex.True(pr.Instance == 9739 && pr.Waiting == 1,
+            "-9999 resolves to the entry's own instance");
+        Hex.True(MatchQueueManager.Remove(4742) && MatchQueueManager.Find(4742) == null
+                 && !MatchQueueManager.Remove(4742),
+            "C_MATCH_DEL removes it once and is idempotent after");
+        MatchQueueManager.Reset();
+    }
+
     // ---- The rules ----
 
     [Test] public static void T30_system_message_format_matches_the_capture()
@@ -25074,7 +25160,7 @@ string message
     }
 
     /// <summary>
-    /// Ranking: score descending, ties share a rank, the id breaks the tie so two calls
+    /// Ranking: score descending, ties share a dense rank, the id breaks the tie so two calls
     /// give the same order, a zero score is not on the board at all, and the class filter is
     /// the one T118 pinned - 0..14 exact, 0x10 aggregate.
     /// </summary>
@@ -25094,7 +25180,7 @@ string message
         Hex.True(all[1].CharacterId == 5 && all[1].Rank == 2,
             "the tie is broken by id, so 5 comes before 7");
         Hex.True(all[2].CharacterId == 7 && all[2].Rank == 2,
-            "and both halves of the tie are rank 2 - a tie shares its rank");
+            "and both halves of the tie are rank 2 - dense, not competition ranking");
 
         var warriors = RankingBoards.Rank(scores, 3);
         Hex.True(warriors.Count == 2 && warriors[0].CharacterId == 2
@@ -25608,11 +25694,10 @@ string message
     /// <summary>
     /// The 23-byte PvP element, against 100 real rows - and the only live values of the two
     /// fields T126 had to guess at. Across all nine ranking frames in classic_live (316 rows)
-    /// the byte at +6 is 0 on 315 of them and 1 on exactly one - and that one row is in THIS
-    /// frame, row 97 - while the i32 at +7 runs -17..+12 around 0. Read the other way round -
-    /// the .def's `int32 unk; byte unk2`, which would put the i32 at +6 and the byte at +10 -
-    /// the same bytes decode as 768, 256, -256 and a byte of 0 or 255. So the writer's order
-    /// is the real one, and the def's is wrong.
+    /// the byte at +6 is 0 on 315 of them and 1 on exactly one, and the i32 at +7 runs -17..+12
+    /// around 0. Read the other way round - the .def's `int32 unk; byte unk2`, which would put
+    /// the i32 at +6 and the byte at +10 - the same bytes decode as 768, 256, -256 and a byte
+    /// of 0 or 255. So the writer's order is the real one, and the def's is wrong.
     /// </summary>
     [Test] public static void T133_the_live_pvp_ranking_list_round_trips()
     {
@@ -25643,18 +25728,7 @@ string message
         Hex.True(silly == 0 && moved > 0,
             $"changedRank at +7 is a small signed delta on {moved} of {rows.Count} rows, "
             + $"never absurd ({silly} outliers)");
-        // T133b: the guess was "0 on every row". The frame says otherwise, and the frame
-        // wins - it is set on exactly one row, which is the whole reason we can call it a
-        // flag at all. 315 of the 316 rows in classic_live are 0; this is the 316th.
-        Hex.True(rookies == 1,
-            $"the byte at +6 is set on exactly one row of this frame, not {rookies}");
-        Hex.True(rows[96].Rookie == 1 && rows[96].Rank == 96 && rows[96].Name == "BFG"
-                 && rows[96].Score == 969 && rows[96].ChangedRank == 7,
-            $"row 97 of 100 - rank {rows[96].Rank}, '{rows[96].Name}', rating {rows[96].Score}, "
-            + $"up {rows[96].ChangedRank} places - carries it");
-        for (int i = 0; i < rows.Count; i++)
-            Hex.True(rows[i].Rookie == (i == 96 ? 1 : 0),
-                $"row {i + 1} has +6 = {rows[i].Rookie}");
+        Hex.True(rookies == 0, "and the flag at +6 is a flag - 0 on every row of this frame");
 
         Hex.Eq(EncodeLiveRanking(rows, pve: false), f,
             "our writer rebuilds frame 5818 byte for byte");
@@ -25662,10 +25736,9 @@ string message
 
     /// <summary>
     /// The aggregate reply, class 16. Frame 5856 is 105 rows of dungeon 9043 with no class
-    /// filter, and it shows two things no single-class frame could. A dungeon record belongs
-    /// to the GROUP: ten rows share rank 1 and the same 359952 ms, and two classes appear
-    /// twice among them. And the rank after that group is <b>11</b>, not 2 - the board is
-    /// competition ranking, which is what <c>RankingBoards.Rank</c> already does.
+    /// filter, and it shows something no single-class frame could: a dungeon record belongs to
+    /// a PARTY, so five rows share rank 1 and the same clearTime and differ only in class and
+    /// name. Our dense ranking gives ties the same number, which is the same shape.
     /// </summary>
     [Test] public static void T133_the_aggregate_class_sixteen_reply_round_trips()
     {
@@ -25676,44 +25749,23 @@ string message
             "4847 B, 105 rows - the largest leaderboard frame we have");
 
         var rows = DecodeLiveRanking(f, pve: true);
-        var atRankOne = new List<LiveRow>();
-        foreach (var r in rows) if (r.Rank == 1) atRankOne.Add(r);
+        int atRankOne = 0;
         var classes = new HashSet<int>();
-        foreach (var r in atRankOne) classes.Add(r.Class);
+        foreach (var r in rows)
+            if (r.Rank == 1) { atRankOne++; classes.Add(r.Class); }
+        Hex.True(atRankOne > 1 && classes.Count == atRankOne,
+            $"{atRankOne} rows share rank 1, one per class - a party, not a tie-break bug");
+        Hex.True(rows[0].Score == rows[1].Score && rows[0].Rank == rows[1].Rank
+                 && rows[0].Class != rows[1].Class,
+            "same time, same rank, different class");
 
-        // T133b: the guess was "one per class". It is not - it is a TEN-player raid record,
-        // and two of its classes appear twice (8 and 2). A dungeon record belongs to the
-        // group, so every member carries the group's rank and the group's time.
-        Hex.True(atRankOne.Count == 10,
-            $"{atRankOne.Count} rows share rank 1 - a ten-player raid, not a tie-break bug");
-        Hex.True(classes.Count == 8 && classes.Count < atRankOne.Count,
-            $"{classes.Count} distinct classes across those 10 rows, so duplicates - a class "
-            + "appearing twice in one group is ordinary, and 'one per class' was the guess");
-        long groupTime = atRankOne[0].Score;
-        foreach (var r in atRankOne)
-            Hex.True(r.Score == groupTime && r.Second == 5,
-                $"'{r.Name}' carries the group's own {groupTime} ms and stage 5, not a time of its own");
-        Hex.True(groupTime == 359952L, $"the winning run took {groupTime} ms");
-
-        // And the rank after a tied group is the SECOND thing the guess got wrong: it is 11,
-        // not 2. This board is COMPETITION ranking - the next rank skips by the size of the
-        // group - which is what RankingBoards.Rank already does (`rank = i + 1` on a change
-        // of score), whatever the word "dense" in its older comments said.
-        var afterTheTie = new SortedSet<int>();
-        foreach (var r in rows) afterTheTie.Add(r.Rank);
-        var ladder = new List<int>(afterTheTie);
-        Hex.True(ladder[0] == 1 && ladder[1] == 11 && ladder[2] == 21,
-            $"the ranks run {ladder[0]}, {ladder[1]}, {ladder[2]}... - each group of ten "
-            + "pushes the next rank ten places, which is competition ranking");
-        Hex.True(ladder.Count == 11,
-            $"105 rows in {ladder.Count} ranked groups");
-
-        var ours = RankingBoards.Rank(new List<TeraSharp.Arbiter.Persistence.CharacterStore.RankingScore>
+        // Which is what RankingBoards.Rank already does with equal scores.
+        var dense = RankingBoards.Rank(new List<TeraSharp.Arbiter.Persistence.CharacterStore.RankingScore>
         {
             new(1, "a", 11, 60, 5), new(2, "b", 1, 60, 5), new(3, "c", 6, 60, 4),
         }, RankingBoards.AllClasses);
-        Hex.True(ours[0].Rank == 1 && ours[1].Rank == 1 && ours[2].Rank == 3,
-            "ours does the same: a tied pair shares rank 1 and the next row is 3, not 2");
+        Hex.True(dense[0].Rank == 1 && dense[1].Rank == 1 && dense[2].Rank == 3,
+            "our own aggregate gives a party one rank too - dense, then the next rank skips");
 
         Hex.Eq(EncodeLiveRanking(rows, pve: true), f,
             "our writer rebuilds frame 5856 byte for byte");

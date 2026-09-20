@@ -488,3 +488,109 @@ cool-time line already there at :285:
 ```
 
 The cool-time half was applied by hand at :285 and needs nothing further.
+
+## T136 - the leader side, from classic_live3
+
+The leader-side capture T134b said was needed now exists: `D:\packetlogs\classic_live3.log`, the
+human queueing Kelsaik (instance **9739**) as party leader, matching, and cancelling once. 56085
+records. It pins the REQUEST half, which classic_live2 could not.
+
+### The lifecycle, by record
+
+| # | dir | packet | what |
+|---|---|---|---|
+| 8643 | C->S | `C_MATCH_ADD` (0xCE5F, 55 B) | the leader queues |
+| 8662 | S->C | `S_ADD_INTER_PARTY_MATCH_POOL` (49 B) | the pool holds this party |
+| 8664 | S->C | `S_CHANGE_EVENT_MATCHING_STATE` (34 B) | `queued = 1` |
+| 8670 | C->S | `C_MATCH_PROGRESS` | asks about instance **-9999** = any |
+| 8678 | S->C | `S_MATCH_PROGRESS` (36 B) | |
+| 8826 | C->S | `C_MATCH_ROOM_LIST` (0x88D0) | the browse window |
+| 8838 | S->C | `S_MATCH_ROOM_LIST` (0x68E0, 456 B) | ten rooms |
+| 9183 | C->S | `C_MATCH_PROGRESS` | asks about 9739 by name |
+| 9476 | C->S | `C_MATCH_DEL` (0xC057) | the leader cancels |
+| 9487 | S->C | `S_CHANGE_EVENT_MATCHING_STATE` | `queued = 0` |
+| 9489 | S->C | `S_DEL_INTER_PARTY_MATCH_POOL` (0x72DC) | |
+| 9491 | S->C | `S_CHANGE_EVENT_MATCHING_STATE` | `queued = 0` **again** - the client is told twice |
+| 10322 | C->S | `C_MATCH_ADD` | queued a second time |
+| 10585 | S->C | `S_FIN_INTER_PARTY_MATCH` (16 B) | **match found** |
+| 53967 | S->C | `S_CANCEL_PARTY_MATCH_POOL` (0xD756, 12 B) | the separate board-side cancel |
+
+### Corrections this capture forces
+
+1. **`-9999`, not `-10001`.** `F1 D8 FF FF` is `0xFFFFD8F1` = **-9999**, the client's "any instance"
+   sentinel in `C_MATCH_PROGRESS` and the value `S_CANCEL_PARTY_MATCH_POOL` echoes. T134's note on
+   classic_live2 read it as -10001.
+2. **`S_ADD_INTER_PARTY_MATCH_POOL`'s shipped `.1.def` is wrong, and here is the real layout.** The
+   def has `players` as a FLAT array beside `instances` plus two leading int32; the wire has
+   `players` NESTED inside each instance element, and no leading scalars at all:
+   ```
+   body 0  u16 count instances / 2 u16 offset instances
+        4  u16 count (a second array, 0 in both captured frames) / 6 u16 offset
+   instance element 20 B:  +0 u16 here / +2 u16 next
+                           +4 u16 count players / +6 u16 offset players   <- NESTED
+                           +8 i32 instanceId / +12 i32 / +16 i32
+   player element 17 B:    +0 u16 here / +2 u16 next
+                           +4 i32 planetId (2800) / +8 i32 playerId / +12 byte / +13 i32
+   ```
+   Decoding classic_live2 record 9335 with the def gave `type = 2097154`; that is the nested
+   count/offset pair (`0x0020`, `0x0002`) being read as one int32. The def is not merely a version
+   behind - it is a different shape.
+3. **`S_FIN_INTER_PARTY_MATCH`'s field 1 is the INSTANCE id, not a zone.** 9739 here, 9075 and 10
+   in classic_live2 - all instance ids from the dungeon roster. The def calls it `zone` and
+   declares only that one int32; the body is 12 B, three int32.
+4. **`S_CHANGE_EVENT_MATCHING_STATE` is where the queued flag lives.** `[u16 count][u16 offset]`
+   quests, then `byte queued`, `byte unk` (1 in every frame), then 8 B elements `[here][next][i32
+   questId]`. Between records 8664 and 9487 the ONLY byte that changes is that flag.
+
+### Implemented (T136): `World/MatchQueueManager.cs`
+
+RAM-only. Tracks one `Entry` per party leader (`InstanceIds`, `MemberPlayerIds`, `QueuedAt`),
+answers `Progress` from that state, and builds every frame above byte-exact:
+`BuildAddInterPartyMatchPool`, `BuildChangeEventMatchingState`, `BuildMatchProgress`,
+`BuildDelPool`, `BuildMatchRoomDelete`, `BuildCancelPartyMatchPool`, `BuildFinInterPartyMatch`,
+plus `ReadInstanceIds` for the shared `C_MATCH_DEL` / `C_MATCH_PROGRESS` request layout.
+
+**Matchmaking is a stub and says so.** There is no MatchServer, so nothing decides that strangers
+belong together: a party that queues with at least `MembersForInstantMatch` members and a non-empty
+instance list matches ITSELF immediately and gets `S_FIN_INTER_PARTY_MATCH`. Anything else sits in
+the dictionary.
+
+### NOT IMPLEMENTED - the instance hand-off, and it is the next step
+
+`S_FIN_INTER_PARTY_MATCH` is a signal, not a teleport. After it the real stack must:
+
+1. create (or pick) an instance of 9739 on a DungeonServer,
+2. tell every party member which server and channel it is on,
+3. push the `S_LOAD_TOPO` that moves them into it, and
+4. hold the party together across the move, so `C_LOAD_TOPO_FIN` from each member lands in the same
+   instance.
+
+None of that exists. TeraSharp has one World and no DungeonServer, so step 1 has nowhere to go -
+which is the same gap `status/WORLD-PARTIAL-LOAD.md` describes from the other end. Sending FIN
+today makes the client's matching window close and show "match found"; it will then wait for a
+load that never comes. **Do not wire FIN into a live server until the hand-off exists.** The
+builder is there so the frame is pinned and testable, not so it can be fired.
+
+### NOT DECODED
+
+`S_MATCH_ROOM_LIST` (456 B, record 8838) is ten 44-byte room rows - room id, a dungeon id
+(`53 23` = 9043, `73 23` = 9075, `C4 23`, `D0 23`), a timestamp-looking `6A AF F6 67`, and three
+trailing int32 flags. The row stride and the id fields are clear; the flags are not, and one
+capture of ten rows is not enough to name them. Left for a task with a second sample.
+
+`S_CHANGE_EVENT_MATCHING_STATE`'s big forms (730 B / 1290 B at records 10580/10581) are the same
+layout with 90 and 160 quest ids - the full vanguard roster. The builder handles any count.
+
+### NOT APPLIED - registry lines, `Handlers/HandlerRegistry.cs` is human-owned
+
+```
+        Reg("C_MATCH_ADD", 0, (s, b) => MatchWiring.OnMatchAdd(s, b));
+        Reg("C_MATCH_DEL", 0, (s, b) => MatchWiring.OnMatchDel(s, b));
+        Reg("C_MATCH_PROGRESS", 0, (s, b) => MatchWiring.OnMatchProgress(s, b));
+        Reg("C_MATCH_ROOM_LIST", 0, (s, b) => MatchWiring.OnMatchRoomList(s, b));
+```
+
+`MatchWiring` does not exist yet - the four handlers that glue `MatchQueueManager` to a session
+(read the ids, look up the party, send the pair of frames) are the obvious next slice, and they
+are small now that every frame is pinned. Wiring `C_MATCH_ADD` before the hand-off exists is the
+one that should wait; `C_MATCH_PROGRESS` and `C_MATCH_ROOM_LIST` are read-only and safe.
