@@ -283,6 +283,7 @@ public static class HandlerRegistry
 
         // T134: dungeon cool-time window (all 9 live replies are empty). Clear-count needs the 14-id roster merge - T134b.
         Reg("C_DUNGEON_COOL_TIME_LIST", 0, (s, body) => { s.Send(ArbiterClientHandlers.BuildDungeonCoolTimeList()); return true; });
+        Reg("C_DUNGEON_CLEAR_COUNT_LIST", 0, (s, b) => ArbiterClientHandlers.OnDungeonClearCountList(s, b));   // T134b: roster + store merge
         // --- T97: party extras, event/VIP windows, reports, profile ---
         Reg("C_REQUEST_PARTY_NAME",                     MiscClientPackets.RequestPartyNameBodySize,      (s,b) => MiscClientPackets.OnRequestPartyName(s,b,misc));
         Reg("C_VIEW_PARTY_INVITE",                      0,                                              (s,b) => MiscClientPackets.OnViewPartyInvite(s,b,misc));
