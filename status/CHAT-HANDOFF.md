@@ -124,6 +124,25 @@ and look for the next caller.
 
 ## Next steps (in order)
 
+**Checkpoint 2026-09-20 - 832 tests, T113-T124b merged.** Live session with the Classic+ client (the
+`D:\Tera 100` client doesn't exercise leaderboard/Alt+A; Classic+ does - run it via the rust launcher
+at D:\tera-rust-launcher-local which auths to tera-api, path=D:\Tera 100). FIXED LIVE THIS ROUND:
+leaderboard now opens and lists (T118 exploit-fix mod forwards C_REQUEST_P*_RANKING - the mod's
+season>0/id>0 guard drops tabs sending 0, watch its console; T119 builds S_PVE/PVP_RANKING_LIST from
+dungeon_cooldowns clears + game_log pvp.kill, 0 rows until progress exists), character-select level
+(T122 refreshes the live row), play time (T113), admin web game-log search (T116), api-gateway fields
+in S_LOGIN_ACCOUNT_INFO (T124). PARKED: Alt+A GM panel. Full byte parity reached vs the working
+cap_final_gm_client2 session (status 33, S_ADMIN_GM_SKILL before S_LOAD_TOPO via the tunnel T121,
+S_LOGIN_ACCOUNT_INFO 544B identical layout, apiServerAddress reachable) AND Fiddler shows the client
+fires NO http on Alt+A against TeraSharp while the same client opens it on the real Arbiter - trigger
+is client-internal, not in any packet we send; deferred, /@ + admin web cover its function. Note:
+apiServerAddress must be the SERVER's reachable IP:port (client/server are separate machines here);
+tera-api gateway API_GATEWAY_LISTEN_HOST reverted to 127.0.0.1 and the 8040 firewall rule removed
+after testing. T126 (leaderboard class dropdown 'undefined') on HOLD - class names are client-side;
+identify the exact undefined control before building. Open polish: leaderboard class dropdown, EP
+maxRestBonusXp (needs RestBonusDataSheet), exp offset in blob (needs an earned-level capture).
+Still to do: multi-World (patch ready, needs dungeon-server capture), go-live per docs/GO-LIVE.md.
+
 **Checkpoint 2026-09-19 - 797 tests, T83-T110 merged.** Client-facing handler set essentially complete
 (~250/273; remaining are skip-list or capture-gated: guild war accept/raise/give-up, guild quest
 start/finish, Civil Unrest). New since last checkpoint: cards (account-wide + per-character mounts),
