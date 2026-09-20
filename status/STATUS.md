@@ -946,7 +946,7 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   level, +7 a band width of 0, and the rookie flag computed from what we wrote - so it is
   always 0, which is "we do not model the rookie band" rather than a flag that means nothing.
 
-  Dense ranks, ties broken by character id, class filter on T118's range (`0..14` exact, `0x10`
+  Ranks (competition - see T133b), ties broken by character id, class filter on T118's range (`0..14` exact, `0x10`
   aggregate), 50 a page, and the requester's own row appended when the page does not hold it.
   The request has no page field, so the handler sends page 0 plus that row. Only
   `season == 1` - the season `S_P*_LEADER_BOARD_INFO` advertises (T91) - has rows; anything
@@ -1144,3 +1144,26 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   header-only .npcap and never showed on a real capture. Re-run on `classic_live.npcap`:
   byte-identical to the committed `classic_live.log`, and `reframe-client.ps1` still reports
   6 467 packets with no rejects.
+
+- T133b: **two T133 assertions were guesses; the frames say otherwise.** Both round trips
+  still hold - the layouts were never in question, only what I claimed the values were.
+
+  `S_PVP_RANKING_LIST-5818`: I asserted the `rookie` byte at +6 was "0 on every row of this
+  frame". It is **1 on exactly one row** - row 97 of 100, rank 96, `BFG`, rating 969, up
+  seven places. That is the single set flag in all 316 rows of classic_live, and it is in
+  this frame, which is the whole reason the byte can be called a flag. The test now pins
+  every row's value, not just the count.
+
+  `S_PVE_RANKING_LIST-5856-class16`: I asserted "N rows share rank 1, one per class". Wrong
+  twice over. Ten rows share rank 1, and only **eight distinct classes** among them (8 and 2
+  each appear twice) - it is a ten-player raid record, and every member carries the group's
+  own 359952 ms and stage 5. And the rank after that group is **11, not 2**: the ladder runs
+  1, 11, 21, 31, 41, 51, 61, 69, 78, 87, 96, where the short steps are groups of eight and
+  nine.
+
+  **Which means `RankingBoards.Rank` is COMPETITION ranking, not dense** - `rank = i + 1` on
+  a change of score, so a tied pair is 1, 1, 3. The behaviour was always right and matches
+  the live board; the word "dense" in T119's comments, `RankingRow`'s summary,
+  `status/LEADERBOARD.md` 6.2 and the STATUS entry was wrong, and is corrected. The test
+  name `T119_ranks_are_dense_stable_and_class_filtered` is left alone so its history stays
+  findable; its comments no longer claim the wrong thing.
