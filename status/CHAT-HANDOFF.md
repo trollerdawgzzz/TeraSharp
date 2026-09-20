@@ -124,6 +124,26 @@ and look for the next caller.
 
 ## Next steps (in order)
 
+**Checkpoint 2026-09-19 - 797 tests, T83-T110 merged.** Client-facing handler set essentially complete
+(~250/273; remaining are skip-list or capture-gated: guild war accept/raise/give-up, guild quest
+start/finish, Civil Unrest). New since last checkpoint: cards (account-wide + per-character mounts),
+perks/crest, account lists, GM tool complete incl. Alt+A URL reply (T107), guild board/wanted/lists/
+ranking/flag/quests, private channels wired, telemetry acks, item strings/boards/dungeon rank, misc
+acks, character rename/cancel-delete, admin web (T101a-d: lookups, restore, soft delete, restrictions,
+money/items/kick/announce, status tab + log tail at http://127.0.0.1:8051/ with TERASHARP_ADMIN_TOKEN),
+log provider (console Warning+, daily file), go-live kit (tools/harden-netcup.ps1 default-deny -
+needs -AdminIp; tools/backup-db.ps1; docs/GO-LIVE.md), multi-World steps 1-2 dormant behind null hooks
++ status/MULTIWORLD-PATCH.diff (apply after a dungeon-server capture; T109: no allocator exists - one
+World per continent from ServerConfig). LIVE FINDINGS FIXED THIS ROUND: bag loss (starter rows shared
+item ids 7..12 across characters - T105), blob level stamped at 204, watched movies account-scoped
+(intro cutscene), broker register push, status 33 for GM accounts. STILL TO VERIFY LIVE: items intact
+after relog, level in-world, cutscene once, listing push, Alt+A, admin web, flag-8 mode-screen
+experiment (LoginHandlers.SendContentFlags id 8 enabled - revert if no effect). Mode-select screen:
+client-native (S1UI_GameModeSelectScene.gpk, no data/packet gate found - CLIENT-GAMEMODE-SCREEN.md).
+GM notes: TERASHARP_GM_ACCOUNTS takes the numeric accountDBID; real Arbiter GM needs qaServer=true.
+Next: live pass -> fix -> T111 (WorldServerList into DungeonChannels + apply patch) -> dungeon-server
+capture -> go-live per docs/GO-LIVE.md.
+
 **Checkpoint 2026-09-17 - 696 tests, T74-T82 merged.** Captures cap_social3_client2 (seller) and
 cap_social4 (+client2) consumed: broker complete end to end (T71/T72/T74/T81), EP stored/served (T77),
 party-matching board (T78), guild war persisted (T80), guild crest + skill polishing (T82), 0x2792
