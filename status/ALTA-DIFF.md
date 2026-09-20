@@ -173,3 +173,73 @@ listed once at the end rather than in the table.
 ### Byte-identical and same count (39) - no row needed
 
 `S_ACCOUNT_BENEFIT_LIST`, `S_ACCOUNT_PACKAGE_LIST`, `S_ADMIN_GM_SKILL`, `S_ARTISAN_RECIPE_LIST`, `S_ARTISAN_SKILL_LIST`, `S_AVAILABLE_SOCIAL_LIST`, `S_BROCAST_GUILD_FLAG`, `S_CHANGE_POCKET_NAME`, `S_CLEAR_QUEST_INFO`, `S_CURRENT_ELECTION_STATE`, `S_DECO_UI_INFO`, `S_F2P_PremiumUser_Permission`, `S_FESTIVAL_LIST`, `S_GMEVENT_OFF_GUIDE_MESSAGE`, `S_GUARD_PK_POLICY`, `S_INGAMESHOP_CATEGORY_BEGIN`, `S_INGAMESHOP_CATEGORY_DATA`, `S_INGAMESHOP_CATEGORY_END`, `S_INGAMESHOP_PRODUCT_BEGIN`, `S_INGAMESHOP_PRODUCT_END`, `S_LOGIN_ARBITER`, `S_MOVE_DISTANCE_DELTA`, `S_MY_DESCRIPTION`, `S_PARCEL_READ_RECV_STATUS`, `S_PET_INCUBATOR_INFO_CHANGE`, `S_PLAYER_CHANGE_ALL_PROF`, `S_PVE_LEADER_BOARD_INFO`, `S_PVP_LEADER_BOARD_INFO`, `S_REQUEST_SERVANT_INFO_LIST`, `S_RESPONSE_SERVANT_ADVENTURE_LIST`, `S_RP_SKILL_POLISHING_LIST`, `S_START_COOLTIME_SERVANT_SKILL`, `S_TOTAL_GUILD_WAR_DATA`, `S_TRADE_BROKER_HIGHEST_ITEM_LEVEL`, `S_UPDATE_CONTENTS_ON_OFF`, `S_UPDATE_FRIEND_INFO`, `S_USER_BLOCK_LIST`, `S_VIRTUAL_LATENCY`, `S_WEAK_POINT`
+
+## T131 - the two candidates, resolved
+
+### 1. S_VERSION_INFO: built, tested, needs ONE registry line
+
+`S_VERSION_INFO.1.def` = `int32 revision / string description / byte display`. Decoded from
+cap_final_gm_client2 record 286 (`0D 00 67 B7 0B 00 00 00 00 00 01 00 00`):
+
+```
+body  0  u16  ref description = 11   (packet-relative -> body index 7)
+      2  i32  revision        = 0    NOT 376056; S_SERVER_BUILD_INFO carries the build revision
+      6  byte display         = 1
+      7       description     = ""   (the bare UTF-16 terminator)
+```
+
+2 + 4 + 1 + 2 = 9 body bytes, + 4 header = 13. The def and the capture agree exactly, and the
+test asserts the builder against BOTH.
+
+`ArbiterClientHandlers.BuildVersionInfo(int revision = 0, bool display = true)` returns that
+frame. Its position is fixed across both captured logins - after S_LOAD_CLIENT_USER_SETTING,
+immediately before S_PARCEL_READ_RECV_STATUS - so the send site is the C_LOAD_TOPO_FIN burst in
+`Handlers/HandlerRegistry.cs`. That file is human-owned, so THE LINE IS NOT APPLIED. Add it:
+
+```
+                ClientSettingsHandlers.SendUserSetting(s);
+                s.Send(ArbiterClientHandlers.BuildVersionInfo());   // T131: cap frame 286, before the parcel status
+                ParcelHandlers.SendReadRecvStatus(s);        // T42: 13-byte S_PARCEL_READ_RECV_STATUS (cap frame 312)
+```
+
+i.e. one new line between HandlerRegistry.cs:102 and :103 as they stand today.
+
+### 2. S_SELECT_USER: the source is correct; the capture predates the build
+
+Both trees already call it - `Handlers/LoginHandlers.cs:180`
+`s.SendByDef("S_SELECT_USER", ArbiterClientHandlers.BuildSelectUserFields());` (and :173 for the
+refusal) - and `ArbiterClientHandlers.BuildSelectUserFields` returns `unk1 = 1, unk2 = (ushort)1,
+unk3 = 0UL`, which is the capture's `01 | 01 00 | 00 x8`. Nothing to fix in source.
+
+Why cap_t124 still shows the old shape: master's `ArbiterClientHandlers.cs` was last written at
+1789913259597 and `src\TeraSharp.Arbiter\bin\Release\net8.0\TeraSharp.Arbiter.dll` was built
+at 1789906810382 - the build is 6449 s OLDER than the file. cap_t124.log (1789907491945) came
+from that older binary. Rebuild and re-capture; there is no code change to make.
+
+### 3. The port: 8800 is SERVER config, not a client constant
+
+`Executable\DeploymentConfig.xml`, the original ArbiterServer's own config:
+
+```
+<APIServer ip="127.0.0.1" port="8800" protocol="http" ttl="120" />
+```
+
+and `DeploymentConfig.xml.orig` - the untouched vendor file, whose shop URLs still point at
+`172.16.200.119` before this box localised them - carries the SAME 8800. So 8800 was never
+localised: it is the vendor default for the Arbiter's APIServer element, which the Arbiter copies
+into `apiServerAddress`. `ttl="120"` is the clincher - it is exactly the `exp = iat + 120` in the
+T123/T124 token. This one XML element is the source of the whole Alt+A field set.
+
+`arb_gw\config_arb_gw.txt` has no 8800 at all (it is `rest_url=http://127.0.0.1:8080/api`,
+`web_shop_url=http://127.0.0.1:81/...`), so the gateway the client is pointed at is NOT arb_gw.
+
+Conclusion: **the client uses whatever `apiServerAddress` the server sends - it does not hardcode
+a port.** 8040 is not wrong because it is 8040; it is wrong because nothing serves it. Setting
+`TERASHARP_API_GATEWAY=127.0.0.1:8800` only helps if something is listening there, and on this box
+nothing is (the original ArbiterServer is not running). The real work is standing up the admin-tool
+HTTP endpoint and pointing the env var at it. Matching 8800 is still worth doing - it is what the
+client was built against and costs nothing.
+
+NOT CHECKED: `D:\Tera 100\S1Game\Config` and the client exe. That folder is not connected to this
+session and a folder-access request for it was refused, so the client-side half of the question is
+answered from the server config only. To confirm against the exe, connect `D:\Tera 100`.

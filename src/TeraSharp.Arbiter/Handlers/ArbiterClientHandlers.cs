@@ -2068,6 +2068,44 @@ public static class ArbiterClientHandlers
         => new byte[] { 0x05, 0x00, unchecked((byte)S_ADMIN_HOLD_CHARACTER), (byte)(S_ADMIN_HOLD_CHARACTER >> 8),
                         (byte)(held ? 1 : 0) };
 
+    /// <summary>S_VERSION_INFO (0xB767). T131. Opcode only - the frame is built below.</summary>
+    public const ushort S_VERSION_INFO = 0xB767;
+
+    /// <summary>
+    /// S_VERSION_INFO, byte-exact against cap_final_gm_client2 records 286 and 2648:
+    /// <c>0D 00 67 B7 0B 00 00 00 00 00 01 00 00</c>, 13 bytes.
+    ///
+    /// <para>T129 found it is the only non-content S_ opcode the real Arbiter sends and we never
+    /// did. Both captured logins put it in the same slot of the post-C_LOAD_TOPO_FIN burst:
+    /// after S_LOAD_CLIENT_USER_SETTING, immediately before S_PARCEL_READ_RECV_STATUS.</para>
+    ///
+    /// <code>
+    ///   S_VERSION_INFO.1.def    int32 revision / string description / byte display
+    ///
+    ///   body  0  u16  ref description = 11   (packet-relative, so body index 7)
+    ///         2  i32  revision        = 0
+    ///         6  byte display         = 1
+    ///         7       description     = ""   (the bare UTF-16 terminator)
+    /// </code>
+    ///
+    /// <para><c>revision</c> is 0 in the capture - NOT the 376056 that S_SERVER_BUILD_INFO
+    /// carries - and <c>description</c> is empty in every captured frame, so this writes the
+    /// terminator and nothing else and the frame is always 13 bytes. Hand-built rather than sent
+    /// through the def for the same reason its neighbours in this burst are: the length is fixed
+    /// and the capture is the specification.</para>
+    /// </summary>
+    public static byte[] BuildVersionInfo(int revision = 0, bool display = true)
+    {
+        var p = new byte[13];
+        p[0] = 0x0D; p[1] = 0x00;
+        p[2] = unchecked((byte)S_VERSION_INFO); p[3] = (byte)(S_VERSION_INFO >> 8);
+        p[4] = 11; p[5] = 0;                            // ref description -> packet offset 11
+        BitConverter.GetBytes(revision).CopyTo(p, 6);
+        p[10] = (byte)(display ? 1 : 0);
+        p[11] = 0; p[12] = 0;                           // the empty description
+        return p;
+    }
+
     /// <summary>
     /// S_ADMIN_CUSTOM_BOOKMARK_LIST (0xE4A4) and S_ADMIN_DEFAULT_BOOKMARK_LIST (0xE430) - one
     /// layout, two opcodes.
