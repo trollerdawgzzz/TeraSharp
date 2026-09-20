@@ -8070,7 +8070,7 @@ public bool TryHandle(WorldBridge bridge, WorldLink link, ushort op, byte[] payl
         var p = GuildPackets.BuildAsGuildString(42, "LOGO-7");
         Hex.True(BitConverter.ToInt32(p, 0) == 0x0E, $"string offset 0x{BitConverter.ToInt32(p, 0):X2}, want frame 0x0E");
         Hex.True(BitConverter.ToInt32(p, 4) == 42, "GuildDbId @frame 0x0A");
-        Hex.Eq(p[8..20], System.System.Text.Encoding.Unicode.GetBytes("LOGO-7"), "the wstring sits at the advertised frame offset");
+        Hex.Eq(p[8..20], System.Text.Encoding.Unicode.GetBytes("LOGO-7"), "the wstring sits at the advertised frame offset");
 
         var g = GuildPackets.BuildAsCreateGuildGroup(42, 3, "Officer", 0x7F);
         Hex.True(BitConverter.ToInt32(g, 0) == 0x16, $"group name offset 0x{BitConverter.ToInt32(g, 0):X2}, want frame 0x16");
@@ -8162,7 +8162,7 @@ public bool TryHandle(WorldBridge bridge, WorldLink link, ushort op, byte[] payl
         BitConverter.GetBytes(65).CopyTo(body, 6);
         BitConverter.GetBytes(2).CopyTo(body, 0x0A);
         BitConverter.GetBytes(3).CopyTo(body, 0x0E);
-        System.System.Text.Encoding.Unicode.GetBytes(intro).CopyTo(body, 0x12);
+        System.Text.Encoding.Unicode.GetBytes(intro).CopyTo(body, 0x12);
         var got = GuildPackets.ParseCSetGuildJoinCondition(body);
         Hex.True(got != null, "parsed");
         Hex.True(got!.Value.introduction == intro, $"introduction '{got.Value.introduction}'");
@@ -8923,9 +8923,9 @@ array    friends
     {
         // The two strings come from StrFriendDataSheet (ids 100 and 200), so they are only
         // knowable from the capture - and they are what makes frames 305/306 reproduce.
-        Hex.Eq(System.System.Text.Encoding.Unicode.GetBytes(SocialHandlers.SampleGroupNameTw),
+        Hex.Eq(System.Text.Encoding.Unicode.GetBytes(SocialHandlers.SampleGroupNameTw),
             "7D 59 CB 53", "the sample group name is the capture's two code units");
-        Hex.Eq(System.System.Text.Encoding.Unicode.GetBytes(SocialHandlers.DefaultProfileMessageTw),
+        Hex.Eq(System.Text.Encoding.Unicode.GetBytes(SocialHandlers.DefaultProfileMessageTw),
             "CA 4E 29 59 5F 4E 2F 66 09 61 EB 5F 84 76 00 4E 29 59 21 00",
             "the default profile message is the capture's ten code units");
     }
@@ -11309,7 +11309,7 @@ bool   isGuildWarAcceptable
             $"a real URL still self-describes its length: {url.Length}");
         Hex.True(BitConverter.ToUInt16(url, 4) == 8 && BitConverter.ToUInt16(url, 6) == 54,
             "the first ref stays at 8; the second moves past the string");
-        Hex.True(System.System.Text.Encoding.Unicode.GetString(url, 8, 44) == "http://127.0.0.1:8050/"
+        Hex.True(System.Text.Encoding.Unicode.GetString(url, 8, 44) == "http://127.0.0.1:8050/"
                  && url[52] == 0 && url[53] == 0 && url[54] == 0 && url[55] == 0,
             "and both wide strings are terminated");
 
@@ -11944,7 +11944,7 @@ bool   isGuildWarAcceptable
     [Test] public static void T124_login_account_info_carries_the_gateway_and_a_real_token()
     {
         const long Iat = 1789619351L;   // the capture's iat
-        var secret = System.System.Text.Encoding.UTF8.GetBytes("test-secret");
+        var secret = System.Text.Encoding.UTF8.GetBytes("test-secret");
 
         // The two segments are byte-exact against the capture's token: same JOSE header
         // (typ JWS, not JWT) and the same claim set in the same alphabetical order.
@@ -11962,11 +11962,11 @@ bool   isGuildWarAcceptable
 
         // It verifies, and only with the right key and an untouched payload.
         Hex.True(TeraSharp.Arbiter.Auth.ApiGatewayToken.Verify(tok, secret), "HS256 signature checks out");
-        Hex.True(!TeraSharp.Arbiter.Auth.ApiGatewayToken.Verify(tok, System.System.Text.Encoding.UTF8.GetBytes("other")),
+        Hex.True(!TeraSharp.Arbiter.Auth.ApiGatewayToken.Verify(tok, System.Text.Encoding.UTF8.GetBytes("other")),
             "a different key does not");
         Hex.True(!TeraSharp.Arbiter.Auth.ApiGatewayToken.Verify(
                      seg[0] + "." + TeraSharp.Arbiter.Auth.ApiGatewayToken.Base64Url(
-                         System.System.Text.Encoding.UTF8.GetBytes(
+                         System.Text.Encoding.UTF8.GetBytes(
                              TeraSharp.Arbiter.Auth.ApiGatewayToken.Payload(9999, Iat))) + "." + seg[2], secret),
             "and neither does a swapped account id");
 
@@ -12135,7 +12135,7 @@ bool   isGuildWarAcceptable
         // The JWT round trip: mint one, hand it over the way each carrier would, get it back
         // whole, and check it still verifies. url-encoding in the query has to survive.
         const long Iat = 1789619351L;
-        var secret = System.System.Text.Encoding.UTF8.GetBytes("test-secret");
+        var secret = System.Text.Encoding.UTF8.GetBytes("test-secret");
         string tok = TeraSharp.Arbiter.Auth.ApiGatewayToken.Mint(1, Iat, secret);
 
         var carried = new[]
@@ -12424,7 +12424,7 @@ bool   isGuildWarAcceptable
     static System.Net.Http.HttpResponseMessage Json(System.Net.HttpStatusCode status, string body)
         => new(status)
         {
-            Content = new System.Net.Http.StringContent(body, System.System.Text.Encoding.UTF8, "application/json"),
+            Content = new System.Net.Http.StringContent(body, System.Text.Encoding.UTF8, "application/json"),
         };
 
     [Test] public static void T31_login_packet_carries_an_ascii_ticket()
@@ -12460,9 +12460,9 @@ bytes  ticket
     {
         Hex.True(AuthTicket.Decode(null) == "", "null");
         Hex.True(AuthTicket.Decode(Array.Empty<byte>()) == "", "empty");
-        Hex.True(AuthTicket.Decode(System.System.Text.Encoding.ASCII.GetBytes(Cap2Ticket + "\0")) == Cap2Ticket,
+        Hex.True(AuthTicket.Decode(System.Text.Encoding.ASCII.GetBytes(Cap2Ticket + "\0")) == Cap2Ticket,
             "a trailing NUL is trimmed");
-        Hex.True(AuthTicket.Decode(System.System.Text.Encoding.Unicode.GetBytes(Cap2Ticket)) == Cap2Ticket,
+        Hex.True(AuthTicket.Decode(System.Text.Encoding.Unicode.GetBytes(Cap2Ticket)) == Cap2Ticket,
             "a UTF-16 ticket still decodes (defensive, not observed)");
         Hex.True(AuthTicket.Decode(Cap2Ticket) == Cap2Ticket, "a string passes through");
         Hex.True(!AuthTicket.LooksCanonical("nope"), "shape check rejects junk");
@@ -14879,7 +14879,7 @@ some prose with `backticks` that is not a table row
                  "the string offset is frame-relative and constant: 6 + the 12-byte fixed part");
         Hex.True(BitConverter.ToUInt32(p, 4) == 2, "UserDbId");
         Hex.True(BitConverter.ToUInt32(p, 8) == 1, "CommandType");
-        Hex.True(System.System.Text.Encoding.Unicode.GetString(p, 12, p.Length - 14) == "teleport 1 2 3",
+        Hex.True(System.Text.Encoding.Unicode.GetString(p, 12, p.Length - 14) == "teleport 1 2 3",
                  "and the line round-trips");
         Hex.True(p[^2] == 0 && p[^1] == 0, "terminated");
     }
@@ -16019,7 +16019,7 @@ some prose with `backticks` that is not a table row
         BitConverter.GetBytes(6550).CopyTo(body, 22);
         BitConverter.GetBytes(1).CopyTo(body, 26);
         BitConverter.GetBytes(9).CopyTo(body, 30);
-        System.System.Text.Encoding.Unicode.GetBytes(owner).CopyTo(body, ArbiterClientHandlers.TooltipRequestBodySize);
+        System.Text.Encoding.Unicode.GetBytes(owner).CopyTo(body, ArbiterClientHandlers.TooltipRequestBodySize);
 
         var req = ArbiterClientHandlers.ParseTooltipRequest(body);
         Hex.True(req != null, "parsed");
@@ -16144,9 +16144,9 @@ some prose with `backticks` that is not a table row
     {
         var body = new List<byte>();
         body.AddRange(new byte[] { 0x01, 0x00, 0x02, 0x00 });                 // junk
-        body.AddRange(System.System.Text.Encoding.Unicode.GetBytes("ItemTooltip"));
+        body.AddRange(System.Text.Encoding.Unicode.GetBytes("ItemTooltip"));
         body.AddRange(new byte[] { 0x00, 0x00 });
-        body.AddRange(System.System.Text.Encoding.Unicode.GetBytes("failed"));
+        body.AddRange(System.Text.Encoding.Unicode.GetBytes("failed"));
 
         string text = ArbiterClientHandlers.ExtractWideRuns(body.ToArray());
         Hex.True(text.Contains("ItemTooltip", StringComparison.Ordinal), $"got '{text}'");
@@ -16232,7 +16232,7 @@ some prose with `backticks` that is not a table row
                  == SocialHandlers.DefaultProfileMessageTw, "and the captured greeting");
 
         // the captured bytes, so the TW strings cannot drift
-        Hex.Eq(System.System.Text.Encoding.Unicode.GetBytes(SocialHandlers.SampleGroupNameTw),
+        Hex.Eq(System.Text.Encoding.Unicode.GetBytes(SocialHandlers.SampleGroupNameTw),
             "7D 59 CB 53", "cap_newchar_client.log frame 305");
 
         using var store = T45Store();
@@ -19641,7 +19641,7 @@ string message
         BitConverter.GetBytes(1003).CopyTo(fetch, 16);          // ContractorDbId, the founder New
         BitConverter.GetBytes(10).CopyTo(fetch, 20);            // ContractType
         BitConverter.GetBytes(4).CopyTo(fetch, 24);             // ContractId
-        System.System.Text.Encoding.Unicode.GetBytes("test").CopyTo(fetch, 28);
+        System.Text.Encoding.Unicode.GetBytes("test").CopyTo(fetch, 28);
         BitConverter.GetBytes(2).CopyTo(fetch, 166);            // the other party member
 
         var parsed = ContractBroker.ParseFetch(fetch);
@@ -19672,7 +19672,7 @@ string message
 
         // cap_social2_client frame 896 - what the 0x280D at tap 1186 becomes on the member client
         var param = new byte[0x8A];
-        System.System.Text.Encoding.Unicode.GetBytes("test").CopyTo(param, 0);
+        System.Text.Encoding.Unicode.GetBytes("test").CopyTo(param, 0);
         var begin = ContractBroker.BuildSBegin("New", ContractBroker.TypeCreateGuild, 4, 2, param);
         Hex.True(begin.Length == 168, "S_BEGIN is 168 bytes, exactly client frame 896");
         Hex.Eq(begin[..40],
@@ -22935,8 +22935,8 @@ string message
     [Test] public static void T115_the_group_duel_log_decodes_both_leaders()
     {
         // Payload, then the two leader names appended past the fixed part.
-        var blue = System.System.Text.Encoding.Unicode.GetBytes("Blue\0");
-        var red = System.System.Text.Encoding.Unicode.GetBytes("Red\0");
+        var blue = System.Text.Encoding.Unicode.GetBytes("Blue\0");
+        var red = System.Text.Encoding.Unicode.GetBytes("Red\0");
         int fixedLen = GameLogPackets.GroupDuelLogMinPayload;
         var p = new byte[fixedLen + blue.Length + red.Length];
         blue.CopyTo(p, fixedLen);
@@ -24701,7 +24701,7 @@ string message
     [Test] public static void T65_the_friend_accepted_message_is_smt_433()
     {
         var cap = Hex.B(Cap65_SmtFriendAccepted);
-        string seen = System.System.Text.Encoding.Unicode.GetString(cap).TrimEnd('\0');
+        string seen = System.Text.Encoding.Unicode.GetString(cap).TrimEnd('\0');
         Hex.True(SocialHandlers.SmtAcceptedToRequester == 433,
             $"SMT 433, not 432: {SocialHandlers.SmtAcceptedToRequester}");
         Hex.True(seen == SocialHandlers.Smt(SocialHandlers.SmtAcceptedToRequester, "UserName", "two"),
@@ -24790,7 +24790,7 @@ string message
         // and the same string on the wire, byte for byte: [u16 msgOffset=6][NUL-terminated UTF-16LE]
         var body = new byte[2 + (expected.Length + 1) * 2];
         BitConverter.GetBytes((ushort)6).CopyTo(body, 0);
-        System.System.Text.Encoding.Unicode.GetBytes(expected).CopyTo(body, 2);
+        System.Text.Encoding.Unicode.GetBytes(expected).CopyTo(body, 2);
         Hex.Eq(body,
             "06 00  40 00 34 00 33 00 33 00  0B 00  "
             + "55 00 73 00 65 00 72 00 4E 00 61 00 6D 00 65 00  0B 00  74 00 77 00 6F 00  00 00",
