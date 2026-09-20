@@ -557,3 +557,50 @@ TeraSharp 33  01 | 00 00 | 00 00 00 00 00 01 01         unk1=1 unk2=0 unk3=0x010
 TeraSharp writes the two trailing bytes at the end of `unk3` instead of into `unk2` - the fields
 are being emitted out of declaration order. Not the Alt+A gate (the panel is decided long before
 `S_SELECT_USER`), but it is wrong bytes on the wire and should be its own task.
+
+### T124 - the fix
+
+`Auth/ApiGatewayToken.cs` (new) mints the credential; `ArbiterClientHandlers` builds the two
+packets; three one-line calls in `LoginHandlers` (human-owned) put them on the wire.
+
+**The token is byte-reproducible.** With `accountDbId = 1` and `iat = 1789619351`, `Mint` produces
+the capture's first two segments character for character and a 231-char token - the same length
+frame 8 carries. Signing differs only in the key, which is the one thing we cannot read off the
+wire.
+
+```
+header  eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXUyJ9
+claims  eyJhY2NvdW50RGJJZCI6MSwiYXVkIjoiYXBpIiwiZXhwIjoxNzg5NjE5NDcxLCJpYXQiOjE3ODk2
+        MTkzNTEsImlzcyI6ImFyYml0ZXIiLCJuYmYiOjE3ODk2MTkzNTEsInBsYW5ldElkIjoyODAwfQ
+```
+
+**`antiCheatChecksumSeed` is the login instant's low six digits.** The capture's 619351 is
+`1789619351 % 1000000` - its own `iat`. One sample, so not a proof, but it is stable for a login,
+never 0, and free. 0 is what we sent before and the one value the client could read as "no seed".
+
+**The address is repaired, not trusted.** `Address()` strips a pasted scheme and appends the
+default port when none is given, because `127.0.0.1` with no port is precisely the value that did
+not work and a config that forgets the port must not reproduce the bug.
+
+**Nothing verifies the signature.** tera-api has no `jwt.verify` in `src`, so the gateway takes
+whatever arrives - a well-formed token is enough. It is signed properly anyway so that turning
+verification on is a config change. `TERASHARP_API_JWT_SECRET` has **no hard-coded default**: a
+signing key does not belong in source. Unset, it mints with a per-process random key and
+`--check-config` says so.
+
+`S_SELECT_USER` is fixed in the same pass: `unk2 = 1, unk3 = 0`, byte-exact against frame 37.
+
+**Three human-owned one-liners** (`Handlers/LoginHandlers.cs`):
+
+```csharp
+// line 61 - replace the 64-byte stub
+s.SendByDef("S_LOGIN_ACCOUNT_INFO", ArbiterClientHandlers.BuildLoginAccountInfoFields(
+    s.Account.AccountId, DateTimeOffset.UtcNow.ToUnixTimeSeconds()));   // T124
+// line 176 - the World-not-ready refusal
+s.SendByDef("S_SELECT_USER", ArbiterClientHandlers.BuildSelectUserFields(accepted: false));
+// line 183 - the accepted path
+s.SendByDef("S_SELECT_USER", ArbiterClientHandlers.BuildSelectUserFields());
+```
+
+Also fixed here: `SelfTest.IsSecret` matched only `_TOKEN` and `_PASSWORD`, so `--check-config`
+would have printed the new signing key in full. It now masks `_SECRET` and `_KEY` too.

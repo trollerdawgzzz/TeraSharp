@@ -134,6 +134,28 @@ one that loses is whichever starts second.
       the Status tab fills in
 - [ ] from outside, that port is filtered (step 7 does this)
 
+### The Alt+A panel (T124)
+
+The In-Game Operation Tool is an embedded web view. It needs two fields in
+`S_LOGIN_ACCOUNT_INFO` - the second frame of every session - and a GM account:
+
+```
+setx /M TERASHARP_API_GATEWAY      127.0.0.1:8040
+setx /M TERASHARP_DB_SERVER_NAME   PlanetDB_2800
+setx /M TERASHARP_API_JWT_SECRET   <tera-api .env API_PORTAL_SECRET, verbatim>
+```
+
+- [ ] the port is tera-api's `API_GATEWAY_LISTEN_PORT`, **not** the arbiter API on 8080 that
+      `TERASHARP_AUTH` uses - check your `.env` and mirror it here
+- [ ] tera-api's **gateway_api** component is actually running (`start_gateway_api.bat`)
+- [ ] the account is a GM (`TERASHARP_GM_ACCOUNTS`, or `accounts.admin_level >= 1`), which is
+      what makes `S_LOGIN_ARBITER.status` 33 - both halves are needed
+- [ ] `--check-config` shows `TERASHARP_API_JWT_SECRET  (set, N chars)` and no `!` line
+
+Nothing on this stack verifies the token today (tera-api has no `jwt.verify`), so the panel
+opens even with the secret unset - it is signed properly so that enabling verification later
+is a config change. Leaving it unset is a one-line note in `--check-config`, not a failure.
+
 Reach it from your desk over an SSH/RDP tunnel, never by opening the port.
 
 ---

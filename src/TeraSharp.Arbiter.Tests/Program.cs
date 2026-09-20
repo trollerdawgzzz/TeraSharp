@@ -11937,6 +11937,106 @@ bool   isGuildWarAcceptable
             "still gated on admin level 1, still immediately before S_LOAD_TOPO");
     }
 
+    /// <summary>
+    /// T124 - the Alt+A fix. S_LOGIN_ACCOUNT_INFO.3's apiServer fields, and the HS256 token,
+    /// against cap_final_gm_client2 frame 8 - the session where the panel opened.
+    /// </summary>
+    [Test] public static void T124_login_account_info_carries_the_gateway_and_a_real_token()
+    {
+        const long Iat = 1789619351L;   // the capture's iat
+        var secret = System.Text.Encoding.UTF8.GetBytes("test-secret");
+
+        // The two segments are byte-exact against the capture's token: same JOSE header
+        // (typ JWS, not JWT) and the same claim set in the same alphabetical order.
+        string tok = TeraSharp.Arbiter.Auth.ApiGatewayToken.Mint(1, Iat, secret);
+        var seg = tok.Split('.');
+        Hex.True(seg.Length == 3, "compact serialization has three segments");
+        Hex.True(seg[0] == "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXUyJ9", "header, verbatim: " + seg[0]);
+        Hex.True(seg[1] == "eyJhY2NvdW50RGJJZCI6MSwiYXVkIjoiYXBpIiwiZXhwIjoxNzg5NjE5NDcxLCJpYXQiOjE3ODk2"
+                         + "MTkzNTEsImlzcyI6ImFyYml0ZXIiLCJuYmYiOjE3ODk2MTkzNTEsInBsYW5ldElkIjoyODAwfQ",
+            "claims, verbatim: " + seg[1]);
+        Hex.True(tok.Length == 231, $"231 chars, exactly what the capture carries: {tok.Length}");
+        Hex.True(TeraSharp.Arbiter.Auth.ApiGatewayToken.Decode(seg[1])
+                 == "{\"accountDbId\":1,\"aud\":\"api\",\"exp\":1789619471,\"iat\":1789619351,\"iss\":\"arbiter\",\"nbf\":1789619351,\"planetId\":2800}",
+            "nbf == iat and exp == iat + 120");
+
+        // It verifies, and only with the right key and an untouched payload.
+        Hex.True(TeraSharp.Arbiter.Auth.ApiGatewayToken.Verify(tok, secret), "HS256 signature checks out");
+        Hex.True(!TeraSharp.Arbiter.Auth.ApiGatewayToken.Verify(tok, System.Text.Encoding.UTF8.GetBytes("other")),
+            "a different key does not");
+        Hex.True(!TeraSharp.Arbiter.Auth.ApiGatewayToken.Verify(
+                     seg[0] + "." + TeraSharp.Arbiter.Auth.ApiGatewayToken.Base64Url(
+                         System.Text.Encoding.UTF8.GetBytes(
+                             TeraSharp.Arbiter.Auth.ApiGatewayToken.Payload(9999, Iat))) + "." + seg[2], secret),
+            "and neither does a swapped account id");
+
+        // The address must carry a port - '127.0.0.1' with none is exactly what did not work.
+        Hex.True(TeraSharp.Arbiter.Auth.ApiGatewayToken.Address("127.0.0.1") == "127.0.0.1:8040",
+            "a portless value is repaired, not passed on");
+        Hex.True(TeraSharp.Arbiter.Auth.ApiGatewayToken.Address("http://10.0.0.5:8800/") == "10.0.0.5:8800"
+                 && TeraSharp.Arbiter.Auth.ApiGatewayToken.Address(" ") == "127.0.0.1:8040",
+            "a pasted URL is reduced to host:port, and blank falls back to the box default");
+
+        // antiCheatChecksumSeed: 0 is what we sent before. The capture's 619351 is its own
+        // iat's low six digits - one sample, but stable per login and never zero.
+        Hex.True(TeraSharp.Arbiter.Auth.ApiGatewayToken.ChecksumSeed(Iat) == 619351,
+            "1789619351 -> 619351, the value in frame 8");
+        Hex.True(TeraSharp.Arbiter.Auth.ApiGatewayToken.ChecksumSeed(1_000_000L) != 0,
+            "and it is never 0, which is the one value the client could read as absent");
+
+        // Now the packet. Fixed part is 4 + three u16 refs + u64 + i32 = 22, so the first
+        // string starts at 22 - refs 22 / 50 / 80 in the capture, 22 / 42 / 62 in the old stub.
+        var defs = LoadDefinitionsOrSkip();
+        if (defs == null) return;
+        var def = defs.Get("S_LOGIN_ACCOUNT_INFO");
+        Hex.True(def != null, "S_LOGIN_ACCOUNT_INFO.3.def is present");
+        var pkt = new DefinitionWriter().Write(def!, ArbiterClientHandlers.BuildLoginAccountInfoFields(
+            1UL, Iat, "PlanetDB_2800", "127.0.0.1:8800", tok));
+        Hex.True(BitConverter.ToUInt16(pkt, 0) == pkt.Length, "self-consistent length");
+        Hex.True(BitConverter.ToUInt16(pkt, 4) == 22, "dbServerName ref is 22");
+        Hex.True(BitConverter.ToUInt16(pkt, 6) == 50, "apiServerAddress ref is 50 - PlanetDB_2800 is 13 chars");
+        Hex.True(BitConverter.ToUInt16(pkt, 8) == 80, "apiServerAuthToken ref is 80 - 127.0.0.1:8800 is 14");
+        Hex.True(BitConverter.ToUInt64(pkt, 10) == 1UL, "accountId");
+        Hex.True(BitConverter.ToInt32(pkt, 18) == 619351, "antiCheatChecksumSeed, not 0");
+        Hex.True(pkt.Length == 544, $"544 bytes, the same as the capture: {pkt.Length}");
+        Hex.True(WStringAt(pkt, 22) == "PlanetDB_2800" && WStringAt(pkt, 50) == "127.0.0.1:8800"
+                 && WStringAt(pkt, 80) == tok,
+            "the three strings decode back");
+    }
+
+    /// <summary>UTF-16LE, null-terminated, at a packet-relative offset.</summary>
+    static string WStringAt(byte[] p, int off)
+    {
+        var sb = new System.Text.StringBuilder();
+        for (int i = off; i + 1 < p.Length; i += 2)
+        {
+            ushort c = BitConverter.ToUInt16(p, i);
+            if (c == 0) break;
+            sb.Append((char)c);
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// T124 - S_SELECT_USER, byte-exact against cap_final_gm_client2 frame 37. We were sending
+    /// unk3 = 72339069014638592 (0x0101000000000000), which puts the capture's unk2 bytes at
+    /// the top of unk3: 01 | 00 00 | 00 00 00 00 00 00 01 01 instead of 01 | 01 00 | 00 x8.
+    /// </summary>
+    [Test] public static void T124_select_user_is_byte_exact()
+    {
+        var f = ArbiterClientHandlers.BuildSelectUserFields();
+        Hex.True((ushort)f["unk2"] == 1 && (ulong)f["unk3"] == 0UL,
+            "unk2 = 1 and unk3 = 0 - the 01 01 belongs to unk1 and unk2, not to unk3");
+        Hex.True((int)ArbiterClientHandlers.BuildSelectUserFields(false)["unk1"] == 0,
+            "the World-not-ready refusal keeps unk1 = 0 and the same constants");
+
+        var defs = LoadDefinitionsOrSkip();
+        if (defs == null) return;
+        Hex.Eq(WriteByDef(defs, "S_SELECT_USER", f),
+            "0F 00 FB 8A 01 01 00 00 00 00 00 00 00 00 00",
+            "cap_final_gm_client2 frame 37 (and 2408), 15 bytes of 0x8AFB");
+    }
+
     // ---- The rules ----
 
     [Test] public static void T30_system_message_format_matches_the_capture()
