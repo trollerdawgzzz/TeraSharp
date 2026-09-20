@@ -238,7 +238,8 @@ public sealed class LoginHandlers
 
         var benefits = Program.Store?.GetAccountBenefits((int)s.Account.AccountId) ?? new List<TeraSharp.Arbiter.Persistence.CharacterStore.AccountBenefitRow>();
         s.SendByDef("S_ACCOUNT_BENEFIT_LIST", ArbiterClientHandlers.BuildAccountBenefitFields(benefits));   // T84
-        s.SendByDef("S_SEND_USER_PLAY_TIME", ArbiterClientHandlers.BuildUserPlayTimeFields(0, DateTimeOffset.UtcNow.ToUnixTimeSeconds()));   // T84
+        int playSeconds = s.Account.Characters.Sum(c => (int)(Program.Store?.GetCharacterPlaySeconds((int)c.Id) ?? 0));   // T113
+        s.SendByDef("S_SEND_USER_PLAY_TIME", ArbiterClientHandlers.BuildUserPlayTimeFields(playSeconds, DateTimeOffset.UtcNow.ToUnixTimeSeconds()));   // T84
         s.SendByDef("S_ENABLE_DISABLE_SELLABLE_ITEM_LIST", ArbiterClientHandlers.BuildSellableItemListFields());   // T84 (frame 441)
         return true;
     }

@@ -53,6 +53,16 @@ public static class Program
         Auth = AuthProviders.FromEnvironment(log);
         log.LogInformation("TeraSharp Arbiter starting (protocol {Proto}, patch {Patch})", ProtocolVersion, MajorPatchVersion);
         log.LogInformation("Data root: {Root}, logs: {Logs}, db: {Db}", DataRoot, PacketLogsPath, DbPath);
+        ItemNames.DataRoot = DataRoot;      // T113: item strsheets resolve under the data root
+        if (args.Any(a => a is "--check-config" or "/check-config"))
+        {
+            Console.WriteLine(SelfTest.BuildConfigReport(new[] {
+                ("data root", DataRoot), ("opcodes", DataJsonPath), ("definitions", DefinitionsPath),
+                ("logs", PacketLogsPath), ("db", DbPath),
+                ("game port", BindAddress + ":" + BindPort),
+                ("admin web", "127.0.0.1:" + (Environment.GetEnvironmentVariable("TERASHARP_ADMIN_PORT") ?? "8050")) }));
+            return;
+        }
         log.LogInformation("Auth provider: {Name}", Auth.Name);
 
         OpcodeTable opcodes;
@@ -121,6 +131,9 @@ public static class Program
         if (admin != null)
         {
             admin.Api.StartedAt = DateTimeOffset.UtcNow;
+            ArbiterClientHandlers.PlayTimeLookup = s => { int id = (int)(s.SelectedCharacter?.Id ?? 0);
+                return (int)((Store?.GetCharacterPlaySeconds(id) ?? 0)
+                    + DbProxyHandlers.SecondsInWorld(id, DateTimeOffset.UtcNow.ToUnixTimeSeconds())); };   // T113
             admin.Api.WorldStatus = () => (World?.LinkCount ?? 0, World?.IsReady ?? false, World?.InWorldSessions().Count ?? 0);
             admin.Api.KickPlayer = id => { var s = World?.SessionForPlayerId(id); if (s == null) return false; s.Close(); return true; };
             admin.Api.Announce = text => { var all = World?.InWorldSessions() ?? new List<GameSession>();

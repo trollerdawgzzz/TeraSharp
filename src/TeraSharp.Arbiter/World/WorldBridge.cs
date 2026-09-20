@@ -560,7 +560,11 @@ public sealed class WorldBridge
         _log.LogInformation("SA_LEAVE_WORLD (0x1393) -> AS_ARBITER_USER_DELETE (0x1433) for gameId {G:X}", gameId);
 
         var session = FindPlayer(gameId) ?? FindPlayer(gameId | 0x80000AF00000UL);
-        if (session != null) session.OnWorldLeaveConfirmed();
+        if (session != null)
+        {
+            DbProxy?.CommitPlayTime((int)(session.SelectedCharacter?.Id ?? 0), DateTimeOffset.UtcNow.ToUnixTimeSeconds());   // T113
+            session.OnWorldLeaveConfirmed();
+        }
         else _log.LogWarning("SA_LEAVE_WORLD: no session for gameId {G:X}", gameId);
     }
 }
