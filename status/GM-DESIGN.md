@@ -71,11 +71,10 @@ then ships near-matches as `S_COMMAND_HELP` (0x4F79). TeraSharp sends the first,
 
 ```c
 FUN_140350eb0(&pkt,0x2829);                 // [u32 frameLen][u16 opcode]
-local_e8 = (int *)(*local_f8 + local_100);
-*local_e8 = 0;  FUN_14013d0b0(&pkt,*local_e8);   // u32 string offset, reserved as 0
+// reserve the u32 string-offset slot by writing 0 into it
 FUN_14013d0b0(&pkt,(int)lVar6);                   // u32 userId   (User+0x120 = playerId)
 FUN_14013d0b0(&pkt,(int)lVar18);                  // u32 bypass mode (1 = bucket 4)
-*local_e8 = *local_f8;                            // backpatch: 18, frame-relative
+// backpatch that slot with the running frame length: 18, frame-relative
 FUN_140351030(&pkt,line);                         // wcscpy_s -> UTF-16LE + a u16 0
 ```
 
@@ -195,8 +194,8 @@ fields and their frame offsets, with a `0x11 < len` guard:
 | 0x12 | 12 | wchar[] | the command line, UTF-16LE, NUL-terminated |
 
 The third field is `CommandType`, not a "bypass mode", but T32's **value** is right and for the
-right reason: the writer fills it from the *handler object's* own constant
-(`lVar18 = param_1[0x24]`, `Arb_part_067.c:6898`), not from the client packet.
+right reason: the writer fills it from a constant stored on the *handler object itself*
+(`Arb_part_067.c:6898`), not from the client packet.
 `ArbiterBypassCommandHandler` is constructed twice, with 1 and 0
 (`Arb_part_033.c:13685`/`:13691`), and World commands live in the bucket that carries **1**. So
 `ForwardToWorld` ignoring its own `commandType` argument is correct, not an oversight.

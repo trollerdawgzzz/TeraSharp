@@ -77,8 +77,8 @@ chat window processing `S_CHAT` and it is live-verified. The account one is simp
 ## 4. What the real Arbiter does
 
 **Save** — `Handler_C_SAVE_CLIENT_USER_SETTING` (`Arb_part_041.c:11024`) and
-`Handler_C_SAVE_CLIENT_ACCOUNT_SETTING` (`:10300`). Both require a packet of at least 8 bytes, take
-`param_2` as the **packet** start, and read `param_2[2]` (offset) / `param_2[3]` (count). If the
+`Handler_C_SAVE_CLIENT_ACCOUNT_SETTING` (`:10300`). Both require a packet of at least 8 bytes, treat
+their pointer as the **packet** start, and read the packet's third and fourth u16 as the offset and the count. If the
 offset is non-zero and inside the packet they pass `packetStart + offset` and the count to the
 store; otherwise they pass NULL.
 
@@ -86,7 +86,7 @@ store; otherwise they pass NULL.
 `Account::SaveClientSetting` (`Arb_part_065.c:9779`) are the same function twice:
 
 ```c
-if (param_3 == 0 || 9000 < param_3) { log_error(...); return; }   // dropped, nothing written
+if (len == 0 || 9000 < len) { log_error(...); return; }           // dropped, nothing written
 ... spSaveClientSettingForUser / ForAccount (playerId|accountId, blob, len) ...
 if (ok) { memcpy(user + 0x6290, blob, len); *(int*)(user + 0x85bc) = len; }
 ```

@@ -166,9 +166,8 @@ Atom-relative offsets, from the nine atoms in the capture plus the World-side bu
 `TransSQLExec::OnTransError` logs the atom's `+0x20` and `+0x38`, which are the two playerId slots —
 source owner and destination owner. A cross-character move is presumably where they differ.
 
-The i64 at +0x50 is unambiguous: `PrepareChangeInvenPos` literally writes
-`*(longlong *)(atom + 0x50) = (longlong)iVar4;` and `= (longlong)-iVar4;` for the two halves of a
-stack merge.
+The i64 at +0x50 is unambiguous: `PrepareChangeInvenPos` writes the moved amount into `atom+0x50`
+for one half of a stack merge and its negation for the other.
 
 Everything past ~offset 100 in the atom is the same kind of mostly-zero-plus-garbage as the item
 record, including three of the same `{1970-01-01}` DateTime blocks and the same 1.0f.
@@ -177,9 +176,12 @@ record, including three of the same `{1970-01-01}` DateTime blocks and the same 
 
 ## 4. Sub-operations
 
-The operation is a plain **enum index at atom+4**, dispatched through four function-pointer tables
-in the Arbiter — `DAT_140f02f30` / `DAT_140f03260` for `TransSQLExec::CanExecTrans`, and
-`DAT_140f03590` / `DAT_140f038c0` for `TransSQLExec::ExecuteTrans`. Index < 100. Each entry is a
+The operation is a plain **enum index at atom+4**, dispatched through four function-pointer
+tables in the Arbiter — two for `TransSQLExec::CanExecTrans`, at data symbols
+`DAT_140f02f30`
+and `DAT_140f03260`, and two for `TransSQLExec::ExecuteTrans`, at
+`DAT_140f03590`
+and `DAT_140f038c0`. Index < 100. Each entry is a
 `DO_TS_*` function; the Arbiter contains 82 of them (`DO_TS_CHANGE_ITEM_AMOUNT`,
 `DO_TS_CHANGE_ITEM_POS`, `DO_TS_DELETE_ITEM`, `DO_TS_INSERT_STACKABLE_ITEM`, … the full list is in
 the decompile, `grep -o 'DO_TS_[A-Z_0-9]*'`).
@@ -463,14 +465,14 @@ items: character money 10000000000 for owner 4 - not stored
 (WorldServer.exe.c:1407fa050) is the only builder of an op-9 atom, and it settles the question
 three ways over:
 
-```c
+if (amount != 0) {                                     // amount 0 -> NO atom at all
 if (param_2 != 0) {                                    // amount 0 -> NO atom at all
-    if ((param_2 < 0) && (*(longlong *)(param_1 + 0x78) + param_2 < 0)) { error 0x18/0x1a; }
-    //                    ^ Inventory+0x78 is the money it already holds
-    if (0 < param_2) { ... GetAddableMoney ... if (addable < param_2) error 0x19; }
+    // a negative amount is refused when it would take Inventory+0x78 (the money already
+    // held) below zero -> error 0x18/0x1a; a positive one is refused when GetAddableMoney
+    // reports less room than the amount -> error 0x19
     atom = new;
     *(u32     *)(atom + 4)     = 9;                    // op
-    *(longlong*)(atom + 0x20)  = playerId;             // srcOwner
+    *(longlong*)(atom + 0x50)  = amount;               // <- the delta, verbatim
     *(longlong*)(atom + 0x38)  = playerId;             // dstOwner
     *(u32     *)(atom + 0x28)  = 0;                    // srcInven
     *(u32     *)(atom + 0x40)  = 0;                    // dstInven

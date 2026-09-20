@@ -49,10 +49,10 @@ DBS_LOAD_USER_ACHIEVEMENT (0x27F9), our reply to 0x27F8
   [309..]    bodies, in list order
 ```
 
-The writer confirms both: `FUN_1406eeae0` lays down 76 backpatch slots (`param_1[3]` … `param_1[0x4e]`),
-then `FUN_14013d0b0(param_1, param_3)` (DlmId) and `FUN_1403513d0(param_1, param_4)` (Success), then
-`*(u32*)param_1[3] = current length; *(u32*)param_1[4] = param_5; FUN_1403c98b0(param_1, param_5, param_6)`
-— list 0 written as raw bytes of length `param_5`, and `Handler_SDB_LOAD_USER_ACHIEVEMENT` passes
+The writer confirms both: `FUN_1406eeae0` lays down 76 backpatch slots, then appends the DlmId as
+a u32 and Success as a u8, then backpatches the first list's offset with the running length and
+its count slot with the caller's byte count before appending the bytes themselves
+— list 0 written as raw bytes of that length, and `Handler_SDB_LOAD_USER_ACHIEVEMENT` passes
 `local_d08 = 0x4a0` = **1184** for it.
 
 **List 0 of both is `Data`**, a fixed 1184-byte blob. Every other list is a counter vector.

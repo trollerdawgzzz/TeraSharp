@@ -856,7 +856,7 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   Of the three fields, `id` (+8) - the one the mod validated - is **safe**: it goes to
   `DungeonDataSheet::GetDungeonTemplate` (Arb_part_003.c:3388), a red-black-tree find that
   returns 0 for an unknown key, checked by the caller. The crash is `class` (+0xC), unchecked:
-  the past-season path does `puVar13 + ((longlong)param_5 + 1) * 3` (Arb_part_050.c:10630) - a
+  the past-season path advances a cursor by `(class + 1) * 3` pointers (Arb_part_050.c:10630) - a
   raw pointer index, 24-byte stride, no bound - and the current-season path reaches
   `RankTree<..>::ClassRank` (Arb_part_049.c:11647) whose `if (0xe < (ulonglong)(int)param_2)`
   calls a no-return function, with a sign-extending cast so negatives abort too. **Safe set:
@@ -1114,7 +1114,7 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   the i32 at +7 runs -17..+12 - a rank delta. The def's reading gives 768, 256, -256.
 
   **The self-rank frame is conditional, and T126 sent it always.** `SendNowSeasonRank` guards
-  it with `param_5 == user.class || param_5 == 0x10` (Arb_part_050.c:9961); all nine live
+  it on the requested class matching the user's own class or 0x10 (Arb_part_050.c:9961); all nine live
   requests agree, including frame 5846, which asked for class 0 from a class-9 player and got
   the list alone. `RankingBoards.SendsSelfRank` is the rule.
 

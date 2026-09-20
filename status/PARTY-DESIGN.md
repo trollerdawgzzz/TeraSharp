@@ -40,15 +40,21 @@ Two consequences for TeraSharp:
 | `AS_DO_*` senders (Arbiter → World) | `Arb_part_066.c:18048–18780` |
 | PDL dumpers (field names + offsets) | `Arb_part_010.c`–`Arb_part_016.c` |
 
-Singletons: `DAT_141299948` = `PartyManager`, `DAT_141214fe8` = `UserManager`,
-`DAT_141094468` = the world-session array, `DAT_140e2d020` = **PlanetId** (2800).
+Singletons, by data-symbol address:
+
+| symbol | what |
+|---|---|
+| `DAT_141299948` | `PartyManager` |
+| `DAT_141214fe8` | `UserManager` |
+| `DAT_141094468` | the world-session array |
+| `DAT_140e2d020` | **PlanetId** (2800) |
 
 ---
 
 ## 2. The `Party` object
 
-`sizeof(Party) = 0x1878` — `PartyManager::New_CreateParty` (`Arb_part_079.c:15298`):
-`lVar14 = FUN_14002a7a0(DAT_14131d858,0x1878);`. Constructor `FUN_1407b40d0`
+`sizeof(Party) = 0x1878` — `PartyManager::New_CreateParty` (`Arb_part_079.c:15298`) allocates
+exactly that many bytes. Constructor `FUN_1407b40d0`
 (`Arb_part_067.c:2118`), signature
 `Party::Party(__int64 partyId, int ownerPlanetId, bool isSysParty, bool raid, int maxMemberCount, bool)`.
 
@@ -74,33 +80,21 @@ Singletons: `DAT_141299948` = `PartyManager`, `DAT_141214fe8` = `UserManager`,
 | **0xC0 / 0xC4** | int,int | **Manager `PDId` {PlanetId, UserDbId}** |
 | 0xC8 | int | `MemberCount` |
 | 0xCC | int | join-order counter |
-| **0xD0** | int | `MaxMemberCount` — ctor: `uVar2 = 5; if (raid) uVar2 = 0x1e;` |
+| **0xD0** | int | `MaxMemberCount` — the ctor sets 5, or 0x1E for a raid |
 | 0xD4 | bool | `IsAnonymous` |
 | **0xD8** | `{int PlanetId; int UserDbId}[30]` | **member key table**, stride 8, empty = `{-1, 0}` |
 | **0x1C8** | `PartyMemberInfo[30]`, stride **0xC0** | member records |
 | 0x1848 | map | friendship / exp-share |
 | 0x1868 | map<int,wstring> | raid sub-party names |
 
-The 30-slot table is literal — ctor (`Arb_part_067.c` ≈ 2160):
+The 30-slot table is literal — the ctor (`Arb_part_067.c` ≈ 2160) walks 0x1E eight-byte slots
+from `Party+0xD8`, writing −1 into each slot's PlanetId and 0 into its UserDbId.
 
-```c
-    puVar3 = param_1 + 0x1b; lVar4 = 0x1e;
-    do { *(undefined4 *)puVar3 = 0xffffffff;
-         *(undefined4 *)((longlong)puVar3 + 4) = 0;
-         puVar3 = puVar3 + 1; lVar4 = lVar4 + -1; } while (lVar4 != 0);
-```
+and `Party::BroadcastPacket` = `FUN_1407b71e0` (`Arb_part_067.c:4370`) iterates the same 0x1E
+slots directly, skipping any whose `UserDbId` is 0 and sending to the `ClientSession` of each
+member whose `PlanetId` matches this Arbiter's.
 
-and `Party::BroadcastPacket` = `FUN_1407b71e0` (`Arb_part_067.c:4370`) iterates it directly:
-
-```c
-      piVar6 = (int *)(param_1 + 0xdc);
-      do {
-        if ((*piVar6 != 0) && (piVar6[-1] == DAT_140e2d020)) { …send to that user's ClientSession… }
-        uVar7 = uVar7 + 1; piVar6 = piVar6 + 2;
-      } while (uVar7 < 0x1e);
-```
-
-Occupied ⇔ `UserDbId != 0`. Note the `piVar6[-1] == DAT_140e2d020` guard: **only members on
+Occupied ⇔ `UserDbId != 0`. Note the PlanetId guard: **only members on
 this planet get a unicast**; everyone else is reached by re-sending the change to their
 Arbiter. In one process that guard is always true.
 
@@ -126,9 +120,9 @@ party, 30 for a raid**.
 
 The first 0xA0 bytes of `PartyMemberInfo` are also the record `AS_DO_CREATE_PARTY` carries,
 N of them, raw. Built by `PartyInOneWorldOperator::AddPartyMember` = `FUN_14090d540`
-(`Arb_part_079.c:2557`); the 0xA0 stride is confirmed twice — the encoder's bounds check
-`if ((int)param_1[2] < *(int *)param_1[1] + 0xa0)` and `puVar25 = puVar25 + 0x28;` (int-stride
-0xA0) in `New_CreateParty`.
+(`Arb_part_079.c:2557`); the 0xA0 stride is confirmed twice — by the encoder's bounds check,
+which demands 0xA0 more bytes of room before each record, and by `New_CreateParty` advancing
+its cursor 0x28 ints (0xA0 bytes) per member.
 
 ---
 
@@ -146,18 +140,11 @@ N of them, raw. Built by `PartyInOneWorldOperator::AddPartyMember` = `FUN_14090d
 Lookup when a member acts — `PartyManager::FindParty(int,int)` = `FUN_1409142f0`
 (`Arb_part_079.c:7688`): sys index first, then normal.
 
-```c
-  plVar3 = (longlong *)FUN_140914600(param_1,&local_40,param_3,param_4,0);   // FindSysParty
-  if (lVar2 == 0) { plVar3 = (longlong *)FUN_1409141e0(param_1,&local_40,param_3,param_4,lVar4); } // FindNormalParty
-```
+It calls `FindSysParty` first and falls back to `FindNormalParty` when that comes back empty.
 
-Party id allocation (`Arb_part_079.c:15283`):
-
-```c
-  uVar12 = DAT_140e2d020 << 0x10;
-  LOCK(); piVar23 = (int *)(param_1 + 0x74); iVar1 = *piVar23; *piVar23 = *piVar23 + 1; UNLOCK();
-  local_2b8 = (ushort *)CONCAT44(uVar12 | *(ushort *)(param_1 + 0x70),iVar1 + 1);
-```
+Party id allocation (`Arb_part_079.c:15283`): the high half is the PlanetId shifted left 16 and
+ORed with the u16 at `PartyManager+0x70`; the low half is a lock-protected counter at
+`PartyManager+0x74`, read and incremented under `LOCK`, used as `counter + 1`.
 
 ⇒ **`PartyId = ((i64)((PlanetId << 16) | PlanetInnerId) << 32) | (++counter)`**. `PlanetInnerId`
 comes from `dbo.spIssuePartyInnerId` once at boot
@@ -228,12 +215,7 @@ fields; arrays are u32 offset + u32 count.
 dword, UserDbId in the high dword.
 
 Every `AS_DO_*` is **broadcast to all connected world servers** — the sender loops 32 slots of
-0x38 bytes and sends where state == 2:
-
-```c
-    local_a8 = 0x20;
-    do { if ((int)param_1[6] == 2) { … send … } param_1 = param_1 + 7; … } while (…);
-```
+0x38 bytes and sends on each whose state field is 2.
 
 ### 5.2 World → Arbiter
 
@@ -254,12 +236,8 @@ Every `AS_DO_*` is **broadcast to all connected world servers** — the sender l
 | **0x13F8** | `SA_BYPASS_TO_GROUP` | `FUN_140721360` (`Arb_part_062.c:3820`) | `u32 PacketOff@06, u32 PacketLen@0A, i32 GroupType@0E, i64 GroupId@12, i32 ObjectPlanetId@1A, i32 ObjectId@1E` (0x22) |
 
 **A short `SA_*` frame kills the connection**, it is not a dropped packet —
-`Handler_SA_JOIN_PARTY`:
-
-```c
-  if (param_3 < 0x56) { … }
-  (**(code **)(*DAT_14131d200 + 0x30))(DAT_14131d200,8,L"Arbiter <-> World PDL Version Mismatch! Bye :(\n");
-```
+`Handler_SA_JOIN_PARTY` requires at least 0x56 bytes and, short of that, closes the link with
+the message `Arbiter <-> World PDL Version Mismatch! Bye :(`.
 
 So the fixed-part sizes above must be exact.
 
@@ -309,13 +287,8 @@ MASTER_FINAL `.def` files are from a different protocol build and are wrong** (e
 | **0xFFB6** | `C_LEAVE_PARTY` | *(empty)* | **none — World-side** |
 | **0x60D6** | `C_CHANGE_PARTY_MANAGER` | `uint32 serverId`, `uint32 playerId` | **none — World-side** |
 
-`C_REPLY_INTER_PARTY_MAKE.1.def` is **incomplete** — the handler requires 9 bytes and reads
-`*(undefined4 *)(param_2 + 4)` and `*(undefined1 *)(param_2 + 8)`:
-
-```c
-  if ((local_res18[0] < 9) || (param_2 == 0)) { … L"GET_CLIENT_BUFFER_BUFSIZE_MISMATCH" … }
-  …  uVar2 = *(undefined4 *)(param_2 + 4);   uVar1 = *(undefined1 *)(param_2 + 8);
-```
+`C_REPLY_INTER_PARTY_MAKE.1.def` is **incomplete** — the handler rejects a body under 9 bytes
+with `GET_CLIENT_BUFFER_BUFSIZE_MISMATCH`, then reads a u32 at body+4 and a u8 at body+8.
 
 Also World-side (no Arbiter handler): `C_CHANGE_PARTY_MEMBER_AUTHORITY` 0x5553,
 `C_EXTEND_PARTY` 0xB67A, `C_SWAP_PARTY` 0xAE96, `C_VOTE_DISMISS_PARTY` 0x6D46,
@@ -326,8 +299,8 @@ Also World-side (no Arbiter handler): `C_CHANGE_PARTY_MEMBER_AUTHORITY` 0x5553,
 **There is no `C_ACCEPT_PARTY`, `S_ASK_JOIN_PARTY`, `S_JOIN_PARTY` or `S_PARTY_SETTING` in
 376012.** The invite handshake runs through the generic interactive-target path
 (`C_ASK_INTERACTIVE` 0x5639 → `S_ANSWER_INTERACTIVE` 0x85C8, which carries a "target is already
-in a party" bit — `FUN_140351320(&local_60,bVar11)` with
-`bVar11 = FindPartyByPDId(...) != 0`) and is **completed by World**, which then tells the
+in a party" bit, set from whether `FindPartyByPDId` returns a party) and is **completed by
+World**, which then tells the
 Arbiter with `SA_JOIN_PARTY` 0x1395. The Arbiter-side "apply to a listed party" flow is
 `C_APPLY_PARTY` → `S_OTHER_USER_APPLY_PARTY`.
 
@@ -481,9 +454,9 @@ T27's per-session routing and a live two-client test.
    byte-exact ones.
 2. **`S_VIEW_PARTY_INVITE`'s first array element layout** was not traced (the second is
    `[u16 self][u16 next][u16 nameOff][int32][int32]` + name).
-3. **`SA_SEND_PARTY_MEMBER_UPDATE_INFO` fields at +0x12 and +0x16** have their names in
-   `&DAT_140ae7bac` / `&DAT_140ae7bb4`, which the dump does not resolve. Almost certainly
-   CurHp/CurMp given `MaxHp`/`MaxMp` follow.
+3. **`SA_SEND_PARTY_MEMBER_UPDATE_INFO` fields at +0x12 and +0x16** have their names in two
+   string constants the dump does not resolve: `DAT_140ae7bac` for the first, and
+   `DAT_140ae7bb4` for the second. Almost certainly CurHp/CurMp given `MaxHp`/`MaxMp` follow.
 4. **The party-matching timeout duration** (`MA_ASK_TO_JOIN_PARTY_PROGRESS` 0x466F /
    `MA_ASK_TO_JOIN_PARTY_ABORT` 0x4662) was not traced. Only matters if matchmaking is built.
 5. **`S_OTHER_USER_APPLY_PARTY`'s `unk1`/`unk2`** are `PartyMatchInfo+0x98` and bit 4 of

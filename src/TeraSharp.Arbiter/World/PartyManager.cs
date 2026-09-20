@@ -129,7 +129,7 @@ public sealed class Party
     public PartyPackets.LootSettings Loot { get; set; } = DefaultLoot;
     public PartyPackets.PartyMember?[] Slots { get; } = new PartyPackets.PartyMember?[SlotCount];
 
-    /// <summary>Party::Party: `uVar2 = 5; if (raid) uVar2 = 0x1e;`</summary>
+    /// <summary>Party::Party sets this to 5, or 0x1e when the party is a raid.</summary>
     public int MaxMembers => Raid ? PartyPackets.MaxRaidMembers : PartyPackets.MaxPartyMembers;
     public int Count { get { int n = 0; foreach (var s in Slots) if (s != null) n++; return n; } }
 
@@ -188,9 +188,9 @@ public sealed class PartyManager
 
     /// <summary>
     /// PartyId = ((PlanetId &lt;&lt; 16 | PlanetInnerId) &lt;&lt; 32) | ++counter
-    /// (PartyManager::New_CreateParty, Arb_part_079.c:15283):
-    ///   uVar12 = DAT_140e2d020 &lt;&lt; 0x10;  LOCK(); iVar1 = *piVar23; *piVar23 = *piVar23 + 1; UNLOCK();
-    ///   local_2b8 = CONCAT44(uVar12 | *(ushort *)(param_1 + 0x70), iVar1 + 1);
+    /// (PartyManager::New_CreateParty, Arb_part_079.c:15283): the high dword is the PlanetId
+    /// shifted left 16 and ORed with the u16 at PartyManager+0x70; the low dword is a
+    /// lock-protected counter, read and incremented under LOCK and used as counter + 1.
     /// With PlanetId 2800 the high dword is 0x0AF00001, so the first id is 0x0AF0000100000001.
     /// The counter is process-lifetime on the real server and nothing detects a duplicate, so if
     /// party ids ever need to survive a restart, persist or randomise the seed
@@ -695,10 +695,8 @@ public sealed class PartyManager
     /// fan it out to a party, because the Arbiter owns the member list.
     /// Handler FUN_140721360 (Arb_part_062.c:3820) -> PartyManager::BroadcastPacketToParty
     /// (FUN_14090ed50) -> Party::BroadcastPacket (FUN_1407b71e0, Arb_part_067.c:4370), which
-    /// walks the 30 slots and unicasts to each member's ClientSession:
-    ///     if ((*piVar6 != 0) &amp;&amp; (piVar6[-1] == DAT_140e2d020)) { ...send... }
-    /// with the originator skipped unless GroupType == 1:
-    ///     if (param_2 != 1) { if ((piVar6[-1] == param_3) &amp;&amp; (*piVar6 == param_4)) goto skip; }
+    /// walks the 30 slots and unicasts to every member whose UserDbId is non-zero and whose
+    /// PlanetId is this Arbiter's, skipping the originator unless GroupType == 1.
     /// The PlanetId guard means members on another planet are not unicast here - with one planet
     /// it is always true, but the check is kept so the behaviour is the real one.
     /// </summary>
@@ -832,9 +830,9 @@ public sealed class PartyManager
     /// .def to use is version 8, NOT 7. Sources: ims &lt;- Party+0x78, raid &lt;- +0x79,
     /// memberLimit &lt;- +0xD0, id &lt;- +0x80, leader &lt;- +0xC0/+0xC4,
     /// loot &lt;- +0xA8,+0xAC,+0xB4,+0xB5,+0xB0,+0xB8,+0xBC, anonymized &lt;- +0xD4.
-    /// `slot` is the loop index for a party and Party::GetIndex(PDId) for a raid:
-    ///     if (*(char *)(param_1 + 0x79) != '\0') iVar11 = FUN_1407b9e80(...);
-    /// which for us is the same number either way, because we never compact the slot array.
+    /// `slot` is the loop index for a party and Party::GetIndex(PDId) for a raid, chosen on the
+    /// raid flag at Party+0x79 - which for us is the same number either way, because we never
+    /// compact the slot array.
     /// </summary>
     public Dictionary<string, object> MemberListFields(Party party)
     {

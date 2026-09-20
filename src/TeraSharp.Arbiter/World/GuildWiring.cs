@@ -949,8 +949,8 @@ public static class GuildWiring
         return frames;
     }
 
-    /// <summary>DBS_INIT_GUILD_PERK_LIST's element stride, from its writer's
-    /// <c>*local_24f8 = *local_24f8 + 0xc</c> loop (Arb_part_072.c:14554). The contents are two
+    /// <summary>DBS_INIT_GUILD_PERK_LIST's element stride, from the 0xc its writer's loop adds
+    /// per record (Arb_part_072.c:14554). The contents are two
     /// u32s and never non-empty here, so only the stride matters.</summary>
     public const int GuildPerkRecordSize = 0x0C;
 

@@ -268,7 +268,7 @@ public static class PartyMatchManager
     /// <summary>
     /// A null-terminated UTF-16LE string at a PACKET-relative offset, read out of the BODY.
     /// An offset of 0, or one outside the body, is the codec's "no string" and the real
-    /// handler's <c>uVar1 == 0 || *param_2 &lt;= uVar1</c> bounds check.
+    /// handler's own bounds check - zero, or not below the packet length.
     /// </summary>
     public static string ReadWString(ReadOnlySpan<byte> body, int packetOffset)
     {

@@ -51,14 +51,8 @@ list as the fallback for the case where World asks for nothing.**
 
 ### The payload shape was also slightly wrong
 
-Writer `FUN_1407ace90` (`Arb_part_066.c:17289`):
-
-```c
-  FUN_140350eb0(local_30,0x1581);
-  FUN_14013d0b0(local_30,param_2);   // u32
-  FUN_1403513d0(local_30,param_3);   // u8
-  FUN_140351270(local_30,param_4);   // u64
-```
+Writer `FUN_1407ace90` (`Arb_part_066.c:17289`): it opens the packet with opcode `0x1581`, then
+appends its three arguments as a u32, a u8 and a u64, in that order.
 
 Dumper field names (`Arb_part_011.c:10058`): `DungeonId` @frame+6, `IsOn` @frame+10,
 `NextChange` @frame+0x0B. So the 13-byte payload is
@@ -77,10 +71,8 @@ the fix.
 to all 0x20 world-session slots (`Arb_part_065.c:13600`). The handler itself
 (`Handler_DSA_DUNGEON_TIMELINE_OPEN_INFO`, `Arb_part_062.c:332`) is a pure fan-out:
 
-```c
-  FUN_140786fd0(DAT_141114760, piVar2[2], (char)piVar2[3],
-                *(undefined8 *)((longlong)piVar2 + 0xd), *(undefined1 *)((longlong)piVar2 + 0x15));
-```
+It reads the record's fields straight out of the frame and hands them to the broadcaster
+unchanged; the layout is below.
 
 `DSA_DUNGEON_TIMELINE_OPEN_INFO` (0x13F2) layout, from the dumper at `Arb_part_016.c:2781`
 (`L"OpenInfo"`, `L"DungeonId"`, `L"CurrOpen"`, `L"NextChange"`, `L"SendSystemMessage"`):
@@ -97,7 +89,7 @@ Node size confirmed by the handler's own guard `(longlong)iVar2 + 0x16U <= …`.
 ## 1. Where the Arbiter reads datasheets from
 
 `ServerConfig.xml` carries a **name → filename-glob table** read at boot
-(`Arb_part_077.c:3434`: `(**(code **)(*plVar8 + 0x108))(plVar8,L"Datasheet");`):
+(`Arb_part_077.c:3434`, which asks the config object for its `Datasheet` section):
 
 ```xml
 <Datasheet rootFolder=".\Datasheet\" …>
@@ -113,7 +105,7 @@ Node size confirmed by the handler's own guard `(longlong)iVar2 + 0x16U <= …`.
 Only **8** `.xml` filenames are hardcoded in the whole binary (`ServerConfig.xml`,
 `DeploymentConfig.xml`, `DefineDefine.xml`, `Version.xml`, `NetModeratorConfig.xml` and three
 DB-definition files); everything else resolves through that table by logical name, e.g.
-`Arb_part_085.c:989`: `FUN_140033940(local_260,0x10,local_268,L"PoliticsTemplate");`.
+`Arb_part_085.c:989`, which resolves the logical name `PoliticsTemplate` through it.
 
 **They are plain XML in `Executable\Datasheet\`. There is no packed or compiled form.**
 
@@ -160,10 +152,8 @@ matches `(DungeonData ∩ ContinentData) − DungeonMatching` exactly, in order.
 `isActive` is parsed World-side in `DungeonBaseTemplate::ParseConstraint`
 (`WorldServer.exe.c:266453`):
 
-```c
-  uVar2 = (**(code **)(*param_2 + 0x10))(param_2,L"isActive",0);
-  *(undefined1 *)(param_1 + 0x95) = uVar2;
-```
+It reads the `isActive` attribute off the parsed node and stores it as the byte at
+`DungeonBaseTemplate+0x95`.
 
 and consumed by `DungeonOffManager::IsDisabled(int)` (`:3151768`) as
 `(*(char *)(puVar3[5] + 0x95) != '\0')`.
@@ -197,14 +187,9 @@ captures at the same position (`arb_world.log` chunks 6→7, 76-byte frame).
 Writer `World::SendPoliticsUnit(class Session *)` (`Arb_part_074.c:4349`) emits an
 offset/length pair then a raw `int[]`:
 
-```c
-  FUN_140350eb0(&local_c8,0x1559);
-  local_b0 = …; *local_b0 = 0; FUN_14013d0b0(&local_c8,*local_b0);   // u32 dataOffset
-  local_a8 = …; *local_a8 = 0; FUN_14013d0b0(&local_c8,*local_a8);   // u32 byteLength
-  *local_b0 = *local_c0;                                              // patch offset
-  …  *puVar7 = *puVar8;  *local_c0 = *local_c0 + 4;                   // append each int
-  *local_a8 = (int)((longlong)puStack_98 - (longlong)local_a0 >> 2) * 4;
-```
+It opens the packet with opcode `0x1559`, reserves the `dataOffset` and `byteLength` u32 slots
+by writing zero into each, backpatches the offset once the data begins, appends the ints one at
+a time, and finally backpatches the length as the element count times four.
 
 ⇒ `[u32 dataOffset=14][u32 byteLength=68][int[17]]`. Decoded from `lobby_tap.log` seq 7:
 

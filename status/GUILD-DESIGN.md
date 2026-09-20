@@ -85,12 +85,7 @@ one — the reverse of the party case, where World owns nothing and the Arbiter 
 ### 2.1 `GuildData` — 0x23A0 bytes, the thing that crosses the wire
 
 Size is not inferred: `Guild::SetGuildAddAccountLimitValue` broadcasts it by explicit length —
-
-```c
-  FUN_14001bdc0(local_50,"void __cdecl Guild::BroadcastGuildData(struct GuildData &)",0);
-  local_68[0] = 0x23a0;
-  local_60 = (undefined4 *)(param_1 + 0x88);
-```
+`Guild::BroadcastGuildData` is handed the block at `Guild+0x88` with the length `0x23A0`.
 
 Offsets are blob-relative. Names come from the `spLoadAllGuild` column binds and the named
 `Guild::` accessors; the ones marked *(capture)* are additionally confirmed by the empty
@@ -260,13 +255,9 @@ through `spLeaveGuildMember`.
 
 ### 3.2 The bound parameters that matter
 
-```c
-/* spCreateGuild — GuildManager::CreateGuildData, Arb_part_069.c:3945 */
-FUN_140108af0(local_f8,param_2,&local_138,0xffffffff);          // P1 nvarchar  guildName
-FUN_140108660(local_f8,local_130,&local_140,0xffffffff);        // P2 int       chiefDbId
-FUN_1401089a0(local_f8,&stack0x00000030,&local_148,0xffffffff); // P3 bit       isGuildWarAcceptable
-FUN_140108140(local_f8,local_158,&local_150,0xffffffff);        // C1 int OUT   guildDbId
-```
+`GuildManager::CreateGuildData` (`Arb_part_069.c:3945`) binds `spCreateGuild` in this order:
+P1 nvarchar `guildName`, P2 int `chiefDbId`, P3 bit `isGuildWarAcceptable`, then C1 int OUT
+`guildDbId`.
 
 | proc | params in order |
 |---|---|
@@ -468,15 +459,10 @@ Every other `AS_*GUILD*` is **broadcast to all connected world servers**, by the
 `AS_LOAD_GUILD_DATA`'s and `AS_UPDATE_GUILD_DATA`'s `.def` files both declare
 `string guildData`. They are wrong: the writer reserves an (offset, count) pair and calls the
 raw-bytes helper `FUN_1403c98b0`, never the wstring helper.
-
-```c
-/* AS_UPDATE_GUILD_DATA, Arb_part_045.c:4839 */
-  FUN_140350eb0(&local_98,0x144e);
-  *local_80 = 0;  FUN_14013d0b0(&local_98,*local_80);   /* offset slot @frame+6  */
-  *local_78 = 0;  FUN_14013d0b0(&local_98,*local_78);   /* count  slot @frame+10 */
-  *local_80 = *local_90;   *local_78 = uVar1;
-  FUN_1403c98b0(&local_98,uVar1,uVar3);                 /* raw bytes */
-```
+raw-bytes helper `FUN_1403c98b0`, never the wstring helper. The writer
+(`Arb_part_045.c:4839`) opens the packet with opcode `0x144E`, reserves the offset slot at
+frame+6 and the count slot at frame+10 by writing zero into each, backpatches them with the real
+data offset and byte count, and only then appends the bytes.
 
 ### 4.2 World → Arbiter (`SA_`)
 
@@ -610,16 +596,10 @@ announce is the guild's; the introduce is the MEMBER's own note. Both route thro
 `NetModeratorHelper::RequestToEvaluateString` first — the profanity filter — which TeraSharp
 does not have and which this design treats as a no-op.
 
-`Guild::UpdateGuildAnnounce` is worth quoting, because three of its rules are not obvious:
-
-```c
-  FUN_14002ce70(&local_58,&DAT_140ad89e0,&DAT_140d3dc2c);   /* & -> &amp;  */
-  FUN_14002ce70(&local_58,&DAT_140bebc7c,L"&lt;");          /* < -> &lt;   */
-  FUN_14002ce70(&local_58,&DAT_140bebc8c,L"&gt;");          /* > -> &gt;   */
-  cVar3 = FUN_140572c70(param_1,param_2,4);                 /* GuildAuthority bit 2, NOT chief */
-  ...
-  wcsncpy_s((wchar_t *)(param_1 + 0x118),0xc9,pwVar5,...);  /* truncate at 200 chars */
-```
+`Guild::UpdateGuildAnnounce` is worth spelling out, because three of its rules are not obvious.
+It runs three literal replacements over the text, in the order `&` → `&amp;`, `<` → `&lt;`,
+`>` → `&gt;`; it gates on `GuildAuthority` bit 2 through `FUN_140572c70` rather than on "is the
+chief"; and it copies the result into `Guild+0x118` with a `wcsncpy_s` bounded at 0xC9 wchars.
 
 The ampersand is replaced FIRST, so an escape it introduces is not escaped again; the gate is an
 authority bit rather than "is the chief"; and the DB gets the full escaped string while
@@ -628,11 +608,9 @@ authority bit rather than "is the chief"; and the DB gets the full escaped strin
 `Guild::HaveGuildAuthorityWithLock(User*, enum GuildAuthority)` (`FUN_140572c70`,
 `Arb_part_046.c:6358`) is that gate everywhere:
 
-```c
-  if (*(int *)(param_1 + 0xd8) == *(int *)(param_2 + 0x120)) { return 1; }   /* chief passes */
-  lVar1 = FUN_14056e030(param_1,*(undefined4 *)(lVar1 + 0x5c));              /* member's group */
-  if ((lVar1 != 0) && ((param_3 & *(uint *)(lVar1 + 0x24)) != 0)) { return 1; }
-```
+It returns true at once when `Guild+0xD8` (the chief's db id) equals `User+0x120`; otherwise it
+looks the member's group up and returns true when the requested authority mask ANDs non-zero
+with the group's own mask at `+0x24`.
 
 Masks the callers actually pass: **0x01** invite / manage applications (the `InviteAuthority`
 bool in `S_GUILD_APPLY_LIST` is this bit), **0x02**, **0x04** change the announce, **0x10**,
@@ -686,11 +664,8 @@ constant matched the handler constant on all 17 Arbiter-handled packets, so it i
 A `bytes` field reserves **two** slots in the order **(offset, count)** — the reverse of an
 array's (count, offset). `S_GET_USER_GUILD_LOGO` is the proof:
 
-```c
-/* Arb_part_046.c:12743 */  *local_90 = *local_a0;            /* slot A <- data OFFSET */
-/* Arb_part_046.c:12744 */  *local_88 = (short)uVar2;         /* slot B <- byte COUNT  */
-/* Arb_part_046.c:12745 */  FUN_1403c9790(&local_a8,uVar2 & 0xffff,uVar4);
-```
+At `Arb_part_046.c:12743-12745` the writer puts the data offset in slot A, the byte count in
+slot B, and only then appends the bytes.
 
 `Protocol/DefinitionWriter.cs` already does exactly this, which is a nice independent
 confirmation that the existing codec's conventions are the binary's.
@@ -1146,10 +1121,9 @@ looks like:
   [12] record[]             raw, no per-element header
 ```
 
-The proof for the byte length is the member frame's backpatch,
-`*local_2508 = ((int)(lVar10 >> 7) - (int)(lVar10 >> 0x3f)) * 0xf0` — element count times the
-0xF0 stride. The group frame's records are 0x28 and the perk frame's are 0x0C
-(`*local_24f8 = *local_24f8 + 0xc`). `DBS_LOAD_GUILD_COMPLETE` has **no payload at all**: its
+The proof for the byte length is the member frame's backpatch, which stores the element count
+times the 0xF0 stride. The group frame's records are 0x28 and the perk frame's are 0x0C, added
+a record at a time. `DBS_LOAD_GUILD_COMPLETE` has **no payload at all**: its
 writer (`Arb_part_069.c:13947`) opens the packet and sends it.
 
 **This is what retires the replay entry.** `WorldBridge.HandleFrame` consults `DbProxy.TryHandle`
@@ -1275,10 +1249,8 @@ it at next login. And there is no wanted board in this build, so `fromWantedList
 **`C_CHANGE_GUILDNAME` (0xFC1C)** — `FUN_1404dc6a0` (`Arb_part_040.c:19716`) has exactly one
 guard before it hands off, and it is not the invite authority:
 
-```c
-  FUN_140386990(user,&local_30);                                  /* User::GetGuild */
-  if ((local_30 != 0) && (*(int *)(local_30 + 0xd8) == *(int *)(lVar2 + 0x120))) {
-```
+It fetches the caller's guild with `User::GetGuild` and goes ahead only when that guild exists
+and its `+0xD8` equals the caller's `+0x120`.
 
 `Guild+0xD8` is `GuildData+0x50` = `ChiefDbId`, `User+0x120` is `UserDbId`: **only the guild
 master may rename.** What follows in the real one is `InputRestrictionHelper::CheckGuildName`

@@ -53,8 +53,8 @@ public static class ParcelDbHandlers
     //   u8  uVar11                                     Success
     //   u32 uVar4   = *(u32*)(request + 0xe)           ViewType, echoed
     //   u32 uVar10  = *(u32*)(request + 0x12)          CurPage, echoed
-    //   u32 uVar9   = local_ec                         MaxPage
-    //   u32 uVar8   = local_f0                         ParcelCount
+    //   u32                                            MaxPage, set by the handler
+    //   u32                                            ParcelCount, likewise
     //   *slotA = frameLength                           ALWAYS - even for an empty list
     //   if (list non-empty) { append N x 0x9e8; *slotB = N * 0x9e8; }
     public const int ListReplyHeader = 29;              // payload bytes before the list
@@ -67,7 +67,7 @@ public static class ParcelDbHandlers
     public const int ListRspParcelCount = 25;
 
     /// <summary><c>ParcelDataNoMsg</c>, 0x9e8 bytes — the stride the writer copies with and the
-    /// size its bounds check tests (<c>if (local_d0 &lt; *local_d8 + 0x9e8)</c>).</summary>
+    /// size its bounds check demands of the remaining room, per record.</summary>
     public const int ParcelDataNoMsgSize = 0x9e8;
 
     // --- SDB_MAKE_PARCEL 0x2779 -> DBS_MAKE_PARCEL 0x277a ---
@@ -178,9 +178,9 @@ public static class ParcelDbHandlers
     /// <para><b>The empty form is byte-exact from the decompile alone.</b> Every field is either
     /// echoed from the request (DlmId, ViewType, CurPage) or a value
     /// <c>Handler_SDB_LIST_PARCEL</c> sets before it consults the parcel manager:
-    /// <c>local_ec = 1</c> (MaxPage) and <c>local_f0 = 0</c> (ParcelCount) at Arb_part_071.c:15334.
+    /// MaxPage 1 and ParcelCount 0, both set at Arb_part_071.c:15334.
     /// The list offset slot is backpatched to the running frame length <i>unconditionally</i>
-    /// (<c>*local_c8 = *local_d8;</c>), which for an empty list is exactly 35; the byte-count
+    /// which for an empty list is exactly 35; the byte-count
     /// slot is only written inside the non-empty branch, so it stays 0. A fresh character's
     /// inbox is therefore the 35-byte frame
     /// <c>23 00 00 00 78 27 | 23 00 00 00 | 00 00 00 00 | &lt;dlm&gt; | 01 | &lt;view&gt; | &lt;page&gt; | 01 00 00 00 | 00 00 00 00</c>.</para>

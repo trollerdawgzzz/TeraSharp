@@ -670,7 +670,7 @@ public static class ArbiterClientHandlers
     /// <summary>
     /// The AS_ADD_TRADE_BAG (0x1637) payload the real Arbiter forwards. The leading u64 is not
     /// copied from the packet - the Arbiter builds it from its own planet id and the SENDER's
-    /// character db id (<c>CONCAT44(*(u32 *)(lVar9 + 0x120), DAT_140e2d020)</c>, so planet id in
+    /// character db id (the sender's <c>User+0x120</c> concatenated with the planet id, so planet id in
     /// the low half and db id in the high half).
     /// </summary>
     public static byte[] BuildAsAddTradeBag(int planetId, int senderDbId, AddTradeBagRequest r)
@@ -1071,7 +1071,7 @@ public static class ArbiterClientHandlers
     /// <summary>
     /// Reads a NUL-terminated UTF-16LE string whose u16 PACKET offset sits at
     /// <paramref name="slotIndex"/> of the BODY. Empty for the 0 / out-of-range offsets the real
-    /// handlers fall back on (<c>if ((uVar1 == 0) || (*param_2 &lt;= uVar1)) puVar6 = &amp;DAT_140d3e020;</c>).
+    /// handlers fall back on - an offset of zero, or one not below the packet length, yields "").
     /// </summary>
     // =========================================================================================
     // 14. Guild crest and the skill-polishing window                                     (T82)
@@ -5114,7 +5114,7 @@ public static class ItemBoardPackets
 /// (Arb_part_003.c:3388) - a red-black-tree find that RETURNS 0 for an unknown key, and the
 /// caller checks it. Safe.</item>
 /// <item><c>class</c>: on the past-season path
-/// (Arb_part_050.c:10630) it is <c>puVar13 + ((longlong)param_5 + 1) * 3</c> - a raw pointer
+/// (Arb_part_050.c:10630) the cursor is advanced by <c>(class + 1) * 3</c> pointers - a raw
 /// index, 24-byte stride, <b>no bounds check at all</b>. On the current-season path it reaches
 /// <c>RankTree&lt;...&gt;::ClassRank(enum ClassType,int)</c> (Arb_part_049.c:11647) whose
 /// <c>if (0xe &lt; (ulonglong)(int)param_2)</c> calls a function Ghidra marks
@@ -5236,9 +5236,9 @@ public static class LeaderboardPackets
         // only the first leaves the "my record" row under the board with nothing to fill it.
         //
         // T133: but the second frame is CONDITIONAL, and classic_live shows exactly when.
-        // SendNowSeasonRank guards it with `param_5 == *(int *)(local_80 + 0x2f) || param_5 ==
-        // 0x10` (Arb_part_050.c:9961) - the class asked for is the requester's OWN class, or
-        // the aggregate. Nine requests in that capture, all from a class-9 player: the eight
+        // SendNowSeasonRank guards it on the requested class equalling the requester's OWN
+        // class, or the aggregate 0x10 (Arb_part_050.c:9961).
+        // Nine requests in that capture, all from a class-9 player: the eight
         // asking for class 9 or 16 each got S_USER_P*_RANKING, and frame 5846 - the one asking
         // for class 0 - got the list and nothing else. Your rank on somebody else's class
         // board is not a number that exists, so the server does not invent one.

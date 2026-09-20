@@ -4715,8 +4715,8 @@ public sealed class DbProxyHandlers
     // ---- DSA_DUNGEON_TIMELINE_OPEN_INFO (0x13F2) -> N x AS_DUNGEON_TIMELINE_ON_OFF (0x1581) ----
     //
     // Layout, from the dumper at Arb_part_016.c:2781 (L"OpenInfo", L"DungeonId", L"CurrOpen",
-    // L"NextChange", L"SendSystemMessage") and the handler's own bounds check
-    // `(longlong)iVar2 + 0x16U <= (ulonglong)(longlong)*piVar9`:
+    // L"NextChange", L"SendSystemMessage") and the handler's own bounds check, which demands
+    // 0x16 more bytes of payload per node:
     //
     //   payload [0] u32 count   [4] u32 listOffset (FRAME-relative, 14)
     //   then count x 0x16-byte nodes:

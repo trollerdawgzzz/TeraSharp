@@ -304,8 +304,8 @@ public sealed class GmCommandHandlers
     /// <summary>
     /// What goes in the forward's third field. The Arbiter's dumper calls that field
     /// <c>CommandType</c> (FUN_14017bdf0, Arb_part_011.c:5334), and the writer fills it from the
-    /// HANDLER's own constant, not from the client packet: <c>lVar18 = param_1[0x24]</c>, where
-    /// param_1 is the ArbiterBypassCommandHandler (Arb_part_067.c:6898). The handler is
+    /// HANDLER's own constant - a field on the ArbiterBypassCommandHandler object
+    /// (Arb_part_067.c:6898). The handler is
     /// constructed twice, with 1 and 0 (Arb_part_033.c:13685/13691), and World commands live in
     /// the bucket that carries 1.
     ///

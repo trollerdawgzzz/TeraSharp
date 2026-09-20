@@ -27,14 +27,16 @@ public readonly record struct RankingRow(
 /// straight off the writer, <c>PVERankingSystemManager::SendRankList</c> (Arb_part_050.c:9747,
 /// which stamps 0xBEDC at :9758). Every offset below is that function's own store:
 /// <code>
-///   *puVar24 = here;  puVar24[1] = next;  puVar24[2] = nameOffset;   // +0 +2 +4, u16
-///   *(u8 *)(puVar24 + 3)          = IsRookie(..)                     // +6
-///   *(u32*)((char*)puVar24 + 7)   = rankInfo+0x1C                    // +7
-///   *(u32*)((char*)puVar24 + 0xb) = rankInfo+0x18                    // +11
-///   *(u32*)((char*)puVar24 + 0xf) = rankInfo+0x08                    // +15
-///   *(u64*)((char*)puVar24 + 0x13)= rankInfo+0x10                    // +19
-///   *(u32*)((char*)puVar24 + 0x1b)= node+0x18                        // +27
-///   *local_b0 += 0x1f;  puVar24[2] = *local_b0;                      // then the name
+///   +0    u16  here
+///   +2    u16  next
+///   +4    u16  nameOffset
+///   +6    u8   IsRookie(..)
+///   +7    u32  rankInfo+0x1C
+///   +11   u32  rankInfo+0x18
+///   +15   u32  rankInfo+0x08
+///   +19   u64  rankInfo+0x10
+///   +27   u32  node+0x18
+///   then the cursor advances 0x1f and nameOffset is backpatched to it; the name follows
 /// </code>
 /// so the element is 31 fixed bytes and a NUL-terminated UTF-16 name.</item>
 /// </list>
@@ -141,7 +143,7 @@ public static class RankingBoards
     // ---- the PvP element ----
     // The .def and the writer disagree on the first two scalars: the def declares
     // `int32 unk; byte unk2`, which encodes as i32@6 + u8@10, while the writer stores
-    // `*(u8 *)(puVar27 + 3)` at +6 and `*(u32 *)((char *)puVar27 + 7)` at +7
+    // a u8 at +6 and a u32 at +7
     // (Arb_part_050.c:10266-10267) - byte FIRST. The decompile wins, so the byte sits at +6.
     // Both fields are 0 in every frame we send, so the bytes are the same either way and the
     // def cross-check in the tests still holds; only the shape is corrected.
@@ -393,7 +395,8 @@ public static class RankingBoards
     /// <summary>
     /// T133. Whether the requester's own line (<c>S_USER_P*_RANKING</c>) follows the list.
     /// <c>SendNowSeasonRank</c> guards it with
-    /// <c>param_5 == *(int *)(local_80 + 0x2f) || param_5 == 0x10</c> (Arb_part_050.c:9961):
+    /// the requested class matching either the requester's own class or the aggregate 0x10
+    /// (Arb_part_050.c:9961):
     /// the class asked for is the requester's own, or the aggregate. classic_live agrees on
     /// all nine of its requests - the one that asked for a class the viewer is not (frame
     /// 5846, class 0 from a class-9 player) got the list alone.

@@ -141,7 +141,7 @@ That also means a quest write can allocate item ids exactly like `0x2768` does (
 reply echoes the atoms back the same way — `PKT_DBS_SET_QUEST_INFO_WRITE` is templated on
 `vector<ItemTransactionAtom const*>` and its `SendToSession` argument list is
 `int, long, bool&, int, const unsigned char*, int&, vector<Atom>*`, i.e. reqId, op, ok, and the
-80-byte record echoed back by pointer+length (`local_1a8 = &record; local_1b0 = 0x50`).
+80-byte record echoed back as a pointer plus the length 0x50.
 
 ### The 80-byte QuestData record
 

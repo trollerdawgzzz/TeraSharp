@@ -573,7 +573,8 @@ public static class PartyPackets
     // PartyMemberBasicInfo - 0xA0 bytes, the wire form of a member.
     // The first 0xA0 bytes of Party's own PartyMemberInfo (Party+0x1C8, stride 0xC0); the
     // stride is confirmed twice in PartyManager::New_CreateParty (Arb_part_079.c) - the
-    // encoder bound check `(int)param_1[2] < *(int *)param_1[1] + 0xa0` and `puVar25 + 0x28`.
+    // encoder's bound check demands 0xa0 more bytes per record, and the cursor advances 0x28
+    // ints (0xa0 bytes) per member.
     //   [0x00] i32 PlanetId   [0x04] i32 UserDbId   [0x08] i64 GameId (masked 0x7FFF...)
     //   [0x10] i32 Level      [0x14] i32 Class      [0x18] i32 Race    [0x1C] i32 Gender
     //   [0x20] i32 Role (-1)  [0x24] wchar Name[0x25]

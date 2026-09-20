@@ -22,7 +22,7 @@ neighbour among the leftovers is `C_REQUEST_PARTY_MATCH_INFO_PAGE` (`int16 page`
 
 `class` reaches two places unchecked:
 
-- **Past season**, Arb_part_050.c:10630 - `puVar13 = puVar13 + ((longlong)param_5 + 1) * 3;`
+- **Past season**, Arb_part_050.c:10630 - the cursor is advanced by `(class + 1) * 3` pointers.
   A raw pointer index, 24-byte stride, no bound of any kind. `0x7fffffff` is a ~51 GB offset; a
   negative value walks backwards. A wild read, i.e. a real fault.
 - **Current season** - `RankTree<LevelTime,...>::ClassRank(enum ClassType,int)`
@@ -328,8 +328,8 @@ carries 1 - row 97 of frame 5818, rank 96, "BFG", up seven places.
 
 ### 8.3 The self-rank frame is conditional
 
-`SendNowSeasonRank` guards the second frame with
-`param_5 == *(int *)(local_80 + 0x2f) || param_5 == 0x10` (Arb_part_050.c:9961): the class
+`SendNowSeasonRank` guards the second frame on the requested class matching either the
+requester's own class or the aggregate value 0x10 (Arb_part_050.c:9961): the class
 asked for is the requester's own, or the aggregate. T126 sent it unconditionally. All nine
 requests in classic_live come from a class-9 player and agree:
 

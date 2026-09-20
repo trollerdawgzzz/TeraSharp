@@ -73,8 +73,8 @@ def names the enum: `0 = declare, 1 = Withdrew, 2 = Surrendered`.
 ### `S_OPEN_GUILD_WAR_WINDOW.1` has no war list at all
 
 It declares two `int32` and stops - eight bytes. Frame 1623 is twelve and frame 3389 is 104. The
-writer (`Arb_part_059.c:2659`) settles it: `*local_1b8 = *local_1b8 + 0x48` - **72 bytes per
-element** - and it writes, in order,
+writer (`Arb_part_059.c:2659`) settles it: it advances the element cursor by 0x48 - **72 bytes
+per element** - and it writes, in order,
 
 ```
 +0  u16 here      +2  u16 next

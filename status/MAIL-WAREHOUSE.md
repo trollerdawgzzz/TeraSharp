@@ -61,7 +61,8 @@ decompile. Our stored pocket ids are the right key — they are just read by a d
 | `TransSQLExec` (ctors, `GetInven`, `IsAccountDbIdInvenType`) | `Arb_part_037.c:11701`, `Arb_part_038.c:5918`, `:11173` |
 | PDL dumpers — the authoritative field names + offsets | `Arb_part_015.c`–`Arb_part_018.c` |
 
-Singletons: `DAT_141299b00` = `ParcelManager`, `DAT_141214fe8` = `UserManager`,
+Singletons, by data-symbol address: `DAT_141299b00` = `ParcelManager`;
+`DAT_141214fe8` = `UserManager`;
 `DAT_140f02a78` = `ReturnUserManager`.
 
 Every offset below is **frame-relative** for `SDB_`/`DBS_` messages (payload offset = frame − 6,
@@ -235,7 +236,7 @@ apply unchanged. Proof of the stride: both the parcel and the warehouse handlers
 with `(byteCount - 1) / 0x358 + 1` (e.g. `Arb_part_063.c:8550`).
 
 `ParcelDataNoMsg` is **0x9e8 = 2536 bytes** — read directly from the `DBS_LIST_PARCEL` writer's
-bounds check `if (local_d0 < *local_d8 + 0x9e8)` (`Arb_part_071.c:15396`). The full `ParcelData`
+bounds check, which demands 0x9e8 more bytes of room per record (`Arb_part_071.c:15396`). The full `ParcelData`
 with the message body is larger (a `memset` of `0xdd8` appears at `Arb_part_082.c:11099`); the
 receiver dbId sits at `+0x50` (§2.1). **The rest of the struct's interior is not pinned** — it is
 the Arbiter's own SQL row shape, and for a byte-exact `DBS_LIST_PARCEL` we would have to pin all
@@ -423,19 +424,10 @@ FUN_140483290   Arb_part_037.c:11701   TransSQLExec::TransSQLExec(class BaseInve
 ### 6.2 `GetInven` resolves an atom against the bound inventories only
 
 `TransSQLExec::GetInven(__int64 ownerDbId, enum INVEN_TYPE)` = `FUN_140497f00`
-(`Arb_part_038.c`, tracer `:5918`), decompiled:
-
-```c
-plVar2 = (longlong *)*param_1;                       // bound inventory #1
-if (ownerDbId == plVar2[0xc]) {                      // OwnerDbId matches?
-    if ((**(code **)(*plVar2 + 0x20))(plVar2, invenType)) return plVar2;   // accepts this INVEN_TYPE?
-}
-plVar2 = (longlong *)param_1[1];                     // bound inventory #2
-if (ownerDbId == plVar2[0xc]) {
-    if ((**(code **)(*plVar2 + 0x20))(plVar2, invenType)) return plVar2;
-}
-return 0;                                            // -> NULL -> transaction fails
-```
+(`Arb_part_038.c`, tracer `:5918`) tries each of its two bound inventories in turn: it compares
+the caller's `ownerDbId` against the inventory's own at `+0x60`, asks the inventory whether it
+accepts this `INVEN_TYPE`, and returns the first that answers yes. When neither does it returns
+NULL and the transaction fails.
 
 There is no third lookup and no global inventory registry. An atom whose `(OwnerDbId, InvenType)`
 pair matches neither bound inventory resolves to NULL.
@@ -445,9 +437,7 @@ pair matches neither bound inventory resolves to NULL.
 `Handler_SDB_ITEM_SINGLE` = `FUN_14074aca0`, `Arb_part_063.c:11656–11811`. The only
 `TransSQLExec` construction in the whole function is at `:11756`:
 
-```c
-FUN_1404832f0(local_c8, lVar6 + 0x3c80);   // TransSQLExec(BaseInventory*) -- User+0x3c80 = the bag
-```
+It constructs a `TransSQLExec` over a single inventory — `User+0x3c80`, the bag.
 
 Contrast the siblings, which bind two:
 

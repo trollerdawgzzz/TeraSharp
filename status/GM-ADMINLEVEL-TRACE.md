@@ -42,9 +42,8 @@ AuthManager::ResAuthenticationProc(ClientSession, __int64 accountDbId, std::pair
   ^ the pair IS (Result1, Result2)                        Arb_part_058.c:19176
 AuthManager::ResAuthentication(ClientSession, __int64, int, int, __int64, int, bool, bool, ...)
 Handler_UserLoginAns(void*, const unsigned char*, int)    Arb_part_046.c:6166 (FUN_140572890)
-  local_16c = local_d0;   -> Result1
-  local_170 = local_cc;   -> Result2
-  FUN_1406c9040(AuthManager, &session, accountDbId, local_16c);
+  reads Result1 and Result2 out of the answer and passes Result1 on to
+  AuthManager
 ```
 
 `local_d0` is a field of the message `FUN_14080d4e0` deserialises out of the hub frame, and it is

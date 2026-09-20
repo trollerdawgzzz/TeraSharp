@@ -6943,7 +6943,7 @@ public bool TryHandle(WorldBridge bridge, WorldLink link, ushort op, byte[] payl
 
     [Test] public static void Party_capacities_are_5_and_30()
     {
-        // Party::Party: `uVar2 = 5; if (raid) uVar2 = 0x1e;`  and the member table is 30 slots.
+        // Party::Party sets 5, or 0x1e for a raid, and the member table is 30 slots.
         Hex.True(PartyPackets.MaxPartyMembers == 5, "a party holds 5");
         Hex.True(PartyPackets.MaxRaidMembers == 30, "a raid holds 30, which is also the table size");
     }
@@ -7718,7 +7718,7 @@ public bool TryHandle(WorldBridge bridge, WorldLink link, ushort op, byte[] payl
         var pkt = Hex.B("08 00 6B 7D 01 02 03 04");     // an S_CHAT-shaped stand-in
 
         // Party::BroadcastPacket skips the originator unless GroupType == 1:
-        //   if (param_2 != 1) { if (planet == param_3 && db == param_4) goto skip; }
+        //   the skip fires only when GroupType != 1 and the slot's planet and db id are the originator's.
         var skip = pm.OnWorldFrame(PartyPackets.SA_BYPASS_TO_GROUP, SaBypassToGroupPayload(id, 0, 1, pkt));
         Hex.True(skip.ToWorld.Count == 0, "a fan-out never goes back to World");
         Hex.True(skip.ToClients.Count == 2 && skip.ToClients.All(c => c.IsRaw), Names(skip));
@@ -16104,7 +16104,7 @@ some prose with `backticks` that is not a table row
     /// <summary>
     /// The whole point of T45's mail half. Every byte of the empty reply is either echoed from
     /// the request or a compiled-in default that Handler_SDB_LIST_PARCEL sets at
-    /// Arb_part_071.c:15334 (<c>local_ec = 1</c>, <c>local_f0 = 0</c>) before it consults the
+    /// Arb_part_071.c:15334 (MaxPage 1, ParcelCount 0) before it consults the
     /// parcel manager, so the frame is knowable byte-for-byte without a capture.
     /// </summary>
     [Test] public static void Parcel_empty_inbox_is_the_35_byte_frame()
@@ -16128,7 +16128,7 @@ some prose with `backticks` that is not a table row
 
     [Test] public static void Parcel_list_offset_is_the_header_length_and_bytes_track_the_count()
     {
-        // The writer backpatches the OFFSET slot unconditionally (*local_c8 = *local_d8) and the
+        // The writer backpatches the OFFSET slot unconditionally, with the running frame length, and the
         // BYTES slot only inside the non-empty branch - so an empty list has offset 35, not 0.
         var empty = ParcelDbHandlers.BuildDbsListParcel(1, true, 0, 0, 1, 0, null);
         Hex.True(BitConverter.ToUInt32(empty, ParcelDbHandlers.ListRspBinaryRef) == 6 + 29,
@@ -25912,7 +25912,7 @@ string message
     /// from a class-9 player: the eight that asked for class 9 or class 16 were answered with
     /// S_USER_P*_RANKING after the list, and frame 5846 - the one that asked for class 0 - got
     /// the list alone. That is SendNowSeasonRank's own guard,
-    /// <c>param_5 == user.class || param_5 == 0x10</c> (Arb_part_050.c:9961).
+    /// the requested class equalling the user's own class or 0x10 (Arb_part_050.c:9961).
     /// </summary>
     [Test] public static void T133_the_self_rank_frame_only_follows_your_own_board()
     {

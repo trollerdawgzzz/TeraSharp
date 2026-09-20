@@ -21,7 +21,7 @@ Python against the capture, and the tests assert the same bytes.
 Friends are **per character**, not per account: every stored procedure the real Arbiter calls
 (`spAddFriendOnList`, `spDeleteFriendOnList`, `spLoadAllFriendList`) is keyed on `playerId`.
 The account appears only as a *guard* — `User::CanAddFriendNoLock` (Arb_part_028.c:6721) refuses
-a request when `*(longlong *)(param_1 + 0xb0) == *(longlong *)(param_2 + 0xb0)`, i.e. two
+a request when the two users' account ids (the i64 at `User+0xB0`) are equal, i.e. two
 characters of one account cannot be friends.
 
 **None of this goes through the DB-proxy protocol.** There is no `SDB_ADD_FRIEND`; the real
@@ -38,7 +38,7 @@ DLM item.
 `dungeonGauntletDifficultyId` after `sectionId`. The 100.02 writer does not:
 
 ```
-User::SendFriendListNoLock   (Arb_part_030.c:8)      *local_b0 = *local_b0 + 0x3f;   // 63 bytes
+User::SendFriendListNoLock   (Arb_part_030.c:8)      advances the cursor by 0x3f   // 63 bytes
   here 2 | next 2 | name 2 | myNote 2 | theirNote 2
   playerId 4 | group 4 | level 4 | race 4 | class 4 | gender 4 | worldId 4 | guardId 4 | sectionId 4
   summonable 1 | lastOnline 8 | type 4 | bonds 4                                   = 63
@@ -243,16 +243,9 @@ is empty; in 1437 `myNote` is empty and `theirNote` carries the friend's own pro
 
 `User::SendFriendListNoLock` (Arb_part_030.c) computes it as a subtraction, not a stored value:
 
-```
-lVar15 = 0;
-FUN_140034490(&local_c0, puVar19 + 0x3b);   // a time_t at UserFriendInfo+0xEC
-if (local_c0 != local_78) {                 // != the default/unset time
-  lVar14 = FUN_1400346a0(&local_c0);
-  lVar15 = FUN_1400346a0(local_70) - lVar14;  // now - that time
-}
-...
-*(longlong *)((longlong)puVar18 + 0x2f) = lVar15;   // element +47, eight bytes
-```
+It reads a `time_t` at `UserFriendInfo+0xEC`, and when that is not the unset default it
+subtracts it from now; the difference — 0 when unset — is stored as the eight bytes at
+element +47.
 
 So the wire value is an **elapsed second count from a fixed origin**, and 0 when the origin is
 unset. Three facts pick login over logout: the two frames differ by 3 (they are seconds apart);

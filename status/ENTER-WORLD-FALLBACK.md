@@ -26,8 +26,8 @@ ChannelInstanceId **0**, and no 0x138D.
 
 ## 1. `SA_ENTER_WORLD_FAIL` (0x138D) — 38-byte fixed frame
 
-Field names are the Arbiter's own, from its packet dumper for `"SA_ENTER_WORLD_FAIL"`
-(`wcscpy_s(param_3,0x100,L"SA_ENTER_WORLD_FAIL")`, min length `0x25 < param_2`).
+Field names are the Arbiter's own, from its packet dumper for `"SA_ENTER_WORLD_FAIL"`, which
+labels the frame with that string and rejects anything whose length is not above `0x25`.
 Offsets below are **payload** (frame - 6), which is what `DbProxyHandlers` works in.
 
 | payload | frame | type | name | seq 836 |
@@ -44,13 +44,10 @@ reads frame `0x1e` and `0x22`, logs
 `[ERROR] Handler_SA_ENTER_WORLD_FAIL (DbId:%d, Name:%s, LoginState:%d, continent:%d reason:%d)`,
 and schedules a `User::DoTimerJob` **3000 ms** out:
 
-```c
-puVar7[0xe]  = FUN_140382970;                    // User::EnterWorldFail
-puVar7[0xf]  = param_1;                          // the User
-*(u32*)(puVar7 + 0x10) = *(u32*)(*param_3+0x1e); // job+0x80 = ContinuousDungeonId
-*(u32*)((char*)puVar7 + 0x84) = *(u32*)(*param_3+0x22);   // job+0x84 = FailReason
-FUN_14003e660(..., puVar7, 3000, 0);
-```
+The job it queues carries `User::EnterWorldFail` as its entry point and the `User*` alongside
+it, and copies two fields out of the frame into the job: `ContinuousDungeonId` from frame+0x1E
+into job+0x80, and `FailReason` from frame+0x22 into job+0x84. The job is then scheduled 3000 ms
+out.
 
 seq 836 is at 11:45:56.587 and seq 841/842/843 at 11:45:59.601-.604 — **3.014 s**, i.e. that timer.
 We fire immediately instead; nothing in World depends on the delay.
@@ -74,16 +71,10 @@ Scope tracer `"void __cdecl User::EnterWorldFail(enum EnterWorldFailReason,int)"
    * `User+0x3b74 = 0` (u64), `User+0x3b7c = 0` (u8)
 5. **Then the override that actually produced seq 843:**
 
-```c
-if (0 < *(int *)(param_1 + 0x1a8)) {           // a stored SysReturnLoc
-  *(int *)(param_1 + 0x19c) = *(int *)(param_1 + 0x1a8);   // continent
-  *(u32 *)(param_1 + 0x1a0) = *(u32 *)(param_1 + 0x1ac);   // channelInstanceId
-  *(float *)(param_1 + 0x18c) = (float)*(int *)(param_1 + 0x1b0);  // x
-  *(float *)(param_1 + 0x190) = (float)*(int *)(param_1 + 0x1b4);  // y
-  *(float *)(param_1 + 0x194) = (float)*(int *)(param_1 + 0x1b8);  // z
-  FUN_1403793f0(param_1);
-}
-```
+When `User+0x1a8` holds a stored SysReturnLoc greater than zero, it overrides the five fields
+just set: continent from `+0x1a8`, channelInstanceId from `+0x1ac`, and x/y/z widened from the
+ints at `+0x1b0`, `+0x1b4` and `+0x1b8` into the floats at `+0x18c`, `+0x190` and `+0x194`. It
+then clears the stored return point.
 
 The coordinates are stored as **ints** and widened back with `(float)(int)`, which is why the
 capture's fallback is exactly `(16260, 1253, -4410)` and never a fraction.
@@ -101,16 +92,11 @@ session. `User::CleanSysReturnLoc` is `UpdateSysReturnLoc(0,0,0,0,0)`.
 
 The call that matters is in `Handler_SA_RESPONSE_ENTER_DUNGEON`:
 
-```c
-FUN_14016e0d0(local_f8, lVar10 + 0xe);   // copy the 176-byte DungeonEnterContext
-...
-if ((local_ce == '\0') || (local_68 == '\0')) {
-    if (local_f4 != 1) FUN_1403793f0(lVar7);              // CleanSysReturnLoc
-} else {
-    local_300 = (int)local_c4;  local_308 = (int)local_c8;
-    FUN_1403bced0(lVar7, local_c0, *(u32 *)(lVar7 + 0x1a0), (int)local_cc);
-}
-```
+It copies the 176-byte `DungeonEnterContext` out of the frame at +0x0E, and then branches on
+two of its bytes. When either the "commit the return point" byte at ctx+42 or the byte at ctx+144
+is zero it calls `CleanSysReturnLoc` — unless the type field at ctx+4 is 1. Otherwise it calls
+`UpdateSysReturnLoc` with the context's coordinates and the user's current
+`channelInstanceId` from `User+0x1a0`.
 
 Ghidra split the context into consecutive stack slots, so `local_XX` is `ctx + (0xf8 - XX)`:
 
@@ -132,8 +118,8 @@ Two independent confirmations that ctx+42 and ctx+144 are single bytes: the T10 
 which was derived from the *copy* functions, has a gap at payload 51 ("after a u16 + u8 at
 40..42") and at payload 153..155 ("after a lone u8 at 144").
 
-`x = local_cc` (ctx+44), `y = local_c8` (ctx+48), `z = local_c4` (ctx+52): args 5 and 6 go on the
-stack as `local_308` then `local_300`, in that address order.
+`x` is ctx+44, `y` is ctx+48 and `z` is ctx+52: the last two arguments go on the stack in that
+address order.
 
 **The channelInstanceId stored as the return one is `User+0x1a0` at dungeon-entry time**, i.e. the
 open-world value (-1) — which is exactly what seq 843 carries.

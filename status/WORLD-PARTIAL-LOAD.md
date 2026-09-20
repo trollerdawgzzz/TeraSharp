@@ -39,18 +39,11 @@ into three buckets by `channelType` (the literal mapping is read at `:368532-368
 * `channelType == 4` -> the **battlefield** set (`:379155`);
 * anything else -> the **normal** set (`:379313-379325`).
 
-Then, per `<WorldServer>` element:
-
-```c
-cVar5 = (**(code **)(*plVar16 + 0x10))(plVar16,L"loadAllContinents",0);   // :379371
-if (local_a44 == 1) {                                   // this element's type == "normal"
-  if ((cVar5 == '\0') &&                                // loadAllContinents == FALSE
-     (puVar12 = (undefined8 *)plVar16[3], puVar12 != (undefined8 *)plVar16[4])) {
-    do {
-      local_bc4 = (...)((longlong *)*puVar12, &DAT_1419c346c);   // the child's id attribute
-      ... lower_bound of local_bc4 in local_b88 ...              // the NORMAL set only
-      if ((bVar33) && (plVar32 != local_b88)) { ... push local_bc4 ... }   // :379574-379584
-```
+Then, per `<WorldServer>` element (`:379371`, `:379574-379584`): it reads the element's
+`loadAllContinents` attribute; when the element's type is `normal` and that attribute is false,
+it walks the element's `<Continent>` children, takes each child's `id` attribute, looks it up by
+`lower_bound` **in the normal set only**, and pushes the id onto the server's list when it is
+found there.
 
 **The lookup is against the normal set only.** A `<Continent id="9827"/>` under a `type="normal"`
 `<WorldServer>` is silently discarded, because 9827 is `channelType="dungeon"` and therefore lives
@@ -67,10 +60,7 @@ not.
 `ContinentManager::LoadAndInitializeContinent` (`:2076019`) brackets its loop with
 `FUN_1400118b0()`, which is `GetTickCount64() - _DAT_141ee9578` (`:10712`), and prints
 
-```c
-(**(code **)(*DAT_141ee9108 + 0x10))
-          (DAT_141ee9108,10,L"Continent load time[%d]\n",(iVar6 - iVar5) / 1000);   // :2076092
-```
+`Continent load time[%d]` with the elapsed milliseconds divided by 1000 (`:2076092`).
 
 So `[0]` means "finished in under a second". It is consistent with "nothing loaded", but it is not
 evidence of it - with only Island of Dawn it would print `[0]` on a healthy boot too. The line that
@@ -347,18 +337,9 @@ an `-AsideRoot` under the Datasheet tree for exactly this reason.
 ## 7. The channeling rule - why continent 1 drags in 7001-7005
 
 `inChannelingContinent` is parsed as a comma-separated int list onto the continent record at `+0xb8`
-(`Arb_part_009.c:4449`, W `:368627`) and validated in `PlanetInfo::PostProcess`:
-
-```c
-for (puVar11 = (uint *)plVar10[0x1a]; puVar11 != (uint *)plVar10[0x1b]; puVar11++) {
-    uVar2 = *puVar11;
-    ... hash lookup in the continent map ...
-    if (lVar8 == 0) {
-      FUN_14002b950();
-      iVar7 = FUN_14002bcd0(local_838,0x3ff,
-                L"Invalid Channeling Continent Info. ContinentId [%d], Channeling ContinentId [%d]",
-                (int)plVar10[3]);
-```
+(`Arb_part_009.c:4449`, W `:368627`) and validated in `PlanetInfo::PostProcess`, which walks the
+parsed list, looks each id up in the continent map, and on a miss aborts with
+`Invalid Channeling Continent Info. ContinentId [%d], Channeling ContinentId [%d]`.
 (`Arb_part_009.c:14488-14570`, World `:390254`.) Failure is fatal.
 
 On the shipped data exactly **five** rows carry the attribute:
@@ -549,16 +530,9 @@ say that. Run the copy-mode command above and point a test server at it.
 
 `ContinentManager::LoadTopo(const struct PlanetInfo *)` (`WorldServer.exe.c:2076907`) is the **first**
 thing `ProcessWhenThreadReady` does (`:636667`), and it iterates **`PlanetInfo`'s full continent
-list** - not the per-server list:
-
-```c
-plVar5 = (longlong *)**(longlong **)(param_2 + 8);        // the FULL continent list
-do {
-  *(undefined8 *)(param_1 + 0x13878 + (longlong)(int)plVar5[3] * 8) = uVar3;   // TopoMap[continentId]
-  cVar1 = FUN_141254b60(*(...), &DAT_141dd1c58);                               // TopoMap::LoadWorld
-  plVar5 = (longlong *)*plVar5;
-} while (true);
-```
+list** - not the per-server list. It walks that full list, storing each entry's `TopoMap` pointer
+into the per-continent slot at `param_1 + 0x13878 + continentId * 8` and calling
+`TopoMap::LoadWorld` for each.
 
 There is **no** `DoIHaveThisContinent` filter here. A TopoMap is built for every `<Continent>` in
 `ContinentData.xml`, whether or not this world server owns it. That single fact is why trimming the

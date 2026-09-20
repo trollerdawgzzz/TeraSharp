@@ -18,7 +18,7 @@ Opcode name from the Arbiter's `case 0x1439:`. Writer `FUN_14035f5e0`:
 FUN_140350eb0(param_1, 0x1439);
 param_1[3] = <slot>; write 0;      // [0] u32 list offset  (backpatched)
 param_1[4] = <slot>; write 0;      // [4] u32 list byte length (backpatched)
-FUN_14013d0b0(param_1, param_3);   // [8] u32 playerId
+append the playerId as a u32;       // [8] u32 playerId
 *(u32*)param_1[3] = <current len>; // list starts here (always frame 18)
 ... 0x10 bytes reserved per element ...
 *(u32*)param_1[4] = <bytes written>;

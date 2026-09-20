@@ -240,8 +240,8 @@ u32 uVar3  = *(u32*)(request + 6)        DlmId, echoed
 u8  uVar11                               Success
 u32 uVar4  = *(u32*)(request + 0xe)      ViewType, echoed
 u32 uVar10 = *(u32*)(request + 0x12)     CurPage, echoed
-u32 uVar9  = local_ec                    MaxPage
-u32 uVar8  = local_f0                    ParcelCount
+u32        = MaxPage, from the handler's own count
+u32        = ParcelCount, likewise
 *slotA = *local_d8;                      offset := the running FRAME LENGTH - unconditionally
 if (list non-empty) { append N x 0x9e8; *slotB = N * 0x9e8; }
 ```
@@ -279,8 +279,8 @@ the same atom `SDB_ITEM_SINGLE` carries — so `WarehouseHandlers.CloneAtomsWith
 are reused unchanged, and the insert-id rule is the same one T44 established: **atoms are applied
 from the reply, never the request**.
 
-`ParcelDataNoMsg` is 0x9e8 = 2536 bytes, read off the writer's own bounds check
-(`if (local_d0 < *local_d8 + 0x9e8)`). **Its interior is not pinned by anything we have.** Only
+`ParcelDataNoMsg` is 0x9e8 = 2536 bytes, read off the writer's own bounds check, which demands
+0x9e8 more bytes of room per record. **Its interior is not pinned by anything we have.** Only
 two fields are: the parcel id at +0 and the receiver db id at +0x50 (the latter from
 `Handler_C_SHOW_PARCEL_MESSAGE`'s ownership test, MAIL-WAREHOUSE §2.1). So T45 does what T44 did
 for item records — `SDB_MAKE_PARCEL` hands us the real `ParcelData` and we keep it verbatim in
@@ -317,7 +317,7 @@ potion with the tooltip open and read what the client says.
 | `C_REQUEST_GUILD_LIST` | accepted silently | the guild browser; `S_REPLY_GUILD_LIST` (0x5F75) is a paged list we have no shape for |
 | `C_REQUEST_CANDIDATE_LIST` | accepted silently | lord election |
 | `C_VIEW_BATTLE_FIELD_RESULT` | accepted silently | no battleground records |
-| `C_SHOW_AWESOMIUMWEB_SHOP` | accepted silently | the real handler sends a configured URL (`DAT_14121924a`) and skips the packet entirely when the shop is off (`DAT_141219248 == 0`), which is our case |
+| `C_SHOW_AWESOMIUMWEB_SHOP` | accepted silently | the real handler sends a configured URL held at data symbol `DAT_14121924a`, and skips the packet entirely when the shop-enabled flag beside it is 0, which is our case |
 | `C_RESET_ALL_DUNGEON` | accepted silently | a party vote; needs a party |
 | `C_EVENT_GUIDE`, `C_UPDATE_CONTENTS_PLAYTIME` | accepted silently | already `RegNoop`; the change is that they stop being forwarded |
 
