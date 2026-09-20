@@ -196,6 +196,7 @@ public static class AdminPage
   button { cursor:pointer; border-color:var(--accent); color:var(--accent); background:transparent; }
   button:hover { background:var(--accent); color:var(--bg); }
   button.danger { border-color:var(--warn); color:var(--warn); }
+  button.on { background:var(--accent); color:var(--bg); }
   button.danger:hover { background:var(--warn); color:var(--bg); }
   .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
   .row + .row { margin-top:8px; }
@@ -245,7 +246,7 @@ public static class AdminPage
   <a data-tab='announce'>Announces</a>
   <a data-tab='grant'>Grants</a>
   <a data-tab='deleted'>Deleted</a>
-  <a data-tab='audit'>Admin log</a>
+  <a data-tab='logs'>Logs</a>
 </nav>
 <main>
 
@@ -417,11 +418,43 @@ public static class AdminPage
   <div id='dresult'></div>
 </section>
 
-<section id='t-audit'>
-  <h2>Admin log</h2>
-  <p class='sub'>Every write this tool has made, newest first, with its source and result.</p>
-  <div class='card'><div class='row'><button onclick='loadAudit()'>Refresh</button></div></div>
-  <div id='auresult'></div>
+<section id='t-logs'>
+  <h2>Logs</h2>
+  <p class='sub'>What the players did, and what this tool did.</p>
+  <div class='row' style='margin-bottom:12px'>
+    <button id='lt-game' class='on' onclick='logTab(0)'>Game log</button>
+    <button id='lt-admin' onclick='logTab(1)'>Admin log</button>
+  </div>
+
+  <div id='lp-game'>
+    <div class='card'>
+      <div class='row'>
+        <input id='gl_who' placeholder='account or character (name or id)' size='30'>
+        <select id='gl_cat'><option value=''>any category</option></select>
+        <input id='gl_act' placeholder='action prefix' size='14'>
+      </div>
+      <div class='row' style='margin-top:8px'>
+        <label class='note'>from <input id='gl_from' type='datetime-local'></label>
+        <label class='note'>to <input id='gl_to' type='datetime-local'></label>
+        <select id='gl_size'>
+          <option value='25'>25 / page</option>
+          <option value='50' selected>50 / page</option>
+          <option value='100'>100 / page</option>
+          <option value='200'>200 / page</option>
+        </select>
+        <button onclick='loadGameLog(0)'>Search</button>
+        <button onclick='glPage(-1)'>Prev</button>
+        <button onclick='glPage(1)'>Next</button>
+      </div>
+      <div class='note' id='gl_note'></div>
+    </div>
+    <div id='glresult'></div>
+  </div>
+
+  <div id='lp-admin' style='display:none'>
+    <div class='card'><div class='row'><button onclick='loadAudit()'>Refresh</button></div></div>
+    <div id='auresult'></div>
+  </div>
 </section>
 
 </main>
@@ -496,6 +529,9 @@ tabs.forEach(a => a.onclick = () => {
   a.classList.add('on');
   document.querySelectorAll('main section').forEach(s => s.classList.remove('on'));
   el('t-' + a.dataset.tab).classList.add('on');
+  // T116: arriving at Logs fills the category dropdown and shows the newest rows,
+  // so the tab is never a blank form with an empty select.
+  if (a.dataset.tab === 'logs' && !el('gl_cat').value && !glTotal) loadGameLog(0);
 });
 
 // ---- confirmation ---------------------------------------------------------
@@ -820,6 +856,68 @@ function askRestore(id) {
 }
 
 // ---- audit ----------------------------------------------------------------
+// ---- logs: two panels in one tab (T116) -----------------------------------
+function logTab(i) {
+  el('lt-game').classList.toggle('on', i === 0);
+  el('lt-admin').classList.toggle('on', i === 1);
+  el('lp-game').style.display = i === 0 ? '' : 'none';
+  el('lp-admin').style.display = i === 1 ? '' : 'none';
+  if (i === 1) loadAudit();
+}
+
+let glPageNo = 0, glTotal = 0;
+function glPage(d) {
+  const size = num('gl_size') || 50;
+  const next = glPageNo + d;
+  if (next < 0 || next * size >= glTotal) return;
+  loadGameLog(next);
+}
+
+async function loadGameLog(page) {
+  glPageNo = page || 0;
+  const size = num('gl_size') || 50;
+  const p = new URLSearchParams();
+  if (val('gl_who')) p.set('who', val('gl_who'));
+  if (val('gl_cat')) p.set('category', val('gl_cat'));
+  if (val('gl_act')) p.set('action', val('gl_act'));
+  if (localUnix('gl_from')) p.set('from', localUnix('gl_from'));
+  if (localUnix('gl_to')) p.set('to', localUnix('gl_to'));
+  p.set('page', glPageNo);
+  p.set('size', size);
+
+  const r = await api('GET', '/api/game-log?' + p.toString());
+  if (r.status !== 200) { glTotal = 0; say('glresult', r); return; }
+  glTotal = r.data.total;
+
+  const sel = el('gl_cat');
+  if (sel.options.length <= 1 && r.data.categories) {
+    r.data.categories.forEach(c => {
+      const o = document.createElement('option');
+      o.value = c; o.textContent = c; sel.appendChild(o);
+    });
+  }
+
+  const first = glTotal ? glPageNo * size + 1 : 0;
+  const last = Math.min(glTotal, (glPageNo + 1) * size);
+  el('gl_note').textContent = glTotal
+    ? `${first}-${last} of ${glTotal}` + (r.data.who ? ` for ${r.data.who}` : '')
+    : 'no rows match';
+
+  el('glresult').innerHTML = table([
+    { label: 'when', cell: e => when(e.at) },
+    { label: 'category', cell: e => `<span class='chip'>${esc(e.category)}</span>` },
+    { label: 'action', cell: e => esc(e.action) },
+    { label: 'actor', cell: e => e.actor ? `${esc(e.actor)} <span class='note'>${e.characterId}</span>`
+        : (e.characterId ? String(e.characterId) : '-') },
+    { label: 'target', cell: e => e.target ? `${esc(e.target)} <span class='note'>${e.targetId}</span>`
+        : (e.targetId ? String(e.targetId) : '-') },
+    { label: 'item', cell: e => e.item.templateId ? itemLabel(e.item) : '-' },
+    { label: 'amount', num: true, cell: e => e.amount || '-' },
+    { label: 'money', num: true, cell: e => e.money || '-' },
+    { label: 'extra', cell: e => e.extra ? `<span class='note'>${esc(e.extra)}</span>` : '-' },
+  ], r.data.log);
+}
+
 async function loadAudit() {
   const r = await api('GET', '/api/admin-log?limit=200');
   if (r.status !== 200) { say('auresult', r); return; }

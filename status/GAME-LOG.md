@@ -80,3 +80,38 @@ frames with no A->W frame after any of them. `FileGameLog` stores and answers no
 0x27DD, 0x27FE and 0x288C came **out** of `WorldReplayTable.OneWayFromWorld` to make this work:
 a sealed opcode never reaches a handler. `T115_the_log_opcodes_are_handlers_not_sealed` pins the
 invariant for all five.
+
+## 6. The admin page (T116)
+
+`GET /api/game-log?who=&category=&action=&from=&to=&page=&size=`, behind the same
+`X-Admin-Token` gate as everything else in `AdminApi`. No `Program.cs` change: the route hangs
+off `AdminApi.Handle`, which `AdminServer` already dispatches to.
+
+| Parameter | Meaning |
+|---|---|
+| `who` | one box: account name, character name, account id or character id |
+| `category` | one of the eight, from `GameLogPackets.Categories` |
+| `action` | a **prefix** - `trade` finds `trade.send` and `trade.recv` |
+| `from` / `to` | unix seconds, inclusive at both ends |
+| `page` / `size` | zero-based; size clamped to `CharacterStore.GameLogMaxPageSize` (200) |
+
+`who` resolves digits as a **character id first** and only then as an account id, because every
+one of the five decoded frames names a character and only some name an account (section 3). A
+term that matches nothing answers `404` / result 2 rather than quietly returning the whole log -
+an audit tool that widens its own filter is worse than one that says no.
+
+The reply carries `total` from `CountGameLog` with the same clauses in the same order (so the
+page's "n of m" cannot disagree with its pages), `who` as resolved, `categories` so the dropdown
+is built from the code rather than a second copy of the list in the HTML, and per row: `actor`
+and `target` names alongside their ids, `item` as `{templateId, name}` via `Protocol.ItemNames`,
+`amount`, `money` and `extra` as an opaque string. An id with no character - the CashItemLog
+case from section 3 - comes back with an empty name and the page shows the number.
+
+`CharacterStore.QueryGameLog` and `CountGameLog` gained the `action` filter for this;
+it is `LIKE <prefix>%` with `ESCAPE '\'`, because SQLite has no default escape character and
+without it an action containing `%` would still behave as a wildcard.
+
+**The page.** One nav entry, `Logs`, with two panels: the game-log search and the admin-log
+viewer that used to be its own `Admin log` tab. The old entry is gone rather than left rendering
+the same table in two places. The page literal still contains no double quote (CLAUDE.md's
+verbatim-string rule), and `T116_the_admin_page_carries_both_logs_in_one_tab` checks that.

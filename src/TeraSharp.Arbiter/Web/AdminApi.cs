@@ -126,6 +126,7 @@ public sealed class AdminApi
         if (method == "GET" && path == "/api/announces") return Announces(query);
         if (method == "GET" && path == "/api/status") return Status();
         if (method == "GET" && path == "/api/log") return LogTail(query);
+        if (method == "GET" && path == "/api/game-log") return GameLog(query);
         if (method == "POST" && path == "/api/restore-character") return RestoreCharacter(body, sourceIp);
 
         // ---- phase 2 (T101b) ----
@@ -357,6 +358,111 @@ public sealed class AdminApi
         sb.Append("]}");
         return new AdminResponse(200, "application/json; charset=utf-8", sb.ToString());
     }
+
+    /// <summary>
+    /// GET /api/game-log?who=&amp;category=&amp;action=&amp;from=&amp;to=&amp;page=&amp;size= - T116.
+    ///
+    /// <para><c>who</c> is one box on the page and can be an account name, a character name, an
+    /// account id or a character id. Digits are tried as a CHARACTER id first and only then as
+    /// an account id, because every one of the five decoded log frames names a character and
+    /// only some name an account (status/GAME-LOG.md section 3). A term that resolves to
+    /// nothing answers 2 rather than silently returning the whole log, which is the failure
+    /// that makes an audit tool useless.</para>
+    ///
+    /// <para>The reply carries <c>total</c> from CountGameLog with the same filters, so the
+    /// page can show which page of how many without a second call, and <c>categories</c> so the
+    /// dropdown is built from the code rather than a copy of the list in the HTML.</para>
+    /// </summary>
+    private AdminResponse GameLog(IReadOnlyDictionary<string, string> q)
+    {
+        long accountId = 0, characterId = 0;
+        string who = (Get(q, "who") ?? string.Empty).Trim();
+        string resolved = string.Empty;
+        if (who.Length > 0)
+        {
+            if (long.TryParse(who, NumberStyles.Integer, CultureInfo.InvariantCulture, out long id)
+                && id > 0)
+            {
+                var byId = id <= int.MaxValue ? _store.GetCharacter((int)id) : null;
+                if (byId != null) { characterId = byId.Id; resolved = "character " + byId.Name; }
+                else { accountId = id; resolved = "account " + id; }
+            }
+            else
+            {
+                var chr = _store.GetCharacterByName(who);
+                if (chr != null) { characterId = chr.Id; resolved = "character " + chr.Name; }
+                else
+                {
+                    var acct = _store.GetAccount(who);
+                    if (acct == null)
+                        return Json(404, ResultNotFound, "no account or character called " + who);
+                    accountId = acct.Id;
+                    resolved = "account " + acct.Name;
+                }
+            }
+        }
+
+        string? category = Blank(Get(q, "category"));
+        string? action = Blank(Get(q, "action"));
+        long from = Num(q, "from"), to = Num(q, "to");
+        int page = (int)Math.Min(Num(q, "page"), int.MaxValue);
+        int size = (int)Math.Min(Num(q, "size"), CharacterStore.GameLogMaxPageSize);
+        if (size == 0) size = 50;
+
+        var rows = _store.QueryGameLog(accountId, characterId, category, action, from, to, page, size);
+        long total = _store.CountGameLog(accountId, characterId, category, action, from, to);
+
+        var sb = new StringBuilder();
+        sb.Append("{\"result\":").Append(ResultOk)
+          .Append(",\"total\":").Append(total)
+          .Append(",\"page\":").Append(page)
+          .Append(",\"size\":").Append(size)
+          .Append(",\"who\":").Append(Str(resolved))
+          .Append(",\"categories\":[");
+        for (int i = 0; i < World.GameLogPackets.Categories.Length; i++)
+        {
+            if (i > 0) sb.Append(',');
+            sb.Append(Str(World.GameLogPackets.Categories[i]));
+        }
+        sb.Append("],\"log\":[");
+        for (int i = 0; i < rows.Count; i++)
+        {
+            var e = rows[i];
+            if (i > 0) sb.Append(',');
+            sb.Append("{\"logId\":").Append(e.LogId)
+              .Append(",\"at\":").Append(e.LoggedAt)
+              .Append(",\"category\":").Append(Str(e.Category))
+              .Append(",\"action\":").Append(Str(e.Action))
+              .Append(",\"accountId\":").Append(e.AccountId)
+              .Append(",\"characterId\":").Append(e.CharacterId)
+              .Append(",\"actor\":").Append(Str(NameOfCharacter(e.CharacterId)))
+              .Append(",\"targetId\":").Append(e.TargetId)
+              .Append(",\"target\":").Append(Str(NameOfCharacter(e.TargetId)))
+              .Append(",\"itemDbId\":").Append(e.ItemDbId)
+              .Append(",\"item\":{\"templateId\":").Append(e.TemplateId)
+              .Append(",\"name\":").Append(Str(e.TemplateId == 0
+                  ? string.Empty
+                  : Protocol.ItemNames.Lookup(e.TemplateId))).Append('}')
+              .Append(",\"amount\":").Append(e.Amount)
+              .Append(",\"money\":").Append(e.Money)
+              .Append(",\"extra\":").Append(Str(e.Extra)).Append('}');
+        }
+        sb.Append("]}");
+        return new AdminResponse(200, "application/json; charset=utf-8", sb.ToString());
+    }
+
+    /// <summary>The character's name for a db id, or the empty string - an id that is not ours
+    /// (an account id in the CashItemLog case) has no name and the page shows the number.</summary>
+    private string NameOfCharacter(long id)
+        => id > 0 && id <= int.MaxValue ? _store.GetCharacter((int)id)?.Name ?? string.Empty : string.Empty;
+
+    /// <summary>Null for a missing or all-space query value, so that filter is simply absent.</summary>
+    private static string? Blank(string? s) => string.IsNullOrWhiteSpace(s) ? null : s.Trim();
+
+    /// <summary>A non-negative long from the query bag; 0 for anything missing or unparsable.</summary>
+    private static long Num(IReadOnlyDictionary<string, string> q, string key)
+        => long.TryParse(Get(q, key), NumberStyles.Integer, CultureInfo.InvariantCulture,
+               out long v) && v > 0 ? v : 0;
 
     /// <summary>GET /api/admin-log?limit=N - what this tool has done.</summary>
     private AdminResponse AdminLog(IReadOnlyDictionary<string, string> q)
