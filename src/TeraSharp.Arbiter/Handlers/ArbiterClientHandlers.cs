@@ -2610,6 +2610,31 @@ public static class ArbiterClientHandlers
     public static readonly int[] LeaderBoardCapturedPvp = { 10, 30, 37 };
     public static readonly int[] LeaderBoardCapturedPve = { 3126, 3203, 9126 };
 
+    // ---------------------------------------------------------------- T133: the live sets
+    // The T91 constants above are a real capture, but of a CLOSED 2022 season on the retail
+    // build. classic_live.npcap (T130) is the live Classic+ server four years later, and its
+    // two frames - 5608 and 5609 - are what a client actually gets today:
+    //
+    //   S_PVP_LEADER_BOARD_INFO  60 B, season 15, 4 battleground ids
+    //   S_PVE_LEADER_BOARD_INFO  92 B, season 15, 8 dungeon ids
+    //
+    // The two boards have DIFFERENT windows, which the one shared pair of constants could not
+    // express; both are exactly 28 days, like T91's. The ids matter more than they look: the
+    // client echoes one straight back as C_REQUEST_P*_RANKING's `id`, so a board we do not
+    // list is a board the player can never ask for.
+
+    /// <summary>The four battleground ids frame 5608 lists.</summary>
+    public static readonly int[] LeaderBoardLivePvp = { 10, 26, 30, 37 };
+    /// <summary>The eight dungeon ids frame 5609 lists.</summary>
+    public static readonly int[] LeaderBoardLivePve = { 9043, 9056, 9068, 9156, 9168, 9507, 9756, 9768 };
+
+    /// <summary>Frame 5608's window: 2026-09-17 to 2026-10-15, 28 days to the second.</summary>
+    public const long LeaderBoardLivePvpStart = 1789639200L;
+    public const long LeaderBoardLivePvpEnd = 1792058400L;
+    /// <summary>Frame 5609's window: 2026-09-15 to 2026-10-13, also 28 days.</summary>
+    public const long LeaderBoardLivePveStart = 1789448400L;
+    public const long LeaderBoardLivePveEnd = 1791867600L;
+
     public static byte[] BuildLeaderBoardInfo(ushort opcode, IReadOnlyList<int>? values,
         int season = 1, long start = LeaderBoardCapturedStart, long end = LeaderBoardCapturedEnd)
     {
@@ -2632,12 +2657,22 @@ public static class ArbiterClientHandlers
         return p;
     }
 
-    /// <summary>The two frames as the capture pushes them, for the enter-world burst.</summary>
+    /// <summary>
+    /// The two frames for the enter-world burst, in the live Classic+ shape (T133): the id
+    /// sets and windows of frames 5608 / 5609, under <see cref="RankingBoards.CurrentSeason"/>
+    /// so the season the client is told about is the season the ranking handler will answer.
+    /// <para>T91's 2022 capture is still reachable - pass
+    /// <see cref="LeaderBoardCapturedPvp"/> / <see cref="LeaderBoardCapturedPve"/> and the
+    /// captured window to <see cref="BuildLeaderBoardInfo"/> - and the tests still assert it
+    /// byte for byte, because it is the frame that proved the layout.</para>
+    /// </summary>
     public static byte[] BuildPvpLeaderBoardInfo()
-        => BuildLeaderBoardInfo(S_PVP_LEADER_BOARD_INFO, LeaderBoardCapturedPvp);
+        => BuildLeaderBoardInfo(S_PVP_LEADER_BOARD_INFO, LeaderBoardLivePvp,
+            RankingBoards.CurrentSeason, LeaderBoardLivePvpStart, LeaderBoardLivePvpEnd);
 
     public static byte[] BuildPveLeaderBoardInfo()
-        => BuildLeaderBoardInfo(S_PVE_LEADER_BOARD_INFO, LeaderBoardCapturedPve);
+        => BuildLeaderBoardInfo(S_PVE_LEADER_BOARD_INFO, LeaderBoardLivePve,
+            RankingBoards.CurrentSeason, LeaderBoardLivePveStart, LeaderBoardLivePveEnd);
 
     // =========================================================================================
     // 17. S_ADMIN_GET_USERINFO_INVEN - the tool's inventory tab                         (T93)
@@ -4967,18 +5002,29 @@ public static class LeaderboardPackets
         // T126: the real handler sends TWO frames - the list, then the requester's own line
         // (PVERankingSystemManager::SendNowSeasonRank, Arb_part_050.c:10074 / :10518). Sending
         // only the first leaves the "my record" row under the board with nothing to fill it.
+        //
+        // T133: but the second frame is CONDITIONAL, and classic_live shows exactly when.
+        // SendNowSeasonRank guards it with `param_5 == *(int *)(local_80 + 0x2f) || param_5 ==
+        // 0x10` (Arb_part_050.c:9961) - the class asked for is the requester's OWN class, or
+        // the aggregate. Nine requests in that capture, all from a class-9 player: the eight
+        // asking for class 9 or 16 each got S_USER_P*_RANKING, and frame 5846 - the one asking
+        // for class 0 - got the list and nothing else. Your rank on somebody else's class
+        // board is not a number that exists, so the server does not invent one.
+        bool sendSelf = RankingBoards.SendsSelfRank(cls, s.SelectedCharacter?.Class ?? -1);
         if (pve)
         {
             s.Send(RankingBoards.BuildPveRankingList(page, myRank));
-            s.Send(RankingBoards.BuildUserPveRanking(myRank, self?.Level ?? 0,
-                                                     self?.Score ?? 0, viewerRank: myRank));
+            if (sendSelf)
+                s.Send(RankingBoards.BuildUserPveRanking(myRank, self?.Level ?? 0,
+                                                         self?.Score ?? 0, viewerRank: myRank));
         }
         else
         {
             s.Send(RankingBoards.BuildPvpRankingList(page, myRank));
-            s.Send(RankingBoards.BuildUserPvpRanking(
-                myRank, (int)Math.Clamp(self?.Score ?? 0, int.MinValue, int.MaxValue),
-                viewerRank: myRank));
+            if (sendSelf)
+                s.Send(RankingBoards.BuildUserPvpRanking(
+                    myRank, (int)Math.Clamp(self?.Score ?? 0, int.MinValue, int.MaxValue),
+                    viewerRank: myRank));
         }
         return true;
     }

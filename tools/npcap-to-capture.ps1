@@ -55,6 +55,9 @@
     .\reframe-client.ps1   -Log   D:\packetlogs\classic_live.log
 
 .NOTES
+    Runs on Windows PowerShell 5.1 as well as pwsh 7: no ternary, no ?? and no calculated
+    -Property on Measure-Object, which is the one that bit first.
+
     Opcode names come from the map, never from the file - .npcap stores none.
     An opcode the map does not know is written UNKNOWN_0xNNNN so the record
     still parses; reframe-client.ps1 then renames it if its map is newer.
@@ -172,8 +175,11 @@ if ($off -ne $bytes.Length) {
 # They are two logs of the same session, not two copies of one log: Noctenium is
 # a proxy, so a packet a mod rewrites or injects reaches the packet view without
 # ever being on the socket. Saying how far they agree is the whole point.
-$wireBytes  = ($wire  | ForEach-Object { $_.Data.Length } | Measure-Object -Sum).Sum
-$splitBytes = ($split | ForEach-Object { $_.Data.Length } | Measure-Object -Sum).Sum
+# Windows PowerShell 5.1 has no CALCULATED -Property on Measure-Object (that arrived in
+# PS 6), so project with ForEach-Object first and sum the plain numbers. The [int64] cast
+# also covers the empty case: Measure-Object -Sum over nothing gives $null, not 0.
+$wireBytes  = [int64](($wire  | ForEach-Object { $_.Data.Length } | Measure-Object -Sum).Sum)
+$splitBytes = [int64](($split | ForEach-Object { $_.Data.Length } | Measure-Object -Sum).Sum)
 
 function Compare-View([string] $dir) {
     $a = @($wire  | Where-Object { $_.Dir -eq $dir })
@@ -193,7 +199,9 @@ function Compare-View([string] $dir) {
 $cmp = @((Compare-View 'S->C'), (Compare-View 'C->S'))
 
 # ---- write -------------------------------------------------------------------
-$chosen = if ($Stream -eq 'Raw') { $wire } else { $split }
+# @() is load-bearing: a List[object] coming out of an if-expression is UNROLLED by the
+# pipeline, so an empty one lands as $null and $chosen.Count then throws under StrictMode.
+$chosen = @(if ($Stream -eq 'Raw') { $wire } else { $split })
 $utf8 = New-Object Text.UTF8Encoding($false)
 $w = New-Object IO.StreamWriter($Out, $false, $utf8)
 try {
