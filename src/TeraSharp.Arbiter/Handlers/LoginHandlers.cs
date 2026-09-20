@@ -58,11 +58,8 @@ public sealed class LoginHandlers
             ["unk"] = 0u,
             ["language"] = language, ["pvpDisabled"] = false, ["unk1"] = (ushort)0, ["unk2"] = (ushort)0,
         });
-        s.SendByDef("S_LOGIN_ACCOUNT_INFO", new Dictionary<string, object>
-        {
-            ["accountId"] = s.Account.AccountId, ["antiCheatChecksumSeed"] = 0,
-            ["dbServerName"] = "TeraSharp", ["apiServerAddress"] = "127.0.0.1", ["apiServerAuthToken"] = "",
-        });
+        s.SendByDef("S_LOGIN_ACCOUNT_INFO", ArbiterClientHandlers.BuildLoginAccountInfoFields(   // T124: real api-gateway fields + JWT (Alt+A)
+            s.Account.AccountId, DateTimeOffset.UtcNow.ToUnixTimeSeconds()));
         return true;
     }
 
@@ -173,17 +170,14 @@ public sealed class LoginHandlers
             // World still loading: reject like the real Arbiter does (client shows "You can't enter right now").
             _log.LogWarning("C_SELECT_USER while World not ready - rejecting");
             s.SendByDef("S_SYSTEM_MESSAGE", new Dictionary<string, object> { ["message"] = "@769" });
-            s.SendByDef("S_SELECT_USER", new Dictionary<string, object> { ["unk1"] = 0, ["unk2"] = 0, ["unk3"] = 72339069014638592UL });
+            s.SendByDef("S_SELECT_USER", ArbiterClientHandlers.BuildSelectUserFields(accepted: false));   // T124
             return true;
         }
         if (WorldEntry.EnterWorld(s, _log)) return true;
 
         if (PureReplay) { SpawnReplay.ReplayPhase1(s, _log); return true; }
 
-        s.SendByDef("S_SELECT_USER", new Dictionary<string, object>
-        {
-            ["unk1"] = 1, ["unk2"] = 0, ["unk3"] = 72339069014638592UL,
-        });
+        s.SendByDef("S_SELECT_USER", ArbiterClientHandlers.BuildSelectUserFields());   // T124
         s.SendByDef("S_BROCAST_GUILD_FLAG", new Dictionary<string, object>());
         ArbiterClientHandlers.SendCurrentElectionState(s);   // T106: frame 49, constant
         SendContentFlags(s);
