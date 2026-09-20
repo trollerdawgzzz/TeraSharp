@@ -4,6 +4,7 @@
 |---|---|---|
 | `reframe-tap.ps1` | `arbiter-world-tap.js` log | reassembles the TCP stream and cuts it into frames |
 | `reframe-client.ps1` | packet-logger `capture_*.log` | validates each record and resolves names from `data.json` |
+| `npcap-to-capture.ps1` | a Noctenium `.npcap` | unpacks it into the `capture_*.log` text the two reframers read |
 | `trim-datasheets.ps1` | the server's `Datasheet\` folder | cuts it down to a keep-list of continent ids so the real servers fit in memory |
 | `restore-datasheets.ps1` | a trim manifest | puts it all back |
 
@@ -289,3 +290,61 @@ Rows removed, the same at every tier: 248 `<Continent>` from AreaList, 250 from 
 `<Constraint>`, 39 + 8 `<Dungeon>`, 7 `<ContentInfo>`, 154 `<Event>` + 6 `<EnableTime>` + 5 empty
 `<EnableDay>`. `-WhatIf` changed 0 of 3,229 files; **trim -> restore was byte-identical at all three
 tiers**. What that does not prove is that the result boots — only the real binaries can say that.
+
+## `npcap-to-capture.ps1` — Noctenium `.npcap` in, `capture_*.log` out (T130)
+
+Noctenium (the Classic+ launcher's proxy) writes its own captures to
+`...\noctenium\logs\packet-captures\capture-<date>-<id>.npcap`. They are the only client-side
+capture we get from a **live** server, so they are worth reading; the container is small and
+was reversed in T130 from `classic_live.npcap` (3 318 599 B, 7 391 records, parses to the byte).
+
+```
+file header, 16 B
+  [0]  char[4]  "NPCP"
+  [4]  u32      version, 2
+  [8]  u64      capture start, UNIX NANOSECONDS
+
+record, 14 B header + payload
+  [0]  u16      type
+  [2]  u64      nanoseconds since the client started
+  [10] u32      payload length
+  [14] payload
+```
+
+`type` is both the direction and the view:
+
+| type | direction | view |
+|---|---|---|
+| 0 | S→C | wire — one socket read, **zero or more whole frames back to back** |
+| 1 | C→S | wire |
+| 2 | S→C | packet — exactly one frame |
+| 3 | C→S | packet |
+
+Both views of the same session are in the same file. The u64s are what identify the layout
+without guessing: they are monotonic across all 7 391 records, and the file header's
+`1789912872310233200` ns is `2026-09-20 14:01:12 UTC`, which is the `-100112` in the file's own
+name at UTC-4.
+
+**The two views are not copies of each other.** Noctenium is a proxy, so a packet one of its
+mods rewrites or injects reaches the packet view without ever being on the socket. In
+`classic_live.npcap` they are byte-identical for the first 5 433 S→C frames and the first 27
+C→S frames and then diverge; the packet view is the longer one (6 467 frames vs 6 441). The
+script always walks **both** and prints where they part, because a silent difference between
+them is the one thing that would make the capture lie to you.
+
+```powershell
+# the packet view (default) - one record per frame, and the complete list
+.\npcap-to-capture.ps1 -Npcap D:\packetlogs\classic_live.npcap
+
+# the socket view instead
+.\npcap-to-capture.ps1 -Npcap D:\packetlogs\classic_live.npcap -Stream Raw -Out raw.log
+
+# then read it like any other client capture
+.\reframe-client.ps1 -Log D:\packetlogs\classic_live.log
+```
+
+Opcode names come from `data.json` (`-Protocol`, default 376012), never from the file — an
+`.npcap` stores no names. An opcode the map does not know is written `UNKNOWN_0xNNNN` so the
+record still parses and `reframe-client.ps1` can rename it. On `classic_live.npcap` every one
+of the 6 467 frames resolved and `reframe-client.ps1` reported **no rejects and no renames**,
+which is also how we know the live Classic+ server speaks the same 376012 map this build does.
