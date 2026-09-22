@@ -137,7 +137,8 @@ what, and what is deliberately still unimplemented. It is verbose on purpose.
 
 ## Contributing
 
-Two rules carry most of the weight:
+`CONTRIBUTING.md` has the workflow: branches and worktrees, the budget rules, capture-first,
+adding a datasheet loader, and the tap. Two rules carry most of the weight:
 
 1. **Evidence order.** When notes and the binary disagree, the binary wins. When the binary and
    a capture disagree, the capture wins. An assertion with no evidence behind it is a guess and
