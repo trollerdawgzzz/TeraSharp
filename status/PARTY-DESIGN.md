@@ -87,8 +87,7 @@ exactly that many bytes. Constructor `FUN_1407b40d0`
 | 0x1848 | map | friendship / exp-share |
 | 0x1868 | map<int,wstring> | raid sub-party names |
 
-The 30-slot table is literal — the ctor (`Arb_part_067.c` ≈ 2160) walks 0x1E eight-byte slots
-from `Party+0xD8`, writing −1 into each slot's PlanetId and 0 into its UserDbId.
+The 30-slot table is literal — ctor (`Arb_part_067.c` ≈ 2160):
 
 and `Party::BroadcastPacket` = `FUN_1407b71e0` (`Arb_part_067.c:4370`) iterates the same 0x1E
 slots directly, skipping any whose `UserDbId` is 0 and sending to the `ClientSession` of each
@@ -799,7 +798,7 @@ there every time.
 
 ## 13. T64 — the party family against a real capture
 
-`D:\packetlogs\cap_social.log` is the first tap that contains a real party being formed, used and
+`<captures>\cap_social.log` is the first tap that contains a real party being formed, used and
 handed over, by the **real** ArbiterServer, with two players: "Test" (playerId 2) and "two"
 (playerId 1002). The frames, by that log's sequence numbers:
 

@@ -9,8 +9,8 @@
 
 | file | what |
 |---|---|
-| `D:\packetlogs\cap_newchar.log` | "Test" (playerId 2), FIRST login of a brand-new character |
-| `D:\packetlogs\arb_world_2026-09-13T11-33-30-680Z.log` | dob (playerId 1) and "Test" logging in WITH progress |
+| `<captures>\cap_newchar.log` | "Test" (playerId 2), FIRST login of a brand-new character |
+| `<captures>\arb_world_2026-09-13T11-33-30-680Z.log` | dob (playerId 1) and "Test" logging in WITH progress |
 | `data/cap_t22_newchar.bin` | the 15 frames of the first that the tests need (TSIS container) |
 | `data/cap_t22_relog.bin` | the 10 frames of the second |
 

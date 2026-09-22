@@ -10,7 +10,7 @@ Sources, in the order they win when they disagree:
   writer (`FUN_1406f6f40`, 1213482).
 - `D:\v100\TERA_SERVER.100\world_decompiled\WorldServer.exe.c` — the `Inventory::Prepare*`
   functions that build the transaction atoms, which is where the operation enum comes from.
-- `D:\packetlogs\cap_newchar.log` — real ArbiterServer, new character "Test" playerId 2, Island of
+- `<captures>\cap_newchar.log` — real ArbiterServer, new character "Test" playerId 2, Island of
   Dawn: create, enter, gather, combine, drink two potions, kill, zone change, logout. Reframed by
   u32 length. Every byte quoted below was checked against it with Python (no build here).
 
@@ -199,6 +199,7 @@ atom. Scanning `WorldServer.exe.c` for `*(undefined4 *)(X + 4) = N;` followed by
 | 5 | `PrepareChangeCustomizing` | customise |
 | 6 | `PrepareChangeInvenPos`, `PrepareSendStackableItem` | detach a fully-consumed stack (always paired with 11) |
 | 7 | *(insert path)* | **insert item** — the only op that arrives with DB id 0 |
+| 8 | `ItemInserter::AddNonStackNormalRecvToTransactionAtoms` | **insert a non-stackable item** (GM makeitem, reward gear) - also arrives with DB id 0; T153 |
 | 9 | `Inventory::PrepareMoneyTransaction` | change money by a signed DELTA (template id 0) — section 8.1 |
 | 11 | `PrepareSendNonStackItem`, `PrepareChangeInvenPos` | delete the row |
 | 13, 18 | warehouse | `DO_TS_WARE_*` |
@@ -214,6 +215,27 @@ Names line up one-to-one with the Arbiter's `DO_TS_*` set wherever both sides na
 (`PrepareCombineItem` ↔ `DO_TS_COMBINE_ITEM`, `PrepareAwakenItem` ↔ `DO_TS_AWAKEN_ITEM`, and so on),
 which is what makes the table above trustworthy — but the pairing is *inferred*, not read out of a
 table, so treat any row we have not seen on the wire as a lead rather than a fact.
+
+### Op 8 - the non-stackable insert (T153)
+
+World writes it in `Inventory::ItemInserter::AddNonStackNormalRecvToTransactionAtoms`
+(WorldServer.exe.c:1432708); the Arbiter runs it as `DO_TS_INSERT_NONSTACKABLE_ITEM`
+(Arb_part_038.c:771), which allocates the id into atom `+0x10` and fills a local ItemData - the
+536-byte record 0x27A4 serves - from the atom. `World/ItemCreate.cs` `Map` is that copy (record
+offset = the local's distance from the struct base: template +0x18 -> +0x08, owner +0x38 -> +0x10,
+slot +0x48 -> +0x24, +0x5C -> +0x28, +0x58 -> +0x2C, bound +0x260 -> +0x34, the 16-byte timestamp
++0x1F0 -> +0x1D0, the custom string +0x17C -> +0x17C, and 25 more). Proven against the four created
+items the real Arbiter served back later (cap_social2 10018, cap_social3 10030, cap_multiworld
+10052/10053): every mapped field matches.
+
+On the wire the reply is the request with the id at +0x10 (cap_final 5914 -> 5915, 5974 -> 5975
+byte-exact). For some templates the real Arbiter also writes a template-derived value at +0x104
+(1 for 17000/17004/17005/72277, 0 for 168010/168011/156258/156259), and for period items a computed
+expiry at +0x1F0; both need item template data we do not load, so we leave World's values.
+
+Atom ops seen in the captures and still not modelled: **37** (RECV_PARCEL / _EX, 9 atoms, parcel
+receive), **40** (ITEM_SIMPLE_ATOM, 1), **92** (ITEM_UNIDENTIFY, 2). None has reached TeraSharp's
+log yet.
 
 The four ops the game actually issued in an hour of level-1 play are **2, 6+11, 7, 9**. Those four
 plus 3 and 36 (moving things in the bag) are the whole of a starter character's inventory.
@@ -465,14 +487,14 @@ items: character money 10000000000 for owner 4 - not stored
 (WorldServer.exe.c:1407fa050) is the only builder of an op-9 atom, and it settles the question
 three ways over:
 
-if (amount != 0) {                                     // amount 0 -> NO atom at all
+```c
 if (param_2 != 0) {                                    // amount 0 -> NO atom at all
     // a negative amount is refused when it would take Inventory+0x78 (the money already
     // held) below zero -> error 0x18/0x1a; a positive one is refused when GetAddableMoney
     // reports less room than the amount -> error 0x19
     atom = new;
     *(u32     *)(atom + 4)     = 9;                    // op
-    *(longlong*)(atom + 0x50)  = amount;               // <- the delta, verbatim
+    *(longlong*)(atom + 0x20)  = playerId;             // srcOwner
     *(longlong*)(atom + 0x38)  = playerId;             // dstOwner
     *(u32     *)(atom + 0x28)  = 0;                    // srcInven
     *(u32     *)(atom + 0x40)  = 0;                    // dstInven
@@ -582,3 +604,127 @@ cap_social2.log, seq 2085, alone in its list: item 10018, template 17000, (2, in
 That brings the ops a normal session issues to: 2, 3, 6+11, 7, 9, 0x0D, 0x0E, **0x10**, 0x0F, 0x11.
 `TS_CHANGE_ITEM_OWNER` (the player-trade op behind `SDB_ITEM_TRADE`, T65 section 9) is still the one
 whose index is unknown.
+
+
+---
+
+## T145 - the 886 B grant frame is not in `arbiter-2026-09-20.log`
+
+Stopped before fixing anything: three of the brief's four load-bearing facts are absent from
+the named log, and the one that is attributable says the opposite of what the brief reads into
+it. Recorded so the next session does not re-derive it.
+
+### What the log does and does not contain
+
+`<captures>\arbiter-2026-09-20.log` (183 KB, UTF-16LE, 974 lines, 14:27:42 - 14:32:40):
+
+| the brief says | the log says |
+|---|---|
+| an 886 B `SDB_ITEM_SINGLE` grant frame | the **only** `0x2768` in the file is **len=30**, at 14:31:00. No 886-byte frame of any opcode |
+| it logged `0 inserted, 0 moved, 1 amount, 0 deleted (0 atoms changed no row)` | the words `inserted`, `moved`, `deleted`, `amount`, `atoms changed` and `no row` appear **zero** times |
+| the grant happened at the level jump | the `level 70` jump (14:31:11, account 2, player 3) produced **no `0x2768` at all** - not before it and not after it |
+| `level` / `perfect_level` | one `level 70`; no `perfect_level` anywhere |
+
+`world-2026-09-20.log` has no `2768`, `ITEM_SINGLE`, `inserted` or `atoms` either.
+
+### What the level jump actually did (14:31:11, player 3)
+
+`0x273B S_UPDATE_EXP_LEVEL` -> level 70 stored; `0x1465 SA_CREST_POINT` -> 60 points;
+`0x1463 SA_LEARN_ALL_CREST_ACQUIRABLE` -> 61 new crests; `0x272E SDB_SET_QUEST_INFO` x13 ->
+questDbId 36..48; `0x2899` x18 and `0x2891` x13. **No item frame.** So on this run the level
+command granted no gear through the DB proxy, and a failed grant cannot be what broke the bag.
+
+### Why the one 30-byte `0x2768` logged nothing, and why that is correct
+
+`OnItemSingle` (`DbProxyHandlers.cs:2418`) logs the echo line only when
+`declaredA + declaredB > 0` and the accounting line only when `touched > 0`. A 24-byte payload
+carries no atoms, so both counts are 0 and the handler is silent by design. Nothing is wrong
+with that frame.
+
+### The accounting line is real, and it does not say what the brief reads into it
+
+The format string exists at `DbProxyHandlers.cs:2446`, so the user did see that line - from a
+run other than this file. But `0 inserted ... 1 amount ... (0 atom(s) changed no row)` means:
+one atom changed an item's **amount**, and **zero atoms failed to find a row**. `Ignored` is
+the "changed no row" counter and it is 0. That is a successful single amount update, not a
+rejected batch of inserts. An 886-byte frame carrying one amount atom is unremarkable - the
+size is the item binary, not the atom count.
+
+### Also checked and cleared
+
+`SDB_USER_LOAD_INVENTORY` logging two sixes for player 3 at 14:31:00 (`6 starter items for
+class 0 (warrior)` then `6 item row(s) from the store`) is not a mismatch: the handler builds
+the kit, seeds rows only when the character has none, and then **rebuilds the reply from the
+rows** with `BagItems.BuildPayload`, so the ids World is handed are the row ids. No
+`seeded N starter row(s)` line appears for player 3, i.e. the rows already existed.
+
+### What is needed to finish this
+
+1. **Bytes.** The arbiter log records opcode and length only; it has no hex. Decoding the 886 B
+   frame needs the A-W tap for that session (`tools/reframe-tap.ps1` over an
+   `arb_world_*.log`), and no tap log covers 2026-09-20.
+2. **Which run.** The console text around the `0 inserted ... 1 amount` line, or the arbiter log
+   for the day it actually happened - it is not 2026-09-20.
+3. **Which character and when.** The brief names dob / warrior / testagain; the only level jump
+   in this file is player 3 at 14:31:11, and it moved no items.
+
+Without (1) there is nothing to decode and no way to tell an unknown atom type from an owner
+mismatch from a slot conflict - which is the whole of part 1, and parts 2 and 3 are built on its
+answer.
+
+---
+
+## T145 - cap_bag: the equip and learn "wedges" are one login wedge (0x2732)
+
+| cap_bag.log | what | before | now |
+|---|---|---|---|
+| 314 W->A 0x2732 SDB_SET_QUESTLIST_INFO, 759 B, `test` (10), 9 quests | batch quest write at login | "no replay" - never answered | 0x2733, quests stored (UpsertQuest) |
+| after 314 | no SDB_ for `test` for the rest of the capture: no 0x2930 hold load, no 0x278E learn, no bind/equip write | queued behind 314 inside World | released |
+| client 809..940 | 9 x C_SKILL_LEARN_REQUEST, **no server reply at all** | DBUserLearnSkillContext never leaves World | - |
+| client 697..764 | C_BIND_ITEM_BEGIN_PROGRESS / EXECUTE x2 (the equip attempt: bind-on-equip) | same | - |
+| 120, 200 W->A 0x13CC SA_EQUIP_ITEM_LEVEL, 18 B | one-way push; 0x13CD is BSA_EXIT_BATTLE_FIELD, no reply in any real tap | - | unchanged |
+| (none) 0x1491 SA_UPDATE_USER_STATUS | one-way (0x1492 is AS_REQUEST_SPAWN_NPC); cap_final / cap_newchar never answer it | - | unchanged |
+
+- **0x2733** (Handler_DBS_SET_QUESTLIST_INFO, frame >= 0x24): `[offA][8n][offB][0][offC][0][reqId][ok][apply]`
+  + n x (questId, questDbId). `apply` = 0 makes World ignore the reply and leave the transaction
+  open. Byte-exact against all three real pairs (cap_social4 2935/3244/7843).
+- **0x2813 SDB_EQUIP_ITEM** is written by the same template as SDB_ITEM_SINGLE (886 B = one
+  856-byte atom), and Handler_DBS_EQUIP_ITEM reads exactly what Handler_DBS_ITEM_SINGLE reads. It is
+  answered with 0x2814 in the 0x2769 shape and its atoms applied to the items table by the same
+  code. **No tap contains one** - cap_bag's never left World - so recapture one equip to pin it.
+- **The skill refusal is not vaporize**: the learn requests fall in the window World had `test`
+  visible (0x282D 0 at 00:34:15, 1 again at 00:35:09). AS_ENTER_WORLD[111] was 5. The capture holds
+  no refusal message; the requests simply go unanswered, which is what a stuck DB queue does.
+
+---
+
+## T151 - three live-run follow-ups
+
+| # | symptom | cause (bytes / decompile) | fix |
+|---|---|---|---|
+| 1 | "atom op 51 not modelled (item 1068, 0:2 -> 0:2)" in SDB_EQUIP_ITEM | op 51 is **bind**, not a move: World's `PrepareChangeSealItem` copies the item's current position into both triples and sets `atom+0x168 = GetDbId()`; the Arbiter's `DO_TS_BIND_ITEM` is `ItemUtil::UpdateItemBound(item, owner, owner, item+0x1c4)` -> ItemData **+0x34 bound, +0x38 owner**. Op 63 (`DO_TS_UNBIND_ITEM`) = `UpdateItemBound(item, 0, atom+0x168, atom+0x1c4)` | both applied to the stored 536-B record (a synthesised one if the row had none), position untouched |
+| 2 | system mail listed with blank sender / subject | `OnMakeSysParcel` filed Title and Message as `""`. SA_MAKE_SYS_PARCEL carries Writer / Title / Message refs at payload 8 / 12 / 16 (cap_social4 2962: `@Achievement:6903`, `@2051`, `@2052\vAchievementName\v@Achievement:6900`); the real rows list them verbatim (seq 4560: +0x04, +0x960) with type **102** at +0xA4 and the receiver's name at +0x54 | strings stored; the synthesised row gets type and receiver name |
+| 3 | every glyph locked | AS_LEARN_ALL_CREST_ACQUIRABLE's list is the crests World must **not** learn: `DBUserAutoLearnCrestContext::SetRecvData` erases each id in it from the set it asked for. We echoed all 42, so none were learned. Real Arbiter: cap_social4 2820 (42 crests) -> 2821, **empty** | reply always empty; the request's crests are stored |
+
+Not done: (1) no tap yet holds an SDB_EQUIP_ITEM, so whether an equip also moves the row (bag -> inven 14) in the same frame is unconfirmed - the live log only prints unmodelled ops. (2) System-parcel attachments (row +0xE0, template/amount per 0x1B0 slot) are still not listed or delivered - that needs SDB_RECV_PARCEL_EX on a system parcel (cap_social4 has six). (3) World re-asks for the crests at every login because our enter-world data carries none; with the empty reply it simply learns them again, and tier unlocks go through the item transactions already handled.
+
+
+## T166 - enchanting: ten generic transactions, eight record-edit ops
+
+Every op below is the same handler on the real Arbiter: request `[ref @6 -> 856-byte atoms][DlmId @0E][UserDbId @12]` (frame >= 0x16), ExecTrans, reply `[ref -> atoms][DlmId][ok]` (World reads >= 0x13) - `DbAckTable` rows with `b6=6`. SDB_ITEM_MERGE replies `[DlmId][ok]` only (`a6`). SDB_ITEM_DECOMPOSE 0x275C is dead on both sides (Arbiter stub, no World builder) and stays unanswered. **World rolls; the Arbiter never does**: success, penalty and "failed, level kept" are all expressed in the atoms World sends, so applying them is following World's result.
+
+| SDB | World context | atoms |
+|---|---|---|
+| 0x276E ITEM_ENCHANT | DBItemEnchantContext (ContractEnchant::ExecuteTemper) | 2 / 11+6 materials, 80, 4 (success or penalty level), 73, 75 |
+| 0x2770 ITEM_ENCHANT_IDENTIFY | DBItemEnchantIdentifyContext | scroll, 4 or 86 (+0x348 masterwork, +0x349 awaken), 73 |
+| 0x28F4 ENCHANT_ITEM_BOOST | DBItemEnchantBoostContext | material, 75 on target, 4 (=0) on source |
+| 0x2932 ITEM_AWAKEN | DBItemAwakenContext | materials, 80, 81 |
+| 0x2934 ITEM_UNBIND | DBItemUnbindContext | scroll, 63, 93 |
+| 0x295F EQUIPMENT_INHERITANCE | DBEquipmentInheritContext | 8 (new item, enchant at +0x5C), 11/6 sources |
+| 0x28A1 ITEM_UNIDENTIFY | DBItemOptionResetContext - **op 92 is option reset** | materials, 92 |
+| 0x275A ITEM_EXTRACT / 0x2920 ITEM_DECOMPOSITION | DBItemExtractTransaction / DBItemDecomposeContext | 9 cost, source 11/2, outputs 7/8/2 |
+| 0x2774 ITEM_MERGE | DBMergeItemContext | 67 period extend, consumed item |
+
+Record edits (`World/ItemEdits.cs`, DO_TS pairing inferred from the fields each side touches): 4 +0x28 <- +0x5C; 86 the same plus masterwork/grade/passive (+0x138/+0x134/+0x13C) and awaken +0x139; 73 +0x160 <- +0x16C; 75 +0x16C/+0x168 <- +0x174/+0x178; 80 +0x1C0; 81 +0x139 = 1; 92 +0x54..0xCB / +0xD0..0xE7 / +0x134 <- +0x60..0xD7 / +0xEC..0x103 / +0x104; 93 +0x170 <- +0x1D0. Op 6 reads as DO_TS_POP_ITEM (medium).
+
+**Pinned:** 0x28A1 against cap_multiworld 10859/10860 and 11043/11044 - our reply equals the real one except atom +0x74..0xC6, the empty passive slots the real Arbiter fills from template/EnchantData (not loaded). Everything else is decompile-derived; no capture holds another of these ops. **Not modelled:** that fill, op 86's rolled passive, op 67's time transfer, and the Arbiter's owner/old-level checks (logged, not enforced - our record can lag World's item).

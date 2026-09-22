@@ -1,4 +1,7 @@
-﻿using Microsoft.Extensions.Logging;
+﻿// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 the TeraSharp contributors
+
+using Microsoft.Extensions.Logging;
 using TeraSharp.Arbiter.Game;
 using TeraSharp.Arbiter.Network;
 using TeraSharp.Arbiter.Persistence;
@@ -143,6 +146,11 @@ public static class ArbiterClientHandlers
         World.GuildWarManager.C_CHECK_TO_DECLARE_GUILD_WAR,
         World.GuildWarManager.C_DECLARE_GUILD_WAR,
         World.GuildWarManager.C_WITHDRAW_GUILD_WAR,
+        // T170 - the defender's side and the surrender (cap_final2a_client1 4067/4072/10378/10380).
+        World.GuildWarManager.C_CHECK_TO_OPPOSITE_DECLARE_GUILD_WAR,
+        World.GuildWarManager.C_OPPOSITE_DECLARE_GUILD_WAR,
+        World.GuildWarManager.C_REQUEST_GUILD_WAR_PENALTY_INFO,
+        World.GuildWarManager.C_GIVE_UP_GUILD_WAR,
         // T82 - three more the Arbiter answers from its own tables. The two skill-polishing
         // loads were on the RegNoop list, which is not the same thing: a noop registers the
         // opcode (so it is not forwarded) but sends NOTHING, and the real Arbiter answers both
@@ -327,29 +335,51 @@ public static class ArbiterClientHandlers
     public const int TtExteriorItemTemplateId = 0xC9;
     public const int TtDamaged = 0x12F;
 
+    // --- T169: the real shape, pinned to cap_final2a/2b (164 client samples, 94 compare pairs) ---
+    // After the bound-owner string the real Arbiter always writes TWO option sets and TWO compare
+    // sets, interleaved and linked (u16 self, u16 next):
+    //   [OptionSet 0: 0x1C head + 15 x 8 passive][CompareSet 0: 0xA4][OptionSet 1 ...][CompareSet 1 ...]
+    // OptionSet head: [self][next][u16 15][u16 passives][i32 CurOptionIndex = k][i32 0]
+    //                 [f32 ItemLevel][f32 ItemMinLevel][f32 ItemMaxLevel]
+    // CompareSet:     [self][next][i32 k][15 x i32 stat][8 x i32 0][8 x i64]; without a compare the
+    //                 15 stats are "no value" (-1000, or -1000f at 6-8 and 13-15) and the i64s 0xFE-fill.
+    // What is NOT reproduced (the only bytes that differ from the capture): the three item-level
+    // floats, CumulatedEnchantAmount and DecompositionCost of equipment. The real Arbiter computes
+    // them from EquipmentItemLevelData / its equipment tables, which are not among our datasheets;
+    // they are 0 / -1 here. Consumables and materials (the Forge picker) are byte-exact.
+    public const int TtOptionSetHead = 0x1C, TtPassiveSlots = 15, TtPassiveEntry = 8, TtCompareSetSize = 0xA4;
+    public const int TtSetPair = TtOptionSetHead + TtPassiveSlots * TtPassiveEntry + TtCompareSetSize;   // 0x138
+    public const int TtOpenDateTime = 0xE5, TtRemainPeriodInSec = 0xED;
+    public const int TtEquipmentSetId = 0xF5, TtCompareEquipmentSetId = 0xF9;
+    public const int TtCumulatedEnchantAmount = 0x111, TtDecompositionCost = 0x115;
+    // The 536-byte item record fields the tooltip copies (ItemEdits' names).
+    public const int TipRecEnchant = 0x28, TipRecDurability = 0x2C, TipRecBound = 0x34,
+                     TipRecPassives = 0x54, TipRecPassiveSet = 0x3C, TipRecGrade = 0x134;
+    private static readonly int NoStatFloat = BitConverter.SingleToInt32Bits(-1000f);
+
     /// <summary>
-    /// S_SHOW_ITEM_TOOLTIP for one stored item row. Built as a raw frame rather than through
-    /// <c>SendByDef</c> for the same reason <see cref="ParcelHandlers"/> builds its three: there
-    /// is no .def to drive the encoder with.
-    ///
-    /// <para>The fields that matter to the client's item cache — <c>ItemDbId</c>,
-    /// <c>TemplateId</c>, <c>InvenType</c>, <c>InvenPos</c>, <c>Count</c> and
-    /// <c>SavedCount</c> — come from the row. Everything else is zero, which is what a stack of
-    /// consumables actually is: no enchant, no options, no colouring, not bound.</para>
+    /// S_SHOW_ITEM_TOOLTIP for one stored item row (raw frame: there is no .def). The row gives the
+    /// ids, place and count; its 536-byte record (when we have one) the enchant, durability, bound
+    /// flag, grade and both passive sets. <paramref name="compare"/> is World's 0x150-byte
+    /// CompareItemToolTip (SDB_SIMULATE_ITEM_TOOLTIP): with it the paper-doll compare is on, the
+    /// compare sets carry its stats and CurrentSlotItemLevel its +0x140.
     /// </summary>
     public static byte[] BuildShowItemTooltip(int toolTipType, CharacterStore.ItemRow row,
-                                              string boundOwner = "")
+                                              string boundOwner = "", byte[]? compare = null)
     {
         ArgumentNullException.ThrowIfNull(row);
         boundOwner ??= string.Empty;
+        if (compare != null && compare.Length < CmpSize) compare = null;
         int textBytes = (boundOwner.Length + 1) * 2;
-        int len = TooltipFixedSize + textBytes;
+        int optOff = TooltipFixedSize + textBytes;
+        int len = optOff + 2 * TtSetPair;
         var p = new byte[len];
         p[0] = (byte)len; p[1] = (byte)(len >> 8);
         p[2] = unchecked((byte)S_SHOW_ITEM_TOOLTIP); p[3] = (byte)(S_SHOW_ITEM_TOOLTIP >> 8);
 
-        // The four arrays stay empty: count 0, offset 0.
-        BitConverter.GetBytes((ushort)TooltipFixedSize).CopyTo(p, TtItemBoundOwner);
+        W16(p, TtOptionSetCount, 2); W16(p, TtOptionSetOffset, optOff);
+        W16(p, TtCompareStatCount, 2); W16(p, TtCompareStatOffset, optOff + TtOptionSetHead + TtPassiveSlots * TtPassiveEntry);
+        W16(p, TtItemBoundOwner, TooltipFixedSize);
         System.Text.Encoding.Unicode.GetBytes(boundOwner).CopyTo(p, TooltipFixedSize);
 
         BitConverter.GetBytes(toolTipType).CopyTo(p, TtToolTipType);
@@ -361,7 +391,131 @@ public static class ArbiterClientHandlers
         BitConverter.GetBytes(row.Slot).CopyTo(p, TtInvenPos);
         BitConverter.GetBytes((int)row.Amount).CopyTo(p, TtSavedCount);
         BitConverter.GetBytes((int)row.Amount).CopyTo(p, TtCount);
+
+        var rec = row.Record != null && row.Record.Length >= TipRecGrade + 4 ? row.Record : null;
+        if (rec != null)
+        {
+            Array.Copy(rec, TipRecEnchant, p, TtEnchantCount, 4);
+            Array.Copy(rec, TipRecDurability, p, TtDurability, 4);
+            p[TtIsBound] = rec[TipRecBound];
+            Array.Copy(rec, TipRecGrade, p, TtCurrentUnidentifiedItemGrade, 4);
+        }
+        if (compare != null)
+        {
+            p[TtHavePaperDollCompare] = 1;
+            Array.Copy(compare, CmpSlotItemLevel, p, TtCurrentSlotItemLevel, 4);
+        }
+        BitConverter.GetBytes(-1L).CopyTo(p, TtOpenDateTime);
+        BitConverter.GetBytes(-2L).CopyTo(p, TtRemainPeriodInSec);
+        BitConverter.GetBytes(-1).CopyTo(p, TtEquipmentSetId);
+        BitConverter.GetBytes(-1).CopyTo(p, TtCompareEquipmentSetId);
+        BitConverter.GetBytes(-1).CopyTo(p, TtCumulatedEnchantAmount);
+        BitConverter.GetBytes(-1L).CopyTo(p, TtDecompositionCost);
+
+        for (int k = 0; k < 2; k++)
+        {
+            int o = optOff + k * TtSetPair, sub = o + TtOptionSetHead;
+            int cmp = sub + TtPassiveSlots * TtPassiveEntry;
+            int next = k == 0 ? o + TtSetPair : 0;
+            W16(p, o, o); W16(p, o + 2, next); W16(p, o + 4, TtPassiveSlots); W16(p, o + 6, sub);
+            BitConverter.GetBytes(k).CopyTo(p, o + 8);
+            for (int j = 0; j < TtPassiveSlots; j++)
+            {
+                int e = sub + j * TtPassiveEntry;
+                W16(p, e, e); W16(p, e + 2, j < TtPassiveSlots - 1 ? e + TtPassiveEntry : 0);
+                if (rec != null) Array.Copy(rec, TipRecPassives + k * TipRecPassiveSet + 4 * j, p, e + 4, 4);
+            }
+            W16(p, cmp, cmp); W16(p, cmp + 2, k == 0 ? cmp + TtSetPair : 0);
+            BitConverter.GetBytes(k).CopyTo(p, cmp + 4);
+            for (int s = 1; s <= 15; s++)
+            {
+                int v = compare != null ? BitConverter.ToInt32(compare, CmpStats + 8 * (s - 1) + 4 * k)
+                      : (s is >= 6 and <= 8 or >= 13) ? NoStatFloat : -1000;
+                BitConverter.GetBytes(v).CopyTo(p, cmp + 4 + 4 * s);
+            }
+            if (compare == null) p.AsSpan(cmp + 4 + 96, 64).Fill(0xFE);
+        }
         return p;
+    }
+
+    private static void W16(byte[] p, int at, int v) { p[at] = (byte)v; p[at + 1] = (byte)(v >> 8); }
+
+    // --- T169: the compare exchange (cap_final2b 94 pairs, e.g. 3954 -> 3955 -> client tooltip) ---
+    // User::AskItemCompareTooltip (Arb_part_067.c:3671) asks World to simulate the hovered item on
+    // the paper doll - A->W 0x282E DBS_SIMULATE_ITEM_TOOLTIP
+    //   [u64 gameId & 0x7FFF..][i32 ToolTipType][i64 ContentId][i64 ItemDbId][i32 owner character]
+    // - and sends no tooltip. World answers W->A 0x282F SDB_SIMULATE_ITEM_TOOLTIP
+    //   [u32 off 0x12 (frame-relative)][u32 0x150][u32 character][CompareItemToolTip 0x150]
+    // and AnswerItemCompareTooltipLock (:3530) sends the tooltip from the record: type at +0, item
+    // at +0x20, character at +0x14C. It asks only for the user's own item, type != 27, whose
+    // template has an equipment part the switch maps to a worn slot that is occupied (ear and
+    // finger fall back to the second slot), and - for type 21 - not when the item is itself worn.
+    public const ushort DBS_SIMULATE_ITEM_TOOLTIP = 0x282E;
+    public const ushort SDB_SIMULATE_ITEM_TOOLTIP = 0x282F;
+    public const int CmpSize = 0x150, CmpType = 0x00, CmpItemDbId = 0x20, CmpStats = 0x2C,
+                     CmpSlotItemLevel = 0x140, CmpCharacter = 0x14C;
+    public const int SimulateAskSize = 32;
+    public const int WornInvenType = 14;
+
+    public static byte[] BuildSimulateItemTooltipAsk(ulong gameId, int toolTipType, long contentId,
+                                                     long itemDbId, int ownerDbId)
+    {
+        var p = new byte[SimulateAskSize];
+        BitConverter.GetBytes(gameId & 0x7FFFFFFFFFFFFFFFUL).CopyTo(p, 0);
+        BitConverter.GetBytes(toolTipType).CopyTo(p, 8);
+        BitConverter.GetBytes(contentId).CopyTo(p, 12);
+        BitConverter.GetBytes(itemDbId).CopyTo(p, 20);
+        BitConverter.GetBytes(ownerDbId).CopyTo(p, 28);
+        return p;
+    }
+
+    /// <summary>The worn slot the real switch compares <paramref name="row"/> against, or null for
+    /// "no compare, answer at once". <paramref name="wornSlotOf"/> is the template's slot
+    /// (DatasheetLoader.EquipSlots).</summary>
+    public static int? CompareSlotFor(int toolTipType, CharacterStore.ItemRow row,
+                                      IEnumerable<CharacterStore.ItemRow> inventory, Func<int, int> wornSlotOf)
+    {
+        if (toolTipType == 27) return null;
+        if (toolTipType == 21 && row.InvenType == WornInvenType && row.Slot != 0) return null;
+        int slot = wornSlotOf(row.TemplateId);
+        if (slot <= 0) return null;
+        var worn = inventory.Where(r => r.InvenType == WornInvenType).Select(r => r.Slot).ToHashSet();
+        if (worn.Contains(slot)) return slot;
+        if (slot == 6 && worn.Contains(7)) return 7;
+        if (slot == 8 && worn.Contains(9)) return 9;
+        return null;
+    }
+
+    /// <summary>SDB_SIMULATE_ITEM_TOOLTIP: the CompareItemToolTip record, or null on a bad frame.</summary>
+    public static byte[]? ReadSimulateItemTooltip(byte[]? payload)
+    {
+        if (payload == null || payload.Length < 12) return null;
+        int off = BitConverter.ToInt32(payload, 0) - 6, n = BitConverter.ToInt32(payload, 4);   // offsets count the 6-B frame head
+        if (n != CmpSize || off < 12 || off + n > payload.Length) return null;
+        return payload.AsSpan(off, n).ToArray();
+    }
+
+    /// <summary>World's answer: the tooltip, with the compare, to the character it names.</summary>
+    public static bool OnSimulateItemTooltip(WorldBridge? bridge, byte[] payload, ILogger log)
+    {
+        var rec = ReadSimulateItemTooltip(payload);
+        if (rec == null)
+        {
+            log.LogWarning("SDB_SIMULATE_ITEM_TOOLTIP: {Len} B, not [off][0x150][char][record] - dropped", payload?.Length ?? 0);
+            return true;
+        }
+        int character = BitConverter.ToInt32(rec, CmpCharacter);
+        long itemDbId = BitConverter.ToInt64(rec, CmpItemDbId);
+        var s = bridge?.InWorldSessions().FirstOrDefault(o => o.SelectedCharacter != null && (int)o.SelectedCharacter.Id == character);
+        var store = Program.Store;
+        var row = s == null || store == null ? null : FindItem(store, character, itemDbId);
+        if (s == null || row == null)
+        {
+            log.LogDebug("SDB_SIMULATE_ITEM_TOOLTIP: character {C} / item {I} not found - no tooltip", character, itemDbId);
+            return true;
+        }
+        s.Send(BuildShowItemTooltip(BitConverter.ToInt32(rec, CmpType), row, compare: rec));
+        return true;
     }
 
     /// <summary>
@@ -399,6 +553,13 @@ public static class ArbiterClientHandlers
             return true;
         }
 
+        // T169: an equipment item of the user's own with a worn counterpart is World's to simulate
+        // first (0x282E); the tooltip goes out when 0x282F comes back (OnSimulateItemTooltip).
+        if (owner == chr.Id
+            && CompareSlotFor(req.Value.ToolTipType, match, store.GetInventoryItems(owner), DatasheetLoader.EquipSlotOf) != null
+            && SendToWorld(s, DBS_SIMULATE_ITEM_TOOLTIP, BuildSimulateItemTooltipAsk(s.GameId, req.Value.ToolTipType,
+                   req.Value.ContentId, req.Value.ItemDbId, (int)chr.Id)))
+            return true;
         s.Send(BuildShowItemTooltip(req.Value.ToolTipType, match));
         return true;
     }
@@ -446,10 +607,14 @@ public static class ArbiterClientHandlers
     /// every <c>C_LOAD_TOPO_FIN</c> — with an empty list, hard-coded, because nothing tracked
     /// visited sections. So after every relog World is told the character has explored nothing,
     /// and anything gated on exploration (quest steps that want a section visited, the
-    /// teleport-scroll destinations) is reset. Feeding it the stored rows is the fix; the entry
-    /// stride is 12 bytes, the same <c>(mapId, guardId, sectionId)</c> the client sends.</para>
+    /// teleport-scroll destinations) is reset. Feeding it the stored rows is the fix.</para>
+    ///
+    /// <para>T172: the entry is the real VisitedSectionInfo, <b>16</b> bytes
+    /// <c>(mapId, guardId, sectionId, continentId)</c> - FUN_14035f5e0 copies 0x10 per entry, and
+    /// FUN_1403c95f0 fills the 4th from the guard's GuardData.xml continent (cap_final2b 956:
+    /// guard 1 -> 1, guard 25 -> 5). T45's 12-byte stride made World misread every non-empty list.</para>
     /// </summary>
-    public const int VisitedEntrySize = 12;
+    public const int VisitedEntrySize = 16;
 
     public static byte[] BuildUpdateVisitedSectionList(uint playerId,
         IReadOnlyList<CharacterStore.VisitedSection> sections)
@@ -465,6 +630,7 @@ public static class ArbiterClientHandlers
             BitConverter.GetBytes(sections[i].MapId).CopyTo(p, at);
             BitConverter.GetBytes(sections[i].GuardId).CopyTo(p, at + 4);
             BitConverter.GetBytes(sections[i].SectionId).CopyTo(p, at + 8);
+            BitConverter.GetBytes(DatasheetLoader.GuardContinentOf(sections[i].GuardId)).CopyTo(p, at + 12);
         }
         return p;
     }
@@ -963,7 +1129,7 @@ public static class ArbiterClientHandlers
     /// NUL-terminated UTF-16LE, and the result is an empty string when nothing matched.
     ///
     /// <para>Pinned against the real Arbiter's own replies in
-    /// <c>D:\packetlogs\cap_social_client_ctl.txt</c> frames 1093 / 1096 / 1098.</para>
+    /// <c><captures>\cap_social_client_ctl.txt</c> frames 1093 / 1096 / 1098.</para>
     /// </summary>
     public static byte[] BuildFindName(int findType, string query, IReadOnlyList<string>? matches)
     {
@@ -1019,7 +1185,7 @@ public static class ArbiterClientHandlers
     /// re-entered within the session and S_VISIT_NEW_SECTION alone is enough.
     ///
     /// <para>The real Arbiter sends it immediately after C_LOAD_TOPO_FIN:
-    /// <c>D:\packetlogs\cap_social_client_ctl.txt</c> frame 256 is the C_LOAD_TOPO_FIN and 257 is
+    /// <c><captures>\cap_social_client_ctl.txt</c> frame 256 is the C_LOAD_TOPO_FIN and 257 is
     /// this packet - the same point where HandlerRegistry already pushes the World-side list.</para>
     ///
     /// <para>Standard TERA list encoding, the same shape as S_WATCHED_MOVIES: count at 0x04, the
@@ -1637,24 +1803,48 @@ public static class ArbiterClientHandlers
     public const ushort S_SELECT_USER = 0x8AFB;
 
     /// <summary>
-    /// S_SELECT_USER (<c>byte unk1 / uint16 unk2 / uint64 unk3</c>). T123: we were sending
-    /// <c>unk2 = 0, unk3 = 72339069014638592</c> (0x0101000000000000), which puts the two
-    /// bytes the capture has in <c>unk2</c> at the TOP of <c>unk3</c> instead:
+    /// S_SELECT_USER. The shipped def types the 11-byte body <c>byte unk1 / uint16 unk2 /
+    /// uint64 unk3</c>, which is MIS-TYPED. T144b read the writer instead - the PDL signature is
+    /// <c>PKT_S_SELECT_USER_WRITE, bool, int, enum SelectUserErrorCode, bool, bool</c> and the
+    /// two emit helpers give the widths away (<c>FUN_140351320</c> advances the cursor by 1,
+    /// <c>FUN_1400554e0</c> by 4), so the real body is:
     ///
     /// <code>
-    /// real      37   01 | 01 00 | 00 00 00 00 00 00 00 00
-    /// ours      33   01 | 00 00 | 00 00 00 00 00 00 01 01
+    /// body 0   bool   accepted
+    /// body 1   int32  adminLevel                 &lt;- User+0x3B98, User::UpdateAdminLevel(int)
+    /// body 5   int32  SelectUserErrorCode
+    /// body 9   bool   isFirstLoginToday
+    /// body 10  bool   isFirstLoginTodayByAccount
     /// </code>
     ///
-    /// <para>Same length, so nothing ever complained. The capture reads unk1 = 1, unk2 = 1,
-    /// unk3 = 0. Only the accepted form is captured; the World-not-ready refusal keeps unk1 = 0
-    /// and the same constants, because guessing a second shape from no sample is worse.</para>
+    /// <para>1 + 4 + 4 + 1 + 1 = 11, the captured length. <c>User+0x3B98</c> is the same field
+    /// S_GET_USER_LIST's <c>adminLevel</c> comes from (T144), so the two frames always agree on
+    /// the real server - and that is what the four captures show:</para>
+    ///
+    /// <code>
+    /// cap_final_gm_client2 char dob   adminLevel 1  01 01000000 00000000 00 00  Alt+A PANEL OPENS
+    /// cap_final_gm_client  char 1003  adminLevel 0  01 00000000 00000000 00 00  Alt+A, no panel
+    /// cap_final_client2    normal     adminLevel 0  01 00000000 00000000 00 00  Alt+A, no panel
+    /// cap_altA_gm (ours)   char dob   adminLevel 5  01 00000000 00000000 01 01  Alt+A, no panel
+    /// </code>
+    ///
+    /// <para>Row 2 is the control that settles it: the SAME GM account, same status 33, same
+    /// S_ADMIN_GM_SKILL, Alt+A pressed - but a character whose admin level is 0, and no panel.
+    /// The panel follows this int32, not the account. Ours sent 0 in it and, worse, put the old
+    /// <c>unk3 = 0x0101000000000000</c> tail on the two bools, claiming a first login every time.</para>
+    ///
+    /// <para>The def's names still address those bytes: <c>unk2</c> is the low half of the
+    /// adminLevel int32 and <c>unk3</c> spans its high half plus the error code plus the two
+    /// bools, so <c>unk2 = adminLevel, unk3 = 0</c> writes the real frame exactly. The level is
+    /// clamped to 16 bits so an out-of-range value can never bleed into the error code.</para>
     /// </summary>
-    public static Dictionary<string, object> BuildSelectUserFields(bool accepted = true)
+    public static Dictionary<string, object> BuildSelectUserFields(bool accepted = true, int adminLevel = 0)
         => new()
         {
             ["unk1"] = accepted ? 1 : 0,
-            ["unk2"] = (ushort)1,
+            // 2026-09-21: the real Arbiter sends 1 for its GM (cap_final_gm_client2 frame 37). Our LevelOf is 5
+            // and a 5 here left the character frozen, skill-less and unable to use items. Positive -> 1.
+            ["unk2"] = (ushort)(adminLevel > 0 ? 1 : 0),
             ["unk3"] = 0UL,
         };
 
@@ -2076,7 +2266,7 @@ public static class ArbiterClientHandlers
 
     // ---- T134: the two dungeon windows, from classic_live2 ----
     //
-    // Ground truth: D:\packetlogs\classic_live2.log, a live Classic+ reference. The client fires
+    // Ground truth: <captures>\classic_live2.log, a live Classic+ reference. The client fires
     // both requests back to back when the dungeon window opens and the replies come back in
     // request order, interleaved with each other (records 13160/13161 -> 13163/13164). 9 cool-time
     // pairs and 17 clear-count pairs in the capture.
@@ -2678,6 +2868,177 @@ public static class ArbiterClientHandlers
         return frame;
     }
 
+    // ------------------------------------------------------------------- T148: World's half
+    // A GM's invisibility is WORLD state, not only a client switch. cap_final.log (real
+    // Arbiter, dob at adminLevel 1):
+    //
+    //   408  A->W AS_ENTER_WORLD, payload[111] adminLevel = 1
+    //   495  W->A SDB_USER_VAPORIZED 01 00 00 00 01      World vaporizes the GM at spawn
+    //   769  A->W AS_ADMIN_REQUEST_USERACTION (0x2827)   the tool's C_ADMIN_GM_SKILL(0), 542
+    //   774  W->A SDB_USER_VAPORIZED 01 00 00 00 00      World releases it
+    //   775  W->A S_ADMIN_GM_SKILL 00, then S_LOAD_TOPO  World answers; the short loading screen
+    //
+    // User::EnterWorld calls SetVaporized(1) whenever World's admin level is > 0, and since
+    // T142b that is what our AS_ENTER_WORLD[111] carries - so every GM has spawned vaporized
+    // on World while our Alt+A answered the CLIENT only and never told World. The real
+    // Arbiter's Handler_C_ADMIN_GM_SKILL checks adminLevel >= 1 and sends 0x2827 with action
+    // 0x65; World's Handler_AS_ADMIN_REQUEST_USERACTION case 0x65 dispatches on the skill
+    // (0 -> the vaporize toggle FUN_1408cee20, 1 invincible, 2 hide-from-mobs) and sends
+    // every client-facing reply itself.
+
+    /// <summary>AS_ADMIN_REQUEST_USERACTION - A-&gt;W, one admin action on a user.</summary>
+    public const ushort AS_ADMIN_REQUEST_USERACTION = 0x2827;
+
+    /// <summary>The action World's case 0x65 treats as "GM skill <c>arg</c>".</summary>
+    public const int UserActionGmSkill = 0x65;
+
+    // T155: the other five cases of World's Handler_AS_ADMIN_REQUEST_USERACTION - it has six and
+    // drops every other action - and the two Arbiter-side ones that never reach it.
+    /// <summary>12 "go to" (C_ADMIN_REQUEST_USERACTION): World moves the REQUESTER (payload 84) to the record's zone/position.</summary>
+    public const int UserActionGoTo = 12;
+    /// <summary>13 "summon": World moves the TARGET (payload 164) to the record's position.</summary>
+    public const int UserActionSummon = 13;
+    /// <summary>100 C_ADMIN_GM_TELEPORT: World moves the GM to the packet's zone/x/y/z.</summary>
+    public const int UserActionGmTeleport = 100;
+    /// <summary>0x66 C_ADMIN_REMOVE_NPC: World removes the NPC whose game id is at payload 200.</summary>
+    public const int UserActionRemoveNpc = 0x66;
+    /// <summary>0x67 C_ADMIN_GM_MAPTELEPORT: zone/x/y and z = 16777215; World drops the GM to the ground.</summary>
+    public const int UserActionMapTeleport = 0x67;
+    /// <summary>11 "resurrect": AS_ASK only - World runs User::ResurrectNow on the target and answers nothing.</summary>
+    public const int UserActionResurrect = 11;
+    /// <summary>10 "kick": the Arbiter's own AdminTargetUserDisconnectJob (@1333, disconnect after 3 s); World never sees it.</summary>
+    public const int UserActionKick = 10;
+    /// <summary>A-&gt;W, same 216-byte record: World fills in the live position (12: target's, 13: GM's) and answers 0x2826.</summary>
+    public const ushort AS_ASK_ADMIN_REQUEST_USERACTION = 0x2825;
+    /// <summary>W-&gt;A, the filled record; the Arbiter forwards it verbatim as 0x2827 to the requester's World.</summary>
+    public const ushort SA_ADMIN_REQUEST_USERACTION = 0x2826;
+    /// <summary>Handler_C_ADMIN_GM_MAPTELEPORT's z: <c>0x4b7fffff</c> = 16777215f.</summary>
+    public const uint MapTeleportZBits = 0x4B7FFFFF;
+
+    /// <summary>
+    /// The payload: <c>[u32 14][u32 208]</c> then a 208-byte record. World reads the first
+    /// u32 as the record's FRAME offset (6 + 8) and the second is its size. Record, as payload
+    /// offsets (cap_final 769 / 1278 / 3276):
+    /// <code>
+    ///   8  wchar[38] requester name     84 u32 requester dbId
+    ///  88  wchar[38] target name       164 u32 target dbId      &lt;- World's user lookup key
+    /// 168  u32 zone                    172 u32 0
+    /// 176  f32 x, y, z                 188 i32 action (0x65)    192 i32 arg (the GM skill)
+    /// 196  u32 0                      200 i64 NPC game id (0x66, T155)    208 8 bytes, zero
+    /// </code>
+    /// Zone and position are the Arbiter's User+0x19c / +0x18c, which match the last
+    /// S_LOAD_TOPO exactly in frame 769; World's case 0x65 reads only 164, 188 and 192.
+    /// Bytes past each name's terminator and in the tail are uninitialised stack on the real
+    /// Arbiter (<c>d5 33</c>, <c>e6 33</c>, <c>f6 7f</c>...); ours are zero.
+    /// </summary>
+    public const int UserActionPayloadSize = 216;
+    public const int UserActionRecordFrameOffset = 14;
+    public const int UserActionRecordSize = 208;
+    public const int UserActionNameChars = 38;
+
+    public static byte[] BuildAdminRequestUserAction(string? name, int dbId, int action, int arg,
+        int zone = 0, float x = 0, float y = 0, float z = 0)
+        => BuildUserActionRecord(name, dbId, name, dbId, action, arg, zone, x, y, z);
+
+    /// <summary>
+    /// T155: the record with requester (8 / 84) and target (88 / 164) apart, as
+    /// C_ADMIN_REQUEST_USERACTION fills it, and the i64 at payload 200 C_ADMIN_REMOVE_NPC uses.
+    /// </summary>
+    public static byte[] BuildUserActionRecord(string? gmName, int gmId, string? targetName, int targetId,
+        int action, int arg = 0, int zone = 0, float x = 0, float y = 0, float z = 0, long gameId = 0)
+    {
+        var p = new byte[UserActionPayloadSize];
+        BitConverter.GetBytes(UserActionRecordFrameOffset).CopyTo(p, 0);
+        BitConverter.GetBytes(UserActionRecordSize).CopyTo(p, 4);
+        foreach (var (at, name, dbId) in new[] { (8, gmName, gmId), (88, targetName, targetId) })
+        {
+            System.Text.Encoding.Unicode.GetBytes(
+                (name ?? "").Length >= UserActionNameChars ? name![..(UserActionNameChars - 1)] : name ?? "").CopyTo(p, at);
+            BitConverter.GetBytes(dbId).CopyTo(p, at + UserActionNameChars * 2);
+        }
+        BitConverter.GetBytes(gameId).CopyTo(p, 200);
+        BitConverter.GetBytes(zone).CopyTo(p, 168);
+        BitConverter.GetBytes(x).CopyTo(p, 176);
+        BitConverter.GetBytes(y).CopyTo(p, 180);
+        BitConverter.GetBytes(z).CopyTo(p, 184);
+        BitConverter.GetBytes(action).CopyTo(p, 188);
+        BitConverter.GetBytes(arg).CopyTo(p, 192);
+        return p;
+    }
+
+    /// <summary>Last S_LOAD_TOPO per player: zone and position, for the 0x2827 record.</summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, (int Zone, float X, float Y, float Z)> LastTopo = new();
+
+    /// <summary>Remember an S_LOAD_TOPO's <c>[u32 zone][f32 x][f32 y][f32 z]</c>.</summary>
+    public static void ObserveLoadTopo(int playerId, ReadOnlySpan<byte> clientPacket)
+    {
+        if (playerId <= 0 || clientPacket.Length < 20 || !IsLoadTopo(clientPacket)) return;
+        LastTopo[playerId] = (BitConverter.ToInt32(clientPacket[4..]), BitConverter.ToSingle(clientPacket[8..]),
+            BitConverter.ToSingle(clientPacket[12..]), BitConverter.ToSingle(clientPacket[16..]));
+    }
+
+    /// <summary>The 0x2827 payload asking World to toggle GM skill <paramref name="skill"/> on the player itself.</summary>
+    public static byte[] BuildGmSkillRequest(int playerId, string? name, int skill)
+    {
+        LastTopo.TryGetValue(playerId, out var t);
+        return BuildAdminRequestUserAction(name, playerId, UserActionGmSkill, skill, t.Zone, t.X, t.Y, t.Z);
+    }
+
+    /// <summary>
+    /// Hand a GM-skill toggle to World, the way the real Arbiter does. False when there is no
+    /// World to ask (standalone, or not in world yet) - the caller then answers locally.
+    /// World's replies (S_ADMIN_GM_SKILL, the message, the respawn) come back through the
+    /// tunnel, and its SDB_USER_VAPORIZED keeps <see cref="IsGmInvisible"/> honest.
+    /// </summary>
+    public static bool RequestWorldGmSkill(GameSession s, int skill)
+        => s?.SelectedCharacter != null
+           && SendToWorld(s, AS_ADMIN_REQUEST_USERACTION, BuildGmSkillRequest((int)s.PlayerId, s.SelectedCharacter.Name, skill));
+
+    /// <summary>
+    /// T155: send one admin frame to the World <paramref name="s"/> is on. False when there is
+    /// none (standalone, or not in world) - the caller then logs instead.
+    /// </summary>
+    public static bool SendToWorld(GameSession s, ushort op, byte[] payload)
+    {
+        var w = Program.World;
+        if (s == null || w == null || !w.IsConnected || !s.InWorld || s.SelectedCharacter == null) return false;
+        w.SendFrame(s.CurrentWorldId, op, payload);
+        return true;
+    }
+
+    // ------------------------------------------------------ T155: the rest of the GM tool
+    // cap_multiworld.log (real Arbiter): client C_ADMIN_GM_TELEPORT 2497 (zone 5, 16920 / 1232 /
+    // -4427) -> A->W 3060, action 100, the packet's zone and position; 2243 / 5101 (zones 9087 and
+    // 3023, position 0) -> 2768 / 6171 the same way. cap_final.log: "go to" 916 AS_ASK (the GM's
+    // own position) -> 917 SA (World filled in New's) -> 918 0x2827 = 917 byte for byte; summon
+    // 1081 / 1082 / 1083 the same. Handler_C_ADMIN_GM_MAPTELEPORT (0x67) and _REMOVE_NPC (0x66)
+    // have no sample - their records are the decompile's.
+
+    /// <summary>C_ADMIN_GM_TELEPORT <c>[u16 _][i32 zone][f32 x][f32 y][f32 z]</c> as action 100 on the GM.</summary>
+    public static byte[] BuildGmTeleportRequest(int playerId, string? name, ReadOnlySpan<byte> body)
+        => BuildAdminRequestUserAction(name, playerId, UserActionGmTeleport, 0, BitConverter.ToInt32(body[2..]),
+            BitConverter.ToSingle(body[6..]), BitConverter.ToSingle(body[10..]), BitConverter.ToSingle(body[14..]));
+
+    /// <summary>C_ADMIN_GM_MAPTELEPORT <c>[u16 nameOffset][i32 zone][f32 x][f32 y]</c> as action 0x67, z = 16777215.</summary>
+    public static byte[] BuildMapTeleportRequest(int playerId, string? name, ReadOnlySpan<byte> body)
+        => BuildAdminRequestUserAction(name, playerId, UserActionMapTeleport, 0, BitConverter.ToInt32(body[2..]),
+            BitConverter.ToSingle(body[6..]), BitConverter.ToSingle(body[10..]), BitConverter.UInt32BitsToSingle(MapTeleportZBits));
+
+    /// <summary>C_ADMIN_REMOVE_NPC <c>[i64 gameId]</c> as action 0x66, the id at payload 200.</summary>
+    public static byte[] BuildRemoveNpcRequest(int playerId, string? name, long gameId)
+        => BuildUserActionRecord(name, playerId, name, playerId, UserActionRemoveNpc, gameId: gameId);
+
+    /// <summary>The AS_ASK record for actions 11 / 12 / 13: GM, target, and the GM's last S_LOAD_TOPO.</summary>
+    public static byte[] BuildAskUserAction(int gmId, string? gmName, int targetId, string? targetName, int action)
+    {
+        LastTopo.TryGetValue(gmId, out var t);
+        return BuildUserActionRecord(gmName, gmId, targetName, targetId, action, 0, t.Zone, t.X, t.Y, t.Z);
+    }
+
+    /// <summary>The requester dbId (payload 84) SA_ADMIN_REQUEST_USERACTION is routed back by; 0 if short.</summary>
+    public static int UserActionRequester(ReadOnlySpan<byte> payload)
+        => payload.Length >= UserActionPayloadSize ? BitConverter.ToInt32(payload[84..]) : 0;
+
     /// <summary>
     /// Every W-&gt;A tunnelled client packet for this session, on its way out. Forwards
     /// verbatim except for T138c's battleground-result rewrite, and slips the enter-world
@@ -2698,15 +3059,27 @@ public static class ArbiterClientHandlers
         // is rewritten so the client shows the number the database now holds. Every other
         // packet pays one u16 compare. World/BattlegroundRating.cs.
         BattlegroundRating.OnTunnelled(s, clientPacket, s.Log);
-        if (IsLoadTopo(clientPacket)
-            && !GmSkillPushed.ContainsKey((int)s.PlayerId)
-            && OperatorGetsGmSkillPush(GmCommandHandlers.LevelOf(s, Program.Store))
-            && TryTakeGmSkillPush((int)s.PlayerId))
-        {
-            s.Send(BuildAdminGmSkill(GmSkillInvisible, on: true));
-            SetGmInvisible((int)s.PlayerId, true);   // T128: the default spawn state, recorded
-        }
+        ObserveLoadTopo((int)s.PlayerId, clientPacket);   // T148: zone + position for 0x2827
+        // T152: NO enter-world S_ADMIN_GM_SKILL on the World path. The real one is WORLD's:
+        // cap_final.log 495 SDB_USER_VAPORIZED 01 00 00 00 01, then 496 SA_BYPASS_TO_CLIENT
+        // carrying 09 00 BE 64 00 00 00 00 01 - World vaporizes the GM and tells the client in
+        // the same breath. It only does so when it vaporizes (adminLevel 1 in cap_final; the 5
+        // we send never vaporizes at spawn - cap_bag, cap_skills2 x2). Our push told the client
+        // "invisible" while World had the GM visible, so the panel's Invisible OFF VAPORIZED
+        // them (cap_skills2 5889 -> 5896, @1435), the panel re-sent its toggle 51 ms later to
+        // match, the un-vaporize never completed (no 0x282D 00), and the character stayed
+        // vaporized on World for the session - where every learn came back @3534. The tracker
+        // now starts visible at SDB_USER_ENTERWORLD and follows SDB_USER_VAPORIZED (T148).
         s.Send(clientPacket);
+        // 2026-09-20: a GM-flagged character (S_SELECT_USER.adminLevel > 0, T144b) spawns HELD and the real
+        // Arbiter releases it with S_ADMIN_HOLD_CHARACTER 00 shortly after S_SPAWN_ME (cap frame 402, ~106
+        // frames later). Sent before spawn (the old topo-fin slot) it did nothing; omitted, the GM cannot move
+        // or use items. So: release right behind the tunnelled S_SPAWN_ME, operators only.
+        if (clientPacket.Length >= 4 && clientPacket[2] == 0x65 && clientPacket[3] == 0x83   // S_SPAWN_ME 0x8365
+            && OperatorGetsGmSkillPush(GmCommandHandlers.LevelOf(s, Program.Store)))
+            s.Send(BuildAdminHoldCharacter());
+        if (clientPacket.Length >= 4 && clientPacket[2] == 0x65 && clientPacket[3] == 0x83)
+            WorldLevelSync.OnSpawn(s);   // T152b: a level set while offline reaches World here
     }
 
     // =========================================================================================
@@ -2898,12 +3271,15 @@ public static class ArbiterClientHandlers
     /// captured window to <see cref="BuildLeaderBoardInfo"/> - and the tests still assert it
     /// byte for byte, because it is the frame that proved the layout.</para>
     /// </summary>
+    /// <para>T159: the ids come from this server's sheets (<see cref="DatasheetLoader.PvpBoardIds"/>,
+    /// <see cref="DatasheetLoader.PveBoardIds"/>) - BattleFieldData.xml's ranked battlegrounds and
+    /// the dungeons with a DungeonRankRecorder_&lt;id&gt;.xml. The live sets above are the built-ins.</para>
     public static byte[] BuildPvpLeaderBoardInfo()
-        => BuildLeaderBoardInfo(S_PVP_LEADER_BOARD_INFO, LeaderBoardLivePvp,
+        => BuildLeaderBoardInfo(S_PVP_LEADER_BOARD_INFO, DatasheetLoader.PvpBoardIds.Value,
             RankingBoards.CurrentSeason, LeaderBoardLivePvpStart, LeaderBoardLivePvpEnd);
 
     public static byte[] BuildPveLeaderBoardInfo()
-        => BuildLeaderBoardInfo(S_PVE_LEADER_BOARD_INFO, LeaderBoardLivePve,
+        => BuildLeaderBoardInfo(S_PVE_LEADER_BOARD_INFO, DatasheetLoader.PveBoardIds.Value,
             RankingBoards.CurrentSeason, LeaderBoardLivePveStart, LeaderBoardLivePveEnd);
 
     // =========================================================================================
@@ -5275,26 +5651,60 @@ public static class LeaderboardPackets
     /// <summary>[i32 userDbId][u16 nameOffset] + the string.</summary>
     public const int ChangeUserNameBodySize = 6;
 
-    /// <summary>
-    /// C_VIEW_INTER_PARTY_MATCH_DUNGEON_LIST (0xBA83) -&gt; S_..._DUNGEON_LIST (0xF732),
-    /// three zero bytes: an empty user pool, an empty party pool, and the dungeon-work UI off.
-    /// </summary>
-    public static bool OnViewInterPartyMatchDungeonList(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
-    {
-        s.SendByDef("S_VIEW_INTER_PARTY_MATCH_DUNGEON_LIST", new Dictionary<string, object>
-        {
-            ["userPool"] = (byte)0, ["partyPool"] = (byte)0, ["isShowDungeonWorkUI"] = (byte)0,
-        });
-        return true;
-    }
+    // ---- T157: the Instance Matching tabs are WORLD's to build ----
+    // The real Arbiter's Handler_C_VIEW_INTER_PARTY_MATCH_DUNGEON_LIST (ArbiterServer.exe.c:834385)
+    // sends the client nothing. It sends World AS_VIEW_INTER_PARTY_MATCH_DUNGEON_LIST_EXTENDED
+    // (0x1644) [pool list ref][UserDbId], and World (User::ViewDungeonMatchingListForUserPool /
+    // ...ForPartyPool) writes S_VIEW_INTER_PARTY_MATCH_DUNGEON_LIST from its own
+    // DungeonMatching.xml, the character's level and item level, and sends it through the
+    // tunnel: cap_social 1699 -> 1701, cap_social4 8098 -> 8099 (25 dungeons for a level 70).
+    // The battleground tab is the same with 0x1645 and BattleFieldData.xml (cap_social4 8217 ->
+    // 8218: every battleground whose level band admits him). The Arbiter has no writer for either
+    // S_ packet. Until T157 we answered the client ourselves with the def's three bytes - no array
+    // header at all - which the client read as "No available dungeons".
+    // The pool list is empty in every capture; its entries would be the Arbiter's queue state per
+    // instance (what World turns into each role's queue indicator) and are not modelled.
 
-    /// <summary>C_VIEW_INTER_PARTY_MATCH_BATTLEFIELD_LIST (0x9830) -&gt; 0x7A2C, two empty pools.</summary>
+    /// <summary>S_VIEW_INTER_PARTY_MATCH_DUNGEON_LIST.</summary>
+    public const ushort S_VIEW_INTER_PARTY_MATCH_DUNGEON_LIST = 0xF732;
+    /// <summary>S_VIEW_INTER_PARTY_MATCH_BATTLEFIELD_LIST.</summary>
+    public const ushort S_VIEW_INTER_PARTY_MATCH_BATTLEFIELD_LIST = 0x7A2C;
+
+    /// <summary>
+    /// Only when there is no World to ask: [dungeon array 0/0][user pool][party pool][work UI],
+    /// 11 bytes - World's own empty form (cap_social 1701) with every flag off.
+    /// </summary>
+    public static readonly byte[] EmptyDungeonList = { 0x0B, 0x00, 0x32, 0xF7, 0, 0, 0, 0, 0, 0, 0 };
+    /// <summary>The same for battlegrounds: [battleground array][reward-guild array][two pools], 14 bytes.</summary>
+    public static readonly byte[] EmptyBattlefieldList = { 0x0E, 0x00, 0x2C, 0x7A, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+
+    /// <summary>The frame the real Arbiter sends World for a list request - byte-exact against cap_social 1699 / 1723.</summary>
+    public static (ushort Op, byte[] Payload) WorldListRequest(bool dungeons, int characterId)
+        => (dungeons ? PartyPackets.AS_VIEW_INTER_PARTY_MATCH_DUNGEON_LIST_EXTENDED
+                     : PartyPackets.AS_VIEW_INTER_PARTY_MATCH_BATTLEFIELD_LIST_EXTENDED,
+            PartyPackets.BuildAsViewInterPartyMatchList(characterId));
+
+    /// <summary>C_VIEW_INTER_PARTY_MATCH_DUNGEON_LIST (0xBA83): ask World (0x1644); it answers the client.</summary>
+    public static bool OnViewInterPartyMatchDungeonList(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+        => AskWorldForList(s, dungeons: true, log);
+
+    /// <summary>C_VIEW_INTER_PARTY_MATCH_BATTLEFIELD_LIST (0x9830): ask World (0x1645); it answers the client.</summary>
     public static bool OnViewInterPartyMatchBattlefieldList(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
+        => AskWorldForList(s, dungeons: false, log);
+
+    private static bool AskWorldForList(GameSession s, bool dungeons, ILogger log)
     {
-        s.SendByDef("S_VIEW_INTER_PARTY_MATCH_BATTLEFIELD_LIST", new Dictionary<string, object>
+        var w = Program.World;
+        var chr = s.SelectedCharacter;
+        if (w != null && w.IsConnected && s.InWorld && chr != null)
         {
-            ["userPool"] = (byte)0, ["partyPool"] = (byte)0,
-        });
+            var (op, payload) = WorldListRequest(dungeons, (int)chr.Id);
+            w.SendFrame(s.CurrentWorldId, op, payload);
+            return true;
+        }
+        log.LogDebug("C_VIEW_INTER_PARTY_MATCH_{Kind}_LIST: no World to ask - sending the empty list",
+            dungeons ? "DUNGEON" : "BATTLEFIELD");
+        s.Send((byte[])(dungeons ? EmptyDungeonList : EmptyBattlefieldList).Clone());
         return true;
     }
 

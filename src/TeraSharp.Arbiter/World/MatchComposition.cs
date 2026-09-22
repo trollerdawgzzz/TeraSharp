@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 the TeraSharp contributors
+
 namespace TeraSharp.Arbiter.World;
 
 // =============================================================================================
@@ -36,6 +39,9 @@ namespace TeraSharp.Arbiter.World;
 // so Warrior and Berserker really can tank, Fighter (Brawler) really is a tank by default, and
 // the two healers really are Priest and Elementalist (Mystic). <see cref="RoleOf"/> is the
 // default position; <see cref="CanFill"/> is the whole row, including the level gate.
+//
+// T157: the battleground ids and team sizes are no longer a table here - they are read from
+// BattleFieldData.xml (BattleFieldSheet), and only the stated per-type rules stay in code.
 //
 // WHAT IS STILL OURS. Each <Dungeon> row carries a `matchingRoleId` (17 for 53 of the 82 rows,
 // then 23, 32, 26, 29 and eleven one-offs) and the table those ids index is inside the
@@ -118,9 +124,14 @@ public static class MatchComposition
 
     /// <summary>
     /// <c>DungeonMatching.xml</c>'s <c>&lt;ClassPosition&gt;</c>, indexed by the Arbiter's own
-    /// class id (Warrior 0 .. Glaiver 12 - <c>FUN_140065e00</c>, Arb_part_003.c:2179).
+    /// class id (Warrior 0 .. Glaiver 12 - <c>FUN_140065e00</c>, Arb_part_003.c:2179). T159:
+    /// read from the sheet (<see cref="DatasheetLoader.ClassPositions"/>); this is the table as
+    /// transcribed, used only when the sheet is missing.
     /// </summary>
-    public static readonly ClassPosition[] ClassPositions =
+    public static ClassPosition[] ClassPositions => DatasheetLoader.ClassPositions.Value;
+
+    /// <summary>The transcribed <c>&lt;ClassPosition&gt;</c> - the built-in for <see cref="ClassPositions"/>.</summary>
+    public static readonly ClassPosition[] BuiltInClassPositions =
     {
         /*  0 Warrior      */ new(MatchRole.Dps,    MatchRole.Tank,   MatchRole.Dps,    0),
         /*  1 Lancer       */ new(MatchRole.Tank,   MatchRole.Tank,   MatchRole.Tank,   0),
@@ -156,6 +167,66 @@ public static class MatchComposition
         if (p.Default == role || p.Third == role) return true;
         return p.Second == role && level >= p.SecondLevel;
     }
+
+    // ---- the queue window's position choice (T138f) ------------------------------------
+
+    /// <summary>
+    /// C_MATCH_ADD's trailing int32, decoded. T138c read it as "1 on the first queue, 0 on the
+    /// second"; it is the POSITION the player picked in the matching window, in the datasheet's
+    /// own numbering, and the coincidence was that the same player queued twice.
+    ///
+    /// <para>Four captured frames, and one of them settles it:</para>
+    /// <code>
+    ///   classic_live3  8643   Elin Warrior (11001)    1   DPS   -> cancelled at 9476
+    ///   classic_live3 10322   the SAME character      0   Tank  -> matched at 10585
+    ///   cap_multiworld 3889   Castanic Glaiver        1   DPS
+    ///   cap_social4    5294   Human Warrior           1   DPS
+    /// </code>
+    /// <para>The Warrior's two queues differ in this field and nothing else, and
+    /// S_SYS_PARTY_INFO record 10587 puts him in the party as position <b>0, a tank</b> - his
+    /// SECOND position, not his default. He cancelled a DPS queue and re-queued as a tank, which
+    /// is both the confirmation and the reason the choice is binding: the server did not move
+    /// him, he had to ask again.</para>
+    /// <para><b>2 (healer) is never observed</b> - the only healers in the captures are Priest
+    /// and Elementalist, which have no second position to choose - so that row is the numbering,
+    /// not a sample. This table is the one line to change if a later capture disagrees.</para>
+    /// </summary>
+    public static readonly MatchRole[] ChoiceToRole = { MatchRole.Tank, MatchRole.Dps, MatchRole.Healer };
+
+    /// <summary>The value the client sends when it states no position. Ours, not the wire's -
+    /// every captured frame names one, so this is what an absent or short array reads as.</summary>
+    public const int NoChoice = -1;
+
+    /// <summary>
+    /// The position <paramref name="value"/> names, or null when it names none.
+    /// </summary>
+    public static MatchRole? ChosenRole(int value)
+        => (uint)value < (uint)ChoiceToRole.Length ? ChoiceToRole[value] : null;
+
+    /// <summary>
+    /// Whether this class may be put in <paramref name="role"/> given what the player ASKED for.
+    /// A stated position the class can actually fill is binding - a Warrior who queued as DPS is
+    /// not seated as a tank, which is what classic_live3 shows. A stated position the class
+    /// cannot fill is ignored rather than obeyed: a client may narrow its own options, never
+    /// widen them.
+    /// </summary>
+    public static bool CanFill(int classId, MatchRole role, int level, int chosen)
+    {
+        if (!CanFill(classId, role, level)) return false;
+        return ChosenRole(chosen) is not MatchRole pick
+               || !CanFill(classId, pick, level)
+               || pick == role;
+    }
+
+    /// <summary>
+    /// The position a queuer is treated as when nothing is matching on it - the S_SYS_PARTY_INFO
+    /// slot for a battleground team, and the pool-add tail the real server echoes back (record
+    /// 8662 carries 1 for the DPS queue, record 10333 carries 0 for the tank one). Their own
+    /// choice when they made one they can fill, else the class default.
+    /// </summary>
+    public static MatchRole EffectiveRole(int classId, int level, int chosen)
+        => ChosenRole(chosen) is MatchRole pick && CanFill(classId, pick, level)
+            ? pick : RoleOf(classId);
 
     // ---- dungeon templates -----------------------------------------------------------------
 
@@ -197,36 +268,52 @@ public static class MatchComposition
     public const int DefaultMaxTanks = 3;
 
     /// <summary>
-    /// The battlegrounds with a rule of their own, keyed by <c>BattleFieldData.xml</c>'s
-    /// <c>&lt;BattleField id&gt;</c>. The ids and the team sizes are that file's; the healer
-    /// and lancer numbers are the human-stated rules from the T138 brief.
-    /// <code>
-    ///   Round_PvP            37, 38 (3v3) and 39, 40 (5v5)   Champions' Skyring
-    ///   StrongholdOccupation 26, 27, 28, 29 (15v15)          Corsairs' Stronghold
-    ///   Cannon               10, 11 (20v20)                  Fraywind Canyon
-    /// </code>
-    /// <para>Skyring: at most one lancer and EXACTLY one healer, which is the brief's
-    /// "1 mystic or 1 priest per team" - the two healer classes share the one slot.
-    /// Corsairs: at least three healers, no cap and no lancer rule. Fraywind: at most two
-    /// lancers and at least two healers.</para>
-    /// <para>Skyring also carries <c>MaxPerClass = 2</c>, the other half of the same stated
-    /// rule - "every other class can have doubles" - so a team cannot be three brawlers either.
-    /// The two big battlegrounds have no such cap: at 15 and 20 a side, capping every class at
-    /// two would leave most queues unstartable.</para>
+    /// T157. The team rules the T138 brief stated, by <c>BattleFieldData.xml</c> TYPE - the one
+    /// part of a battleground's rule the sheet does not carry. Ids, team sizes and whether a
+    /// battleground exists at all come from the sheet (<see cref="BattleFieldSheet"/>), so the
+    /// four Skyrings, four Corsairs and two Fraywinds the sheet has today all take their type's
+    /// rule, and one taken out of the sheet is out of the matcher.
+    /// <para>Round_PvP (Champions' Skyring): at most one lancer and EXACTLY one healer - the
+    /// brief's "1 mystic or 1 priest per team" - and <c>MaxPerClass = 2</c>, the other half of
+    /// the same rule ("every other class can have doubles"). StrongholdOccupation (Corsairs'
+    /// Stronghold): at least three healers. Cannon (Fraywind Canyon): at most two lancers, at
+    /// least two healers. Any other type takes <see cref="MaxHealersVariable"/> /
+    /// <see cref="MaxTanksVariable"/>.</para>
     /// </summary>
-    public static readonly BattlegroundRule[] Battlegrounds =
+    public static readonly IReadOnlyDictionary<string, (int MinHealers, int MaxHealers, int MaxLancers, int MaxPerClass)> TypeRules =
+        new Dictionary<string, (int, int, int, int)>(StringComparer.Ordinal)
+        {
+            ["Round_PvP"] = (1, 1, 1, 2),
+            ["StrongholdOccupation"] = (3, 0, 0, 0),
+            ["Cannon"] = (2, 0, 2, 0),
+        };
+
+    /// <summary>
+    /// The battlegrounds with a stated rule of their own, one per sheet row whose type is in
+    /// <see cref="TypeRules"/>, in sheet order. Empty when the sheet could not be read.
+    /// </summary>
+    public static IReadOnlyList<BattlegroundRule> Battlegrounds
     {
-        new(37, "Champions' Skyring 3v3", 3, MinHealers: 1, MaxHealers: 1, MaxLancers: 1, MaxPerClass: 2),
-        new(38, "Champions' Skyring 3v3", 3, MinHealers: 1, MaxHealers: 1, MaxLancers: 1, MaxPerClass: 2),
-        new(39, "Champions' Skyring 5v5", 5, MinHealers: 1, MaxHealers: 1, MaxLancers: 1, MaxPerClass: 2),
-        new(40, "Champions' Skyring 5v5", 5, MinHealers: 1, MaxHealers: 1, MaxLancers: 1, MaxPerClass: 2),
-        new(26, "Corsairs' Stronghold", 15, MinHealers: 3, MaxHealers: 0, MaxLancers: 0, MaxPerClass: 0),
-        new(27, "Corsairs' Stronghold", 15, MinHealers: 3, MaxHealers: 0, MaxLancers: 0, MaxPerClass: 0),
-        new(28, "Corsairs' Stronghold", 15, MinHealers: 3, MaxHealers: 0, MaxLancers: 0, MaxPerClass: 0),
-        new(29, "Corsairs' Stronghold", 15, MinHealers: 3, MaxHealers: 0, MaxLancers: 0, MaxPerClass: 0),
-        new(10, "Fraywind Canyon", 20, MinHealers: 2, MaxHealers: 0, MaxLancers: 2, MaxPerClass: 0),
-        new(11, "Fraywind Canyon", 20, MinHealers: 2, MaxHealers: 0, MaxLancers: 2, MaxPerClass: 0),
-    };
+        get
+        {
+            var list = new List<BattlegroundRule>();
+            foreach (var e in BattleFieldSheet.Current ?? Array.Empty<BattleFieldEntry>())
+                if (TypeRules.ContainsKey(e.Type)) list.Add(RuleFrom(e));
+            return list;
+        }
+    }
+
+    private static BattlegroundRule RuleFrom(BattleFieldEntry e)
+    {
+        string name = e.Type + " " + e.Id;
+        if (TypeRules.TryGetValue(e.Type, out var t))
+            return new BattlegroundRule(e.Id, name, e.TeamSize, t.MinHealers, t.MaxHealers, t.MaxLancers, t.MaxPerClass);
+        return new BattlegroundRule(e.Id, name, e.TeamSize,
+            MinHealers: 0,
+            MaxHealers: EnvCount(MaxHealersVariable, DefaultMaxHealers),
+            MaxLancers: 0,
+            MaxPerClass: 0);
+    }
 
     private static int EnvCount(string name, int fallback)
     {
@@ -236,28 +323,28 @@ public static class MatchComposition
     }
 
     /// <summary>
-    /// The rule for <paramref name="battleFieldId"/>. A battleground with no row of its own -
-    /// Kumas Royale, Gridiron, anything a future datasheet adds - falls back to the two
-    /// environment caps and no floor, which is the T138 brief's
-    /// <see cref="MaxHealersVariable"/>/<see cref="MaxTanksVariable"/> path. The environment is
-    /// read on every call, not cached, so a restartless change takes.
+    /// The rule for <paramref name="battleFieldId"/>: its sheet row's team size with its type's
+    /// stated rule, or - for a type with none (Kumas, Free_Fight, anything a future sheet adds) -
+    /// the two environment caps and no floor. The environment is read on every call, so a
+    /// restartless change takes. A battleground the sheet does not have (or no sheet at all)
+    /// gets team size 0, which never forms: it is not offered, so it is not matched.
     /// </summary>
-    public static BattlegroundRule RuleFor(int battleFieldId, int teamSize = 0)
+    public static BattlegroundRule RuleFor(int battleFieldId)
     {
-        foreach (var r in Battlegrounds) if (r.BattleFieldId == battleFieldId) return r;
-        return new BattlegroundRule(battleFieldId, "battleground " + battleFieldId,
-            teamSize > 0 ? teamSize : 0,
-            MinHealers: 0,
-            MaxHealers: EnvCount(MaxHealersVariable, DefaultMaxHealers),
-            MaxLancers: 0,
-            MaxPerClass: 0);
+        var e = BattleFieldSheet.Find(battleFieldId);
+        return e != null ? RuleFrom(e)
+            : new BattlegroundRule(battleFieldId, "battleground " + battleFieldId + " (not in " + BattleFieldSheet.FileName + ")",
+                0, 0, 0, 0, 0);
     }
 
-    /// <summary>Whether a rule came from <see cref="Battlegrounds"/> rather than the fallback.</summary>
+    /// <summary>Whether the sheet offers <paramref name="battleFieldId"/> at all.</summary>
+    public static bool IsOffered(int battleFieldId) => BattleFieldSheet.Find(battleFieldId) != null;
+
+    /// <summary>Whether a battleground's rule is one of <see cref="TypeRules"/> rather than the environment fallback.</summary>
     public static bool HasRule(int battleFieldId)
     {
-        foreach (var r in Battlegrounds) if (r.BattleFieldId == battleFieldId) return true;
-        return false;
+        var e = BattleFieldSheet.Find(battleFieldId);
+        return e != null && TypeRules.ContainsKey(e.Type);
     }
 
     /// <summary>The per-team tank cap for a battleground with no row of its own. 0 = no cap.</summary>

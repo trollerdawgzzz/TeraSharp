@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 the TeraSharp contributors
+
 using Microsoft.Extensions.Logging;
 using TeraSharp.Arbiter.Handlers;
 using TeraSharp.Arbiter.Network;
@@ -220,6 +223,39 @@ public static class GuildWiring
     /// load loop forces 2 for everyone and flips to 0 as sessions arrive.</summary>
     public const int StateOnline = GuildHandlers.MemberStateOnline;
     public const int StateOffline = GuildHandlers.MemberStateOffline;
+
+    /// <summary>
+    /// T172. AS_UPDATE_GUILD_QUEST_POINT_INFO (0x1453), GuildQuestPointRewardManager::SendPointInfoToWorld
+    /// (Arb_part_030.c:1885): <c>[i32 guildId][i32 point][i32 maxPoint][i32 0]</c>, only for a guild
+    /// member and only when maxPoint &gt; 0. cap_final2a/2b: in the C_LOAD_TOPO_FIN burst after 0x1439
+    /// (and after 0x14AF when it is there), 88 frames, all <c>[2|3][0][900][0]</c> - guild 2 for 1003,
+    /// guild 3 for 1. Guild quests are not modelled, so the point is 0; 900 is the captured maximum
+    /// of both (fresh) guilds, whose source row (GuildQuestConfigData) is not among our sheets.
+    /// </summary>
+    public const ushort AS_UPDATE_GUILD_QUEST_POINT_INFO = 0x1453;
+    public const int GuildQuestMaxPoint = 900;
+
+    public static byte[] BuildGuildQuestPointInfo(int guildId, int point = 0, int maxPoint = GuildQuestMaxPoint)
+    {
+        var p = new byte[16];
+        BitConverter.GetBytes(guildId).CopyTo(p, 0);
+        BitConverter.GetBytes(point).CopyTo(p, 4);
+        BitConverter.GetBytes(maxPoint).CopyTo(p, 8);
+        return p;
+    }
+
+    /// <summary>The load-burst send: nothing for a character with no guild.</summary>
+    public static bool SendGuildQuestPointInfo(GameSession? session)
+    {
+        var chr = session?.SelectedCharacter;
+        var store = Store;
+        if (chr == null || store == null || !session!.InWorld) return false;
+        int guildId = store.GetGuildIdOf((int)chr.Id);
+        if (guildId == 0) return false;
+        global::TeraSharp.Arbiter.Program.World?.SendFrame(session.CurrentWorldId, AS_UPDATE_GUILD_QUEST_POINT_INFO,
+            BuildGuildQuestPointInfo(guildId));
+        return true;
+    }
 
     /// <summary>
     /// A guild member entered the world: tell the rest of the guild they are online, and tell

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 the TeraSharp contributors
+
 using System.Collections.Concurrent;
 using Microsoft.Extensions.Logging;
 using TeraSharp.Arbiter.Network;
@@ -130,7 +133,12 @@ public static class BattlegroundRating
     /// <param name="Rating">The rating after, never below <see cref="Floor"/>.</param>
     /// <param name="Delta">What was rolled - which is NOT always
     /// <c>Rating - Previous</c>, because the floor can eat part of a loss.</param>
-    public readonly record struct Result(int Previous, int Rating, int Delta);
+    public readonly record struct Result(int Previous, int Rating, int Delta)
+    {
+        /// <summary>What the rating actually moved by after the floor - the number the client must see,
+        /// so a player on 3 who loses a roll of 8 is shown -3, not -8 (T138c review fix, restored T138f).</summary>
+        public int Applied => Rating - Previous;
+    }
 
     private static readonly ConcurrentDictionary<int, Result> LastResults = new();
 
@@ -177,7 +185,7 @@ public static class BattlegroundRating
         int characterId = (int)(session.SelectedCharacter?.Id ?? 0);
         bool win = ReadDelta(packet) > 0;
         var r = Apply(Program.Store, characterId, win, rng);
-        WriteDelta(packet, r.Delta);
+        WriteDelta(packet, r.Applied);
         log?.LogInformation("battleground: character {Id} {Outcome} - rating {From} -> {To}, delta {Delta}",
             characterId, win ? "won" : "lost", r.Previous, r.Rating, r.Delta);
         return r;

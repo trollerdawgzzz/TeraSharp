@@ -1,16 +1,16 @@
-# TeraSharp — Status
+﻿# TeraSharp â€” Status
 
 Mirrors `CLAUDE.md` section 0. When the two disagree, **CLAUDE.md wins** and this file is stale.
 Day-by-day state, live-debug recipes and the deploy loop are in `status/CHAT-HANDOFF.md`.
 
-Read order for anyone new: `CLAUDE.md` (workspace rules at the top) -> `status/HANDOFF.md` §1
-(DLMItems — the single failure mode behind every relog hang) -> `status/PERSISTENCE-MAP.md`
+Read order for anyone new: `CLAUDE.md` (workspace rules at the top) -> `status/HANDOFF.md` Â§1
+(DLMItems â€” the single failure mode behind every relog hang) -> `status/PERSISTENCE-MAP.md`
 (every per-user W->A opcode and how it is answered) -> this file.
 
-Build: `dotnet build TeraSharp.sln` — 0 warnings, 0 errors.
-Tests: `dotnet run --project src\TeraSharp.Arbiter.Tests` — **808** `[Test]` methods.
-Deploy check: `TeraSharp.Arbiter.exe --selftest` — one PASS/FAIL line per data dependency (T37).
-Config check: `TeraSharp.Arbiter.exe --check-config` — every `TERASHARP_*`, the resolved paths
+Build: `dotnet build TeraSharp.sln` â€” 0 warnings, 0 errors.
+Tests: `dotnet run --project src\TeraSharp.Arbiter.Tests` â€” **808** `[Test]` methods.
+Deploy check: `TeraSharp.Arbiter.exe --selftest` â€” one PASS/FAIL line per data dependency (T37).
+Config check: `TeraSharp.Arbiter.exe --check-config` â€” every `TERASHARP_*`, the resolved paths
 and ports, and the four settings that are legal, silent and wrong (T113).
 One page on processes, ports, the file map and the env: `docs/ARCHITECTURE.md` (T114).
 
@@ -18,14 +18,14 @@ One page on processes, ports, the file map and the env: `docs/ARCHITECTURE.md` (
 in one world are live-verified; so are the T105 fixes that came out of a real session (the starter
 kit was handing every character the same six item db ids, and `/@perfect_level` wrote a row the blob
 then overwrote). Since T64 the work has been **breadth**: every client packet the real Arbiter
-handles is now either registered or deliberately left out — 201 of 273, with the remaining 72 listed
+handles is now either registered or deliberately left out â€” 201 of 273, with the remaining 72 listed
 in `status/MISSING-HANDLERS.txt` and all of them belonging to systems nobody has started (lord and
 city war, petitions, guild quests, the TBA battlepass, rankings, name and appearance change).
 
 Almost all of that breadth is **live-untested**. `status/LIVE-CHECKLIST.md` is still the pass that
 closes the gap, and `docs/GO-LIVE.md` is the ordered checklist for putting this in front of players.
-The one piece of finished work that is not in master is `status/MULTIWORLD-PATCH.diff` — T103/T108/
-T111/T112's changes to the four human-owned files — which waits on the section 5 capture.
+The one piece of finished work that is not in master is `status/MULTIWORLD-PATCH.diff` â€” T103/T108/
+T111/T112's changes to the four human-owned files â€” which waits on the section 5 capture.
 
 ---
 
@@ -42,48 +42,48 @@ exist, nothing routes to it.
 | Enter-world, blob save/load, restriction, gameId per login | **live** |
 | Chat (say / area / global), client settings, keybinds | **live** |
 | Per-user DB writes during play (T15), quests (T17), skills in blob (T18) | **live** |
-| Inventory — bag + worn slots as rows in `items`; 0x27A4 rebuilt from them, atoms applied | **live** (T44) |
-| Character money — `characters.money` from the op-9 atom delta, served back at blob + 448 | **wired** (T59) |
-| Achievements, tutorial tips, seren guide, reputation, fatigability, dungeon cool times — from rows | **live** (T22/T25/T26) |
+| Inventory â€” bag + worn slots as rows in `items`; 0x27A4 rebuilt from them, atoms applied | **live** (T44) |
+| Character money â€” `characters.money` from the op-9 atom delta, served back at blob + 448 | **wired** (T59) |
+| Achievements, tutorial tips, seren guide, reputation, fatigability, dungeon cool times â€” from rows | **live** (T22/T25/T26) |
 | Zone change / quest teleport (0x13BE/0x13C0 echoes) | **live** |
 | Relog into a dead instance (0x138D -> retry at the stored return point) | **live** (T21, verified twice) |
-| Friends, friend groups, memos, block list — two-step requests, all from rows | **live** (T30) |
+| Friends, friend groups, memos, block list â€” two-step requests, all from rows | **live** (T30) |
 | Character delete, cascading every per-character table | **live** |
-| Multiple players — TicketAllocator, N-recipient `SA_BYPASS_TO_CLIENT`, per-ticket reorder | **live** (T38 routing) |
+| Multiple players â€” TicketAllocator, N-recipient `SA_BYPASS_TO_CLIENT`, per-ticket reorder | **live** (T38 routing) |
 | Account auth | **live** as accept-all; tera-api validation behind `TERASHARP_AUTH=true` (T31), its reply shape and fail-closed timeout tested, startup banner names the mode (T113) |
 | GM `/@` recognised by the client (`S_LOGIN_ARBITER.status` 31) | **live** (T32) |
 | Whisper through `ChatManager`, recipients via `WorldBridge.SessionForPlayerId` | **wired** (T43/T47) |
-| The 18 client packets World rejects — tooltip reply, visited sections, client log, small acks | **wired** (T45) |
-| Mail — 3 Arbiter-owned client packets + the 6 `SDB_*_PARCEL` W<->A pairs, empty inbox byte-exact | **wired** (T42/T45) |
-| Warehouse — 8 W->A requests answered from `items`/`warehouses` rows, `0x2754` sealed | **wired** (T42) |
-| Parties — `PartyManager` via `PartyWiring`: 7 `C_` registered, 12 `SA_` gated out of the tunnel | **wired** (T35/T49), byte-exact against cap_social.log (T64) |
-| The party contract broker — the 0x2809..0x2810 handshake, target resolved by name | **wired** (T60), order and layout from the capture (T64) |
-| Friend / block pushes to World — 0x2862, 0x1475, 0x1476 | **wired** (T64) |
-| Guilds — 17 `C_` via `GuildWiring`, rows persisted, `0x27CF` boot load rebuilt from them; 10 of the 12 `SA_` answered | **wired** (T39/T51/T52/T57) |
+| The 18 client packets World rejects â€” tooltip reply, visited sections, client log, small acks | **wired** (T45) |
+| Mail â€” 3 Arbiter-owned client packets + the 6 `SDB_*_PARCEL` W<->A pairs, empty inbox byte-exact | **wired** (T42/T45) |
+| Warehouse â€” 8 W->A requests answered from `items`/`warehouses` rows, `0x2754` sealed | **wired** (T42) |
+| Parties â€” `PartyManager` via `PartyWiring`: 7 `C_` registered, 12 `SA_` gated out of the tunnel | **wired** (T35/T49), byte-exact against cap_social.log (T64) |
+| The party contract broker â€” the 0x2809..0x2810 handshake, target resolved by name | **wired** (T60), order and layout from the capture (T64) |
+| Friend / block pushes to World â€” 0x2862, 0x1475, 0x1476 | **wired** (T64) |
+| Guilds â€” 17 `C_` via `GuildWiring`, rows persisted, `0x27CF` boot load rebuilt from them; 10 of the 12 `SA_` answered | **wired** (T39/T51/T52/T57) |
 | GM World forward (anything not Arbiter-owned -> `AS_ADMIN_COMMAND` 0x2829) + `AS_ENTER_WORLD[111]` AdminLevel | **wired** (T46/T47) |
-| Packet-handling security — bounds, pagination, allocate-by-count, 37k-input fuzz suite | **wired** (T48/T50), 2 human-owned items open |
-| Private chat channels — the channel object, join/leave/kick/password | **designed** (T43), no client packet ever seen |
-| Trade broker — 57 opcodes mapped, codec, 4 corrected `.def`s, the 5 DLM requests answered | **wired** (T53/T55/T71/T72/T74/T81). Search, my-listings and sold tabs are served from real `BrokerListed`/`BrokerSold` rows; only the seller-side capture of T81 pinned the last two layouts |
-| Lord / election / city war, petitions, guild quests, rankings, appearance & name change, TBA battlepass | **not started** — and these are precisely the 72 in `status/MISSING-HANDLERS.txt` |
-| Multi-World / multi-planet | **designed** (T103/T108/T109/T111/T112) — the Cowork-owned half is in master; the four human-owned files are not, and wait as `status/MULTIWORLD-PATCH.diff` |
-| Cards and crests — `cards` per ACCOUNT, `card_mounts` per character, `crests` from `SA_LEARN_ALL_CREST_ACQUIRABLE` | **wired** (T83/T85/T85b/T86) |
+| Packet-handling security â€” bounds, pagination, allocate-by-count, 37k-input fuzz suite | **wired** (T48/T50), 2 human-owned items open |
+| Private chat channels â€” the channel object, join/leave/kick/password | **designed** (T43), no client packet ever seen |
+| Trade broker â€” 57 opcodes mapped, codec, 4 corrected `.def`s, the 5 DLM requests answered | **wired** (T53/T55/T71/T72/T74/T81). Search, my-listings and sold tabs are served from real `BrokerListed`/`BrokerSold` rows; only the seller-side capture of T81 pinned the last two layouts |
+| Lord / election / city war, petitions, guild quests, rankings, appearance & name change, TBA battlepass | **not started** â€” and these are precisely the 72 in `status/MISSING-HANDLERS.txt` |
+| Multi-World / multi-planet | **designed** (T103/T108/T109/T111/T112) â€” the Cowork-owned half is in master; the four human-owned files are not, and wait as `status/MULTIWORLD-PATCH.diff` |
+| Cards and crests â€” `cards` per ACCOUNT, `card_mounts` per character, `crests` from `SA_LEARN_ALL_CREST_ACQUIRABLE` | **wired** (T83/T85/T85b/T86) |
 | Guild perks, crest windows, the guild board, guild search, level ranking, the flag image | **wired** (T83/T95) |
-| The In-Game Operation Tool (Alt+A) — 9 `C_ADMIN_*`, user-info tabs, the 400-byte inventory record, bookmarks, the panel's own URL reply | **wired** (T89/T91/T93/T99/T107) |
-| The lobby, packet for packet — `S_LOGIN_ARBITER.status` 31/33, `S_DECO_UI_INFO`, `S_CONFIRM_INVITE_CODE_BUTTON`, `S_CURRENT_ELECTION_STATE` | **wired** (T89b/T104/T106/T106b/T106c) |
-| The ack / small-reply batch — 26 packets read out of their own `Handler_C_*`, none in any capture | **wired** (T97) |
+| The In-Game Operation Tool (Alt+A) â€” 9 `C_ADMIN_*`, user-info tabs, the 400-byte inventory record, bookmarks, the panel's own URL reply | **wired** (T89/T91/T93/T99/T107) |
+| The lobby, packet for packet â€” `S_LOGIN_ARBITER.status` 31/33, `S_DECO_UI_INFO`, `S_CONFIRM_INVITE_CODE_BUTTON`, `S_CURRENT_ELECTION_STATE` | **wired** (T89b/T104/T106/T106b/T106c) |
+| The ack / small-reply batch â€” 26 packets read out of their own `Handler_C_*`, none in any capture | **wired** (T97) |
 | Item strings, board posts, item preview, trade log, dungeon ranking, the GM tool tail | **wired** (T99) |
-| Watched movies — stored per ACCOUNT, so the intro cutscene stops replaying every relog | **wired** (T104) |
-| Admin web — account and character pages, search, online list, grants, bans, announces, admin log, status tab with a live log tail | **wired** (T101/T101b/T101c/T101d/T106), served on loopback behind `TERASHARP_ADMIN_TOKEN` |
-| Item names in the admin web — the client's own `StrSheet_Item*.xml`, both sheets merged, loaded lazily | **wired** (T101c/T113) |
-| Play time — `characters.play_seconds` stamped at leave-world, account total in the same transaction | **wired** (T113). Not in `S_GET_USER_LIST`: that def has no field for it |
-| Logging — console at Warning, a daily `arbiter-<date>.log` taking everything, the spam pushes at Debug | **wired** (T106) |
+| Watched movies â€” stored per ACCOUNT, so the intro cutscene stops replaying every relog | **wired** (T104) |
+| Admin web â€” account and character pages, search, online list, grants, bans, announces, admin log, status tab with a live log tail | **wired** (T101/T101b/T101c/T101d/T106), served on loopback behind `TERASHARP_ADMIN_TOKEN` |
+| Item names in the admin web â€” the client's own `StrSheet_Item*.xml`, both sheets merged, loaded lazily | **wired** (T101c/T113) |
+| Play time â€” `characters.play_seconds` stamped at leave-world, account total in the same transaction | **wired** (T113). Not in `S_GET_USER_LIST`: that def has no field for it |
+| Logging â€” console at Warning, a daily `arbiter-<date>.log` taking everything, the spam pushes at Debug | **wired** (T106) |
 | Starter kit item db ids drawn from the shared counter instead of a fixed 7..12 | **live** (T105, found and fixed from a real session) |
-| Go-live kit — default-deny firewall, scheduled SQLite backup with a verified restore, the checklist | **wired** (`tools/harden-netcup.ps1`, `tools/backup-db.ps1`, `docs/GO-LIVE.md`) |
+| Go-live kit â€” default-deny firewall, scheduled SQLite backup with a verified restore, the checklist | **wired** (`tools/harden-netcup.ps1`, `tools/backup-db.ps1`, `docs/GO-LIVE.md`) |
 ## Where the truth lives
 
 | Question | File |
 |---|---|
-| Why a relog hangs | `status/HANDOFF.md` §1 |
+| Why a relog hangs | `status/HANDOFF.md` Â§1 |
 | Is opcode 0xNNNN answered, and how | `status/PERSISTENCE-MAP.md` (a test parses this table) |
 | Quest list / quest writes | `status/QUEST-DESIGN.md` |
 | Inventory and the 536-byte item record | `status/INVENTORY-DESIGN.md` |
@@ -92,19 +92,19 @@ exist, nothing routes to it.
 | Enter-world failure and the fallback retry | `status/ENTER-WORLD-FALLBACK.md` |
 | The per-character login loads, and the two that resisted | `status/ACHIEVEMENTS.md` |
 | Reputation and fatigability, and why the captures alone could not pin them | `status/REPUTATION-FATIGABILITY.md` |
-| Friends, groups, memos, blocks — and the patch-101 def trap | `status/FRIENDS.md` |
+| Friends, groups, memos, blocks â€” and the patch-101 def trap | `status/FRIENDS.md` |
 | What a second player still needs | `status/MULTIPLAYER-DESIGN.md` |
 | The login ticket, and who actually checks it | `status/AUTH-DESIGN.md` |
 | How `/@` commands reach the server and who runs them | `status/GM-DESIGN.md` |
 | What to click, and which log line proves it worked | `status/LIVE-CHECKLIST.md` |
 | What to capture next, and which task consumes it | `status/CAPTURE-PLAN.md` |
-| The two tunnel frame layouts, and the Ticket | `status/MULTIPLAYER-DESIGN.md` §6, `World/TunnelFrames.cs` |
+| The two tunnel frame layouts, and the Ticket | `status/MULTIPLAYER-DESIGN.md` Â§6, `World/TunnelFrames.cs` |
 | Every GM command, by side and risk tier | `status/GM-COMMANDS-ARBITER.md`, `status/GM-COMMANDS-FULL.md` |
 | Dungeon cool times and entry counts | `status/DUNGEON-COOLTIME.md` |
 | Mail, the warehouse, and which pocket id means what | `status/MAIL-WAREHOUSE.md` |
-| Where an item is, and which atom op moved it | `status/INVENTORY-DESIGN.md` §7, `status/PERSISTENCE-MAP.md` |
+| Where an item is, and which atom op moved it | `status/INVENTORY-DESIGN.md` Â§7, `status/PERSISTENCE-MAP.md` |
 | What a real party looks like on the wire, end to end | `status/PARTY-DESIGN.md` section 13, `status/CONTRACT-DESIGN.md` section 10 |
-| Why a warehouse move is not an `SDB_ITEM_SINGLE` atom | `status/MAIL-WAREHOUSE.md` §6 |
+| Why a warehouse move is not an `SDB_ITEM_SINGLE` atom | `status/MAIL-WAREHOUSE.md` Â§6 |
 | Everything else in the 2026-09-13 relog capture | `status/RELOG-CAPTURE-NOTES.md` |
 | Guilds - the object, the SQL schema, the opcodes and the .def corrections | `status/GUILD-DESIGN.md` |
 | Guild rows, the Arbiter-side guild handlers, and the wiring they still need | `status/GUILD-DESIGN.md` section 10 |
@@ -126,21 +126,21 @@ exist, nothing routes to it.
 
 1. **Never send a `DBS_*` reply World did not ask for.** Every `DBS_` carries a DLM id World looks
    up; an unsolicited one completes whichever item currently holds that id.
-2. **Every per-user W->A request must be answered** — allow-listed in
+2. **Every per-user W->A request must be answered** â€” allow-listed in
    `DbProxyHandlers.IsHandledRequest`, or in `WorldReplayTable.OneWayFromWorld`, or with a replay
    entry. `no replay for 0xNNNN` right before silence is the tell.
 3. **Captured per-character data must never be served to another character.** Quests, inventory,
    the world blob, skills and the T22 loads each bit us as "every new character got dob's X".
-   playerId 1 (dob) is the one character that still gets the captures, on purpose —
+   playerId 1 (dob) is the one character that still gets the captures, on purpose â€”
    `DbProxyHandlers.ServesCapturedStatics` is the single place that decides it.
 
 Two guards enforce this and both fail the build:
 `Every_per_user_request_opcode_is_answered` (from PERSISTENCE-MAP.md) and
-`Dispatch_switch_and_the_allow_list_agree` (T24 — a dispatch case that is in neither
+`Dispatch_switch_and_the_allow_list_agree` (T24 â€” a dispatch case that is in neither
 `IsHandledRequest` nor `DispatchOnlyForTests` is dead code, which is how four per-character loads
 went on replaying dob's bytes until T22).
 
-## Scope — who may edit what
+## Scope â€” who may edit what
 
 From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and cannot run git.
 
@@ -148,14 +148,14 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   `World/WorldReplayTable.cs`, `World/PartyManager.cs`, `World/StarterInventory.cs`,
   `Persistence/CharacterStore.cs`, `Handlers/CharacterHandlers.cs`, `Handlers/SocialHandlers.cs`,
   `Handlers/ChatHandlers.cs`, `Handlers/GmCommands.cs`, `Auth/*`, `Protocol/*`,
-  `src/TeraSharp.Arbiter.Tests/`, `status/*.md`, `data/*` — plus any new file a task brief names
+  `src/TeraSharp.Arbiter.Tests/`, `status/*.md`, `data/*` â€” plus any new file a task brief names
   explicitly. That last clause is how `World/ChatManager.cs`, `World/ActionDispatcher.cs`,
   `World/ParcelDbHandlers.cs`, `World/PartyWiring.cs`, `World/GuildWiring.cs`,
   `Handlers/GuildHandlers.cs`, `Handlers/ArbiterClientHandlers.cs`, `World/GuildWarManager.cs`,
   `World/WorldRegistration.cs`, `World/WorldInstances.cs`, `World/WorldServerList.cs`,
   `Web/AdminApi.cs`, `Web/AdminServer.cs`, `Web/ArbiterLog.cs`, `Protocol/ItemNames.cs`,
   `tools/*` and `docs/*` came to exist; once created they stay editable.
-- **Human-owned — describe the change, never edit:** `World/WorldBridge.cs`,
+- **Human-owned â€” describe the change, never edit:** `World/WorldBridge.cs`,
   `World/TunnelFrames.cs`, `Network/*`, `Handlers/WorldEntry.cs`, `Handlers/HandlerRegistry.cs`,
   `Handlers/LoginHandlers.cs`, `Program.cs`.
 
@@ -163,12 +163,12 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
 
 - [x] **T1-T113 merged.** `git log --oneline` is the record; the last merge is
   `Merge cowork T113 + wiring: play time, item names, check-config`.
-- [x] **T114** — docs refreshed from git: this table, `CLAUDE.md` section 0,
+- [x] **T114** â€” docs refreshed from git: this table, `CLAUDE.md` section 0,
   `status/MISSING-HANDLERS.txt` (regenerated, 126 -> 72) and `docs/ARCHITECTURE.md`.
 - [ ] **The live pass.** `status/LIVE-CHECKLIST.md` sections 5-11, two clients, ~45 minutes.
   It has been the next thing to do since T51 and the untested surface has grown every task
   since; almost everything in the table above marked **wired** is waiting on it.
-- [ ] **Apply `status/MULTIWORLD-PATCH.diff`** (`git apply`, not `patch -p1` — T112) once the
+- [ ] **Apply `status/MULTIWORLD-PATCH.diff`** (`git apply`, not `patch -p1` â€” T112) once the
   `status/CAPTURE-PLAN.md` section 5 capture settles the ticket-overlap question.
 - [ ] Then the two capture sessions in `status/CAPTURE-PLAN.md`, in that order.
 - [ ] **Go live**: `docs/GO-LIVE.md`, in order, ending at the firewall.
@@ -181,30 +181,30 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   comparing (`packetStart + packetLength > payload.Length`). For a `packetLength` near
   `int.MaxValue` that sum overflows negative, the bound passes, and `new byte[packetLength]`
   throws `OutOfMemoryException`. Compare on the safe side instead:
-  `packetLength > payload.Length - packetStart`. This is H1 from `status/SECURITY-AUDIT.md` §5.1,
-  which moved into `TunnelFrames` when the routing was applied — the file the audit named no
+  `packetLength > payload.Length - packetStart`. This is H1 from `status/SECURITY-AUDIT.md` Â§5.1,
+  which moved into `TunnelFrames` when the routing was applied â€” the file the audit named no
   longer contains the code. 0x13F7 is the highest-volume frame on the link, and the fuzz suite
   does not reach this parser (it drives `DbProxyHandlers.TryHandle`, not `WorldBridge.HandleFrame`).
 - `Program.Store` has a private setter, so the client fuzz runs against a null store and only
   covers the shallow half of each handler. `internal set` would fix it
-  (`status/SECURITY-AUDIT.md` §5.4). Five real `Convert.ToInt32` bugs in `SocialHandlers` were
+  (`status/SECURITY-AUDIT.md` Â§5.4). Five real `Convert.ToInt32` bugs in `SocialHandlers` were
   found by reading in T50 precisely because the suite could not reach them.
 - `Network/PacketReader.cs` is dead code and its `ReadOffsetString` uses a body-relative offset
-  where the protocol is packet-relative — delete it or fix it before anyone wires it up.
+  where the protocol is packet-relative â€” delete it or fix it before anyone wires it up.
 
 **No arbiter log line to watch**
 
 - Guild handlers log nothing at Information. Every other subsystem announces itself
-  (`Party 0x{Id:X} created`, `Whisper from {Name} delivered`, `C_ADD_FRIEND: …`), so a live guild
+  (`Party 0x{Id:X} created`, `Whisper from {Name} delivered`, `C_ADD_FRIEND: â€¦`), so a live guild
   test has to be judged from the client and the DB. One `_log.LogInformation` per guild command in
-  `GuildWiring` would close it; `status/LIVE-CHECKLIST.md` §9 says so at the top of the step.
+  `GuildWiring` would close it; `status/LIVE-CHECKLIST.md` Â§9 says so at the top of the step.
 
 **Needs a live session (`status/LIVE-CHECKLIST.md`)**
 
 - Whether answering `C_SHOW_ITEM_TOOLTIP_EX` is what repaints a used potion's count. The packet is
   certainly the Arbiter's and certainly carries `Count`, but no capture has the exchange
-  (`status/CLIENT-REJECTS.md` §2.4).
-- Everything else in §§5-11 of the checklist: the empty mailbox, whisper between two clients,
+  (`status/CLIENT-REJECTS.md` Â§2.4).
+- Everything else in Â§Â§5-11 of the checklist: the empty mailbox, whisper between two clients,
   party invite/accept/leave, guild create/invite/accept/announce, `/@teleport` and `AdminLevel[5]`.
 
 **Needs a capture (`status/CAPTURE-PLAN.md`)**
@@ -212,45 +212,45 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
 - **Warehouse**: no capture contains a single warehouse frame; every offset in
   `World/WarehouseHandlers.cs` comes from the PDL dumpers cross-checked against the writers.
 - **`ParcelDataNoMsg`** (0x9e8 B): the interior is unknown, so `ParcelCount = 0` is the only
-  honest `DBS_LIST_PARCEL` this build can send (`status/MAIL-WAREHOUSE.md` §9).
+  honest `DBS_LIST_PARCEL` this build can send (`status/MAIL-WAREHOUSE.md` Â§9).
 - **`SDB_CREATE_GUILD2`'s 0x2A-byte fixed part** and the `DBS_CREATE_GUILD2`
-  broadcast-then-unicast `DlmId` trick — the highest-risk claims in `status/GUILD-DESIGN.md` (§8),
+  broadcast-then-unicast `DlmId` trick â€” the highest-risk claims in `status/GUILD-DESIGN.md` (Â§8),
   and the only place where a wrong size kills the World link.
 - **`S_GUILD_INFO` / `S_GUILD_MEMBER_LIST`** with a real guild: 31 unaligned fields.
-- **No captured party bytes exist at all** (`status/PARTY-DESIGN.md` §11.1); the A->W frames are
+- **No captured party bytes exist at all** (`status/PARTY-DESIGN.md` Â§11.1); the A->W frames are
   golden against the decompiled writers and nothing else.
-- **No private channel packet has ever been seen** (`status/CHAT-DESIGN.md` §9): the member cap
+- **No private channel packet has ever been seen** (`status/CHAT-DESIGN.md` Â§9): the member cap
   default, what the create/edit invite list sends each invitee, and the master-promotion rule are
   all ours, not the binary's.
 - Six `S_` reply shapes whose requests cannot be answered properly until a client sends them:
   `S_DUNGEON_COOL_TIME_LIST`, `S_REPLY_GUILD_LIST`, `S_SHOW_PARTY_MATCH_INFO`,
   `S_MY_PARTY_MATCH_INFO`, `S_SHOW_CANDIDATE_LIST`, `S_VIEW_BATTLE_FIELD_RESULT`.
 - Trade broker: no listings table, so every answer is an empty form or a refusal. The five
-  DLM-carrying requests ARE answered (T55) — that was the part that wedged characters. A real
-  broker needs the two tables of `BROKER-DESIGN.md` §6.1 and a manager, both of which wait on
+  DLM-carrying requests ARE answered (T55) â€” that was the part that wedged characters. A real
+  broker needs the two tables of `BROKER-DESIGN.md` Â§6.1 and a manager, both of which wait on
   a capture. `SDB_TRADE_BROKER_START_DEAL` and `_CANCEL_DEAL` are still unanswered on purpose:
   neither carries a DlmId, so neither can head-block anyone.
 
 **Known-incomplete, by choice**
 
-- Parties: four W->A opcodes are gated to `PartyManager` but have no case — `SA_SWAP_PARTY`
+- Parties: four W->A opcodes are gated to `PartyManager` but have no case â€” `SA_SWAP_PARTY`
   0x139A, `SA_CHANGE_PARTY_MEMBER_AUTHORITY` 0x139C, `SA_JOIN_PARTY_IN_ARBITER` 0x13AB,
   `SA_MERGE_PARTY_TO_RAID` 0x13AC. They log a rejection and send nothing
-  (`status/PARTY-DESIGN.md` §11.6). Party matching is registered and deliberately swallowed (§11.3).
+  (`status/PARTY-DESIGN.md` Â§11.6). Party matching is registered and deliberately swallowed (Â§11.3).
 - `DBS_LOAD_DUNGEON_COOL_TIME` lists 1 and 2 (clear counts, UI history): stored, not served,
-  layouts unobserved (`status/DUNGEON-COOLTIME.md` §3).
+  layouts unobserved (`status/DUNGEON-COOLTIME.md` Â§3).
 - The trailing u32 of the fatigability element (630 / 1626 / 88 in the captures) is sent as 0;
-  nothing explains it and World never reads it (`status/REPUTATION-FATIGABILITY.md` §2.3).
+  nothing explains it and World never reads it (`status/REPUTATION-FATIGABILITY.md` Â§2.3).
 - Warehouse `MaxSlotCount` is 0 until a `warehouses` row exists; the real caps are in
   `ServerConfig.xml`, which we do not read.
 - Continent fallback table for a character with no stored return point
-  (`status/ENTER-WORLD-FALLBACK.md` §9).
+  (`status/ENTER-WORLD-FALLBACK.md` Â§9).
 - Exit countdown: `S_PREPARE_EXIT` is not in the def registry.
 - Friend/blocked memos skip the Arbiter's banned-word + NetModerator stage (we have neither).
 - `S_CHANGE_FRIEND_STATE` on login/logout and the `AS_*` block-list pushes are not sent
   (`status/MULTIPLAYER-DESIGN.md`).
 
-**Closed since the last revision of this file** — kept for one cycle so a stale note is recognisable
+**Closed since the last revision of this file** â€” kept for one cycle so a stale note is recognisable
 
 - T21 relog-into-instance: live-verified twice on 2026-09-14.
 - `AS_ENTER_WORLD[111]` AdminLevel: populated from `GmCommandHandlers.LevelOf` (T46).
@@ -259,44 +259,44 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   `ArbiterClientHandlers.ArbiterOwned` and the `PacketDispatcher` deny-list (T45).
 - The guild/chat/party wiring length bug (TOTAL vs BODY): the registry now calls
   `GuildWiring.MinBodyLength` / `PartyWiring.MinBodyLength`.
-- `WorldLink.ReceiveLoop` per-frame try/catch: applied — a throwing handler now logs
+- `WorldLink.ReceiveLoop` per-frame try/catch: applied â€” a throwing handler now logs
   `Link #{Id}: handler for 0x{Op:X4} ({Len} B) threw - frame dropped` instead of closing the link.
 - `C_CHECK_ALIVE`: registration dropped (it is not in opcode map 376012).
 - The replayed `DBS_INIT_GUILD_DATA` stack-padding leak: retired by allow-listing `0x27CF` (T51).
 - `status/*.txt` decompile scratch files: down to two (`arbiter_c_handlers.txt`,
   `arbiter_s_packets.txt`), both still referenced by the scope notes.
-- T65 (live 2026-09-16): `SDB_ITEM_TRADE` 0x276A answered (0x238 records, not 0x358) — it was
+- T65 (live 2026-09-16): `SDB_ITEM_TRADE` 0x276A answered (0x238 records, not 0x358) â€” it was
   head-blocking a character's DLM queue; `SA_JOIN_PARTY_IN_ARBITER` 0x13AB now reaches PartyManager,
   which is the only way a party forms in this build; parcel rows carry their parcel id and receiver
   again and attached gold is paid on claim; friend-accepted system message is SMT 433.
 
-- T69 (cap_social2.log, real Arbiter): `SDB_CREATE_GUILD2` 0x27D4 answered — guild creation was
+- T69 (cap_social2.log, real Arbiter): `SDB_CREATE_GUILD2` 0x27D4 answered â€” guild creation was
   unanswered and head-blocked the founder; `SDB_LOAD_REFER_A_FRIEND_LIST` 0x28B0 and
   `SDB_LOAD_INVITE_FRIEND` 0x28B7 promoted out of the replay table (both echo a DlmId); warehouse
   MaxSlotCount is 0x48 and EndPos is the last index, not one past it; TS op 0x10 applied. The guild
   boot terminator and the whole warehouse request/reply layout are confirmed byte-exact.
 
 - T70 (cap_social3.log): the broker's TradeData/CalcItemList record (0x188) decoded at last, and
-  the two-step Step 1 = read / Step 2 = commit protocol pinned — BROKER-DESIGN.md says what is
+  the two-step Step 1 = read / Step 2 = commit protocol pinned â€” BROKER-DESIGN.md says what is
   left (the listings table). `AS_LOAD_EXTRAPOINT_DATA` 0x1555 was writing Result and UserDbId at
   the wrong offsets, so World read back user 1 for every character; fixed and byte-exact.
   Of the 31 opcodes in T70's item-2 list, 25 are Arbiter -> World pushes and cannot wedge; of the
   six real requests only 0x1554 carries a DlmId.
 
 - T71 (cap_social3.log): the broker listings table exists and the five two-step DB-proxy handlers
-  run on it — register (price read from the op-53 atom at +0x288), cancel, buy, and the two
+  run on it â€” register (price read from the op-53 atom at +0x288), cancel, buy, and the two
   collects, with the three different Step-2 reply shapes pinned. All twelve captured broker frames
   reproduce byte for byte. A listed item lives in inven 6, the broker pocket, not in limbo. The
   client half (nine `C_TRADE_BROKER_*` windows) is still the empty forms.
 
-- T72: master is green again — `T71_registering_creates_a_listing_and_pockets_the_item` was the
+- T72: master is green again â€” `T71_registering_creates_a_listing_and_pockets_the_item` was the
   test, not the code (`AddCharacterMoney` clamps at zero and the test's seller had none). The
   broker's two client list bodies are decoded and served from the listings table:
   `S_TRADE_BROKER_WAITING_ITEM_LIST` (92-byte elements) and `_BOUGHT_ITEM_LIST` (98-byte), plus
   the float 469.0 `S_TRADE_BROKER_HIGHEST_ITEM_LEVEL` that T45 was answering as 0. REGISTERED and
   SOLD stay on the empty form: the capture never shows a populated one.
 
-- T74 (live 2026-09-16 economy pass): mail attachments arrive again — `SDB_RECV_PARCEL` is
+- T74 (live 2026-09-16 economy pass): mail attachments arrive again â€” `SDB_RECV_PARCEL` is
   two-step and its reply carries the full 3544-byte record, not the 0x9e8 list form, so World can
   build the step-2 atoms; warehouse withdraw no longer multiplies the stack (TS op 0x11 is a
   magnitude to remove, not a signed delta); an already-collected broker row answers Success 1 so
@@ -305,36 +305,36 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   populated one and the shipped def is provably wrong about the list we did verify.
 
 - T77 (cap_social4.log): thirteen previously unanswered W->A request/reply pairs are named,
-  decoded and answered, and two one-way writes are sealed — the DB-proxy half of EP, character
+  decoded and answered, and two one-way writes are sealed â€” the DB-proxy half of EP, character
   cards, crest points, limit reputation, the feudal-lord flag, the battle-pass season and system
   mail. EP is now **persisted**: the six numbers `SDB_UPDATE_EXTRA_POINT` writes survive a relog
   and come back in `AS_LOAD_EXTRAPOINT_DATA`, which answered 53 zero bytes on every login before.
   Guild war, LFG/party matching, servants, the wanted board and the guild logo are **A->W pushes
-  only** in this capture (0x14A3/0x14AC/0x14AF/0x14B3, 0x1413, 0x14E1/0x14E2/0x14E6/0x14E9, ...) —
+  only** in this capture (0x14A3/0x14AC/0x14AF/0x14B3, 0x1413, 0x14E1/0x14E2/0x14E6/0x14E9, ...) â€”
   nothing to pin a handler against, so they are reported rather than built.
 
-- T79 (live 2026-09-16, part 2): `SDB_USER_FORGET_SKILL` 0x2792 named and answered — six pairs in
+- T79 (live 2026-09-16, part 2): `SDB_USER_FORGET_SKILL` 0x2792 named and answered â€” six pairs in
   cap_social4 went unanswered and head-blocked the account's DB queue on the first forgotten
   skill. Warehouse withdraw no longer duplicates: the op-17 atom carries ItemDbId 0 **and src
-  slot 0** in every capture, so the row is resolved by template id — by slot it only worked when
+  slot 0** in every capture, so the row is resolved by template id â€” by slot it only worked when
   the bank row happened to sit at slot 0, which is why it failed on a second character. The
   served `ParcelData` record now carries its own send date (+0xAC, six u16s: year, month, day,
   hour, minute, second) and read flag (+0xA8); replaying World's zeros there is what produced
   "cannot claim now" and a deletion date in 2013. The intro cinematic is **not** driven by
-  `S_VISITED_SECTION_LIST` — the client reads `S_VISIT_NEW_SECTION.isFirstVisit` (1 in
+  `S_VISITED_SECTION_LIST` â€” the client reads `S_VISIT_NEW_SECTION.isFirstVisit` (1 in
   cap_newchar_client frame 436 where the intro plays, 0 in cap_social_client frame 374 where it
   does not); the list is built from the stored rows and is byte-exact, but we send it **eighth**
   in the C_LOAD_TOPO_FIN burst where the real Arbiter sends it **first** (frame 257, ahead of
   S_REQUEST_INVITE_GUILD_TAG).
 
 - T81 (cap_social3_client2.log): the broker's last two tabs are real. That log is the **seller's**
-  client of the cap_social3 session — the one T71/T72/T74 worked from was the buyer's, which is
+  client of the cap_social3 session â€” the one T71/T72/T74 worked from was the buyer's, which is
   why both tabs were empty there and stayed on the empty form for three tasks.
   `S_TRADE_BROKER_REGISTERED_ITEM_LIST` has a 66-byte element that carries **no name at all** and
   opens with two u16s rather than three (frames 1258 / 1436 / 1457, one, two and three rows,
   oldest first); `S_TRADE_BROKER_SOLD_ITEM_LIST` has a 20-byte fixed part and an element that is
   the bought-list element **plus one i64** at +76 (frame 1572, with seq 1486 as an independent
-  witness for everything before it). Both are served from the listings table — Active Listings
+  witness for everything before it). Both are served from the listings table â€” Active Listings
   from `BrokerListed`, Sold from `BrokerSold` until the proceeds are taken. T74's "the defs
   disagree, so these two wait for a capture" note in BROKER-DESIGN.md is replaced by the layouts.
 
@@ -1048,7 +1048,7 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   `T128_vis_and_invis_are_arbiter_side_commands`.
 
 - T130: **Noctenium `.npcap` converter** (`tools/npcap-to-capture.ps1`, `tools/README.md`).
-  `D:\packetlogs\classic_live.npcap` is a client-side capture of the **live Classic+ server** -
+  `<captures>\classic_live.npcap` is a client-side capture of the **live Classic+ server** -
   the first working non-GM reference this project has had - and nothing could read it.
 
   **The container, reversed from the first records and then verified over all 7 391:**
@@ -1259,3 +1259,242 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   committed `bin/`/`obj/` (it does not - they are ignored), and I first concluded there was no
   verbatim decompiled C anywhere. A 4-consecutive-lines heuristic said so; a
   two-identifiers-on-one-line rule found 198. The tool is right and the eyeball was not.
+
+- T141: **the economy, checked against a server that answers** (`status/BROKER-DESIGN.md`, the
+  T141 section). `classic_live4.log` is a client capture of a live Classic+ 100.02 server
+  driven through a whole broker episode, a mail episode, warehouse moves and two player
+  trades. Ten of the S_ packets in it are ours; every one was rebuilt from the frame's own
+  decoded values and diffed byte-for-byte.
+
+  **Eight came back byte-exact first time**: `S_TRADE_BROKER_HIGHEST_ITEM_LEVEL`,
+  `CALC_NOTIFY`, `INPUT_PRICE`, `REGISTERED_ITEM_LIST` (empty and one row), `BUY_IT_NOW`,
+  `SOLD_ITEM_LIST` (empty), `S_SHOW_PARCEL_MESSAGE` (all five) and
+  `S_PARCEL_READ_RECV_STATUS` (all seven). Two of those answered a question the old captures
+  could not: CALC_NOTIFY's pair is SoldCount then BoughtCount (seq 6019 reads (0,1) with one
+  purchase uncollected and 6071 reads (0,0) after it), and READ_RECV_STATUS seq 7164 is the
+  first frame anywhere with the second u32 set, so it is a field and not padding.
+
+  **One real bug.** `BlTotalPaid` (+68) was the listing price; it is the price **with the
+  broker's cut on it**. The live purchase proves it inside one frame set - the bought row at
+  seq 6056 reads Price 6562 and TotalPaid 7546, and the same trade's search row at seq 5938
+  reads TotalPriceWithTax 7546. T74 read it as the price because its only row was priced at 1,
+  where the two are the same number. Fixed in both the bought and the sold builder;
+  `SlSellerProceeds` (+76) is deliberately left as the price.
+
+  **The fee rate is server configuration.** All 80 live search rows satisfy
+  `price + price * 15 / 100` exactly and none satisfy the hard-coded tenth. Our own 100.02
+  charges a tenth (10001 lists at 11001), so 10 stays the default and
+  `TERASHARP_BROKER_FEE_PERCENT` overrides it.
+
+  **Not ours, so not diffed**: `S_LIST_PARCEL_EX`, `S_SEND_PARCEL_TAX`, `S_VIEW_WARE_EX`,
+  `S_ADD_TRADE_BAG`, `S_TRADE_BOX`, `S_TRADE_ACCEPT`, `S_TRADE_BAG_DONE`. TeraSharp has no
+  builder for any of them - World writes them and we only feed the `DBS_` rows behind them.
+  Checking the Arbiter-fed fields needs an A-W tap, and this capture is a client-side one of
+  someone else's server, so that is left open.
+
+  **Left open**: two u8 flags in the waiting element, `+51` (1 on 40 of 80 live rows, 0 on the
+  other 40, correlating with nothing we can see) and `+83` (1 on all 80). Both are 0 on all
+  five of our own rows, which is what we send. Named `WlUnknownFlagA` / `WlUnknownFlagB` so
+  the element tail is not mistaken for padding.
+
+  A correction worth recording: my first pass reported both flags as "1 on every live row" -
+  it came from collecting the set of values seen at each offset instead of the value per row,
+  and the rebuild-and-diff caught it. Aggregate over rows is not the same as the row.
+
+- T147: **crafting and gathering** (`status/CRAFTING.md`). The crafting window's two packets,
+  `S_ARTISAN_SKILL_LIST` and `S_ARTISAN_RECIPE_LIST`, are World-built and tunnelled through
+  `SA_BYPASS_TO_CLIENT`; the Arbiter only owns the rows behind them. It answered the two loads
+  (empty, replay-served) and none of the ten writes: `SDB_LEARN_ITEM_RECIPE`,
+  `SDB_DELETE_ITEM_RECIPE_LIST`, `SDB_SET_RECIPE_BOOKMARK`, `SDB_ITEM_PRODUCE_STEP1/2`,
+  `SDB_UPDATE_SKILL_PROF` and the four gathering `S_UPDATE_PROF_*` (0x273D-0x2740). Each
+  carries a DlmId, so the first recipe, craft or gathered node head-blocked the character.
+
+  All twelve are handled now. Recipes, skill proficiencies and gathering levels persist per
+  character (`item_recipes`, `skill_profs`, `gathering_profs`). LEARN and STEP2 apply and echo
+  their item atoms, STEP1 charges the account's fatigability as the T26 handler does, and the
+  gathering levels are stamped into the enter-world blob at +0x1C8..+0x1D4, where the real
+  Arbiter binds `profMineral..profHerb`. Empty loads stay byte-exact against cap_social4.
+  `C_START_PRODUCE` itself is World-side; no capture has a craft or a gather, so those layouts
+  are from the dumpers and handlers, not the wire. Needs `dotnet build` and the test run.
+
+- T147b: **crafting and gathering checked against live Classic+** (`status/CRAFTING.md`, the
+  T147b section; `classic_craft.log`: four crafts, three gathers). Both artisan lists decode
+  and re-encode byte-exact (36 recipes, five skills), the recipe ids C_START_PRODUCE asks for
+  are the list's +8, the skill list's id/value pairs are our SkillProf records, and all four
+  STEP1 fatigue totals (1340 -> 1335 -> 1330, 1230 -> 1210, 1150 -> 1130) come out of our
+  handler. Gathering: ProficiencyType 1 = herb, 2 = mineral, confirmed client-side, and the
+  three 350 writes land at the right blob offsets. No code mismatch; one note corrected (the
+  recipe's u64 at +37 is the enter-world time, not the learn time). Every A<->W write is still
+  capture-less - a client capture cannot show them.
+
+- T149: **capture tuning for guild war, guild quests and Civil Unrest** (`tools/capture-tune.ps1`,
+  `status/CAPTURE-T149-GUILD.md`). Temporary edits to the real servers' datasheets so two or three GM
+  characters can reach every flow in one session: 21 guild-war values (`GuildConfig.xml`
+  `GuildWarTime` and `GuildSizeTable`, `GuildWar.xml`, `BattleChipData.xml`), 7 guild-quest values
+  (`Datasheet\GuildQuest\`), 6 Civil Unrest values (`CityWar.xml`: today's battle at the next full
+  hour, 30 minutes, no tower-destroy rule, entry gate 10). The script backs up, hashes and changes
+  only attribute values, keeping the BOM; `-Revert` restores byte for byte (tested on copies of the
+  real sheets). Two rules are not in any sheet: a member's 7-day guild-quest wait
+  (`/@guild_quest_usable on`, per account) and guild points / level (`/@add_guild_point`,
+  `/@guild_level`, ...). Side finding for T80: the war's 1500 cost, limit 10 and the unexplained
+  250 are `GuildConfig.xml` `GuildSize[rank=0]` `declareCost` / `declareLimitCount` / `maintainCost`.
+
+- T150b: **0x283D re-landed alone, plus four proven generic acks** (T150 was reverted after a
+  live regression: level-70 character at level 1, frozen, Invisible OFF not reloading).
+  Bag offsets proven by the real Arbiter's own effect: cap_social4.log character 1 enters with 40
+  at blob +0x3AF0 (seq 250), asks 48 (3039 -> 3040), enters with 48 (5715; cap_final 411+). Against
+  the wedged TeraSharp tap (cap_invensize.log 103 / 683) the next enter-world blob differs from
+  World's in exactly one byte (+0x3AF0, 40 -> 48); level, money and length untouched. DbAckTable is
+  now opt-in per opcode: only GUILD_LEARN_PERK, CONDITIONAL_TELEPORT, ITEM_SIMPLE_ATOM and
+  MAIN_MENU_COMMAND, each byte-exact against its live pair and matched to what World's handler
+  reads. The other 177 stay unanswered (candidates listed in PERSISTENCE-MAP.md T150b). Caution:
+  answering 0x283D releases whatever World queued behind it (skill learns, equips via T145's
+  0x2813, mail) - none of that is new code here, but it was hidden by the wedge. Built and run
+  in a Linux sandbox (890 passed); needs `dotnet build` and a tapped live test.
+
+- T153: **atom op 8 (non-stackable insert, GM makeitem) lands** (`World/ItemCreate.cs`,
+  status/INVENTORY-DESIGN.md "Op 8"). It is allocated an id like op 7 (ITEM_SINGLE's CloneAtomList
+  and WarehouseHandlers.CloneAtomsWithIds), inserted by Apply, and its row gets the 536-byte record
+  the Arbiter's DO_TS_INSERT_NONSTACKABLE_ITEM builds from the atom - so enchant and the rest survive
+  relog. Proven: cap_final 5914 -> 5915 / 5974 -> 5975 byte-exact; the record matches the real
+  Arbiter's stored item for 10018, 10030, 10052, 10053; the live makeitem (cap_makeitem 15152) now
+  gets an id, a row at 0:1 and a record. 0x27A4 now patches id/amount/pocket/slot from the row onto
+  a stored record (a move only updates the row). Not reproduced: the template-derived +0x104 byte
+  and period expiry (need item template data). Ops seen but still unmodelled: 37, 40, 92 (real
+  captures only). Built and run in a Linux sandbox (893 passed); this branch lacks master's T151.
+
+- T154: **SDB_LOAD_CITY_GUILD_INFO (0x2954) answered** from a new `city_guild` table (league,
+  season, guild, tower build/destroy time, kill/death/destroy, maintain bonus). Reply decoded from
+  the Arbiter's writer (Arb_part_054.c:13406) and World's reader (WorldServer.exe.c:3016303): a
+  count, the first element's frame offset, LeagueId, SeasonId, then 44-byte self/next-linked
+  elements. Empty table = "no owning guild", byte-exact against every live pair (league 1, season
+  1 and 2). One explicit allow-list case, like the T150b opt-ins. 0x28B8 SDB_PUBLISH_INVITE_CODE
+  confirmed one-way and left sealed. Built and run in a Linux sandbox (899 passed).
+
+- T156: **Vanguard Initiative window - the Arbiter's half** (PERSISTENCE-MAP.md T156). Every
+  client packet (S_AVAILABLE_EVENT_MATCHING_LIST, S_ADD_NEW / S_REMOVE_EVENT_MATCHING_QUEST,
+  S_UPDATE_EVENT_MATCHING_BONUS_INFO) is World-built from World's own EventMatching datasheet and
+  reaches the client through 0x13F7; C_AVAILABLE_EVENT_MATCHING_LIST already reaches World
+  (HandlerRegistry RegNoop forwards in-world). The empty window: World asks 0x1507 and the replay
+  table answered 0x1591 naming captured user 1, so World looked up the wrong character. Now
+  answered for the live user; 0x293C stores the daily counts and pushes 0x1591 before its ack (the
+  real push on quest progress); 0x293A/0x293E/0x2965/0x2967 are per-character rows; 0x1592 is
+  served from stored stamps and 0x1598 / 0x159A (re-sent 80+ times a session) are answered and
+  stored - 0x159A is no longer sealed one-way. The live 2421-byte list is decoded and tiled byte
+  for byte. Not done: the match-pool id lists in 0x1591 (always empty in captures), the 0x1599
+  broadcast to other Worlds, the 0x293E trailing flag. Built and run in a Linux sandbox (907 passed).
+
+- T157: **Instance Matching lists come from World** (ArbiterClientHandlers T157 block). The real
+  Arbiter never writes S_VIEW_INTER_PARTY_MATCH_DUNGEON_LIST / _BATTLEFIELD_LIST: it sends World
+  0x1644 / 0x1645 [empty pool list][UserDbId], and World builds the tab from its own
+  DungeonMatching.xml / BattleFieldData.xml, the character's level and item level, and tunnels it
+  (cap_social4: 25 dungeons, 17 battlegrounds for a level 70). We answered the client ourselves
+  with a 3-byte body - "No available dungeons". Now the request goes to World; with no World linked
+  the client gets World's empty shape. Live tabs (classic_live3 7964, classic_live2 9364) and this
+  server's are decoded byte for byte in the tests. T138c's battleground table is gone: ids and team
+  sizes are read from BattleFieldData.xml (BattleFieldSheet, TERASHARP_DATASHEET or
+  TERASHARP_DATA\Executable\Datasheet); only the stated healer/lancer rules stay, per type. A
+  battleground missing from the sheet is neither listed by World nor queued/matched by us; no sheet
+  = no battlegrounds. Not modelled: the pool list (role queue indicators). Built and run in a Linux
+  sandbox (915 passed).
+- T159: **datasheets are the source of truth** (`World/DatasheetLoader.cs`, audit in
+  status/DATASHEETS.md). Seven values TeraSharp had copied from Executable\Datasheet are read from
+  the sheet now, the copy kept only as the built-in: GuildConfig `<GuildSize>` (war declare cost /
+  limit / maintain cost), DungeonMatching `<ClassPosition>`, DefaultSkillSet, CreateCharData,
+  BattleFieldData `<RankingCompetition>` (PvP board ids), DungeonRankRecorder_*.xml (PvE board ids)
+  and the 98 dungeon-timeline ids. Each reproduces its old table from the real sheet, except the
+  two board sets, which were a live server's and now follow ours. `--check-config` lists every
+  sheet; `DatasheetLoader.LoadAll` logs one line each - the call belongs in Program.cs (human-owned,
+  one line, see DATASHEETS.md); without it each sheet still loads on first use. The battleground
+  table is T157's (cowork/T8). CLAUDE.md: no new sheet constant without a loader. Built and run in a
+  Linux sandbox (911 passed).
+- T161: **first live queue** (cap_queue1 + cap_queue1_client, two level-70s on 3036). (1) BUG: FIN
+  went out before the party existed and with no state pair; neither client opened the enter
+  window. Now each member gets classic_live3's order - party member list, S_CHANGE_EVENT_MATCHING_
+  STATE (queued 0, flag 1) then (0, 0), FIN, S_SYS_PARTY_INFO (10568-10587; FUN_14090df50's per-
+  member order). Our pair is the empty form: the live one carries 90/160 event ids from a per-user
+  roster we do not keep. World 13 being down does not affect the window. (2) NOT an Arbiter bug:
+  every frame World builds Vanguard from is byte-identical to the real Arbiter's (0x1595, 0x1582 x2,
+  0x157E, 0x157F, empty 0x1591 - arb_world.log vs cap_queue1). The list is the character's daily
+  event quests; World's login reset added 9 (client frame 129) - only events EventMatchingManager
+  has started, which needs the quest in World's QuestDataSheet plus a timeline. No dungeon event is
+  started, so the cause is World data; classic_live3 is another data version (5 of its ids are not
+  in our EventMatching.xml). (3) BUG, human-owned: after a leave the single-session fallback put the
+  leaver's frames in the survivor's reorder buffer (seq 2730 vs 1362 - the stall), then delivered
+  them. Rule in World/TunnelRouting.cs; WorldBridge change in status/T161-PATCH.diff (test PENDING
+  until applied). "SA_LEAVE_WORLD: no session" is the client closing first - harmless. (4) A formed
+  match is state (MatchWiring.PendingMatch): re-offered once per world entry (FIN + party info,
+  riding SocialHandlers.SendBlockList), C_MATCH_ADD refused, claimed on SA_RESPONSE_ENTER_DUNGEON,
+  voided with the 53967 cancel pair on leaving the party / C_MATCH_DEL / TERASHARP_MATCH_ENTRY_
+  SECONDS (default 300). classic_live3's match was entered at once: no re-offer or expiry frame
+  exists, so (4) is decompile-guided and ours. Built and run in a Linux sandbox (927 passed).
+- T163: **matched parties are system parties** (decompile: PartyManager keeps a normal and a system
+  map; New_CreateParty, KickPartyMember, Party::OnDungeonClear, the leave job). (1) BattleFieldSheet
+  is in DatasheetLoader.All (--check-config lists it; missing sheet = no battleground). (2) A
+  match now always gets a NEW party - SysPartyInfoType 0 + dungeon id in AS_DO_CREATE_PARTY - so
+  C_ENTER_DUNGEON works for a queued party too; the queued party is suspended, not extended: its
+  clients get S_LEAVE_PARTY (classic_live2 19463), World is told nothing (it suspends its own
+  copy). S_PARTY_MEMBER_LIST ims = 1 for it (classic_live3 10568). (3) Leaving the matched party
+  restores the pre-queue party (S_PARTY_MEMBER_LIST to the returner); a dissolve restores
+  everyone; each leave carries S_CANCEL_PARTY_MATCH_POOL(-9999, 2) (classic_live3 53966/53967,
+  53993/53994). The teleport out is World's. (4) The dropout debuff (999994, 180 s,
+  DungeonMatching.xml) is World's, applied on our AS_NOTIFY_ABOUT_SYS_PARTY_WITHDRAWAL 0x13F5
+  [planet][dbId] - sent on SA_LEAVE_PARTY from a dungeon match until World's
+  DSA_NOTIFY_ABOUT_DUNGEON_CLEAR 0x13F0 [partyId][dungeonId] disarms it (now handled). No A<->W
+  capture has either frame: layouts from the writers/handlers; classic_live3 pins the no-debuff
+  after clear. Kick: restore only, no penalty (the decompile's second job is unclear). Replaced
+  T138d's two extend/merge tests. Sandbox: 929 passed, 1 failed - T162_level_jump_scroll, which
+  fails the same way on the untouched rebased tree.
+
+- T165: **no twin left unclassified** (World/DbAckGroups.cs, PERSISTENCE-MAP.md T165). The 189
+  names, each checked against World's Handler_DBS_* (guard + every offset read) and the Arbiter's
+  dumpers and Handler_SDB_*: 5 were already answered under other names; A 51 answered now as
+  unpinned DbAckTable rows (26 bare, 7 apply request atoms, 18 echo them - the real writer gets
+  the request's own vector, ITEM_SIMPLE_ATOM's shape), each logging "generic ack 0x.... NAME -
+  capture a real pair to pin" once; B 62 denied; C 71 + 4 the walk found = the T166 spec with
+  reply layouts. Not A despite the brief: VIP exp, attendance/playtime checks, hide-passive learn,
+  MARK_AS_QUEST_COMPLETED (their readers take data). DbAckTable refuses to load a B/C row and
+  OnGenericAck refuses them again, so T150's reload cannot come back. Tests walk all 300 twins
+  (one group each, including 16 answered or sealed elsewhere). Sandbox: 933 passed, 1 failed -
+  T162_level_jump_scroll, the same pre-existing failure as T163.
+
+- T165b: **DbAckGroups follows the allow-list.** B, C and Elsewhere stay T165's tables
+  (DenySpec / RealHandlerSpec / ElsewhereSpec); what is pending is those minus every opcode
+  IsHandledRequest answers with its own case, read at call time. DbAckGroups.Landed is the "real
+  handler on master" group: T164's 0x2790 and 0x28AE today, T166's enchanting ops with no table
+  edit (checked by registering two C ops in a scratch copy: the walk passes and lists them).
+  DbAckTable still refuses every B/C row, landed or not. Sandbox, on the rebased tree: 936
+  passed, 0 failed.
+
+- T167: **cards, EP pages, skill polishing, dungeon rank - real handlers** (World/DbProxyT167.cs,
+  PERSISTENCE-MAP.md T167). 15 group-C names plus the three loads that feed them back: 0x2986 card
+  data, 0x27B9 EP perks, 0x2975 polishing - byte-exact against cap_social4 (data/cap_t167.bin). The
+  brief's other pins were not SDB frames (the 45 are S_CHANGE_CARD_PRESET); the rest is
+  decompile-derived. New tables card_info, card_combines, ep_perks, skill_polishing(+_options,
+  _levels), dungeon_rank_records; characters gets card_preset_index and five ep_* columns. T77's
+  learn / reset / pre-EP now write the pages. Dungeon rank is not answered (the real Arbiter sends
+  World nothing) and ranks the PvE board. All 15 show as landed. Sandbox: 942 passed, 0 failed.
+
+- T168: **group C slice 3 - the rest of PERSISTENCE-MAP's C table** (World/DbProxyT168.cs,
+  PERSISTENCE-MAP.md T168). 22 echo rows on the T166 path, store-backed money / gold / VIP /
+  attendance / hidden passives / servants / book rewards / guild member + name, refusals (ok 0)
+  where nothing is kept, broker deals taken silently. New tables vip_info, hidden_passives,
+  servants, card_book_rewards; characters gets gold_consumption, attend_bitmap, attend_set. The
+  walk's pending C is the four left on purpose (275C, 27E6, 282F, 2969). Sandbox: 954 passed, 0 failed.
+
+- T168b: **ADD_GUILDMEMBER2 no longer throws on an unknown guild** (fuzz: 0x27DB FOREIGN KEY
+  constraint failed, which closed the World link). The handler refuses a short payload or a missing
+  guild with ok 0 and a Warning; CharacterStore gets NoSuchGuild / NoSuchAccount next to NoSuchOwner,
+  and every T168 INSERT is guarded (AddGuildMember, AddServant, LearnHiddenPassives, AddVipGameExp,
+  AddCardBookReward; servant / passive / VIP now answer ok 0 when dropped). Only guild_members has
+  FKs among them.
+  Sandbox, on the rebased tree: 958 passed, 0 failed.
+
+- T170: **real-Arbiter pins + the last two C ops** (World/DbProxyT170.cs, PERSISTENCE-MAP.md T170,
+  GUILD-WAR.md section 8). 0x27E6 clear-all-skill byte-exact (cap_clearallskill), 0x2969 event
+  progress stored (decompile-only), T169's tooltip patch applied (0x282F). EP writes and the
+  loads after relog replay byte-exact from cap_final2b; card loads pinned with the card seeded
+  (no card write exists in either capture). Mail op 37 is DO_TS_RECV_PARCEL, now a known marker.
+  T170-guildwar: declare back, one-side withdraw, penalty info and surrender, pinned to
+  cap_final2a/2b; T80's declare now pays and notifies both guilds; guild quests may run side by
+  side and cancel answers S_FAIL_GUILD_QUEST. Group C: 0x275C only. Sandbox: 967 passed, 0 failed.

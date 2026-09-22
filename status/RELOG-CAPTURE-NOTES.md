@@ -1,6 +1,6 @@
 # Relog capture — notes only (T21, part C)
 
-Findings from `D:\packetlogs\arb_world_2026-09-13T11-33-30-680Z.log` that are recorded but **not
+Findings from `<captures>\arb_world_2026-09-13T11-33-30-680Z.log` that are recorded but **not
 implemented**. Condensed listing `cap_relog9827_ctl.txt`, full frames `cap_relog9827_frames.txt`.
 Two logins: dob (playerId 1, seq 355-828) and "Test" (playerId 2, seq 835-2036, saved inside
 instance 9827). The enter-world fallback that capture is really about is in
@@ -229,7 +229,7 @@ the one-line fix is to give `0x1592` a real handler, or to special-case it in
 
 ## 7. T23 audit: does the burst double-send anything the replay table already sends?
 
-`WorldReplayTable.Load` was transliterated and run against `D:\packetlogs\arb_world.log` (the file
+`WorldReplayTable.Load` was transliterated and run against `<captures>\arb_world.log` (the file
 `Program.cs` loads it from): 1239 frames, **70 request opcodes**. Every response opcode of every
 one of those 70 entries was intersected with the 50 distinct burst opcodes. Result:
 

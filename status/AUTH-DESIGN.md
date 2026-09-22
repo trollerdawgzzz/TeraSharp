@@ -5,7 +5,7 @@ the provider that now implements it.
 
 Sources: `Handler_C_LOGIN_ARBITER` and `AuthManager::*` in `Arb_part_*.c`, the packet dumper at
 `Arb_part_014.c:239-303`, tera-api's own source on disk (`D:\v100\TERA_SERVER.100\tera-api`), and
-`D:\packetlogs\cap_newchar_client.log` frames 2 and 7.
+`<captures>\cap_newchar_client.log` frames 2 and 7.
 **No build was possible in the Cowork container**; the packet claims were re-derived in Python
 from the capture and the tests assert them.
 

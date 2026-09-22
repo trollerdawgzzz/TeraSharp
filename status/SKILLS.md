@@ -50,7 +50,7 @@ arrays, actives first, and that is `S_SKILL_LIST`.
 
 ## 2. The proof, end to end
 
-From `D:\packetlogs\cap_newchar.log` + `cap_newchar_client.log` (the same session — a character
+From `<captures>\cap_newchar.log` + `cap_newchar_client.log` (the same session — a character
 created and played from scratch by the *real* ArbiterServer):
 
 - `data/starter_blob.bin` holds **7 active** ids at 7200 and **17 passive** at 6880:
@@ -160,3 +160,28 @@ gets them — so they are not evidence of a class mix-up. The Glaiver-only activ
   noted here so the next session does not go looking for it again.
 - **Race 2 has no name string in the decompile** (`&DAT_140ac7cb8` -> 2); it is Aman by
   elimination from the datasheet's own `race=` values, and the table uses that.
+
+---
+
+## T152b - a level set outside World never auto-learns
+
+| | real dob, lvl 70 (cap_final 411) | `test`, lvl 70, session A (cap_skills3 714) | `test`, session C 03:48 (15197) |
+|---|---|---|---|
+| blob level (+204) | 70 | 70 | 70 |
+| active / passive skill entries | 164 / 22 | 7 / 17 (the creation set) | 54 / 18 (A's 48 manual learns) |
+| SDB_UPDATE_EXP_LEVEL (0x273B) ever | yes | never | never |
+| crest reply | - | 691 B echo (pre-T151) | 19 B; World asked for 0 crests (it has them) |
+
+- World learns ranks itself: `DBLevelExpContext::ExecuteCommitSQL` -> `AutoLearnSkills` learns every type-11 row
+  `IsSkillLearnable` allows, on every level commit. cap_social4: `perfect_level 65` (1401) -> 168 SDB_USER_LEARN_SKILL in
+  0.8 s; `perfect_level 20` (7539) -> 43.
+- `test` got to 70 through /api/set-level, which only wrote the store. No level commit ever ran in World, so no ranks
+  were granted: the Learned Skills window's "[Click to obtain]" rows.
+- The clicks this session: C_SKILL_LEARN_REQUEST (60401301, isActive 0) at 573 and (60199, isActive 0) at 589 ->
+  S_SYSTEM_MESSAGE @3534 (0xDCE, IsSkillLearnable false) each, before any GM toggle (visible). Both skills are already
+  in the list (60199 behind 60299); the 13 rows World does offer (S_SKILL_LEARN_LIST, e.g. 60399, 150299) are
+  isActive 1 and were not clicked.
+- Fix: /api/set-level also hands World `perfect_level N` (AS_ADMIN_COMMAND, cap_social4 1401 shape) - at once if online,
+  else behind the next S_SPAWN_ME. For `test` now: run set-level 70 again, or `/@perfect_level 70` in game; if World
+  does not commit an unchanged level, 69 then 70.
+

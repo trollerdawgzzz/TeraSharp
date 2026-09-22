@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 the TeraSharp contributors
+
 using Microsoft.Extensions.Logging;
 using TeraSharp.Arbiter.Network;
 using TeraSharp.Arbiter.Persistence;
@@ -59,6 +62,21 @@ public static class GuildWarManager
     public const ushort C_DECLARE_GUILD_WAR = 0xD366;
     /// <summary>C_WITHDRAW_GUILD_WAR (64870).</summary>
     public const ushort C_WITHDRAW_GUILD_WAR = 0xFD66;
+    // T170 - the defender's side and the surrender, pinned to cap_final2a_client1/2 + cap_final2b.
+    /// <summary>C_CHECK_TO_OPPOSITE_DECLARE_GUILD_WAR (37928) - [i32 opponent guild] (client1 4067).</summary>
+    public const ushort C_CHECK_TO_OPPOSITE_DECLARE_GUILD_WAR = 0x9428;
+    /// <summary>C_OPPOSITE_DECLARE_GUILD_WAR (60347) - declare back: the war becomes mutual (client1 4072).</summary>
+    public const ushort C_OPPOSITE_DECLARE_GUILD_WAR = 0xEBBB;
+    /// <summary>C_REQUEST_GUILD_WAR_PENALTY_INFO (54232) - what a surrender would cost (client1 10378).</summary>
+    public const ushort C_REQUEST_GUILD_WAR_PENALTY_INFO = 0xD3D8;
+    /// <summary>C_GIVE_UP_GUILD_WAR (62917) - surrender (client1 10380).</summary>
+    public const ushort C_GIVE_UP_GUILD_WAR = 0xF5C5;
+    /// <summary>S_CHECK_TO_OPPOSITE_DECLARE_GUILD_WAR - [i32 opponent][i32 cost] (client1 4068), raw body.</summary>
+    public const string S_CHECK_TO_OPPOSITE_DECLARE_GUILD_WAR = "S_CHECK_TO_OPPOSITE_DECLARE_GUILD_WAR";
+    /// <summary>S_GUILD_WAR_PENALTY_INFO - [i32 opponent][i64 penalty] (client1 10379), raw body.</summary>
+    public const string S_GUILD_WAR_PENALTY_INFO = "S_GUILD_WAR_PENALTY_INFO";
+    /// <summary>S_GUILD_MONEY_INFO_CHANGED - [i32 guild][i64 money], after every war payment.</summary>
+    public const string S_GUILD_MONEY_INFO_CHANGED = "S_GUILD_MONEY_INFO_CHANGED";
 
     /// <summary>S_OPEN_GUILD_WAR_WINDOW (28989) - the live wars plus the declare counters.</summary>
     public const string S_OPEN_GUILD_WAR_WINDOW = "S_OPEN_GUILD_WAR_WINDOW";
@@ -77,25 +95,33 @@ public static class GuildWarManager
     public const ushort AS_END_GUILD_WAR = 0x14AC;
     /// <summary>AS_NOTIFY_GUILD_WAR_INFO - A-&gt;W push, frame 11 / payload 5. Tap 5094/5846/5950.</summary>
     public const ushort AS_NOTIFY_GUILD_WAR_INFO = 0x14AF;
+    /// <summary>T170. AS_OPPOSITE_DECLARE_GUILD_WAR - the AS_DECLARE layout (cap_final2b 6901).</summary>
+    public const ushort AS_OPPOSITE_DECLARE_GUILD_WAR = 0x14A4;
+    /// <summary>T170. AS_WITHDRAW_GUILD_WAR - the AS_END layout, the last int the war's NEW state
+    /// (cap_final2b 14883: 6 - only the attacker is still declared).</summary>
+    public const ushort AS_WITHDRAW_GUILD_WAR = 0x14B1;
+
+    // T159: the three numbers below are GuildConfig.xml's <GuildSize rank="0"> - declareLimitCount
+    // 10, declareCost 1500, maintainCost 250 - which is also what every captured frame carries
+    // (client 1623 / 3382 / 3389 / 4453). They are read from the sheet now (DatasheetLoader);
+    // the literals live on only as DatasheetLoader.BuiltInGuildSizes, used when it is missing.
+    // The sheet has four sizes (1 / 40 / 80 / 999 accounts); only the smallest is used, as before.
+
+    /// <summary>The GuildSize row in use: the smallest guild size.</summary>
+    public static GuildSizeRow GuildSize => DatasheetLoader.GuildSizes.Value[0];
+
+    /// <summary>How many wars one guild may declare - declareLimitCount.</summary>
+    public static int DeclareLimit => GuildSize.DeclareLimitCount;
+
+    /// <summary>What a declaration costs - declareCost (cap_social4_client 3382's guildWarMoney).</summary>
+    public static int DeclareCost => GuildSize.DeclareCost;
 
     /// <summary>
-    /// How many wars one guild may declare. 10 in every captured frame - client 1623, 3382,
-    /// 3389 and 4453 all carry it. Not read from anything we have, so it is a constant here.
+    /// The value both guild blocks carry in the slot after their money: 250 for BOTH sides in
+    /// frame 3389, which is the sheet's maintainCost - the per-war upkeep, not a per-side amount.
+    /// status/GUILD-WAR.md section 4.
     /// </summary>
-    public const int DeclareLimit = 10;
-
-    /// <summary>
-    /// What a declaration costs. 1500 in cap_social4_client frame 3382's guildWarMoney and in
-    /// the attacker's money slot of frame 3389.
-    /// </summary>
-    public const int DeclareCost = 1500;
-
-    /// <summary>
-    /// The value both guild blocks carry in the slot after their money. 250 for BOTH sides in
-    /// frame 3389 - the attacker who paid 1500 and the defender who paid nothing - so it is not
-    /// a per-side amount. Reproduced, not explained; status/GUILD-WAR.md section 4.
-    /// </summary>
-    public const int GuildBlockUnk2 = 250;
+    public static int GuildBlockUnk2 => GuildSize.MaintainCost;
 
     /// <summary>SMT 1788, the confirmation text S_CHECK_TO_DECLARE_GUILD_WAR carries on a yes.
     /// cap_social4_client frame 3382 is <c>@1788</c> with no parameters.</summary>
@@ -103,6 +129,8 @@ public static class GuildWarManager
 
     /// <summary>S_VIEW_GUILD_WAR.result / AS_END_GUILD_WAR.reason: the attacker withdrew.</summary>
     public const int ResultWithdrew = 1;
+    /// <summary>T170. AS_END_GUILD_WAR.reason for a surrender (cap_final2b 14989).</summary>
+    public const int ResultGaveUp = 4;
 
     /// <summary>A client packet's <c>[u16 length][u16 opcode]</c> header.</summary>
     public const int ClientHeaderSize = 4;
@@ -115,6 +143,10 @@ public static class GuildWarManager
         ("C_CHECK_TO_DECLARE_GUILD_WAR", C_CHECK_TO_DECLARE_GUILD_WAR),
         ("C_DECLARE_GUILD_WAR",          C_DECLARE_GUILD_WAR),
         ("C_WITHDRAW_GUILD_WAR",         C_WITHDRAW_GUILD_WAR),
+        ("C_CHECK_TO_OPPOSITE_DECLARE_GUILD_WAR", C_CHECK_TO_OPPOSITE_DECLARE_GUILD_WAR),   // T170
+        ("C_OPPOSITE_DECLARE_GUILD_WAR",          C_OPPOSITE_DECLARE_GUILD_WAR),
+        ("C_REQUEST_GUILD_WAR_PENALTY_INFO",      C_REQUEST_GUILD_WAR_PENALTY_INFO),
+        ("C_GIVE_UP_GUILD_WAR",                   C_GIVE_UP_GUILD_WAR),
     };
 
     /// <summary>
@@ -126,12 +158,14 @@ public static class GuildWarManager
     {
         C_VIEW_GUILD_WAR => 4,
         C_WITHDRAW_GUILD_WAR => 4,
+        C_CHECK_TO_OPPOSITE_DECLARE_GUILD_WAR or C_OPPOSITE_DECLARE_GUILD_WAR
+            or C_REQUEST_GUILD_WAR_PENALTY_INFO or C_GIVE_UP_GUILD_WAR => 4,   // T170: one i32 each
         C_CHECK_TO_DECLARE_GUILD_WAR => 2,
         C_DECLARE_GUILD_WAR => 2,
         _ => 0,
     };
 
-    /// <summary>Is this one of the five?</summary>
+    /// <summary>Is this one of the nine (T80's five, T170's four)?</summary>
     public static bool IsArbiterSide(ushort op)
     {
         foreach (var (_, code) in ClientOpcodes) if (code == op) return true;
@@ -197,31 +231,68 @@ public static class GuildWarManager
     // 4. Builders - field sets, named as V100Definitions names them
     // =========================================================================================
 
-    /// <summary>One row of S_OPEN_GUILD_WAR_WINDOW, built from a live war row plus both names.</summary>
+    /// <summary>One row of S_OPEN_GUILD_WAR_WINDOW as the ATTACKER sees it (T80's form).</summary>
     public static Dictionary<string, object> BuildWarRow(
         CharacterStore.GuildWarRow war, string attackName, string defendName)
     {
         ArgumentNullException.ThrowIfNull(war);
+        return BuildWarRow(war, war.AttackGuildId, attackName, defendName);
+    }
+
+    /// <summary>
+    /// T170. The row is VIEWER-relative: the first block is always the viewer's own guild, the
+    /// second the opponent - cap_final2a_client1 4011 (sdg, the defender) and client2 2179 (fdh,
+    /// the attacker) show the same war with the blocks swapped. Flag = that side has declared,
+    /// money = what its declaration cost (0 once withdrawn, client1 10345); the maintain cost
+    /// rides in both blocks. The def's "attack"/"defend" names are T80's, kept for its tests.
+    /// </summary>
+    public static Dictionary<string, object> BuildWarRow(
+        CharacterStore.GuildWarRow war, int viewerGuildId, string myName, string theirName)
+    {
+        ArgumentNullException.ThrowIfNull(war);
+        bool iAttack = war.AttackGuildId == viewerGuildId;
+        var mine = iAttack ? (Id: war.AttackGuildId, On: war.AttackDeclared, Money: war.Money)
+                           : (Id: war.DefendGuildId, On: war.DefendDeclared, Money: war.DefendMoney);
+        var them = iAttack ? (Id: war.DefendGuildId, On: war.DefendDeclared, Money: war.DefendMoney)
+                           : (Id: war.AttackGuildId, On: war.AttackDeclared, Money: war.Money);
         return new Dictionary<string, object>
         {
-            ["attackGuildId"] = (long)war.AttackGuildId,
-            ["attackFlag"] = (byte)1,
+            ["attackGuildId"] = (long)mine.Id,
+            ["attackFlag"] = (byte)(mine.On ? 1 : 0),
             ["attackUnk1"] = 0,
-            ["attackMoney"] = war.Money,
+            ["attackMoney"] = mine.On ? mine.Money : 0L,
             ["attackUnk2"] = GuildBlockUnk2,
             ["attackUnk3"] = (byte)0,
-            ["defendGuildId"] = (long)war.DefendGuildId,
-            ["defendFlag"] = (byte)0,
+            ["defendGuildId"] = (long)them.Id,
+            ["defendFlag"] = (byte)(them.On ? 1 : 0),
             ["defendUnk1"] = 0,
-            ["defendMoney"] = 0L,
+            ["defendMoney"] = them.On ? them.Money : 0L,
             ["defendUnk2"] = GuildBlockUnk2,
             ["defendUnk3"] = (byte)0,
             ["date"] = war.DeclaredAt,
-            ["attackName"] = attackName ?? string.Empty,
+            ["attackName"] = myName ?? string.Empty,
             ["attackEmblem"] = string.Empty,
-            ["defendName"] = defendName ?? string.Empty,
+            ["defendName"] = theirName ?? string.Empty,
             ["defendEmblem"] = string.Empty,
         };
+    }
+
+    /// <summary>T170. S_CHECK_TO_OPPOSITE_DECLARE_GUILD_WAR body: [i32 opponent][i32 cost] (client1 4068).</summary>
+    public static byte[] BuildCheckOppositeBody(int opponentGuildId, int cost)
+    {
+        var b = new byte[8];
+        BitConverter.GetBytes(opponentGuildId).CopyTo(b, 0);
+        BitConverter.GetBytes(cost).CopyTo(b, 4);
+        return b;
+    }
+
+    /// <summary>T170. S_GUILD_WAR_PENALTY_INFO body: [i32 opponent][i64 penalty] (client1 10379).</summary>
+    public static byte[] BuildPenaltyBody(int opponentGuildId, long penalty)
+    {
+        var b = new byte[12];
+        BitConverter.GetBytes(opponentGuildId).CopyTo(b, 0);
+        BitConverter.GetBytes(penalty).CopyTo(b, 4);
+        return b;
     }
 
     /// <summary>S_OPEN_GUILD_WAR_WINDOW for one guild.</summary>
@@ -353,7 +424,10 @@ public static class GuildWarManager
         var rows = new List<object>();
         if (guildId != 0)
             foreach (var w in store.GetGuildWars(guildId))
-                rows.Add(BuildWarRow(w, NameOf(store, w.AttackGuildId), NameOf(store, w.DefendGuildId)));
+            {
+                int them = w.AttackGuildId == guildId ? w.DefendGuildId : w.AttackGuildId;
+                rows.Add(BuildWarRow(w, guildId, NameOf(store, guildId), NameOf(store, them)));
+            }
         a.ToPlayer(playerId, S_OPEN_GUILD_WAR_WINDOW,
             BuildWindowFields(guildId == 0 ? 0 : store.CountGuildWarDeclarations(guildId), rows));
         return a;
@@ -415,11 +489,18 @@ public static class GuildWarManager
         var them = store.GetGuildByName(opponentName ?? string.Empty);
         if (mine == 0 || them == null || them.GuildId == mine) return a.Reject("no such guild to declare on");
         if (store.CountGuildWarDeclarations(mine) >= DeclareLimit) return a.Reject("declare limit reached");
+        if (store.GetGuildWarBetween(mine, them.GuildId) != null) return a.Reject("already at war with that guild");
+        if ((store.GetGuild(mine)?.Money ?? 0) < DeclareCost) return a.Reject("the guild cannot pay the declaration");
 
         long warId = store.DeclareGuildWar(mine, them.GuildId, nowUnix, DeclareCost);
         if (warId == 0) return a.Reject("already at war with that guild");
 
-        a.Client(StatusChanged(playerId));
+        // T170: the declaration is PAID (cap_social4_client 3385 and cap_final2a_client2 2175 are
+        // S_GUILD_MONEY_INFO_CHANGED; taps 6022 / 6800 are AS_UPDATE_GUILD_DATA before the
+        // AS_DECLARE), and both guilds hear about it (client1 4008).
+        PayGuild(a, store, mine, -DeclareCost);
+        PushGuildData(a, store, mine);
+        NotifyGuilds(a, store, mine, them.GuildId);
         a.World(AS_DECLARE_GUILD_WAR, BuildAsDeclare(warId, mine, them.GuildId));
         Log.LogInformation("guild war {War}: guild {A} declared on guild {B}", warId, mine, them.GuildId);
         return a;
@@ -438,14 +519,157 @@ public static class GuildWarManager
         if (mine == 0) return a.Reject("not in a guild");
         var war = store.GetGuildWarBetween(mine, opponentGuildId);
         if (war == null) return a.Reject("not at war with that guild");
+        bool defender = war.DefendGuildId == mine;
+        if (!(defender ? war.DefendDeclared : war.AttackDeclared)) return a.Reject("this guild has not declared");
+        if (defender ? war.AttackDeclared : war.DefendDeclared)
+        {
+            // T170: one side of a MUTUAL war takes its declaration back. The war lives on with the
+            // other side's alone (client1 10345) and World hears the new state (tap 14883: 6).
+            int state = store.WithdrawGuildWarSide(war.WarId, defender);
+            NotifyGuilds(a, store, mine, opponentGuildId);
+            a.World(AS_WITHDRAW_GUILD_WAR, BuildAsEnd(war.WarId, war.AttackGuildId, war.DefendGuildId, state));
+            Log.LogInformation("guild war {War}: guild {G} withdrew its declaration (state {S})", war.WarId, mine, state);
+            return a;
+        }
 
         store.EndGuildWar(war.WarId, ResultWithdrew, nowUnix);
-        a.Client(StatusChanged(playerId));
+        NotifyGuilds(a, store, mine, opponentGuildId);
         a.World(AS_END_GUILD_WAR,
             BuildAsEnd(war.WarId, war.AttackGuildId, war.DefendGuildId, ResultWithdrew));
         Log.LogInformation("guild war {War}: guild {A} withdrew from guild {B}",
             war.WarId, war.AttackGuildId, war.DefendGuildId);
         return a;
+    }
+
+    // ---- T170: the defender's side and the surrender --------------------------------------
+
+    /// <summary>The war with <paramref name="opponent"/> this guild could declare back on - its own
+    /// side not declared yet - or null.</summary>
+    private static CharacterStore.GuildWarRow? OpenToDeclareBack(CharacterStore store, int mine, int opponent)
+    {
+        var war = mine == 0 ? null : store.GetGuildWarBetween(mine, opponent);
+        if (war == null) return null;
+        return (war.DefendGuildId == mine ? war.DefendDeclared : war.AttackDeclared) ? null : war;
+    }
+
+    /// <summary>C_CHECK_TO_OPPOSITE_DECLARE_GUILD_WAR: [opponent][cost] (client1 4067 -&gt; 4068), or
+    /// silence when there is nothing to declare back on (as the T80 check does).</summary>
+    public static ArbiterActions OnCheckToOppositeDeclare(int playerId, int opponentGuildId)
+    {
+        var a = New(playerId);
+        var store = TheStore;
+        if (store == null) return a.Reject("no store");
+        if (OpenToDeclareBack(store, store.GetGuildIdOf(playerId), opponentGuildId) == null) return a;
+        a.Client(ClientPacket.Body(Recipient.Player(playerId), S_CHECK_TO_OPPOSITE_DECLARE_GUILD_WAR,
+            BuildCheckOppositeBody(opponentGuildId, DeclareCost)));
+        return a;
+    }
+
+    /// <summary>
+    /// C_OPPOSITE_DECLARE_GUILD_WAR: the other side declares back and the war is mutual (state 8).
+    /// Paid like a declaration (client1 4073), both guilds notified (4074, client2 2212), World
+    /// gets AS_UPDATE_GUILD_DATA then AS_OPPOSITE_DECLARE_GUILD_WAR (taps 6900, 6901). The war
+    /// itself (S_START_GUILD_WAR, client1 4616) is World's: GuildWar::DoDeclareTick starts it
+    /// after the pre-war period, and the frame reaches the client through the tunnel.
+    /// </summary>
+    public static ArbiterActions OnOppositeDeclare(int playerId, int opponentGuildId)
+    {
+        var a = New(playerId);
+        var store = TheStore;
+        if (store == null) return a.Reject("no store");
+        int mine = store.GetGuildIdOf(playerId);
+        var war = OpenToDeclareBack(store, mine, opponentGuildId);
+        if (war == null) return a.Reject("no war to declare back on");
+        if ((store.GetGuild(mine)?.Money ?? 0) < DeclareCost) return a.Reject("the guild cannot pay the declaration");
+        store.DeclareGuildWarSide(war.WarId, war.DefendGuildId == mine, DeclareCost);
+        PayGuild(a, store, mine, -DeclareCost);
+        PushGuildData(a, store, mine);
+        NotifyGuilds(a, store, mine, opponentGuildId);
+        a.World(AS_OPPOSITE_DECLARE_GUILD_WAR, BuildAsDeclare(war.WarId, war.AttackGuildId, war.DefendGuildId));
+        Log.LogInformation("guild war {War}: guild {G} declared back - mutual", war.WarId, mine);
+        return a;
+    }
+
+    /// <summary>
+    /// What surrendering to <paramref name="opponentGuildId"/> costs: GuildConfig's
+    /// reparationRate x the WINNER's declared money (GuildWarManager::GetGiveUpPenaltyInfo) -
+    /// 0.5 x 100 = 50 in client1 10379. Every guild is size rank 0 here, as for the costs.
+    /// </summary>
+    public static long GiveUpPenalty(CharacterStore store, int mine, int opponentGuildId)
+    {
+        var war = mine == 0 ? null : store.GetGuildWarBetween(mine, opponentGuildId);
+        if (war == null) return 0;
+        bool winnerAttacks = war.AttackGuildId == opponentGuildId;
+        long money = winnerAttacks ? (war.AttackDeclared ? war.Money : 0) : (war.DefendDeclared ? war.DefendMoney : 0);
+        return (long)(DatasheetLoader.ReparationRate(GuildSize.Rank, GuildSize.Rank) * (float)money);
+    }
+
+    /// <summary>C_REQUEST_GUILD_WAR_PENALTY_INFO -&gt; S_GUILD_WAR_PENALTY_INFO (client1 10378 -&gt; 10379).
+    /// Always answered; no war is a penalty of 0 (the Arbiter's not-found branch).</summary>
+    public static ArbiterActions OnPenaltyInfo(int playerId, int opponentGuildId)
+    {
+        var a = New(playerId);
+        var store = TheStore;
+        if (store == null) return a.Reject("no store");
+        long penalty = GiveUpPenalty(store, store.GetGuildIdOf(playerId), opponentGuildId);
+        a.Client(ClientPacket.Body(Recipient.Player(playerId), S_GUILD_WAR_PENALTY_INFO,
+            BuildPenaltyBody(opponentGuildId, penalty)));
+        return a;
+    }
+
+    /// <summary>
+    /// C_GIVE_UP_GUILD_WAR: surrender. The reparation moves from this guild to the winner
+    /// (client1 10381, client2 3656 - 8898565 -&gt; 8898515 and 9999900 -&gt; 9999950), both guilds'
+    /// data is pushed (taps 14987, 14988), both are notified, and World ends the war with
+    /// reason 4 (tap 14989). The war goes to the history with that result.
+    /// </summary>
+    public static ArbiterActions OnGiveUp(int playerId, int opponentGuildId, long nowUnix)
+    {
+        var a = New(playerId);
+        var store = TheStore;
+        if (store == null) return a.Reject("no store");
+        int mine = store.GetGuildIdOf(playerId);
+        var war = mine == 0 ? null : store.GetGuildWarBetween(mine, opponentGuildId);
+        if (war == null) return a.Reject("not at war with that guild");
+        long penalty = Math.Min(GiveUpPenalty(store, mine, opponentGuildId), store.GetGuild(mine)?.Money ?? 0);
+        store.EndGuildWar(war.WarId, ResultGaveUp, nowUnix);
+        if (penalty > 0)
+        {
+            PayGuild(a, store, mine, -penalty);
+            PayGuild(a, store, opponentGuildId, penalty);
+            PushGuildData(a, store, mine);
+            PushGuildData(a, store, opponentGuildId);
+        }
+        NotifyGuilds(a, store, mine, opponentGuildId);
+        a.World(AS_END_GUILD_WAR, BuildAsEnd(war.WarId, war.AttackGuildId, war.DefendGuildId, ResultGaveUp));
+        Log.LogInformation("guild war {War}: guild {G} gave up to {O}, reparation {P}", war.WarId, mine, opponentGuildId, penalty);
+        return a;
+    }
+
+    /// <summary>T170. Guild money moves, and every member hears the new total.</summary>
+    private static void PayGuild(ArbiterActions a, CharacterStore store, int guildId, long delta)
+    {
+        long now = store.AddGuildMoney(guildId, delta);
+        if (now < 0) return;
+        var fields = new Dictionary<string, object> { ["guildDbId"] = guildId, ["newMoney"] = now };
+        foreach (var m in store.GetGuildMembers(guildId))
+            a.ToPlayer(m.UserDbId, S_GUILD_MONEY_INFO_CHANGED, fields);
+    }
+
+    /// <summary>T170. AS_UPDATE_GUILD_DATA after the money moved (GuildWiring's builder).</summary>
+    private static void PushGuildData(ArbiterActions a, CharacterStore store, int guildId)
+    {
+        var p = GuildWiring.BuildGuildDataPush(store, guildId);
+        if (p != null) a.World(GuildPackets.AS_UPDATE_GUILD_DATA, p);
+    }
+
+    /// <summary>T170. S_NOTIFY_GUILD_WAR_STATUS_CHANGE to every member of both guilds (offline ones
+    /// are dropped by the dispatcher).</summary>
+    private static void NotifyGuilds(ArbiterActions a, CharacterStore store, int mine, int theirs)
+    {
+        foreach (int g in new[] { mine, theirs })
+            foreach (var m in store.GetGuildMembers(g))
+                a.Client(StatusChanged(m.UserDbId));
     }
 
     /// <summary>
@@ -534,6 +758,10 @@ public static class GuildWarManager
             C_CHECK_TO_DECLARE_GUILD_WAR => OnCheckToDeclare(playerId, ParseOpponentName(body)),
             C_DECLARE_GUILD_WAR => OnDeclare(playerId, ParseOpponentName(body), nowUnix),
             C_WITHDRAW_GUILD_WAR => OnWithdraw(playerId, ParseInt32(body), nowUnix),
+            C_CHECK_TO_OPPOSITE_DECLARE_GUILD_WAR => OnCheckToOppositeDeclare(playerId, ParseInt32(body)),
+            C_OPPOSITE_DECLARE_GUILD_WAR => OnOppositeDeclare(playerId, ParseInt32(body)),
+            C_REQUEST_GUILD_WAR_PENALTY_INFO => OnPenaltyInfo(playerId, ParseInt32(body)),
+            C_GIVE_UP_GUILD_WAR => OnGiveUp(playerId, ParseInt32(body), nowUnix),
             _ => New(playerId),
         };
 }

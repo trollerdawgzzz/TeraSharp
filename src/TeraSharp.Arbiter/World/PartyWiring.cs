@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 the TeraSharp contributors
+
 using Microsoft.Extensions.Logging;
 using TeraSharp.Arbiter.Network;
 
@@ -276,6 +279,25 @@ public static class PartyWiring
     }
 
     /// <summary>
+    /// T138d. The matcher put a group together - make them a party and push it to World and to
+    /// every member. Returns the actions so a test can read them; the dispatch has already
+    /// happened. A rejection is logged rather than thrown: a match that cannot become a party
+    /// still gave everyone their FIN, and dropping the party is better than dropping the match.
+    /// </summary>
+    public static PartyActions FormMatchedParty(
+        IReadOnlyList<PartyManager.MatchedMember> members, bool raid, int dungeonId,
+        int battleFieldId = 0, int teamIndex = 0, IReadOnlyList<byte[]>? matchFrames = null)
+    {
+        var actions = Manager.FormMatchedParty(members, raid, dungeonId, battleFieldId, teamIndex,
+            matchFrames);
+        if (actions.Rejected != null)
+            PartyLog.LogWarning("match-party: {Why}", actions.Rejected);
+        else if (!actions.IsEmpty)
+            Dispatcher(null, PartyLog).Dispatch(actions, "match-party");
+        return actions;
+    }
+
+    /// <summary>
     /// Register every in-world session. Cheap and idempotent, and it is what makes a party work
     /// for a player who entered world before this code did - the same self-heal
     /// <c>SocialHandlers.SyncChatRoster</c> performs for whisper.
@@ -322,6 +344,15 @@ public static class PartyWiring
     {
         if (!HandlesWorldFrame(opcode)) return false;
         DispatchWorldFrame(Manager, Dispatcher(null, PartyLog), opcode, payload);
+        // T161: leaving (or being voted out of) the party a match formed is how a member turns
+        // the offer down - there is no decline packet in either binary's opcode list.
+        int gone = opcode switch
+        {
+            PartyPackets.SA_LEAVE_PARTY => PartyPackets.ParseSaLeaveParty(payload)?.MemberDbId ?? 0,
+            PartyPackets.SA_KICK_PARTY => PartyPackets.ParseSaKickParty(payload)?.TargetDbId ?? 0,
+            _ => 0,
+        };
+        if (gone > 0) MatchWiring.OnLeftParty(gone);
         return true;
     }
 

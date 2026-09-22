@@ -78,7 +78,7 @@ and look for the next caller.
 
 ## How to get facts
 
-- Captures in `D:\packetlogs\`: `lobby_tap.log` (login/logout/relog, real Arbiter), `cap_newchar.log`
+- Captures in `<captures>\`: `lobby_tap.log` (login/logout/relog, real Arbiter), `cap_newchar.log`
   + `cap_newchar_client.log` (create char → Island of Dawn → quests/gathering/kills/level-up/teleport
   → logout). `cap_newchar_ctl.txt` = condensed control-channel listing (seq, dir, time, op, len,
   first 64 B) — read this first, it's small. `cap_newchar_zone.txt` = full 0x13BE/0x13C0 frames.
@@ -123,6 +123,67 @@ and look for the next caller.
 - `TERASHARP_START_OVERRIDE="zone,x,y,z"` env var forces new-character start (experiment knob).
 
 ## Next steps (in order)
+
+**Checkpoint 2026-09-21 - 878 tests. ALT+A FIXED (T144b).** The gate was one int32: S_SELECT_USER =
+`accepted(u8) | adminLevel(i32) | errorCode(i32) | firstLoginToday(u8) | firstLoginByAccount(u8)` (11 B; the
+shipped .def is mis-typed). The real Arbiter sends the GM's admin level there; T124 had the layout but only
+fixed the standalone path - WorldEntry (every live login) kept the old literal. Proven by a CONTROL
+(cap_final_gm_client: same account, status 33, adminLevel 0 -> no panel). Lessons: (1) when two sessions
+behave differently, find a control and diff EVERY field on the LIVE path - never accept "byte-identical"
+from truncated _ctl lines or the standalone path; (2) T129's "S_SELECT_USER differs, cosmetic" was the
+miss. Also T144: S_GET_USER_LIST adminLevel(+142) = the [GM] select tag. GM state consequences: a
+GM-flagged character spawns HELD - S_ADMIN_HOLD_CHARACTER 00 must go right AFTER S_SPAWN_ME (now injected
+in DeliverTunnelled; the old topo-fin send did nothing and its removal froze GMs) - verify live: move +
+potion after deploy. Wedges fixed: 0x2734 SDB_SET_TASK_SHOW_TOGGLE (after /@level - T142), 12 crafting
+writes (T147). T142b: character 1 is live (replay fixture retired), empty-bag guard, DBS_ITEM_SINGLE ack
+pinned. AdminLevel in World (User+0xA474) is NOT settable from the Arbiter (console/script only) - World
+logs AdminLevel[0] for GMs and that's cosmetic. Admin web: /api/set-level, set-money, give-item, teleport
+(DB-side, wired 2026-09-20; body field is "id"), no delete route. Characters leveled by /@level or
+perfect_level before T142 may have broken bags - reroll them. OPEN: T145 (bags after /@level - needs the
+tap-in-front-of-TeraSharp capture cap_levelbag on a fresh char), crafting live validation (learn/craft/
+gather once - decompile-derived layouts, no capture), GM panel buttons never exercised (BG/Dungeon/Event
+tabs, Summon, Resurrect, Restrict, Punishment, Delete monster -> click through, capture proxy log, task),
+multi-World live test (Velik's walk-in + MIN_MEMBERS=2 queue), go-live, public repo push (D:\TeraSharp-
+public, audit -Strict then push).
+
+**OPS NOTE 2026-09-20 (post-reboot recovery - read before touching netcup configs).** After a VPS
+reboot Topography failed every start with `open failed [2]` / `Load Topo Fail, continent=N` /
+`LoadZone Error (x,y)`. ROOT CAUSE: `DeploymentConfig.xml` had `<Topography folderName="..\..\Topology"
+/>` (vendor-relative -> resolves to C:\Topology); it must be `.\Topology` (the folder lives in
+Executable\). ProcMon showed `C:\Topology\x46y52.geo PATH NOT FOUND`. Everything else was a red
+herring: all 1773 tiles were on the box the whole time (Executable\Topology, .geo/.idx global grid,
+703 geo), pagefile/disk fine, ServerConfig fine. Other lessons: (1) TopographyServer MUST run with
+`--sharedmemoryproducer=true` (the bat does; bare exe dies attaching to a map nobody made); (2) it logs
+into WorldServerConsole_*.log, not only TopoServerConsole_*; (3) LoadWorld/LoadZone lines only print
+on failure and loading is parallel, so the first failing continent is random - do NOT chase it per
+continent; (4) ServerConfig.xml needs its UTF-8 BOM; (5) active data set = the 102 KB ContinentData
+(D:\ContinentData.lowmem.xml == full list) + low-mem CAPACITIES ServerConfig (D:\ServerConfig.lowmem.xml,
+same as ServerConfig.pc-copy) - NOT the 16 KB aggressive trim (6 continents; fails PostProcess: 1 needs
+7001-7004); World 1 = ~13 GB, --id=13 loads only its roster so both should fit in 32 GB; (6) MySQL is
+Laragon (no service) - start Laragon or mysqld from laragon\bin\mysql; tera-api needs it (3306);
+(7) `_capture_aside\` holds AreaData/DungeonData set-asides (empty) + DungeonConstraint/EventMatching
+.full copies; (8) Topography/World need an elevated shell; (9) after any World reconnect the tap link
+numbers climb - grep by link, not by "#3". Netcup boot order for TeraSharp: SQL(auto) -> Laragon ->
+tera-api -> proxy -> TopographyServer(bat) -> deploy.ps1 -> WorldServer --id=1 -> --id=13.
+
+**Checkpoint 2026-09-21 - ~860 tests, T138b/T138c/T139 merged.** Multi-World hand-off is WIRED
+(WorldBridge.HandleFrame: 0x164D roster -> DungeonChannels.MapContinent; 0x13BE on main -> 0x13BF on
+owner link; 0x13C0 on owner -> 0x13C1 to main; 0x13C5/0x13C6 channel add/remove; packed channel =
+channel|planet<<16, client shows channel+1). Matchmaker built (T138c): roles from characters.class via
+DungeonMatching.xml ClassPosition (C_MATCH_ADD carries NO class - the two i32s are the queuer's own
+pid + a first-queue flag), 1/1/3 pools, party slots kept, BG random fill with per-BG table from
+BattleFieldData.xml (Skyring 37-40, Corsairs 26-29, Fraywind 10/11), rating +/-5..12 pinned to a live
+S_BATTLE_FIELD_RESULT (delta -8), stored characters.bg_rating. FIN does not teleport: client shows
+enter-now/later, C_ENTER_DUNGEON (World-owned) triggers the hand-off. LEFT: T138d - PartyManager.
+FormMatchedParty (S_SYS_PARTY_INFO after FIN so strangers share one instance), PvP board ordered by
+rating, env TERASHARP_MATCH_MIN_MEMBERS test knob. LIVE TEST PENDING: TeraSharp + WorldServer --id=1
+and --id=13 (all three DeploymentConfig ports 7802), walk into Velik's Sanctuary 9781, two accounts
+queue a dungeon with MIN_MEMBERS=2, enter now -> same instance. OPEN SOURCE: T139 landed (LICENSE MIT,
+README, docs/SETUP.md, .env.example, deploy.example.ps1, tools/audit-release.ps1); D:\TeraSharp-public
+(branch public) is the stripped clone - 36 retail/capture files removed; T140 (session 2) is replacing
+200 verbatim-decompile quotes with descriptions+citations; audit -Strict exit 0 = push. Master keeps
+all fixtures. Handlers: 211/273 registered by name (~90% of the 235 reachable; the rest are lord/TBA/
+petition/city-war skip set + 8 guild-war accept/surrender needing a two-guild capture).
 
 **Checkpoint 2026-09-20 (late) - 854 tests, T125-T138a merged, ticket patch APPLIED.** Captures:
 classic_live/2/3 (Noctenium .npcap from the live Classic+ server via tools/npcap-to-capture.ps1 -
@@ -197,7 +258,7 @@ decision (SharedDB), go-live (auth on, ports, backups).
 
 **Checkpoint 2026-09-16 17:15 - 663 tests, T70-T73 merged.** Captures: cap_social3 (broker with
 listings, windows, guild ranks/leave/relog-in-guild, LFG create, guild war window, wanted board) - all
-reframed under D:\packetlogs. Real-Arbiter GM: gate is bit 5 of Account+0x2adc from the hub's
+reframed under <captures>. Real-Arbiter GM: gate is bit 5 of Account+0x2adc from the hub's
 UserLoginAns.ext_flag, which arb_gw_tw2 never delivers - fix is ArbiterServer_m1.exe (100.02 TW patch,
 the intended setup per the proxy's README) or qaServer=true; SQL Users.money works for gold;
 level lives in the blob. Low-mem config in tools/ (World 13.6 GB). LIVE PASS ON TERASHARP (first with
@@ -211,7 +272,7 @@ Guild rank/announce/leave/relog and LFG are captured (cap_social2/3) and coded, 
 fix to exercise live. Web Admin Tool: WEBADMIN-DESIGN.md - it reads game data via ODBC SharedDB (not
 in shipped config); decision deferred. Both worktrees rebased on master after each merge.
 
-**CAPTURE 2026-09-15 13:52-13:56 (real Arbiter + T56 tap, two clients): D:\packetlogs\cap_social.log +
+**CAPTURE 2026-09-15 13:52-13:56 (real Arbiter + T56 tap, two clients): <captures>\cap_social.log +
 cap_social_client.log (+ _ctl.txt/_frames.txt via tools/reframe-*.ps1).** Contains: party lifecycle
 through contracts (0x2809/0x280B/0x280C/0x280A/0x280D invite, 0x280F/0x2810 accept, 0x13AB -> 0x139E party
 list, 0x13F8 SA_BYPASS_TO_GROUP fan-outs, 0x13BB leave, 0x139D/0x13A6, 0x139B/0x13A4), loot method change,
@@ -367,7 +428,7 @@ section 0 has the queue. Merge order irrelevant; both touch DbProxyHandlers.cs s
 `client_settings`/`account_settings`, `C_SAVE_CLIENT_*` registered, `S_LOAD_CLIENT_ACCOUNT_SETTING`
 sent before the user setting after C_LOAD_TOPO_FIN), T20 (inventory persistence - `items` table
 keyed (owner_id, id), atoms applied for ops 7/2/6/11/9, 0x27A4 rebuilt from rows, starter kit
-inserted on first login). 272 tests. **Capture taken**: `D:\packetlogs\arb_world_2026-09-13T11-33-30-680Z.log`
+inserted on first login). 272 tests. **Capture taken**: `<captures>\arb_world_2026-09-13T11-33-30-680Z.log`
 (+ `capture_2026-09-13T11-42-27-513Z.log` client side), condensed `cap_relog9827_ctl.txt`, full
 enter-world frames `cap_relog9827_frames.txt`. It shows the real relog-into-instance behaviour:
 AS_ENTER_WORLD into 9827 with [52]=PDId -> World 0x138D (fail) -> Arbiter pushes 0x148D x2 and
@@ -427,7 +488,7 @@ T17's; three tests needed fixture rows because playerId 1 is reserved for dob's 
    both instances `MSSQLSERVER` and `MSSQL$SQL2022` were STOPPED and the Arbiter died instantly
    with no console log; check `Get-NetTCPConnection -LocalPort 1433 -State Listen` first); restart
    World; client proxy; log in "Test" (the real Arbiter's playerId 2, saved in 9827); spawn, walk,
-   Logout, Exit. Copy tap log + proxy log to D:\packetlogs\cap_relog9827[_client].log. Revert the
+   Logout, Exit. Copy tap log + proxy log to <captures>\cap_relog9827[_client].log. Revert the
    port to 7802 and `C:\deploy.ps1`.
    (b) short-term: on login, if the saved zone is an instance, spawn at the continent's return
    position instead (the real Arbiter has AS_SAVE_ETC_DATA_FOR_MOVE_WORLD 0x1499 data for that).

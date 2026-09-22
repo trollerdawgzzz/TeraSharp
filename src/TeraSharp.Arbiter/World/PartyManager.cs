@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 the TeraSharp contributors
+
 using Microsoft.Extensions.Logging;
 
 namespace TeraSharp.Arbiter.World;
@@ -122,6 +125,17 @@ public sealed class Party
     public bool IsAnonymous { get; set; }
     /// <summary>Party+0x94, -1 for a normal party (the ctor default).</summary>
     public int PartyType { get; set; } = -1;
+    /// <summary>T163. Party+0x78: a system party - one the matcher made (Party::GetWithdrawalPenalty
+    /// answers false without it). S_PARTY_MEMBER_LIST's `ims` byte: 1 in classic_live3 10568 and
+    /// classic_live2 19466, 0 for a normal party (classic_live2 5463).</summary>
+    public bool IsSys { get; set; }
+    /// <summary>T163. Party+0x7A: leaving costs the dropout debuff. Set when a dungeon match forms
+    /// (Handler_MA_FIN_PARTY_MATCH), cleared by DSA_NOTIFY_ABOUT_DUNGEON_CLEAR (Party::OnDungeonClear).</summary>
+    public bool WithdrawalPenalty { get; set; }
+    /// <summary>T163. Party+0x7B: the matched dungeon was cleared.</summary>
+    public bool DungeonCleared { get; set; }
+    /// <summary>T163. The dungeon a system party was matched for (0 for none).</summary>
+    public int DungeonId { get; set; }
     /// <summary>Party+0xC0/0xC4 - the manager's PDId.</summary>
     public int ManagerPlanetId { get; set; } = PartyPackets.PlanetId;
     public int ManagerDbId { get; set; }
@@ -221,11 +235,16 @@ public sealed class PartyManager
         _byTicket[p.Ticket] = p;
         _ticketByDbId[p.UserDbId] = p.Ticket;
         // A member who was offline comes back online in whatever party still holds them.
-        if (_byMember.TryGetValue(p.UserDbId, out var party))
-        {
-            int i = party.IndexOf(p.UserDbId);
-            if (i >= 0) party.Slots[i] = party.Slots[i]!.Value with { Online = true, GameId = p.GameId };
-        }
+        if (_byMember.TryGetValue(p.UserDbId, out var party)) SetOnline(party, p.UserDbId, true, p.GameId);
+        if (_normalByMember.TryGetValue(p.UserDbId, out var normal)) SetOnline(normal, p.UserDbId, true, p.GameId);   // T163
+    }
+
+    private static void SetOnline(Party party, int userDbId, bool online, ulong? gameId = null)
+    {
+        int i = party.IndexOf(userDbId);
+        if (i < 0) return;
+        var m = party.Slots[i]!.Value with { Online = online };
+        party.Slots[i] = gameId is { } g ? m with { GameId = g } : m;
     }
 
     /// <summary>
@@ -240,9 +259,9 @@ public sealed class PartyManager
         _ticketByDbId.Remove(p.UserDbId);
         _applications.RemoveWhere(x => x.applicant == p.UserDbId || x.target == p.UserDbId);
 
+        if (_normalByMember.TryGetValue(p.UserDbId, out var normal)) SetOnline(normal, p.UserDbId, false);   // T163
         if (!_byMember.TryGetValue(p.UserDbId, out var party)) return a;
-        int i = party.IndexOf(p.UserDbId);
-        if (i >= 0) party.Slots[i] = party.Slots[i]!.Value with { Online = false };
+        SetOnline(party, p.UserDbId, false);
         foreach (var (t, _) in OnlineMembersOf(party, except: p.UserDbId))
             a.Client(ClientAction.Def(t, "S_LOGOUT_PARTY_MEMBER", new Dictionary<string, object>
             {
@@ -279,6 +298,9 @@ public sealed class PartyManager
         foreach (var m in p.Members())
         {
             if (m.UserDbId == except) continue;
+            // T163: a member away in a system party does not see this (suspended) party's
+            // traffic - their client left it (S_LEAVE_PARTY) and is shown it again on return.
+            if (_normalByMember.TryGetValue(m.UserDbId, out var sus) && ReferenceEquals(sus, p)) continue;
             if (_ticketByDbId.TryGetValue(m.UserDbId, out uint t)) yield return (t, m);
         }
     }
@@ -287,9 +309,20 @@ public sealed class PartyManager
 
     private readonly Dictionary<long, Party> _byId = new();
     private readonly Dictionary<int, Party> _byMember = new();
+    /// <summary>T163: the NORMAL party a member of a system party still belongs to, suspended until
+    /// they leave the system one (PartyManager's +0x10 map; _byMember is FindParty, system first).</summary>
+    private readonly Dictionary<int, Party> _normalByMember = new();
 
-    /// <summary>PartyManager::FindPartyByPDId (FUN_1409145a0). One planet, so the key is the db id.</summary>
+    /// <summary>PartyManager::FindPartyByPDId (FUN_1409145a0). One planet, so the key is the db id.
+    /// T163: like FindParty, the system party when there is one.</summary>
     public Party? FindByMember(int userDbId) => _byMember.TryGetValue(userDbId, out var p) ? p : null;
+
+    /// <summary>T163: PartyManager::FindNormalParty - the member's own party, suspended or not.</summary>
+    public Party? FindNormalParty(int userDbId)
+    {
+        if (_normalByMember.TryGetValue(userDbId, out var n)) return n;
+        return FindByMember(userDbId) is { IsSys: false } p ? p : null;
+    }
     public Party? FindById(long id) => _byId.TryGetValue(id, out var p) ? p : null;
     public int PartyCount => _byId.Count;
 
@@ -467,6 +500,7 @@ public sealed class PartyManager
             case PartyPackets.SA_CHANGE_PARTY_MANAGER: return ChangeManagerFromWorld(a, payload);
             case PartyPackets.SA_CHANGE_LOOTING_METHOD: return ChangeLootingFromWorld(a, payload);
             case PartyPackets.SA_BYPASS_TO_GROUP: return BypassToGroup(a, payload);
+            case PartyPackets.DSA_NOTIFY_ABOUT_DUNGEON_CLEAR: return DungeonClearFromWorld(a, payload);   // T163
             default: return a.Reject($"0x{opcode:X4} is not a party frame");
         }
     }
@@ -578,6 +612,181 @@ public sealed class PartyManager
         return a;
     }
 
+    // =========================================================================================
+    // T138d - the matched party
+    // =========================================================================================
+
+    /// <summary>
+    /// One member of a formed match: who, and which POSITION they were matched into.
+    /// <paramref name="Role"/> is what S_SYS_PARTY_INFO carries per slot.
+    /// </summary>
+    public readonly record struct MatchedMember(int UserDbId, MatchRole Role);
+
+    /// <summary>
+    /// T138d. The matcher put these characters together - make them a party.
+    ///
+    /// <para>classic_live3 record 10585 is S_FIN_INTER_PARTY_MATCH and 10587 is a 488-byte
+    /// S_SYS_PARTY_INFO carrying all five matched members with their positions; the player only
+    /// presses enter (C_ENTER_DUNGEON, 11521) afterwards. So the party has to exist BEFORE anyone
+    /// walks in, which is the whole reason five matched strangers land in one instance rather
+    /// than five: World routes a party together, and it only knows they are a party because
+    /// AS_DO_CREATE_PARTY told it - carrying <paramref name="dungeonId"/> and
+    /// <paramref name="battleFieldId"/>, the two fields that say WHICH content this party was
+    /// matched for (DbProxyStaticData's AS_DO_CREATE_PARTY layout, [2B] and [34]).</para>
+    ///
+    /// <para><b>T163: always a NEW system party; the queued parties are suspended, not
+    /// extended.</b> T138d extended the biggest queued party, which left World with a NORMAL
+    /// party (PartyType -1, dungeon id -1 - cap_social seq 748) and so no dungeon for
+    /// C_ENTER_DUNGEON to find (User::Handler_C_ENTER_DUNGEON, WorldServer.exe.c:577742:
+    /// party+0x13C0 == -1 -> system message 0x889). The real Arbiter does what this does now:
+    /// Handler_MA_FIN_PARTY_MATCH calls PartyManager::New_CreateParty with a SysPartyInfoType, and
+    /// New_CreateParty (ArbiterServer.exe.c:1595045) sends S_LEAVE_PARTY to every member it finds
+    /// in a NORMAL party - classic_live2 19463, the queued pair's client, right before the
+    /// matched raid's member lists - and leaves that normal party where it is. PartyManager keeps
+    /// two maps (FindNormalParty +0x10, FindSysParty +0x20; FindParty tries the system one
+    /// first), and so does World (PartyViewManager::DoCreateParty, WorldServer.exe.c:1635173,
+    /// suspends each member's normal party itself when the new one is not type -1). When a
+    /// member leaves the system party the normal one is theirs again: KickPartyMember ends with
+    /// Party::New_SendPartyMemberList(normal, member) - <see cref="RestoreNormalParty"/>.</para>
+    ///
+    /// <para>Members who are not registered - logged out between formation and this call - are
+    /// skipped rather than faked. Fewer than two survivors is a rejection, not a party of one.</para>
+    ///
+    /// <para><b>T161: <paramref name="matchFrames"/></b> are what each MATCHED member gets after
+    /// the party exists and before their S_SYS_PARTY_INFO - classic_live3 10568-10579 (party
+    /// member lists), 10580/10581 (S_CHANGE_EVENT_MATCHING_STATE x2), 10585 (FIN), 10587
+    /// (S_SYS_PARTY_INFO). Before T161 the FIN went out ahead of the party and no client of
+    /// cap_queue1 opened the enter-now/later window.</para>
+    /// </summary>
+    public PartyActions FormMatchedParty(IReadOnlyList<MatchedMember>? members, bool raid,
+        int dungeonId, int battleFieldId = 0, int teamIndex = 0,
+        IReadOnlyList<byte[]>? matchFrames = null)
+    {
+        var a = new PartyActions();
+        if (members == null || members.Count < 2)
+            return a.Reject("FormMatchedParty: a match of fewer than two is not a party");
+
+        var known = new List<(MatchedMember M, PartyPlayer P)>(members.Count);
+        foreach (var m in members)
+            if (_ticketByDbId.TryGetValue(m.UserDbId, out uint t)
+                && _byTicket.TryGetValue(t, out var p))
+                known.Add((m, p));
+        if (known.Count < 2)
+            return a.Reject($"FormMatchedParty: only {known.Count} of {members.Count} are online");
+
+        // "Already in SysParty" (New_CreateParty's refusal): a member cannot be in two matches.
+        foreach (var (m, _) in known)
+            if (FindByMember(m.UserDbId) is { IsSys: true } busy)
+                return a.Reject($"FormMatchedParty: {m.UserDbId} is already in system party 0x{busy.Id:X}");
+
+        var party = new Party
+        {
+            Id = NextPartyId(), Raid = raid, IsAnonymous = false,
+            // SysPartyInfoType, Party+0x94: 0 for a dungeon (MA_FIN_PARTY_MATCH's FIN branch is
+            // `party+0x94 == 0`; cap_queue1 3312 carries 0), never the normal party's -1.
+            PartyType = 0,
+            IsSys = true,
+            DungeonId = dungeonId,
+            // Handler_MA_FIN_PARTY_MATCH: SetWithdrawalPenalty(true) only on the dungeon branch.
+            WithdrawalPenalty = dungeonId > 0 && battleFieldId == 0,
+        };
+        party.ManagerDbId = known[0].M.UserDbId;
+        _byId[party.Id] = party;
+
+        foreach (var (m, p) in known)
+        {
+            if (party.FindEmptySlot() < 0) break;
+            if (FindByMember(m.UserDbId) is { } normal)
+            {
+                // Suspended, not left: no AS_DO_REMOVE_PARTY_MEMBER, the normal party keeps the
+                // slot, World suspends its own copy. Only the client is told (classic_live2 19463).
+                _normalByMember[m.UserDbId] = normal;
+                a.Client(ClientAction.Def(p.Ticket, "S_LEAVE_PARTY", new Dictionary<string, object>()));
+            }
+            AddMember(a, party, p);
+        }
+
+        if (party.Count < 2)
+        {
+            foreach (var mm in party.Members()) Unsuspend(mm.UserDbId);
+            Dissolve(a, party, "matched party never reached two members");
+            return a.Reject("FormMatchedParty: nobody could be seated");
+        }
+
+        a.World(PartyPackets.AS_DO_CREATE_PARTY, PartyPackets.BuildDoCreateParty(
+            party.Id, party.OwnerPlanetId, party.ManagerPlanetId, party.ManagerDbId,
+            party.MaxMembers, party.PartyType, dungeonClearCompensation: false,
+            dungeonId: dungeonId, raid: party.Raid, teamIndex: teamIndex,
+            battleFieldId: battleFieldId, members: party.Members().ToList()));
+        // The same two-per-member mirror JoinCore sends: matching is over, and World will not
+        // refresh its party UI without the second one (T64, cap_social.log seq 748 -> 751..753).
+        foreach (var m in party.Members())
+            a.World(PartyPackets.AS_CHANGE_EVENT_MATCHING_STATE,
+                PartyPackets.BuildAsChangeEventMatchingState(m.UserDbId, isMatching: false));
+        foreach (var m in party.Members())
+            a.World(PartyPackets.AS_REQUEST_REFRESH_PARTY_INFO,
+                PartyPackets.BuildAsRequestRefreshPartyInfo(m.UserDbId));
+
+        BroadcastMemberList(a, party);
+        BroadcastSysPartyInfo(a, party, known, matchFrames);
+
+        _log.LogInformation(
+            "Party 0x{Id:X} (system) created by the matcher: {N} member(s), dungeon {D}, battlefield {B}, {S} normal part(ies) suspended",
+            party.Id, party.Count, dungeonId, battleFieldId,
+            party.Members().Count(m => _normalByMember.ContainsKey(m.UserDbId)));
+        return a;
+    }
+
+    /// <summary>
+    /// S_SYS_PARTY_INFO to every online member. The slots follow the party's own slot order -
+    /// which for a party created here is the order the matcher seated them, leader first - and
+    /// each one carries that member's matched position (-1, the empty slots' value, for anyone
+    /// without one).
+    /// </summary>
+    private void BroadcastSysPartyInfo(PartyActions a, Party party,
+        List<(MatchedMember M, PartyPlayer P)> known, IReadOnlyList<byte[]>? matchFrames = null)
+    {
+        var roles = new Dictionary<int, int>(known.Count);
+        foreach (var (m, _) in known) roles[m.UserDbId] = (int)m.Role;
+
+        var frame = SysPartyInfoFrame(party, roles);
+        foreach (var (t, m) in OnlineMembersOf(party))
+        {
+            // T161: the matched members' state pair + FIN go here, per member and ahead of
+            // that member's S_SYS_PARTY_INFO. A seed-party member who was not in this match
+            // gets no FIN - there is no window for them to answer.
+            if (matchFrames != null && roles.ContainsKey(m.UserDbId))
+                foreach (var f in matchFrames) a.Client(ClientAction.Raw(t, f));
+            a.Client(ClientAction.Raw(t, frame));
+        }
+    }
+
+    /// <summary>S_SYS_PARTY_INFO for <paramref name="party"/>: its own slot order, each member's
+    /// matched position from <paramref name="roles"/>, -1 for anyone without one.</summary>
+    private static byte[] SysPartyInfoFrame(Party party, IReadOnlyDictionary<int, int> roles)
+    {
+        var slots = new List<PartyPackets.SysPartySlot>(party.Count);
+        foreach (var m in party.Members())
+            slots.Add(new PartyPackets.SysPartySlot(
+                m.PlanetId, m.UserDbId, roles.TryGetValue(m.UserDbId, out int r) ? r : -1));
+        return PartyPackets.BuildSysPartyInfo(slots);
+    }
+
+    /// <summary>
+    /// T161. The S_SYS_PARTY_INFO a re-offered match carries: the party
+    /// <paramref name="userDbId"/> is in now, with the positions the matcher seated. Null when
+    /// they are in no party - the party was dissolved while the match waited, and a FIN alone
+    /// is still a valid offer (C_ENTER_DUNGEON then fails World's party check, 0x889).
+    /// </summary>
+    public byte[]? SysPartyInfoFor(int userDbId, IReadOnlyDictionary<int, int> roles)
+    {
+        var party = FindByMember(userDbId);
+        return party == null ? null : SysPartyInfoFrame(party, roles);
+    }
+
+    /// <summary>T161: the party id <paramref name="userDbId"/> is in, 0 for none.</summary>
+    public long PartyIdOf(int userDbId) => FindByMember(userDbId)?.Id ?? 0;
+
     /// <summary>SA_LEAVE_PARTY (0x1396). C_LEAVE_PARTY has no Arbiter handler - the button goes
     /// to World and comes back here.</summary>
     private PartyActions LeaveParty(PartyActions a, byte[] payload)
@@ -588,11 +797,72 @@ public sealed class PartyManager
         if (party == null) return a.Reject($"SA_LEAVE_PARTY: no party 0x{l.Value.PartyId:X}");
         if (party.IndexOf(l.Value.MemberDbId) < 0) return a.Reject("SA_LEAVE_PARTY: not a member");
 
+        // T163: Party::GetWithdrawalPenalty, read BEFORE the member goes (the leave job keeps it
+        // at +0x9C and acts on it after the removal).
+        bool penalty = party.IsSys && party.WithdrawalPenalty;
         RemoveMember(a, party, l.Value.MemberDbId, tellLeaver: true);
         a.World(PartyPackets.AS_DO_REMOVE_PARTY_MEMBER,
             PartyPackets.BuildDoRemovePartyMember(party.Id, PlanetId, l.Value.MemberDbId));
+        if (penalty)
+        {
+            // The dropout debuff is World's (abnormality DungeonMatching.xml withdrawalAbnormalityId,
+            // 999994 / 180 s here) - applied on this frame, FUN_1409752e0 -> FUN_140982610.
+            a.World(PartyPackets.AS_NOTIFY_ABOUT_SYS_PARTY_WITHDRAWAL,
+                PartyPackets.BuildAsNotifyAboutSysPartyWithdrawal(PlanetId, l.Value.MemberDbId));
+            _log.LogInformation("Party 0x{Id:X}: {M} left dungeon {D} before the clear - dropout penalty",
+                party.Id, l.Value.MemberDbId, party.DungeonId);
+        }
+        RestoreNormalParty(a, l.Value.MemberDbId);
         FinishAfterRemoval(a, party);
         return a;
+    }
+
+    /// <summary>
+    /// T163. DSA_NOTIFY_ABOUT_DUNGEON_CLEAR (0x13F0): [i64 PartyId][i32 DungeonId], frame 0x12
+    /// (Handler at ArbiterServer.exe.c:1240706). World sends it for the party that owns a
+    /// dungeon when it is cleared (DungeonManager::BroadcastDungeonClear). Party::OnDungeonClear
+    /// then writes 0x100 to +0x7A: penalty off, cleared on - so leaving after the last boss
+    /// costs nothing (classic_live3: 53190 S_DUNGEON_CLEAR, 53990 C_LEAVE_PARTY, and no 999994
+    /// on the capturer afterwards). Nothing goes to a client or back to World.
+    /// </summary>
+    private PartyActions DungeonClearFromWorld(PartyActions a, byte[] payload)
+    {
+        if (payload.Length < PartyPackets.DungeonClearMinPayload)
+            return a.Reject("DSA_NOTIFY_ABOUT_DUNGEON_CLEAR: short frame");
+        long partyId = BitConverter.ToInt64(payload, 0);
+        int dungeonId = BitConverter.ToInt32(payload, 8);
+        var party = FindById(partyId);
+        if (party == null) return a.Reject($"DSA_NOTIFY_ABOUT_DUNGEON_CLEAR: no party 0x{partyId:X}");
+        if (!party.IsSys) return a;                        // `if (*(char *)(param_1 + 0x78) != '\0')`
+        party.WithdrawalPenalty = false;
+        party.DungeonCleared = true;
+        _log.LogInformation("Party 0x{Id:X} cleared dungeon {D}: leaving no longer costs the dropout penalty",
+            party.Id, dungeonId);
+        return a;
+    }
+
+    /// <summary>
+    /// T163. <paramref name="userDbId"/> left their system party: the normal party they were in
+    /// when they queued is theirs again, and their client is shown it -
+    /// Party::New_SendPartyMemberList(normal, member), the last step of
+    /// PartyManager::KickPartyMember (ArbiterServer.exe.c:1593106). World restores its own copy.
+    /// </summary>
+    private void RestoreNormalParty(PartyActions a, int userDbId)
+    {
+        if (!_normalByMember.Remove(userDbId, out var normal)) return;
+        if (!_byId.ContainsKey(normal.Id) || normal.IndexOf(userDbId) < 0) return;   // it went while they were away
+        _byMember[userDbId] = normal;
+        if (_ticketByDbId.TryGetValue(userDbId, out uint t))
+            a.Client(ClientAction.Def(t, "S_PARTY_MEMBER_LIST", MemberListFields(normal)));
+        _log.LogInformation("Party 0x{Id:X}: {M} is back from the matched party", normal.Id, userDbId);
+    }
+
+    /// <summary>T163: forget a suspension without restoring it (a match that never formed).</summary>
+    private void Unsuspend(int userDbId)
+    {
+        if (_normalByMember.Remove(userDbId, out var normal) && _byId.ContainsKey(normal.Id)
+            && normal.IndexOf(userDbId) >= 0)
+            _byMember[userDbId] = normal;
     }
 
     /// <summary>SA_DISMISS_PARTY (0x1397) - World accepted the dismiss request.</summary>
@@ -618,7 +888,7 @@ public sealed class PartyManager
 
         var target = party.Slots[slot]!.Value;
         party.Slots[slot] = null;
-        _byMember.Remove(target.UserDbId);
+        Unmap(target.UserDbId, party);
 
         if (_ticketByDbId.TryGetValue(target.UserDbId, out uint tt))
             a.Client(ClientAction.Def(tt, "S_BAN_PARTY", new Dictionary<string, object>()));
@@ -632,6 +902,7 @@ public sealed class PartyManager
             }));
         a.World(PartyPackets.AS_DO_REMOVE_PARTY_MEMBER,
             PartyPackets.BuildDoRemovePartyMember(party.Id, PlanetId, target.UserDbId));
+        if (party.IsSys) RestoreNormalParty(a, target.UserDbId);   // T163: KickPartyMember's last step
         FinishAfterRemoval(a, party);
         return a;
     }
@@ -750,17 +1021,37 @@ public sealed class PartyManager
         if (slot < 0) return;
         var gone = party.Slots[slot]!.Value;
         party.Slots[slot] = null;
-        _byMember.Remove(userDbId);
+        Unmap(userDbId, party);
 
         if (tellLeaver && _ticketByDbId.TryGetValue(userDbId, out uint lt))
+        {
             a.Client(ClientAction.Def(lt, "S_LEAVE_PARTY", new Dictionary<string, object>()));
+            // T163: a system party's leaver is also taken out of matching - classic_live3 53993
+            // S_LEAVE_PARTY, 53994 S_CANCEL_PARTY_MATCH_POOL(-9999, 2).
+            if (party.IsSys) a.Client(ClientAction.Raw(lt, MatchQueueManager.BuildCancelPartyMatchPool()));
+        }
         foreach (var (t, _) in OnlineMembersOf(party))
+        {
             a.Client(ClientAction.Def(t, "S_LEAVE_PARTY_MEMBER", new Dictionary<string, object>
             {
                 ["serverId"] = (uint)PlanetId,
                 ["playerId"] = (uint)userDbId,
                 ["name"] = gone.Name,
             }));
+            // T163: and so is everyone left behind - 53966 S_LEAVE_PARTY_MEMBER, 53967 the same cancel.
+            if (party.IsSys) a.Client(ClientAction.Raw(t, MatchQueueManager.BuildCancelPartyMatchPool()));
+        }
+    }
+
+    /// <summary>
+    /// T163: <paramref name="userDbId"/> is no longer in <paramref name="party"/>. Only the map
+    /// entry that points at THIS party goes - a suspended member's system party, or a system
+    /// member's suspended normal party, is somebody else's business.
+    /// </summary>
+    private void Unmap(int userDbId, Party party)
+    {
+        if (_byMember.TryGetValue(userDbId, out var cur) && ReferenceEquals(cur, party)) _byMember.Remove(userDbId);
+        if (_normalByMember.TryGetValue(userDbId, out var n) && ReferenceEquals(n, party)) _normalByMember.Remove(userDbId);
     }
 
     /// <summary>
@@ -794,13 +1085,19 @@ public sealed class PartyManager
 
     private void Dissolve(PartyActions a, Party party, string why)
     {
-        foreach (var (t, _) in OnlineMembersOf(party))
-            a.Client(ClientAction.Def(t, "S_LEAVE_PARTY", new Dictionary<string, object>()));
-        foreach (var m in party.Members()) _byMember.Remove(m.UserDbId);
+        // A suspended member (in a system party right now) is not shown their normal party
+        // going: their client already had S_LEAVE_PARTY for it when the match formed.
+        foreach (var (t, m) in OnlineMembersOf(party))
+            if (!_normalByMember.TryGetValue(m.UserDbId, out var sus) || !ReferenceEquals(sus, party))
+                a.Client(ClientAction.Def(t, "S_LEAVE_PARTY", new Dictionary<string, object>()));
+        var former = party.Members().Select(m => m.UserDbId).ToList();
+        foreach (int id in former) Unmap(id, party);
         for (int i = 0; i < party.Slots.Length; i++) party.Slots[i] = null;
         _byId.Remove(party.Id);
         a.World(PartyPackets.AS_DO_DISMISS_PARTY, PartyPackets.BuildDoDismissParty(party.Id));
         _log.LogInformation("Party 0x{Id:X} {Why}", party.Id, why);
+        // T163: the matched party is over - everyone goes back to the group they queued with.
+        if (party.IsSys) foreach (int id in former) RestoreNormalParty(a, id);
     }
 
     private void BroadcastMemberList(PartyActions a, Party party)
@@ -859,7 +1156,7 @@ public sealed class PartyManager
         }
         return new Dictionary<string, object>
         {
-            ["ims"] = false,                          // Party+0x78 IsSysParty; matchmaking only
+            ["ims"] = party.IsSys,                    // Party+0x78 IsSysParty - T163: 1 in classic_live3 10568
             ["raid"] = party.Raid,
             ["memberLimit"] = (uint)party.MaxMembers,
             ["id"] = (ulong)party.Id,

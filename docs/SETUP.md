@@ -32,6 +32,9 @@ Put the first four under one root. That root is `TERASHARP_DATA`:
     WebApp\AppResource\ItemData\StrSheet_Item*.xml      (optional, admin-web item names)
 ```
 
+`Executable\Datasheet\` is read by the Arbiter too, not only by World: it is where server
+policy lives (section 8).
+
 Nothing in that tree comes from this repository and nothing in it should ever be committed
 back into it — `.gitignore` already refuses the obvious paths.
 
@@ -52,8 +55,9 @@ plain console app on purpose, so there is no xUnit to restore.
 dotnet run --project src\TeraSharp.Arbiter.Tests
 ```
 
-Expect a lot of `(skipped: data/... not found)`. That is correct: the byte-exact fixtures are
-not in the repository and you have not generated any yet. The run must still end green.
+Expect a lot of `SKIP  <test>: data/... not found`. That is correct: the byte-exact fixtures are
+not in the repository and you have not generated any yet. The run ends
+`N passed, 0 failed, S skipped` and exits 0; a skip is never a failure.
 
 ## 2. Configure
 
@@ -137,7 +141,8 @@ dotnet run --project src\TeraSharp.Arbiter
 
 You want to see, in order: the opcode count, the definition count, the registered handler
 count, then `World link` coming up. If World is not running yet the Arbiter waits and
-reconnects — that is normal, and an Arbiter restart does not need a World restart.
+reconnects — that is normal. The reverse is not: World does not survive the Arbiter link
+dropping, so every Arbiter restart needs a World restart (section 12).
 
 Log in. If the client reaches the lobby but not the world, the enter-world path is where to
 look; `status/ENTER-WORLD-FALLBACK.md` covers what the fallback does and why.
@@ -169,13 +174,107 @@ Work through `docs/GO-LIVE.md`. The short version:
 - the Arbiter's phone-home inheritance: the retail ArbiterServer called out to a hardcoded
   address at startup. TeraSharp does not, but block outbound from the box anyway.
 
-## 8. Contributing back
+## 8. Datasheets are the source of truth
+
+Server policy lives in the datasheets, not in TeraSharp. The Arbiter reads the same
+`Executable\Datasheet` World does: guild-war costs and surrender rates (`GuildConfig.xml`), class
+roles (`DungeonMatching.xml`), default skills, starter kits and start level (`CreateCharData.xml`),
+battlegrounds and leaderboards (`BattleFieldData.xml`, `DungeonRankRecorder_*.xml`), event
+matching, guards and continents (`GuardData.xml`), daily shop resets (`BuyMenuData*.xml`).
+
+- To change a rule, edit the sheet and restart **both** servers. Do not patch a constant.
+- A missing or broken sheet falls back to a built-in copy; a missing `BattleFieldData.xml` means
+  no battlegrounds.
+- `--check-config` lists every sheet it loaded. `status/DATASHEETS.md` is the full table.
+
+## 9. The admin API
+
+The admin web's own listener, `http://127.0.0.1:<TERASHARP_ADMIN_PORT>/api/...`. Every call
+needs the `X-Admin-Token` header; every write takes a `reason` and lands in `GET /api/admin-log`.
 
 ```powershell
-.\tools\audit-release.ps1
+$h   = @{ 'X-Admin-Token' = $env:TERASHARP_ADMIN_TOKEN }
+$api = "http://127.0.0.1:$($env:TERASHARP_ADMIN_PORT)/api"
+Invoke-RestMethod "$api/online" -Headers $h
+Invoke-RestMethod "$api/set-level" -Method Post -Headers $h -ContentType 'application/json' `
+    -Body '{"name":"Someone","level":65,"reason":"test"}'
 ```
 
-Run it before every push to a public remote. It fails on retail blobs (by content hash, so a
+| Route | Body | Notes |
+|---|---|---|
+| `POST /api/set-level` | `{"id"` or `"name","level","reason"}` | 1..70. World levels the character too and learns its skills: now if it is in world, else on its next spawn |
+| `POST /api/give-item` | `{"id","templateId","amount","reason"}` | a plain template and amount, no option block |
+| `POST /api/delete-character` | `{"id","reason"}` | **immediate hard delete**, no restore. Refused while online: kick first |
+| `POST /api/teleport` | `{"id","targetId"}` | moves `id` to `targetId`; both must be in world |
+| `POST /api/kick`, `/api/announce` | `{"id","reason"}`, `{"text","reason"}` | the restart rule, section 12 |
+
+The rest: `GET` accounts, account, character, search, online, deleted, restrictions, announces,
+status, log, game-log, admin-log; `POST` restore-character, set-money, ban/unban, mute/unmute,
+warn, gm-level, rename, announce-schedule, announce-delete. `status/WEBADMIN-DESIGN.md` has them.
+
+## 10. The GM panel (Alt+A)
+
+The client's In-Game Operation Tool. It opens for a GM account (`TERASHARP_GM_ACCOUNTS`, or
+`accounts.admin_level >= 1`) once `TERASHARP_API_GATEWAY`, `TERASHARP_DB_SERVER_NAME` and
+`TERASHARP_API_JWT_SECRET` are set. `docs/GO-LIVE.md` section 4 is the checklist. `/@` chat
+commands use the same admin level (`status/GM-COMMANDS-ARBITER.md`).
+
+## 11. Level-70 start, from data
+
+A new character's kit and start level come from `CreateCharData.xml` (section 8), so a level-70
+start is a datasheet edit, not a code change:
+
+```powershell
+.\tools\level70-start.ps1 -Executable <TERASHARP_DATA>\Executable -StarterScroll   # stop both servers first
+.\tools\level70-start.ps1 -Executable <TERASHARP_DATA>\Executable -Revert
+```
+
+It lifts the class teleport gate, and `-StarterScroll` puts the level-70 jump scroll in every new
+character's bag. Both servers read the sheet at boot. Originals are backed up with a hash manifest.
+
+## 12. Restarting: announce, kick, restart
+
+World does not survive the Arbiter link dropping, and a character is saved when it leaves the
+world. So never kill the Arbiter with players online:
+
+1. **Announce** - `POST /api/announce {"text":"Restart in 5 minutes","reason":"deploy"}`.
+2. **Kick** everyone left after the grace period - `GET /api/online`, then `POST /api/kick` per
+   `playerId`. Each kick runs World's normal leave-and-save path.
+3. **Restart** - stop the Arbiter, deploy, start it, then restart `WorldServer.exe`.
+
+`deploy.example.ps1` does steps 1-2 for you (`-GraceSeconds`) when `TERASHARP_ADMIN_TOKEN` is set.
+
+## 13. Matchmaking knobs
+
+| Variable | Default | |
+|---|---|---|
+| `TERASHARP_MATCH_ENTRY_SECONDS` | 300 | how long a formed match stays claimable |
+| `TERASHARP_BG_MAX_HEALERS` / `TERASHARP_BG_MAX_TANKS` | 2 / 3 | per-team caps for a battleground type with no rule of its own |
+| `TERASHARP_MATCH_MIN_MEMBERS` | unset | **test only.** A pool forms at N players and roles are ignored, so two accounts can reach a dungeon. The Arbiter warns at start while it is set. Never on a server with players |
+
+Team sizes and which battlegrounds exist come from `BattleFieldData.xml`, not from these.
+
+## 14. Capturing your own traffic: the tap in front of TeraSharp
+
+The byte-exact fixtures (`data/README.md`) come from your own server. To record the
+Arbiter<->World link, put `tools/arbiter-world-tap.js` between World and TeraSharp:
+
+1. Edit `logPath` at the top of the script to a folder you own (default `C:\TERA_SERVER.100\`).
+2. Point World at the tap: `DeploymentConfig.xml` `<ArbiterServer port="7812"/>`.
+3. `node tools\arbiter-world-tap.js`, then start TeraSharp (it still listens on 7802), then World.
+4. Play the flow you want pinned, stop, then `tools\reframe-tap.ps1` and `tools\make-tsis.ps1`
+   (`tools/README.md`, `data/README.md`).
+
+The same tap in front of a stock `ArbiterServer.exe` gives you the reference to compare against.
+Put the port back to 7802 when you are done. Never commit a capture.
+
+## 15. Contributing back
+
+```powershell
+.\tools\audit-release.ps1 -Strict
+```
+
+Run it before every push to a public remote; `-Strict` also fails on decompiler-style lines. It fails on retail blobs (by content hash, so a
 rename does not help), captured ranking frames, credentials, public IP addresses and build
 junk. Fix what it reports rather than working around it.
 
@@ -189,6 +288,8 @@ junk. Fix what it reports rather than working around it.
 | `Failed to load definitions` | the `tera_v100_MASTER_FINAL\` path, and that it really holds `.def` files |
 | Client reaches the lobby, never the world | `status/ENTER-WORLD-FALLBACK.md` |
 | Character creation fails | the four runtime blobs, section 3 |
+| No battlegrounds in the matching window | `BattleFieldData.xml` missing, section 8 |
+| Characters lose progress after a deploy | the Arbiter was killed with players online, section 12 |
 | Admin web does not answer | `TERASHARP_ADMIN_TOKEN` unset means it never starts |
 | Alt+A rejects the token | `TERASHARP_API_JWT_SECRET` does not match tera-api |
 | A packet the client ignores | `status/CLIENT-REJECTS.md` lists the ones World refuses and why |

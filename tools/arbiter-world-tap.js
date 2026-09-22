@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 the TeraSharp contributors
 // arbiter-world-tap.js
 // TCP proxy that sits between WorldServer and ArbiterServer, logging every byte
 // in both directions. WorldServer connects to LISTEN_PORT, we forward to

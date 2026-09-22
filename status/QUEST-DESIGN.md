@@ -2,7 +2,7 @@
 
 > ## THE CAPTURE ARRIVED — LIST 2 IS THE COMPLETED IDS
 >
-> `D:\packetlogs\arb_world_2026-09-13T11-33-30-680Z.log` **seq 881** is the "Test" login this
+> `<captures>\arb_world_2026-09-13T11-33-30-680Z.log` **seq 881** is the "Test" login this
 > file was asking for: three completed quests (59901, 59902, 59903) and one in progress (59904).
 > The answers:
 >
@@ -27,9 +27,9 @@ Sources, in the order they win:
 - `D:\v100\TERA_SERVER.100\ArbiterServer.exe.c` — `Handler_SDB_SET_QUEST_INFO` (tracer line
   1283916), `Handler_SDB_LOAD_QUEST_LIST` (1275742), and the `0x272D` writer `FUN_1406edac0`
   (1206774, opcode at 1206795).
-- `D:\packetlogs\cap_newchar.log` — real ArbiterServer, brand-new character "Test" playerId 2.
+- `<captures>\cap_newchar.log` — real ArbiterServer, brand-new character "Test" playerId 2.
   One login, 28 × `0x272E`, one `0x272C`.
-- `D:\packetlogs\lobby_tap.log` — "dob", a played character: login + relog, so two `0x272D`
+- `<captures>\lobby_tap.log` — "dob", a played character: login + relog, so two `0x272D`
   replies, one of which actually has content.
 
 All offsets are **payload**-relative (frame offset − 6) unless a line says "frame". Everything
@@ -326,3 +326,61 @@ Verified in Python against both captures, not built: all 28 `0x272F` replies reb
 (given the capture's questDbIds 2-5); `BuildDbs272D` with no rows reproduces cap_newchar seq 342's
 73-byte payload exactly; and with the capture's one active record, the three completed ids and its
 trailer it reproduces arb_world seq 881's 165-byte payload exactly.
+
+## T158 - cap_play1: what stopped test and caludesucks
+
+All pins are cap_play1.log (A<->W) frame numbers.
+
+| Symptom | Cause | Verdict |
+|---|---|---|
+| test: gathering gives nothing, mailbox empty | 13074 SA_CREST_USE (glyph applied, DLM 0x4C5) never answered. After it World sent no DB frame for player 10: the ten PICKENDs (result 3, same node template 402 and quest step as caludesucks) had no SDB_ITEM_SINGLE, five C_LIST_PARCEL had no SDB_LIST_PARCEL, the 05:42 save never came | bug - AS_CREST_USE `[DLM][1]` |
+| caludesucks: quest 59911 stuck at step 5, pegasus refused | 31914 SDB_PEGASUS_FEE (one 568-byte TS_CHANGE_MONEY of -1000, the fee 0x538e lists) never answered; 31996 / 32127 retries sent nothing | bug - fee charged, DBS_PEGASUS_FEE `[DLM][1]` |
+| Village Atlas / `teleport 7005` "@3301" | World's User::CheckTeleportClassException: while the class task (questId/task in the datasheet) is incomplete, any other continent is refused. No 0x13BE is sent, so the Arbiter is not asked | expected; clears when the chain is done |
+| every spawn | replayed DBS_END_START_QUEST_LIST with captured DLM 50 after SA_USER_ON_SPAWN_COMPLETE (694 ... 30805) | bug - 0x15AE sealed |
+| C_SET_VISIBLE_RANGE | forwarded; World has no handler | accept-silently |
+
+Checked and fine: the three 0x13BE -> 0x13BF / 0x13C0 -> 0x13C1 instance entries (18469, 20973, 29259) stay on link 1 via the T108 path; world 0's 0x164D roster (82, 173 continents) is applied under world 0 and has no 7005. SDB_SET_QUESTLIST_INFO / 0x2733 and SDB_SET_QUEST_INFO all answered. caludesucks' mailbox lists both system parcels correctly; player-to-player rows still come from the stored MAKE record (T151 touched only the synthesized branch). Not fixed: system-mail attachments (SA_MAKE_SYS_PARCEL carries 202089 + 202238) are not delivered on receive - no captured DBS_RECV_PARCEL_EX with atoms, so op 37 is still unmodelled.
+
+## T160 - level-70 start from data (tools/level70-start.ps1)
+
+**Gate.** `User::Teleport` -> `CheckTeleportClassException` = `ClassExceptionDataSheet::GetClassExceptionData(class, level)`; a row with `TeleportRestriction@continentId` refuses (@3301, 0xCE5) any other continent until `questId`/`taskId` is done. This server's `Datasheet\ClassException.xml` has exactly two such rows, both Reaper (`soulless`, levels 1-57 and 58-70): `continentId="7087" questId="8708" taskId="3"`. The script comments both out. No other class has one: test and caludesucks are class 12 (`glaiver`, blob+200), so their @3301 in cap_play1 is not this sheet. The only other @3301 in `User::Teleport` is `RestrictionProcess<TeleportRestrictionAgent>` (agent mode defaults to -1 = off, per-user flag User+42000 from `AddHuddleAddingPackage`). No sheet sets that mode - see T162 for `RestrictionOpenData`.
+
+**Scroll.** `207631` "70等級跳躍卷軸": `PERFECT_LEVEL_JUMPING_UP`, `combatItemArg1="70"` (target level), usable at levels 1-64, not tradable or destroyable. Same target, levels 1-69: `207301`, `207472`-`207474` (`LEVEL_JUMPING_UP`, but `periodInMinute="1" periodByWebAdmin="True"`, so they expire unless web-admin grants them). Lower: `98836` (65), `206532`-`206539` (26-68), `209170` (68). World side: using one builds `DBIncrementCharacterLevelJump` / `...PerfectJump(user, itemId)`, which deletes the item and sends `SDB_INCREMENT_CHARACTER_LEVEL_JUMP` 0x28DB / `..._PERFECT_JUMP` 0x28DD. The level (item template +0x314 = combatItemArg1) is committed only on the DBS reply (0x28DC / 0x28DE). **TeraSharp answers neither**, so the scroll wedges that character's DB queue, the same failure as T158's SA_CREST_USE. (Answered since T162.)
+
+**Handing it out.**
+
+| Route | Sheet | Works on TeraSharp? |
+|---|---|---|
+| Starter bag | `CreateCharData.xml` `<Char><InitItem itemTemplateId="207631" initWear="false" amount="1"/>` (`-StarterScroll`) | yes since T159 (items) - it reads the sheet, `StarterInventory.cs` is the fallback |
+| Start at 70 outright | `CreateCharData.xml` `<Char createdLevel="70">` (soulless already uses 50) | yes since T162 |
+| UserAdditionalItem / PCBangItem | not loaded by this WorldServer (no such names in it) | - |
+| World-side grants (quest reward, NPC buy list) | QuestData / BuyList | the item arrives via SDB_SET_QUEST_INFO / SDB_ITEM_SINGLE atoms, which TeraSharp applies; not traced further |
+
+**Client DC.** The gate is enforced by World alone: no repack. `207631` must exist in the client's ItemData + StrSheet_Item (it is in this server's 100.02 sheets, zh-TW strings): check the DC; repack those two rows only if they are missing. `CreateCharData` is not in the client DC.
+
+## T162 - data-driven start, the level-jump answers, RestrictionOpen
+
+**createdLevel.** `DatasheetLoader.CreatedLevels` reads `<Char createdLevel>` per class the way the Arbiter does (ArbiterServer.exe.c:141515: default 1, outside 1..127 -> 1); `StarterInventory.BuiltInCreatedLevels` (all 1, soulless 50) is the fallback. `CharacterHandlers.BuildRecord` makes the row at that level (the blob gets it on the way out, T105); above 1 it is queued for `WorldLevelSync`, so World runs its own level commit - skills - at the first spawn. `<InitItem>` rows were already read (T159); the scroll lands in the bag behind the potions.
+
+**0x28D9 / 0x28DB / 0x28DD.** All three have one layout: request `[ref @6 -> 856-byte atoms][DlmId @0E][UserDbId @12]` (World FUN_1405f3b00 / 3db0), reply `[DlmId @6][ok @0A]`. The real Arbiter runs the atoms (the used-up item) and never touches the level. World levels the character itself after the reply: `DBIncrementCharacterLevelPerfectJump::ExecuteCommitSQL` starts a `DBLevelExpContext` to item template +0x314 (combatItemArg1), which arrives as S_UPDATE_EXP_LEVEL 0x273B - already persisted. So no Arbiter-side level sync for the scroll (it would level twice). DbAckTable rows with the new `a6` token; the only rows without a live pair.
+
+**RestrictionOpenData = `Datasheet\RestrictionOpen.xml`** (top level; ServerConfig.xml `<RestrictionOpenData fileName="RestrictionOpen.xml"/>` in both server sections). Eight `<RestrictionOpen>` blocks:
+
+| Block | Applies when | Content |
+|---|---|---|
+| `level="1"` (CBT: continent A only) | WorldServerConfig `restrictionOpenLevel` == 1 | PegasusException 21,29,30,93,121,132,130,113,103,27; BuyList 141,142,151,159; HuntingZone 61,361,4,204,304,8,208,308,10,210,310; Territory 212/21200007; Collection 7004 |
+| `pve="true"` | PvE server | GuardPolicy 1; BuyList 352,150005,219000; Quest 7289,7299,6389 |
+| `server="dungeon"` / `"battlefield"` | that server type | Quest 7289,7299,6389 |
+| `publisher="FOG"` / `"EME"` / `"RUS"` | that publisher | Npc (T-Cat, summer event, Pandora), Quest 6382,4180,6378,477,6377, BuyList |
+| `level="0"` | always | Quest 6378 |
+
+`IsAppliableRestriction` (WorldServer.exe.c:187788): level 0 = always, else equal to `restrictionOpenLevel` (config +0x44 = DAT_141dd1504). This server has `restrictionOpenLevel="0"`, so the CBT row - the only one that closes travel (pegasus routes) - is off. **No row gates teleport**, so it is not the Valkyrie @3301 either; `level70-start.ps1` now pins `restrictionOpenLevel="0"` (0 edits here). The @3301 left is `TeleportRestrictionAgent` (mode -1 = off unless set at runtime); re-check with a capture on T158+ code, where the pegasus fee no longer wedges.
+
+## T164 - the two requests that wedged cap_scroll
+
+| Request | cap_scroll | Layout (frame offsets) | Answer |
+|---|---|---|---|
+| 0x28AE SDB_MARK_AS_QUEST_COMPLETED, 22 B | 18110, player 11, after the jump's level/skill burst | `[ref @6 -> i32 quest ids][DlmId @0E][UserDbId @12]` | 0x28AF `[ref @6 -> ids newly complete][DlmId @0E]`; each id stored complete (`CharacterStore.MarkQuestCompleted`, served in 0x272D list 2) |
+| 0x2790 SDB_USER_LEARN_SKILL_FOR_MULTIPLE, 1760 B | 14359, caludesucks, skill 111110, item 1100 (template 70) used up | `[ref @6 atoms][ref @0E {skillId, flag}][DlmId @16][UserDbId @1A][skillId @1E][u8 @22][u32 @23][u8 @27][i32 @28][i32 @2C]` | 0x2791 `[ref atoms][ref periods][ref {skillId, result}][DlmId @1E][ok][hasPeriods][alreadyLearned]`; atoms applied |
+
+**The scroll's quest list is empty.** World builds 0x28AE from a list of flagged entries after the level commit (`DBIncrementCharacterLevelPerfectJump::ExecuteCommitSQL`, WorldServer.exe.c:1130501); on this server it came out empty, so the request completes nothing and is not the missing teleport gate. World calls the reply a success only when its list is non-empty, so this one ends in OnFail - as it would on the real Arbiter - but the queue moves on. Skills learned through 0x2790 persist like 0x278E's: in the blob World saves. No real pair for either op in cap_social4 or cap_final.

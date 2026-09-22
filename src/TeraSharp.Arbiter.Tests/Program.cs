@@ -1,4 +1,7 @@
-﻿using System.Collections.Concurrent;
+﻿// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 the TeraSharp contributors
+
+using System.Collections.Concurrent;
 using System.Net.Sockets;
 using System.Reflection;
 using TeraSharp.Arbiter.Auth;
@@ -12,27 +15,52 @@ namespace TeraSharp.Arbiter.Tests;
 /// <summary>
 /// Minimal test harness: every public static method tagged [Test] is run; it throws on
 /// failure. Exit code = number of failures, so `dotnet run` is the CI gate.
-/// Ground-truth bytes are from D:\packetlogs\arb_world.log (the real ArbiterServer logout).
+/// Ground-truth bytes are from <captures>\arb_world.log (the real ArbiterServer logout).
 /// </summary>
 [AttributeUsage(AttributeTargets.Method)]
 public sealed class TestAttribute : Attribute { }
+
+/// <summary>T173: a test that needs a capture/datasheet fixture calls <see cref="Because"/> and
+/// returns; the harness then reports SKIP (not PASS, not FAIL). Exit code stays = failures.</summary>
+public static class Skip
+{
+    public static string? Reason;
+    public static void Because(string why)
+    {
+        Reason ??= why;
+        Console.WriteLine($"        (skipped: {why})");
+    }
+}
 
 public static class Program
 {
     public static int Main()
     {
-        int pass = 0, fail = 0;
+        int pass = 0, fail = 0, skip = 0;
+        // T159: every sheet-backed value on its built-in, so a machine with a Datasheet folder
+        // runs the same suite as one without. The T159 tests load the sheets themselves.
+        TeraSharp.Arbiter.World.DatasheetLoader.UseBuiltIns();
+        // T170: TERASHARP_TEST_FILTER=T170_ runs only the tests whose name contains it.
+        var filter = Environment.GetEnvironmentVariable("TERASHARP_TEST_FILTER");
         foreach (var m in typeof(Tests).GetMethods(BindingFlags.Public | BindingFlags.Static))
         {
             if (m.GetCustomAttribute<TestAttribute>() == null) continue;
-            try { m.Invoke(null, null); Console.WriteLine($"  PASS  {m.Name}"); pass++; }
+            if (!string.IsNullOrEmpty(filter) && !m.Name.Contains(filter, StringComparison.Ordinal)) continue;
+            Skip.Reason = null;
+            try
+            {
+                m.Invoke(null, null);
+                // T173: a test whose fixture is absent returns early - report it, don't count it.
+                if (Skip.Reason != null) { Console.WriteLine($"  SKIP  {m.Name}: {Skip.Reason}"); skip++; }
+                else { Console.WriteLine($"  PASS  {m.Name}"); pass++; }
+            }
             catch (TargetInvocationException ex)
             {
                 Console.WriteLine($"  FAIL  {m.Name}: {ex.InnerException?.Message}");
                 fail++;
             }
         }
-        Console.WriteLine($"\n{pass} passed, {fail} failed");
+        Console.WriteLine($"\n{pass} passed, {fail} failed, {skip} skipped");
         return fail;
     }
 }
@@ -85,7 +113,7 @@ public static class Tests
 
     [Test] public static void LeaveWorld_Lobby_uses_type3_reason0()
     {
-        // Ground truth: D:\packetlogs\lobby_tap.log 02:51:52.830Z, real ArbiterServer, a WORKING
+        // Ground truth: <captures>\lobby_tap.log 02:51:52.830Z, real ArbiterServer, a WORKING
         // Logout-button lobby return followed by a clean relog:
         //   A->W 0x1392  01 00 f0 0a 00 80 00 00 | 03 00 00 00 | 00 00 00 00 | 01 00 00 00
         // and World echoes type=3 reason=0 straight back in SA_LEAVE_WORLD (0x1393).
@@ -1440,7 +1468,7 @@ array items
     // including UserLeaveWorld, which is what emits SA_LEAVE_WORLD (0x1393).
     //
     // Replaying a captured reply therefore MUST patch the live id in. These tests
-    // pin that contract. Bytes are from D:\packetlogs\arb_world.log.
+    // pin that contract. Bytes are from <captures>\arb_world.log.
     // ---------------------------------------------------------------------
 
     /// <summary>Writes a minimal Arbiter&lt;-&gt;World tap log in the format WorldReplayTable.Load parses.</summary>
@@ -1538,7 +1566,7 @@ array items
     }
 
     // ---------------------------------------------------------------------
-    // Daily-quest enter-world step.  Ground truth: D:\packetlogs\lobby_tap.log,
+    // Daily-quest enter-world step.  Ground truth: <captures>\lobby_tap.log,
     // real ArbiterServer, 2026-09-13T02:51:10.
     //
     // At enter-world World emits SDB_UPDATE_DAILY_QUEST_SEED (0x2899) once per daily
@@ -1634,7 +1662,7 @@ array items
     // T1 — byte-exact tests for the handlers that unblock the per-user DLM
     // queue (the ones made real for the logout/relog fix).
     //
-    // Ground truth: D:\packetlogs\lobby_tap.log, real ArbiterServer, login +
+    // Ground truth: <captures>\lobby_tap.log, real ArbiterServer, login +
     // logout-button lobby return + relog, 2026-09-13T02:51:10–02:52:07.
     // Frame = [u32 len][u16 op][payload]; the bytes below are PAYLOADS
     // (frame len - 6), reframed from the tap's TCP chunks.
@@ -2020,7 +2048,7 @@ array items
     // ================================================================================
     // T3 - DBS_USER_RESTRICTION (0x2830), sent right after DBS_USER_ENTERWORLD
     //
-    // Ground truth: D:\packetlogs\lobby_tap.log packet 131, A->W, 02:51:10.552Z, 22-byte frame:
+    // Ground truth: <captures>\lobby_tap.log packet 131, A->W, 02:51:10.552Z, 22-byte frame:
     //   16 00 00 00  30 28 | 16 00 00 00  00 00 00 00  01 00 f0 0a 00 80 00 00
     //                        listOff=22    count=0      gameId 0x80000AF00001
     // listOff = 22 = the whole frame length, i.e. an empty list parked at the end. The handler
@@ -2052,7 +2080,7 @@ array items
     // ================================================================================
     // T4 - 0x2869 also pushes AS_REQUEST_DUNGEON_PHASE_USER_RESET (0x15E0)
     //
-    // Ground truth: D:\packetlogs\lobby_tap.log 02:51:10.705-.709, packets 172/173/174 -
+    // Ground truth: <captures>\lobby_tap.log 02:51:10.705-.709, packets 172/173/174 -
     // one W->A request answered by TWO A->W frames, the push first:
     //   172 W->A 0x2869  15 00 00 00  01 00 00 00
     //   173 A->W 0x15E0  01 00 00 00  00 00 00 00  9e 0f a6 6a 00 00 00 00
@@ -2133,9 +2161,11 @@ array items
     {
         ushort[] expected =
         {
-            0x1436, 0x15A8, 0x159A, 0x2958, 0x13FA, 0x13CC, 0x1626, 0x1441,
+            0x15A8, 0x13FA, 0x13CC, 0x1626, 0x1441,   // 0x159A left in T156 - answered now; 0x1436, 0x2958 in T172
             0x143F, 0x15B5, 0x13AA, 0x13F2, 0x13E5, 0x164D,
-            // T15, from D:\packetlogs\cap_newchar.log: no A->W frame follows any occurrence.
+            // T158: SA_USER_ON_SPAWN_COMPLETE - its replayed 0x2737 went out with DLM 50 after every spawn.
+            0x15AE,
+            // T15, from <captures>\cap_newchar.log: no A->W frame follows any occurrence.
             0x2927, 0x1491, 0x156F, 0x1499, 0x15FA,   // 0x13B6 became a handler in T25,
             //                                            0x13C5 and 0x13C6 in T108
             // T23: Handler_SA_REWARD_CITYWAR_KILL_DEATH_COUNT has no SendToSession.
@@ -2271,7 +2301,7 @@ array items
         Hex.True(DbProxyOpcodeNames.Count == 712,
             $"expected 712 entries extracted from WorldServer.exe.c, got {DbProxyOpcodeNames.Count}");
         // Nothing outside 0x2700-0x29FF may be in this table - AS_/SA_ opcodes below 0x2700 are
-        // named by D:\packetlogs\world_opcodes.txt instead.
+        // named by <captures>\world_opcodes.txt instead.
         Hex.True(DbProxyOpcodeNames.Name(0x1392) == null, "0x1392 AS_LEAVE_WORLD is out of range");
         Hex.True(DbProxyOpcodeNames.Name(0x26FF) == null, "0x26FF is below the range");
         Hex.True(DbProxyOpcodeNames.Name(0x2A00) == null, "0x2A00 is above the range");
@@ -2332,7 +2362,7 @@ array items
         // same extraction; this keeps them from drifting. Skipped (with a note) when the test
         // runs somewhere the repo root is not above the binary, e.g. from a publish folder.
         var path = FindRepoFile(Path.Combine("data", "dbproxy_opcodes.txt"));
-        if (path == null) { Console.WriteLine("        (skipped: data/dbproxy_opcodes.txt not found)"); return; }
+        if (path == null) { Skip.Because("data/dbproxy_opcodes.txt not found"); return; }
 
         int n = 0;
         foreach (var raw in File.ReadAllLines(path))
@@ -2354,8 +2384,8 @@ array items
     // T8 — character creation
     //
     // Ground truth:
-    //   D:\packetlogs\cap_newchar_client.log packets 30-38  (client <-> real ArbiterServer)
-    //   D:\packetlogs\cap_newchar.log packet 133, 05:49:03  (the starter blob, DBS_USER_ENTERWORLD)
+    //   <captures>\cap_newchar_client.log packets 30-38  (client <-> real ArbiterServer)
+    //   <captures>\cap_newchar.log packet 133, 05:49:03  (the starter blob, DBS_USER_ENTERWORLD)
     //   data/starter_blob.bin                               (that blob, extracted)
     // ================================================================================
 
@@ -2866,7 +2896,7 @@ array items
     // (b) S_UPDATE_EXP_LEVEL (0x273B) -> D_UPDATE_EXP_LEVEL (0x273C) is a real
     //     handler that writes level/exp and echoes the LIVE DLM id.
     //
-    // Ground truth: D:\packetlogs\cap_newchar.log, real ArbiterServer, new
+    // Ground truth: <captures>\cap_newchar.log, real ArbiterServer, new
     // character "Test" playerId 2, reframed by u32 length. Layout cross-checked
     // against Handler_S_UPDATE_EXP_LEVEL (ArbiterServer.exe.c FUN_1408f44b0,
     // scope tracer line 1564123), which requires frame >= 0x2e and reads
@@ -3032,9 +3062,9 @@ array items
     // =====================================================================
     // T10 — tests for the zone-change handshake and the starter inventory.
     //
-    // Ground truth: D:\packetlogs\cap_newchar.log (real ArbiterServer, new
+    // Ground truth: <captures>\cap_newchar.log (real ArbiterServer, new
     // character "Test" playerId 2), reframed by u32 length; the four zone
-    // frames are also listed in D:\packetlogs\cap_newchar_zone.txt.
+    // frames are also listed in <captures>\cap_newchar_zone.txt.
     //   2457 W->A 0x13BE 215 B -> 2458 A->W 0x13BF 215 B
     //   2464 W->A 0x13C0 214 B -> 2465 A->W 0x13C1 214 B
     //    135 W->A 0x27A2  14 B ->  136 A->W 0x27A3 19 B + 137 A->W 0x27A4 3235 B
@@ -3211,7 +3241,7 @@ array items
     static byte[]? LoadStarterInventoryOrSkip()
     {
         var path = FindRepoFile(Path.Combine("data", "starter_inventory.bin"));
-        if (path == null) { Console.WriteLine("        (skipped: data/starter_inventory.bin not found)"); return null; }
+        if (path == null) { Skip.Because("data/starter_inventory.bin not found"); return null; }
         var bytes = File.ReadAllBytes(path);
         Hex.True(bytes.Length == DbProxyHandlers.StarterInventorySize,
             $"starter_inventory.bin must be {DbProxyHandlers.StarterInventorySize} bytes, got {bytes.Length}");
@@ -3317,8 +3347,10 @@ array items
         try
         {
             var req = Hex.B("05 00 00 00  01 00 00 00");   // reqId 5, playerId 1
-            Hex.True(!HandlerAccepts(DbProxyHandlers.SDB_USER_LOAD_INVENTORY, req),
-                "playerId 1 must fall through to the replay table, not get the starter inventory");
+            // T142b: character 1 is a LIVE character now (the replay fixture was retired) - it is
+            // read from the store / seeded like everyone else, never left to the replay table.
+            Hex.True(HandlerAccepts(DbProxyHandlers.SDB_USER_LOAD_INVENTORY, req),
+                "playerId 1 is served from the store like any other character (T142b)");
         }
         finally { DbProxyHandlers.SetStarterInventoryForTest(null); }
     }
@@ -3332,7 +3364,7 @@ array items
     // item DB id 0 for the item it thinks it saved.
     //
     // Ground truth: data/cap_item_single.bin — the four frames from cap_newchar.log, extracted
-    // so the tests do not need D:\packetlogs. See data/cap_item_single.md and
+    // so the tests do not need <captures>. See data/cap_item_single.md and
     // status/INVENTORY-DESIGN.md.
     //   2072 -> 2073   one atom, op 7 (insert)      only change in 856 B: [16] 0 -> 15
     //   2211 -> 2213   five atoms, ops 6,11,6,11,7  atoms 0..3 identical, atom 4 [16] 0 -> 16
@@ -3353,14 +3385,14 @@ array items
     /// <summary>
     /// A TSIS container from data/ keyed by capture sequence number, or null (with a printed
     /// note) when the tests run somewhere the repo root is not above the binary. TSIS is the
-    /// little container T13 introduced so byte-exact tests do not need D:\packetlogs and do not
+    /// little container T13 introduced so byte-exact tests do not need <captures> and do not
     /// carry tens of kilobytes of hex literals: "TSIS", u32 recordCount, then per record
     /// u32 seq | u16 opcode | u32 payloadLength | payload.
     /// </summary>
     static Dictionary<uint, byte[]>? LoadTsisOrSkip(string fileName)
     {
         var path = FindRepoFile(Path.Combine("data", fileName));
-        if (path == null) { Console.WriteLine($"        (skipped: data/{fileName} not found)"); return null; }
+        if (path == null) { Skip.Because($"data/{fileName} not found"); return null; }
 
         var b = File.ReadAllBytes(path);
         Hex.True(b.Length > 8 && b[0] == (byte)'T' && b[1] == (byte)'S' && b[2] == (byte)'I' && b[3] == (byte)'S',
@@ -4185,7 +4217,7 @@ array items
     static byte[]? LoadStarterTemplateOrSkip()
     {
         var path = FindRepoFile(Path.Combine("data", "starter_blob.bin"));
-        if (path == null) { Console.WriteLine("        (skipped: data/starter_blob.bin not found)"); return null; }
+        if (path == null) { Skip.Because("data/starter_blob.bin not found"); return null; }
         var bytes = File.ReadAllBytes(path);
         Hex.True(bytes.Length == 15312, $"starter_blob.bin must be 15312 bytes, got {bytes.Length}");
         return bytes;
@@ -4202,7 +4234,7 @@ array items
     // T15 - the per-user DB writes World sends during play.
     //
     // Ground truth: data/cap_t15.bin, the request/reply frames lifted out of
-    // D:\packetlogs\cap_newchar.log (real ArbiterServer, new character "Test", playerId 2,
+    // <captures>\cap_newchar.log (real ArbiterServer, new character "Test", playerId 2,
     // five minutes on the Island of Dawn). See data/cap_t15.md for the record list.
     //
     // Every handler gets two tests: the captured bytes reproduced exactly, and a live-reqId
@@ -4552,18 +4584,19 @@ array items
     {
         var cap = LoadT15CaptureOrSkip();
         if (cap == null) return;
-        // (request opcode, reply opcode, reqId payload offset in the request, reqId offset in the reply)
-        var cases = new (uint seq, ushort req, ushort rsp, int reqAt, int rspAt)[]
+        // (request opcode, reply opcode, reqId payload offset in the request, reqId offset in the reply, frames)
+        // frames: 0x293C sends 0x1591 (the live player) FIRST and then its ack - the real Arbiter's order (T156).
+        var cases = new (uint seq, ushort req, ushort rsp, int reqAt, int rspAt, int frames)[]
         {
-            (719, DbProxyHandlers.SDB_ADD_TUTORIAL_SIMPLE_TIP,       DbProxyHandlers.DBS_ADD_TUTORIAL_SIMPLE_TIP,       0, 0),
-            (505, DbProxyHandlers.SDB_UPDATE_USER_DAILY_EVENT_COUNT, DbProxyHandlers.DBS_UPDATE_USER_DAILY_EVENT_COUNT, 8, 0),
-            (503, DbProxyHandlers.SDB_UPDATE_GET_EXTRA_REWARD,       DbProxyHandlers.DBS_UPDATE_GET_EXTRA_REWARD,       0, 0),
-            (634, DbProxyHandlers.SDB_UPDATE_SEREN_GUIDE_INFO,       DbProxyHandlers.DBS_UPDATE_SEREN_GUIDE_INFO,       0, 0),
+            (719, DbProxyHandlers.SDB_ADD_TUTORIAL_SIMPLE_TIP,       DbProxyHandlers.DBS_ADD_TUTORIAL_SIMPLE_TIP,       0, 0, 1),
+            (505, DbProxyHandlers.SDB_UPDATE_USER_DAILY_EVENT_COUNT, DbProxyHandlers.DBS_UPDATE_USER_DAILY_EVENT_COUNT, 8, 0, 2),
+            (503, DbProxyHandlers.SDB_UPDATE_GET_EXTRA_REWARD,       DbProxyHandlers.DBS_UPDATE_GET_EXTRA_REWARD,       0, 0, 1),
+            (634, DbProxyHandlers.SDB_UPDATE_SEREN_GUIDE_INFO,       DbProxyHandlers.DBS_UPDATE_SEREN_GUIDE_INFO,       0, 0, 1),
         };
-        foreach (var (seq, reqOp, rspOp, reqAt, rspAt) in cases)
+        foreach (var (seq, reqOp, rspOp, reqAt, rspAt, frames) in cases)
         {
             uint captured = BitConverter.ToUInt32(cap[seq], reqAt);
-            var (op, body) = RunHandler1(reqOp, WithLiveId(cap[seq], reqAt, 0x0BAD));
+            var (op, body) = RunHandler(reqOp, WithLiveId(cap[seq], reqAt, 0x0BAD), frames)[^1];   // the ack is always the LAST frame
             Hex.True(op == rspOp, $"0x{reqOp:X4} must reply 0x{rspOp:X4}, got 0x{op:X4}");
             uint echoed = BitConverter.ToUInt32(body, rspAt);
             Hex.True(echoed == 0x0BAD, $"0x{rspOp:X4} must carry the LIVE DLM id, carried 0x{echoed:X}");
@@ -4614,14 +4647,14 @@ array items
         // W->A opcode seen in a real capture. An opcode is answered if it is in the TryHandle
         // allow-list, in OneWayFromWorld (World wants no reply), or has a replay entry.
         var mapPath = FindRepoFile(Path.Combine("status", "PERSISTENCE-MAP.md"));
-        if (mapPath == null) { Console.WriteLine("        (skipped: status/PERSISTENCE-MAP.md not found)"); return; }
+        if (mapPath == null) { Skip.Because("status/PERSISTENCE-MAP.md not found"); return; }
 
         var opcodes = ParsePersistenceMapRequestOpcodes(File.ReadAllText(mapPath));
         Hex.True(opcodes.Count >= 18,
             $"only {opcodes.Count} opcodes parsed out of PERSISTENCE-MAP.md - the table format changed "
             + "and this guard is no longer guarding anything");
 
-        // The replay table is optional: it is built from D:\packetlogs\arb_world.log at runtime and
+        // The replay table is optional: it is built from <captures>\arb_world.log at runtime and
         // that file is not in the repo. Without it the other two arms have to carry the check, which
         // is the stricter answer anyway.
         var replay = LoadWorldReplayTableOrNull();
@@ -4700,11 +4733,11 @@ array items
 
     /// <summary>
     /// The replay table the running server would build, or null when the tap log is not on this
-    /// machine. Same env var as Program.cs (TERASHARP_LOGS, default D:\packetlogs).
+    /// machine. Same env var as Program.cs (TERASHARP_LOGS, default <captures>).
     /// </summary>
     static WorldReplayTable? LoadWorldReplayTableOrNull()
     {
-        var dir = Environment.GetEnvironmentVariable("TERASHARP_LOGS") ?? @"D:\packetlogs";
+        var dir = Environment.GetEnvironmentVariable("TERASHARP_LOGS") ?? "logs";
         var path = Path.Combine(dir, "arb_world.log");
         if (!File.Exists(path))
         {
@@ -4731,7 +4764,7 @@ array items
     //
     // Ground truth for the byte-exact tests:
     //   data/starter_blob.bin            blob 6880/7200 = 17 passive + 7 active ids
-    //   D:\packetlogs\cap_newchar_client.log packet 81 = the same 24 ids as S_SKILL_LIST
+    //   <captures>\cap_newchar_client.log packet 81 = the same 24 ids as S_SKILL_LIST
     //   Datasheet\DefaultSkillSet.xml    Popori/Female/Glaiver row = the same 24 ids
     // =====================================================================
 
@@ -5175,7 +5208,7 @@ array items
     // ================================================================================
     // T21 - relog into an instanced zone, and completed quests.
     //
-    // Ground truth: D:\packetlogs\arb_world_2026-09-13T11-33-30-680Z.log, the "Test"
+    // Ground truth: <captures>\arb_world_2026-09-13T11-33-30-680Z.log, the "Test"
     // (playerId 2) login at seq 835-2036. That character was saved inside instance 9827;
     // WorldServer refused the enter, and the real Arbiter fell back to Velika.
     //   seq 835  A->W 0x138E AS_ENTER_WORLD        continent 9827, ChannelInstanceId 0x0AF00001
@@ -5578,7 +5611,7 @@ array items
     // T22 - the per-character login loads, rebuilt from rows instead of replaying dob's
     // captured reply to every character.
     //
-    // Ground truth, both committed as TSIS containers so the tests need no D:\packetlogs:
+    // Ground truth, both committed as TSIS containers so the tests need no <captures>:
     //   data/cap_t22_newchar.bin  cap_newchar.log            - "Test" (playerId 2) FIRST login
     //   data/cap_t22_relog.bin    arb_world_2026-09-13...log - dob and "Test" WITH progress
     //
@@ -5945,7 +5978,7 @@ array items
         var path = FindRepoFile(Path.Combine("data", DbProxyHandlers.HandshakeBurstFile));
         if (path == null)
         {
-            Console.WriteLine($"        (skipped: data/{DbProxyHandlers.HandshakeBurstFile} not found)");
+            Skip.Because($"data/{DbProxyHandlers.HandshakeBurstFile} not found");
             return null;
         }
         var burst = DbProxyHandlers.ParseBurst(File.ReadAllBytes(path));
@@ -6369,7 +6402,7 @@ array items
     public static void Dispatch_switch_and_the_allow_list_agree()
     {
         var path = FindRepoFile(Path.Combine("src", "TeraSharp.Arbiter", "World", "DbProxyHandlers.cs"));
-        if (path == null) { Console.WriteLine("        (skipped: DbProxyHandlers.cs not found)"); return; }
+        if (path == null) { Skip.Because("DbProxyHandlers.cs not found"); return; }
         var source = File.ReadAllText(path);
 
         var allowList = CaseLabelsIn(source, "public static bool IsHandledRequest(ushort op)");
@@ -6964,7 +6997,7 @@ public bool TryHandle(WorldBridge bridge, WorldLink link, ushort op, byte[] payl
         }
         var configured = HandshakeData.DatasheetDirectory();
         if (Directory.Exists(configured)) return configured;
-        Console.WriteLine("        (skipped: Executable\\Datasheet not found)");
+        Skip.Because("Executable\\Datasheet not found");
         return null;
     }
 
@@ -8761,7 +8794,7 @@ public bool TryHandle(WorldBridge bridge, WorldLink link, ushort op, byte[] payl
                 if (Directory.Exists(c)) { folder = c; break; }
             }
         }
-        if (!Directory.Exists(folder)) { Console.WriteLine("        (skipped: tera_v100_MASTER_FINAL not found)"); return null; }
+        if (!Directory.Exists(folder)) { Skip.Because("tera_v100_MASTER_FINAL not found"); return null; }
         return TeraSharp.Arbiter.Protocol.DefinitionRegistry.LoadFromFolder(folder, QuietLog());
     }
 
@@ -9259,6 +9292,7 @@ array battles
             Hex.True(sdg == 2 && fdh == 3, $"the capture s guild ids; got {sdg} and {fdh}");
             store.AddGuildMember(sdg, 1, "New", 4, 12, 1, 20, 1);
             store.AddGuildMember(fdh, 2, "Other", 4, 12, 1, 20, 1);
+            store.AddGuildMoney(sdg, 10_000_000);   // T170: the declaration is paid (client 3385: 9998500 after)
 
             // 1621 -> 1623: the window is empty
             var a = GuildWarManager.Decide(1, GuildWarManager.C_OPEN_GUILD_WAR_WINDOW, default, 0);
@@ -9282,13 +9316,21 @@ array battles
             // 3384 -> 3387 + tap 6023
             a = GuildWarManager.Decide(1, GuildWarManager.C_DECLARE_GUILD_WAR,
                     Hex.B("06 00  66 00 64 00 68 00 00 00"), 1789608618);
-            Hex.True(ChatSeq(a).Count == 1 && ChatSeq(a)[0] == (1, "S_NOTIFY_GUILD_WAR_STATUS_CHANGE"),
-                "the declare answers the client with the empty status packet");
+            // T170: 3385 S_GUILD_MONEY_INFO_CHANGED came first (T80 missed it), and the other guild
+            // is notified too (cap_final2a_client1 4008).
+            Hex.True(ChatSeq(a).SequenceEqual(new[] { (1, "S_GUILD_MONEY_INFO_CHANGED"),
+                         (1, "S_NOTIFY_GUILD_WAR_STATUS_CHANGE"), (2, "S_NOTIFY_GUILD_WAR_STATUS_CHANGE") }),
+                "the declare pays, then answers both guilds with the empty status packet: "
+                + string.Join(",", ChatSeq(a)));
+            Hex.True(Convert.ToInt64(ChatFields(a, 0)["newMoney"]) == 10_000_000 - GuildWarManager.DeclareCost,
+                "the guild paid the declare cost");
             var worldFrames = new List<(ushort Op, byte[] Payload)>();
             foreach (var item in a.Ordered)
                 if (item is IArbiterWorldAction w) worldFrames.Add((w.Opcode, w.Payload));
-            Hex.True(worldFrames.Count == 1 && worldFrames[0].Op == GuildWarManager.AS_DECLARE_GUILD_WAR,
-                "and pushes exactly one A->W frame");
+            Hex.True(worldFrames.Count == 2 && worldFrames[0].Op == GuildPackets.AS_UPDATE_GUILD_DATA
+                     && worldFrames[1].Op == GuildWarManager.AS_DECLARE_GUILD_WAR,
+                "AS_UPDATE_GUILD_DATA then AS_DECLARE_GUILD_WAR (taps 6022, 6023)");
+            worldFrames.RemoveAt(0);
             Hex.Eq(worldFrames[0].Payload,
                 "01 00 00 00 00 00 00 00  02 00 00 00  03 00 00 00  00", "tap 6023, byte for byte");
 
@@ -9313,8 +9355,8 @@ array battles
             // 4449 -> 4450 + tap 7468. The int32 is the OPPONENT s guild id, not a war id.
             a = GuildWarManager.Decide(1, GuildWarManager.C_WITHDRAW_GUILD_WAR,
                     Hex.B("03 00 00 00"), 1789609000);
-            Hex.True(ChatSeq(a).Count == 1 && ChatSeq(a)[0] == (1, "S_NOTIFY_GUILD_WAR_STATUS_CHANGE"),
-                "the withdrawal answers with the same empty packet");
+            Hex.True(ChatSeq(a).Count == 2 && ChatSeq(a)[0] == (1, "S_NOTIFY_GUILD_WAR_STATUS_CHANGE"),
+                "the withdrawal answers both guilds with the same empty packet");
             worldFrames.Clear();
             foreach (var item in a.Ordered)
                 if (item is IArbiterWorldAction w) worldFrames.Add((w.Opcode, w.Payload));
@@ -11827,10 +11869,10 @@ bool   isGuildWarAcceptable
             Environment.SetEnvironmentVariable("TERASHARP_ADMIN_PORT", "8051");
             Environment.SetEnvironmentVariable("TERASHARP_BIND", "127.0.0.1");
 
-            string clean = SelfTest.BuildConfigReport(new[] { ("db", "D:\\packetlogs\\terasharp.db") });
+            string clean = SelfTest.BuildConfigReport(new[] { ("db", "logs\\terasharp.db") });
             Hex.True(clean.Contains("TERASHARP_GM_ACCOUNTS") && clean.Contains("2800,2801"),
                 "it prints every known variable and its value");
-            Hex.True(clean.Contains("D:\\packetlogs\\terasharp.db"),
+            Hex.True(clean.Contains("logs\\terasharp.db"),
                 "and the resolved paths Program computed, rather than re-deriving them here");
             Hex.True(!clean.Contains(new string('x', 48)) && clean.Contains("(set, 48 chars)"),
                 "the admin token is NEVER printed - a log line gets pasted into bug reports");
@@ -12050,10 +12092,12 @@ bool   isGuildWarAcceptable
     /// T124 - S_SELECT_USER, byte-exact against cap_final_gm_client2 frame 37. We were sending
     /// unk3 = 72339069014638592 (0x0101000000000000), which puts the capture's unk2 bytes at
     /// the top of unk3: 01 | 00 00 | 00 00 00 00 00 00 01 01 instead of 01 | 01 00 | 00 x8.
+    /// T144b named those bytes: the capture's "unk2 = 1" is the selected character's ADMIN
+    /// LEVEL, so the GM frame is what BuildSelectUserFields(adminLevel: 1) writes.
     /// </summary>
     [Test] public static void T124_select_user_is_byte_exact()
     {
-        var f = ArbiterClientHandlers.BuildSelectUserFields();
+        var f = ArbiterClientHandlers.BuildSelectUserFields(accepted: true, adminLevel: 1);
         Hex.True((ushort)f["unk2"] == 1 && (ulong)f["unk3"] == 0UL,
             "unk2 = 1 and unk3 = 0 - the 01 01 belongs to unk1 and unk2, not to unk3");
         Hex.True((int)ArbiterClientHandlers.BuildSelectUserFields(false)["unk1"] == 0,
@@ -12071,6 +12115,85 @@ bool   isGuildWarAcceptable
         Hex.Eq(Framed(ArbiterClientHandlers.S_SELECT_USER, selectBody),
             "0F 00 FB 8A 01 01 00 00 00 00 00 00 00 00 00",
             "and the frame the client sees - 15 bytes of 0x8AFB");
+    }
+
+    /// <summary>
+    /// T144b - S_SELECT_USER carries the admin level, and that is the Alt+A gate.
+    ///
+    /// The writer's PDL signature is (bool, int, SelectUserErrorCode, bool, bool) and the two
+    /// emit helpers fix the widths (1, 4, 4, 1, 1 = the captured 11), so body 1 is an int32
+    /// read from User+0x3B98 - the field User::UpdateAdminLevel(int) writes and the same one
+    /// S_GET_USER_LIST's adminLevel comes from. Four captures, one control:
+    ///
+    ///   cap_final_gm_client2  dob,  adminLevel 1  -> body 1 = 1, panel OPENS
+    ///   cap_final_gm_client   1003, adminLevel 0  -> body 1 = 0, same GM account, no panel
+    ///   cap_final_client2     normal, adminLevel 0 -> body 1 = 0, no panel
+    ///   cap_altA_gm (ours)    dob,  adminLevel 5  -> body 1 = 0 and the two bools set, no panel
+    ///
+    /// So the GM frame and the ordinary-player frame are both pinned here, and the clamp keeps
+    /// an out-of-range level out of the error code that follows it.
+    /// </summary>
+    [Test] public static void T144b_select_user_carries_the_admin_level()
+    {
+        var defs = LoadDefinitionsOrSkip();
+        if (defs == null) return;
+
+        var gm = WriteByDef(defs, "S_SELECT_USER",
+            ArbiterClientHandlers.BuildSelectUserFields(accepted: true, adminLevel: 1));
+        Hex.Eq(gm, "01 01 00 00 00 00 00 00 00 00 00",
+            "cap_final_gm_client2 frame 37 - the session whose Alt+A opened the panel");
+
+        var normal = WriteByDef(defs, "S_SELECT_USER",
+            ArbiterClientHandlers.BuildSelectUserFields(accepted: true, adminLevel: 0));
+        Hex.Eq(normal, "01 00 00 00 00 00 00 00 00 00 00",
+            "cap_final_client2 frame 37 - an ordinary player, and cap_final_gm_client's "
+            + "adminLevel-0 character too: same bytes, no panel");
+
+        // The old WorldEntry literal, so the regression is named rather than merely absent.
+        Hex.True(Hex.S(normal) != Hex.S(Hex.B("01 00 00 00 00 00 00 00 00 01 01")),
+            "isFirstLoginToday / isFirstLoginTodayByAccount are no longer the tail of unk3");
+
+        var clamped = ArbiterClientHandlers.BuildSelectUserFields(accepted: true, adminLevel: 0x1FFFF);
+        Hex.True((ushort)clamped["unk2"] == 1 && (ulong)clamped["unk3"] == 0UL,
+            "any positive admin level goes out as 1 (the real Arbiter's value) and never reaches SelectUserErrorCode");
+    }
+
+    /// <summary>
+    /// T148 - a GM's invisibility is World's. cap_final.log (real Arbiter, dob at adminLevel 1):
+    /// AS_ENTER_WORLD[111] = 1 -> World vaporizes at spawn (495 SDB_USER_VAPORIZED 01 00 00 00 01);
+    /// the tool's C_ADMIN_GM_SKILL(0) becomes 769 AS_ADMIN_REQUEST_USERACTION; World releases
+    /// (774 ... 00) and answers the client itself (775 S_ADMIN_GM_SKILL 00). Pinned: the 0x2827
+    /// payload, SDB_USER_VAPORIZED tracked and unanswered, and 0x2931 never holding anyone.
+    /// </summary>
+    [Test] public static void T148_gm_skill_goes_to_world_and_vaporize_is_tracked()
+    {
+        // 769, byte for byte - except 82-83, 162-163 and 196-215, uninitialised stack on the
+        // real Arbiter (they differ between 769, 1278 and 3276), which we send as zero.
+        ArbiterClientHandlers.ObserveLoadTopo(1,
+            Hex.B("15 00 28 E8 05 00 00 00 D3 50 83 46 A3 0A 9D 44 00 50 8A C5 00"));   // frame 549's zone + position
+        var got = ArbiterClientHandlers.BuildGmSkillRequest(1, "dob", ArbiterClientHandlers.GmSkillInvisible);
+        var want = new byte[ArbiterClientHandlers.UserActionPayloadSize];
+        Hex.B("0E 00 00 00 D0 00 00 00 64 00 6F 00 62 00").CopyTo(want, 0);
+        Hex.B("01 00 00 00 64 00 6F 00 62 00").CopyTo(want, 84);
+        Hex.B("01 00 00 00 05 00 00 00 00 00 00 00 D3 50 83 46 A3 0A 9D 44 00 50 8A C5 "
+            + "65 00 00 00 00 00 00 00").CopyTo(want, 164);
+        Hex.Eq(got, want, "cap_final 769: AS_ADMIN_REQUEST_USERACTION, action 0x65, skill 0, target dob (1)");
+
+        // SDB_USER_VAPORIZED: accepted, tracked, never answered or stored.
+        Hex.True(DbProxyHandlers.IsHandledRequest(DbProxyHandlers.SDB_USER_VAPORIZED),
+            "0x282D is handled - it has no DBS_ twin, so handled means accepted and dropped");
+        ArbiterClientHandlers.ResetGmSkillPush(1);
+        Hex.True(HandlerAccepts(DbProxyHandlers.SDB_USER_VAPORIZED, Hex.B("01 00 00 00 01"))
+                 && ArbiterClientHandlers.IsGmInvisible(1), "495: World vaporized dob at spawn - tracked");
+        Hex.True(HandlerAccepts(DbProxyHandlers.SDB_USER_VAPORIZED, Hex.B("01 00 00 00 00"))
+                 && !ArbiterClientHandlers.IsGmInvisible(1), "774: World released dob - tracked");
+        Hex.True(!DbProxyHandlers.TryReadUserVaporized(Hex.B("01 00 00 00"), out _, out _),
+            "a 4-byte payload is refused, not read past its end");
+
+        // 618 -> 619: LoadHoldCharacterStatus is answered ok = 1, held = 0, for a GM too.
+        Hex.Eq(DbProxyHandlers.Build2931(Hex.B("91 00 00 00 20 40 2C 45 DD 02 00 00 01 00 00 00")),
+            "91 00 00 00 01 00", "cap_final 619: DBS_UPDATE_HOLD_CHARACTER_STATUS, payload[5] held = 0");
+        ArbiterClientHandlers.ResetGmSkillPush(1);
     }
 
     /// <summary>
@@ -13066,7 +13189,7 @@ some prose with `backticks` that is not a table row
         var arbiterFile = FindRepoFile(Path.Combine("status", "GM-COMMANDS-ARBITER.md"));
         var worldFile = FindRepoFile(Path.Combine("status", "GM-COMMANDS-FULL.md"));
         if (arbiterFile == null || worldFile == null)
-        { Console.WriteLine("        (skipped: GM catalogues not found)"); return; }
+        { Skip.Because("GM catalogues not found"); return; }
 
         var arbiter = GmCommandCatalog.ParseMarkdown(File.ReadAllText(arbiterFile));
         var world = GmCommandCatalog.ParseMarkdown(File.ReadAllText(worldFile));
@@ -13307,7 +13430,7 @@ some prose with `backticks` that is not a table row
     {
         // On the deploy box this is the real check; in a container without D:\ it skips.
         var data = FindRepoFile(Path.Combine("data", "starter_blob.bin"));
-        if (data == null) { Console.WriteLine("        (skipped: repo data folder not found)"); return; }
+        if (data == null) { Skip.Because("repo data folder not found"); return; }
         string dir = Path.GetDirectoryName(data)!;
 
         var blob = SelfTest.CheckFixedSize("starter blob", data, DbProxyHandlers.WorldBlobSize);
@@ -15306,7 +15429,7 @@ some prose with `backticks` that is not a table row
         var arbiterFile = FindRepoFile(Path.Combine("status", "GM-COMMANDS-ARBITER.md"));
         var worldFile = FindRepoFile(Path.Combine("status", "GM-COMMANDS-FULL.md"));
         if (arbiterFile == null || worldFile == null)
-        { Console.WriteLine("        (skipped: GM catalogue markdown not found)"); return; }
+        { Skip.Because("GM catalogue markdown not found"); return; }
 
         GmCommandCatalog.Set(
             GmCommandCatalog.ParseMarkdown(File.ReadAllText(arbiterFile)),
@@ -16066,7 +16189,7 @@ some prose with `backticks` that is not a table row
     [Test] public static void Parcel_opcodes_match_dbproxy_opcodes_txt()
     {
         var path = FindRepoFile(Path.Combine("data", "dbproxy_opcodes.txt"));
-        if (path == null) { Console.WriteLine("        (skipped: data/dbproxy_opcodes.txt not found)"); return; }
+        if (path == null) { Skip.Because("data/dbproxy_opcodes.txt not found"); return; }
 
         var byName = new Dictionary<string, ushort>(StringComparer.Ordinal);
         foreach (var line in File.ReadAllLines(path))
@@ -16360,8 +16483,8 @@ some prose with `backticks` that is not a table row
         var p = ArbiterClientHandlers.BuildShowItemTooltip(toolTipType: 0, row);
         Hex.True(BitConverter.ToUInt16(p, 0) == p.Length, "length field");
         Hex.True(BitConverter.ToUInt16(p, 2) == ArbiterClientHandlers.S_SHOW_ITEM_TOOLTIP, "opcode");
-        Hex.True(p.Length == ArbiterClientHandlers.TooltipFixedSize + 2,
-            "an empty bound-owner is just the terminator");
+        Hex.True(p.Length == ArbiterClientHandlers.TooltipFixedSize + 2 + 2 * ArbiterClientHandlers.TtSetPair,
+            "an empty bound-owner is just the terminator; then the two option/compare set pairs (T169)");
 
         Hex.True(BitConverter.ToInt64(p, ArbiterClientHandlers.TtItemDbId) == 1042, "ItemDbId");
         Hex.True(BitConverter.ToInt32(p, ArbiterClientHandlers.TtTemplateId) == 6550, "TemplateId");
@@ -16372,20 +16495,22 @@ some prose with `backticks` that is not a table row
             "Count - the stack size the client was never told about");
         Hex.True(BitConverter.ToInt32(p, ArbiterClientHandlers.TtSavedCount) == 19, "SavedCount");
 
-        // the four arrays are empty and the string ref points past the fixed part
+        // customizing / combine-passive stay empty; T169: two option sets and two compare sets
         foreach (int at in new[]
         {
             ArbiterClientHandlers.TtCustomizingCount, ArbiterClientHandlers.TtCustomizingOffset,
-            ArbiterClientHandlers.TtOptionSetCount, ArbiterClientHandlers.TtOptionSetOffset,
             ArbiterClientHandlers.TtCombinePassiveCount, ArbiterClientHandlers.TtCombinePassiveOffset,
-            ArbiterClientHandlers.TtCompareStatCount, ArbiterClientHandlers.TtCompareStatOffset,
         })
             Hex.True(BitConverter.ToUInt16(p, at) == 0, $"array slot 0x{at:X2} is empty");
+        Hex.True(BitConverter.ToUInt16(p, ArbiterClientHandlers.TtOptionSetCount) == 2
+                 && BitConverter.ToUInt16(p, ArbiterClientHandlers.TtOptionSetOffset) == 0x132
+                 && BitConverter.ToUInt16(p, ArbiterClientHandlers.TtCompareStatCount) == 2
+                 && BitConverter.ToUInt16(p, ArbiterClientHandlers.TtCompareStatOffset) == 0x132 + 0x94, "the set refs");
         Hex.True(BitConverter.ToUInt16(p, ArbiterClientHandlers.TtItemBoundOwner)
                  == ArbiterClientHandlers.TooltipFixedSize, "ItemBoundOwner ref");
 
         var named = ArbiterClientHandlers.BuildShowItemTooltip(0, row, "t1");
-        Hex.True(named.Length == ArbiterClientHandlers.TooltipFixedSize + 6, "\"t1\" + NUL = 6 bytes");
+        Hex.True(named.Length == ArbiterClientHandlers.TooltipFixedSize + 6 + 2 * ArbiterClientHandlers.TtSetPair, "\"t1\" + NUL = 6 bytes");
         Hex.True(named[ArbiterClientHandlers.TooltipFixedSize] == (byte)'t', "the string lands at the ref");
     }
 
@@ -16428,9 +16553,9 @@ some prose with `backticks` that is not a table row
         var full = ArbiterClientHandlers.BuildUpdateVisitedSectionList(1, rows);
         Hex.True(BitConverter.ToUInt32(full, 0) == 18,
             "the entries offset is frame-relative: 6 header + 12 fixed");
-        Hex.True(BitConverter.ToUInt32(full, 4) == 24, "two entries x 12 bytes");
+        Hex.True(BitConverter.ToUInt32(full, 4) == 32, "two entries x 16 bytes (T172: the real VisitedSectionInfo)");
         Hex.True(BitConverter.ToUInt32(full, 8) == 1, "playerId");
-        Hex.True(full.Length == 12 + 24, "payload length");
+        Hex.True(full.Length == 12 + 32, "payload length");
         Hex.True(BitConverter.ToInt32(full, 12) == 7005 && BitConverter.ToInt32(full, 20) == 3,
             "first entry is (map, guard, section)");
     }
@@ -17631,9 +17756,9 @@ string message
                 if (File.Exists(c)) { path = c; break; }
             }
         }
-        if (!File.Exists(path)) { Console.WriteLine("        (skipped: data.json not found)"); return null; }
+        if (!File.Exists(path)) { Skip.Because("data.json not found"); return null; }
         try { return TeraSharp.Arbiter.Protocol.OpcodeTable.LoadFromFile(path, "376012"); }
-        catch (Exception ex) { Console.WriteLine($"        (skipped: {ex.Message})"); return null; }
+        catch (Exception ex) { Skip.Because($"{ex.Message}"); return null; }
     }
 
     /// <summary>
@@ -18124,11 +18249,13 @@ string message
         BitConverter.GetBytes(26u).CopyTo(loop, 24);      // next -> itself
         BitConverter.GetBytes(4242).CopyTo(loop, 28);     // crestId
         BitConverter.GetBytes(1).CopyTo(loop, 32);        // value
+        var el = DbProxyHandlers.ReadCrestEntries(loop);
+        Hex.True(el.Count == 1 && el[0].id == 4242,
+            $"a self-referential chain yields one entry, got {el.Count}");
+        // T151: the reply is the (empty) refusal list whatever was asked for.
         var rl = DbProxyHandlers.BuildLearnAllCrest(loop);
-        Hex.True(rl != null && BitConverter.ToUInt32(rl, 0) == 1,
-            $"a self-referential chain yields one entry, got {(rl == null ? -1L : BitConverter.ToUInt32(rl, 0))}");
-        Hex.True(rl!.Length == 13 + 16, $"and one entry of payload, got {rl.Length} B");
-        Hex.True(BitConverter.ToInt32(rl, 13 + 8) == 4242, "which is the one that was sent");
+        Hex.True(rl != null && rl.Length == 13 && BitConverter.ToUInt32(rl, 0) == 0
+                 && BitConverter.ToUInt32(rl, 8) == 0x77u, "and the reply is 13 bytes, no entries, reqId echoed");
     }
 
     /// <summary>
@@ -18931,12 +19058,12 @@ string message
             Hex.True(BrokerPackets.ReplyFor(op) == (ushort)(op + 1), $"0x{op:X4} -> 0x{op + 1:X4}");
         }
 
-        // the two without a DlmId stay alone: an unanswered one cannot head-block anyone
+        // the two without a DlmId cannot head-block anyone: T168 takes them (logged, never
+        // answered - there is no deal to have yet); T168_refusals_... pins the silence
         foreach (ushort op in new ushort[] { 0x2821, 0x2824 })
         {
             Hex.True(!BrokerPackets.CarriesDlmId(op), $"0x{op:X4} carries no DlmId");
-            Hex.True(!DbProxyHandlers.IsHandledRequest(op),
-                $"0x{op:X4} is deliberately still unanswered - there is no deal to have yet");
+            Hex.True(DbProxyHandlers.IsHandledRequest(op), $"0x{op:X4} is taken off the replay path");
         }
         // and the Arbiter->World push has no request at all
         Hex.True(!DbProxyHandlers.IsHandledRequest(0x2823),
@@ -20195,7 +20322,7 @@ string message
     // T64 - the party and social families, byte-exact against a real-Arbiter
     // capture at last.
     //
-    // D:\packetlogs\cap_social.log is a two-player tap of the REAL
+    // <captures>\cap_social.log is a two-player tap of the REAL
     // ArbiterServer: "Test" (playerId 2) invites "two" (playerId 1002) to a
     // party through the contract broker, they loot, swap manager, become
     // friends, block and unblock. Every literal below is the payload of a
@@ -20945,7 +21072,7 @@ string message
 
     /// <summary>
     /// C_FINDNAME -&gt; S_FINDNAME, pinned against the REAL Arbiter's replies in
-    /// D:\packetlogs\cap_social_client_ctl.txt frames 1093 / 1096 / 1098 - three keystrokes of
+    /// <captures>\cap_social_client_ctl.txt frames 1093 / 1096 / 1098 - three keystrokes of
     /// "two", each answered with the query echoed and an empty result.
     /// </summary>
     [Test] public static void T62_findname_matches_the_real_arbiters_replies()
@@ -22301,7 +22428,7 @@ string message
         var path = FindRepoFile(Path.Combine("data", "t93_admin_inven_frame724.bin"));
         if (path == null)
         {
-            Console.WriteLine("        (skipped: data/t93_admin_inven_frame724.bin not found)");
+            Skip.Because("data/t93_admin_inven_frame724.bin not found");
             return;
         }
         var capture = File.ReadAllBytes(path);
@@ -22872,7 +22999,7 @@ string message
 
     // ===================== T103: SA_REGISTER answered for real =====================
     //
-    // D:\packetlogs\arb_world_2026-09-13T11-33-30-680Z.log opens with world 0's 25 registrations -
+    // <captures>\arb_world_2026-09-13T11-33-30-680Z.log opens with world 0's 25 registrations -
     // one control link (IsBypass 0, BypassIndex -1) and 24 bypass links (IsBypass 1, 0..23). The
     // builder below reproduces all 25 replies; the three pinned here are the first, the second and
     // the last, which are the three shapes.
@@ -24124,6 +24251,242 @@ string message
             "S_SHOW_CREST_LEARN, frame 5109 - a push with no body at all");
     }
 
+    /// <summary>cap_social4.log record 2962: SA_MAKE_SYS_PARCEL, achievement 6903's reward mail to player 1.</summary>
+    static readonly byte[] T151SysParcel2962 = Hex.B(
+              "02 00 00 00 AB 00 00 00 2B 00 00 00 4F 00 00 00 "
+            + "5B 00 00 00 64 02 00 00 01 00 00 00 00 00 00 00 "
+            + "00 00 00 00 00 40 00 41 00 63 00 68 00 69 00 65 "
+            + "00 76 00 65 00 6D 00 65 00 6E 00 74 00 3A 00 36 "
+            + "00 39 00 30 00 33 00 00 00 40 00 32 00 30 00 35 "
+            + "00 31 00 00 00 40 00 32 00 30 00 35 00 32 00 0B "
+            + "00 41 00 63 00 68 00 69 00 65 00 76 00 65 00 6D "
+            + "00 65 00 6E 00 74 00 4E 00 61 00 6D 00 65 00 0B "
+            + "00 40 00 41 00 63 00 68 00 69 00 65 00 76 00 65 "
+            + "00 6D 00 65 00 6E 00 74 00 3A 00 36 00 39 00 30 "
+            + "00 30 00 00 00 AB 00 00 00 D6 00 00 00 00 00 00 "
+            + "00 00 00 00 00 69 15 03 00 01 00 00 00 00 00 00 "
+            + "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+            + "D6 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+            + "FE 15 03 00 01 00 00 00 00 00 00 00 00 00 00 00 "
+            + "00 00 00 00 00 00 00 00 00 00 00");
+
+    /// <summary>
+    /// T151. Three live-run follow-ups, each against its real frame:
+    /// (1) glyphs: AS_LEARN_ALL_CREST_ACQUIRABLE is World's REFUSAL list - DBUserAutoLearnCrestContext
+    /// ::SetRecvData erases every id in it - so it goes out empty, as cap_social4 2821 does, and the
+    /// crests are stored from the request; (2) system mail keeps its Writer and Title
+    /// (cap_social4 2962 -&gt; row 4 of 4560); (3) atom op 51 binds the item in its stored record.
+    /// </summary>
+    [Test] public static void T151_crests_system_mail_and_bind()
+    {
+        // ---- (1) crests: the 42-crest request after perfect_level, header of seq 2820 ----
+        var req = new byte[20 + 2 * DbProxyHandlers.CrestEntrySize];
+        Hex.B("2A 00 00 00 1A 00 00 00 20 00 86 C5 CF 02 00 00 DD 01 00 00").CopyTo(req, 0);
+        Hex.B("1A 00 00 00 2A 00 00 00 E8 80 00 00 00 00 00 00").CopyTo(req, 20);
+        Hex.B("2A 00 00 00 00 00 00 00 E9 80 00 00 00 00 00 00").CopyTo(req, 36);
+        Hex.Eq(DbProxyHandlers.BuildLearnAllCrest(req)!, "00 00 00 00 00 00 00 00 DD 01 00 00 01",
+            "cap_social4 2821: no entries - nothing refused, so World learns all it asked for");
+        var asked = DbProxyHandlers.ReadCrestEntries(req);
+        Hex.True(asked.Count == 2 && asked[0].id == 0x80E8 && asked[1].id == 0x80E9, "the request's crests");
+
+        // ---- (2) system mail ----
+        var (writer, title, message) = DbProxyHandlers.ReadSysParcelText(T151SysParcel2962);
+        Hex.True(writer == "@Achievement:6903" && title == "@2051"
+                 && message == "@2052\vAchievementName\v@Achievement:6900",
+            $"Writer / Title / Message: '{writer}' '{title}' '{message}'");
+        using var store = StoreWithTwoAccounts();
+        var ack = RunHandler(DbProxyHandlers.SA_MAKE_SYS_PARCEL, T151SysParcel2962, 1, store);
+        Hex.Eq(ack[0].body, "64 02 00 00 00 00 00 00", "cap_social4 2968: AS_MAKE_SYS_PARCEL, sent");
+        var row = store.GetParcel(1)!;
+        Hex.True(row.SenderName == "@Achievement:6903" && row.Title == "@2051"
+                 && row.ParcelType == ParcelDbHandlers.ParcelTypeSystem, "stored with its strings and type 102");
+        var rec = ParcelDbHandlers.ServedParcelRecord(store, row);
+        Hex.True(ParcelDbHandlers.WStringAt(rec, ParcelDbHandlers.ParcelDataSenderName, ParcelDbHandlers.ParcelNameMaxChars) == "@Achievement:6903"
+                 && ParcelDbHandlers.WStringAt(rec, ParcelDbHandlers.ParcelDataTitle, ParcelDbHandlers.ParcelTitleMaxChars) == "@2051"
+                 && ParcelDbHandlers.WStringAt(rec, ParcelDbHandlers.ParcelDataReceiverName, ParcelDbHandlers.ParcelNameMaxChars) == "t30_1"
+                 && BitConverter.ToInt32(rec, ParcelDbHandlers.ParcelDataParcelType) == 102,
+            "the listed row carries sender +0x04, receiver +0x54, type +0xA4, title +0x960 - seq 4560's fields");
+
+        // ---- (3) op 51 bind, op 63 unbind ----
+        store.UpsertItem(1068, 1, 0, 2, 15004, 1);
+        var atom = new byte[DbProxyHandlers.ItemAtomSize];
+        BitConverter.GetBytes(WarehouseHandlers.TsBindItem).CopyTo(atom, WarehouseHandlers.AtomOp);
+        BitConverter.GetBytes(1068L).CopyTo(atom, WarehouseHandlers.AtomItemDbId);
+        BitConverter.GetBytes(1L).CopyTo(atom, WarehouseHandlers.AtomSrcOwner);
+        BitConverter.GetBytes(2u).CopyTo(atom, WarehouseHandlers.AtomSrcSlot);
+        BitConverter.GetBytes(1L).CopyTo(atom, WarehouseHandlers.AtomDstOwner);
+        BitConverter.GetBytes(2u).CopyTo(atom, WarehouseHandlers.AtomDstSlot);
+        BitConverter.GetBytes(1).CopyTo(atom, WarehouseHandlers.AtomBoundOwner);
+        var parsed = WarehouseHandlers.ParseAtomArray(atom);
+        Hex.True(parsed[0].BoundOwner == 1, "atom +0x168 is read");
+        var bound = WarehouseHandlers.Apply(store, parsed, () => 9999);
+        var it = store.GetItem(1068)!;
+        Hex.True(bound.AmountChanged == 1 && it.InvenType == 0 && it.Slot == 2
+                 && it.Record![WarehouseHandlers.RecordBoundFlag] == 1
+                 && BitConverter.ToInt32(it.Record, WarehouseHandlers.RecordBoundOwner) == 1,
+            "0:2 -> 0:2 stays put; the record is bound to player 1 (UpdateItemBound +0x34 / +0x38)");
+        BitConverter.GetBytes(WarehouseHandlers.TsUnbindItem).CopyTo(atom, WarehouseHandlers.AtomOp);
+        BitConverter.GetBytes(0).CopyTo(atom, WarehouseHandlers.AtomBoundOwner);
+        WarehouseHandlers.Apply(store, WarehouseHandlers.ParseAtomArray(atom), () => 9999);
+        Hex.True(store.GetItem(1068)!.Record![WarehouseHandlers.RecordBoundFlag] == 0, "and op 63 unbinds it");
+    }
+
+    /// <summary>
+    /// T152b. A level set by the web tool reaches World as <c>perfect_level N</c>, so World's
+    /// level commit runs AutoLearnSkills. cap_social4 1401 is the frame (player 1, 65); 168
+    /// SDB_USER_LEARN_SKILL followed it. `test` was set to 70 by the store alone and kept its
+    /// seven creation skills (cap_skills3 714) - no 0x273B in any of its sessions.
+    /// </summary>
+    [Test] public static void T152b_a_stored_level_is_handed_to_world()
+    {
+        Hex.Eq(WorldLevelSync.BuildFrame(1, 65),
+            "12 00 00 00 01 00 00 00 01 00 00 00 70 00 65 00 72 00 66 00 65 00 63 00 74 00 5F 00 "
+            + "6C 00 65 00 76 00 65 00 6C 00 20 00 36 00 35 00 00 00",
+            "cap_social4 1401: AS_ADMIN_COMMAND perfect_level 65 for player 1");
+
+        const int pid = 4344;
+        WorldLevelSync.TryTake(pid, out _);
+        WorldLevelSync.Queue(pid, 70);                        // offline: no World, no session
+        Hex.True(WorldLevelSync.IsPending(pid), "queued for the next spawn");
+        Hex.True(WorldLevelSync.TryTake(pid, out int lvl) && lvl == 70, "taken once, with its level");
+        Hex.True(!WorldLevelSync.TryTake(pid, out _), "and only once");
+        WorldLevelSync.Queue(0, 70);
+        Hex.True(!WorldLevelSync.IsPending(0), "nobody is never queued");
+    }
+
+    /// <summary>
+    /// T155. The GM tool's World-bound buttons, as AS_ADMIN_REQUEST_USERACTION records. Bytes
+    /// 82-83, 162-163, 196-199 and 209-215 are uninitialised stack on the real Arbiter; ours are
+    /// zero (T148). Coordinate teleport: cap_multiworld client 2497 -&gt; A-&gt;W 3060, action 100.
+    /// Go to / summon: cap_final 916 / 1081 AS_ASK with the GM's last S_LOAD_TOPO, and World's
+    /// SA answer (917) is routed back by the requester at payload 84. Map teleport (0x67) and
+    /// remove NPC (0x66) have no sample: their fields are Handler_C_ADMIN_GM_MAPTELEPORT's and
+    /// Handler_C_ADMIN_REMOVE_NPC's.
+    /// </summary>
+    [Test] public static void T155_panel_teleport_and_user_actions_reach_world()
+    {
+        static byte[] Want(params (int At, string Bytes)[] runs)
+        {
+            var w = new byte[ArbiterClientHandlers.UserActionPayloadSize];
+            Hex.B("0E 00 00 00 D0 00 00 00").CopyTo(w, 0);
+            foreach (var (at, hex) in runs) Hex.B(hex).CopyTo(w, at);
+            return w;
+        }
+
+        var tp = Hex.B("42 00 4B EC 16 00 05 00 00 00 00 30 84 46 00 00 9A 44 00 58 8A C5");   // client 2497 (name tail cut)
+        Hex.Eq(ArbiterClientHandlers.BuildGmTeleportRequest(1, "dobb", tp.AsSpan(4)),
+            Want((8, "64 00 6F 00 62 00 62 00"), (84, "01 00 00 00 64 00 6F 00 62 00 62 00"),
+                 (164, "01 00 00 00 05 00 00 00 00 00 00 00 00 30 84 46 00 00 9A 44 00 58 8A C5 64 00 00 00")),
+            "cap_multiworld 3060: C_ADMIN_GM_TELEPORT zone 5 (16920, 1232, -4427) is action 100 on dobb (1)");
+
+        ArbiterClientHandlers.ObserveLoadTopo(1,
+            Hex.B("15 00 28 E8 05 00 00 00 D3 50 83 46 A3 0A 9D 44 00 50 8A C5 00"));   // frame 549's zone + position
+        Hex.Eq(ArbiterClientHandlers.BuildAskUserAction(1, "dob", 1003, "New", ArbiterClientHandlers.UserActionGoTo),
+            Want((8, "64 00 6F 00 62 00"), (84, "01 00 00 00 4E 00 65 00 77 00"),
+                 (164, "EB 03 00 00 05 00 00 00 00 00 00 00 D3 50 83 46 A3 0A 9D 44 00 50 8A C5 0C 00 00 00")),
+            "cap_final 916: AS_ASK 0x2825, go to New (1003) from dob's own position");
+
+        var answer = Want((8, "64 00 6F 00 62 00"), (84, "01 00 00 00 4E 00 65 00 77 00"),
+            (164, "EB 03 00 00 05 00 00 00 00 00 00 00 5A 9D 82 46 24 E5 96 44 00 28 8A C5 0C 00 00 00"));
+        Hex.True(ArbiterClientHandlers.UserActionRequester(answer) == 1
+                 && ArbiterClientHandlers.UserActionRequester(answer.AsSpan(0, 200)) == 0,
+            "cap_final 917: World filled in New's position; routed to dob (payload 84), sent on as 918 unchanged");
+
+        ArbiterClientHandlers.ObserveLoadTopo(1,
+            Hex.B("15 00 28 E8 05 00 00 00 5A 9D 82 46 24 E5 96 44 00 28 8A C5 00"));   // dob after the go-to
+        Hex.Eq(ArbiterClientHandlers.BuildAskUserAction(1, "dob", 1003, "New", ArbiterClientHandlers.UserActionSummon),
+            Want((8, "64 00 6F 00 62 00"), (84, "01 00 00 00 4E 00 65 00 77 00"),
+                 (164, "EB 03 00 00 05 00 00 00 00 00 00 00 5A 9D 82 46 24 E5 96 44 00 28 8A C5 0D 00 00 00")),
+            "cap_final 1081: AS_ASK 0x2825, summon New to dob");
+
+        var map = ArbiterClientHandlers.BuildMapTeleportRequest(1, "dob",
+            Hex.B("0E 00 05 00 00 00 00 30 84 46 00 00 9A 44"));
+        Hex.True(BitConverter.ToInt32(map, 168) == 5 && BitConverter.ToSingle(map, 176) == 16920f
+                 && BitConverter.ToSingle(map, 180) == 1232f && BitConverter.ToUInt32(map, 184) == 0x4B7FFFFF
+                 && BitConverter.ToInt32(map, 188) == 0x67,
+            "no sample: C_ADMIN_GM_MAPTELEPORT is action 0x67, zone +6, x +10, y +14, z = 0x4b7fffff");
+        var npc = ArbiterClientHandlers.BuildRemoveNpcRequest(1, "dob", 0x0000800C_0000B7A8);
+        Hex.True(BitConverter.ToInt32(npc, 188) == 0x66 && BitConverter.ToInt64(npc, 200) == 0x0000800C_0000B7A8
+                 && BitConverter.ToInt32(npc, 168) == 0,
+            "no sample: C_ADMIN_REMOVE_NPC is action 0x66 with the game id at payload 200");
+    }
+
+    /// <summary>
+    /// T158, cap_play1.log. (1) SA_CREST_USE 13074 (test applies a glyph, 05:37:19) was never
+    /// answered - a DLM request, so every DB write World queued for player 10 after it sat behind
+    /// it: the ten gathers (PICKEND result 3, no SDB_ITEM_SINGLE), five C_LIST_PARCEL (no
+    /// SDB_LIST_PARCEL), the 05:42 periodic save. (2)/(4) SDB_PEGASUS_FEE 31914 (caludesucks at
+    /// the flight master, quest 59911 step 5) was never answered either: no flight, and the two
+    /// later C_RIDE_PEGASUS produced no second request. Also: SA_USER_ON_SPAWN_COMPLETE's
+    /// replayed "reply" (DBS_END_START_QUEST_LIST, DLM 50, after every spawn) is sealed, and
+    /// C_SET_VISIBLE_RANGE (0xE7EF, forwarded to a World with no handler) is accepted here.
+    /// </summary>
+    [Test] public static void T158_crest_use_and_pegasus_fee_are_answered()
+    {
+        var crest = Hex.B("01 00 F0 0A 00 80 00 00 C5 04 00 00 07 81 00 00 01");   // 13074 payload
+        Hex.True(DbProxyHandlers.IsHandledRequest(DbProxyHandlers.SA_CREST_USE)
+                 && HandlerAccepts(DbProxyHandlers.SA_CREST_USE, crest),
+            "0x1469 is answered, not left to the replay table");
+        Hex.Eq(DbProxyHandlers.BuildReqIdAck(crest, DbProxyHandlers.CrestUseReqDlmId), "C5 04 00 00 01",
+            "AS_CREST_USE [DLM 0x4C5][true] - Handler_AS_CREST_USE reads @06 / @0A");
+
+        // 31914 payload: 16-byte header, one 568-byte give/take record (TS_CHANGE_MONEY -1000).
+        var fee = new byte[16 + DbProxyHandlers.ItemGiveTakeSize];
+        foreach (var (at, hex) in new[]
+        {
+            (0,   "16 00 00 00 38 02 00 00 26 06 00 00 09 00 00 00 00 00 00 00 09 00 00 00"),
+            (48,  "09 00 00 00"), (68, "20 02 00 00 09 00 00 00"), (96, "18 FC FF FF FF FF FF FF"),
+            (289, "F6 30 A4"), (497, "66 DE 06 20 02"),
+            (512, "B2 07 01 00 01 00 00 00 00 00 00 00 00 00 00 00 00 2C AE 04 10 00 00 00 00 00 80 3F"),
+        }) Hex.B(hex).CopyTo(fee, at);
+        Hex.True(DbProxyHandlers.IsHandledRequest(DbProxyHandlers.SDB_PEGASUS_FEE)
+                 && HandlerAccepts(DbProxyHandlers.SDB_PEGASUS_FEE, fee), "0x27A5 is answered");
+        Hex.Eq(DbProxyHandlers.BuildReqIdAck(fee, DbProxyHandlers.PegasusFeeReqDlmId), "26 06 00 00 01",
+            "DBS_PEGASUS_FEE [DLM 0x626][ok] - Handler_DBS_PEGASUS_FEE reads @06 / @0A");
+        using (var store = GuildStore(9))
+        {
+            store.AddCharacterMoney(9, 5000);
+            var r = DbProxyHandlers.ApplyPegasusFee(store, fee, QuietLog());
+            Hex.True(r.CharacterMoneyDelta == -1000 && store.GetCharacterMoney(9) == 4000,
+                "the route's 1000 is charged to player 9");
+        }
+
+        Hex.True(WorldReplayTable.OneWayFromWorld.Contains(0x15AE),
+            "SA_USER_ON_SPAWN_COMPLETE is sealed: its replayed DBS_END_START_QUEST_LIST carried DLM 50");
+        var names = RegisteredOpcodeNames();
+        if (names.Count > 0)
+            Hex.True(names.Any(n => n.Name == "C_SET_VISIBLE_RANGE" && n.Op == 0xE7EF),
+                "C_SET_VISIBLE_RANGE (59375) is registered - accepted, not forwarded");
+    }
+
+    /// <summary>
+    /// T152. The GM's spawn visibility is World's to announce, not ours. cap_final.log (real,
+    /// adminLevel 1): 495 SDB_USER_VAPORIZED 01 00 00 00 01, then 496 World's own tunnelled
+    /// S_ADMIN_GM_SKILL - the same nine bytes our enter-world push used to send. With the 5 we
+    /// send, World never vaporizes at spawn (cap_skills2 5267.., no 0x282D), so the push was a
+    /// false "invisible", the panel's Invisible OFF vaporized the GM (5889 -&gt; 5896 01) and the
+    /// learns that followed came back @3534. So: the tracker starts visible and moves only on
+    /// World's SDB_USER_VAPORIZED.
+    /// </summary>
+    [Test] public static void T152_spawn_visibility_follows_world()
+    {
+        Hex.Eq(ArbiterClientHandlers.BuildAdminGmSkill(ArbiterClientHandlers.GmSkillInvisible, on: true),
+            "09 00 BE 64 00 00 00 00 01",
+            "cap_final 496: World sends this itself, straight after vaporizing - the push only duplicated it");
+
+        const int pid = 10;
+        ArbiterClientHandlers.ResetGmSkillPush(pid);                    // SDB_USER_ENTERWORLD
+        Hex.True(!ArbiterClientHandlers.IsGmInvisible(pid),
+            "spawn state is visible until World says otherwise - cap_skills2 5267..5889 has no 0x282D");
+        Hex.True(HandlerAccepts(DbProxyHandlers.SDB_USER_VAPORIZED, Hex.B("0A 00 00 00 01"))
+                 && ArbiterClientHandlers.IsGmInvisible(pid),
+            "cap_skills2 5896: World vaporized character 10 - now tracked as invisible");
+        Hex.True(HandlerAccepts(DbProxyHandlers.SDB_USER_VAPORIZED, Hex.B("0A 00 00 00 00"))
+                 && !ArbiterClientHandlers.IsGmInvisible(pid),
+            "and only World's release clears it");
+        ArbiterClientHandlers.ResetGmSkillPush(pid);
+    }
+
     /// <summary>
     /// The crest window's two inputs, end to end. SA_CREST_POINT (0x1465) carried NewPoint and
     /// NewExPoint and T77 dropped both; SA_LEARN_ALL_CREST_ACQUIRABLE (0x1463) named the crest
@@ -25089,7 +25452,7 @@ string message
     /// of SMT 433 was sent with NO parameter. Both sides get the other party's name, keyed
     /// <c>UserName</c> - capitalised exactly like this, because the client substitutes by key and a
     /// miss leaves the placeholder in the text. Pinned to the real Arbiter's own frame 1436 in
-    /// D:\packetlogs\cap_social_client.log.
+    /// <captures>\cap_social_client.log.
     /// </summary>
     [Test] public static void T75_friend_accept_smt_names_the_other_party()
     {
@@ -25354,7 +25717,10 @@ string message
     /// <summary>
     /// Both boards, out of the store, against real stored progress: PvE sums
     /// <c>dungeon_cooldowns.clear_count</c> (what SA_UPDATE_DUNGEON_CLEAR_COUNT 0x13B7 writes)
-    /// and PvP counts the game log's <c>pvp.kill</c> rows.
+    /// and PvP counted the game log's <c>pvp.kill</c> rows - until T138d made the PvP board the
+    /// battleground rating ladder. The kill query is still here as
+    /// <c>GetPvpKillScores</c> and is still what this test exercises; what changed is that it is
+    /// no longer the board.
     /// <para>The brief asked for a game_log dungeon category; there is none - T115 created
     /// eight categories and no log opcode carries a dungeon clear - so the clear counter is
     /// the nearest real source, and this test is what says so.</para>
@@ -25385,13 +25751,17 @@ string message
         store.AddGameLog(GameLogPackets.CategoryPvp, "pvp.kill", 0, 2, 1, 0, 0, 0, 0, null, 1000);
         store.AddGameLog(GameLogPackets.CategoryPvp, "pvp.kill", 0, 2, 1, 0, 0, 0, 0, null, 1001);
         store.AddGameLog(GameLogPackets.CategoryPvp, "pk.kill", 0, 1, 2, 0, 0, 0, 0, null, 1002);
-        var pvp = store.GetPvpRankingScores();
+        var pvp = store.GetPvpKillScores();
         Hex.True(pvp.Count == 1 && pvp[0].CharacterId == 2 && pvp[0].Score == 2,
-            "two kills for character 2; pk.kill is the outlaw counter and is not the board");
-        Hex.True(store.GetPvpRankingScores(0).Count == 1
-                 && store.GetPvpRankingScores(-5).Count == 1
-                 && store.GetPvpRankingScores(int.MaxValue).Count == 1,
+            "two kills for character 2; pk.kill is the outlaw counter and is not counted");
+        Hex.True(store.GetPvpKillScores(0).Count == 1
+                 && store.GetPvpKillScores(-5).Count == 1
+                 && store.GetPvpKillScores(int.MaxValue).Count == 1,
             "and a nonsense limit falls back to the cap rather than to no rows");
+        // T138d: kills are no longer the PvP BOARD. Nobody here has finished a battleground,
+        // so the ladder is still empty - which is the point of that change, not a side effect.
+        Hex.True(store.GetPvpRankingScores().Count == 0,
+            "two kills put nobody on the rating ladder");
 
         // End to end: the store's rows, ranked and framed, are the frame the handler sends.
         var frame = RankingBoards.BuildPveRankingList(
@@ -25621,7 +25991,7 @@ string message
     static byte[]? LoadLiveFrame(string name)
     {
         var path = FindRepoFile(Path.Combine("data", "classic-live", name));
-        if (path == null) { Console.WriteLine($"        (skipped: data/classic-live/{name} not found)"); return null; }
+        if (path == null) { Skip.Because($"data/classic-live/{name} not found"); return null; }
         var sb = new System.Text.StringBuilder();
         foreach (var line in File.ReadAllLines(path))
         {
@@ -26116,10 +26486,14 @@ string message
         }
         Hex.True(starts == 3 && lists == 3, "the notice and the board go to the whole guild");
 
-        // One quest at a time - T98's table keeps a single row at status 1.
+        // T170: a DIFFERENT quest runs beside it (cap_final2a_client2 1548 then 1565, both result 1);
+        // only the same quest twice is refused.
         var second = guilds.OnClientPacket(3, GuildPackets.C_REQUEST_START_GUILD_QUEST,
             T135QuestBody(10002));
-        Hex.True(second.Rejected != null, "a second quest cannot start while one runs");
+        Hex.True(second.Rejected == null, $"a second, different quest starts: {second.Rejected}");
+        Hex.True(guilds.OnClientPacket(3, GuildPackets.C_REQUEST_START_GUILD_QUEST,
+            T135QuestBody(10002)).Rejected != null, "the same quest cannot start twice");
+        guilds.OnClientPacket(3, GuildPackets.C_REQUEST_CANCEL_GUILD_QUEST, T135QuestBody(10002));
         Hex.True(guilds.OnClientPacket(3, GuildPackets.C_REQUEST_START_GUILD_QUEST,
             T135QuestBody(99999)).Rejected != null, "and a quest that is not on the board never starts");
 
@@ -26131,13 +26505,15 @@ string message
             T135QuestBody(10001));
         Hex.True(cancel.Rejected == null && store.GetRunningGuildQuest(guildId) == null,
             $"the starter may cancel: {cancel.Rejected}");
-        int cancelLists = 0, replies = 0;
+        int cancelLists = 0, fails = 0, notices = 0;
         foreach (var c in cancel.ToClients)
         {
-            if (c.PacketName == "S_GUILD_QUEST_LIST") cancelLists++; else replies++;
+            if (c.PacketName == "S_GUILD_QUEST_LIST") cancelLists++;
+            if (c.PacketName == "S_FAIL_GUILD_QUEST") fails++;
+            if (c.PacketName == "S_SYSTEM_MESSAGE") notices++;
         }
-        Hex.True(cancelLists == 3 && replies == 0,
-            "the refresh IS the answer - the 376012 map has no S_CANCEL_GUILD_QUEST");
+        Hex.True(cancelLists == 3 && fails == 3 && notices == 3,
+            "T170: S_FAIL_GUILD_QUEST, the board and SMT 3909 to the guild (cap_final2a_client1 4654..4656)");
 
         // The chief's own cancel, on a quest somebody else started.
         guilds.OnClientPacket(2, GuildPackets.C_REQUEST_START_GUILD_QUEST, T135QuestBody(10003));
@@ -26345,6 +26721,7 @@ string message
     {
         var now = DateTimeOffset.UnixEpoch.AddHours(2);
         const int Skyring = 37, Corsairs = 26, Fraywind = 10;
+        T157TestSheet();   // T157: the ids and sizes come from BattleFieldData.xml now
 
         var sky = MatchComposition.RuleFor(Skyring);
         Hex.True(sky.TeamSize == 3 && sky.MinHealers == 1 && sky.MaxHealers == 1
@@ -26413,15 +26790,16 @@ string message
                  && !MatchComposition.TeamAccepts(sky, 2, 0, 0, 0, sameClass: 2),
             "doubles yes, triples no");
 
-        // No row of its own: the two environment caps, read fresh on every call.
+        // A sheet row with no stated rule: the two environment caps, read fresh on every call.
+        // (Until T157 this was 909, which BattleFieldData.xml has commented out - not offered now.)
         Environment.SetEnvironmentVariable(MatchComposition.MaxHealersVariable, "1");
         Environment.SetEnvironmentVariable(MatchComposition.MaxTanksVariable, "4");
         try
         {
-            var other = MatchComposition.RuleFor(909, teamSize: 8);
-            Hex.True(!MatchComposition.HasRule(909) && other.MaxHealers == 1
-                     && other.TeamSize == 8 && MatchComposition.FallbackMaxTanks() == 4,
-                "an unlisted battleground takes TERASHARP_BG_MAX_HEALERS/TANKS");
+            var other = MatchComposition.RuleFor(5);   // T157: a sheet type with no stated rule (Kumas)
+            Hex.True(!MatchComposition.HasRule(5) && other.MaxHealers == 1
+                     && other.TeamSize == 13 && MatchComposition.FallbackMaxTanks() == 4,
+                "a battleground with no stated rule takes TERASHARP_BG_MAX_HEALERS/TANKS");
             Hex.True(!MatchComposition.TeamAccepts(other, 6, healers: 1, tanks: 0, lancers: 0),
                 "and the cap bites");
         }
@@ -26430,23 +26808,26 @@ string message
             Environment.SetEnvironmentVariable(MatchComposition.MaxHealersVariable, null);
             Environment.SetEnvironmentVariable(MatchComposition.MaxTanksVariable, null);
         }
-        Hex.True(MatchComposition.RuleFor(909).MaxHealers == MatchComposition.DefaultMaxHealers
+        Hex.True(MatchComposition.RuleFor(5).MaxHealers == MatchComposition.DefaultMaxHealers
                  && MatchComposition.FallbackMaxTanks() == MatchComposition.DefaultMaxTanks,
             "and with nothing set it is the brief's 2 and 3");
         MatchQueueManager.Reset();
+        BattleFieldSheet.ResetForTest();
     }
 
     /// <summary>
     /// T138c. FIN goes to EVERY member of a formed group, not just the leaders, and the formed
     /// entries leave the pool. The delivery seam stands in for the sessions the test has not
-    /// got.
+    /// got. T161: none of these five is registered with the party layer, so no party forms and
+    /// each of them gets the whole match sequence - state (0,1), state (0,0), FIN - through the
+    /// fallback, in that order.
     /// </summary>
     [Test] public static void T138c_formation_fins_every_member()
     {
         const int Kelsaik = 9739;
-        MatchQueueManager.Reset();
+        using var _ev = T161bEvents((2154, "Dungeon", Kelsaik), (5001, "BattleField", Kelsaik));   // T161b
+        MatchWiring.Reset();
         var sent = new List<(uint Player, string Hex)>();
-        var keep = MatchWiring.Deliver;
         MatchWiring.Deliver = (q, p) => sent.Add((q.PlayerId, BitConverter.ToString(p)));
         try
         {
@@ -26455,14 +26836,19 @@ string message
             T138cQueue(4, Kelsaik, T138cQ(4, 5));
             T138cQueue(5, Kelsaik, T138cQ(5, 4));
             var g = MatchWiring.TryFormAndFinish(Kelsaik, DateTimeOffset.UnixEpoch.AddHours(3));
-            Hex.True(g != null && sent.Count == 5, $"five members, five FINs: {sent.Count}");
+            Hex.True(g != null && sent.Count == 15, $"five members, three frames each: {sent.Count}");
             string fin = BitConverter.ToString(MatchQueueManager.BuildFinInterPartyMatch(Kelsaik));
-            foreach (var (_, hex) in sent)
-                Hex.True(hex == fin, "and every one of them is record 10585's frame");
+            var seq = MatchWiring.MatchFoundFrames(Kelsaik).Select(b => BitConverter.ToString(b)).ToList();
+            foreach (uint who in new uint[] { 1, 2, 3, 4, 5 })
+            {
+                var mine = sent.Where(s => s.Player == who).Select(s => s.Hex).ToList();
+                Hex.True(mine.SequenceEqual(seq), $"member {who}: state, state, FIN");
+                Hex.True(mine[2] == fin, "and the FIN is record 10585's frame");
+            }
             Hex.True(MatchQueueManager.Find(1) == null && MatchQueueManager.Find(5) == null,
                 "a formed entry leaves the pool");
         }
-        finally { MatchWiring.Deliver = keep; MatchQueueManager.Reset(); }
+        finally { MatchWiring.Reset(); }
     }
 
     /// <summary>
@@ -26520,6 +26906,22 @@ string message
             "and it is kept, so S_VIEW_BATTLE_FIELD_RESULT's previousrating/rating are there "
             + "the day that frame gets a capture");
 
+        // The floor eats part of a loss, and the CLIENT is told what actually moved - not the
+        // roll. A player on 3 who loses a roll of 8 has lost 3, and the frame must say so or
+        // the window and the leaderboard disagree by five points forever.
+        // This also leaves character 1 AT the floor, which is why the ladder further down
+        // holds exactly one row.
+        store.SetBgRating(1, 3);
+        int before = store.GetBgRating(1);
+        var floored = BattlegroundRating.Apply(store, 1, win: false, rng: new Random(3));
+        Hex.True(floored.Previous == 3 && floored.Rating == 0 && floored.Delta <= -5
+                 && floored.Applied == -3,
+            $"the roll was {floored.Delta} but only {floored.Applied} of it fits above the floor");
+        var rewritten = BattlegroundRating.Build(floored.Delta);
+        BattlegroundRating.WriteDelta(rewritten, floored.Applied);
+        Hex.True(BattlegroundRating.ReadDelta(rewritten) == floored.Applied && before == 3,
+            "and the frame carries the applied movement, which is what OnTunnelled writes");
+
         // The leaderboard: the rating field carries bg_rating when a row has one, and the
         // score when it does not - which is why every T119 frame is still byte-identical.
         var withRating = new List<RankingRow>
@@ -26531,17 +26933,4180 @@ string message
         Hex.True(BitConverter.ToInt32(RankingBoards.BuildPvpRankingList(without), at) == 7,
             "and falls back to the score, which is what T119 shipped");
 
-        // And the store hands the rating to the board beside the kills.
+        // And the store hands the rating to the board. T138d made the rating the ORDER too, so
+        // the score and the rating are one number; T138d_the_pvp_board_is_a_rating_ladder is
+        // where that is exercised properly.
+        Hex.True(store.GetBgRating(1) == 0,
+            "character 1 is at the floor, so only character 2 is on the ladder below");
         store.SetBgRating(2, 33);
         store.AddGameLog(GameLogPackets.CategoryPvp, "pvp.kill", 0, 2, 1, 0, 0, 0, 0, null, 1000);
         var scores = store.GetPvpRankingScores();
-        Hex.True(scores.Count == 1 && scores[0].CharacterId == 2 && scores[0].Score == 1
+        Hex.True(scores.Count == 1 && scores[0].CharacterId == 2 && scores[0].Score == 33
                  && scores[0].Rating == 33,
-            "one kill and a rating of 33 - the ORDER is still the kills");
+            $"a rating of 33 is both the score and the rating ({scores.Count} row(s))");
         var ranked = RankingBoards.Rank(scores, RankingBoards.AllClasses);
         Hex.True(ranked.Count == 1 && ranked[0].Rating == 33,
             "and Rank carries it through to the row the frame is built from");
         BattlegroundRating.Reset();
+    }
+
+
+    // =========================================================================================
+    // T138d - the matched party, the rating ladder and the min-members knob.
+    // =========================================================================================
+
+    /// <summary>classic_live3 record 10587 - S_SYS_PARTY_INFO for the matched party.</summary>
+    const string T138dSysPartyInfo =
+          "E8 01 C7 74 1E 00 08 00 08 00 18 00 F0 0A 00 00 "
+        + "86 12 00 00 00 00 00 00 18 00 28 00 F0 0A 00 00 "
+        + "9B 1C 02 00 02 00 00 00 28 00 38 00 F0 0A 00 00 "
+        + "32 88 01 00 01 00 00 00 38 00 48 00 F0 0A 00 00 "
+        + "58 0E 02 00 01 00 00 00 48 00 58 00 F0 0A 00 00 "
+        + "0B CC 01 00 01 00 00 00 58 00 68 00 FF FF FF FF "
+        + "00 00 00 00 FF FF FF FF 68 00 78 00 FF FF FF FF "
+        + "00 00 00 00 FF FF FF FF 78 00 88 00 FF FF FF FF "
+        + "00 00 00 00 FF FF FF FF 88 00 98 00 FF FF FF FF "
+        + "00 00 00 00 FF FF FF FF 98 00 A8 00 FF FF FF FF "
+        + "00 00 00 00 FF FF FF FF A8 00 B8 00 FF FF FF FF "
+        + "00 00 00 00 FF FF FF FF B8 00 C8 00 FF FF FF FF "
+        + "00 00 00 00 FF FF FF FF C8 00 D8 00 FF FF FF FF "
+        + "00 00 00 00 FF FF FF FF D8 00 E8 00 FF FF FF FF "
+        + "00 00 00 00 FF FF FF FF E8 00 F8 00 FF FF FF FF "
+        + "00 00 00 00 FF FF FF FF F8 00 08 01 FF FF FF FF "
+        + "00 00 00 00 FF FF FF FF 08 01 18 01 FF FF FF FF "
+        + "00 00 00 00 FF FF FF FF 18 01 28 01 FF FF FF FF "
+        + "00 00 00 00 FF FF FF FF 28 01 38 01 FF FF FF FF "
+        + "00 00 00 00 FF FF FF FF 38 01 48 01 FF FF FF FF "
+        + "00 00 00 00 FF FF FF FF 48 01 58 01 FF FF FF FF "
+        + "00 00 00 00 FF FF FF FF 58 01 68 01 FF FF FF FF "
+        + "00 00 00 00 FF FF FF FF 68 01 78 01 FF FF FF FF "
+        + "00 00 00 00 FF FF FF FF 78 01 88 01 FF FF FF FF "
+        + "00 00 00 00 FF FF FF FF 88 01 98 01 FF FF FF FF "
+        + "00 00 00 00 FF FF FF FF 98 01 A8 01 FF FF FF FF "
+        + "00 00 00 00 FF FF FF FF A8 01 B8 01 FF FF FF FF "
+        + "00 00 00 00 FF FF FF FF B8 01 C8 01 FF FF FF FF "
+        + "00 00 00 00 FF FF FF FF C8 01 D8 01 FF FF FF FF "
+        + "00 00 00 00 FF FF FF FF D8 01 00 00 FF FF FF FF "
+        + "00 00 00 00 FF FF FF FF";
+
+    /// <summary>The five matched members of that capture, in its slot order.</summary>
+    static readonly (int Id, MatchRole Role)[] T138dCaptureParty =
+    {
+        (4742, MatchRole.Tank), (138395, MatchRole.Healer), (100402, MatchRole.Dps),
+        (134744, MatchRole.Dps), (117771, MatchRole.Dps),
+    };
+
+    static List<PartyPackets.SysPartySlot> T138dCaptureSlots()
+    {
+        var slots = new List<PartyPackets.SysPartySlot>();
+        foreach (var (id, role) in T138dCaptureParty)
+            slots.Add(new PartyPackets.SysPartySlot(PartyPackets.PlanetId, id, (int)role));
+        return slots;
+    }
+
+    /// <summary>
+    /// T138d. S_SYS_PARTY_INFO (0x74C7), classic_live3 record 10587 - the frame the real server
+    /// sends between FIN (10585) and the player pressing enter (11521). Thirty slots whatever
+    /// the party size, and the third field of each is the matched POSITION.
+    /// </summary>
+    [Test] public static void T138d_sys_party_info_is_byte_exact()
+    {
+        Hex.Eq(PartyPackets.BuildSysPartyInfo(T138dCaptureSlots()), T138dSysPartyInfo,
+            "classic_live3 record 10587: 30 slots, five filled, 488 bytes");
+
+        var frame = Hex.B(T138dSysPartyInfo);
+        Hex.True(frame.Length == 488 && BitConverter.ToUInt16(frame, 2) == PartyPackets.S_SYS_PARTY_INFO
+                 && BitConverter.ToUInt16(frame, 4) == PartyPackets.MaxRaidMembers
+                 && BitConverter.ToUInt16(frame, 6) == 8,
+            "the count is MaxRaidMembers - 30 - even for a five-man group");
+
+        // The roles are 0, 2, 1, 1, 1 in the datasheet's own numbering: one tank, one healer,
+        // three DPS. That is T138c's composition rule, confirmed from the wire rather than
+        // assumed, and it is also what fixes MatchRole's numbers.
+        int tanks = 0, healers = 0, dps = 0;
+        for (int i = 0; i < 5; i++)
+        {
+            int at = 8 + i * 16;
+            var role = (MatchRole)BitConverter.ToInt32(frame, at + 12);
+            if (role == MatchRole.Tank) tanks++;
+            if (role == MatchRole.Healer) healers++;
+            if (role == MatchRole.Dps) dps++;
+            Hex.True(BitConverter.ToInt32(frame, at + 4) == PartyPackets.PlanetId,
+                $"slot {i} is on planet 2800");
+        }
+        Hex.True(tanks == 1 && healers == 1 && dps == 3,
+            $"1 tank / 1 healer / 3 DPS on the wire: {tanks}/{healers}/{dps}");
+
+        // Slot 0 is player 4742, templateId 11001 - an Elin WARRIOR, whose defaultPosition is
+        // DPS and whose secondPosition is tank - and he is in the frame as a tank. So the field
+        // is the matched position, not the class, and CanFill's second-position rule is real.
+        Hex.True(BitConverter.ToInt32(frame, 8 + 8) == 4742
+                 && BitConverter.ToInt32(frame, 8 + 12) == (int)MatchRole.Tank
+                 && MatchComposition.RoleOf(0) == MatchRole.Dps
+                 && MatchComposition.CanFill(0, MatchRole.Tank, level: 65),
+            "a Warrior seated as a tank - the capture's own slot 0");
+
+        // The 25 unused slots, and the last one's terminator.
+        for (int i = 5; i < PartyPackets.MaxRaidMembers; i++)
+        {
+            int at = 8 + i * 16;
+            Hex.True(BitConverter.ToInt32(frame, at + 4) == -1
+                     && BitConverter.ToInt32(frame, at + 8) == 0
+                     && BitConverter.ToInt32(frame, at + 12) == -1,
+                $"slot {i} is the empty triple -1 / 0 / -1");
+        }
+        Hex.True(BitConverter.ToUInt16(frame, 8 + 29 * 16 + 2) == 0, "the last slot ends the list");
+
+        // An empty party still sends thirty empty slots rather than a short frame.
+        Hex.True(PartyPackets.BuildSysPartyInfo(null).Length == 488,
+            "the frame is a fixed size; the slot list is what varies");
+    }
+
+    /// <summary>The AS_DO_CREATE_PARTY frames in a batch of actions.</summary>
+    static List<byte[]> T138dCreates(PartyActions a)
+    {
+        var outp = new List<byte[]>();
+        foreach (var w in a.ToWorld)
+            if (w.Opcode == PartyPackets.AS_DO_CREATE_PARTY) outp.Add(w.Payload);
+        return outp;
+    }
+
+    static int T138dCountWorld(PartyActions a, ushort op)
+    {
+        int n = 0;
+        foreach (var w in a.ToWorld) if (w.Opcode == op) n++;
+        return n;
+    }
+
+    /// <summary>Every raw S_SYS_PARTY_INFO a batch sends, by recipient ticket.</summary>
+    static List<(uint Ticket, byte[] Frame)> T138dSysFrames(PartyActions a)
+    {
+        var outp = new List<(uint, byte[])>();
+        foreach (var c in a.ToClients)
+            if (c.IsRaw && c.RawPacket != null && c.RawPacket.Length >= 4
+                && BitConverter.ToUInt16(c.RawPacket, 2) == PartyPackets.S_SYS_PARTY_INFO)
+                outp.Add((c.Ticket, c.RawPacket));
+        return outp;
+    }
+
+    static List<PartyManager.MatchedMember> T138dMembers(params (int Id, MatchRole Role)[] rows)
+    {
+        var outp = new List<PartyManager.MatchedMember>();
+        foreach (var (id, role) in rows) outp.Add(new PartyManager.MatchedMember(id, role));
+        return outp;
+    }
+
+    /// <summary>
+    /// T138d. A formed match becomes ONE party, and World is told so with AS_DO_CREATE_PARTY
+    /// carrying the dungeon id - which is what makes five matched strangers land in one instance
+    /// instead of five when they each press enter.
+    /// </summary>
+    [Test] public static void T138d_a_formed_match_becomes_one_party()
+    {
+        var pm = NewPartyManager();
+        // A Warrior tank, a Priest healer and three DPS - the capture's own shape.
+        pm.Register(P(1, 101, "warr", cls: 0));
+        pm.Register(P(2, 102, "priest", cls: 6));
+        pm.Register(P(3, 103, "slayer", cls: 2));
+        pm.Register(P(4, 104, "archer", cls: 5));
+        pm.Register(P(5, 105, "sorc", cls: 4));
+
+        var members = T138dMembers((101, MatchRole.Tank), (102, MatchRole.Healer),
+            (103, MatchRole.Dps), (104, MatchRole.Dps), (105, MatchRole.Dps));
+        var a = pm.FormMatchedParty(members, raid: false, dungeonId: 9739);
+        Hex.True(a.Rejected == null, $"the match forms a party: {a.Rejected}");
+
+        var creates = T138dCreates(a);
+        Hex.True(creates.Count == 1, $"exactly one AS_DO_CREATE_PARTY: {creates.Count}");
+        var pay = creates[0];
+        Hex.True(BitConverter.ToInt32(pay, 0x25) == 9739,
+            $"and it carries the dungeon id at [2B]: {BitConverter.ToInt32(pay, 0x25)}");
+        Hex.True(BitConverter.ToInt32(pay, 0x2E) == 0 && pay[0x29] == 0
+                 && BitConverter.ToInt32(pay, 0x2A) == 0,
+            "a dungeon match is not a raid, not a battlefield and has no team index");
+        Hex.True(BitConverter.ToUInt32(pay, 0x04) == 5 * (uint)PartyPackets.MemberBasicInfoSize,
+            "[0A] is a BYTE length and it covers all five members");
+
+        // One party, holding everybody.
+        var party = pm.FindByMember(101);
+        Hex.True(party != null && party.Count == 5, $"five in one party: {party?.Count}");
+        foreach (int id in new[] { 102, 103, 104, 105 })
+            Hex.True(ReferenceEquals(pm.FindByMember(id), party), $"{id} is in that same party");
+        Hex.True(party!.ManagerDbId == 101, "the first queued member leads it");
+
+        // The mirror JoinCore sends, per member, in the same order.
+        Hex.True(T138dCountWorld(a, PartyPackets.AS_CHANGE_EVENT_MATCHING_STATE) == 5
+                 && T138dCountWorld(a, PartyPackets.AS_REQUEST_REFRESH_PARTY_INFO) == 5,
+            "matching off and a party refresh for each of the five");
+
+        // S_SYS_PARTY_INFO to all five, the same frame, carrying the matched positions.
+        var sys = T138dSysFrames(a);
+        Hex.True(sys.Count == 5, $"one S_SYS_PARTY_INFO per member: {sys.Count}");
+        var first = sys[0].Frame;
+        foreach (var (_, f) in sys) Hex.Eq(f, first, "every member sees the same roster");
+        Hex.True(BitConverter.ToInt32(first, 8 + 8) == 101
+                 && BitConverter.ToInt32(first, 8 + 12) == (int)MatchRole.Tank
+                 && BitConverter.ToInt32(first, 8 + 16 + 12) == (int)MatchRole.Healer,
+            "slot 0 is the tank we matched and slot 1 the healer - not their default positions");
+        Hex.True(BitConverter.ToInt32(first, 8 + 5 * 16 + 4) == -1,
+            "and the sixth slot is empty");
+    }
+
+    /// <summary>Two SA_JOIN_PARTY frames: a normal party of <paramref name="ids"/>, first one leading.</summary>
+    static Party T163NormalParty(PartyManager pm, params int[] ids)
+    {
+        for (int i = 1; i < ids.Length; i++)
+            Hex.True(pm.OnWorldFrame(PartyPackets.SA_JOIN_PARTY, SaJoinPartyPayload(ids[0], ids[i])).Rejected == null,
+                $"{ids[i]} joins {ids[0]}");
+        var p = pm.FindByMember(ids[0])!;
+        Hex.True(!p.IsSys && p.Count == ids.Length && p.PartyType == -1, "an ordinary party");
+        return p;
+    }
+
+    static List<string> T163Names(PartyActions a, uint ticket)
+        => a.ToClients.Where(c => c.Ticket == ticket)
+            .Select(c => c.IsRaw ? $"raw:{BitConverter.ToUInt16(c.RawPacket!, 2):X4}" : c.PacketName).ToList();
+
+    /// <summary>classic_live3 53967 / 53994: S_CANCEL_PARTY_MATCH_POOL(-9999, 2) after a leave from a matched party.</summary>
+    const string T163CancelAny = "0c 00 56 d7 f1 d8 ff ff 02 00 00 00";
+
+    /// <summary>
+    /// T163 (2). A party that queued together is SUSPENDED, and the match gets its own system
+    /// party - New_CreateParty's path, not T138d's extension. World is told once, with the
+    /// dungeon id and SysPartyInfoType 0 (cap_queue1 3312 has both), so C_ENTER_DUNGEON finds
+    /// the dungeon; the queued trio's clients get S_LEAVE_PARTY first (classic_live2 19463) and
+    /// World hears nothing about their old party, which it suspends itself.
+    /// </summary>
+    [Test] public static void T163_a_queued_party_is_suspended_not_extended()
+    {
+        var pm = NewPartyManager();
+        for (uint i = 1; i <= 5; i++) pm.Register(P(i, 100 + (int)i, "p" + i, cls: i == 1 ? 1 : i == 2 ? 6 : 2));
+        var normal = T163NormalParty(pm, 101, 102, 103);
+
+        var full = pm.FormMatchedParty(T138dMembers(
+            (101, MatchRole.Tank), (102, MatchRole.Healer), (103, MatchRole.Dps),
+            (104, MatchRole.Dps), (105, MatchRole.Dps)), raid: false, dungeonId: 9739);
+        Hex.True(full.Rejected == null, $"the match forms: {full.Rejected}");
+        var creates = T138dCreates(full);
+        Hex.True(creates.Count == 1, "one AS_DO_CREATE_PARTY - a party of its own");
+        Hex.True(BitConverter.ToInt32(creates[0], 0x20) == 0 && BitConverter.ToInt32(creates[0], 0x25) == 9739
+                 && BitConverter.ToUInt32(creates[0], 0x04) == 5 * (uint)PartyPackets.MemberBasicInfoSize,
+            "SysPartyInfoType 0, dungeon 9739 at [2B], all five members - what C_ENTER_DUNGEON needs");
+        foreach (var op in new[] { PartyPackets.AS_DO_ADD_PARTY_MEMBER, PartyPackets.AS_DO_REMOVE_PARTY_MEMBER,
+                                   PartyPackets.AS_DO_DISMISS_PARTY, PartyPackets.AS_DO_EXTEND_PARTY })
+            Hex.True(T138dCountWorld(full, op) == 0, $"0x{op:X4}: World is not told about the queued party");
+
+        foreach (uint t in new uint[] { 1, 2, 3 })
+        {
+            var mine = T163Names(full, t);
+            Hex.True(mine.Count > 1 && mine[0] == "S_LEAVE_PARTY" && mine.IndexOf("S_PARTY_MEMBER_LIST") > 0,
+                $"ticket {t}: S_LEAVE_PARTY, then the matched party - {string.Join(" ", mine)}");
+        }
+        foreach (uint t in new uint[] { 4, 5 })
+            Hex.True(!T163Names(full, t).Contains("S_LEAVE_PARTY"), $"ticket {t} had no party to leave");
+
+        var sys = pm.FindByMember(101)!;
+        Hex.True(sys.IsSys && sys.Count == 5 && sys.Id != normal.Id && sys.WithdrawalPenalty,
+            "the member's party is now the system one, penalty armed");
+        Hex.True(ReferenceEquals(pm.FindNormalParty(101), normal) && normal.Count == 3 && pm.PartyCount == 2,
+            "and the trio's party is still there, all three slots kept");
+        Hex.True((bool)pm.MemberListFields(sys)["ims"] && !(bool)pm.MemberListFields(normal)["ims"],
+            "S_PARTY_MEMBER_LIST ims: 1 for the matched party (classic_live3 10568), 0 for a normal one (classic_live2 5463)");
+
+        Hex.True(pm.FormMatchedParty(T138dMembers((101, MatchRole.Tank), (104, MatchRole.Dps)),
+                raid: false, dungeonId: 9739).Rejected != null,
+            "Already in SysParty: a second match is refused");
+        var alone = NewPartyManager().FormMatchedParty(
+            T138dMembers((900, MatchRole.Tank), (901, MatchRole.Dps)), raid: false, dungeonId: 1);
+        Hex.True(alone.Rejected != null && alone.IsEmpty, "an unregistered pair is refused rather than faked");
+    }
+
+    /// <summary>
+    /// T163 (3). Leaving the matched party gives each member their pre-queue group back
+    /// (KickPartyMember -> Party::New_SendPartyMemberList), every leave is followed by the
+    /// matching cancel (classic_live3 53966/53967 for the others, 53993/53994 for the leaver),
+    /// and when the matched party falls apart the last members are restored too.
+    /// </summary>
+    [Test] public static void T163_leaving_the_matched_party_restores_the_group()
+    {
+        var pm = NewPartyManager();
+        for (uint i = 1; i <= 5; i++) pm.Register(P(i, 100 + (int)i, "p" + i, cls: 2));
+        var pair = T163NormalParty(pm, 101, 102);          // the tank + healer who queued together
+        pm.FormMatchedParty(T138dMembers((103, MatchRole.Dps), (101, MatchRole.Tank), (102, MatchRole.Healer),
+            (104, MatchRole.Dps), (105, MatchRole.Dps)), raid: false, dungeonId: 9739);
+        var sys = pm.FindByMember(101)!;
+
+        var a = pm.OnWorldFrame(PartyPackets.SA_LEAVE_PARTY, SaLeavePartyPayload(sys.Id, 101));
+        var leaver = a.ToClients.Where(c => c.Ticket == 1).ToList();
+        Hex.True(leaver.Count == 3 && leaver[0].PacketName == "S_LEAVE_PARTY"
+                 && leaver[1].IsRaw && BitConverter.ToString(leaver[1].RawPacket!) == BitConverter.ToString(Hex.B(T163CancelAny))
+                 && leaver[2].PacketName == "S_PARTY_MEMBER_LIST"
+                 && (ulong)leaver[2].Fields!["id"] == (ulong)pair.Id,
+            $"101: S_LEAVE_PARTY, the 53994 cancel, then the pair's party again - {string.Join(" ", T163Names(a, 1))}");
+        Hex.True(ReferenceEquals(pm.FindByMember(101), pair), "101 is back in the pair");
+        foreach (uint t in new uint[] { 2, 3, 4, 5 })
+            Hex.True(T163Names(a, t).SequenceEqual(new[] { "S_LEAVE_PARTY_MEMBER", "raw:D756", "S_PARTY_MEMBER_LIST" }),
+                $"ticket {t}: 53966 + 53967, then the list - {string.Join(" ", T163Names(a, t))}");
+
+        // 102 still in the matched party does not see traffic of the pair it is away from.
+        Hex.True(ReferenceEquals(pm.FindByMember(102), sys), "102 is still in the dungeon party");
+
+        // The matched party dismissed: everyone is restored at once - 102 to the pair, the rest to nothing.
+        var d = pm.OnWorldFrame(PartyPackets.SA_DISMISS_PARTY, SaPartyActorPayload(102));
+        Hex.True(d.Rejected == null && T138dCountWorld(d, PartyPackets.AS_DO_DISMISS_PARTY) == 1, "the system party goes");
+        var two = T163Names(d, 2);
+        Hex.True(two.SequenceEqual(new[] { "S_LEAVE_PARTY", "S_PARTY_MEMBER_LIST" }) && ReferenceEquals(pm.FindByMember(102), pair),
+            $"102: out of the matched party and back in the pair - {string.Join(" ", two)}");
+        Hex.True(T163Names(d, 3).SequenceEqual(new[] { "S_LEAVE_PARTY" }) && pm.FindByMember(103) == null,
+            "103 queued alone and goes back to no party");
+        Hex.True(pair.Count == 2 && pm.PartyCount == 1, "the pair survived the whole dungeon");
+    }
+
+    /// <summary>
+    /// T163 (4). The dropout debuff is World's abnormality (DungeonMatching.xml
+    /// withdrawalAbnormalityId 999994, 180 s); what decides it is the Arbiter's
+    /// AS_NOTIFY_ABOUT_SYS_PARTY_WITHDRAWAL. Leaving a matched DUNGEON party before World's
+    /// DSA_NOTIFY_ABOUT_DUNGEON_CLEAR sends it; after it, nothing (classic_live3: 53190
+    /// S_DUNGEON_CLEAR, 53990 /drop, no 999994 on the capturer). A normal party and a
+    /// battleground side never send it.
+    /// </summary>
+    [Test] public static void T163_dropout_penalty_before_the_clear_only()
+    {
+        var pm = NewPartyManager();
+        for (uint i = 1; i <= 5; i++) pm.Register(P(i, 100 + (int)i, "p" + i, cls: 2));
+        pm.FormMatchedParty(T138dMembers((101, MatchRole.Tank), (102, MatchRole.Healer), (103, MatchRole.Dps),
+            (104, MatchRole.Dps), (105, MatchRole.Dps)), raid: false, dungeonId: 3036);
+        var sys = pm.FindByMember(101)!;
+
+        var drop = pm.OnWorldFrame(PartyPackets.SA_LEAVE_PARTY, SaLeavePartyPayload(sys.Id, 101));
+        var notes = drop.ToWorld.Where(w => w.Opcode == PartyPackets.AS_NOTIFY_ABOUT_SYS_PARTY_WITHDRAWAL).ToList();
+        Hex.True(notes.Count == 1, "/drop before the clear: one AS_NOTIFY_ABOUT_SYS_PARTY_WITHDRAWAL");
+        Hex.Eq(notes[0].Payload, "f0 0a 00 00 65 00 00 00", "[planet 2800][userDbId 101] - FUN_140982610's two ints");
+        Hex.True(drop.ToWorld.FindIndex(w => w.Opcode == PartyPackets.AS_DO_REMOVE_PARTY_MEMBER)
+                 < drop.ToWorld.FindIndex(w => w.Opcode == PartyPackets.AS_NOTIFY_ABOUT_SYS_PARTY_WITHDRAWAL),
+            "after the removal, as the leave job does it");
+
+        var clear = new byte[12];
+        BitConverter.GetBytes(sys.Id).CopyTo(clear, 0);
+        BitConverter.GetBytes(3036).CopyTo(clear, 8);
+        Hex.True(PartyWiring.HandlesWorldFrame(PartyPackets.DSA_NOTIFY_ABOUT_DUNGEON_CLEAR)
+                 && PartyPackets.MinFrameLength(PartyPackets.DSA_NOTIFY_ABOUT_DUNGEON_CLEAR) == 0x12,
+            "0x13F0 reaches the party layer, frame guard 0x12");
+        var c = pm.OnWorldFrame(PartyPackets.DSA_NOTIFY_ABOUT_DUNGEON_CLEAR, clear);
+        Hex.True(c.Rejected == null && c.IsEmpty && !sys.WithdrawalPenalty && sys.DungeonCleared,
+            "the clear disarms the penalty and says nothing to anyone");
+        Hex.True(pm.OnWorldFrame(PartyPackets.DSA_NOTIFY_ABOUT_DUNGEON_CLEAR, new byte[11]).Rejected != null,
+            "a short 0x13F0 is dropped");
+
+        var after = pm.OnWorldFrame(PartyPackets.SA_LEAVE_PARTY, SaLeavePartyPayload(sys.Id, 102));
+        Hex.True(after.Rejected == null && after.ToWorld.All(w => w.Opcode != PartyPackets.AS_NOTIFY_ABOUT_SYS_PARTY_WITHDRAWAL),
+            "leaving after the last boss: no penalty");
+
+        // A normal party and a battleground side never carry it.
+        var pm2 = NewPartyManager();
+        for (uint i = 1; i <= 4; i++) pm2.Register(P(i, 200 + (int)i, "q" + i, cls: 2));
+        var normal = T163NormalParty(pm2, 201, 202);
+        Hex.True(pm2.OnWorldFrame(PartyPackets.SA_LEAVE_PARTY, SaLeavePartyPayload(normal.Id, 202))
+                    .ToWorld.All(w => w.Opcode != PartyPackets.AS_NOTIFY_ABOUT_SYS_PARTY_WITHDRAWAL),
+            "leaving an ordinary party costs nothing");
+        pm2.FormMatchedParty(T138dMembers((203, MatchRole.Dps), (204, MatchRole.Dps)),
+            raid: false, dungeonId: 0, battleFieldId: 37, teamIndex: 1);
+        var bg = pm2.FindByMember(203)!;
+        Hex.True(bg.IsSys && !bg.WithdrawalPenalty, "a battleground side is a system party without the dungeon penalty");
+        var nonsys = new byte[12];
+        BitConverter.GetBytes(normal.Id).CopyTo(nonsys, 0);
+        Hex.True(pm2.OnWorldFrame(PartyPackets.DSA_NOTIFY_ABOUT_DUNGEON_CLEAR, nonsys).IsEmpty,
+            "a clear for a party that is gone or ordinary changes nothing");
+    }
+
+    /// <summary>
+    /// T138d. The matcher hands the formed group to the party layer, after the FINs, with the
+    /// positions it actually SEATED people in - so a Warrior who filled the tank slot reaches
+    /// S_SYS_PARTY_INFO as a tank, exactly as classic_live3 record 10587 has him.
+    /// </summary>
+    [Test] public static void T138d_the_matcher_hands_the_seating_to_the_party_layer()
+    {
+        const int Kelsaik = 9739;
+        MatchQueueManager.Reset();
+        var finned = new List<uint>();
+        MatchQueueManager.FormedGroup? handed = null;
+        MatchWiring.Reset();
+        MatchWiring.Deliver = (q, p) =>
+        {
+            if (BitConverter.ToUInt16(p, 2) == MatchQueueManager.S_FIN_INTER_PARTY_MATCH) finned.Add(q.PlayerId);
+        };
+        MatchWiring.FormParty = (g, _) => { handed = g; return Array.Empty<int>(); };
+        try
+        {
+            T138cQueue(1, Kelsaik, T138cQ(1, 0));     // Warrior  - default DPS, second TANK
+            T138cQueue(2, Kelsaik, T138cQ(2, 6));     // Priest
+            T138cQueue(3, Kelsaik, T138cQ(3, 2));     // Slayer
+            T138cQueue(4, Kelsaik, T138cQ(4, 5));     // Archer
+            T138cQueue(5, Kelsaik, T138cQ(5, 4));     // Sorcerer
+            var g = MatchWiring.TryFormAndFinish(Kelsaik, DateTimeOffset.UnixEpoch.AddHours(4));
+            Hex.True(g != null && handed != null && ReferenceEquals(g, handed),
+                "the group the matcher formed is the group the party layer is handed");
+            Hex.True(finned.Count == 5, "and a party layer that reached nobody leaves every FIN to the fallback");
+
+            Hex.True(g!.Roles.Count == g.Members.Count, "one seated position per member");
+            int tanks = 0, healers = 0;
+            for (int i = 0; i < g.Members.Count; i++)
+            {
+                if (g.Roles[i] == MatchRole.Tank) tanks++;
+                if (g.Roles[i] == MatchRole.Healer) healers++;
+                if (g.Members[i].PlayerId == 1)
+                    Hex.True(g.Roles[i] == MatchRole.Tank
+                             && g.Members[i].Role == MatchRole.Dps,
+                        "the Warrior was SEATED as the tank even though he defaults to DPS");
+            }
+            Hex.True(tanks == 1 && healers == 1,
+                $"1 tank / 1 healer / 3 DPS, as on the wire: {tanks}/{healers}");
+        }
+        finally { MatchWiring.Reset(); }
+    }
+
+    /// <summary>
+    /// T138d. TERASHARP_MATCH_MIN_MEMBERS: with it set, any N bodies are a group and the
+    /// composition is not consulted; with it unset the real rules are back.
+    /// </summary>
+    [Test] public static void T138d_the_min_members_knob_ignores_composition()
+    {
+        const int Kelsaik = 9739, Skyring = 37;
+        var now = DateTimeOffset.UnixEpoch.AddHours(5);
+        T157TestSheet();   // T157: Skyring's size comes from the sheet
+        Hex.True(MatchQueueManager.MinMembersOverride() == 0, "unset by default");
+
+        // Two priests are not a party under the real rules.
+        MatchQueueManager.Reset();
+        T138cQueue(1, Kelsaik, T138cQ(1, 6));
+        T138cQueue(2, Kelsaik, T138cQ(2, 6));
+        Hex.True(MatchQueueManager.TryForm(Kelsaik, now) == null,
+            "no tank and no DPS, so no group");
+
+        Environment.SetEnvironmentVariable(MatchQueueManager.MinMembersVariable, "2");
+        try
+        {
+            Hex.True(MatchQueueManager.MinMembersOverride() == 2, "the knob is read fresh");
+            var g = MatchQueueManager.TryForm(Kelsaik, now);
+            Hex.True(g != null && g.Members.Count == 2 && g.Roles.Count == 2,
+                $"with the knob, two bodies are a group: {g?.Members.Count}");
+            foreach (var r in g!.Roles)
+                Hex.True(r == MatchRole.Healer,
+                    "and their DEFAULT position is still what the roster reports");
+
+            // Battlegrounds too: four queuers make two teams of two, and Skyring's one-healer
+            // and one-lancer rules are not consulted.
+            MatchQueueManager.Reset();
+            Environment.SetEnvironmentVariable(MatchQueueManager.MinMembersVariable, "4");
+            for (uint i = 1; i <= 4; i++) T138cQueue(i, Skyring, T138cQ(i, 6));
+            var bg = MatchQueueManager.TryForm(Skyring, now, new T138cAlternating());
+            Hex.True(bg != null && bg.TeamA.Count == 2 && bg.TeamB.Count == 2,
+                $"two teams of two: {bg?.TeamA.Count}/{bg?.TeamB.Count}");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(MatchQueueManager.MinMembersVariable, null);
+            MatchQueueManager.Reset();
+        }
+
+        // And with it unset the composition is back in force.
+        MatchQueueManager.Reset();
+        for (uint i = 1; i <= 4; i++) T138cQueue(i, Skyring, T138cQ(i, 6));
+        Hex.True(MatchQueueManager.TryForm(Skyring, now, new T138cAlternating()) == null,
+            "four priests are not a Skyring match once the knob is gone");
+        MatchQueueManager.Reset();
+    }
+
+    /// <summary>
+    /// T138d. The PvP board is a rating ladder: it is empty until somebody finishes a
+    /// battleground, it orders by bg_rating, and the frame's rating field is that same number.
+    /// </summary>
+    [Test] public static void T138d_the_pvp_board_is_a_rating_ladder()
+    {
+        using var store = StoreWithTwoAccounts();
+        Hex.True(store.GetPvpRankingScores().Count == 0,
+            "nobody has finished a battleground, so the ladder has no standings");
+
+        store.AddGameLog(GameLogPackets.CategoryPvp, "pvp.kill", 0, 2, 1, 0, 0, 0, 0, null, 1000);
+        Hex.True(store.GetPvpRankingScores().Count == 0,
+            "and a kill does not put anybody on it - T119's kill board is not this board");
+        Hex.True(store.GetPvpKillScores().Count == 1 && store.GetPvpKillScores()[0].Score == 1,
+            "the kill counts are still there, they are just not the ladder");
+
+        store.SetBgRating(1, 15);
+        store.SetBgRating(2, 40);
+        var scores = store.GetPvpRankingScores();
+        Hex.True(scores.Count == 2 && scores[0].CharacterId == 2 && scores[0].Score == 40
+                 && scores[1].CharacterId == 1 && scores[1].Score == 15,
+            "ordered by rating, highest first");
+        Hex.True(scores[0].Rating == 40 && scores[1].Rating == 15,
+            "and the score and the rating are the same number now");
+
+        var rows = RankingBoards.Rank(scores, RankingBoards.AllClasses);
+        Hex.True(rows.Count == 2 && rows[0].Rank == 1 && rows[1].Rank == 2,
+            "ranked 1 and 2");
+        int at = RankingBoards.HeaderSize + RankingBoards.ListHeadSize;
+        var frame = RankingBoards.BuildPvpRankingList(rows);
+        Hex.True(BitConverter.ToInt32(frame, at + RankingBoards.PvpRatingOffset) == 40
+                 && BitConverter.ToInt32(frame, at + RankingBoards.PvpRankOffset) == 1,
+            "the top row is rank 1 with a rating of 40");
+
+        store.SetBgRating(2, 0);
+        Hex.True(store.GetPvpRankingScores().Count == 1,
+            "a rating back at the floor leaves the ladder");
+    }
+
+
+    /// <summary>
+    /// T142. THE LEVEL WEDGE. SDB_SET_TASK_SHOW_TOGGLE (0x2734) arrives once, at the end of the
+    /// quest burst a level jump kicks off (arbiter-2026-09-20.log 14:31:11 - the last W-&gt;A
+    /// frame of that burst). It was in no table, so it fell through to the replay and got
+    /// nothing, World's per-user DB queue stalled, and every later command for that character
+    /// no-opped: "perfect_level applies the LEVEL but the gear grant does not land".
+    /// Byte-exact against cap_social4.log records 3195-&gt;3196 and 3233-&gt;3234.
+    /// </summary>
+    [Test] public static void T142_set_task_show_toggle_is_answered_byte_exact()
+    {
+        // Record 3195: [u32 reqId][i32 1][i32 taskId][u8 toggle=0][i32 0]
+        var off = Hex.B("A2 03 00 00  01 00 00 00  01 00 00 00  00  00 00 00 00");
+        var frames = RunHandler(DbProxyHandlers.SDB_SET_TASK_SHOW_TOGGLE, off, 1);
+        Hex.True(frames.Count == 1 && frames[0].op == DbProxyHandlers.DBS_SET_TASK_SHOW_TOGGLE,
+            $"one frame, 0x2735: {frames.Count} frame(s)");
+        Hex.Eq(frames[0].body, "A2 03 00 00 01 00 00 00 01 00 00 00 01",
+            "record 3196: the request's first twelve bytes and the ok flag");
+
+        // Record 3233 carries toggle = 1 and is answered with the SAME 01. The last byte is an
+        // ok flag, not the toggle echoed - the decompile alone would have had us echo it.
+        var on = Hex.B("B5 03 00 00  01 00 00 00  F4 03 00 00  01  00 00 00 00");
+        Hex.Eq(RunHandler(DbProxyHandlers.SDB_SET_TASK_SHOW_TOGGLE, on, 1)[0].body,
+            "B5 03 00 00 01 00 00 00 F4 03 00 00 01",
+            "record 3234: 01 whatever the toggle was");
+
+        // A short frame is still answered. An unanswered DB request is the wedge itself, so
+        // there is no input for which this handler may stay silent.
+        var stub = RunHandler(DbProxyHandlers.SDB_SET_TASK_SHOW_TOGGLE, Hex.B("07 00 00 00"), 1);
+        Hex.True(stub[0].body.Length == DbProxyHandlers.SetTaskShowToggleReplySize
+                 && stub[0].body[12] == 1,
+            "13 bytes and the ok flag even when the request is truncated");
+    }
+
+
+    /// <summary>
+    /// T142b. THE GEAR-GRANT WEDGE. SDB_ITEM_SINGLE (0x2768) must be answered with
+    /// DBS_ITEM_SINGLE (0x2769) or World's per-user DB queue head-blocks and every later grant
+    /// no-ops. arbiter-2026-09-20.log carries one 0x2768 at 14:31:00 and NOT ONE 0x2769 all day.
+    /// cap_social4.log answers all nineteen; records 434-&gt;435 and 658-&gt;659 are the two whose
+    /// reply is pure header (no atoms, so no item-id allocation) and therefore deterministic.
+    ///
+    /// <para>The reply is the request minus three bytes: the frame-relative offset at [0] becomes
+    /// the reply's own 21-byte header, the offset at [8] drops by 3 with the frame, the reqId at
+    /// [16] is echoed, and the request's i32 at [20] becomes a single ok byte.</para>
+    /// </summary>
+    [Test] public static void T142b_item_single_is_acked_byte_exact()
+    {
+        using var store = StoreWithTwoAccounts();
+
+        // cap_social4.log record 434 -> 435.
+        var r434 = Hex.B("1E 00 00 00  00 00 00 00  1E 00 00 00  00 00 00 00  43 00 00 00  01 00 00 00");
+        var f = RunHandler(DbProxyHandlers.SDB_SAVE_2768, r434, 1, store);
+        Hex.True(f.Count == 1 && f[0].op == DbProxyHandlers.DBS_SAVE_2769,
+            $"one frame, 0x2769: {f.Count} frame(s)");
+        Hex.Eq(f[0].body, "1B 00 00 00 00 00 00 00 1B 00 00 00 00 00 00 00 43 00 00 00 01",
+            "record 435");
+
+        // Record 658 -> 659: a different reqId, and the request's trailing 0x3EA is dropped for
+        // the ok byte rather than echoed.
+        var r658 = Hex.B("1E 00 00 00  00 00 00 00  1E 00 00 00  00 00 00 00  89 00 00 00  EA 03 00 00");
+        Hex.Eq(RunHandler(DbProxyHandlers.SDB_SAVE_2768, r658, 1, store)[0].body,
+            "1B 00 00 00 00 00 00 00 1B 00 00 00 00 00 00 00 89 00 00 00 01",
+            "record 659 - the ok byte replaces the request's last int32, it is not echoed");
+    }
+
+    /// <summary>cap_social4.log record 2935: SDB_SET_QUESTLIST_INFO, player 1, reqId 0x1F3, four quests.</summary>
+    static readonly byte[] T145QuestList2935 = Hex.B(
+              "27 00 00 00 40 01 00 00 67 01 00 00 00 00 00 00 "
+            + "67 01 00 00 00 00 00 00 F3 01 00 00 01 00 00 00 "
+            + "01 00 00 00 00 7F CD 0E 00 01 00 00 00 01 00 00 "
+            + "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+            + "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+            + "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+            + "00 00 00 00 00 00 00 00 00 00 00 00 00 FF FF FF "
+            + "FF 00 00 00 00 80 CD 0E 00 01 00 00 00 01 00 00 "
+            + "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+            + "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+            + "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+            + "00 00 00 00 00 00 00 00 00 00 00 00 00 FF FF FF "
+            + "FF 00 00 00 00 CD 01 0F 00 01 00 00 00 01 00 00 "
+            + "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+            + "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+            + "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+            + "00 00 00 00 00 00 00 00 00 00 00 00 00 FF FF FF "
+            + "FF 00 00 00 00 3F 42 0F 00 01 00 00 00 01 00 00 "
+            + "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+            + "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+            + "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+            + "00 00 00 00 00 00 00 00 00 00 00 00 00 FF FF FF "
+            + "FF");
+
+    /// <summary>
+    /// T145. THE LOGIN WEDGE. cap_bag.log record 314: SDB_SET_QUESTLIST_INFO (0x2732) for
+    /// character `test`, never answered - the last SDB_ frame for it in the capture, so its
+    /// hold-status load, its nine skill-learn writes and its bind/equip writes all queued
+    /// behind it inside World. Pinned to the real Arbiter's three answers in cap_social4.log;
+    /// then the handler stores the quests and answers, and SDB_EQUIP_ITEM gets the 0x2769 shape.
+    /// </summary>
+    [Test] public static void T145_quest_list_and_equip_are_answered()
+    {
+        // 2935 -> 2936, with the real Arbiter's ids 0x3F5..0x3F8 handed out in record order.
+        int next = 0x3F5;
+        Hex.Eq(DbProxyHandlers.BuildDbs2733(T145QuestList2935, (_, _) => next++),
+            "24 00 00 00 20 00 00 00 44 00 00 00 00 00 00 00 44 00 00 00 00 00 00 00 F3 01 00 00 01 01 "
+            + "7F CD 0E 00 F5 03 00 00 80 CD 0E 00 F6 03 00 00 CD 01 0F 00 F7 03 00 00 3F 42 0F 00 F8 03 00 00",
+            "cap_social4 2936: offsets, reqId, ok, apply, then (questId, questDbId) x4");
+
+        // 7843 -> 7844: player 1003, two quests, header only differs where the counts do.
+        var r7843 = new byte[193];
+        Hex.B("27 00 00 00 A0 00 00 00 C7 00 00 00 00 00 00 00 C7 00 00 00 00 00 00 00 97 05 00 00 EB 03 00 00 01")
+            .CopyTo(r7843, 0);
+        Hex.B("1E 35 0C 00 01 00 00 00 01").CopyTo(r7843, 37);
+        Hex.B("32 35 0C 00 01 00 00 00 01").CopyTo(r7843, 117);
+        next = 0x404;
+        Hex.Eq(DbProxyHandlers.BuildDbs2733(r7843, (_, _) => next++),
+            "24 00 00 00 10 00 00 00 34 00 00 00 00 00 00 00 34 00 00 00 00 00 00 00 97 05 00 00 01 01 "
+            + "1E 35 0C 00 04 04 00 00 32 35 0C 00 05 04 00 00",
+            "cap_social4 7844");
+
+        // The handler: one 0x2733, the quests stored, and the same ids on a repeat.
+        using var store = StoreWithTwoAccounts();
+        var first = RunHandler(DbProxyHandlers.SDB_SET_QUESTLIST_INFO, T145QuestList2935, 1, store);
+        Hex.True(first.Count == 1 && first[0].op == DbProxyHandlers.DBS_SET_QUESTLIST_INFO
+                 && first[0].body.Length == 30 + 4 * 8 && first[0].body[28] == 1 && first[0].body[29] == 1,
+            "one 0x2733 with four pairs, ok and apply set");
+        var ids = Enumerable.Range(0, 4).Select(i => BitConverter.ToInt32(first[0].body, 34 + i * 8)).ToArray();
+        Hex.True(ids.All(id => id > 0) && ids.Distinct().Count() == 4, "four distinct stored row ids");
+        var again = RunHandler(DbProxyHandlers.SDB_SET_QUESTLIST_INFO, T145QuestList2935, 1, store);
+        Hex.True(Hex.S(again[0].body) == Hex.S(first[0].body), "a repeat hands back the same rows");
+        Hex.True(RunHandler(DbProxyHandlers.SDB_SET_QUESTLIST_INFO, Hex.B("01 02"), 1, store)[0].body.Length == 30,
+            "a truncated request is still answered - silence is the wedge");
+
+        // SDB_EQUIP_ITEM: no tap has one, but World reads DBS_EQUIP_ITEM exactly as it reads
+        // DBS_ITEM_SINGLE, and writes the request with the same template. Record 434's shape.
+        var eq = RunHandler(DbProxyHandlers.SDB_EQUIP_ITEM,
+            Hex.B("1E 00 00 00  00 00 00 00  1E 00 00 00  00 00 00 00  43 00 00 00  01 00 00 00"), 1, store);
+        Hex.True(eq.Count == 1 && eq[0].op == DbProxyHandlers.DBS_EQUIP_ITEM, "one 0x2814");
+        Hex.Eq(eq[0].body, "1B 00 00 00 00 00 00 00 1B 00 00 00 00 00 00 00 43 00 00 00 01",
+            "frame 0x1B: lists at +6/+0xE, reqId +0x16, ok +0x1A - Handler_DBS_EQUIP_ITEM's reads");
+    }
+
+    /// <summary>
+    /// T142b. An empty bag is never written over a bag that has something in it. Every way this
+    /// has gone wrong looked the same - a caller that could not resolve the owner handing the
+    /// store nothing - so the store itself refuses, and clearing a bag needs saying so.
+    /// </summary>
+    [Test] public static void T142b_replace_inventory_never_empties_a_bag()
+    {
+        using var store = StoreWithTwoAccounts();
+        var rows = new List<TeraSharp.Arbiter.Persistence.CharacterStore.ItemRow>
+        {
+            new(101, 1, 0, 0, 88, 1, new byte[8]),
+            new(102, 1, 0, 1, 89, 3, new byte[8]),
+        };
+        store.ReplaceInventory(1, rows);
+        Hex.True(store.CountInventoryItems(1) == 2, "two rows in");
+
+        store.ReplaceInventory(1, new List<TeraSharp.Arbiter.Persistence.CharacterStore.ItemRow>());
+        Hex.True(store.CountInventoryItems(1) == 2,
+            "an empty replace over a non-empty bag is REFUSED, not obeyed");
+
+        store.ReplaceInventory(1, new List<TeraSharp.Arbiter.Persistence.CharacterStore.ItemRow>(),
+            allowEmpty: true);
+        Hex.True(store.CountInventoryItems(1) == 0, "and clearing it on purpose still works");
+
+        // The guard never blocks a real replace, and never blocks an empty one on an empty bag.
+        store.ReplaceInventory(1, rows);
+        Hex.True(store.CountInventoryItems(1) == 2, "a non-empty replace is untouched by the guard");
+        store.ReplaceInventory(2, new List<TeraSharp.Arbiter.Persistence.CharacterStore.ItemRow>());
+        Hex.True(store.CountInventoryItems(2) == 0, "and an empty bag stays empty without a fuss");
+    }
+
+    // =======================================================================================
+    // T147 - crafting (status/CRAFTING.md). S_ARTISAN_SKILL_LIST / S_ARTISAN_RECIPE_LIST are
+    // World-built; the Arbiter owns the learned recipes and proficiencies behind them and the
+    // six crafting writes, which had no answer before T147 and head-blocked the DB queue.
+    // =======================================================================================
+
+    /// <summary>The empty loads through the live, per-character handler: byte-exact against
+    /// cap_social4.log records 260-&gt;261 and 262-&gt;263 (character 1, no rows).</summary>
+    [Test] public static void T147_the_empty_artisan_loads_are_byte_exact()
+    {
+        using var store = GuildStore(1);
+        var (op, body) = RunHandler1(DbProxyHandlers.SDB_LOAD_ITEM_RECIPE, Hex.B("05 00 00 00 01 00 00 00"), store);
+        Hex.True(op == DbProxyHandlers.DBS_LOAD_ITEM_RECIPE, $"0x{op:X4}");
+        Hex.Eq(body, "13 00 00 00 00 00 00 00 05 00 00 00 01", "record 261");
+
+        (op, body) = RunHandler1(DbProxyHandlers.SDB_LOAD_SKILL_PROF, Hex.B("06 00 00 00 01 00 00 00"), store);
+        Hex.True(op == DbProxyHandlers.DBS_LOAD_SKILL_PROF, $"0x{op:X4}");
+        Hex.Eq(body, "13 00 00 00 00 00 00 00 06 00 00 00 01", "record 263");
+
+        foreach (ushort w in new[] { DbProxyHandlers.SDB_LOAD_ITEM_RECIPE, DbProxyHandlers.SDB_LOAD_SKILL_PROF,
+                                     DbProxyHandlers.SDB_LEARN_ITEM_RECIPE, DbProxyHandlers.SDB_DELETE_ITEM_RECIPE_LIST,
+                                     DbProxyHandlers.SDB_SET_RECIPE_BOOKMARK, DbProxyHandlers.SDB_ITEM_PRODUCE_STEP1,
+                                     DbProxyHandlers.SDB_ITEM_PRODUCE_STEP2, DbProxyHandlers.SDB_UPDATE_SKILL_PROF })
+            Hex.True(DbProxyHandlers.IsHandledRequest(w), $"0x{w:X4} must be allow-listed");
+    }
+
+    static byte[] T147Learn(uint dlm, int owner, int recipe, bool extract)
+    {
+        var p = new byte[ArtisanDb.LearnRequestSize];
+        BitConverter.GetBytes((uint)(6 + ArtisanDb.LearnRequestSize)).CopyTo(p, ArtisanDb.LearnReqBinaryRef);
+        BitConverter.GetBytes(dlm).CopyTo(p, ArtisanDb.LearnReqDlmId);
+        BitConverter.GetBytes(owner).CopyTo(p, ArtisanDb.LearnReqOwner);
+        BitConverter.GetBytes(recipe).CopyTo(p, ArtisanDb.LearnReqRecipeId);
+        p[ArtisanDb.LearnReqExtract] = (byte)(extract ? 1 : 0);
+        return p;
+    }
+
+    static byte[] T147Four(params int[] v)
+    {
+        var p = new byte[4 * v.Length];
+        for (int i = 0; i < v.Length; i++) BitConverter.GetBytes(v[i]).CopyTo(p, 4 * i);
+        return p;
+    }
+
+    /// <summary>Learn, bookmark and proficiency writes are answered and read back by the loads
+    /// in the 28-byte / 8-byte record formats World's parser expects.</summary>
+    [Test] public static void T147_learned_recipes_and_proficiencies_load_back()
+    {
+        using var store = GuildStore(2);
+        long before = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+
+        var (op, body) = RunHandler1(DbProxyHandlers.SDB_LEARN_ITEM_RECIPE, T147Learn(0x10, 1, 1001, true), store);
+        Hex.True(op == DbProxyHandlers.DBS_LEARN_ITEM_RECIPE, $"0x{op:X4}");
+        Hex.Eq(body, "13 00 00 00 00 00 00 00 10 00 00 00 01", "no atoms: ref 0x13, 0 bytes, DlmId, Success");
+        RunHandler1(DbProxyHandlers.SDB_LEARN_ITEM_RECIPE, T147Learn(0x11, 1, 1001, false), store);
+        Hex.True(store.GetItemRecipes(1).Count == 1, "learning a known recipe again adds no second row");
+
+        Hex.Eq(RunHandler1(DbProxyHandlers.SDB_SET_RECIPE_BOOKMARK,
+                   Hex.B("12 00 00 00 01 00 00 00 E9 03 00 00 01"), store).body,
+               "12 00 00 00 01", "DBS_SET_RECIPE_BOOKMARK: DlmId then Success");
+
+        (op, body) = RunHandler1(DbProxyHandlers.SDB_LOAD_ITEM_RECIPE, Hex.B("13 00 00 00 01 00 00 00"), store);
+        Hex.True(body.Length == 13 + ArtisanDb.RecipeInfoSize, $"one 28-byte RecipeInfo: {body.Length}");
+        Hex.Eq(body[..13], "13 00 00 00 1C 00 00 00 13 00 00 00 01", "ref 0x13, 28 bytes, DlmId, Success");
+        var rec = body[13..];
+        Hex.True(BitConverter.ToInt32(rec, ArtisanDb.RecipeIdOffset) == 1001
+                 && rec[ArtisanDb.RecipeExtractOffset] == 1 && rec[ArtisanDb.RecipeBookmarkOffset] == 1,
+            "recipe 1001, extract from the first learn, bookmark set");
+        long learned = store.GetItemRecipes(1)[0].LearnedAtUnix;
+        Hex.True(learned >= before, "the learn is stamped with the current time");
+        Hex.Eq(rec[ArtisanDb.RecipeLearnedAtOffset..(ArtisanDb.RecipeLearnedAtOffset + 16)],
+            DbProxyHandlers.EncodeDbDateTime(DateTimeOffset.FromUnixTimeSeconds(learned).UtcDateTime),
+            "+8 is the 16-byte ODBC TIMESTAMP of that time");
+        Hex.True(RunHandler1(DbProxyHandlers.SDB_LOAD_ITEM_RECIPE, Hex.B("14 00 00 00 02 00 00 00"), store).body.Length == 13,
+            "character 2 has none of character 1's recipes");
+
+        Hex.Eq(RunHandler1(DbProxyHandlers.SDB_UPDATE_SKILL_PROF, T147Four(0x15, 1, 3, 150), store).body,
+               "15 00 00 00 01", "DBS_UPDATE_SKILL_PROF: DlmId then Success");
+        RunHandler1(DbProxyHandlers.SDB_UPDATE_SKILL_PROF, T147Four(0x16, 1, 3, 120), store);
+        Hex.Eq(RunHandler1(DbProxyHandlers.SDB_LOAD_SKILL_PROF, Hex.B("17 00 00 00 01 00 00 00"), store).body,
+               "13 00 00 00 08 00 00 00 17 00 00 00 01 03 00 00 00 78 00 00 00",
+               "one 8-byte record, and the value is SET (120), not accumulated");
+
+        store.LearnItemRecipe(2, 7, false, before);
+        store.SetSkillProf(2, 3, 5);
+        var acct = store.GetCharacter(2)!.AccountId;
+        Hex.True(store.DeleteCharacter(2, acct), "character 2 deletes");
+        Hex.True(store.GetItemRecipes(2).Count == 0 && store.GetSkillProfs(2).Count == 0,
+            "and takes its recipes and proficiencies with it, so a reused id starts clean");
+    }
+
+    /// <summary>SDB_DELETE_ITEM_RECIPE_LIST: a byte-counted u32 array behind a frame-relative
+    /// ref. The one reply with Success first. An empty list answers false, as the real
+    /// handler's flag starts false.</summary>
+    [Test] public static void T147_delete_recipe_list_reads_a_byte_counted_id_array()
+    {
+        using var store = GuildStore(1);
+        store.LearnItemRecipe(1, 1001, false, 0);
+        store.LearnItemRecipe(1, 1002, false, 0);
+        store.LearnItemRecipe(1, 1003, false, 0);
+
+        var req = T147Four(6 + 16, 8, 0x20, 1, 1001, 1003);
+        var (op, body) = RunHandler1(DbProxyHandlers.SDB_DELETE_ITEM_RECIPE_LIST, req, store);
+        Hex.True(op == DbProxyHandlers.DBS_DELETE_ITEM_RECIPE_LIST, $"0x{op:X4}");
+        Hex.Eq(body, "01 20 00 00 00", "Success, then DlmId");
+        var left = store.GetItemRecipes(1);
+        Hex.True(left.Count == 1 && left[0].RecipeId == 1002, "1001 and 1003 are gone, 1002 stays");
+
+        Hex.Eq(RunHandler1(DbProxyHandlers.SDB_DELETE_ITEM_RECIPE_LIST, T147Four(6 + 16, 0, 0x21, 1), store).body,
+               "00 21 00 00 00", "an empty list is answered, with Success 0");
+
+        // Unsigned bounds: every malformed ref yields no ids rather than a read outside the payload.
+        Hex.True(ArtisanDb.ParseDeleteRecipeIds(T147Four(6, 4, 1, 1, 9)).Count == 0, "a ref into the header");
+        Hex.True(ArtisanDb.ParseDeleteRecipeIds(T147Four(22, 6, 1, 1, 9, 9)).Count == 0, "a count that is not whole ids");
+        Hex.True(ArtisanDb.ParseDeleteRecipeIds(T147Four(22, 8, 1, 1, 9)).Count == 0, "a count past the end");
+        Hex.True(ArtisanDb.ParseDeleteRecipeIds(T147Four(-1, 4, 1, 1, 9)).Count == 0, "offset 0xFFFFFFFF");
+        Hex.True(ArtisanDb.ParseDeleteRecipeIds(T147Four(22, -4, 1, 1, 9)).Count == 0, "count 0xFFFFFFFC");
+        Hex.True(ArtisanDb.ParseDeleteRecipeIds(T147Four(22, 4, 1, 1, 9)).SequenceEqual(new[] { 9 }), "and a good one reads");
+    }
+
+    /// <summary>SDB_ITEM_PRODUCE_STEP2, the craft: atoms echoed with a fresh item id and applied,
+    /// then the proficiency set when the value is above zero.</summary>
+    [Test] public static void T147_produce_step2_echoes_its_atoms_and_sets_the_proficiency()
+    {
+        using var store = GuildStore(1);
+        int head = ArtisanDb.Step2RequestSize, atom = DbProxyHandlers.ItemAtomSize;
+        var req = new byte[head + atom];
+        BitConverter.GetBytes((uint)(6 + head)).CopyTo(req, ArtisanDb.Step2ReqBinaryRef);
+        BitConverter.GetBytes((uint)atom).CopyTo(req, ArtisanDb.Step2ReqBinaryRef + 4);
+        BitConverter.GetBytes((uint)(6 + head + atom)).CopyTo(req, ArtisanDb.Step2ReqEnchantRef);
+        T147Four(0x30, 1, 3, 42).CopyTo(req, ArtisanDb.Step2ReqDlmId);
+        BrokerAtom(0, WarehouseHandlers.TsInsertItem, 0, 201612, 1, 0, 0, 0, 1, BagItems.Pocket, 37).CopyTo(req, head);
+
+        var (op, body) = RunHandler1(DbProxyHandlers.SDB_ITEM_PRODUCE_STEP2, req, store);
+        Hex.True(op == DbProxyHandlers.DBS_ITEM_PRODUCE_STEP2, $"0x{op:X4}");
+        Hex.Eq(body[..13], "13 00 00 00 58 03 00 00 30 00 00 00 01", "ref 0x13, one atom, DlmId, Success");
+        Hex.True(body.Length == 13 + atom, $"the atom is echoed: {body.Length}");
+        int id = BitConverter.ToInt32(body, 13 + WarehouseHandlers.AtomItemDbId);
+        var row = store.FindItemAt(1, BagItems.Pocket, 37);
+        Hex.True(id != 0 && row is not null && row.ItemDbId == id,
+            $"the product is inserted under the id World is handed: echoed {id}, row {row?.ItemDbId}");
+        var prof = store.GetSkillProfs(1);
+        Hex.True(prof.Count == 1 && prof[0].SkillProfId == 3 && prof[0].Value == 42, "proficiency 3 = 42");
+
+        var noProf = (byte[])req.Clone();
+        T147Four(0x31, 1, 4, 0).CopyTo(noProf, ArtisanDb.Step2ReqDlmId);
+        new byte[atom].CopyTo(noProf, head);
+        BitConverter.GetBytes(0u).CopyTo(noProf, ArtisanDb.Step2ReqBinaryRef + 4);
+        Hex.Eq(RunHandler1(DbProxyHandlers.SDB_ITEM_PRODUCE_STEP2, noProf, store).body[..13],
+               "13 00 00 00 00 00 00 00 31 00 00 00 01", "no atoms, still Success");
+        Hex.True(store.GetSkillProfs(1).Count == 1, "a value of 0 leaves the proficiencies alone");
+    }
+
+    /// <summary>SDB_ITEM_PRODUCE_STEP1 is the production-point charge: the real handler runs the
+    /// same FatigabilityController call as SDB_UPDATE_FATIGABILITY_POINT, on the account.</summary>
+    [Test] public static void T147_produce_step1_charges_the_account_fatigability()
+    {
+        using var store = GuildStore(1);
+        long acct = store.GetCharacter(1)!.AccountId;
+        int was = store.GetFatigability(acct).CurPoint;
+        var (op, body) = RunHandler1(DbProxyHandlers.SDB_ITEM_PRODUCE_STEP1, T147Four(0x40, 1, 1, 5), store);
+        Hex.True(op == DbProxyHandlers.DBS_ITEM_PRODUCE_STEP1, $"0x{op:X4}");
+        Hex.Eq(body, "40 00 00 00 01", "DlmId then Success");
+        Hex.True(store.GetFatigability(acct).CurPoint == was + 5, "the delta lands on the account row");
+    }
+
+    /// <summary>No input may go unanswered: a truncated request still gets its reply opcode.</summary>
+    [Test] public static void T147_short_crafting_requests_are_still_answered()
+    {
+        using var store = GuildStore(1);
+        var pairs = new (ushort Req, ushort Rep)[]
+        {
+            (DbProxyHandlers.SDB_LOAD_ITEM_RECIPE, DbProxyHandlers.DBS_LOAD_ITEM_RECIPE),
+            (DbProxyHandlers.SDB_LOAD_SKILL_PROF, DbProxyHandlers.DBS_LOAD_SKILL_PROF),
+            (DbProxyHandlers.SDB_LEARN_ITEM_RECIPE, DbProxyHandlers.DBS_LEARN_ITEM_RECIPE),
+            (DbProxyHandlers.SDB_DELETE_ITEM_RECIPE_LIST, DbProxyHandlers.DBS_DELETE_ITEM_RECIPE_LIST),
+            (DbProxyHandlers.SDB_SET_RECIPE_BOOKMARK, DbProxyHandlers.DBS_SET_RECIPE_BOOKMARK),
+            (DbProxyHandlers.SDB_ITEM_PRODUCE_STEP1, DbProxyHandlers.DBS_ITEM_PRODUCE_STEP1),
+            (DbProxyHandlers.SDB_ITEM_PRODUCE_STEP2, DbProxyHandlers.DBS_ITEM_PRODUCE_STEP2),
+            (DbProxyHandlers.SDB_UPDATE_SKILL_PROF, DbProxyHandlers.DBS_UPDATE_SKILL_PROF),
+            (DbProxyHandlers.S_UPDATE_PROF_MINERAL, DbProxyHandlers.D_UPDATE_PROF_RESULT),
+            (DbProxyHandlers.S_UPDATE_PROF_HERB, DbProxyHandlers.D_UPDATE_PROF_RESULT),
+        };
+        foreach (var (req, rep) in pairs)
+        {
+            var frames = RunHandler(req, Hex.B("50 00 00 00"), 1, store);
+            Hex.True(frames[0].op == rep, $"0x{req:X4} must answer 0x{rep:X4}, got 0x{frames[0].op:X4}");
+        }
+        Hex.True(ArtisanDb.ParseLearn(new byte[20]) is null && ArtisanDb.ParseStep2(new byte[31]) is null
+                 && ArtisanDb.ParseBookmark(new byte[12]) is null && ArtisanDb.ParseLoad(new byte[7]) is null,
+            "the parsers refuse one byte short of their header");
+    }
+
+    static byte[] T147EnterWorld(uint replyId, int playerId)
+    {
+        var p = new byte[18];
+        BitConverter.GetBytes(replyId).CopyTo(p, 4);    // frame +10
+        BitConverter.GetBytes(playerId).CopyTo(p, 8);   // frame +14
+        return p;
+    }
+
+    /// <summary>Gathering: S_UPDATE_PROF_MINERAL..HERB are answered with D_UPDATE_PROF_RESULT,
+    /// stored, and stamped into the enter-world blob at UserData +0x1C8 + 4*kind - where the
+    /// real Arbiter binds its profMineral..profHerb columns (Arb_part_032.c:17830-17833).</summary>
+    [Test] public static void T147_gathering_profs_are_answered_and_come_back_in_the_blob()
+    {
+        using var store = GuildStore(1);
+        var (op, body) = RunHandler1(DbProxyHandlers.S_UPDATE_PROF_BUG, T147Four(0x60, 1, 12), store);
+        Hex.True(op == DbProxyHandlers.D_UPDATE_PROF_RESULT, $"0x{op:X4}");
+        Hex.Eq(body, "60 00 00 00 01", "DlmId then Success");
+        RunHandler1(DbProxyHandlers.S_UPDATE_PROF_HERB, T147Four(0x61, 1, 30), store);
+        RunHandler1(DbProxyHandlers.S_UPDATE_PROF_HERB, T147Four(0x62, 1, 31), store);
+        var profs = store.GetGatheringProfs(1);
+        Hex.True(profs.Count == 2 && profs[1] == 12 && profs[3] == 31, "bug 12, herb 31 - set, not added");
+
+        var blob = new byte[DbProxyHandlers.WorldBlobSize];
+        blob[ArtisanDb.GatheringProfBlobOffset] = 0xAA;                  // mineral: never written
+        store.SaveWorldBlob(1, blob);
+        var frames = RunHandler(DbProxyHandlers.SDB_USER_ENTERWORLD, T147EnterWorld(0x63, 1), 2, store);
+        Hex.True(frames[0].op == DbProxyHandlers.DBS_USER_ENTERWORLD, $"0x{frames[0].op:X4}");
+        int at = frames[0].body.Length - DbProxyHandlers.WorldBlobSize + ArtisanDb.GatheringProfBlobOffset;
+        Hex.Eq(frames[0].body[at..(at + 16)], "AA 00 00 00 0C 00 00 00 00 00 00 00 1F 00 00 00",
+            "mineral as saved, bug 12, energy as saved, herb 31");
+
+        Hex.True(ArtisanDb.StampGatheringProfs(new byte[ArtisanDb.GatheringProfBlobOffset + 15], profs) == 0,
+            "a blob too short for the four fields is left alone");
+        Hex.True(ArtisanDb.GatheringKindOf(0x273C) == -1 && ArtisanDb.GatheringKindOf(0x2741) == -1
+                 && ArtisanDb.GatheringKindOf(DbProxyHandlers.S_UPDATE_PROF_MINERAL) == 0
+                 && ArtisanDb.GatheringKindOf(DbProxyHandlers.S_UPDATE_PROF_HERB) == 3, "kind = op - 0x273D");
+    }
+
+    // =======================================================================================
+    // T147b - crafting and gathering against classic_craft.log, live Classic+ (a character that
+    // crafts and gathers). The client packets are World-built, so what these pin is (1) the
+    // layout of the two lists, by decode and re-encode, and (2) every field the Arbiter feeds:
+    // the recipe ids, the skill-prof rows, the STEP1 fatigue delta and the gathering writes.
+    // status/CRAFTING.md, the T147b section.
+    // =======================================================================================
+
+    readonly record struct T147bSkill(int Id, int Id2, int Value, int Flag, int State, int U24, int Tier);
+    readonly record struct T147bMat(int Template, int Amount, int U12, byte B16);
+    sealed record T147bRecipe(int RecipeId, int SkillProfId, int U16, int Product, int Amount, int U28,
+                              byte B32, int NeededProf, long Time, byte B45, List<T147bMat> Mats);
+
+    static int T147bI32(byte[] f, int at) => BitConverter.ToInt32(f, at);
+
+    /// <summary>S_ARTISAN_SKILL_LIST: [count@4][off@6][update u8@8], then 32-byte elements.
+    /// Structural: here, next and the frame end all have to line up.</summary>
+    static List<T147bSkill> T147bDecodeSkills(byte[] f)
+    {
+        int count = BitConverter.ToUInt16(f, 4), at = BitConverter.ToUInt16(f, 6);
+        var list = new List<T147bSkill>();
+        for (int i = 0; i < count; i++)
+        {
+            Hex.True(at == 9 + 32 * i && BitConverter.ToUInt16(f, at) == at, $"skill {i}: here should be {9 + 32 * i}, is {at}");
+            list.Add(new T147bSkill(T147bI32(f, at + 4), T147bI32(f, at + 8), T147bI32(f, at + 12), T147bI32(f, at + 16),
+                                    T147bI32(f, at + 20), T147bI32(f, at + 24), T147bI32(f, at + 28)));
+            int next = BitConverter.ToUInt16(f, at + 2);
+            Hex.True(i + 1 < count ? next == at + 32 : next == 0, $"skill {i}: next {next}");
+            at = next;
+        }
+        Hex.True(9 + 32 * count == f.Length, $"the walk must end at the frame end, {9 + 32 * count} vs {f.Length}");
+        return list;
+    }
+
+    static byte[] T147bEncodeSkills(ushort op, byte update, List<T147bSkill> list)
+    {
+        var b = new List<byte>();
+        void U16(int v) { b.Add((byte)v); b.Add((byte)(v >> 8)); }
+        void I32(int v) => b.AddRange(BitConverter.GetBytes(v));
+        U16(0); U16(op); U16(list.Count); U16(list.Count > 0 ? 9 : 0); b.Add(update);
+        for (int i = 0; i < list.Count; i++)
+        {
+            var s = list[i]; int here = b.Count;
+            U16(here); U16(i + 1 < list.Count ? here + 32 : 0);
+            I32(s.Id); I32(s.Id2); I32(s.Value); I32(s.Flag); I32(s.State); I32(s.U24); I32(s.Tier);
+        }
+        var arr = b.ToArray();
+        BitConverter.GetBytes((ushort)arr.Length).CopyTo(arr, 0);
+        return arr;
+    }
+
+    /// <summary>S_ARTISAN_RECIPE_LIST: [count@4][off@6][update u8@8][end-of-list u8@9], then per
+    /// recipe a 46-byte head (here, next, material count, material offset, recipe id@8, skill-prof
+    /// id@12, 0@16, product template@20, amount@24, -1@28, u8@32, needed proficiency u32@33,
+    /// u64@37, u8@45) followed directly by its 17-byte materials (here, next, template@4,
+    /// amount@8, -1@12, u8@16).</summary>
+    static List<T147bRecipe> T147bDecodeRecipes(byte[] f)
+    {
+        int count = BitConverter.ToUInt16(f, 4), at = BitConverter.ToUInt16(f, 6), end = 10;
+        var list = new List<T147bRecipe>();
+        for (int i = 0; i < count; i++)
+        {
+            Hex.True(at == end && BitConverter.ToUInt16(f, at) == at, $"recipe {i}: here should be {end}, is {at}");
+            int matCount = BitConverter.ToUInt16(f, at + 4), matAt = BitConverter.ToUInt16(f, at + 6), m = at + 46;
+            Hex.True(matCount == 0 ? matAt == 0 : matAt == m, $"recipe {i}: materials start right after the 46-byte head");
+            var mats = new List<T147bMat>();
+            for (int k = 0; k < matCount; k++)
+            {
+                Hex.True(BitConverter.ToUInt16(f, m) == m, $"recipe {i} material {k}: here");
+                int mn = BitConverter.ToUInt16(f, m + 2);
+                Hex.True(k + 1 < matCount ? mn == m + 17 : mn == 0, $"recipe {i} material {k}: next {mn}");
+                mats.Add(new T147bMat(T147bI32(f, m + 4), T147bI32(f, m + 8), T147bI32(f, m + 12), f[m + 16]));
+                m += 17;
+            }
+            list.Add(new T147bRecipe(T147bI32(f, at + 8), T147bI32(f, at + 12), T147bI32(f, at + 16), T147bI32(f, at + 20),
+                T147bI32(f, at + 24), T147bI32(f, at + 28), f[at + 32], T147bI32(f, at + 33),
+                BitConverter.ToInt64(f, at + 37), f[at + 45], mats));
+            int next = BitConverter.ToUInt16(f, at + 2);
+            Hex.True(i + 1 < count ? next == m : next == 0, $"recipe {i}: next {next}, materials end at {m}");
+            end = m; at = next;
+        }
+        Hex.True(end == f.Length, $"the walk must end at the frame end, {end} vs {f.Length}");
+        return list;
+    }
+
+    static byte[] T147bEncodeRecipes(ushort op, byte update, byte endOfList, List<T147bRecipe> list)
+    {
+        var b = new List<byte>();
+        void U16(int v) { b.Add((byte)v); b.Add((byte)(v >> 8)); }
+        void I32(int v) => b.AddRange(BitConverter.GetBytes(v));
+        U16(0); U16(op); U16(list.Count); U16(list.Count > 0 ? 10 : 0); b.Add(update); b.Add(endOfList);
+        for (int i = 0; i < list.Count; i++)
+        {
+            var r = list[i]; int here = b.Count, size = 46 + 17 * r.Mats.Count;
+            U16(here); U16(i + 1 < list.Count ? here + size : 0);
+            U16(r.Mats.Count); U16(r.Mats.Count > 0 ? here + 46 : 0);
+            I32(r.RecipeId); I32(r.SkillProfId); I32(r.U16); I32(r.Product); I32(r.Amount); I32(r.U28);
+            b.Add(r.B32); I32(r.NeededProf); b.AddRange(BitConverter.GetBytes(r.Time)); b.Add(r.B45);
+            for (int k = 0; k < r.Mats.Count; k++)
+            {
+                var mt = r.Mats[k]; int mh = b.Count;
+                U16(mh); U16(k + 1 < r.Mats.Count ? mh + 17 : 0);
+                I32(mt.Template); I32(mt.Amount); I32(mt.U12); b.Add(mt.B16);
+            }
+        }
+        var arr = b.ToArray();
+        BitConverter.GetBytes((ushort)arr.Length).CopyTo(arr, 0);
+        return arr;
+    }
+
+    /// <summary>
+    /// Frame 95. The five artisan skills and their proficiencies. Decoded and re-encoded byte
+    /// for byte, and the Arbiter-fed part checked: each element's id (+4, repeated at +8) and
+    /// value (+12) is one DBS_LOAD_SKILL_PROF record [id][value]. World lists all five skills
+    /// whether a row exists or not - an empty load shows every one at 1 (cap_social4_client frame
+    /// 63) - so skill 23's 1 here says nothing about a row.
+    /// </summary>
+    [Test] public static void T147b_live_skill_list_round_trips_and_carries_the_prof_rows()
+    {
+        var f = LoadLiveFrame("S_ARTISAN_SKILL_LIST-95.hex");
+        if (f == null) return;
+        var skills = T147bDecodeSkills(f);
+        Hex.Eq(T147bEncodeSkills(BitConverter.ToUInt16(f, 2), f[8], skills), f, "frame 95 re-encoded");
+        Hex.True(skills.Select(s => s.Id).SequenceEqual(new[] { 6, 21, 22, 23, 24 })
+                 && skills.All(s => s.Id2 == s.Id), "skills 6, 21, 22, 23, 24, the id twice");
+        Hex.True(skills.Select(s => s.Value).SequenceEqual(new[] { 500, 555, 590, 1, 9 }), "proficiency 500 / 555 / 590 / 1 / 9");
+
+        var rows = skills.Select(s => new ArtisanDb.SkillProf(s.Id, s.Value)).ToList();
+        var body = ArtisanDb.BuildDbsLoadSkillProf(0x33, rows);
+        Hex.True(BitConverter.ToInt32(body, 4) == 5 * ArtisanDb.SkillProfSize, "five 8-byte records");
+        for (int i = 0; i < rows.Count; i++)
+        {
+            int at = ArtisanDb.RefReplyHeader + i * ArtisanDb.SkillProfSize;
+            Hex.True(BitConverter.ToInt32(body, at + ArtisanDb.SkillProfIdOffset) == skills[i].Id
+                     && BitConverter.ToInt32(body, at + ArtisanDb.SkillProfValueOffset) == skills[i].Value,
+                $"record {i} is element {i}'s (id, value)");
+        }
+    }
+
+    /// <summary>
+    /// Frame 96 and its closing frame 97. 36 recipes, decoded and re-encoded byte for byte. The
+    /// Arbiter feeds the recipe id (+8): the two C_START_PRODUCE of the capture ask for 286040
+    /// (frame 8212) and 286050 (frame 9333), both on the list under skill 6, and the loot lines
+    /// that follow (8232, 9358) name their products 423020 / 423021. The u64 at +37 is NOT the
+    /// learn time: all 36 read 1790035042, which is S_SEND_USER_PLAY_TIME's second field (frame
+    /// 112) - the session's enter-world time.
+    /// </summary>
+    [Test] public static void T147b_live_recipe_list_round_trips_and_its_ids_are_ours()
+    {
+        var f = LoadLiveFrame("S_ARTISAN_RECIPE_LIST-96.hex");
+        if (f == null) return;
+        var recipes = T147bDecodeRecipes(f);
+        Hex.True(recipes.Count == 36, $"36 recipes, got {recipes.Count}");
+        Hex.Eq(T147bEncodeRecipes(BitConverter.ToUInt16(f, 2), f[8], f[9], recipes), f, "frame 96 re-encoded");
+        Hex.Eq(T147bEncodeRecipes(ArtisanDb.S_ARTISAN_RECIPE_LIST, 1, 1, new List<T147bRecipe>()),
+               "0A 00 FE 61 00 00 00 00 01 01", "frame 97, the closing frame: no recipes, update 1, end-of-list 1");
+
+        var start1 = Hex.B("0C 00 13 F7 58 5D 04 00 00 00 00 00");   // frame 8212
+        var start2 = Hex.B("0C 00 13 F7 62 5D 04 00 00 00 00 00");   // frame 9333
+        foreach (var (start, product) in new[] { (start1, 423020), (start2, 423021) })
+        {
+            int id = BitConverter.ToInt32(start, 4);
+            var r = recipes.SingleOrDefault(x => x.RecipeId == id);
+            Hex.True(r != null && r.SkillProfId == 6 && r.Product == product,
+                $"C_START_PRODUCE recipe {id} is on the list, skill 6, product {product}");
+        }
+        long login = BitConverter.ToInt64(Hex.B("10 00 E0 A7 C9 41 11 00 62 C4 B1 6A 00 00 00 00"), 8);   // frame 112
+        Hex.True(recipes.All(r => r.Time == login), "every +37 is the enter-world time, not a learn time");
+
+        // The Arbiter side: a store that learned the 36 in this order loads them back in it.
+        using var store = GuildStore(1);
+        foreach (var r in recipes) store.LearnItemRecipe(1, r.RecipeId, false, login);
+        var (op, body) = RunHandler1(DbProxyHandlers.SDB_LOAD_ITEM_RECIPE, Hex.B("34 00 00 00 01 00 00 00"), store);
+        Hex.True(op == DbProxyHandlers.DBS_LOAD_ITEM_RECIPE && body.Length == ArtisanDb.RefReplyHeader + 36 * ArtisanDb.RecipeInfoSize,
+            $"36 RecipeInfo records: {body.Length} bytes");
+        for (int i = 0; i < 36; i++)
+            Hex.True(BitConverter.ToInt32(body, ArtisanDb.RefReplyHeader + i * ArtisanDb.RecipeInfoSize) == recipes[i].RecipeId,
+                $"record {i} is recipe {recipes[i].RecipeId}");
+    }
+
+    /// <summary>
+    /// STEP1 is the fatigue charge, and the capture shows every one land. World writes Type 1 and
+    /// DeltaPoint = minus the recipe's cost; S_FATIGABILITY_POINT (type 1, max 4100) reads 1340
+    /// before the first craft of 286040 (frame 8073), 1335 after it (8233), 1330 after the second
+    /// (8313); 1230 before a craft of 286050 (8595) and 1210 after (9359); 1150 (9561) then 1130
+    /// (9633). The same deltas through our handler give the same totals.
+    /// </summary>
+    [Test] public static void T147b_live_craft_fatigue_is_what_step1_carries()
+    {
+        static int Cur(string hex)
+        {
+            var b = Hex.B(hex);
+            Hex.True(BitConverter.ToInt32(b, 4) == 1 && BitConverter.ToInt32(b, 8) == 4100, "type 1, max 4100");
+            return BitConverter.ToInt32(b, 12);
+        }
+        int[] live =
+        {
+            Cur("10 00 5C 5F 01 00 00 00 04 10 00 00 3C 05 00 00"),   // 8073
+            Cur("10 00 5C 5F 01 00 00 00 04 10 00 00 37 05 00 00"),   // 8233
+            Cur("10 00 5C 5F 01 00 00 00 04 10 00 00 32 05 00 00"),   // 8313
+            Cur("10 00 5C 5F 01 00 00 00 04 10 00 00 CE 04 00 00"),   // 8595
+            Cur("10 00 5C 5F 01 00 00 00 04 10 00 00 BA 04 00 00"),   // 9359
+            Cur("10 00 5C 5F 01 00 00 00 04 10 00 00 7E 04 00 00"),   // 9561
+            Cur("10 00 5C 5F 01 00 00 00 04 10 00 00 6A 04 00 00"),   // 9633
+        };
+        Hex.True(live.SequenceEqual(new[] { 1340, 1335, 1330, 1230, 1210, 1150, 1130 }), "the live totals");
+
+        using var store = GuildStore(1);
+        long acct = store.GetCharacter(1)!.AccountId;
+        var ts = DbProxyHandlers.EncodeDbDateTime(DateTime.UtcNow);
+        int Craft(uint dlm, int cost)
+        {
+            var (op, body) = RunHandler1(DbProxyHandlers.SDB_ITEM_PRODUCE_STEP1, T147Four((int)dlm, 1, 1, -cost), store);
+            Hex.True(op == DbProxyHandlers.DBS_ITEM_PRODUCE_STEP1 && body.Length == 5 && body[4] == 1
+                     && BitConverter.ToUInt32(body, 0) == dlm, "DlmId then Success 1");
+            return store.GetFatigability(acct).CurPoint;
+        }
+        store.AddFatigabilityPoints(acct, live[0], ts);
+        Hex.True(Craft(0x70, 5) == live[1] && Craft(0x71, 5) == live[2], "two crafts of 286040 at 5 points");
+        store.AddFatigabilityPoints(acct, live[3] - live[2], ts);    // regen and two gathers, via 0x2910
+        Hex.True(Craft(0x72, 20) == live[4], "a craft of 286050 at 20 points");
+        store.AddFatigabilityPoints(acct, live[5] - live[4], ts);
+        Hex.True(Craft(0x73, 20) == live[6], "and the second");
+    }
+
+    /// <summary>
+    /// Gathering. S_PLAYER_CHANGE_ALL_PROF (frame 8471) reads energy 350, herb 350, bug 0,
+    /// mineral 350. After each gather World sends S_PLAYER_CHANGE_PROF: type 1 after the two
+    /// plant nodes (templates 3 and 1, frames 8022 / 8040), type 2 after the ore node (template
+    /// 101, frame 9272) - World's ProficiencyType, which DBUserProfContext turns into
+    /// S_UPDATE_PROF_HERB and S_UPDATE_PROF_MINERAL. User::SetProficiency writes even when the
+    /// value does not move, so those three gathers were three DB writes of 350.
+    /// </summary>
+    [Test] public static void T147b_live_gathering_types_map_to_the_prof_writes_and_the_blob()
+    {
+        var all = Hex.B("24 00 CC 70 5E 01 00 00 5E 01 00 00 00 00 00 00 5E 01 00 00 "
+                      + "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00");            // 8471
+        Hex.True(BitConverter.ToInt32(all, 4) == 350 && BitConverter.ToInt32(all, 8) == 350
+                 && BitConverter.ToInt32(all, 12) == 0 && BitConverter.ToInt32(all, 16) == 350,
+            "energy 350, herb 350, bug 0, mineral 350");
+        var plant = Hex.B("0C 00 BE 80 01 00 00 00 5E 01 00 00");   // 8481, after template 3
+        var ore = Hex.B("0C 00 BE 80 02 00 00 00 5E 01 00 00");     // 9560, after template 101
+        Hex.True(BitConverter.ToInt32(Hex.B("28 00 F4 5E 04 8D 06 00 00 80 04 00 03 00 00 00"), 12) == 3
+                 && BitConverter.ToInt32(Hex.B("28 00 F4 5E 8E 83 06 00 00 80 04 00 65 00 00 00"), 12) == 101,
+            "the plant node is template 3, the ore node 101");
+        int plantType = BitConverter.ToInt32(plant, 4), oreType = BitConverter.ToInt32(ore, 4);
+        Hex.True(ArtisanDb.GatheringOpFor(plantType) == DbProxyHandlers.S_UPDATE_PROF_HERB
+                 && ArtisanDb.GatheringOpFor(oreType) == DbProxyHandlers.S_UPDATE_PROF_MINERAL
+                 && ArtisanDb.GatheringOpFor(ArtisanDb.ProfBug) == DbProxyHandlers.S_UPDATE_PROF_BUG
+                 && ArtisanDb.GatheringOpFor(ArtisanDb.ProfEnergy) == DbProxyHandlers.S_UPDATE_PROF_ENERGY
+                 && ArtisanDb.GatheringOpFor(0) == 0, "ProficiencyType 1 herb, 2 mineral, 3 bug, 4 energy");
+
+        using var store = GuildStore(1);
+        int value = BitConverter.ToInt32(plant, 8);
+        foreach (var (op, dlm) in new[] { (ArtisanDb.GatheringOpFor(plantType), 0x80),
+                                          (ArtisanDb.GatheringOpFor(plantType), 0x81),
+                                          (ArtisanDb.GatheringOpFor(oreType), 0x82) })
+        {
+            var (rop, body) = RunHandler1(op, T147Four(dlm, 1, value), store);
+            Hex.True(rop == DbProxyHandlers.D_UPDATE_PROF_RESULT && body[4] == 1, $"0x{op:X4} answered");
+        }
+        store.SaveWorldBlob(1, new byte[DbProxyHandlers.WorldBlobSize]);
+        var frames = RunHandler(DbProxyHandlers.SDB_USER_ENTERWORLD, T147EnterWorld(0x83, 1), 2, store);
+        int at = frames[0].body.Length - DbProxyHandlers.WorldBlobSize + ArtisanDb.GatheringProfBlobOffset;
+        Hex.Eq(frames[0].body[at..(at + 16)], "5E 01 00 00 00 00 00 00 00 00 00 00 5E 01 00 00",
+            "the next enter-world carries mineral 350 at +0x1C8 and herb 350 at +0x1D4");
+    }
+
+    // ============ T157: the Instance Matching tabs - World builds them, the sheet feeds the matcher =====
+
+    /// <summary>data/cap_t157.bin: cap_social (base 100000) and cap_social4 (200000) list requests
+    /// and World's tunnelled answers, keyed by base + tap sequence number (see data/cap_t157.md).</summary>
+    static Dictionary<uint, byte[]>? T157Capture() => LoadTsisOrSkip("cap_t157.bin");
+
+    /// <summary>The client packet inside an SA_BYPASS_TO_CLIENT payload: [recipients ref][packet frame offset][packet length].</summary>
+    static byte[] T157Unwrap(byte[] bypass)
+    {
+        int at = (int)BitConverter.ToUInt32(bypass, 8) - 6, len = (int)BitConverter.ToUInt32(bypass, 12);
+        Hex.True(at >= 16 && at + len <= bypass.Length, "tunnel packet inside the frame");
+        return bypass[at..(at + len)];
+    }
+
+    static List<int> T157Chain(byte[] f, int hdr, Func<int, int> size, List<(int From, int To)> cover)
+    {
+        int n = BitConverter.ToUInt16(f, hdr), at = BitConverter.ToUInt16(f, hdr + 2);
+        var els = new List<int>();
+        if (n == 0) { Hex.True(at == 0, $"empty array at {hdr} has offset {at}"); return els; }
+        for (int i = 0; i < n; i++)
+        {
+            Hex.True(at > 0 && at + 4 <= f.Length && BitConverter.ToUInt16(f, at) == at, $"array at {hdr}, element {i}: self");
+            els.Add(at);
+            cover.Add((at, at + size(at)));
+            int next = BitConverter.ToUInt16(f, at + 2);
+            Hex.True(i == n - 1 ? next == 0 : next != 0, $"array at {hdr}, element {i}: next");
+            at = next;
+        }
+        return els;
+    }
+
+    /// <summary>
+    /// Either tab, every byte accounted for. S_VIEW_INTER_PARTY_MATCH_DUNGEON_LIST: [array][u8 user
+    /// pool][u8 party pool][u8 work UI] (World's writer, WorldServer.exe.c:693375), 36-byte dungeon
+    /// elements - +4 an array of 9-byte entries that each hold an 8-byte list at +4, +8 an array
+    /// that is always empty, +12 the 6-byte [role][level] entries, i32 dungeon id at +16.
+    /// S_VIEW_INTER_PARTY_MATCH_BATTLEFIELD_LIST: [battlegrounds][reward guilds][u8][u8]
+    /// (:693055), 36-byte elements with the roles at +8 and the id at +12, and 12-byte
+    /// [self][next][u32 npc guild][u32 value] entries. The elements must tile the frame exactly.
+    /// </summary>
+    static (byte[] Flags, List<(int Id, (byte Role, byte Level)[] Roles)> Items, List<(uint Guild, uint Value)> Guilds) T157DecodeTab(byte[] f)
+    {
+        ushort op = BitConverter.ToUInt16(f, 2);
+        bool dungeon = op == LeaderboardPackets.S_VIEW_INTER_PARTY_MATCH_DUNGEON_LIST;
+        Hex.True(f.Length >= 11 && BitConverter.ToUInt16(f, 0) == f.Length
+                 && (dungeon || op == LeaderboardPackets.S_VIEW_INTER_PARTY_MATCH_BATTLEFIELD_LIST), "a tab header");
+        int fixedLen = dungeon ? 11 : 14, rolesAt = dungeon ? 12 : 8, idAt = dungeon ? 16 : 12;
+        var cover = new List<(int From, int To)> { (0, fixedLen) };
+        var items = new List<(int, (byte, byte)[])>();
+        var elements = T157Chain(f, 4, at =>
+        {
+            if (dungeon)
+            {
+                T157Chain(f, at + 4, s => { T157Chain(f, s + 4, _ => 8, cover); return 9; }, cover);
+                Hex.True(BitConverter.ToUInt32(f, at + 8) == 0, "dungeon +8 array empty");
+            }
+            else Hex.True(BitConverter.ToUInt32(f, at + 4) == 0, "battleground +4 array empty");
+            return 36;
+        }, cover);
+        foreach (int e in elements)
+            items.Add((BitConverter.ToInt32(f, e + idAt),
+                       T157Chain(f, e + rolesAt, _ => 6, cover).Select(r => (f[r + 4], f[r + 5])).ToArray()));
+        var guilds = dungeon ? new List<(uint, uint)>()
+            : T157Chain(f, 8, _ => 12, cover).Select(g => (BitConverter.ToUInt32(f, g + 4), BitConverter.ToUInt32(f, g + 8))).ToList();
+        int pos = 0;
+        foreach (var (from, to) in cover.OrderBy(c => c.From))
+        {
+            Hex.True(from == pos, $"gap or overlap at {pos} (next element at {from})");
+            pos = to;
+        }
+        Hex.True(pos == f.Length, $"elements end at {pos}, frame is {f.Length}");
+        return (f[(fixedLen - (dungeon ? 3 : 2))..fixedLen], items, guilds);
+    }
+
+    /// <summary>The list request goes to World as the real Arbiter sends it: 0x1644 / 0x1645
+    /// [pool ref 0 / 0][UserDbId] - cap_social 1699 / 1723 and cap_social4 7940 / 8098 / 8217
+    /// byte for byte.</summary>
+    [Test] public static void T157_list_requests_go_to_world_byte_exact()
+    {
+        var (op, p) = LeaderboardPackets.WorldListRequest(true, 1002);
+        Hex.True(op == 0x1644, "dungeons: 0x1644");
+        Hex.Eq(p, "00 00 00 00 00 00 00 00 ea 03 00 00", "cap_social seq 1699");
+        Hex.True(LeaderboardPackets.WorldListRequest(false, 1).Op == 0x1645, "battlegrounds: 0x1645");
+        var cap = T157Capture();
+        if (cap == null) return;
+        foreach (var (key, dungeons, user) in new[] { (101699u, true, 1002), (101723u, false, 1002),
+                                                      (207940u, true, 1003), (208098u, true, 1), (208217u, false, 1) })
+            Hex.Eq(LeaderboardPackets.WorldListRequest(dungeons, user).Payload, cap[key], $"seq {key}");
+    }
+
+    /// <summary>World answers them on this server: the dungeon tab for a level-3 character is
+    /// World's empty form (cap_social 1701), for user 1003 two dungeons (7941), for user 1
+    /// twenty-five (8099); the battleground tab lists every sheet battleground his level band
+    /// admits (8218) - the Arbiter has no writer for either packet.</summary>
+    [Test] public static void T157_world_builds_both_tabs_on_this_server()
+    {
+        var cap = T157Capture();
+        if (cap == null) return;
+        var low = T157DecodeTab(T157Unwrap(cap[101701]));
+        Hex.True(low.Items.Count == 0 && low.Flags.SequenceEqual(new byte[] { 0, 1, 1 }), "cap_social 1701: 11 bytes, no dungeons");
+        var two = T157DecodeTab(T157Unwrap(cap[207941]));
+        Hex.True(two.Items.Select(i => i.Id).SequenceEqual(new[] { 9087, 9047 }), "7941: two dungeons");
+        var full = T157DecodeTab(T157Unwrap(cap[208099]));
+        Hex.True(full.Items.Count == 25 && full.Items.Any(i => i.Id == 9739) && full.Items.All(i => i.Roles.Length == 0),
+            "8099: 25 dungeons, no queue indicators (the pool list was empty)");
+        var bgs = T157DecodeTab(T157Unwrap(cap[208218]));
+        Hex.True(bgs.Items.Select(i => i.Id).SequenceEqual(new[] { 5, 10, 11, 26, 27, 28, 29, 30, 37, 38, 39, 40, 46, 47, 70, 118, 119 }),
+            "8218: the sheet's battlegrounds minus 71, 110, 156");
+        Hex.True(bgs.Guilds.SequenceEqual(new[] { (901u, 0u), (902u, 0u) }), "the two reward guilds");
+        var lowBg = T157DecodeTab(T157Unwrap(cap[101724]));
+        Hex.True(lowBg.Items.Count == 0 && lowBg.Guilds.Count == 2, "cap_social 1724: a level 3 sees no battleground");
+    }
+
+    /// <summary>The live reference tabs (local only - data/classic-live/README.md): classic_live3
+    /// 7964, 803 bytes, fifteen dungeons with [role][level] indicators, and classic_live2 9364,
+    /// 380 bytes, seven battlegrounds. Decoded at the layouts above, tiled exactly.</summary>
+    [Test] public static void T157_live_tabs_decode_byte_exact()
+    {
+        var d = LoadLiveFrame("S_VIEW_INTER_PARTY_MATCH_DUNGEON_LIST-7964.hex");
+        if (d != null)
+        {
+            var t = T157DecodeTab(d);
+            Hex.True(d.Length == 803 && t.Items.Count == 15 && t.Flags.SequenceEqual(new byte[] { 1, 0, 0 }), "803 B, 15 dungeons");
+            Hex.True(t.Items[0].Id == 9068 && t.Items[0].Roles.SequenceEqual(new[] { ((byte)1, (byte)1), ((byte)2, (byte)1), ((byte)4, (byte)1) }),
+                "9068 first, tank / healer / dps indicators");
+            Hex.True(t.Items[^1].Id == 9999 && t.Items[^1].Roles.Length == 0, "9999 last, no roles");
+        }
+        var b = LoadLiveFrame("S_VIEW_INTER_PARTY_MATCH_BATTLEFIELD_LIST-9364.hex");
+        if (b != null)
+        {
+            var t = T157DecodeTab(b);
+            Hex.True(b.Length == 380 && t.Items.Select(i => i.Id).SequenceEqual(new[] { 10, 11, 29, 30, 37, 38, 118 }), "seven battlegrounds");
+            Hex.True(t.Guilds.SequenceEqual(new[] { (901u, 1220u) }), "one reward-guild entry");
+        }
+    }
+
+    /// <summary>With no World to ask, the answer is World's empty shape - not the def's three
+    /// bytes, which have no array header and read as garbage.</summary>
+    [Test] public static void T157_the_no_world_fallback_has_the_real_shape()
+    {
+        var d = T157DecodeTab(LeaderboardPackets.EmptyDungeonList);
+        var b = T157DecodeTab(LeaderboardPackets.EmptyBattlefieldList);
+        Hex.True(LeaderboardPackets.EmptyDungeonList.Length == 11 && d.Items.Count == 0, "11 bytes, no dungeons");
+        Hex.True(LeaderboardPackets.EmptyBattlefieldList.Length == 14 && b.Items.Count == 0 && b.Guilds.Count == 0, "14 bytes, nothing");
+    }
+
+    /// <summary>A small stand-in for BattleFieldData.xml: the same element and attribute names,
+    /// invented rows. 909 is commented out, as the real sheet has it.</summary>
+    const string T157SheetXml = """
+        <?xml version="1.0" encoding="utf-8"?>
+        <BattleFieldData>
+          <!-- <BattleField type="World_Of_Tank" id="909"><CommonData maxTeamMember="8"/></BattleField> -->
+          <BattleField type="Kumas_World" id="5"><CommonData minTeamMember="1" maxTeamMember="13" minLevel="65" maxLevel="70"/></BattleField>
+          <BattleField type="Cannon" id="10"><CommonData maxTeamMember="20" minLevel="70" maxLevel="70"/></BattleField>
+          <BattleField type="Cannon" id="11"><CommonData maxTeamMember="20" minLevel="70" maxLevel="70"/></BattleField>
+          <BattleField type="StrongholdOccupation" id="26"><CommonData maxTeamMember="15" minLevel="65" maxLevel="70"/></BattleField>
+          <BattleField type="Round_PvP" id="37"><CommonData maxTeamMember="3" minLevel="70" maxLevel="70"/></BattleField>
+          <BattleField type="Round_PvP" id="39"><CommonData maxTeamMember="5" minLevel="70" maxLevel="70"/></BattleField>
+        </BattleFieldData>
+        """;
+
+    /// <summary>Point the matcher at <see cref="T157SheetXml"/>.</summary>
+    static void T157TestSheet() => BattleFieldSheet.SetForTest(BattleFieldSheet.Parse(T157SheetXml));
+
+    /// <summary>The matcher's battlegrounds are the sheet's: size from maxTeamMember, rule from
+    /// the type, and one that is not in the sheet is neither offered nor ever formed.</summary>
+    [Test] public static void T157_battlefield_sheet_drives_the_matcher()
+    {
+        var rows = BattleFieldSheet.Parse(T157SheetXml);
+        Hex.True(rows.Select(r => r.Id).SequenceEqual(new[] { 5, 10, 11, 26, 37, 39 }), "comments skipped, file order kept");
+        Hex.True(rows[0] == new BattleFieldEntry(5, "Kumas_World", 13, 65, 70), "a row");
+        try
+        {
+            T157TestSheet();
+            Hex.True(MatchComposition.RuleFor(39).TeamSize == 5 && MatchComposition.RuleFor(39).MaxHealers == 1, "Skyring 5v5 from the sheet");
+            Hex.True(MatchComposition.Battlegrounds.Select(r => r.BattleFieldId).SequenceEqual(new[] { 10, 11, 26, 37, 39 }),
+                "the stated-rule battlegrounds are the sheet's Cannon / Stronghold / Round_PvP rows");
+            Hex.True(MatchComposition.IsOffered(5) && !MatchComposition.HasRule(5) && MatchComposition.RuleFor(5).TeamSize == 13,
+                "a type with no stated rule is offered with the environment caps");
+            Hex.True(!MatchComposition.IsOffered(909) && MatchComposition.RuleFor(909).TeamSize == 0, "909 is commented out: not offered");
+            Hex.True(MatchWiring.Offered(new[] { 9739, 37, 909, 38 }).SequenceEqual(new[] { 9739, 37 }),
+                "a queue keeps dungeons and the sheet's battlegrounds only");
+
+            // Take Skyring 37 out of the sheet: six queuers who would have made a match do not.
+            BattleFieldSheet.SetForTest(rows.Where(r => r.Id != 37).ToList());
+            MatchQueueManager.Reset();
+            uint id = 1;
+            foreach (int cls in new[] { 6, 6, 1, 1, 2, 2 }) { T138cQueue(id, 37, T138cQ(id, cls)); id++; }
+            Hex.True(MatchQueueManager.TryForm(37, DateTimeOffset.UnixEpoch.AddHours(3), new T138cAlternating()) == null,
+                "removed from the sheet, removed from the matcher");
+            Hex.True(!MatchWiring.Offered(new[] { 37 }).Any(), "and refused at the queue");
+
+            BattleFieldSheet.SetForTest(null);
+            Hex.True(!MatchComposition.IsOffered(10) && MatchComposition.Battlegrounds.Count == 0, "no sheet: no battleground");
+        }
+        finally
+        {
+            MatchQueueManager.Reset();
+            BattleFieldSheet.ResetForTest();
+        }
+    }
+
+    /// <summary>The real sheet, when this machine has it (TERASHARP_DATASHEET / TERASHARP_DATA):
+    /// Fraywind 20, Corsairs 15, Skyring 3, and the commented-out 909 absent.</summary>
+    [Test] public static void T157_the_real_sheet_when_present()
+    {
+        var rows = BattleFieldSheet.Load(HandshakeData.DatasheetDirectory());
+        if (rows == null) { Skip.Because("BattleFieldData.xml not found"); return; }
+        int Size(int bf) => rows.Single(r => r.Id == bf).TeamSize;
+        Hex.True(Size(10) == 20 && Size(26) == 15 && Size(37) == 3 && rows.All(r => r.Id != 909), "sizes, and 909 absent");
+        Hex.True(rows.Single(r => r.Id == 10).Type == "Cannon" && rows.Single(r => r.Id == 37).Type == "Round_PvP", "types");
+    }
+
+    // ============ T156: the Vanguard Initiative window - the Arbiter's half ====================
+
+    /// <summary>data/cap_t156.bin keyed by capture + tap sequence number (see data/cap_t156.md), or null.</summary>
+    static Dictionary<uint, byte[]>? T156Capture() => LoadTsisOrSkip("cap_t156.bin");
+
+    /// <summary>The ArbiterUser id in bytes 0..7 of a 0x1507 payload.</summary>
+    static ulong T156Game(byte[] sa1507) => BitConverter.ToUInt64(sa1507, 0);
+
+    /// <summary>0x1507 is answered with 0x1591 naming the LIVE user - the replay table named the
+    /// captured user 1 for everyone, so World looked up the wrong character and the window never
+    /// got its S_AVAILABLE_EVENT_MATCHING_LIST. Pinned to four real pairs: plain, second user,
+    /// in a party (PartyId set) and ByPlayer 1 (echoed).</summary>
+    [Test] public static void T156_available_list_request_names_the_live_user()
+    {
+        Hex.Eq(DbProxyHandlers.BuildEventMatchingInfoList(1002, 0),
+            "1b 00 00 00 00 00 00 00 1b 00 00 00 00 00 00 00 ea 03 00 00 00", "cap_social seq 459, both lists empty");
+        var cap = T156Capture();
+        if (cap == null) return;
+        foreach (var (req, rep, user) in new[] { (100458u, 100459u, 1002), (100545u, 100547u, 2),
+                                                 (201528u, 201529u, 1), (208038u, 208039u, 1) })
+        {
+            var h = FreshHandlers(null);
+            ulong game = T156Game(cap[req]);
+            h.PlayerIdForGameId = g => g == game ? user : 0;
+            var f = RunHandler(DbProxyHandlers.SA_AVAILABLE_EVENT_MATCHING_LIST, cap[req], 1, null, h);
+            Hex.True(f[0].op == DbProxyHandlers.AS_EVENT_MATCHING_INFO_LIST, $"seq {req}: 0x{f[0].op:X4}");
+            Hex.Eq(f[0].body, cap[rep], $"seq {req} -> {rep}");
+        }
+        var none = FreshHandlers(null);
+        none.PlayerIdForGameId = _ => 0;
+        RunHandler(DbProxyHandlers.SA_AVAILABLE_EVENT_MATCHING_LIST, cap[100458], 0, null, none);   // unknown user: silence
+        RunHandler(DbProxyHandlers.SA_AVAILABLE_EVENT_MATCHING_LIST, new byte[5], 0, null, none);   // short: silence
+    }
+
+    /// <summary>0x293C stores the counts, pushes 0x1591 for the user, then acks - the real order,
+    /// cap_social4 seq 421 -> 422, 423. The next 0x293A reads back what was stored: seq 5748 is
+    /// byte-exact after 419 (0x293E) and 421 on an otherwise seeded row.</summary>
+    [Test] public static void T156_daily_event_update_pushes_and_the_load_reads_it_back()
+    {
+        var cap = T156Capture();
+        if (cap == null) return;
+        using var store = GuildStore(1);
+        store.SetDailyEventCounts(1, new int[5], 0x6AA4DA0E, 0);   // the row cap_social4 starts from
+        var h = FreshHandlers(store);
+        Hex.Eq(RunHandler1(DbProxyHandlers.SDB_LOAD_293A, cap[200282], store, h).body, cap[200283], "seq 283: the seeded row");
+        Hex.Eq(RunHandler1(DbProxyHandlers.SDB_UPDATE_GET_EXTRA_REWARD, cap[200419], store, h).body, cap[200420], "seq 420");
+        var f = RunHandler(DbProxyHandlers.SDB_UPDATE_USER_DAILY_EVENT_COUNT, cap[200421], 2, store, h);
+        Hex.True(f[0].op == DbProxyHandlers.AS_EVENT_MATCHING_INFO_LIST && f[1].op == DbProxyHandlers.DBS_UPDATE_USER_DAILY_EVENT_COUNT,
+            "0x1591 first, then 0x293D");
+        Hex.Eq(f[0].body, cap[200422], "seq 422: the push");
+        Hex.Eq(f[1].body, cap[200423], "seq 423: the ack");
+        Hex.Eq(RunHandler1(DbProxyHandlers.SDB_LOAD_293A, cap[205747], store, h).body, cap[205748],
+            "seq 5748: the stamp 0x293C carried comes back");
+
+        // The five counts: whatever 0x293C's record held is what the next load carries at +26.
+        var req = (byte[])cap[200421].Clone();
+        for (int i = 0; i < 5; i++) BitConverter.GetBytes(11 + i).CopyTo(req, 32 + 4 * i);
+        BitConverter.GetBytes(0L).CopyTo(req, 16);                   // no stamp: the stored one stays
+        RunHandler(DbProxyHandlers.SDB_UPDATE_USER_DAILY_EVENT_COUNT, req, 2, store, h);
+        var load = RunHandler1(DbProxyHandlers.SDB_LOAD_293A, cap[205747], store, h).body;
+        Hex.Eq(load[26..46], "0b 00 00 00 0c 00 00 00 0d 00 00 00 0e 00 00 00 0f 00 00 00", "the record round-trips");
+        Hex.True(BitConverter.ToInt64(load, 13) == 0x6AAB4146, "a zero stamp does not overwrite");
+    }
+
+    /// <summary>A never-played character: success 0 and zeros (cap_newchar seq 338), both writes
+    /// answered (504, 507), and the row they create is stamped with their time - cap_social
+    /// seq 283 is that character's next login, and matches byte for byte with the clock at the
+    /// moment of cap_newchar's writes (2026-09-13T05:51:08Z).</summary>
+    [Test] public static void T156_new_character_daily_event_matches_the_real_first_login()
+    {
+        var cap = T156Capture();
+        if (cap == null) return;
+        using var store = GuildStore(1);
+        var h = FreshHandlers(store);
+        h.EventClock = () => DateTimeOffset.FromUnixTimeSeconds(0x6AA639CC);
+        Hex.Eq(RunHandler1(DbProxyHandlers.SDB_LOAD_293A, cap[300337], store, h).body, cap[300338], "seq 338: no row");
+        Hex.Eq(RunHandler1(DbProxyHandlers.SDB_UPDATE_GET_EXTRA_REWARD, cap[300503], store, h).body, cap[300504], "seq 504");
+        var f = RunHandler(DbProxyHandlers.SDB_UPDATE_USER_DAILY_EVENT_COUNT, cap[300505], 2, store, h);
+        Hex.Eq(f[0].body, DbProxyHandlers.BuildEventMatchingInfoList(2, 0), "0x1591 for user 2");
+        Hex.Eq(f[1].body, cap[300507], "seq 507");
+        Hex.Eq(RunHandler1(DbProxyHandlers.SDB_LOAD_293A, cap[100282], store, h).body, cap[100283],
+            "cap_social seq 283: the same character's next load");
+
+        // A record ref pointing outside the frame reads as zeros instead of throwing.
+        var bad = (byte[])cap[300505].Clone();
+        BitConverter.GetBytes(0xFFFFFFF0u).CopyTo(bad, 0);
+        Hex.True(DbProxyHandlers.ReadDailyEventRecord(bad).All(c => c == 0), "out-of-frame ref");
+        Hex.True(DbProxyHandlers.ReadDailyEventRecord(new byte[3]).Length == 5, "short payload");
+    }
+
+    /// <summary>0x1592 once per boot: 0x1595 from the stored stamps, then 0x1582. An empty DB
+    /// answers exactly what the replay table sent before (arb_world.log seq 11, 12); World's
+    /// 0x1598 / 0x159A (cap_invensize seq 91, 92) are answered [1][time] and stored, and the next
+    /// boot carries them - with cap_social4's pair of stamps that is its seq 12 byte for byte.</summary>
+    [Test] public static void T156_event_matching_info_and_the_two_reset_stamps()
+    {
+        var cap = T156Capture();
+        if (cap == null) return;
+        using var store = GuildStore(1);
+        var h = FreshHandlers(store);
+        var boot = RunHandler(DbProxyHandlers.SA_LOAD_EVENT_MATCHING_INFO, cap[500010], 2, store, h);
+        Hex.True(boot[0].op == DbProxyHandlers.AS_EVENT_MATCHING_INFO && boot[1].op == DbProxyHandlers.AS_INIT_TIMELINE_CHANGES, "0x1595, 0x1582");
+        Hex.Eq(boot[0].body, cap[500011], "arb_world seq 11");
+        Hex.Eq(boot[1].body, cap[500012], "arb_world seq 12");
+
+        store.SetEventMatchingReward(10, 800029, 1);
+        var w = RunHandler1(DbProxyHandlers.SA_UPDATE_PLAYGUIDE_EXTRA_REWARD_RESETTIME, cap[400091], store, h);
+        Hex.True(w.op == DbProxyHandlers.AS_UPDATE_PLAYGUIDE_EXTRA_REWARD_RESETTIME, "0x1599");
+        Hex.Eq(w.body, "01 98 ac aa 6a 00 00 00 00", "weekly: result 1 + the time");
+        var d = RunHandler1(DbProxyHandlers.SA_UPDATE_EVENT_MATCHING_ADD_REWARD_RESETTIME, cap[400092], store, h);
+        Hex.True(d.op == DbProxyHandlers.AS_UPDATE_EVENT_MATCHING_ADD_REWARD_RESETTIME, "0x159B");
+        Hex.Eq(d.body, "01 70 46 b1 6a 00 00 00 00", "daily: result 1 + the time");
+        Hex.True(store.GetEventMatchingRewards(10).Count == 0, "the daily reset clears every add-reward count");
+        Hex.Eq(RunHandler(DbProxyHandlers.SA_LOAD_EVENT_MATCHING_INFO, cap[500010], 2, store, h)[0].body,
+            "1e 00 00 00 00 00 00 00 98 ac aa 6a 00 00 00 00 70 46 b1 6a 00 00 00 00", "the next boot carries both");
+
+        RunHandler1(DbProxyHandlers.SA_UPDATE_EVENT_MATCHING_ADD_REWARD_RESETTIME, Hex.B("f0 ae aa 6a 00 00 00 00"), store, h);
+        Hex.Eq(RunHandler(DbProxyHandlers.SA_LOAD_EVENT_MATCHING_INFO, cap[500010], 2, store, h)[0].body, cap[200012],
+            "cap_social4 seq 12");
+        RunHandler(DbProxyHandlers.SA_UPDATE_PLAYGUIDE_EXTRA_REWARD_RESETTIME, new byte[3], 0, store, h);   // short: silence
+    }
+
+    /// <summary>The add-reward receive counts: the empty load is byte-exact twice (real Arbiter,
+    /// cap_social4 seq 285; TeraSharp's World, cap_invensize seq 138), updates are answered
+    /// [DlmId][1] and overwrite per event, and the stored list is the 8-byte records World reads.</summary>
+    [Test] public static void T156_additional_reward_counts_round_trip()
+    {
+        var cap = T156Capture();
+        if (cap == null) return;
+        using var store = GuildStore(1);
+        var h = FreshHandlers(store);
+        Hex.Eq(RunHandler1(DbProxyHandlers.SDB_LOAD_ADDITIONAL_REWARD, cap[200284], store, h).body, cap[200285], "seq 285");
+        Hex.Eq(RunHandler1(DbProxyHandlers.SDB_LOAD_ADDITIONAL_REWARD, cap[400137], store, h).body, cap[400138], "cap_invensize seq 138");
+        foreach (var (ev, n) in new[] { (800029, 2), (800010, 1), (800029, 3) })
+        {
+            var req = new byte[16];
+            BitConverter.GetBytes(0x21).CopyTo(req, 0);
+            BitConverter.GetBytes(10).CopyTo(req, 4);
+            BitConverter.GetBytes(ev).CopyTo(req, 8);
+            BitConverter.GetBytes(n).CopyTo(req, 12);
+            var r = RunHandler1(DbProxyHandlers.SDB_UPDATE_ADDITIONAL_REWARD_RECV_COUNT, req, store, h);
+            Hex.True(r.op == DbProxyHandlers.DBS_UPDATE_ADDITIONAL_REWARD_RECV_COUNT, "0x2966");
+            Hex.Eq(r.body, "21 00 00 00 01", "answered [DlmId][1]");
+        }
+        var load = RunHandler1(DbProxyHandlers.SDB_LOAD_ADDITIONAL_REWARD, cap[400137], store, h).body;
+        Hex.Eq(load, "13 00 00 00 10 00 00 00 11 00 00 00 01 0a 35 0c 00 01 00 00 00 1d 35 0c 00 03 00 00 00",
+            "two records, 800010 x1 and 800029 x3, success 1");
+        var shortReq = RunHandler1(DbProxyHandlers.SDB_UPDATE_ADDITIONAL_REWARD_RECV_COUNT, Hex.B("22 00 00 00 0a 00 00 00"), store, h);
+        Hex.Eq(shortReq.body, "22 00 00 00 01", "a short update is still answered");
+        Hex.True(store.GetEventMatchingRewards(10).Count == 2, "and stores nothing");
+    }
+
+    /// <summary>The opcodes are real handlers now: all allow-listed, 0x159A no longer sealed
+    /// one-way (the real Arbiter answers it), both reset updates still quiet in the log.</summary>
+    [Test] public static void T156_event_matching_opcodes_are_handlers_not_replays()
+    {
+        foreach (ushort op in new ushort[] { 0x1507, 0x1592, 0x1598, 0x159A, 0x293A, 0x293C, 0x293E, 0x2965, 0x2967 })
+        {
+            Hex.True(DbProxyHandlers.IsHandledRequest(op), $"0x{op:X4} allow-listed");
+            Hex.True(!WorldReplayTable.OneWayFromWorld.Contains(op), $"0x{op:X4} not sealed");
+        }
+        Hex.True(!DbProxyHandlers.DispatchOnlyForTests.Contains(DbProxyHandlers.SDB_LOAD_293A)
+                 && !DbProxyHandlers.DispatchOnlyForTests.Contains(DbProxyHandlers.SDB_LOAD_ADDITIONAL_REWARD), "no longer test-only");
+        Hex.True(WorldReplayTable.LogsAtDebug(0x159A) && WorldReplayTable.LogsAtDebug(0x1598), "still quiet");
+    }
+
+    // ---- The client side: World-built, decoded here so the layout is pinned ----
+
+    /// <summary>One decoded S_AVAILABLE_EVENT_MATCHING_LIST quest element.</summary>
+    sealed record T156Quest(int Id, uint State, uint Flags, byte[] Bytes3, uint Tail1, uint Tail2,
+                            List<(uint Cur, uint Max)> Conditions, List<(int Item, long Amount)> Rewards,
+                            List<(uint A, uint B, uint C)> Extra);
+
+    /// <summary>
+    /// S_AVAILABLE_EVENT_MATCHING_LIST (0x810D) taken apart and every byte accounted for. The
+    /// 94-byte fixed part is World's serializer (FUN_140456950): three array headers, 10 u32,
+    /// 3 u8, 3 u32, 3 u8, 5 u32. Quest elements are 47 bytes - self, next, five nested array
+    /// headers (+4 conditions 12 B, +8 rewards 16 B, +12 and +16 always empty, +20 12-byte
+    /// triples 16 B), then i32 id, u32, u32, 3 u8, u32, u32. Bonus elements are 16 bytes. The
+    /// walk checks each element's self offset, ends each chain on next 0, and requires the
+    /// elements to tile [94, length) exactly - a frame from another build fails loudly.
+    /// </summary>
+    static (uint[] Fixed, List<T156Quest> Quests, List<(uint A, uint B, uint C)> Bonus) T156DecodeList(byte[] f)
+    {
+        Hex.True(f.Length >= 94 && BitConverter.ToUInt16(f, 0) == f.Length && BitConverter.ToUInt16(f, 2) == 0x810D, "header");
+        var cover = new List<(int From, int To)> { (0, 94) };
+        List<int> Chain(int hdr, int size)
+        {
+            int count = BitConverter.ToUInt16(f, hdr), at = BitConverter.ToUInt16(f, hdr + 2);
+            var els = new List<int>();
+            if (count == 0) { Hex.True(at == 0, $"empty array at {hdr} has offset {at}"); return els; }
+            for (int i = 0; i < count; i++)
+            {
+                Hex.True(at > 0 && at + size <= f.Length && BitConverter.ToUInt16(f, at) == at, $"element {i} of the array at {hdr}: self");
+                els.Add(at);
+                cover.Add((at, at + size));
+                int next = BitConverter.ToUInt16(f, at + 2);
+                Hex.True(i == count - 1 ? next == 0 : next != 0, $"element {i} of the array at {hdr}: next");
+                at = next;
+            }
+            return els;
+        }
+        var fixedPart = new List<uint>();
+        int o = 16;
+        foreach (var (n, w) in new[] { (10, 4), (3, 1), (3, 4), (3, 1), (5, 4) })
+            for (int i = 0; i < n; i++, o += w) fixedPart.Add(w == 4 ? BitConverter.ToUInt32(f, o) : f[o]);
+        var quests = new List<T156Quest>();
+        foreach (int e in Chain(4, 47))
+        {
+            Hex.True(BitConverter.ToUInt16(f, e + 12) == 0 && BitConverter.ToUInt16(f, e + 16) == 0, "arrays +12 / +16 empty");
+            var cond = Chain(e + 4, 12).Select(x => (BitConverter.ToUInt32(f, x + 4), BitConverter.ToUInt32(f, x + 8))).ToList();
+            var rew = Chain(e + 8, 16).Select(x => (BitConverter.ToInt32(f, x + 4), BitConverter.ToInt64(f, x + 8))).ToList();
+            var extra = Chain(e + 20, 16).Select(x => (BitConverter.ToUInt32(f, x + 4), BitConverter.ToUInt32(f, x + 8), BitConverter.ToUInt32(f, x + 12))).ToList();
+            quests.Add(new T156Quest(BitConverter.ToInt32(f, e + 24), BitConverter.ToUInt32(f, e + 28), BitConverter.ToUInt32(f, e + 32),
+                f[(e + 36)..(e + 39)], BitConverter.ToUInt32(f, e + 39), BitConverter.ToUInt32(f, e + 43), cond, rew, extra));
+        }
+        var bonus = Chain(8, 16).Select(x => (BitConverter.ToUInt32(f, x + 4), BitConverter.ToUInt32(f, x + 8), BitConverter.ToUInt32(f, x + 12))).ToList();
+        Chain(12, 16);
+        int pos = 0;
+        foreach (var (from, to) in cover.OrderBy(c => c.From))
+        {
+            Hex.True(from == pos, $"gap or overlap at {pos} (next element at {from})");
+            pos = to;
+        }
+        Hex.True(pos == f.Length, $"elements end at {pos}, frame is {f.Length}");
+        return (fixedPart.ToArray(), quests, bonus);
+    }
+
+    /// <summary>The list a low-level character gets on this server (cap_social_client seq 365,
+    /// through the real Arbiter): the 94-byte fixed part and three empty arrays. The last u32 is
+    /// the character's level (3).</summary>
+    [Test] public static void T156_own_server_list_is_the_bare_fixed_part()
+    {
+        var f = Hex.B("5e 00 0d 81 00 00 00 00 00 00 00 00 00 00 00 00 0f 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+                    + "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 01 01 01 c7 0f 00 00 c7 "
+                    + "b2 02 00 00 00 00 00 00 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 03 00 00 00");
+        var (fx, quests, bonus) = T156DecodeList(f);
+        Hex.True(quests.Count == 0 && bonus.Count == 0, "no quests, no bonus");
+        Hex.True(fx.Length == 24 && fx[0] == 15 && fx[23] == 3, "first u32 15, level 3");
+    }
+
+    /// <summary>The live reference (classic_live3, local only - data/classic-live/README.md): 2421
+    /// bytes, 21 quests, one bonus entry, tiled exactly. Frame 53330 is the same list after quest
+    /// 800029's one condition went 0/1 -> 1/1, and the three pushes around it decode at World's
+    /// layouts: S_UPDATE_EVENT_MATCHING_BONUS_INFO (0x93D2), S_REMOVE (0xF46C) and
+    /// S_ADD_NEW_EVENT_MATCHING_QUEST (0xDC27).</summary>
+    [Test] public static void T156_live_vanguard_list_decodes_byte_exact()
+    {
+        var before = LoadLiveFrame("S_AVAILABLE_EVENT_MATCHING_LIST-7256.hex");
+        if (before == null) return;
+        var (fx, quests, bonus) = T156DecodeList(before);
+        Hex.True(before.Length == 2421 && quests.Count == 21 && bonus.Count == 1, "2421 B, 21 quests, 1 bonus");
+        Hex.True(fx[23] == 65 && fx[19] == 24 && fx[20] == 24 && fx[21] == 24 && fx[22] == 24, "level 65, four limits of 24");
+        Hex.True(bonus[0] == (202015u, 1u, 0u), "bonus entry");
+        var q0 = quests[0];
+        Hex.True(q0.Id == 2207 && q0.Rewards.SequenceEqual(new[] { (20000000, 30000L), (20000008, 100L) }), "first quest and its rewards");
+        Hex.True(quests.Single(q => q.Id == 800055).Conditions.SequenceEqual(new[] { (0u, 3u) }), "800055 needs 3");
+        Hex.True(quests.Single(q => q.Id == 800029).Conditions.SequenceEqual(new[] { (0u, 1u) }), "800029 at 0/1");
+
+        var after = LoadLiveFrame("S_AVAILABLE_EVENT_MATCHING_LIST-53330.hex");
+        if (after == null) return;
+        var (_, quests2, _) = T156DecodeList(after);
+        var q = quests2.Single(x => x.Id == 800029);
+        Hex.True(q.Conditions.SequenceEqual(new[] { (1u, 1u) }) && q.State == 1, "800029 at 1/1, state 1");
+        Hex.True(quests2.Where(x => x.Id != 800029).Select(x => x.Conditions.Count).SequenceEqual(
+                 quests.Where(x => x.Id != 800029).Select(x => x.Conditions.Count)), "nothing else moved");
+
+        var bonusPush = LoadLiveFrame("S_UPDATE_EVENT_MATCHING_BONUS_INFO-53331.hex");
+        if (bonusPush != null)
+        {
+            Hex.True(bonusPush.Length == 39 && BitConverter.ToUInt16(bonusPush, 2) == 0x93D2
+                     && BitConverter.ToUInt16(bonusPush, 4) == 1 && BitConverter.ToUInt16(bonusPush, 6) == 23
+                     && BitConverter.ToUInt16(bonusPush, 23) == 23 && BitConverter.ToUInt16(bonusPush, 25) == 0
+                     && BitConverter.ToUInt32(bonusPush, 27) == 202015, "fixed 23 B + one 16-byte bonus element");
+        }
+        var remove = LoadLiveFrame("S_REMOVE_EVENT_MATCHING_QUEST-53367.hex");
+        if (remove != null)
+            Hex.True(remove.Length == 8 && BitConverter.ToUInt16(remove, 2) == 0xF46C && BitConverter.ToInt32(remove, 4) == 800029, "remove 800029");
+        var add = LoadLiveFrame("S_ADD_NEW_EVENT_MATCHING_QUEST-53429.hex");
+        if (add != null)
+            Hex.True(add.Length == 16 && BitConverter.ToUInt16(add, 2) == 0xDC27 && BitConverter.ToUInt16(add, 4) == 1
+                     && BitConverter.ToUInt16(add, 6) == 8 && BitConverter.ToUInt16(add, 8) == 8 && BitConverter.ToUInt16(add, 10) == 0
+                     && BitConverter.ToInt32(add, 12) == 800029, "add 800029: one 8-byte id element");
+    }
+
+    // ============ T159: DatasheetLoader - the World datasheets are the source of truth ==========
+
+    /// <summary>The real sheets, when this machine has them: each one parses, and each reproduces
+    /// the table it replaced - the built-ins were transcribed from these very files.</summary>
+    [Test] public static void T159_the_loader_reads_the_real_sheets()
+    {
+        var dir = HandshakeData.DatasheetDirectory();
+        if (!Directory.Exists(dir)) { Skip.Because("no Datasheet folder"); return; }
+        bool Has(string f) => File.Exists(Path.Combine(dir, f));
+        try
+        {
+            if (Has("GuildConfig.xml"))
+            {
+                var st = DatasheetLoader.GuildSizes.Load(dir);
+                Hex.True(st.FromSheet && st.Entries == 4, st.Line);
+                Hex.True(GuildWarManager.DeclareCost == 1500 && GuildWarManager.DeclareLimit == 10 && GuildWarManager.GuildBlockUnk2 == 250,
+                    "GuildSize rank 0 is the captured 1500 / 10 / 250");
+            }
+            if (Has("DungeonMatching.xml"))
+            {
+                Hex.True(DatasheetLoader.ClassPositions.Load(dir).FromSheet, "ClassPosition read");
+                Hex.True(MatchComposition.ClassPositions.SequenceEqual(MatchComposition.BuiltInClassPositions), "and it is the transcribed table");
+            }
+            if (Has("DefaultSkillSet.xml"))
+            {
+                var st = DatasheetLoader.DefaultSkills.Load(dir);
+                Hex.True(st.FromSheet && st.Entries == TeraSharp.Arbiter.Persistence.DefaultSkillSet.BuiltInTable.Count, st.Line);
+                foreach (var (key, v) in TeraSharp.Arbiter.Persistence.DefaultSkillSet.BuiltInTable)
+                    Hex.True(TeraSharp.Arbiter.Persistence.DefaultSkillSet.TryGet(key.Race, key.Gender, key.Class, out var a, out var p)
+                             && a.SequenceEqual(v.Active) && p.SequenceEqual(v.Passive), $"skills {key}");
+            }
+            if (Has("CreateCharData.xml"))
+            {
+                Hex.True(DatasheetLoader.StarterKits.Load(dir).FromSheet, "CreateCharData read");
+                for (int c = 0; c < StarterInventory.BuiltInKits.Length; c++)
+                    Hex.True(StarterInventory.ForClass(c)!.SequenceEqual(StarterInventory.BuiltInKits[c]), $"class {c}'s kit, slots included");
+                Hex.True(DatasheetLoader.CreatedLevels.Load(dir).FromSheet
+                         && DatasheetLoader.CreatedLevels.Value.SequenceEqual(StarterInventory.BuiltInCreatedLevels), "createdLevel, T162");
+            }
+            if (Has("BattleFieldData.xml"))
+            {
+                var st = DatasheetLoader.PvpBoardIds.Load(dir);
+                var ids = DatasheetLoader.PvpBoardIds.Value;
+                Hex.True(st.FromSheet && ids.SequenceEqual(ids.OrderBy(i => i)) && new[] { 10, 26, 30, 37 }.All(ids.Contains),
+                    "the ranked battlegrounds include the live board's four: " + string.Join(",", ids));
+            }
+            if (Directory.EnumerateFiles(dir, "DungeonRankRecorder_*.xml").Any())
+                Hex.True(DatasheetLoader.PveBoardIds.Load(dir).FromSheet, "PvE board ids read");
+            if (HandshakeData.LoadDungeonTimelineIds(dir) != null)
+            {
+                Hex.True(DatasheetLoader.DungeonTimelineIds.Load(dir).FromSheet, "timeline sheets read");
+                Hex.True(DatasheetLoader.DungeonTimelineIds.Value.Select(i => (uint)i).SequenceEqual(DbProxyHandlers.PostHandshakeDungeonIds),
+                    "the 98 ids, order included");
+            }
+        }
+        finally { DatasheetLoader.UseBuiltIns(); }
+    }
+
+    /// <summary>Small stand-ins for the six sheets - the real element and attribute names,
+    /// invented values - so a change is visible. GuildConfig carries a BOM and a comment.</summary>
+    static void T159WriteSheets(string dir)
+    {
+        File.WriteAllText(Path.Combine(dir, "GuildConfig.xml"), "﻿" + """
+            <?xml version="1.0" encoding="utf-8"?>
+            <GuildConfig><GuildSizeTable>
+              <GuildSize rank="1" accountNumOver="40" declareCost="2700" maintainCost="650" declareLimitCount="15"/>
+              <GuildSize rank="0" accountNumOver="1" declareCost="2000" maintainCost="300" declareLimitCount="12"/>
+              <!-- <GuildSize rank="-1" accountNumOver="0" declareCost="1" maintainCost="1" declareLimitCount="1"/> -->
+            </GuildSizeTable></GuildConfig>
+            """);
+        File.WriteAllText(Path.Combine(dir, "DungeonMatching.xml"), """
+            <DungeonMatching><ClassPosition>
+              <Class name="Warrior" defaultPosition="0" secondPosition="0" thirdPosition="0"/>
+            </ClassPosition></DungeonMatching>
+            """);
+        File.WriteAllText(Path.Combine(dir, "DefaultSkillSet.xml"), """
+            <DefaultSkillSet>
+              <Default race="Human" gender="Male" class="Warrior" activeSkillIdList="11;12" passiveSkillIdList="13" />
+            </DefaultSkillSet>
+            """);
+        File.WriteAllText(Path.Combine(dir, "CreateCharData.xml"), """
+            <CreateCharData>
+              <Char class="warrior" createdLevel="1">
+                <InitItem itemTemplateId="10001" initWear="true" amount="1" />
+                <InitItem itemTemplateId="6550" initWear="false" amount="30" />
+              </Char>
+              <Char class="hero"><InitItem itemTemplateId="922102" initWear="true" amount="1" /></Char>
+            </CreateCharData>
+            """);
+        File.WriteAllText(Path.Combine(dir, "BattleFieldData.xml"), """
+            <BattleFieldData>
+              <BattleField type="Cannon" id="11"><RankingCompetition active="true" /></BattleField>
+              <BattleField type="Round_PvP" id="37"><RankingCompetition active="false" /></BattleField>
+              <BattleField type="Cannon" id="10" />
+            </BattleFieldData>
+            """);
+        File.WriteAllText(Path.Combine(dir, "DungeonRankRecorder_9830.xml"), "<DungeonRankRecorder/>");
+        File.WriteAllText(Path.Combine(dir, "DungeonRankRecorder_x.xml"), "<DungeonRankRecorder/>");
+    }
+
+    /// <summary>Change a sheet and the value changes; take it away and the built-in comes back,
+    /// with the startup line saying which.</summary>
+    [Test] public static void T159_a_modified_sheet_changes_the_value()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "t159-" + Guid.NewGuid().ToString("N"));
+        var empty = dir + "-empty";
+        Directory.CreateDirectory(dir);
+        Directory.CreateDirectory(empty);
+        try
+        {
+            T159WriteSheets(dir);
+            var st = DatasheetLoader.LoadAll(null, dir);
+            Hex.True(st.Count == DatasheetLoader.All.Count, "one line per sheet");
+            Hex.True(st.Where(s => s.FromSheet).Count() == 8 && !st.Single(s => s.Sheet.StartsWith("DungeonData_")).FromSheet,
+                "eight read (CreateCharData twice: items, T162 levels; BattleFieldData twice: boards, T163 battlegrounds); the timeline needs four sheets and keeps its built-in");
+            Hex.True(GuildWarManager.DeclareCost == 2000 && GuildWarManager.DeclareLimit == 12 && GuildWarManager.GuildBlockUnk2 == 300,
+                "GuildSize rank 0, found behind a BOM and after rank 1");
+            Hex.True(MatchComposition.RoleOf(0) == MatchRole.Tank && MatchComposition.RoleOf(6) == MatchRole.Healer,
+                "Warrior re-seated as a tank; Priest, absent from the sheet, keeps the built-in");
+            Hex.True(TeraSharp.Arbiter.Persistence.DefaultSkillSet.TryGet(0, 0, 0, out var a, out var p) && a.SequenceEqual(new[] { 11, 12 }) && p.SequenceEqual(new[] { 13 })
+                     && !TeraSharp.Arbiter.Persistence.DefaultSkillSet.TryGet(0, 0, 1, out _, out _), "skills from the sheet - and only its rows");
+            Hex.True(StarterInventory.ForClass(0)!.SequenceEqual(new[] { new StarterItem(10001, 1, 14, 1), new StarterItem(6550, 30, 0, 0) })
+                     && StarterInventory.ForClass(1)!.SequenceEqual(StarterInventory.BuiltInKits[1]),
+                "the warrior kit is the sheet's; lancer, absent, keeps the built-in; hero is skipped");
+            Hex.True(DatasheetLoader.PvpBoardIds.Value.SequenceEqual(new[] { 11 })
+                     && BitConverter.ToUInt16(ArbiterClientHandlers.BuildPvpLeaderBoardInfo(), 4) == 1, "PvP board: the one ranked battleground");
+            Hex.True(DatasheetLoader.PveBoardIds.Value.SequenceEqual(new[] { 9830 }), "PvE board: the recorder files");
+            Hex.True(st.First().Line.StartsWith("loaded GuildConfig.xml"), st.First().Line);
+
+            File.WriteAllText(Path.Combine(dir, "GuildConfig.xml"), "not xml at all");
+            Hex.True(!DatasheetLoader.GuildSizes.Load(dir).FromSheet && GuildWarManager.DeclareCost == 1500, "unreadable: the built-in");
+            var none = DatasheetLoader.LoadAll(null, empty);
+            Hex.True(none.All(s => !s.FromSheet && s.Line.Contains("not found, using built-in")), "no sheets: every built-in, each said");
+            Hex.True(GuildWarManager.DeclareLimit == 10 && MatchComposition.RoleOf(0) == MatchRole.Dps
+                     && ArbiterClientHandlers.BuildPvpLeaderBoardInfo().SequenceEqual(ArbiterClientHandlers.BuildLeaderBoardInfo(
+                         ArbiterClientHandlers.S_PVP_LEADER_BOARD_INFO, ArbiterClientHandlers.LeaderBoardLivePvp, RankingBoards.CurrentSeason,
+                         ArbiterClientHandlers.LeaderBoardLivePvpStart, ArbiterClientHandlers.LeaderBoardLivePvpEnd)),
+                "and the built-ins are the old constants");
+        }
+        finally
+        {
+            DatasheetLoader.UseBuiltIns();
+            try { Directory.Delete(dir, true); Directory.Delete(empty, true); } catch (IOException) { }
+        }
+    }
+
+    /// <summary>--check-config lists every sheet without disturbing the values in use.</summary>
+    [Test] public static void T159_check_config_lists_every_sheet()
+    {
+        string report = SelfTest.BuildConfigReport(new[] { ("db", "x.db") });
+        Hex.True(report.Contains("  datasheets"), "a datasheets section");
+        foreach (var s in DatasheetLoader.All)
+            Hex.True(report.Contains(s.Sheet), s.Sheet);
+        Hex.True(!DatasheetLoader.GuildSizes.Status.FromSheet, "probing did not load anything");
+    }
+
+    // ============ T162: data-driven character start + the level-jump family ====================
+
+    /// <summary>CreateCharData.xml alone decides a new character's level and bag - a scroll row or
+    /// createdLevel="70" is all a server needs; a class the sheet leaves out keeps the built-in.</summary>
+    [Test] public static void T162_created_level_and_starter_items_come_from_the_sheet()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "t162-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            File.WriteAllText(Path.Combine(dir, "CreateCharData.xml"), "\uFEFF" + """
+                <?xml version="1.0" encoding="utf-8"?>
+                <CreateCharData>
+                  <Char class="glaiver" createdLevel="70">
+                    <InitItem itemTemplateId="59053" initWear="true" amount="1" />
+                    <InitItem itemTemplateId="6550" initWear="false" amount="20" />
+                    <InitItem itemTemplateId="207631" initWear="false" amount="1" /><!--T160 level-70 jump scroll-->
+                    <InitMoney amount="0" />
+                  </Char>
+                  <Char class="lancer" createdLevel="0"><InitItem itemTemplateId="10002" initWear="true" amount="1" /></Char>
+                  <Char class="warrior"><InitItem itemTemplateId="10001" initWear="true" amount="1" /></Char>
+                </CreateCharData>
+                """);
+            Hex.True(DatasheetLoader.CreatedLevels.Load(dir).FromSheet && DatasheetLoader.StarterKits.Load(dir).FromSheet, "both read");
+            Hex.True(StarterInventory.CreatedLevelFor(GlaiverClassId) == 70, "glaiver made at 70");
+            Hex.True(StarterInventory.CreatedLevelFor(1) == 1 && StarterInventory.CreatedLevelFor(WarriorClassId) == 1,
+                "0 and a missing createdLevel read as 1, as the Arbiter reads them");
+            Hex.True(StarterInventory.CreatedLevelFor(SoullessClassId) == 50 && StarterInventory.CreatedLevelFor(99) == 1,
+                "soulless, absent from this sheet, keeps the built-in 50");
+            Hex.True(StarterInventory.ForClass(GlaiverClassId)!.SequenceEqual(new[] {
+                    new StarterItem(59053, 1, 14, 1), new StarterItem(6550, 20, 0, 0), new StarterItem(207631, 1, 0, 1) }),
+                "the scroll goes to the bag behind the potion");
+
+            var captured = LoadStarterInventoryOrSkip();
+            if (captured != null)
+            {
+                var built = StarterInventory.Build(captured, GlaiverClassId, playerId: 7, reqId: 1)!;
+                int i = Enumerable.Range(0, RecCount(built)).Single(n => RecInt(built, n, StarterInventory.RecordTemplateIdOffset) == 207631);
+                Hex.True(RecInt(built, i, StarterInventory.RecordAmountOffset) == 1
+                         && RecInt(built, i, StarterInventory.RecordPocketOffset) == StarterInventory.BagPocket
+                         && RecInt(built, i, StarterInventory.RecordSlotOffset) == 1, "0x27A4 carries it at bag slot 1");
+            }
+            var template = LoadStarterTemplateOrSkip();
+            if (template != null)
+            {
+                var req = new CreateUserRequest
+                {
+                    Race = 4, Gender = 1, Class = GlaiverClassId, Name = "Scroll",
+                    Appearance = new byte[8], Details = new byte[32], Shape = new byte[64],
+                };
+                var rec = CharacterHandlers.BuildRecord(req, accountId: 1, position: 1, template, playerId: 7);
+                Hex.True(rec.Level == 70, $"the new row is level {rec.Level}");
+            }
+
+            Directory.Delete(dir, true);
+            Hex.True(!DatasheetLoader.CreatedLevels.Load(dir).FromSheet && StarterInventory.CreatedLevelFor(GlaiverClassId) == 1
+                     && StarterInventory.CreatedLevelFor(SoullessClassId) == 50, "no sheet: the transcribed levels");
+        }
+        finally
+        {
+            DatasheetLoader.UseBuiltIns();
+            try { if (Directory.Exists(dir)) Directory.Delete(dir, true); } catch (IOException) { }
+        }
+    }
+
+    /// <summary>The scroll no longer wedges: each of the three is answered [DlmId][ok 1] - World's
+    /// Handler_DBS_* reads @6 / @0A of an 11-byte frame - and the item it uses up is applied. The
+    /// level is not ours to set: World sends it as S_UPDATE_EXP_LEVEL, so nothing is queued.</summary>
+    [Test] public static void T162_level_jump_scroll_is_answered_and_consumed()
+    {
+        foreach (var (op, dlm) in new[] { (DbProxyHandlers.SDB_INCREMENT_CHARACTER_LEVEL, 0x51u),
+                                          (DbProxyHandlers.SDB_INCREMENT_CHARACTER_LEVEL_JUMP, 0x52u),
+                                          (DbProxyHandlers.SDB_INCREMENT_CHARACTER_LEVEL_PERFECT_JUMP, 0x53u) })
+        {
+            using var store = GuildStore(1);
+            WorldLevelSync.TryTake(1, out _);   // T162b: T101b leaves a queued level for player 1 - not the scroll's doing
+            store.UpsertItem(900, 1, BagItems.Pocket, 3, 207631, 1);
+            int before = store.CountInventoryItems(1);
+            var p = T44AtomPayload(16,
+                (WarehouseHandlers.TsChangeItemAmount, 900, 207631, 1, BagItems.Pocket, 3u, 1, BagItems.Pocket, 3u, -1),
+                (WarehouseHandlers.TsDetachStack, 900, 207631, 1, BagItems.Pocket, 3u, 1, BagItems.Pocket, 3u, 0),
+                (WarehouseHandlers.TsDeleteItem, 900, 207631, 1, BagItems.Pocket, 3u, 1, BagItems.Pocket, 3u, 0));
+            BitConverter.GetBytes(dlm).CopyTo(p, 8);
+            BitConverter.GetBytes(1).CopyTo(p, 12);
+            Hex.True(DbProxyHandlers.IsHandledRequest(op) && DbAckTable.Covers(op), $"0x{op:X4} answered");
+
+            var (rop, body) = RunHandler1(op, p, store);
+            Hex.True(rop == op + 1, $"0x{rop:X4}");
+            Hex.Eq(body, $"{dlm:X2} 00 00 00 01", $"0x{op:X4}: [DlmId][ok]");
+            Hex.True(store.CountInventoryItems(1) == before - 1, "the scroll is used up");
+            Hex.True(store.GetCharacter(1)!.Level == 31 && !WorldLevelSync.IsPending(1), "the level is World's to send");
+        }
+    }
+
+    // ============ T164: the two requests that wedged the scroll session (cap_scroll.log) =========
+
+    /// <summary>0x28AE: cap_scroll 18110 is the scroll's last request, an EMPTY quest list (player
+    /// 11, dlm 0x33D); the reply is [ref -> nothing new][DlmId]. With ids, each is stored complete,
+    /// served by 0x272D after a relog, and only the new ones go back.</summary>
+    [Test] public static void T164_mark_as_quest_completed_is_answered_and_stored()
+    {
+        Hex.True(DbProxyHandlers.IsHandledRequest(DbProxyHandlers.SDB_MARK_AS_QUEST_COMPLETED), "0x28AE allow-listed");
+        using var store = GuildStore(1);
+        var (op, body) = RunHandler1(DbProxyHandlers.SDB_MARK_AS_QUEST_COMPLETED,
+            Hex.B("16 00 00 00 00 00 00 00 3D 03 00 00 0B 00 00 00"), store);
+        Hex.True(op == DbProxyHandlers.DBS_MARK_AS_QUEST_COMPLETED, $"0x{op:X4}");
+        Hex.Eq(body, "12 00 00 00 00 00 00 00 3D 03 00 00", "cap_scroll 18110: empty list, dlm 0x33D");
+
+        var rec = new byte[80];
+        BitConverter.GetBytes(3).CopyTo(rec, 0); BitConverter.GetBytes(7003).CopyTo(rec, 4);
+        BitConverter.GetBytes(1).CopyTo(rec, 8); BitConverter.GetBytes(2).CopyTo(rec, 12);
+        store.UpsertQuest(1, 7003, 1, 2, rec);                                 // in progress
+        store.MarkQuestCompleted(1, 7001);                                     // already complete
+        var req = Hex.B("16 00 00 00 0C 00 00 00 40 00 00 00 01 00 00 00 59 1B 00 00 5A 1B 00 00 5B 1B 00 00");
+        (_, body) = RunHandler1(DbProxyHandlers.SDB_MARK_AS_QUEST_COMPLETED, req, store);
+        Hex.Eq(body, "12 00 00 00 08 00 00 00 40 00 00 00 5A 1B 00 00 5B 1B 00 00", "7001 was done: 7002 and 7003 come back");
+        Hex.True(store.GetCompletedQuestIds(1).OrderBy(i => i).SequenceEqual(new[] { 7001, 7002, 7003 }), "all three stored complete");
+        Hex.True(store.GetActiveQuestRecords(1).Count == 0, "7003 left the active list");
+        (_, body) = RunHandler1(DbProxyHandlers.SDB_MARK_AS_QUEST_COMPLETED, req, store);
+        Hex.Eq(body, "12 00 00 00 00 00 00 00 40 00 00 00", "again: nothing new");
+        (_, body) = RunHandler1(DbProxyHandlers.SDB_MARK_AS_QUEST_COMPLETED, Hex.B("FF FF 00 00 40 00 00 00 41 00 00 00 01 00 00 00"), store);
+        Hex.Eq(body, "12 00 00 00 00 00 00 00 41 00 00 00", "a ref outside the frame reads as empty");
+    }
+
+    /// <summary>0x2790: cap_scroll 14359, caludesucks (9) learns 111110 with the flag set and item
+    /// 1100 (template 70) is used up (op 6 + 11). The reply is 0x278F's shape with a third list:
+    /// atoms echoed at 37, empty periods, one {skillId, 1} per listed pair.</summary>
+    [Test] public static void T164_learn_skill_for_multiple_is_answered_and_applied()
+    {
+        Hex.True(DbProxyHandlers.IsHandledRequest(DbProxyHandlers.SDB_USER_LEARN_SKILL_FOR_MULTIPLE), "0x2790 allow-listed");
+        using var store = GuildStore(9);
+        store.UpsertItem(1100, 9, BagItems.Pocket, 14, 70, 1);
+        int before = store.CountInventoryItems(9);
+        var p = T44AtomPayload(DbProxyHandlers.LearnMultiReqFixed,
+            (WarehouseHandlers.TsDetachStack, 1100, 70, 9, BagItems.Pocket, 14u, 9, BagItems.Pocket, 14u, 0),
+            (WarehouseHandlers.TsDeleteItem, 1100, 70, 9, BagItems.Pocket, 14u, 9, BagItems.Pocket, 14u, 0));
+        Hex.B("30 00 00 00 B0 06 00 00 E0 06 00 00 00 00 00 00 29 02 00 00 09 00 00 00 06 B2 01 00 01 F0 CC 01 00 01 00 00 00 00 00 00 00 00")
+            .CopyTo(p, 0);                                                      // cap_scroll 14359's header
+        Hex.True(p.Length + 6 == 1760, "the captured frame size");
+
+        var (op, body) = RunHandler1(DbProxyHandlers.SDB_USER_LEARN_SKILL_FOR_MULTIPLE, p, store);
+        Hex.True(op == DbProxyHandlers.DBS_USER_LEARN_SKILL_FOR_MULTIPLE, $"0x{op:X4}");
+        Hex.Eq(body.Take(31).ToArray(),
+            "25 00 00 00 B0 06 00 00 D5 06 00 00 00 00 00 00 D5 06 00 00 00 00 00 00 29 02 00 00 01 00 00",
+            "[atoms 37/1712][periods empty][pairs empty][dlm 0x229][ok 1][0][0]");
+        Hex.True(body.Skip(31).SequenceEqual(p.Skip(42)), "the two atoms echoed verbatim");
+        Hex.True(store.CountInventoryItems(9) == before - 1, "item 1100 is used up");
+
+        var withPairs = new byte[p.Length + 16];
+        p.CopyTo(withPairs, 0);
+        BitConverter.GetBytes((uint)(6 + p.Length)).CopyTo(withPairs, 8);
+        BitConverter.GetBytes(16u).CopyTo(withPairs, 12);
+        Hex.B("07 B2 01 00 00 00 00 00 08 B2 01 00 01 00 00 00").CopyTo(withPairs, p.Length);
+        var r = DbProxyHandlers.BuildDbs2791(withPairs, () => 1);
+        Hex.Eq(r.Skip(16).Take(8).ToArray(), "D5 06 00 00 10 00 00 00", "pairs at 1749, 16 bytes");
+        Hex.Eq(r.Skip(31 + 1712).ToArray(), "07 B2 01 00 01 00 00 00 08 B2 01 00 01 00 00 00", "each pair answered as learned");
+        var empty = DbProxyHandlers.BuildDbs2791(Array.Empty<byte>(), () => 1);
+        Hex.Eq(empty, "25 00 00 00 00 00 00 00 25 00 00 00 00 00 00 00 25 00 00 00 00 00 00 00 00 00 00 00 01 00 00", "short request: still answered");
+    }
+
+    // ============ T166: enchanting - generic item transactions, record edits in ItemEdits =======
+
+    static readonly ushort[] T166Ops = { 0x275A, 0x276E, 0x2770, 0x2774, 0x28A1, 0x28F4, 0x2920, 0x2932, 0x2934, 0x295F };
+
+    /// <summary>A T166 request: [ref -> atoms][DlmId][UserDbId], every atom on the user's own item.</summary>
+    static byte[] T166Req(uint dlm, int user, params (uint Op, long Id, int Tmpl, uint Inven, uint Slot, long Delta)[] atoms)
+    {
+        var p = T44AtomPayload(16, atoms.Select(x => (x.Op, x.Id, x.Tmpl, (long)user, x.Inven, x.Slot, (long)user, x.Inven, x.Slot, x.Delta)).ToArray());
+        BitConverter.GetBytes(dlm).CopyTo(p, 8);
+        BitConverter.GetBytes(user).CopyTo(p, 12);
+        return p;
+    }
+
+    /// <summary>Payload offset of a field of atom <paramref name="n"/> in a T166Req / its reply.</summary>
+    static int T166AtReq(int n, int field) => 16 + n * DbProxyHandlers.ItemAtomSize + field;
+    static int T166AtRep(int n, int field) => 13 + n * DbProxyHandlers.ItemAtomSize + field;
+
+    static byte[] T166Item(int id, int tmpl, int owner, int amount, int pocket, int slot, int enchant = 0)
+    {
+        var r = WarehouseHandlers.BuildItemRecord(id, tmpl, owner, amount, pocket, slot);
+        BitConverter.GetBytes(enchant).CopyTo(r, ItemEdits.RecEnchantLevel);
+        return r;
+    }
+
+    static int T166Rec(TeraSharp.Arbiter.Persistence.CharacterStore s, int id, int off) => BitConverter.ToInt32(s.GetItem(id)!.Record!, off);
+
+    /// <summary>Allow-list + wedge guard: every live op is answered and none is sealed one-way;
+    /// the dead SDB_ITEM_DECOMPOSE stays out.</summary>
+    [Test] public static void T166_enchanting_ops_are_answered_and_wedge_guarded()
+    {
+        foreach (ushort op in T166Ops)
+        {
+            Hex.True(DbProxyHandlers.IsHandledRequest(op), $"0x{op:X4} answered - its DlmId would wedge the queue");
+            Hex.True(!DbAckTable.Covers(op) && DbAckGroups.Of(op) == DbAckGroups.Group.Handled && DbAckGroups.Landed.ContainsKey(op),
+                $"0x{op:X4}: a real handler (T165 C -> Handled), never a generic ack");
+            Hex.True(!WorldReplayTable.OneWayFromWorld.Contains(op), $"0x{op:X4} is not one-way");
+            Hex.True(DbProxyHandlers.ItemUpgradeSpecs[op].ReplyOp == op + 1, $"0x{op:X4} -> +1");
+        }
+        Hex.True(!DbProxyHandlers.IsHandledRequest(0x275C), "SDB_ITEM_DECOMPOSE is dead on both sides");
+        var merge = DbProxyHandlers.BuildItemUpgradeReply(DbProxyHandlers.SDB_ITEM_MERGE, T166Req(0x44, 1), null);
+        Hex.Eq(merge.Reply, "44 00 00 00 01", "MERGE answers [DlmId][ok] only");
+    }
+
+    /// <summary>ENCHANT: World rolls; success sends the new level, failure only the materials and
+    /// the adjustment. Both consume the fodder and the alkahest; the header is the generic one.</summary>
+    [Test] public static void T166_enchant_success_and_failure_follow_world()
+    {
+        using var store = GuildStore(1);
+        store.UpsertItem(500, 1, 14, 1, 10001, 1, T166Item(500, 10001, 1, 1, 14, 1, enchant: 2));
+        store.UpsertItem(501, 1, BagItems.Pocket, 3, 10001, 1);
+        store.UpsertItem(502, 1, BagItems.Pocket, 4, 6552, 5);
+        var ok = T166Req(0x60, 1,
+            (WarehouseHandlers.TsChangeItemAmount, 502, 6552, BagItems.Pocket, 4u, -1),
+            (WarehouseHandlers.TsDeleteItem, 501, 10001, BagItems.Pocket, 3u, 0),
+            (WarehouseHandlers.TsDetachStack, 501, 10001, BagItems.Pocket, 3u, 0),
+            (ItemEdits.TsAddEnchantMaterial, 500, 10001, 14u, 1u, 0),
+            (ItemEdits.TsEnchantItem, 500, 10001, 14u, 1u, 0),
+            (ItemEdits.TsChangeEnchantAdjustment, 500, 10001, 14u, 1u, 0));
+        BitConverter.GetBytes(4).CopyTo(ok, T166AtReq(3, ItemEdits.AtomEnchantMaterial));
+        BitConverter.GetBytes(3).CopyTo(ok, T166AtReq(4, ItemEdits.AtomNewEnchant));
+        BitConverter.GetBytes(2).CopyTo(ok, T166AtReq(4, ItemEdits.AtomOldEnchant));
+        BitConverter.GetBytes(0).CopyTo(ok, T166AtReq(5, ItemEdits.AtomEnchantAdjustment));
+
+        var (op, body) = RunHandler1(DbProxyHandlers.SDB_ITEM_ENCHANT, ok, store);
+        Hex.True(op == 0x276F, $"0x{op:X4}");
+        Hex.Eq(body.Take(13).ToArray(), "13 00 00 00 10 14 00 00 60 00 00 00 01", "[ref 19 / 6 atoms][DlmId][ok]");
+        Hex.True(body.Skip(13).SequenceEqual(ok.Skip(16)), "atoms echoed as sent");
+        Hex.True(T166Rec(store, 500, ItemEdits.RecEnchantLevel) == 3 && T166Rec(store, 500, ItemEdits.RecEnchantMaterial) == 4
+                 && T166Rec(store, 500, ItemEdits.RecEnchantAdjustment) == 0, "+3, material count 4, adjustment reset");
+        Hex.True(store.GetItem(501) == null && store.GetItem(502)!.Amount == 4, "fodder and one alkahest used up");
+
+        var fail = T166Req(0x61, 1,
+            (WarehouseHandlers.TsChangeItemAmount, 502, 6552, BagItems.Pocket, 4u, -1),
+            (ItemEdits.TsAddEnchantMaterial, 500, 10001, 14u, 1u, 0),
+            (ItemEdits.TsChangeEnchantAdjustment, 500, 10001, 14u, 1u, 0));
+        BitConverter.GetBytes(5).CopyTo(fail, T166AtReq(1, ItemEdits.AtomEnchantMaterial));
+        BitConverter.GetBytes(250).CopyTo(fail, T166AtReq(2, ItemEdits.AtomEnchantAdjustment));
+        (_, body) = RunHandler1(DbProxyHandlers.SDB_ITEM_ENCHANT, fail, store);
+        Hex.True(body[12] == 1, "a failed roll is still a committed transaction");
+        Hex.True(T166Rec(store, 500, ItemEdits.RecEnchantLevel) == 3 && T166Rec(store, 500, ItemEdits.RecEnchantAdjustment) == 250
+                 && store.GetItem(502)!.Amount == 3, "level unchanged, fail bonus stored, material consumed");
+    }
+
+    /// <summary>ENCHANT_IDENTIFY: the new level, and with the make-masterwork flag the Arbiter's
+    /// write-back (grade 0, masterwork 1) goes into the echo and the record; awaken sets +0x139.</summary>
+    [Test] public static void T166_enchant_identify_masterwork_and_awaken()
+    {
+        using var store = GuildStore(1);
+        store.UpsertItem(600, 1, BagItems.Pocket, 2, 12345, 1, T166Item(600, 12345, 1, 1, BagItems.Pocket, 2, enchant: 5));
+        var p = T166Req(0x70, 1, (ItemEdits.TsEnchantIdentifyItem, 600, 12345, BagItems.Pocket, 2u, 0));
+        BitConverter.GetBytes(6).CopyTo(p, T166AtReq(0, ItemEdits.AtomNewEnchant));
+        BitConverter.GetBytes(5).CopyTo(p, T166AtReq(0, ItemEdits.AtomOldEnchant));
+        BitConverter.GetBytes(3).CopyTo(p, T166AtReq(0, ItemEdits.AtomGrade));
+        p[T166AtReq(0, ItemEdits.AtomMakeMasterwork)] = 1;
+        p[T166AtReq(0, ItemEdits.AtomMakeAwakened)] = 1;
+        var (op, body) = RunHandler1(DbProxyHandlers.SDB_ITEM_ENCHANT_IDENTIFY, p, store);
+        Hex.True(op == 0x2771, $"0x{op:X4}");
+        Hex.True(BitConverter.ToInt32(body, T166AtRep(0, ItemEdits.AtomGrade)) == 0 && body[T166AtRep(0, ItemEdits.AtomMasterwork)] == 1,
+            "echo: grade 0, masterwork 1 (DO_TS_ENCHANT_IDENTIFY_ITEM's write-back)");
+        var rec = store.GetItem(600)!.Record!;
+        Hex.True(BitConverter.ToInt32(rec, ItemEdits.RecEnchantLevel) == 6 && rec[ItemEdits.RecMasterwork] == 1
+                 && BitConverter.ToInt32(rec, ItemEdits.RecGrade) == 0 && rec[ItemEdits.RecAwakened] == 1, "record: +6, masterwork, awakened");
+    }
+
+    /// <summary>AWAKEN, BOOST, UNBIND, INHERITANCE, EXTRACT, DECOMPOSITION, MERGE: each op's fields
+    /// land where its DO_TS writes them, outputs get ids, consumed items go.</summary>
+    [Test] public static void T166_awaken_boost_unbind_inherit_extract_merge()
+    {
+        using var store = GuildStore(1);
+        store.UpsertItem(700, 1, 14, 1, 20001, 1, T166Item(700, 20001, 1, 1, 14, 1, enchant: 9));
+        store.UpsertItem(701, 1, BagItems.Pocket, 5, 20002, 1, T166Item(701, 20002, 1, 1, BagItems.Pocket, 5, enchant: 7));
+        store.UpsertItem(702, 1, BagItems.Pocket, 6, 6553, 3);
+
+        var aw = T166Req(0x80, 1, (WarehouseHandlers.TsChangeItemAmount, 702, 6553, BagItems.Pocket, 6u, -1),
+                                  (ItemEdits.TsAwakenItem, 700, 20001, 14u, 1u, 0));
+        RunHandler1(DbProxyHandlers.SDB_ITEM_AWAKEN, aw, store);
+        Hex.True(store.GetItem(700)!.Record![ItemEdits.RecAwakened] == 1 && store.GetItem(702)!.Amount == 2, "awakened, material used");
+
+        var bo = T166Req(0x81, 1, (ItemEdits.TsChangeEnchantBooster, 700, 20001, 14u, 1u, 0),
+                                  (ItemEdits.TsEnchantItem, 701, 20002, BagItems.Pocket, 5u, 0));
+        BitConverter.GetBytes(15).CopyTo(bo, T166AtReq(0, ItemEdits.AtomBoosterBonus));
+        BitConverter.GetBytes(7).CopyTo(bo, T166AtReq(0, ItemEdits.AtomBoosterLevel));
+        BitConverter.GetBytes(7).CopyTo(bo, T166AtReq(1, ItemEdits.AtomOldEnchant));
+        RunHandler1(DbProxyHandlers.SDB_ENCHANT_ITEM_BOOST, bo, store);
+        Hex.True(T166Rec(store, 700, ItemEdits.RecBoosterBonus) == 15 && T166Rec(store, 700, ItemEdits.RecBoosterLevel) == 7
+                 && T166Rec(store, 701, ItemEdits.RecEnchantLevel) == 0, "target boosted, source enchant reset");
+
+        var rec = store.GetItem(700)!.Record!;
+        rec[WarehouseHandlers.RecordBoundFlag] = 1;
+        BitConverter.GetBytes(77L).CopyTo(rec, ItemEdits.RecEquipmentExp);
+        store.UpsertItem(700, 1, 14, 1, 20001, 1, rec);
+        var ub = T166Req(0x82, 1, (WarehouseHandlers.TsUnbindItem, 700, 20001, 14u, 1u, 0),
+                                  (ItemEdits.TsChangeEquipmentExp, 700, 20001, 14u, 1u, 0));
+        BitConverter.GetBytes(1).CopyTo(ub, T166AtReq(0, WarehouseHandlers.AtomBoundExtra));
+        RunHandler1(DbProxyHandlers.SDB_ITEM_UNBIND, ub, store);
+        rec = store.GetItem(700)!.Record!;
+        Hex.True(rec[WarehouseHandlers.RecordBoundFlag] == 0 && BitConverter.ToInt32(rec, WarehouseHandlers.RecordBoundExtra) == 1
+                 && BitConverter.ToInt64(rec, ItemEdits.RecEquipmentExp) == 0, "unbound, unbind count 1, equipment exp cleared");
+
+        var ih = T166Req(0x83, 1, (WarehouseHandlers.TsInsertNonStackItem, 0, 20003, BagItems.Pocket, 7u, 1),
+                                  (WarehouseHandlers.TsDeleteItem, 700, 20001, 14u, 1u, 0),
+                                  (WarehouseHandlers.TsDeleteItem, 701, 20002, BagItems.Pocket, 5u, 0));
+        BitConverter.GetBytes(9).CopyTo(ih, T166AtReq(0, ItemEdits.AtomNewEnchant));
+        var (_, body) = RunHandler1(DbProxyHandlers.SDB_EQUIPMENT_INHERITANCE, ih, store);
+        int newId = BitConverter.ToInt32(body, T166AtRep(0, WarehouseHandlers.AtomItemDbId));
+        Hex.True(newId != 0 && store.GetItem(newId)?.TemplateId == 20003 && T166Rec(store, newId, ItemEdits.RecEnchantLevel) == 9,
+            "the inherited item gets an id, echoed, and keeps the enchant");
+        Hex.True(store.GetItem(700) == null && store.GetItem(701) == null, "both sources consumed");
+
+        var ex = T166Req(0x84, 1, (WarehouseHandlers.TsChangeItemAmount, 702, 6553, BagItems.Pocket, 6u, -1),
+                                  (WarehouseHandlers.TsInsertItem, 0, 6560, BagItems.Pocket, 8u, 3));
+        (_, body) = RunHandler1(DbProxyHandlers.SDB_ITEM_EXTRACT, ex, store);
+        int outId = BitConverter.ToInt32(body, T166AtRep(1, WarehouseHandlers.AtomItemDbId));
+        Hex.True(outId != 0 && store.GetItem(outId)!.Amount == 3 && store.GetItem(702)!.Amount == 1, "extract: source used, output inserted");
+        (_, body) = RunHandler1(DbProxyHandlers.SDB_ITEM_DECOMPOSITION,
+            T166Req(0x85, 1, (WarehouseHandlers.TsDeleteItem, newId, 20003, BagItems.Pocket, 7u, 0),
+                             (WarehouseHandlers.TsInsertItem, 0, 6561, BagItems.Pocket, 9u, 2)), store);
+        Hex.True(store.GetItem(newId) == null && BitConverter.ToInt32(body, T166AtRep(1, WarehouseHandlers.AtomItemDbId)) != 0,
+            "decomposition: item gone, materials in");
+
+        (_, body) = RunHandler1(DbProxyHandlers.SDB_ITEM_MERGE,
+            T166Req(0x86, 1, (ItemEdits.TsPeriodItemExtend, outId, 6560, BagItems.Pocket, 8u, 0),
+                             (WarehouseHandlers.TsDeleteItem, 702, 6553, BagItems.Pocket, 6u, 0)), store);
+        Hex.Eq(body, "86 00 00 00 01", "merge: [DlmId][ok]");
+        Hex.True(store.GetItem(702) == null, "the consumed item is deleted (op 67's time transfer is not modelled)");
+    }
+
+    /// <summary>SDB_ITEM_UNIDENTIFY is item option reset (op 92). cap_multiworld 10859 -> 10860:
+    /// the reply header is 13 00 00 00 58 03 00 00 DC 00 00 00 01 and the atom comes back; the
+    /// passive sets and grade land in the record. (The real Arbiter also fills empty passive slots
+    /// from template data - not modelled.)</summary>
+    [Test] public static void T166_option_reset_matches_the_live_header_and_stores_passives()
+    {
+        using var store = GuildStore(1);
+        store.UpsertItem(10067, 1, BagItems.Pocket, 24, 72277, 1);
+        var p = T166Req(0xDC, 1, (ItemEdits.TsItemOptionReset, 10067, 72277, BagItems.Pocket, 24u, 0));
+        foreach (var (i, v) in new[] { (0, 0x641A4), (1, 0x1583E4), (15, 0x641C3) })
+            BitConverter.GetBytes(v).CopyTo(p, T166AtReq(0, ItemEdits.AtomPassives + 4 * i));
+        var (op, body) = RunHandler1(DbProxyHandlers.SDB_ITEM_UNIDENTIFY, p, store);
+        Hex.True(op == 0x28A2, $"0x{op:X4}");
+        Hex.Eq(body.Take(13).ToArray(), "13 00 00 00 58 03 00 00 DC 00 00 00 01", "cap_multiworld 10860's header");
+        var rec = store.GetItem(10067)!.Record!;
+        Hex.True(BitConverter.ToInt32(rec, ItemEdits.RecPassives) == 0x641A4 && BitConverter.ToInt32(rec, ItemEdits.RecPassives + 4) == 0x1583E4
+                 && BitConverter.ToInt32(rec, ItemEdits.RecPassives + 60) == 0x641C3 && BitConverter.ToInt32(rec, ItemEdits.RecGrade) == 0,
+            "both passive sets and the grade stored");
+    }
+
+    // ============ T154: SDB_LOAD_CITY_GUILD_INFO answered from city_guild ======================
+
+    /// <summary>The live answer is "no owning guild" - [count 0][first 0][LeagueId][SeasonId] -
+    /// in every capture: arb_world.log / cap_invensize (league 1, season 1) and cap_social4 /
+    /// cap_final (1, 2). An empty city_guild table reproduces both byte for byte.</summary>
+    [Test] public static void T154_city_guild_info_no_owner_is_byte_exact()
+    {
+        Hex.True(DbProxyHandlers.IsHandledRequest(DbProxyHandlers.SDB_LOAD_CITY_GUILD_INFO), "0x2954 allow-listed");
+        using var store = GuildStore(1);
+        foreach (var (req, rep) in new[] {
+                     ("01 00 00 00 01 00 00 00", "00 00 00 00 00 00 00 00 01 00 00 00 01 00 00 00"),
+                     ("01 00 00 00 02 00 00 00", "00 00 00 00 00 00 00 00 01 00 00 00 02 00 00 00") })
+        {
+            var (op, body) = RunHandler1(DbProxyHandlers.SDB_LOAD_CITY_GUILD_INFO, Hex.B(req), store);
+            Hex.True(op == DbProxyHandlers.DBS_LOAD_CITY_GUILD_INFO, $"0x{op:X4}");
+            Hex.Eq(body, rep, $"request {req}");
+        }
+        var (_, bare) = RunHandler1(DbProxyHandlers.SDB_LOAD_CITY_GUILD_INFO, Array.Empty<byte>());
+        Hex.Eq(bare, "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00", "an empty request is still answered");
+    }
+
+    /// <summary>A stored owner goes out as the linked list Handler_DBS_LOAD_CITY_GUILD_INFO walks:
+    /// first element at the frame offset in +4, each element's own offset first, next offset second,
+    /// 0 on the last, 44 bytes each. Only the asked league and season.</summary>
+    [Test] public static void T154_stored_city_guilds_are_served_as_worlds_linked_list()
+    {
+        using var store = GuildStore(1);
+        store.SetCityGuild(new(1, 2, 7, 1111, 2222, 3, 4, 5, 6));
+        store.SetCityGuild(new(1, 2, 9, 0, 0, 10, 11, 12, 13));
+        store.SetCityGuild(new(1, 3, 8, 0, 0, 0, 0, 0, 0));
+        var (_, body) = RunHandler1(DbProxyHandlers.SDB_LOAD_CITY_GUILD_INFO, Hex.B("01 00 00 00 02 00 00 00"), store);
+        Hex.True(body.Length == 16 + 2 * 44 && BitConverter.ToInt32(body, 0) == 2
+                 && BitConverter.ToInt32(body, 8) == 1 && BitConverter.ToInt32(body, 12) == 2, "two guilds, league 1 season 2");
+
+        var guilds = new List<int>();
+        int frameLen = body.Length + 6, off = BitConverter.ToInt32(body, 4);
+        while (off != 0 && off + 44 <= frameLen && BitConverter.ToInt32(body, off - 6) == off)   // World's walk
+        {
+            int e = off - 6;
+            guilds.Add(BitConverter.ToInt32(body, e + 8));
+            if (guilds.Count == 1)
+                Hex.True(BitConverter.ToInt64(body, e + 12) == 1111 && BitConverter.ToInt64(body, e + 20) == 2222
+                         && BitConverter.ToInt32(body, e + 28) == 3 && BitConverter.ToInt32(body, e + 40) == 6, "first element's fields");
+            off = BitConverter.ToInt32(body, e + 4);
+        }
+        Hex.True(guilds.SequenceEqual(new[] { 7, 9 }), "walked " + string.Join(",", guilds));
+        store.SetCityGuild(new(1, 2, 7, 1111, 2222, 30, 4, 5, 6));
+        Hex.True(store.GetCityGuilds(1, 2).Count == 2 && store.GetCityGuilds(1, 2)[0].TotalKill == 30, "a re-store replaces");
+    }
+
+    /// <summary>0x28B8 SDB_PUBLISH_INVITE_CODE is one-way: no DBS_ twin in World's opcode table,
+    /// Handler_SDB_PUBLISH_INVITE_CODE (Arb_part_063.c:18787) only calls User::PublishInviteCode
+    /// and sends nothing back, and no A-&gt;W frame follows it in cap_social4 (2x) or cap_makeitem (3x).</summary>
+    [Test] public static void T154_publish_invite_code_stays_one_way()
+    {
+        Hex.True(WorldReplayTable.OneWayFromWorld.Contains(0x28B8), "0x28B8 sealed one-way");
+        Hex.True(!DbProxyHandlers.IsHandledRequest(0x28B8), "0x28B8 not answered");
+        for (int op = 0; op <= 0xFFFF; op++)
+            Hex.True(DbProxyOpcodeNames.Name((ushort)op) != "DBS_PUBLISH_INVITE_CODE", $"no twin (0x{op:X4})");
+    }
+
+    // ============ T153: atom op 8, the non-stackable insert (GM makeitem) ====================
+
+    /// <summary>data/cap_t153.bin keyed by tap sequence number (see data/cap_t153.md), or null.</summary>
+    static Dictionary<uint, byte[]>? T153Capture() => LoadTsisOrSkip("cap_t153.bin");
+
+    /// <summary>The first 856-byte atom of a DBS_ITEM_SINGLE / SDB_ITEM_SINGLE payload's list A.</summary>
+    static byte[] T153Atom(byte[] payload)
+    {
+        int at = (int)BitConverter.ToUInt32(payload, 0) - 6;
+        return payload[at..(at + DbProxyHandlers.ItemAtomSize)];
+    }
+
+    /// <summary>The 536-byte record with DB id <paramref name="id"/> in a 0x27A4 payload, or null.</summary>
+    static byte[]? T153Record(byte[] load27a4, int id)
+    {
+        int at = (int)BitConverter.ToUInt32(load27a4, 0) - 6, len = (int)BitConverter.ToUInt32(load27a4, 4);
+        for (int o = at; o + 536 <= at + len; o += 536)
+            if (BitConverter.ToInt32(load27a4, o) == id) return load27a4[o..(o + 536)];
+        return null;
+    }
+
+    /// <summary>The real Arbiter answers an op-8 create with the id at +0x10 and nothing else
+    /// changed: cap_final.log 5914 -&gt; 5915 (id 10044) and 5974 -&gt; 5975 (10045) are
+    /// byte-exact. cap_social4.log 8611 -&gt; 8612 also sets a template-derived byte at +0x104,
+    /// which needs item template data we do not load - that one byte is the only difference.</summary>
+    [Test] public static void T153_op8_create_is_answered_with_its_new_id()
+    {
+        Hex.True(WarehouseHandlers.TsInsertNonStackItem == 8, "op 8");
+        var cap = T153Capture();
+        if (cap == null) return;
+        foreach (var (req, rep, id) in new (uint, uint, int)[] { (5914, 5915, 10044), (5974, 5975, 10045) })
+        {
+            Hex.True(BitConverter.ToUInt32(T153Atom(cap[req]), WarehouseHandlers.AtomOp) == 8, $"seq {req} is op 8");
+            int next = id;
+            Hex.Eq(DbProxyHandlers.BuildDbs2769(cap[req], () => next++), cap[rep], $"cap_final.log {req} -> {rep}");
+        }
+        int n2 = 10040;
+        var ours = DbProxyHandlers.BuildDbs2769(cap[8611], () => n2++);
+        var diff = Enumerable.Range(0, ours.Length).Where(i => ours[i] != cap[8612][i]).ToArray();
+        Hex.True(ours.Length == cap[8612].Length && diff.Length == 1 && diff[0] == 21 + 0x104,
+            "cap_social4.log 8612: only atom +0x104 differs, at " + string.Join(",", diff));
+    }
+
+    /// <summary>The record ItemCreate builds from the create atom is the record the real Arbiter
+    /// served back for that item on the next load: cap_social2 10018, cap_social3 10030,
+    /// cap_multiworld 10052 and 10053, every mapped field (10018 was since moved one slot).</summary>
+    [Test] public static void T153_created_record_matches_the_real_arbiters_stored_item()
+    {
+        var cap = T153Capture();
+        if (cap == null) return;
+        foreach (var (reply, load, id) in new (uint, uint, int)[] { (1795, 3287, 10018), (1319, 3931, 10030),
+                                                                   (1257, 8966, 10052), (1703, 8966, 10053) })
+        {
+            var atom = T153Atom(cap[reply]);
+            Hex.True(BitConverter.ToInt32(atom, WarehouseHandlers.AtomItemDbId) == id, $"seq {reply} created {id}");
+            var ours = ItemCreate.BuildRecord(atom)!;
+            var real = T153Record(cap[load], id);
+            Hex.True(real != null && ours.Length == real.Length, $"{id} is in seq {load}");
+            foreach (var (a, r, n) in ItemCreate.Map)
+            {
+                if (id == 10018 && r == StarterInventory.RecordSlotOffset) continue;   // moved after creation
+                Hex.Eq(ours[r..(r + n)], real![r..(r + n)], $"{id}: record +0x{r:X} (atom +0x{a:X})");
+            }
+            foreach (int r in new[] { StarterInventory.RecordAmountOffset, StarterInventory.RecordPocketOffset, 0x114, 0x124, 0x1E4 })
+                Hex.Eq(ours[r..(r + 4)], real![r..(r + 4)], $"{id}: base field +0x{r:X}");
+            Hex.True(ours[ItemCreate.NameRecord] == 0 && real![ItemCreate.NameRecord] == 0
+                     && ours[ItemCreate.NameRecord + 1] == 0 && real[ItemCreate.NameRecord + 1] == 0, $"{id}: no custom name");
+        }
+    }
+
+    /// <summary>The live makeitem (cap_makeitem.log 15152, tap in front of TeraSharp): the
+    /// reply now carries a fresh id where TeraSharp used to echo 0 (seq 15153 otherwise
+    /// unchanged), the row lands at 0:1 with the atom's record (999 at +0x28 included), and the
+    /// next 0x27A4 serves it - at the slot the row says, after a move.</summary>
+    [Test] public static void T153_makeitem_gets_an_id_a_row_and_survives_relog()
+    {
+        var cap = T153Capture();
+        if (cap == null) return;
+        using var store = GuildStore(10);
+        var (op, body) = RunHandler1(DbProxyHandlers.SDB_SAVE_2768, cap[15152], store);
+        Hex.True(op == DbProxyHandlers.DBS_SAVE_2769, $"0x{op:X4}");
+        var atom = T153Atom(body);
+        int id = BitConverter.ToInt32(atom, WarehouseHandlers.AtomItemDbId);
+        Hex.True(id > 0, $"allocated id {id}");
+        var old = cap[15153];
+        var diff = Enumerable.Range(0, body.Length).Where(i => body[i] != old[i]).ToArray();
+        Hex.True(body.Length == old.Length && diff.All(i => i >= 21 + 0x10 && i < 21 + 0x18),
+            "only the id changed against the old echo: " + string.Join(",", diff.Take(8)));
+
+        var row = store.GetItem(id);
+        Hex.True(row != null && row.TemplateId == 88382 && row.OwnerDbId == 10 && row.InvenType == 0
+                 && row.Slot == 1 && row.Amount == 1, "row: template 88382, owner 10, 0:1, x1");
+        Hex.True(row!.Record != null && BitConverter.ToInt32(row.Record, 0x28) == 999
+                 && BitConverter.ToInt32(row.Record, 0) == id, "the atom's record is stored");
+
+        var served = T153Record(BagItems.BuildPayload(store.GetInventoryItems(10), 7, 10), id);
+        Hex.True(served != null && BitConverter.ToInt32(served, 0x28) == 999
+                 && BitConverter.ToInt32(served, StarterInventory.RecordSlotOffset) == 1, "0x27A4 serves it at 0:1");
+        store.MoveItem(id, 10, 0, 5);
+        served = T153Record(BagItems.BuildPayload(store.GetInventoryItems(10), 8, 10), id);
+        Hex.True(served != null && BitConverter.ToInt32(served, StarterInventory.RecordSlotOffset) == 5
+                 && BitConverter.ToInt32(served, 0x28) == 999, "after a move: slot 5, fields kept");
+    }
+
+    // ============ T150b: 0x283D re-landed alone, plus four generic acks proven by live pairs ====
+
+    /// <summary>data/cap_t150.bin keyed by tap sequence number (see data/cap_t150.md), or null.</summary>
+    static Dictionary<uint, byte[]>? T150Capture() => LoadTsisOrSkip("cap_t150.bin");
+
+    /// <summary>The world blob inside a DBS_USER_ENTERWORLD payload ([off][len][reqId][found][blob]).</summary>
+    static byte[] T150EnterBlob(byte[] reply)
+    {
+        int off = (int)BitConverter.ToUInt32(reply, 0) - 6, len = (int)BitConverter.ToUInt32(reply, 4);
+        return reply[off..(off + len)];
+    }
+
+    static byte[] T150IncInv(uint dlm, int user, int tab, int size, int delta, int reason)
+    {
+        var p = new byte[DbProxyHandlers.IncInvReqFixed];
+        BitConverter.GetBytes((uint)(6 + p.Length)).CopyTo(p, 0);   // empty ItemBinary at the frame end
+        BitConverter.GetBytes(dlm).CopyTo(p, DbProxyHandlers.IncInvReqDlmId);
+        BitConverter.GetBytes(user).CopyTo(p, DbProxyHandlers.IncInvReqUserDbId);
+        BitConverter.GetBytes(tab).CopyTo(p, DbProxyHandlers.IncInvReqTab);
+        BitConverter.GetBytes(size).CopyTo(p, DbProxyHandlers.IncInvReqNewSize);
+        BitConverter.GetBytes(delta).CopyTo(p, DbProxyHandlers.IncInvReqExpandDelta);
+        BitConverter.GetBytes(reason).CopyTo(p, DbProxyHandlers.IncInvReqReason);
+        return p;
+    }
+
+    static int T150I32(byte[] b, int at) => BitConverter.ToInt32(b, at);
+
+    /// <summary>The offsets, from the real Arbiter's own effect: cap_social4.log character 1
+    /// enters with 40 at +0x3AF0 (seq 250), asks for 48 (seq 3039 -&gt; 3040), and enters with 48
+    /// there and level 70 at +0xCC (seq 5715). Both blobs are the full 15312 bytes.</summary>
+    [Test] public static void T150b_bag_offsets_are_what_the_real_arbiter_writes()
+    {
+        const int slotsAt = TeraSharp.Arbiter.Persistence.StarterBlob.MaxInvenSlotCountOffset;
+        const int expandAt = TeraSharp.Arbiter.Persistence.StarterBlob.ExpandInvenCountOffset;
+        Hex.True(slotsAt == 0x3AF0 && expandAt == 0x3B00, "blob +0x3AF0 / +0x3B00");
+        var cap = T150Capture();
+        if (cap == null) return;
+        var before = T150EnterBlob(cap[250]);
+        var after = T150EnterBlob(cap[5715]);
+        Hex.True(before.Length == DbProxyHandlers.WorldBlobSize && after.Length == DbProxyHandlers.WorldBlobSize, "15312-byte blobs");
+        Hex.True(T150I32(before, 112) == 1 && T150I32(after, 112) == 1, "both are character 1");
+        Hex.True(T150I32(before, slotsAt) == 40 && T150I32(after, slotsAt) == 48, "40 -> 48 at +0x3AF0");
+        Hex.True(T150I32(before, expandAt) == 0 && T150I32(after, expandAt) == 0, "expand stays 0 (delta 0)");
+        Hex.True(T150I32(after, TeraSharp.Arbiter.Persistence.StarterBlob.LevelOffset) == 70, "level 70 at +0xCC");
+        Hex.True(BitConverter.ToUInt32(cap[3039], DbProxyHandlers.IncInvReqUserDbId) == 1
+                 && BitConverter.ToUInt32(cap[3039], DbProxyHandlers.IncInvReqNewSize) == 48, "seq 3039 asks 48 for character 1");
+    }
+
+    /// <summary>0x283D against the TeraSharp tap it wedged (cap_invensize.log): the level-70 blob
+    /// World got at seq 103 is stored, the seq 683 ask is answered [01][dlm], and the next
+    /// enter-world blob is the seq 103 blob with exactly four bytes changed - +0x3AF0, 40 -&gt; 48.
+    /// Level, money, length and everything else are what they were.</summary>
+    [Test] public static void T150b_bag_size_changes_four_bytes_of_the_real_level70_blob()
+    {
+        const int slotsAt = TeraSharp.Arbiter.Persistence.StarterBlob.MaxInvenSlotCountOffset;
+        var cap = T150Capture();
+        if (cap == null) return;
+        var real = T150EnterBlob(cap[103]);
+        Hex.True(real.Length == DbProxyHandlers.WorldBlobSize && T150I32(real, 112) == 10
+                 && T150I32(real, TeraSharp.Arbiter.Persistence.StarterBlob.LevelOffset) == 70
+                 && T150I32(real, slotsAt) == 40, "seq 103: character 10, level 70, 40 slots");
+
+        using var store = GuildStore(1);
+        store.SaveWorldBlob(1, (byte[])real.Clone());
+        store.UpdateLevelAndExp(1, 70, 0);
+        store.SetCharacterMoney(1, BitConverter.ToInt64(real, TeraSharp.Arbiter.Persistence.StarterBlob.MoneyOffset));
+
+        var ask = (byte[])cap[683].Clone();
+        BitConverter.GetBytes(1).CopyTo(ask, DbProxyHandlers.IncInvReqUserDbId);   // character 10 is our 1
+        var (op, body) = RunHandler1(DbProxyHandlers.SDB_INCREASE_INVENTORY_SIZE, ask, store);
+        Hex.True(op == DbProxyHandlers.DBS_INCREASE_INVENTORY_SIZE, $"0x{op:X4}");
+        Hex.Eq(body, "01 5C 00 00 00", "[u8 Success][u32 DlmId 0x5C]");
+
+        var frames = RunHandler(DbProxyHandlers.SDB_USER_ENTERWORLD, T147EnterWorld(0x99, 1), 2, store);
+        var next = T150EnterBlob(frames[0].body);
+        Hex.True(next.Length == real.Length, $"blob length {next.Length}");
+        var diff = Enumerable.Range(0, real.Length).Where(i => real[i] != next[i]).ToArray();
+        Hex.True(diff.Length == 1 && diff[0] == slotsAt, "only +0x3AF0 changed: " + string.Join(",", diff.Take(12)));
+        Hex.True(T150I32(next, slotsAt) == 48 && T150I32(next, TeraSharp.Arbiter.Persistence.StarterBlob.LevelOffset) == 70,
+            "48 slots, still level 70");
+        Hex.True(store.GetCharacter(1)!.Level == 70, "the level column is untouched");
+    }
+
+    /// <summary>The rest of the 0x283D contract: rounded down to 8, never lowered, the expand count
+    /// accumulates, pockets and unknown characters are acked with the live DlmId and store nothing.</summary>
+    [Test] public static void T150b_inventory_size_edge_cases_are_acked()
+    {
+        const int slotsAt = TeraSharp.Arbiter.Persistence.StarterBlob.MaxInvenSlotCountOffset;
+        const int expandAt = TeraSharp.Arbiter.Persistence.StarterBlob.ExpandInvenCountOffset;
+        Hex.True(DbProxyHandlers.IsHandledRequest(DbProxyHandlers.SDB_INCREASE_INVENTORY_SIZE), "0x283D allow-listed");
+        using var store = GuildStore(1);
+        var blob = new byte[DbProxyHandlers.WorldBlobSize];
+        BitConverter.GetBytes(40).CopyTo(blob, slotsAt);
+        store.SaveWorldBlob(1, blob);
+        int Slots() => T150I32(store.GetCharacter(1)!.WorldBlob!, slotsAt);
+
+        var (_, body) = RunHandler1(DbProxyHandlers.SDB_INCREASE_INVENTORY_SIZE, T150IncInv(0x5C, 1, 0, 45, 0, 5), store);
+        Hex.Eq(body, "01 5C 00 00 00", "45 acked");
+        Hex.True(Slots() == 40, "45 rounds to 40: nothing to store");
+        (_, body) = RunHandler1(DbProxyHandlers.SDB_INCREASE_INVENTORY_SIZE, T150IncInv(0x5D, 1, 0, 63, 1, 1), store);
+        Hex.True(Slots() == 56 && T150I32(store.GetCharacter(1)!.WorldBlob!, expandAt) == 1, "63 -> 56, expand +1");
+        (_, body) = RunHandler1(DbProxyHandlers.SDB_INCREASE_INVENTORY_SIZE, T150IncInv(0x5E, 1, 0, 48, 0, 1), store);
+        Hex.True(Slots() == 56, "never lowered");
+        (_, body) = RunHandler1(DbProxyHandlers.SDB_INCREASE_INVENTORY_SIZE, T150IncInv(0x5F, 1, 2, 80, 0, 1), store);
+        Hex.Eq(body, "01 5F 00 00 00", "tab 2 acked");
+        Hex.True(Slots() == 56, "a pocket does not touch the bag");
+        (_, body) = RunHandler1(DbProxyHandlers.SDB_INCREASE_INVENTORY_SIZE, T150IncInv(0x60, 99, 0, 48, 0, 5), store);
+        Hex.Eq(body, "01 60 00 00 00", "unknown character");
+        (_, body) = RunHandler1(DbProxyHandlers.SDB_INCREASE_INVENTORY_SIZE, Hex.B("26 00 00 00 00 00 00 00 61 00 00 00"), store);
+        Hex.Eq(body, "01 61 00 00 00", "12-byte request");
+    }
+
+    /// <summary>Opt-in means proven: every DbAckTable row has a live pair here and reproduces it
+    /// byte-exact (ITEM_SIMPLE_ATOM with the ids the real Arbiter allocated, 10027..10029). A row
+    /// added without a pair fails this test - except T162's three decompile-proven level jumps.</summary>
+    [Test] public static void T150b_every_generic_ack_row_reproduces_its_live_pair()
+    {
+        var pairs = new Dictionary<ushort, (uint Req, uint Rep)[]>
+        {
+            [0x279A] = new[] { (3348u, 3350u) },
+            [0x27C3] = new[] { (3627u, 3628u), (2668u, 2670u) },
+            [0x27CD] = new[] { (1203u, 1204u) },
+            [0x27DE] = new[] { (2964u, 2965u) },
+        };
+        var decompileOnly = new ushort[] { 0x28D9, 0x28DB, 0x28DD };   // T162, see DbAckTable
+        // T165: the unpinned group-A rows are decompile-only by design and log until pinned.
+        var pinnedRows = DbAckTable.All.Where(s => s.Pinned).ToArray();
+        Hex.True(pinnedRows.Select(s => s.Op).OrderBy(o => o).SequenceEqual(pairs.Keys.Concat(decompileOnly).OrderBy(o => o)),
+            "pinned DbAckTable rows are exactly the opcodes with a live pair: "
+            + string.Join(",", pinnedRows.Select(s => $"0x{s.Op:X4}")));
+        foreach (var s in pinnedRows)
+        {
+            Hex.True(DbProxyHandlers.IsHandledRequest(s.Op), $"0x{s.Op:X4} allow-listed");
+            Hex.True(s.ReplyOp == s.Op + 1, $"0x{s.Op:X4} -> 0x{s.ReplyOp:X4}");
+        }
+        var cap = T150Capture();
+        if (cap == null) return;
+        foreach (var (op, list) in pairs)
+            foreach (var (req, rep) in list)
+            {
+                int next = 10027;
+                var ack = DbAckTable.Build(DbAckTable.For(op)!, cap[req], () => next++);
+                Hex.Eq(ack.Reply, cap[rep], $"0x{op:X4}: seq {req} -> {rep}");
+                if (op != 0x27CD)
+                {
+                    var (rop, body) = RunHandler1(op, cap[req]);
+                    Hex.True(rop == op + 1, $"0x{rop:X4}");
+                    Hex.Eq(body, cap[rep], $"0x{op:X4} through TryHandle");
+                }
+            }
+
+        using var store = GuildStore(2);
+        var (_, live) = RunHandler1(0x27CD, cap[1203], store);
+        Hex.True(live.Length == cap[1204].Length, "same length through the dispatch");
+        var got = store.GetInventoryItems(2).Select(r => r.TemplateId).ToHashSet();
+        Hex.True(got.Contains(200997) && got.Contains(200001) && got.Contains(139093),
+            "the three inserted items are stored for owner 2: " + string.Join(",", got));
+    }
+
+    /// <summary>What T150 answered from the decompile alone stays unanswered - in particular the
+    /// requests whose World handler reloads or rewrites the character (TUTORIAL_END and
+    /// TBA_USER_ENTERWORLD hand World a whole UserData blob; the level and skill-clear contexts
+    /// change the character) and the ones only a real database can answer.</summary>
+    [Test] public static void T150b_unproven_twins_stay_unanswered()
+    {
+        foreach (ushort op in new ushort[] { 0x289F, 0x29BE, 0x28E1,   // 0x28D9/DB/DD: T162; 0x27E6: T170
+                                             0x29A4, 0x29B7, 0x2723 })   // 2746/2747/2717/2835: T168
+        {
+            Hex.True(!DbProxyHandlers.IsHandledRequest(op), $"0x{op:X4} must not be answered yet");
+            Hex.True(!DbAckTable.Covers(op), $"0x{op:X4} is not a table row");
+        }
+    }
+
+    /// <summary>Hostile requests: each row answers an empty payload and one whose refs point
+    /// outside it, without throwing, the refs going back empty.</summary>
+    [Test] public static void T150b_generic_ack_survives_hostile_requests()
+    {
+        var rng = new Random(150);
+        foreach (var s in DbAckTable.All)
+        {
+            var empty = DbAckTable.Build(s, Array.Empty<byte>());
+            Hex.True(empty.Reply.Length == s.RepFixed - 6 && empty.DlmId == 0, $"0x{s.Op:X4} empty payload");
+            var p = new byte[s.ReqFixed - 6];
+            rng.NextBytes(p);
+            foreach (var r in s.Refs.Where(x => x.Req >= 6))
+            {
+                BitConverter.GetBytes(0xFFFFFFF0u).CopyTo(p, r.Req - 6);
+                BitConverter.GetBytes(0x7FFFFFFFu).CopyTo(p, r.Req - 6 + 4);
+            }
+            var bad = DbAckTable.Build(s, p, () => 1);
+            Hex.True(bad.DroppedRefs == s.Refs.Count(x => x.Req >= 6) && bad.Reply.Length == s.RepFixed - 6,
+                $"0x{s.Op:X4}: refs dropped, nothing echoed");
+        }
+    }
+
+    // ============ T165: every unanswered twin in exactly one of A / B / C ==========
+
+    /// <summary>Walks the opcode table: every SDB_X with a DBS_X twin is in exactly one group -
+    /// Handled (its own case), A (a DbAckTable row), B (Deny), C (RealHandler) or Elsewhere - and
+    /// every A row answers with the twin, not op + 1 (nine twins are not adjacent). T165b: B, C and
+    /// Elsewhere are T165's tables minus whatever the allow-list answers now, so a real handler
+    /// (T164's 0x2790 / 0x28AE, T166's enchanting ops) moves its name to Handled by itself.</summary>
+    [Test] public static void T165_every_twin_is_in_exactly_one_group()
+    {
+        var all = DbProxyOpcodeNames.All;
+        var byName = all.ToDictionary(kv => kv.Value, kv => kv.Key);
+        var twins = all.Where(kv => kv.Value.StartsWith("SDB_") && byName.ContainsKey("DBS_" + kv.Value[4..]))
+                       .Select(kv => (Op: kv.Key, Name: kv.Value, Twin: byName["DBS_" + kv.Value[4..]])).ToArray();
+        Hex.True(twins.Length == 300, $"{twins.Length} twins in the table");
+        var bad = new List<string>();
+        foreach (var t in twins)
+        {
+            var groups = new List<string>();
+            if (DbAckTable.Covers(t.Op)) groups.Add("A");
+            else if (DbProxyHandlers.IsHandledRequest(t.Op)) groups.Add("Handled");
+            if (DbAckGroups.Deny.ContainsKey(t.Op)) groups.Add("B");
+            if (DbAckGroups.RealHandler.ContainsKey(t.Op)) groups.Add("C");
+            if (DbAckGroups.Elsewhere.ContainsKey(t.Op)) groups.Add("Elsewhere");
+            if (groups.Count != 1) bad.Add($"0x{t.Op:X4} {t.Name}: [{string.Join(",", groups)}]");
+            if (DbAckTable.For(t.Op) is { } s && s.ReplyOp != t.Twin) bad.Add($"0x{t.Op:X4} answers 0x{s.ReplyOp:X4}, twin 0x{t.Twin:X4}");
+        }
+        Hex.True(bad.Count == 0, "twins not in exactly one group:\n    " + string.Join("\n    ", bad));
+
+        // T165's classification is fixed data; the tables never overlap each other or group A.
+        var unpinned = DbAckTable.All.Where(s => !s.Pinned).ToArray();
+        Hex.True(unpinned.Length == 51 && DbAckGroups.DenySpec.Count == 62 && DbAckGroups.RealHandlerSpec.Count == 75
+                && DbAckGroups.ElsewhereSpec.Count == 16,
+            $"A {unpinned.Length}, B {DbAckGroups.DenySpec.Count}, C {DbAckGroups.RealHandlerSpec.Count}, "
+            + $"Elsewhere {DbAckGroups.ElsewhereSpec.Count}");
+        var specs = DbAckGroups.DenySpec.Keys.Concat(DbAckGroups.RealHandlerSpec.Keys).Concat(DbAckGroups.ElsewhereSpec.Keys).ToArray();
+        Hex.True(specs.Distinct().Count() == specs.Length && !specs.Any(DbAckTable.Covers), "B / C / Elsewhere / A are disjoint");
+        foreach (var s in DbAckTable.All)
+            Hex.True(DbProxyHandlers.IsHandledRequest(s.Op), $"0x{s.Op:X4} allow-listed");
+
+        // "Real handler on master": read from the allow-list, no table edit.
+        var landed = DbAckGroups.Landed;
+        Hex.True(landed.ContainsKey(0x2790) && landed.ContainsKey(0x28AE), "T164's two real handlers have landed: "
+            + string.Join(", ", landed.Keys.OrderBy(o => o).Select(o => $"0x{o:X4}")));
+        foreach (var op in landed.Keys)
+            Hex.True(DbAckGroups.Of(op) == DbAckGroups.Group.Handled && !DbAckGroups.RealHandler.ContainsKey(op)
+                     && !DbAckGroups.Deny.ContainsKey(op) && !DbAckGroups.Elsewhere.ContainsKey(op), $"0x{op:X4} is Handled only");
+        Hex.True(DbAckGroups.RealHandler.Count + DbAckGroups.Deny.Count + DbAckGroups.Elsewhere.Count + landed.Count == specs.Length,
+            "pending + landed = T165's tables");
+        Console.WriteLine($"        (real handler on master: {landed.Count} - "
+            + string.Join(", ", landed.OrderBy(kv => kv.Key).Select(kv => $"0x{kv.Key:X4} {kv.Value.Split(' ')[0]}")) + ")");
+    }
+
+    /// <summary>The T150 regression by construction: no B or C opcode is ever a generic ack - a
+    /// DbAckTable carrying one does not load - and one still pending (no real handler registered)
+    /// is not answered at all: not by the allow-list, not through TryHandle.</summary>
+    [Test] public static void T165_deny_list_makes_the_T150_reload_unreachable()
+    {
+        foreach (var op in DbAckGroups.DenySpec.Keys.Concat(DbAckGroups.RealHandlerSpec.Keys))
+        {
+            Hex.True(DbAckGroups.Refused(op) && !DbAckTable.Covers(op), $"0x{op:X4} has a generic ack");
+            if (DbAckGroups.HasRealHandler(op)) continue;   // landed: its own handler answers it
+            Hex.True(!DbProxyHandlers.IsHandledRequest(op), $"0x{op:X4} answered");
+            Hex.True(!HandlerAccepts(op, new byte[64]), $"0x{op:X4} taken by TryHandle");
+        }
+        // TUTORIAL_END / TBA_USER_ENTERWORLD hand World a whole UserData; INCREMENT_CHARACTER_EXP
+        // changes the character on ok; USER_CLEAR_ALL_SKILL / ITEM_ENCHANT carry state.
+        foreach (var row in new[] { "289F>28A0 q14 r27 d6:22 k26", "29BE>29BF q30 r27 d14:14 k18",
+                                    "28E1>28E2 q22 r11 d14:6 k10 a6", "27E6>27E7 q14 r27 d6:22 k26",
+                                    "276E>276F q22 r19 d14:14 k18 b6=6" })
+        {
+            ushort op = ushort.Parse(row.AsSpan(0, 4), System.Globalization.NumberStyles.HexNumber);
+            Hex.True(DbAckGroups.Refused(op), $"0x{op:X4} is B or C");
+            bool threw = false;
+            try { DbAckTable.Index(Array.Empty<string>(), new[] { row }); }
+            catch (InvalidOperationException) { threw = true; }
+            Hex.True(threw, $"a DbAckTable with {row} must not load");
+        }
+        // A plain-success row still loads, and the same opcode twice does not.
+        Hex.True(DbAckTable.Index(Array.Empty<string>(), new[] { "2806>2807 q18 r11 d6:6 o10 k10" }).Count == 1, "A row loads");
+        bool dup = false;
+        try { DbAckTable.Index(new[] { "2806>2807 q18 r11 d6:6 k10" }, new[] { "2806>2807 q18 r11 d6:6 k10" }); }
+        catch (InvalidOperationException) { dup = true; }
+        Hex.True(dup, "duplicate refused");
+    }
+
+    sealed class T165Log : Microsoft.Extensions.Logging.ILogger
+    {
+        public readonly List<string> Lines = new();
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel level) => true;
+        public void Log<TState>(Microsoft.Extensions.Logging.LogLevel level, Microsoft.Extensions.Logging.EventId id,
+            TState state, Exception? ex, Func<TState, Exception?, string> fmt)
+        { if (level >= Microsoft.Extensions.Logging.LogLevel.Information) Lines.Add(fmt(state, ex)); }
+    }
+
+    /// <summary>Every A row through TryHandle: the twin opcode, the reply size, the request's DlmId
+    /// where World reads it, ok = 1, every other fixed byte 0 except empty ref slots
+    /// ([end of frame][0]). The first use logs the pin reminder once; the second does not.</summary>
+    [Test] public static void T165_group_A_answers_DlmId_and_ok_and_asks_to_be_pinned()
+    {
+        using var store = GuildStore(1);
+        var log = new T165Log();
+        var h = new DbProxyHandlers(store, log);
+        foreach (var s in DbAckTable.All.Where(x => !x.Pinned))
+        {
+            var p = new byte[s.ReqFixed - 6];
+            BitConverter.GetBytes(0x51A0u + s.Op).CopyTo(p, s.ReqDlm - 6);
+            if (s.ReqOwner >= 6) BitConverter.GetBytes(1).CopyTo(p, s.ReqOwner - 6);
+            foreach (var r in s.Refs.Where(x => x.Req >= 6)) BitConverter.GetBytes((uint)s.ReqFixed).CopyTo(p, r.Req - 6);
+            foreach (var a in s.Applies) BitConverter.GetBytes((uint)s.ReqFixed).CopyTo(p, a.Req - 6);
+            string name = DbProxyOpcodeNames.Name(s.Op)!;
+            for (int round = 0; round < 2; round++)
+            {
+                var (rop, body) = RunHandler1(s.Op, p, store, h);
+                Hex.True(rop == s.ReplyOp && body.Length == s.RepFixed - 6, $"{name}: 0x{rop:X4}, {body.Length} B");
+                var want = new byte[s.RepFixed - 6];
+                BitConverter.GetBytes(0x51A0u + s.Op).CopyTo(want, s.RepDlm - 6);
+                foreach (int k in s.Ok) want[k - 6] = 1;
+                foreach (var r in s.Refs) BitConverter.GetBytes((uint)s.RepFixed).CopyTo(want, r.Rep - 6);
+                Hex.Eq(body, want, name);
+            }
+            Hex.True(log.Lines.Count(l => l.StartsWith($"generic ack 0x{s.Op:X4} {name} - capture a real pair to pin")) == 1,
+                $"{name}: one pin reminder");
+        }
+        Hex.True(!log.Lines.Any(l => l.StartsWith("generic ack 0x279A")), "pinned rows do not ask");
+        _ = RunHandler1(0x279A, new byte[20], store, h);
+        Hex.True(!log.Lines.Any(l => l.StartsWith("generic ack 0x279A")), "pinned rows never ask");
+    }
+
+    /// <summary>The two item shapes of group A. "echo" (USE_SERVANT_FEED): the real Arbiter hands its
+    /// writer the request's own atom vector, so the reply is ITEM_SIMPLE_ATOM's shape - the atoms come
+    /// back and are applied. "apply" (INCREMENT_CHARACTER_SOCKET): the atoms run, the reply is bare.</summary>
+    [Test] public static void T165_group_A_item_rows_echo_or_apply_their_atoms()
+    {
+        foreach (var (op, echoed) in new[] { ((ushort)0x271B, true), ((ushort)0x28D7, false) })
+        {
+            using var store = GuildStore(1);
+            store.UpsertItem(900, 1, BagItems.Pocket, 3, 207631, 2);
+            var p = T44AtomPayload(16,
+                (WarehouseHandlers.TsChangeItemAmount, 900, 207631, 1, BagItems.Pocket, 3u, 1, BagItems.Pocket, 3u, -1));
+            BitConverter.GetBytes(0x77u).CopyTo(p, 8);
+            BitConverter.GetBytes(1).CopyTo(p, 12);
+            var (rop, body) = RunHandler1(op, p, store);
+            Hex.True(rop == op + 1, $"0x{rop:X4}");
+            if (echoed)
+            {
+                Hex.True(body.Length == 13 + DbProxyHandlers.ItemAtomSize, $"echo {body.Length} B");
+                Hex.Eq(body.AsSpan(0, 13).ToArray(), "13 00 00 00 58 03 00 00 77 00 00 00 01", "[ref 19, 856][DlmId][ok]");
+                Hex.True(body.AsSpan(13).SequenceEqual(p.AsSpan(16)), "the atom comes back as sent");
+            }
+            else Hex.Eq(body, "77 00 00 00 01", "[DlmId][ok]");
+            var row = store.GetInventoryItems(1).Single(r => r.TemplateId == 207631);
+            Hex.True(row.Amount == 1, $"{(echoed ? "echoed" : "applied")} atom took one: {row.Amount}");
+        }
+        var cs = DbAckTable.For(0x28CD)!;
+        Hex.True(cs.Applies.Single() == new DbAckTable.ApplyRef(6, DbProxyHandlers.ItemGiveTakeSize), "a6.568 parses");
+    }
+
+    // ============ T167: cards, EP pages, skill polishing, dungeon rank ==========
+
+    static readonly ushort[] T167Ops =
+    {
+        0x2998, 0x2990, 0x298E, 0x2992, 0x2994,          // cards
+        0x299C, 0x299A, 0x27B5, 0x27BF,                  // EP
+        0x2975, 0x2979, 0x2973, 0x2971, 0x2977,          // skill polishing
+        0x286B,                                          // dungeon rank
+    };
+
+    /// <summary>The three login loads, served from the store, against cap_social4's pairs (329 -&gt;
+    /// 330, 446 -&gt; 447, 431 -&gt; 432 - a character that never used cards, EP perks or polishing).</summary>
+    [Test] public static void T167_the_three_loads_are_cap_social4s_bytes_from_an_empty_store()
+    {
+        var cap = LoadTsisOrSkip("cap_t167.bin");
+        if (cap == null) return;
+        using var store = GuildStore(1);
+        foreach (var (req, rep, op) in new[] { (329u, 330u, (ushort)0x2975), (446u, 447u, (ushort)0x2986), (431u, 432u, (ushort)0x27B9) })
+        {
+            var (rop, body) = RunHandler1(op, cap[req], store);
+            Hex.True(rop == op + 1, $"0x{rop:X4}");
+            Hex.Eq(body, cap[rep], $"0x{op:X4}: seq {req} -> {rep}");
+        }
+    }
+
+    static byte[] T167Frame(int size, params (int At, long Value, int Width)[] fields)
+    {
+        var p = new byte[size];
+        foreach (var (at, v, w) in fields)
+            if (w == 8) BitConverter.GetBytes(v).CopyTo(p, at); else BitConverter.GetBytes((int)v).CopyTo(p, at);
+        return p;
+    }
+
+    /// <summary>Cards round trip: create, pick a preset, buy one more (the item is used up and its
+    /// atom echoed), activate two combine lists and drop one - then the card-data load carries it
+    /// all, elements linked by frame offset.</summary>
+    [Test] public static void T167_card_frames_persist_and_come_back_in_the_card_data_load()
+    {
+        using var store = GuildStore(1);
+        long acct = store.AccountOf(1);
+        store.AddCard(acct, 100, 2);
+        Hex.True(store.MountCard(1, 1, 100), "mounted");
+        store.UpsertItem(900, 1, BagItems.Pocket, 3, 207631, 2);
+
+        var (op, body) = RunHandler1(0x298E, T167Frame(28, (0, 0x11, 4), (4, acct, 8), (12, 2, 4), (16, 1, 4), (20, 3, 4), (24, 40, 4)), store);
+        Hex.Eq(body, "11 00 00 00 01 02 00 00 00 01 00 00 00 03 00 00 00 28 00 00 00", "DBS_CREATE_CARD_INFO");
+        (op, body) = RunHandler1(0x2998, T167Frame(20, (0, 0x12, 4), (4, acct, 8), (12, 1, 4), (16, 1, 4)), store);
+        Hex.Eq(body, "12 00 00 00 01 01 00 00 00", "DBS_CHANGE_CARD_PRESET");
+        var inc = T44AtomPayload(24, (WarehouseHandlers.TsChangeItemAmount, 900, 207631, 1, BagItems.Pocket, 3u, 1, BagItems.Pocket, 3u, -1));
+        BitConverter.GetBytes(0x13u).CopyTo(inc, 8);
+        BitConverter.GetBytes(acct).CopyTo(inc, 12);
+        BitConverter.GetBytes(1).CopyTo(inc, 20);
+        (op, body) = RunHandler1(0x2990, inc, store);
+        Hex.Eq(body.AsSpan(0, 17).ToArray(), "17 00 00 00 58 03 00 00 13 00 00 00 01 03 00 00 00", "[ref 23, 856][DlmId][ok][amount 3]");
+        Hex.True(body.AsSpan(17).SequenceEqual(inc.AsSpan(24)), "the atom is echoed");
+        Hex.True(store.GetInventoryItems(1).Single(r => r.TemplateId == 207631).Amount == 1, "and applied");
+        foreach (var (o, id) in new[] { ((ushort)0x2992, 5), ((ushort)0x2992, 6), ((ushort)0x2994, 6) })
+            RunHandler1(o, T167Frame(20, (0, 0x14, 4), (4, acct, 8), (12, id, 4), (16, 3, 4)), store);
+        (op, body) = RunHandler1(0x2994, T167Frame(20, (0, 0x15, 4), (4, acct, 8), (12, 6, 4), (16, 3, 4)), store);
+        Hex.Eq(body, "15 00 00 00 00 06 00 00 00 03 00 00 00", "deactivating an inactive list is refused");
+
+        (op, body) = RunHandler1(0x2986, T167Frame(16, (0, 0x16, 4), (4, acct, 8), (12, 1, 4)), store);
+        Hex.Eq(body, @"
+            01 00 00 00 3B 00 00 00  01 00 00 00 4B 00 00 00  01 00 00 00 5B 00 00 00  00 00 00 00 00 00 00 00
+            16 00 00 00 01  03 00 00 00  01 00 00 00  03 00 00 00  28 00 00 00
+            3B 00 00 00 00 00 00 00 64 00 00 00 02 00 00 00
+            4B 00 00 00 00 00 00 00 01 00 00 00 64 00 00 00
+            5B 00 00 00 00 00 00 00 05 00 00 00 03 00 00 00", "DBS_RESPONSE_CARD_DATA with one card, mount and combine");
+    }
+
+    /// <summary>EP pages: two perks on page 0, a new page with one perk, back to page 0 - the perk
+    /// load nests each page's perks right behind it. The item point gain and the reset reach
+    /// T77's stored EP.</summary>
+    [Test] public static void T167_ep_pages_and_perks_persist_and_come_back_in_the_perk_load()
+    {
+        using var store = GuildStore(1);
+        static byte[] Learn(uint dlm, int used, params (int Perk, int Level)[] perks)
+        {
+            var p = new byte[20 + perks.Length * 8];
+            BitConverter.GetBytes(26u).CopyTo(p, 0);
+            BitConverter.GetBytes((uint)(perks.Length * 8)).CopyTo(p, 4);
+            BitConverter.GetBytes(dlm).CopyTo(p, 8);
+            BitConverter.GetBytes(1).CopyTo(p, 12);
+            BitConverter.GetBytes(used).CopyTo(p, 16);
+            for (int i = 0; i < perks.Length; i++)
+            {
+                BitConverter.GetBytes(perks[i].Perk).CopyTo(p, 20 + 8 * i);
+                BitConverter.GetBytes(perks[i].Level).CopyTo(p, 24 + 8 * i);
+            }
+            return p;
+        }
+        RunHandler1(DbProxyHandlers.SDB_USER_LEARN_EP_PERK, Learn(0x21, 5, (7, 2), (9, 1)), store);
+        var (op, body) = RunHandler1(0x299A, T167Frame(16, (8, 0x22, 4), (12, 1, 4)), store);
+        Hex.Eq(body, "22 00 00 00 01", "DBS_EXPAND_EP_PAGE");
+        RunHandler1(DbProxyHandlers.SDB_USER_LEARN_EP_PERK, Learn(0x23, 4, (11, 3)), store);
+        (op, body) = RunHandler1(0x299C, T167Frame(16, (0, 0x24, 4), (4, 1, 4), (8, 0, 4), (12, 5, 4)), store);
+        Hex.Eq(body, "24 00 00 00 01", "DBS_CHANGE_EP_PAGE");
+
+        (op, body) = RunHandler1(0x27B9, T167Frame(8, (0, 0x25, 4), (4, 1, 4)), store);
+        Hex.Eq(body, @"
+            05 00 00 00 27 00 00 00 25 00 00 00 01  05 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 01 00 00 00
+            27 00 00 00 57 00 00 00 02 00 00 00 37 00 00 00
+            37 00 00 00 47 00 00 00 07 00 00 00 02 00 00 00
+            47 00 00 00 00 00 00 00 09 00 00 00 01 00 00 00
+            57 00 00 00 77 00 00 00 01 00 00 00 67 00 00 00
+            67 00 00 00 00 00 00 00 0B 00 00 00 03 00 00 00
+            77 00 00 00 87 00 00 00 00 00 00 00 00 00 00 00
+            87 00 00 00 97 00 00 00 00 00 00 00 00 00 00 00
+            97 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00", "DBS_USER_LOAD_EP_PERK, pages 0 and 1 filled");
+
+        store.SetCharacterEp(1, new TeraSharp.Arbiter.Persistence.CharacterStore.EpRow(900, 4, 10, 50, 6, 3000, 77));
+        RunHandler1(0x27BF, T167Frame(12, (0, 0x26, 4), (4, 1, 4), (8, 7, 4)), store);
+        Hex.True(store.GetCharacterEp(1)!.EpPoint == 17, "item points added");
+        (op, body) = RunHandler1(0x27B5, T167Frame(8, (0, 0x27, 4), (4, 1, 4)), store);
+        Hex.Eq(body, "27 00 00 00 01", "DBS_RESET_EXTRA_POINT_DATA");
+        var ep = store.GetCharacterEp(1)!;
+        Hex.True(ep.EpExp == 0 && ep.EpLevel == 0 && ep.EpPoint == 0 && ep.DailyLimit == 3000, "progress reset, daily limit kept");
+    }
+
+    /// <summary>Polishing: exp, two unlocks (the second takes the applied flag), a change back, a
+    /// level upgrade, and a refusal when the points run out - then the polishing load.</summary>
+    [Test] public static void T167_skill_polishing_persists_and_comes_back_in_the_polishing_load()
+    {
+        using var store = GuildStore(1);
+        var (op, body) = RunHandler1(0x2979, T167Frame(36, (8, 0x31, 4), (12, 1, 4), (16, 2, 4), (20, 10, 4), (24, 30, 4), (28, 500, 8)), store);
+        Hex.Eq(body, "31 00 00 00 01", "DBS_SKILL_POLISHING_ADD_EXP");
+        RunHandler1(0x2971, T167Frame(32, (8, 0x32, 4), (12, 1, 4), (16, 4, 4), (20, 41, 4), (24, 0, 4), (28, 3, 4)), store);
+        RunHandler1(0x2971, T167Frame(32, (8, 0x33, 4), (12, 1, 4), (16, 4, 4), (20, 42, 4), (24, 41, 4), (28, 2, 4)), store);
+        (op, body) = RunHandler1(0x2973, T167Frame(20, (0, 0x34, 4), (4, 1, 4), (8, 4, 4), (12, 41, 4), (16, 42, 4)), store);
+        Hex.Eq(body, "34 00 00 00 01", "DBS_SKILL_POLISHING_CHANGE_OPTION");
+        (op, body) = RunHandler1(0x2973, T167Frame(20, (0, 0x35, 4), (4, 1, 4), (8, 4, 4), (12, 99, 4), (16, 41, 4)), store);
+        Hex.Eq(body, "35 00 00 00 00", "an option never unlocked cannot be applied");
+        (op, body) = RunHandler1(0x2977, T167Frame(28, (8, 0x36, 4), (12, 1, 4), (16, 4, 4), (20, 400, 4), (24, 4, 4)), store);
+        Hex.Eq(body, "36 00 00 00 01", "DBS_SKILL_POLISHING_UPGRADE_LEVEL");
+        (op, body) = RunHandler1(0x2977, T167Frame(28, (8, 0x37, 4), (12, 1, 4), (16, 4, 4), (20, 400, 4), (24, 99, 4)), store);
+        Hex.Eq(body, "37 00 00 00 00", "not enough points");
+
+        (op, body) = RunHandler1(0x2975, T167Frame(8, (0, 0x38, 4), (4, 1, 4)), store);
+        Hex.Eq(body, @"
+            02 00 00 00 2F 00 00 00 01 00 00 00 51 00 00 00
+            38 00 00 00 01  02 00 00 00  01 00 00 00  1E 00 00 00  F4 01 00 00 00 00 00 00
+            2F 00 00 00 40 00 00 00 04 00 00 00 29 00 00 00 01
+            40 00 00 00 00 00 00 00 04 00 00 00 2A 00 00 00 00
+            51 00 00 00 00 00 00 00 04 00 00 00 90 01 00 00", "DBS_LOAD_SKILL_POLISHING: 10 - 3 - 2 - 4 points left");
+    }
+
+    /// <summary>The dungeon rank record: no DlmId, so no reply; the row lands and the PvE board
+    /// ranks by the record's points.</summary>
+    [Test] public static void T167_dungeon_rank_record_is_stored_unanswered_and_ranks_the_pve_board()
+    {
+        using var store = GuildStore(2);
+        var p = new byte[57 + 8];
+        BitConverter.GetBytes(63u).CopyTo(p, 0);                 // MvpName -> frame 63
+        "M\0v\0\0\0"u8.ToArray().CopyTo(p, 57);
+        foreach (var (at, v) in new[] { (16, 2), (20, 9001), (24, 3), (28, 1234), (32, 567), (45, 100), (49, 200), (53, 34) })
+            BitConverter.GetBytes(v).CopyTo(p, at);
+        RunHandler(0x286B, p, 0, store);
+        var row = store.GetDungeonRanks(2).Single();
+        Hex.True(row.DungeonId == 9001 && row.Season == 3 && row.TopPoint == 1234 && row.TopTime == 567
+                 && row.KillPoint == 200 && row.MvpName == "Mv", $"stored: {row}");
+        var board = store.GetPveRankingScores();
+        Hex.True(board.Count == 1 && board[0].CharacterId == 2 && board[0].Score == 1234, "the PvE board ranks by rank points");
+    }
+
+    /// <summary>Allow-list + wedge guard: all fifteen are T165's group C, landed now, and each one
+    /// that carries a DlmId answers even a zero-length frame with its twin.</summary>
+    [Test] public static void T167_all_fifteen_have_landed_and_never_wedge()
+    {
+        var landed = DbAckGroups.Landed;
+        foreach (ushort op in T167Ops)
+        {
+            Hex.True(DbAckGroups.RealHandlerSpec.ContainsKey(op) && landed.ContainsKey(op), $"0x{op:X4} landed");
+            Hex.True(DbProxyHandlers.IsHandledRequest(op) && !DbAckTable.Covers(op), $"0x{op:X4} has its own handler");
+            if (op == DbProxyHandlers.SDB_UPDATE_DUNGEON_RANK_RECORD) continue;
+            string twin = "DBS_" + DbProxyOpcodeNames.Name(op)![4..];
+            var (rop, _) = RunHandler1(op, Array.Empty<byte>());
+            Hex.True(DbProxyOpcodeNames.Name(rop) == twin, $"0x{op:X4} -> 0x{rop:X4}, want {twin}");
+        }
+    }
+
+    // ============ T168: group C, slice 3 - the rest of the C table ==========
+
+    /// <summary>What T168 left in group C on purpose - the walk's pending list must be exactly this.</summary>
+    static readonly ushort[] T168DeliberatelyLeft = { 0x275C };   // 0x282F: T169; 0x27E6, 0x2969: T170
+
+    /// <summary>Every echo-family row through TryHandle with an empty item list: the twin, the
+    /// reply size, the request's DlmId where World reads it, ok 1, empty refs, and the request
+    /// fields the reply repeats.</summary>
+    [Test] public static void T168_the_echo_family_answers_each_request_with_its_own_fields()
+    {
+        using var store = GuildStore(1);
+        foreach (var s in DbProxyHandlers.T168Specs.Values)
+        {
+            var p = new byte[s.ReqFixed - 6];
+            for (int i = 0; i + 4 <= p.Length; i += 4) BitConverter.GetBytes(0x100 + i).CopyTo(p, i);
+            BitConverter.GetBytes(0x5100u + s.Op).CopyTo(p, s.ReqDlm - 6);
+            if (s.ReqOwner >= 6) BitConverter.GetBytes(1).CopyTo(p, s.ReqOwner - 6);
+            foreach (var r in s.Refs.Where(x => x.Req >= 6)) { BitConverter.GetBytes((uint)s.ReqFixed).CopyTo(p, r.Req - 6); BitConverter.GetBytes(0u).CopyTo(p, r.Req - 2); }
+            foreach (var a in s.Applies) { BitConverter.GetBytes((uint)s.ReqFixed).CopyTo(p, a.Req - 6); BitConverter.GetBytes(0u).CopyTo(p, a.Req - 2); }
+            string name = DbProxyOpcodeNames.Name(s.Op)!;
+            var (rop, body) = RunHandler1(s.Op, p, store);
+            Hex.True(DbProxyOpcodeNames.Name(rop) == "DBS_" + name[4..] && body.Length == s.RepFixed - 6, $"{name}: 0x{rop:X4}, {body.Length} B");
+            Hex.True(BitConverter.ToUInt32(body, s.RepDlm - 6) == 0x5100u + s.Op && s.Ok.All(k => body[k - 6] == 1), $"{name}: DlmId / ok");
+            foreach (var r in s.Refs)
+                Hex.True(BitConverter.ToUInt32(body, r.Rep - 6) == s.RepFixed && BitConverter.ToUInt32(body, r.Rep - 2) == 0, $"{name}: empty ref @{r.Rep}");
+            if (DbProxyHandlers.T168Copies.TryGetValue(s.Op, out var copies))
+                foreach (var (req, rep) in copies)
+                    Hex.True(BitConverter.ToUInt32(body, rep - 6) == BitConverter.ToUInt32(p, req - 6), $"{name}: field @{req} copied to @{rep}");
+        }
+    }
+
+    /// <summary>Item records: ALCHEMY's atom comes back and is applied (T166's path), and
+    /// ITEM_DELIVER echoes both the owner's and the target's lists.</summary>
+    [Test] public static void T168_item_echoes_apply_their_atoms()
+    {
+        using var store = GuildStore(2);
+        store.UpsertItem(900, 1, BagItems.Pocket, 3, 207631, 3);
+        store.UpsertItem(901, 2, BagItems.Pocket, 4, 207632, 3);
+        var p = T44AtomPayload(16, (WarehouseHandlers.TsChangeItemAmount, 900, 207631, 1, BagItems.Pocket, 3u, 1, BagItems.Pocket, 3u, -1));
+        BitConverter.GetBytes(0x61u).CopyTo(p, 8);
+        BitConverter.GetBytes(1).CopyTo(p, 12);
+        var (rop, body) = RunHandler1(DbProxyHandlers.SDB_ALCHEMY, p, store);
+        Hex.Eq(body.AsSpan(0, 13).ToArray(), "13 00 00 00 58 03 00 00 61 00 00 00 01", "DBS_ALCHEMY [ref 19, 856][DlmId][ok]");
+        Hex.True(store.GetInventoryItems(1).Single(r => r.TemplateId == 207631).Amount == 2, "applied");
+
+        // ITEM_DELIVER: [owner ref@6][target ref@0E][DlmId@16][owner@1A][target@1E] + two lists.
+        var owner = T44AtomPayload(8, (WarehouseHandlers.TsChangeItemAmount, 900, 207631, 1, BagItems.Pocket, 3u, 1, BagItems.Pocket, 3u, -1));
+        var target = T44AtomPayload(8, (WarehouseHandlers.TsChangeItemAmount, 901, 207632, 2, BagItems.Pocket, 4u, 2, BagItems.Pocket, 4u, 1));
+        var d = new byte[28 + owner.Length - 8 + target.Length - 8];
+        BitConverter.GetBytes(34u).CopyTo(d, 0); BitConverter.GetBytes((uint)(owner.Length - 8)).CopyTo(d, 4);
+        BitConverter.GetBytes((uint)(34 + owner.Length - 8)).CopyTo(d, 8); BitConverter.GetBytes((uint)(target.Length - 8)).CopyTo(d, 12);
+        BitConverter.GetBytes(0x62u).CopyTo(d, 16); BitConverter.GetBytes(1).CopyTo(d, 20); BitConverter.GetBytes(2).CopyTo(d, 24);
+        owner.AsSpan(8).CopyTo(d.AsSpan(28)); target.AsSpan(8).CopyTo(d.AsSpan(28 + owner.Length - 8));
+        (rop, body) = RunHandler1(DbProxyHandlers.SDB_ITEM_DELIVER, d, store);
+        Hex.True(body.Length == 21 + 2 * DbProxyHandlers.ItemAtomSize && BitConverter.ToUInt32(body, 16) == 0x62 && body[20] == 1, "both lists echoed");
+        Hex.True(store.GetInventoryItems(1).Single(r => r.TemplateId == 207631).Amount == 1
+                 && store.GetInventoryItems(2).Single(r => r.TemplateId == 207632).Amount == 4, "and both applied");
+    }
+
+    static byte[] T168Frame(int size, params (int At, long Value, int Width)[] fields) => T167Frame(size, fields);
+
+    /// <summary>Money, VIP, gold consumption and attendance round trips.</summary>
+    [Test] public static void T168_money_vip_gold_and_attendance_are_stored()
+    {
+        using var store = GuildStore(1);
+        var (_, body) = RunHandler1(DbProxyHandlers.SDB_SET_MONEY, T168Frame(16, (0, 0x71, 4), (4, 1, 4), (8, 123456789, 8)), store);
+        Hex.Eq(body, "71 00 00 00 01 15 CD 5B 07 00 00 00 00", "DBS_SET_MONEY");
+        (_, body) = RunHandler1(DbProxyHandlers.SDB_GET_MONEY, T168Frame(8, (0, 0x72, 4), (4, 1, 4)), store);
+        Hex.Eq(body, "72 00 00 00 01 15 CD 5B 07 00 00 00 00", "DBS_GET_MONEY reads it back");
+        RunHandler1(DbProxyHandlers.SDB_ADD_VIP_GAME_EXP, T168Frame(12, (0, 0x73, 4), (4, 1, 4), (8, 40, 4)), store);
+        (_, body) = RunHandler1(DbProxyHandlers.SDB_ADD_VIP_GAME_EXP, T168Frame(12, (0, 0x74, 4), (4, 1, 4), (8, 2, 4)), store);
+        Hex.Eq(body, "74 00 00 00 01 2A 00 00 00", "NewResult is the total, 42");
+        (_, body) = RunHandler1(DbProxyHandlers.SDB_LOAD_USER_VIP_INFO, T168Frame(8, (0, 0x75, 4), (4, 1, 4)), store);
+        Hex.Eq(body, "00 00 00 00 00 00 00 00 01 75 00 00 00 00 00 00 00 2A 00 00 00" + string.Concat(Enumerable.Repeat(" 00", 20)),
+            "DBS_LOAD_USER_VIP_INFO: empty slot list, ok, DlmId, game exp 42");
+        (_, body) = RunHandler1(DbProxyHandlers.SDB_CHANGE_GOLD_CONSUMPTION, T168Frame(16, (0, 0x76, 4), (4, 1, 4), (8, 5000, 8)), store);
+        Hex.True(body.Length == 5 && body[4] == 1 && store.GetGoldConsumption(1) == 5000, "gold consumption stored");
+        RunHandler1(DbProxyHandlers.SDB_ADMIN_USER_DAILY_ATTENDANCE, T168Frame(16, (0, 0x77, 4), (4, 1, 4), (12, 0, 4)), store);
+        (_, body) = RunHandler1(DbProxyHandlers.SDB_ADMIN_USER_DAILY_ATTENDANCE, T168Frame(16, (0, 0x78, 4), (4, 1, 4), (12, 2, 4)), store);
+        Hex.Eq(body, "78 00 00 00 01 05 00 00 00 00 00 00 00", "days 0 and 2 = bitmap 5");
+    }
+
+    /// <summary>Hidden passives, a servant, a guild member and name, a collection-book reward.</summary>
+    [Test] public static void T168_passives_servant_guild_and_book_reward_are_stored()
+    {
+        using var store = GuildStore(2);
+        static byte[] Passives(uint dlm, params int[] ids)
+        {
+            var p = new byte[16 + 4 * ids.Length];
+            BitConverter.GetBytes(22u).CopyTo(p, 0); BitConverter.GetBytes((uint)(4 * ids.Length)).CopyTo(p, 4);
+            BitConverter.GetBytes(dlm).CopyTo(p, 8); BitConverter.GetBytes(1).CopyTo(p, 12);
+            for (int i = 0; i < ids.Length; i++) BitConverter.GetBytes(ids[i]).CopyTo(p, 16 + 4 * i);
+            return p;
+        }
+        RunHandler1(DbProxyHandlers.SDB_USER_LEARN_HIDE_PASSIVE_SKILL, Passives(0x81, 7), store);
+        var (_, body) = RunHandler1(DbProxyHandlers.SDB_USER_LEARN_HIDE_PASSIVE_SKILL, Passives(0x82, 7, 9), store);
+        Hex.Eq(body, "13 00 00 00 10 00 00 00 82 00 00 00 01  07 00 00 00 00 00 00 00  09 00 00 00 01 00 00 00",
+            "ResultList: 7 already known, 9 learned");
+
+        var sv = new byte[52 + 6];
+        BitConverter.GetBytes(58u).CopyTo(sv, 0);                        // ServantName -> "Pi"
+        "P\0i\0\0\0"u8.ToArray().CopyTo(sv, 52);
+        foreach (var (at, v) in new[] { (28, 0x83), (32, 1), (36, 2), (40, 5001), (44, 100), (48, 7) })
+            BitConverter.GetBytes(v).CopyTo(sv, at);
+        (_, body) = RunHandler1(DbProxyHandlers.SDB_ADD_SERVANT, sv, store);
+        var row = store.GetServants(1).Single();
+        Hex.True(row.Name == "Pi" && row.Type == 2 && row.TemplateId == 5001 && row.Energy == 100, $"servant stored: {row}");
+        Hex.True(BitConverter.ToUInt32(body, 36) == 0x83 && body[40] == 1 && BitConverter.ToInt64(body, 41) == row.ServantDbId
+                 && BitConverter.ToInt32(body, 53) == 5001 && body.Length == 85 + 6, "DBS_ADD_SERVANT: DlmId, ok, the new id, the name");
+
+        int guild = store.CreateGuild("sdg", 1, warAcceptable: true);
+        // T168b: an unknown guild threw FOREIGN KEY (link closed); now ok 0, nothing inserted
+        (_, body) = RunHandler1(DbProxyHandlers.SDB_ADD_GUILDMEMBER2, T168Frame(20, (0, 0x8A, 4), (4, guild + 999, 4), (8, 2, 4), (12, 2, 4), (16, 1, 4)), store);
+        Hex.Eq(body, "8A 00 00 00 00", "T168b: unknown guild refused");
+        (_, body) = RunHandler1(DbProxyHandlers.SDB_ADD_GUILDMEMBER2, T168Frame(8, (0, 0x8B, 4)), store);
+        Hex.Eq(body, "8B 00 00 00 00", "T168b: short payload refused");
+        Hex.True(store.AddServant(999, 1, 1, "x", 0, 0) == 0 && !store.AddCardBookReward(999999, 1)
+                 && store.LearnHiddenPassives(999, new[] { 1 }).Count == 0 && store.AddVipGameExp(999999, 1) == 0,
+            "T168b: writes for a missing character / account are dropped");
+        (_, body) = RunHandler1(DbProxyHandlers.SDB_ADD_GUILDMEMBER2, T168Frame(20, (0, 0x84, 4), (4, guild, 4), (8, 2, 4), (12, 2, 4), (16, 1, 4)), store);
+        Hex.Eq(body, "84 00 00 00 01", "member added");
+        (_, body) = RunHandler1(DbProxyHandlers.SDB_ADD_GUILDMEMBER2, T168Frame(20, (0, 0x85, 4), (4, guild, 4), (8, 2, 4), (12, 2, 4), (16, 1, 4)), store);
+        Hex.Eq(body, "85 00 00 00 00", "already in a guild");
+        var ask = new byte[12 + 8];
+        BitConverter.GetBytes(18u).CopyTo(ask, 0); BitConverter.GetBytes(0x86u).CopyTo(ask, 4);
+        "s\0d\0g\0\0\0"u8.ToArray().CopyTo(ask, 12);
+        (_, body) = RunHandler1(DbProxyHandlers.SDB_ASK_CHANGE_GUILD_NAME, ask, store);
+        Hex.Eq(body, "86 00 00 00 00 01 00 00 00", "sdg is taken");
+
+        long acct = store.AccountOf(1);
+        var book = new byte[32];
+        BitConverter.GetBytes(38u).CopyTo(book, 0);
+        BitConverter.GetBytes(0x87u).CopyTo(book, 8); BitConverter.GetBytes(acct).CopyTo(book, 12);
+        BitConverter.GetBytes(1).CopyTo(book, 20); BitConverter.GetBytes(606).CopyTo(book, 28);
+        (_, body) = RunHandler1(DbProxyHandlers.SDB_RECEIVE_COLLECTION_BOOK_REWARD, book, store);
+        Hex.True(BitConverter.ToInt32(body, 17) == 606 && body[12] == 1, "RewardId echoed");
+        (_, body) = RunHandler1(0x2986, T167Frame(16, (0, 0x88, 4), (4, acct, 8), (12, 1, 4)), store);
+        Hex.True(BitConverter.ToUInt32(body, 24) == 1 && BitConverter.ToInt32(body, 53 + 8) == 606,
+            "the card-data load now lists the reward (12-byte element)");
+    }
+
+    /// <summary>The two T168 loads with captured pairs, from TryHandle: both the empty form.</summary>
+    [Test] public static void T168_the_two_captured_loads_are_byte_exact()
+    {
+        var cap = LoadTsisOrSkip("cap_t168.bin");
+        if (cap == null) return;
+        foreach (var (req, rep, op) in new[] { (178u, 179u, (ushort)0x2900), (288u, 289u, (ushort)0x2981) })
+        {
+            var (rop, body) = RunHandler1(op, cap[req]);
+            Hex.True(rop == op + 1, $"0x{rop:X4}");
+            Hex.Eq(body, cap[rep], $"0x{op:X4}: seq {req} -> {rep}");
+        }
+    }
+
+    /// <summary>Refusals (ok 0, nothing applied) and the two silent broker frames.</summary>
+    [Test] public static void T168_refusals_answer_ok_0_and_broker_deals_stay_silent()
+    {
+        using var store = GuildStore(1);
+        var (_, body) = RunHandler1(DbProxyHandlers.SDB_EQUIP_PARTNER_STYLE_ITEM, T168Frame(37, (8, 0x91, 4)), store);
+        Hex.Eq(body, "17 00 00 00 00 00 00 00 91 00 00 00 00 00 00 00 00", "partner style: empty ref, DlmId, ok 0");
+        (_, body) = RunHandler1(DbProxyHandlers.SDB_GROUP_DUEL_RETURN, T168Frame(40, (16, 0x92, 4)), store);
+        Hex.True(body.Length == 18 && BitConverter.ToUInt32(body, 8) == 0x92 && body[12] == 0, "group duel return refused");
+        (_, body) = RunHandler1(DbProxyHandlers.SDB_CHECK_PLAYTIME_REWARD, T168Frame(16, (0, 0x93, 4), (4, 1, 4), (8, 1, 4), (12, 9, 4)), store);
+        Hex.Eq(body, "93 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00", "never eligible");
+        foreach (ushort op in new[] { DbProxyHandlers.SDB_TRADE_BROKER_START_DEAL, DbProxyHandlers.SDB_TRADE_BROKER_CANCEL_DEAL })
+            Hex.True(RunHandler(op, new byte[12], 0, store).Count == 0, $"0x{op:X4}: handled, no reply");
+    }
+
+    /// <summary>Group C after T168: everything landed but the four left on purpose (their rows say why).</summary>
+    [Test] public static void T168_pending_group_C_is_only_what_was_left_on_purpose()
+    {
+        var pending = DbAckGroups.RealHandler.Keys.OrderBy(o => o).ToArray();
+        Hex.True(pending.SequenceEqual(T168DeliberatelyLeft),
+            "pending C: " + string.Join(", ", pending.Select(o => $"0x{o:X4} {DbProxyOpcodeNames.Name(o)}")));
+        foreach (ushort op in T168DeliberatelyLeft)
+            Hex.True(DbAckGroups.RealHandlerSpec[op].Contains("LEFT (T168)"), $"0x{op:X4} says why it was left");
+    }
+
+
+    // ============ T170: real-Arbiter pins + the last two group-C ops ==========
+
+    /// <summary>0x27E6: cap_clearallskill 902 -> 903 byte-exact (user id restamped); the stored
+    /// blob loses both skill regions; an unknown user gets ok 0 and empty refs.</summary>
+    [Test] public static void T170_clear_all_skill_is_byte_exact()
+    {
+        var cap = LoadTsisOrSkip("cap_t170_skill.bin");
+        if (cap == null) return;
+        using var store = GuildStore(1);
+        var blob = new byte[15312];
+        BitConverter.GetBytes(10100).CopyTo(blob, TeraSharp.Arbiter.Persistence.StarterBlob.ActiveSkillsOffset);
+        BitConverter.GetBytes(70301).CopyTo(blob, TeraSharp.Arbiter.Persistence.StarterBlob.PassiveSkillsOffset);
+        store.SaveWorldBlob(1, blob);
+        var req = (byte[])cap[902].Clone();
+        BitConverter.GetBytes(1).CopyTo(req, 4);                 // UserDbId 1003 -> our character 1
+        var (op, body) = RunHandler1(DbProxyHandlers.SDB_USER_CLEAR_ALL_SKILL, req, store);
+        Hex.True(op == DbProxyHandlers.DBS_USER_CLEAR_ALL_SKILL, "0x27E7");
+        Hex.Eq(body, cap[903], "cap_clearallskill 903: 4000 + 320 zero bytes");
+        var after = store.GetCharacter(1)!.WorldBlob!;
+        Hex.True(after.AsSpan(TeraSharp.Arbiter.Persistence.StarterBlob.PassiveSkillsOffset, 4320).IndexOfAnyExcept((byte)0) < 0,
+            "the stored blob lost both skill regions");
+        (_, body) = RunHandler1(DbProxyHandlers.SDB_USER_CLEAR_ALL_SKILL, T168Frame(8, (0, 0x50, 4), (4, 999, 4)), store);
+        Hex.Eq(body, "1B 00 00 00 00 00 00 00 1B 00 00 00 00 00 00 00 50 00 00 00 00", "no such user: ok 0, empty refs");
+    }
+
+    static byte[] T170EventProgress(bool overwrite, params (long Ev, int User, long Acct, int Value, byte F1, byte F2)[] e)
+    {
+        var p = new byte[9 + e.Length * DbProxyHandlers.EventProgressReqElem];
+        BitConverter.GetBytes(e.Length).CopyTo(p, 0);
+        BitConverter.GetBytes(e.Length == 0 ? 0 : 15).CopyTo(p, 4);
+        p[8] = (byte)(overwrite ? 1 : 0);
+        for (int i = 0; i < e.Length; i++)
+        {
+            int o = 9 + i * DbProxyHandlers.EventProgressReqElem, self = o + 6;
+            BitConverter.GetBytes(self).CopyTo(p, o);
+            BitConverter.GetBytes(i + 1 < e.Length ? self + DbProxyHandlers.EventProgressReqElem : 0).CopyTo(p, o + 4);
+            BitConverter.GetBytes(e[i].Ev).CopyTo(p, o + 8);
+            BitConverter.GetBytes(e[i].User).CopyTo(p, o + 0x11);
+            BitConverter.GetBytes(e[i].Acct).CopyTo(p, o + 0x15);
+            BitConverter.GetBytes(e[i].Value).CopyTo(p, o + 0x1D);
+            p[o + 0x21] = e[i].F1; p[o + 0x22] = e[i].F2;
+        }
+        return p;
+    }
+
+    /// <summary>0x2969 (decompile-derived): stored per (event, user, account), value set, Flag1 kept
+    /// unless the header says overwrite; both keys 0 is refused with no reply.</summary>
+    [Test] public static void T170_event_progress_is_stored_and_read_back()
+    {
+        using var store = GuildStore(1);
+        var (op, body) = RunHandler1(DbProxyHandlers.SDB_UPDATE_EVENTSYSTEM_PROGRESS,
+            T170EventProgress(false, (7001, 1, 1, 3, 1, 0), (7002, 1, 1, 9, 0, 1)), store);
+        Hex.True(op == DbProxyHandlers.DBS_UPDATE_EVENTSYSTEM_PROGRESS && body.Length == 9 + 2 * 0x22, "0x296A, two elements");
+        Hex.Eq(body.AsSpan(0, 43).ToArray(),
+            "02 00 00 00 0F 00 00 00 00  0F 00 00 00 31 00 00 00 59 1B 00 00 00 00 00 00 01 00 00 00 01 00 00 00 00 00 00 00 03 00 00 00 01 00",
+            "header + first element: self 15, next 49, event 7001, user 1, account 1, value 3, flags 1/0");
+        (_, body) = RunHandler1(DbProxyHandlers.SDB_UPDATE_EVENTSYSTEM_PROGRESS, T170EventProgress(false, (7001, 1, 1, 5, 0, 0)), store);
+        Hex.True(BitConverter.ToInt32(body, 9 + 0x1C) == 5 && body[9 + 0x20] == 1, "value set to 5, Flag1 kept without overwrite");
+        (_, body) = RunHandler1(DbProxyHandlers.SDB_UPDATE_EVENTSYSTEM_PROGRESS, T170EventProgress(true, (7001, 1, 1, 5, 0, 0)), store);
+        Hex.True(body[9 + 0x20] == 0, "overwrite clears it");
+        Hex.True(store.GetEventProgress(1).Count == 2, "two rows for character 1");
+        Hex.True(RunHandler(DbProxyHandlers.SDB_UPDATE_EVENTSYSTEM_PROGRESS, T170EventProgress(false, (7003, 0, 0, 1, 0, 0)), 0, store).Count == 0,
+            "user and account both 0: refused, no reply");
+    }
+
+    /// <summary>Run captured requests through one handler instance, in order; the replies are
+    /// compared byte for byte. Returns the mismatches (seq and both hex strings).</summary>
+    static List<string> T170Replay(Dictionary<uint, byte[]> cap, TeraSharp.Arbiter.Persistence.CharacterStore store,
+                                   DbProxyHandlers h, params (uint Req, uint Rep, Func<byte[], byte[]>? Stamp)[] pairs)
+    {
+        var bad = new List<string>();
+        foreach (var (req, rep, stamp) in pairs)
+        {
+            var p = (byte[])cap[req].Clone();
+            if (stamp != null) p = stamp(p);
+            ushort op = BitConverter.ToUInt16(BitConverter.GetBytes(T170Ops[req]), 0);
+            var got = RunHandler(op, p, 1, store, h)[0].body;
+            if (!got.AsSpan().SequenceEqual(cap[rep]))
+                bad.Add($"{req}->{rep}: got {Convert.ToHexString(got)} want {Convert.ToHexString(cap[rep])}");
+        }
+        return bad;
+    }
+
+    static readonly Dictionary<uint, ushort> T170Ops = new()
+    {
+        [340] = 0x27B9, [358] = 0x2986, [682] = 0x27B9, [700] = 0x2986, [1012] = 0x27B3, [5716] = 0x27C1,
+        [5750] = 0x27BB, [5787] = 0x299A, [5931] = 0x27BB, [5977] = 0x299C, [6016] = 0x27BB, [6160] = 0x27BB,
+        [6312] = 0x27BD, [29642] = 0x27B9, [29660] = 0x2986,
+    };
+
+    /// <summary>EP and card pins, cap_final2b (data/cap_t170_ep.bin). Character 1003 has no EP and
+    /// no cards (the empty forms, restamped to our character 2). Character 1 is the GM: its first
+    /// load, the eight EP writes in order (pre-EP, learn x4, expand page, change page, reset), and
+    /// the loads after its relog - which read back what the writes stored.</summary>
+    [Test] public static void T170_ep_writes_and_loads_replay_byte_exact()
+    {
+        var cap = LoadTsisOrSkip("cap_t170_ep.bin");
+        if (cap == null) return;
+        using var store = GuildStore(2);
+        var h = FreshHandlers(store);
+        byte[] To2At(byte[] p, int at) { BitConverter.GetBytes(2).CopyTo(p, at); return p; }
+        var bad = T170Replay(cap, store, h,
+            (340, 341, p => To2At(p, 4)), (358, 359, p => To2At(p, 12)));
+        // Character 1 arrives with state from earlier sessions: pre-EP 266/300 (the values its own
+        // 5716 write re-sends) and one card, 311034 x20, mounted in preset 0 (no card write is in
+        // either capture, so this one is seeded, not replayed), with 60 collection-book points.
+        store.SetEpPre(1, 266, 300);
+        store.AddCard(store.AccountOf(1), 311034, 20);
+        store.MountCard(1, 0, 311034);
+        store.SetCardInfo(store.AccountOf(1), store.GetCardInfo(store.AccountOf(1)) with { BookPoint = 60 });
+        bad.AddRange(T170Replay(cap, store, h,
+            (682, 683, null), (700, 701, null), (1012, 1013, null),
+            (5716, 5717, null), (5750, 5751, null), (5787, 5789, null), (5931, 5932, null), (5977, 5978, null),
+            (6016, 6017, null), (6160, 6161, null), (6312, 6313, null),
+            (29642, 29643, null), (29660, 29661, null)));
+
+        // cap_final 2913..2931: character 2 owns the same card but mounts none - the 75-byte form.
+        var fin = LoadTsisOrSkip("cap_t170_final.bin");
+        if (fin != null)
+        {
+            using var s2 = GuildStore(2);
+            s2.AddCard(s2.AccountOf(2), 311034, 20);
+            s2.SetCardInfo(s2.AccountOf(2), s2.GetCardInfo(s2.AccountOf(2)) with { BookPoint = 60 });
+            T170Ops[2913] = 0x27B9; T170Ops[2930] = 0x2986;
+            bad.AddRange(T170Replay(fin, s2, FreshHandlers(s2), (2913, 2914, null), (2930, 2931, null)));
+        }
+        Hex.True(bad.Count == 0, string.Join("\n", bad));
+    }
+
+
+    /// <summary>Mail: every collect's step 2 ends in an op-37 atom (DO_TS_RECV_PARCEL) naming the
+    /// parcel at +0x278. cap_social 1555 -> 1556: the atoms come back byte-exact, op 37 included,
+    /// and op 37 is a known, inert marker (the recv path marks the parcel).</summary>
+    [Test] public static void T170_a_collect_echoes_the_op37_parcel_marker()
+    {
+        var cap = LoadTsisOrSkip("cap_t170_mail.bin");
+        if (cap == null) return;
+        byte[] req = cap[1555], rep = cap[1556];
+        int reqAtoms = (int)BitConverter.ToUInt32(req, ParcelDbHandlers.RecvReqTransListRef) - 6;
+        int reqLen = (int)BitConverter.ToUInt32(req, ParcelDbHandlers.RecvReqTransListRef + 4);
+        int last = reqAtoms + reqLen - DbProxyHandlers.ItemAtomSize;
+        Hex.True(BitConverter.ToUInt32(req, last + WarehouseHandlers.AtomOp) == WarehouseHandlers.TsRecvParcel
+                 && BitConverter.ToUInt32(req, last + WarehouseHandlers.AtomRecvParcelId)
+                    == BitConverter.ToUInt32(req, ParcelDbHandlers.RecvReqParcelId),
+            "the last atom is op 37 and names the parcel being collected");
+
+        using var store = GuildStore(2);
+        int id = store.CreateParcel(2, "Test", 1, "here", string.Empty, 0);
+        Hex.True(id == BitConverter.ToUInt32(req, ParcelDbHandlers.RecvReqParcelId), $"parcel id {id} lines up with the capture");
+        int recOff = (int)BitConverter.ToUInt32(rep, ParcelDbHandlers.RecvRspParcelDataRef) - 6;
+        int recLen = (int)BitConverter.ToUInt32(rep, ParcelDbHandlers.RecvRspParcelDataRef + 4);
+        store.SetParcelRecord(id, rep.AsSpan(recOff, recLen).ToArray());
+        var (_, body) = RunHandler1(DbProxyHandlers.SDB_RECV_PARCEL, req, store);
+        int gotAt = (int)BitConverter.ToUInt32(body, ParcelDbHandlers.RecvRspTransListRef) - 6;
+        int wantAt = (int)BitConverter.ToUInt32(rep, ParcelDbHandlers.RecvRspTransListRef) - 6;
+        int n = (int)BitConverter.ToUInt32(rep, ParcelDbHandlers.RecvRspTransListRef + 4);
+        Hex.Eq(body.AsSpan(gotAt, n).ToArray(), rep.AsSpan(wantAt, n).ToArray(), "cap_social 1556's two atoms, op 37 last");
+        // (The record differs only where ServedParcelRecord stamps our ids - character 1002 is not ours.)
+    }
+
+
+    /// <summary>cap_final2a's two players: character 1 "New" in sdg (guild 2), character 2 "dobb"
+    /// in fdh (guild 3), with the guild money the capture starts from.</summary>
+    static TeraSharp.Arbiter.Persistence.CharacterStore T170GuildWarStore()
+    {
+        var store = new TeraSharp.Arbiter.Persistence.CharacterStore(":memory:", QuietLog());
+        var acct = store.GetOrCreateAccount("t170");
+        foreach (var name in new[] { "New", "dobb" })
+            store.CreateCharacter(new TeraSharp.Arbiter.Persistence.CharacterRecord
+            {
+                AccountId = acct.Id, Name = name, Gender = 1, Race = 4, Class = 12, Level = 65,
+                TemplateId = 10101, Zone = 5, X = 1f, Y = 2f, Z = 3f,
+                Appearance = new byte[8], Details = new byte[32], Shape = new byte[64], Position = 1,
+            });
+        store.CreateGuild("filler", 1, warAcceptable: true);
+        int sdg = store.CreateGuild("sdg", 1, warAcceptable: true);
+        int fdh = store.CreateGuild("fdh", 2, warAcceptable: true);
+        Hex.True(sdg == 2 && fdh == 3, $"the capture's guild ids; got {sdg} and {fdh}");
+        store.AddGuildMember(sdg, 1, "New", 4, 12, 1, 65, acct.Id);
+        store.AddGuildMember(fdh, 2, "dobb", 4, 12, 1, 65, acct.Id);
+        store.AddGuildMoney(sdg, 8_898_665);   // 8898565 after its 100 (client1 4073)
+        store.AddGuildMoney(fdh, 10_000_000);  // 9999900 after its 100 (client2 2175)
+        return store;
+    }
+
+    static byte[] T170Raw(ArbiterActions a, string packet)
+    {
+        foreach (var item in a.Ordered)
+            if (item is ClientPacket c && c.PacketName == packet) return c.RawBody!;
+        throw new Exception($"no {packet} in the actions");
+    }
+
+    static IReadOnlyDictionary<string, object> T170Fields(ArbiterActions a, int to, string packet)
+    {
+        foreach (var item in a.Ordered)
+            if (item is ClientPacket c && c.PacketName == packet && unchecked((int)c.To.Id) == to) return c.Fields!;
+        throw new Exception($"no {packet} for {to}");
+    }
+
+    static byte[] T170World(ArbiterActions a, ushort op)
+    {
+        foreach (var item in a.Ordered)
+            if (item is IArbiterWorldAction w && w.Opcode == op) return w.Payload;
+        throw new Exception($"no 0x{op:X4} in the actions");
+    }
+
+    /// <summary>
+    /// T170-guildwar: the whole cap_final2a/2b episode byte-exact (data/cap_t170_guild.bin) - fdh
+    /// declares on sdg, sdg declares back (mutual), sdg withdraws its declaration, asks the
+    /// penalty, gives up. Client bodies are cap_final2a_client1/2; World frames are the 2b tap.
+    /// The costs are this server's admin override (100 / 10), loaded as a GuildConfig row.
+    /// </summary>
+    [Test] public static void T170_guild_war_accept_and_surrender_match_the_capture()
+    {
+        var cap = LoadTsisOrSkip("cap_t170_guild.bin");
+        if (cap == null) return;
+        var dir = Path.Combine(Path.GetTempPath(), "t170_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        File.WriteAllText(Path.Combine(dir, "GuildConfig.xml"),
+            "<GuildConfig><GuildSizeTable><GuildSize rank='0' accountNumOver='1' declareCost='100' "
+            + "maintainCost='10' declareLimitCount='10'/></GuildSizeTable></GuildConfig>");
+        DatasheetLoader.GuildSizes.Load(dir);
+        using var store = T170GuildWarStore();
+        GuildWarManager.Store = store;
+        try
+        {
+            var reg = CreateT80Defs();
+            reg.RegisterFromDef("S_GUILD_MONEY_INFO_CHANGED", "int32 guildDbId\nint64 newMoney\n");
+            byte[] Window(int player) => WriteByDef(reg, "S_OPEN_GUILD_WAR_WINDOW", new Dictionary<string, object>(
+                ChatFields(GuildWarManager.Decide(player, GuildWarManager.C_OPEN_GUILD_WAR_WINDOW, default, 0), 0)));
+            byte[] Money(ArbiterActions a, int to) => WriteByDef(reg, "S_GUILD_MONEY_INFO_CHANGED",
+                new Dictionary<string, object>(T170Fields(a, to, "S_GUILD_MONEY_INFO_CHANGED")));
+            var sdgBody = Hex.B("06 00  73 00 64 00 67 00 00 00");
+            var three = BitConverter.GetBytes(3);
+
+            // a throwaway war between two other guilds, so this one is war 2 as in the tap
+            int f2 = store.CreateGuild("filler2", 2, warAcceptable: true);
+            long w1 = store.DeclareGuildWar(1, f2, 1, 0);
+            store.EndGuildWar(w1, GuildWarManager.ResultWithdrew, 2);
+
+            var a = GuildWarManager.Decide(2, GuildWarManager.C_CHECK_TO_DECLARE_GUILD_WAR, sdgBody, 0);
+            Hex.Eq(WriteByDef(reg, "S_CHECK_TO_DECLARE_GUILD_WAR", new Dictionary<string, object>(ChatFields(a, 0))),
+                cap[202167], "client2 2167: yes, 100 gold, 0 of 10");
+            a = GuildWarManager.Decide(2, GuildWarManager.C_DECLARE_GUILD_WAR, sdgBody, 1790067785);
+            Hex.Eq(Money(a, 2), cap[202175], "client2 2175: fdh paid 100");
+            Hex.Eq(T170World(a, GuildWarManager.AS_DECLARE_GUILD_WAR), cap[6801], "tap 6801 AS_DECLARE_GUILD_WAR");
+            Hex.Eq(Window(2), cap[202179], "client2 2179: fdh's view - its block first, declared");
+            Hex.Eq(Window(1), cap[104011], "client1 4011: sdg's view of the same war - its block first, not declared");
+
+            a = GuildWarManager.Decide(1, GuildWarManager.C_CHECK_TO_OPPOSITE_DECLARE_GUILD_WAR, three, 0);
+            Hex.Eq(T170Raw(a, GuildWarManager.S_CHECK_TO_OPPOSITE_DECLARE_GUILD_WAR), cap[104068], "client1 4068");
+            a = GuildWarManager.Decide(1, GuildWarManager.C_OPPOSITE_DECLARE_GUILD_WAR, three, 0);
+            Hex.Eq(Money(a, 1), cap[104073], "client1 4073: sdg paid 100");
+            Hex.Eq(T170World(a, GuildWarManager.AS_OPPOSITE_DECLARE_GUILD_WAR), cap[6901], "tap 6901 AS_OPPOSITE_DECLARE_GUILD_WAR");
+            Hex.True(ChatCount(a, "S_NOTIFY_GUILD_WAR_STATUS_CHANGE") == 2, "both guilds notified (client1 4074, client2 2212)");
+            Hex.Eq(Window(1), cap[104077], "client1 4077: mutual, 1 declaration on sdg's counter");
+            Hex.Eq(Window(2), cap[202214], "client2 2214: mutual from fdh's side");
+            Hex.True(GuildWarManager.Decide(1, GuildWarManager.C_CHECK_TO_OPPOSITE_DECLARE_GUILD_WAR, three, 0).IsEmpty,
+                "nothing left to declare back on: silence");
+
+            a = GuildWarManager.Decide(1, GuildWarManager.C_WITHDRAW_GUILD_WAR, three, 0);
+            Hex.Eq(T170World(a, GuildWarManager.AS_WITHDRAW_GUILD_WAR), cap[14883], "tap 14883 AS_WITHDRAW_GUILD_WAR, new state 6");
+            Hex.Eq(Window(1), cap[110345], "client1 10345: sdg's declaration gone, fdh's stands");
+
+            a = GuildWarManager.Decide(1, GuildWarManager.C_REQUEST_GUILD_WAR_PENALTY_INFO, three, 0);
+            Hex.Eq(T170Raw(a, GuildWarManager.S_GUILD_WAR_PENALTY_INFO), cap[110379], "client1 10379: 0.5 x 100 = 50");
+            a = GuildWarManager.Decide(1, GuildWarManager.C_GIVE_UP_GUILD_WAR, three, 1790068000);
+            Hex.Eq(Money(a, 1), cap[110381], "client1 10381: sdg paid 50");
+            Hex.Eq(Money(a, 2), cap[203656], "client2 3656: fdh received it");
+            Hex.Eq(T170World(a, GuildWarManager.AS_END_GUILD_WAR), cap[14989], "tap 14989 AS_END_GUILD_WAR, reason 4");
+            Hex.Eq(Window(1), cap[110385], "client1 10385: empty, counter 1");
+            Hex.Eq(Window(2), cap[203661], "client2 3661: empty, counter 1");
+            Hex.True(store.GetGuildWarHistory(2)[0].Result == GuildWarManager.ResultGaveUp, "history: given up");
+        }
+        finally
+        {
+            GuildWarManager.ResetForTests();
+            DatasheetLoader.GuildSizes.UseBuiltIn();
+            Directory.Delete(dir, true);
+        }
+    }
+
+    /// <summary>T170: guild quest start / cancel, now captured (cap_final2a_client1 4611..4656,
+    /// client2 1548..1550) - the notice, the start, the fail and the 0x1453 push (tap 7776).</summary>
+    [Test] public static void T170_guild_quest_start_and_cancel_match_the_capture()
+    {
+        var cap = LoadTsisOrSkip("cap_t170_guild.bin");
+        if (cap == null) return;
+        using var store = T170GuildWarStore();
+        var guilds = new GuildHandlers(store, QuietLog());
+        var reg = new DefinitionRegistry(QuietLog());
+        reg.RegisterFromDef("S_START_GUILD_QUEST", "byte result\nint32 questId\nstring guildName\n");
+        reg.RegisterFromDef("S_SYSTEM_MESSAGE", "string message\n");
+        byte[] Body(GuildActions a, string p) => T135Bodies(a, reg, p)[0].Body;
+
+        var a = guilds.OnClientPacket(2, GuildPackets.C_REQUEST_START_GUILD_QUEST, T135QuestBody(10002));
+        Hex.Eq(Body(a, "S_SYSTEM_MESSAGE"), cap[201549], "client2 1549: SMT 3809 with the quest's name");
+        Hex.Eq(Body(a, "S_START_GUILD_QUEST"), cap[201550], "client2 1550");
+        a = guilds.OnClientPacket(1, GuildPackets.C_REQUEST_START_GUILD_QUEST, T135QuestBody(10003));
+        Hex.Eq(Body(a, "S_SYSTEM_MESSAGE"), cap[104612], "client1 4612");
+        Hex.Eq(Body(a, "S_START_GUILD_QUEST"), cap[104613], "client1 4613");
+        Hex.Eq(a.ToWorld.Single(w => w.Opcode == GuildPackets.AS_UPDATE_GUILD_QUEST_POINT_INFO).Payload, cap[7776],
+            "tap 7776 AS_UPDATE_GUILD_QUEST_POINT_INFO: guild 2, 900");
+        a = guilds.OnClientPacket(1, GuildPackets.C_REQUEST_CANCEL_GUILD_QUEST, T135QuestBody(10003));
+        Hex.Eq(Body(a, "S_FAIL_GUILD_QUEST"), cap[104654], "client1 4654");
+        Hex.Eq(Body(a, "S_SYSTEM_MESSAGE"), cap[104656], "client1 4656: SMT 3909 names who cancelled");
+    }
+
+    // ============ T161: the first live queue - party before FIN, formed match as state ==========
+
+    /// <summary>
+    /// (1) What a matched member gets between the party and S_SYS_PARTY_INFO. The two state
+    /// frames are classic_live3 10580 (queued 0, flag 1) and 10581 (queued 0, flag 0) - rebuilt
+    /// from their own id lists they come out byte for byte - and the third is FIN, 10585.
+    /// </summary>
+    [Test] public static void T161_the_match_frames_are_classic_live3s()
+    {
+        using var _ev = T161bEvents((2154, "Dungeon", 9739), (5001, "BattleField", 9739));   // T161b: no empty state frames
+        var f = MatchWiring.MatchFoundFrames(9739);
+        Hex.True(f.Count == 3, $"state, state, FIN: {f.Count}");
+        Hex.True(BitConverter.ToUInt16(f[0], 2) == MatchQueueManager.S_CHANGE_EVENT_MATCHING_STATE
+                 && f[0][8] == 0 && f[0][9] == 1, "first: 10580's flags, queued 0 / 1");
+        Hex.True(BitConverter.ToUInt16(f[1], 2) == MatchQueueManager.S_CHANGE_EVENT_MATCHING_STATE
+                 && f[1][8] == 0 && f[1][9] == 0, "second: 10581's flags, queued 0 / 0");
+        Hex.Eq(f[2], MatchQueueManager.BuildFinInterPartyMatch(9739), "third: the FIN");
+
+        var fin = LoadLiveFrame("S_FIN_INTER_PARTY_MATCH-10585.hex");
+        if (fin != null) Hex.Eq(f[2], fin, "classic_live3 10585, byte for byte");
+
+        foreach (var (name, flag) in new[] { ("S_CHANGE_EVENT_MATCHING_STATE-10580.hex", (byte)1),
+                                              ("S_CHANGE_EVENT_MATCHING_STATE-10581.hex", (byte)0) })
+        {
+            var live = LoadLiveFrame(name);
+            if (live == null) continue;
+            var ids = new List<int>();
+            int at = BitConverter.ToUInt16(live, 6);
+            for (int guard = 0; at != 0 && guard < 1000; guard++)
+            {
+                Hex.True((uint)at + 8u <= (uint)live.Length, $"{name}: element at {at} inside the frame");
+                ids.Add(BitConverter.ToInt32(live, at + 4));
+                at = BitConverter.ToUInt16(live, at + 2);
+            }
+            Hex.True(ids.Count == BitConverter.ToUInt16(live, 4), $"{name}: {ids.Count} ids");
+            Hex.True(live[8] == 0 && live[9] == flag, $"{name}: queued 0, flag {flag}");
+            Hex.Eq(MatchQueueManager.BuildChangeEventMatchingState(ids, queued: false, unk: flag), live,
+                $"{name} rebuilt from its own ids");
+        }
+    }
+
+    /// <summary>
+    /// (1) The bug cap_queue1 showed: FIN went out before the party existed. Now every matched
+    /// member's own stream is classic_live3's - party member list, state (0,1), state (0,0),
+    /// FIN naming the dungeon, S_SYS_PARTY_INFO - and it is the same for BOTH members.
+    /// </summary>
+    [Test] public static void T161_the_party_exists_before_each_members_fin()
+    {
+        using var _ev = T161bEvents((7001, "Dungeon", 3036), (7002, "BattleField", 3036));   // T161b
+        var pm = NewPartyManager();
+        pm.Register(P(5, 9, "caludesucks", cls: 0));
+        pm.Register(P(6, 10, "test", cls: 6));
+        var a = pm.FormMatchedParty(T138dMembers((9, MatchRole.Tank), (10, MatchRole.Healer)),
+            raid: false, dungeonId: 3036, matchFrames: MatchWiring.MatchFoundFrames(3036));
+        Hex.True(a.Rejected == null, $"the pair forms a party: {a.Rejected}");
+
+        foreach (uint t in new uint[] { 5, 6 })
+        {
+            var mine = a.ToClients.Where(c => c.Ticket == t).ToList();
+            int Op(int i) => mine[i].IsRaw ? BitConverter.ToUInt16(mine[i].RawPacket!, 2) : -1;
+            int list = mine.FindLastIndex(c => c.PacketName == "S_PARTY_MEMBER_LIST");
+            int s1 = mine.FindIndex(c => c.IsRaw && BitConverter.ToUInt16(c.RawPacket!, 2) == MatchQueueManager.S_CHANGE_EVENT_MATCHING_STATE && c.RawPacket![9] == 1);
+            int s0 = mine.FindIndex(c => c.IsRaw && BitConverter.ToUInt16(c.RawPacket!, 2) == MatchQueueManager.S_CHANGE_EVENT_MATCHING_STATE && c.RawPacket![9] == 0);
+            int fin = mine.FindIndex(c => c.IsRaw && BitConverter.ToUInt16(c.RawPacket!, 2) == MatchQueueManager.S_FIN_INTER_PARTY_MATCH);
+            int sys = mine.FindIndex(c => c.IsRaw && BitConverter.ToUInt16(c.RawPacket!, 2) == PartyPackets.S_SYS_PARTY_INFO);
+            Hex.True(list >= 0 && list < s1 && s1 < s0 && s0 < fin && fin < sys,
+                $"ticket {t}: list {list} < state(0,1) {s1} < state(0,0) {s0} < FIN {fin} < S_SYS_PARTY_INFO {sys}");
+            Hex.True(mine.Count(c => c.IsRaw && BitConverter.ToUInt16(c.RawPacket!, 2) == MatchQueueManager.S_FIN_INTER_PARTY_MATCH) == 1,
+                $"ticket {t}: exactly one FIN");
+            Hex.True(BitConverter.ToInt32(mine[fin].RawPacket!, 4) == 3036, "the FIN names the queued dungeon");
+            Hex.True(Op(sys) == PartyPackets.S_SYS_PARTY_INFO && BitConverter.ToInt32(mine[sys].RawPacket!, 8 + 8) == 9,
+                "and the party info that follows it has the leader in slot 0");
+        }
+    }
+
+    /// <summary>
+    /// (1) The matcher side: the party layer runs FIRST, and a member it could not reach gets
+    /// the same three frames through the fallback - after the party call, never before.
+    /// </summary>
+    [Test] public static void T161_the_matcher_calls_the_party_first()
+    {
+        const int Kelsaik = 9739;
+        using var _ev = T161bEvents((2154, "Dungeon", Kelsaik), (5001, "BattleField", Kelsaik));   // T161b
+        MatchWiring.Reset();
+        var log = new List<string>();
+        MatchWiring.Deliver = (q, p) => log.Add($"{q.CharacterId}:{BitConverter.ToUInt16(p, 2):X4}");
+        MatchWiring.FormParty = (g, frames) =>
+        {
+            log.Add("party");
+            Hex.True(frames.Count == 3, "the party layer is handed the three frames");
+            return new[] { g.Members[0].CharacterId };      // it reached the first member only
+        };
+        try
+        {
+            T138cQueue(1, Kelsaik, T138cQ(1, 1), T138cQ(2, 6));
+            T138cQueue(3, Kelsaik, T138cQ(3, 2));
+            T138cQueue(4, Kelsaik, T138cQ(4, 5));
+            T138cQueue(5, Kelsaik, T138cQ(5, 4));
+            var g = MatchWiring.TryFormAndFinish(Kelsaik, DateTimeOffset.UnixEpoch.AddHours(5));
+            Hex.True(g != null && log.Count > 0 && log[0] == "party", $"the party call comes first: {string.Join(" ", log)}");
+            int reached = g!.Members[0].CharacterId;
+            Hex.True(!log.Any(s => s.StartsWith(reached + ":")), "the member the party reached is not sent it twice");
+            Hex.True(log.Count == 1 + 4 * 3, $"the other four get three frames each: {log.Count - 1}");
+        }
+        finally { MatchWiring.Reset(); }
+    }
+
+    /// <summary>A formed two-member match on 3036 with the party layer stubbed; returns the log of deliveries.</summary>
+    static List<(int Char, ushort Op, byte[] Frame)> T161Form(DateTimeOffset now)
+    {
+        var sent = new List<(int, ushort, byte[])>();
+        MatchWiring.Reset();
+        MatchWiring.Clock = () => now;
+        MatchWiring.Deliver = (q, p) => sent.Add((q.CharacterId, BitConverter.ToUInt16(p, 2), p));
+        MatchWiring.FormParty = (g, _) => g.Members.Select(m => m.CharacterId).ToArray();
+        MatchWiring.SysPartyInfoFor = (id, roles) => PartyPackets.BuildSysPartyInfo(roles
+            .Select(r => new PartyPackets.SysPartySlot(PartyPackets.PlanetId, r.Key, r.Value)).ToList());
+        var keep = Environment.GetEnvironmentVariable(MatchQueueManager.MinMembersVariable);
+        Environment.SetEnvironmentVariable(MatchQueueManager.MinMembersVariable, "2");
+        try
+        {
+            T138cQueue(9, 3036, T138cQ(9, 0));
+            T138cQueue(10, 3036, T138cQ(10, 6));
+            var g = MatchWiring.TryFormAndFinish(3036, now);
+            Hex.True(g != null && g.Members.Count == 2, "the knob's two-member match forms");
+        }
+        finally { Environment.SetEnvironmentVariable(MatchQueueManager.MinMembersVariable, keep); }
+        return sent;
+    }
+
+    /// <summary>
+    /// (4a/4b) A formed match is state: both members have it, it refuses a second queue, and a
+    /// relog gets the offer again - FIN then S_SYS_PARTY_INFO - once per world entry.
+    /// classic_live3's only formed match was entered at once, so there is no re-offer frame to
+    /// pin; the two frames are the capture's own FIN and party info, re-sent.
+    /// </summary>
+    [Test] public static void T161_a_formed_match_stands_until_used()
+    {
+        var t0 = DateTimeOffset.UnixEpoch.AddDays(100);
+        try
+        {
+            T161Form(t0);
+            var m9 = MatchWiring.PendingFor(9, t0);
+            var m10 = MatchWiring.PendingFor(10, t0);
+            Hex.True(m9 != null && ReferenceEquals(m9, m10) && m9.InstanceId == 3036,
+                "both members share one pending match on 3036");
+            Hex.True(m9!.ExpiresAt == t0.AddSeconds(MatchWiring.EntrySeconds()) && m9.FormedAt == t0,
+                "formed-at and expiry are recorded");
+            Hex.True(m9.Roles.Count == 2 && m9.WaitingFor().Count == 2, "with both members' seats");
+
+            var again = MatchWiring.Standing(new[] { T138cQ(10, 6) }, t0.AddSeconds(10));
+            Hex.True(again != null && again.Value.CharacterId == 10, "(b) a second C_MATCH_ADD is refused");
+            Hex.True(MatchWiring.Standing(new[] { T138cQ(11, 6) }, t0) == null, "someone else may queue");
+
+            var offer = MatchWiring.TakeReoffer(0xABCDUL, 10, t0.AddSeconds(30));
+            Hex.True(offer.Count == 2, $"(a) the relog gets FIN + S_SYS_PARTY_INFO: {offer.Count}");
+            Hex.Eq(offer[0], MatchQueueManager.BuildFinInterPartyMatch(3036), "the same FIN");
+            Hex.True(BitConverter.ToUInt16(offer[1], 2) == PartyPackets.S_SYS_PARTY_INFO, "then the party info");
+            Hex.True(MatchWiring.TakeReoffer(0xABCDUL, 10, t0.AddSeconds(31)).Count == 0,
+                "a zone change in the same world entry does not throw the window up again");
+            Hex.True(MatchWiring.TakeReoffer(0xABCEUL, 10, t0.AddSeconds(40)).Count == 2,
+                "the next world entry does");
+        }
+        finally { MatchWiring.Reset(); }
+    }
+
+    /// <summary>
+    /// (4c) "Enter later": the match stays claimable, and walking into 3036 uses up only YOUR
+    /// share of it. Walking into somewhere else uses nothing.
+    /// </summary>
+    [Test] public static void T161_entering_the_instance_claims_your_share()
+    {
+        var t0 = DateTimeOffset.UnixEpoch.AddDays(101);
+        try
+        {
+            T161Form(t0);
+            Hex.True(!MatchWiring.OnDungeonEntered(9, 9739), "another dungeon claims nothing");
+            Hex.True(MatchWiring.PendingFor(9, t0) != null, "so 9's match still stands");
+            Hex.True(MatchWiring.OnDungeonEntered(9, 3036), "9 enters 3036");
+            Hex.True(MatchWiring.PendingFor(9, t0) == null, "9 has used theirs");
+            var m10 = MatchWiring.PendingFor(10, t0);
+            Hex.True(m10 != null && m10.WaitingFor().SequenceEqual(new[] { 10 }), "10 can still enter later");
+            Hex.True(MatchWiring.Standing(new[] { T138cQ(9, 0) }, t0) == null, "and 9 may queue again");
+        }
+        finally { MatchWiring.Reset(); }
+    }
+
+    /// <summary>
+    /// (4d) Declining (leaving the matched party, or C_MATCH_DEL) and running out both void the
+    /// match and tell everyone still waiting with the record-53967 cancel pair.
+    /// </summary>
+    [Test] public static void T161_decline_and_expiry_void_the_match_and_tell_the_party()
+    {
+        using var _ev = T161bEvents((7001, "Dungeon", 3036));   // T161b: one state frame, as before
+        var t0 = DateTimeOffset.UnixEpoch.AddDays(102);
+        try
+        {
+            var sent = T161Form(t0);
+            sent.Clear();
+            Hex.True(MatchWiring.OnLeftParty(9), "9 leaves the matched party");
+            Hex.True(MatchWiring.PendingFor(9, t0) == null && MatchWiring.PendingFor(10, t0) == null,
+                "the match is off for both");
+            foreach (int c in new[] { 9, 10 })
+            {
+                var mine = sent.Where(s => s.Char == c).ToList();
+                Hex.True(mine.Count == 2 && mine[0].Op == MatchQueueManager.S_CANCEL_PARTY_MATCH_POOL
+                         && BitConverter.ToInt32(mine[0].Frame, 4) == 3036
+                         && mine[1].Op == MatchQueueManager.S_CHANGE_EVENT_MATCHING_STATE && mine[1].Frame[8] == 0,
+                    $"{c} is told: cancel(3036) + not queued");
+            }
+
+            sent = T161Form(t0);
+            sent.Clear();
+            Hex.True(MatchWiring.Decline(10, "C_MATCH_DEL"), "10 declines through the matcher");
+            Hex.True(sent.All(s => s.Char == 9) && sent.Count == 2,
+                "the decliner already has the leave pair; the partner gets the cancel pair");
+
+            sent = T161Form(t0);
+            sent.Clear();
+            int secs = MatchWiring.EntrySeconds();
+            Hex.True(MatchWiring.SweepPending(t0.AddSeconds(secs - 1)) == 0, "not before the window closes");
+            Hex.True(MatchWiring.PendingFor(10, t0.AddSeconds(secs)) == null, "at the window's end it no longer stands");
+            Hex.True(MatchWiring.SweepPending(t0.AddSeconds(secs)) == 1 && sent.Count == 4,
+                $"(d) the sweep voids it and tells both: {sent.Count}");
+            Hex.True(MatchWiring.PendingCount == 0, "nothing left behind");
+            Hex.True(MatchWiring.TakeReoffer(0x1234UL, 9, t0.AddSeconds(secs + 5)).Count == 0,
+                "an expired match is never re-offered");
+        }
+        finally { MatchWiring.Reset(); }
+    }
+
+    /// <summary>(4) TERASHARP_MATCH_ENTRY_SECONDS: ours, since no capture has an unanswered FIN.</summary>
+    [Test] public static void T161_the_entry_window_is_a_knob()
+    {
+        var keep = Environment.GetEnvironmentVariable(MatchWiring.EntrySecondsVariable);
+        try
+        {
+            Environment.SetEnvironmentVariable(MatchWiring.EntrySecondsVariable, null);
+            Hex.True(MatchWiring.EntrySeconds() == MatchWiring.DefaultEntrySeconds, "unset: the default");
+            Environment.SetEnvironmentVariable(MatchWiring.EntrySecondsVariable, " 45 ");
+            Hex.True(MatchWiring.EntrySeconds() == 45, "set: its value");
+            foreach (var bad in new[] { "0", "-5", "soon" })
+            {
+                Environment.SetEnvironmentVariable(MatchWiring.EntrySecondsVariable, bad);
+                Hex.True(MatchWiring.EntrySeconds() == MatchWiring.DefaultEntrySeconds, $"'{bad}': the default");
+            }
+        }
+        finally { Environment.SetEnvironmentVariable(MatchWiring.EntrySecondsVariable, keep); }
+    }
+
+    /// <summary>(3) The routing rule on its own: a departed Ticket is never borrowed for.</summary>
+    [Test] public static void T161_a_departed_ticket_is_never_borrowed()
+    {
+        Hex.True(TunnelRouting.Decide(true, false, 2) == TunnelRouting.Route.Own, "own buffer: own");
+        Hex.True(TunnelRouting.Decide(true, true, 1) == TunnelRouting.Route.Own, "re-registered: own");
+        Hex.True(TunnelRouting.Decide(false, false, 1) == TunnelRouting.Route.Borrow,
+            "never-seen Ticket, one session: the single-player fallback stays");
+        Hex.True(TunnelRouting.Decide(false, true, 1) == TunnelRouting.Route.Drop,
+            "cap_queue1: the partner left, one session remains - their frames are dropped, not borrowed");
+        Hex.True(TunnelRouting.Decide(false, false, 2) == TunnelRouting.Route.Drop, "two sessions: drop (T34)");
+        Hex.True(TunnelRouting.Decide(false, false, 0) == TunnelRouting.Route.Drop, "no session: drop");
+
+        var d = new DepartedTickets();
+        d.Add(0, 5);
+        Hex.True(d.Contains(0, 5) && !d.Contains(13, 5), "per World");
+        d.Forget(0, 5);
+        Hex.True(!d.Contains(0, 5), "registered again: live");
+        for (uint i = 0; i < DepartedTickets.Capacity + 10; i++) d.Add(1, i);
+        Hex.True(d.Count == DepartedTickets.Capacity && !d.Contains(1, 0) && d.Contains(1, DepartedTickets.Capacity + 9),
+            "bounded: the oldest are forgotten first");
+        d.Forget(1, DepartedTickets.Capacity + 9);
+        d.Add(1, DepartedTickets.Capacity + 9);
+        d.Add(1, 99999);
+        Hex.True(d.Contains(1, DepartedTickets.Capacity + 9), "a Ticket departed twice keeps its newer entry");
+        d.Clear();
+        Hex.True(d.Count == 0, "World restarted");
+    }
+
+    /// <summary>Flip when status/T161-PATCH.diff is applied to WorldBridge.cs.</summary>
+    public static bool T161PatchApplied = true;   // status/T161-PATCH.diff applied to WorldBridge.cs on master 2026-09-22
+
+    static void PendingUntilT161Patch(string name, Action body)
+    {
+        if (T161PatchApplied) { body(); return; }
+        try { body(); }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"        PENDING (status/T161-PATCH.diff): {name}: {ex.Message.Split('\n')[0]}");
+            return;
+        }
+        throw new Exception($"{name} PASSES against the current WorldBridge - status/T161-PATCH.diff "
+            + "must have landed. Set Tests.T161PatchApplied = true.");
+    }
+
+    /// <summary>
+    /// (3) cap_queue1's stall, on the real WorldBridge: two players, a party fan-out, one of them
+    /// leaves, World keeps addressing the leaver. The survivor must get exactly their own frames,
+    /// in order, and none of the leaver's.
+    /// </summary>
+    [Test] public static void T161_a_leave_during_fan_out_does_not_stall_the_survivor()
+        => PendingUntilT161Patch(nameof(T161_a_leave_during_fan_out_does_not_stall_the_survivor), () =>
+    {
+        var (bridge, link, sock) = TunnelHarness();
+        using (sock)
+        {
+            var five = new List<byte[]>(); var six = new List<byte[]>();
+            bridge.RegisterTunnelRoute(5, five.Add);
+            bridge.RegisterTunnelRoute(6, six.Add);
+            // Both in the party: one fan-out each to 5 (seq 0..2) and 6 (seq 0..2).
+            for (uint s = 0; s < 3; s++)
+                bridge.HandleFrame(link, WorldBridge.OpTunnelToClient,
+                    BuildTunnelFrame(ClientPkt((byte)(0x10 + s)), (5, s), (6, s)));
+            Hex.True(five.Count == 3 && six.Count == 3, "before the leave both have three");
+
+            bridge.UnregisterPlayer(0x80000AF00009UL, 0, 5);    // 5 closes the client
+
+            // World has not seen SA_LEAVE_WORLD yet: 5 is still addressed, AHEAD of 6's sequence.
+            bridge.HandleFrame(link, WorldBridge.OpTunnelToClient, BuildTunnelFrame(ClientPkt(0x55), (5, 4)));
+            bridge.HandleFrame(link, WorldBridge.OpTunnelToClient,
+                BuildTunnelFrame(ClientPkt(0x20), (5, 3), (6, 3)));
+            bridge.HandleFrame(link, WorldBridge.OpTunnelToClient, BuildTunnelFrame(ClientPkt(0x21), (6, 4)));
+            bridge.HandleFrame(link, WorldBridge.OpTunnelToClient, BuildTunnelFrame(ClientPkt(0x56), (5, 5)));
+            bridge.HandleFrame(link, WorldBridge.OpTunnelToClient, BuildTunnelFrame(ClientPkt(0x22), (6, 5)));
+
+            var tags = six.Skip(3).Select(p => p[2]).ToList();
+            Hex.True(tags.SequenceEqual(new byte[] { 0x20, 0x21, 0x22 }),
+                $"6 gets its own three, in order, and none of 5's: {BitConverter.ToString(tags.ToArray())}");
+            Hex.True(five.Count == 3, "and nothing reaches the session that left");
+        }
+    });
+
+    // ============ T161b: queue flow, second live run ===========================================
+
+    sealed class T161bSheet : IDisposable
+    {
+        private readonly string _dir;
+        public T161bSheet(string dir) => _dir = dir;
+        public void Dispose()
+        {
+            DatasheetLoader.EventMatchingTargets.UseBuiltIn();
+            try { Directory.Delete(_dir, true); } catch (IOException) { }
+        }
+    }
+
+    /// <summary>A temp EventMatching.xml holding these matching events, loaded; disposing restores the built-in.</summary>
+    static IDisposable T161bEvents(params (int Id, string Type, int Target)[] events)
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "t161b-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        var xml = new System.Text.StringBuilder("\uFEFF<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<EventMatching><EventList>\n");
+        foreach (var (id, type, target) in events)
+            xml.Append($"<Event id=\"{id}\" type=\"{type}\" active=\"true\"><Action type=\"matching\" /><TargetList><Target id=\"{target}\" /></TargetList></Event>\n");
+        xml.Append("<Event id=\"4001\" type=\"Field\" active=\"true\"><Action type=\"teleport\" /><TargetList><Target id=\"9739\" /></TargetList></Event>\n");
+        xml.Append("<Event id=\"4002\" type=\"Dungeon\" active=\"false\"><Action type=\"matching\" /><TargetList><Target id=\"9739\" /></TargetList></Event>\n");
+        xml.Append("<!--<Event id=\"4003\" type=\"Dungeon\" active=\"true\"><Action type=\"matching\" /><TargetList><Target id=\"9739\" /></TargetList></Event>-->\n");
+        xml.Append("</EventList></EventMatching>\n");
+        File.WriteAllText(Path.Combine(dir, "EventMatching.xml"), xml.ToString());
+        Hex.True(DatasheetLoader.EventMatchingTargets.Load(dir).FromSheet, "the temp EventMatching.xml loads");
+        return new T161bSheet(dir);
+    }
+
+    /// <summary>
+    /// (1) S_CHANGE_EVENT_MATCHING_STATE carries the instance's EventMatching.xml events and is never
+    /// sent empty - WorldOfPartyMatchHelper::SendChangeEventMatchingState / DoAddToUserPool only send
+    /// a frame whose list has something in it. classic_live3 10335 (queued for 9739) is 9739's dungeon
+    /// events; cap_queue2 913/917/918 and client2 1286/1320/1321 were our three empty ones.
+    /// </summary>
+    [Test] public static void T161b_event_matching_state_comes_from_the_sheet_and_is_never_empty()
+    {
+        DatasheetLoader.EventMatchingTargets.UseBuiltIn();
+        Hex.True(MatchQueueManager.EventMatchingFrames(new[] { 9739, 9781 }, queued: true).Count == 0,
+            "no sheet: no ids, so no frame at all");
+        Hex.True(MatchWiring.MatchFoundFrames(9781).Count == 1
+                 && BitConverter.ToUInt16(MatchWiring.MatchFoundFrames(9781)[0], 2) == MatchQueueManager.S_FIN_INTER_PARTY_MATCH,
+            "and a match is FIN alone - never an empty state frame in front of it");
+
+        using (T161bEvents((2154, "Dungeon", 9739), (92151, "Dungeon", 9739), (5001, "BattleField", 118), (5002, "Dungeon", 9781)))
+        {
+            var q = MatchQueueManager.EventMatchingFrames(new[] { 9739 }, queued: true);
+            Hex.True(q.Count == 1, $"a dungeon queue: one frame, {q.Count}");
+            Hex.Eq(q[0], MatchQueueManager.BuildChangeEventMatchingState(new[] { 2154, 92151 }, queued: true, unk: 1),
+                "queued (1,1) with 9739's two matching events - classic_live3 10335 less its newer-datacenter 800029; the Field and inactive events are not matching events");
+            var both = MatchQueueManager.EventMatchingFrames(new[] { 9781, 118 }, queued: false);
+            Hex.True(both.Count == 2 && both[0][9] == 1 && both[1][9] == 0 && both[0][8] == 0
+                     && BitConverter.ToInt32(both[0], 14) == 5002 && BitConverter.ToInt32(both[1], 14) == 5001,
+                "dungeon events in the flag-1 frame, battleground events in the flag-0 frame (10580 / 10581)");
+            var f = MatchWiring.MatchFoundFrames(9781);
+            Hex.True(f.Count == 2 && f[0][8] == 0 && f[0][9] == 1, "a 9781 match: state (0,1) [5002], then FIN");
+            Hex.Eq(f[1], MatchQueueManager.BuildFinInterPartyMatch(9781), "the FIN is unchanged");
+        }
+        Hex.True(MatchQueueManager.EventMatchingFrames(new[] { 9739 }, queued: true).Count == 0, "built-in again");
+    }
+
+    /// <summary>
+    /// (3) cap_crash / arbiter-crash.log: the relog's AS_ENTER_WORLD (28079, ...AF00003) stalled on
+    /// World; the client was closed and AS_LEAVE_WORLD went out at once (28218) - World ignores a
+    /// leave for a user it is still loading and kept it after SA_ENTER_WORLD (28475). The next relog
+    /// (28813, ticket 9) was spawned as that leftover user on ticket 7 (29068): the hang. Now the
+    /// leave waits for SA_ENTER_WORLD, as User::LeaveWorldStart [Pending] / EnterWorldEnd do.
+    /// </summary>
+    [Test] public static void T161b_a_leave_while_world_loads_waits_for_sa_enter_world()
+    {
+        const ulong G = 0x80000AF00003UL;
+        var saEnterWorld = Hex.B("26 00 00 00 D0 3B 00 00 00 00 00 00 00 00 00 00 03 00 F0 0A 00 80 00 00 03 00 F0 0A 00 80 00 00 01 00 00 00 00 00 00 00");
+        var gate = new LeaveGate();
+        Hex.True(!gate.TryReserve(G, 0, 9, LeaveMode.Disconnect), "not entering: the leave goes out as before");
+        gate.Entering(G);
+        Hex.True(gate.TryReserve(G, 0, 9, LeaveMode.Disconnect), "28218: World is still loading ...AF00003 - held");
+        Hex.True(gate.TryReserve(G, 0, 9, LeaveMode.Lobby) && gate.IsEntering(G), "a second leave is the same one");
+        Hex.True(LeaveGate.GameIdOf(saEnterWorld) == G, "SA_ENTER_WORLD's user is the u64 at frame 0x16 (tap 28475)");
+        var held = gate.Entered(LeaveGate.GameIdOf(saEnterWorld));
+        Hex.True(held != null && held.GameId == G && held.PlayerId == 9 && held.WorldId == 0 && held.Mode == LeaveMode.Disconnect,
+            "28475: the first leave is handed back to send");
+        Hex.Eq(WorldBridge.BuildLeaveWorldPayload(held!.GameId, held.PlayerId, held.Mode),
+            Hex.B("03 00 F0 0A 00 80 00 00 01 00 00 00 08 00 00 00 09 00 00 00"), "and it is tap 28218's AS_LEAVE_WORLD, byte for byte");
+        Hex.True(!gate.TryReserve(G, 0, 9, LeaveMode.Disconnect), "entered: its flush (and any later leave) goes out");
+        gate.Entering(G);
+        Hex.True(!gate.IsEntering(G), "RegisterChat's whisper self-heal does not re-mark an entered user");
+        Hex.True(gate.Entered(G) == null, "a second SA_ENTER_WORLD has nothing to send");
+
+        const ulong H = 0x80000AF00004UL;
+        gate.Entering(H);
+        Hex.True(gate.TryReserve(H, 0, 9, LeaveMode.Disconnect), "28344: AF00004 left before World even began");
+        gate.Forget(H);
+        Hex.True(gate.Entered(H) == null, "SA_ENTER_WORLD_FAIL (not retried): World never had it - nothing to leave");
+
+        LeaveGate.Shared.Clear();
+        try
+        {
+            LeaveGate.Shared.Entering(G);
+            LeaveGate.Shared.TryReserve(G, 0, 9, LeaveMode.Disconnect);
+            var h = new DbProxyHandlers(null!, QuietLog());
+            Hex.True(h.TryHandle(null!, null!, DbProxyHandlers.SA_ENTER_WORLD, saEnterWorld) && !LeaveGate.Shared.IsEntering(G),
+                "DbProxyHandlers takes 0x138C and releases the held leave (sent through WorldBridge.NotifyPlayerLeave)");
+            for (ulong i = 1; i <= LeaveGate.Capacity + 5; i++) LeaveGate.Shared.Entering(0x80000AF00000UL + i);
+            Hex.True(!LeaveGate.Shared.IsEntering(0x80000AF00001UL) && LeaveGate.Shared.IsEntering(0x80000AF00000UL + LeaveGate.Capacity + 5),
+                "bounded: the oldest are forgotten");
+        }
+        finally { LeaveGate.Shared.Clear(); }
+    }
+
+    /// <summary>
+    /// (2) /@goto from chat: World's SA_CHAR_LOC (cap_crash 27181 / 27822, cap_social4 882) is the
+    /// T155 "go to" ask - the same record the panel sends (cap_final 916), requester the GM who typed it.
+    /// </summary>
+    [Test] public static void T161b_goto_from_chat_asks_the_targets_world()
+    {
+        var a = GmAdminTool.ReadCharLoc(Hex.B("12 00 00 00 02 00 F0 0A 00 80 00 00 63 00 61 00 6C 00 75 00 64 00 65 00 73 00 75 00 63 00 6B 00 73 00 00 00"));
+        Hex.True(a.Requester == 0x80000AF00002UL && a.Name == "caludesucks", $"27181: test -> caludesucks ({a.Requester:X}, {a.Name})");
+        var b = GmAdminTool.ReadCharLoc(Hex.B("12 00 00 00 01 00 F0 0A 00 80 00 00 74 00 65 00 73 00 74 00 00 00"));
+        Hex.True(b.Requester == 0x80000AF00001UL && b.Name == "test", "27822: caludesucks -> test (28 B)");
+        var c = GmAdminTool.ReadCharLoc(Hex.B("12 00 00 00 20 00 86 C5 CF 02 00 00 6E 00 65 00 77 00 00 00"));
+        Hex.True(c.Requester == 0x02CFC5860020UL && c.Name == "new", "cap_social4 882, the real Arbiter's own");
+        Hex.True(GmAdminTool.ReadCharLoc(Hex.B("40 00 00 00 01 00 F0 0A 00 80 00 00")).Name == ""
+                 && GmAdminTool.ReadCharLoc(new byte[8]).Requester == 0, "an offset past the frame or a short frame reads nothing");
+
+        ArbiterClientHandlers.ObserveLoadTopo(1,
+            Hex.B("15 00 28 E8 05 00 00 00 D3 50 83 46 A3 0A 9D 44 00 50 8A C5 00"));   // cap_final 549, dob's zone + position
+        var ask = GmAdminTool.BuildCharLocAsk(1, "dob", 1003, "New");
+        Hex.Eq(ask, ArbiterClientHandlers.BuildAskUserAction(1, "dob", 1003, "New", ArbiterClientHandlers.UserActionGoTo),
+            "the panel's go-to record");
+        Hex.True(BitConverter.ToInt32(ask, 188) == 12 && BitConverter.ToInt32(ask, 84) == 1 && BitConverter.ToInt32(ask, 164) == 1003
+                 && ArbiterClientHandlers.UserActionRequester(ask) == 1,
+            "cap_final 916: action 12, dob (84) goes to New (164); World's 0x2826 comes back to dob and goes on as 0x2827");
+        Hex.True(DbProxyHandlers.IsHandledRequest(DbProxyHandlers.SA_CHAR_LOC) && DbProxyHandlers.IsHandledRequest(DbProxyHandlers.SA_ENTER_WORLD),
+            "both SA_ frames are DbProxyHandlers', not the replay table's");
+        Hex.True(!GmAdminTool.OnSaCharLoc(null, Hex.B("12 00 00 00 02 00 F0 0A 00 80 00 00 74 00 00 00"), QuietLog()),
+            "no World / no requester: nothing sent");
+    }
+
+    /// <summary>(3) A member who crashed takes the formed match with them; a lobby relog keeps T161's re-offer.</summary>
+    [Test] public static void T161b_a_crash_voids_the_members_match()
+    {
+        var t0 = DateTimeOffset.UnixEpoch.AddDays(103);
+        try
+        {
+            var sent = T161Form(t0);
+            sent.Clear();
+            Hex.True(!MatchWiring.OnLeftWorld(9, disconnected: false) && MatchWiring.PendingFor(9, t0) != null,
+                "a lobby leave: the match stands (re-offered at the next enter-world)");
+            Hex.True(MatchWiring.OnLeftWorld(9, disconnected: true), "arbiter-crash.log 01:11:42: 9's client crashed");
+            Hex.True(MatchWiring.PendingFor(9, t0) == null && MatchWiring.PendingFor(10, t0) == null
+                     && sent.Count(s => s.Char == 10 && s.Op == MatchQueueManager.S_CANCEL_PARTY_MATCH_POOL) == 1
+                     && !sent.Any(s => s.Char == 9),
+                "void for both; the partner gets the cancel, the crashed member nothing");
+            Hex.True(!MatchWiring.OnLeftWorld(10, disconnected: true), "nothing left to void");
+        }
+        finally { MatchWiring.Reset(); }
+    }
+
+
+    // ============ T169: real-Arbiter pins (cap_final2b) ==========
+
+    /// <summary>
+    /// T167's SDB_SKILL_POLISHING_UPGRADE_LEVEL guess against the real Arbiter: all 180 pairs in
+    /// cap_final2b are [DlmId][ok 1] and the request is DlmId@8, UserDbId@12, PolishingId@16,
+    /// EffectId@20, RequiredPoint@24 (1 in every one). This is the real run 37135 -> 37636:
+    /// ADD_EXP leaves 19 points, three upgrades of polishing 1301 spend one each. The frames are
+    /// the real fixed parts with the atom ref's length zeroed (the real ones carry 2 x 856 B).
+    /// </summary>
+    [Test] public static void T169_polishing_upgrade_level_matches_the_real_arbiter()
+    {
+        using var store = GuildStore(1);
+        byte[] F(string hex) { var p = Convert.FromHexString(hex); BitConverter.GetBytes(0).CopyTo(p, 4); return p; }
+        var (op, body) = RunHandler1(0x2979, F("2a000000b006000000020000eb03000013000000130000001300000080841e0000000000"), store);
+        Hex.True(op == 0x297A, $"0x{op:X4}"); Hex.Eq(body, "00 02 00 00 01", "37136");
+        foreach (var (req, rep) in new[]
+        {
+            ("22000000b006000007020000eb030000150500005523f60001000000", "07 02 00 00 01"),   // 37506 -> 37507
+            ("22000000b00600000a020000eb030000150500005623f60001000000", "0A 02 00 00 01"),   // 37590 -> 37591
+            ("22000000b00600000b020000eb030000150500005723f60001000000", "0B 02 00 00 01"),   // 37636 -> 37637
+        })
+        {
+            (op, body) = RunHandler1(0x2977, F(req), store);
+            Hex.True(op == 0x2978, $"0x{op:X4}"); Hex.Eq(body, rep, "DBS_SKILL_POLISHING_UPGRADE_LEVEL");
+        }
+        Hex.True(store.GetPolishing(1003).Point == 16, "19 - 3 points");
+        Hex.True(store.GetPolishingLevels(1003).Single() == new TeraSharp.Arbiter.Persistence.CharacterStore.PolishingLevelRow(1301, 0xF62357),
+            "polishing 1301 holds the last effect");
+    }
+
+
+    /// <summary>
+    /// The first non-empty DBS_LOAD_SKILL_POLISHING (cap_final2b 50067 -> 50068, 191 B) after the
+    /// real six unlocks (38888..39409) and two option changes (39496, 39536): T167's element layout
+    /// and applied flags, byte for byte. Levels and points are seeded (180 upgrades in between).
+    /// </summary>
+    [Test] public static void T169_the_polishing_load_after_real_unlocks_matches_the_capture()
+    {
+        using var store = GuildStore(1);
+        byte[] F(string hex) { var p = Convert.FromHexString(hex); BitConverter.GetBytes(0).CopyTo(p, 4); return p; }
+        foreach (var u in new[] { "23020000eb030000160500005d6605010000000000000000", "26020000eb030000160500005e6605015d66050100000000",
+                                  "29020000eb030000160500005f6605015e66050100000000", "2b020000eb03000018050000336505010000000000000000",
+                                  "2e020000eb03000018050000326505013365050100000000", "2f020000eb03000018050000316505013265050100000000" })
+            Hex.True(RunHandler1(0x2971, F("26000000b0060000" + u), store).body[4] == 1, "unlock ok");
+        foreach (var c in new[] { "32020000eb030000180500003265050131650501", "33020000eb030000160500005e6605015f660501" })
+            Hex.True(RunHandler1(0x2973, Convert.FromHexString(c), store).body[4] == 1, "change ok");
+        foreach (var (id, eff) in new[] { (1301, 0xF62390), (1303, 0xF62200), (1305, 0xF62908) }) store.SetPolishingLevel(1003, id, eff);
+        store.SetPolishing(1003, new TeraSharp.Arbiter.Persistence.CharacterStore.PolishingRow(180, 0, 180, 24362201));
+        var (op, body) = RunHandler1(0x2975, Convert.FromHexString("7f030000eb030000"), store);
+        Hex.True(op == 0x2976, $"0x{op:X4}");
+        Hex.Eq(body, Convert.FromHexString(
+            "060000002f00000003000000950000007f03000001b400000000000000b4000000d9bc7301000000002f00000040000000160500005d660501" +
+            "004000000051000000160500005e660501015100000062000000160500005f6605010062000000730000001805000031650501007300000084" +
+            "000000180500003265050101840000000000000018050000336505010095000000a5000000150500009023f600a5000000b500000017050000" +
+            "0022f600b500000000000000190500000829f600"), "50068");
+    }
+
+
+    // ============ T172: close the census (status/T169-CENSUS.md) ==========
+
+    /// <summary>
+    /// The cinematics bug: characters.id is reused after a delete and visited_sections kept the old
+    /// character's rows, so the new one answered isFirstVisit 0. Rows are purged on delete and on
+    /// create; the replies are the real ones - cli_2026-09-22T09-25-01 2303 (first visit, 1) and
+    /// cli_2026-09-22T09-24-54 (the same section once listed, 0).
+    /// </summary>
+    [Test] public static void T172_a_new_character_gets_first_visits_and_its_own_list()
+    {
+        using var store = GuildStore(2);
+        var acct = store.GetOrCreateAccount("t39");
+        Hex.True(store.AddVisitedSection(2, 9999, 1, 978101) && store.AddWatchedMovie(2, 7), "the old character 2 explored");
+        Hex.True(store.AddVisitedSection(1, 1, 25, 599001), "character 1 explored too");
+        Hex.True(store.DeleteCharacter(2, acct.Id), "character 2 deleted");
+        Hex.True(store.AddVisitedSection(3, 1, 1, 1), "a pre-T172 orphan for the next-but-one id");
+        int id = store.CreateCharacter(new TeraSharp.Arbiter.Persistence.CharacterRecord
+        {
+            AccountId = acct.Id, Name = "fresh", Gender = 0, Race = 1, Class = 2, Level = 1, TemplateId = 10101,
+            Zone = 5, X = 1f, Y = 2f, Z = 3f, Appearance = new byte[8], Details = new byte[32], Shape = new byte[64], Position = 2,
+        });
+        Hex.True(id == 2 && store.GetVisitedSections(2).Count == 0 && store.GetWatchedMovies(2).Count == 0,
+            $"id {id} reused, nothing inherited");
+        bool first = store.AddVisitedSection(2, 9999, 1, 978101);
+        Hex.Eq(ArbiterClientHandlers.BuildVisitNewSection(first, 9999, 1, 978101), "11 00 23 5A 01 0F 27 00 00 01 00 00 00 B5 EC 0E 00",
+            "S_VISIT_NEW_SECTION, first visit: the cinematic plays");
+        bool again = store.AddVisitedSection(2, 9999, 1, 978101);
+        Hex.Eq(ArbiterClientHandlers.BuildVisitNewSection(again, 9999, 1, 978101), "11 00 23 5A 00 0F 27 00 00 01 00 00 00 B5 EC 0E 00",
+            "the same section again: 0");
+        Hex.True(store.GetVisitedSections(1).Single() == new TeraSharp.Arbiter.Persistence.CharacterStore.VisitedSection(1, 25, 599001),
+            "character 1's list untouched");
+        id = store.CreateCharacter(new TeraSharp.Arbiter.Persistence.CharacterRecord
+        {
+            AccountId = acct.Id, Name = "fresh3", Gender = 0, Race = 1, Class = 2, Level = 1, TemplateId = 10101,
+            Zone = 5, X = 1f, Y = 2f, Z = 3f, Appearance = new byte[8], Details = new byte[32], Shape = new byte[64], Position = 3,
+        });
+        Hex.True(id == 3 && store.GetVisitedSections(3).Count == 0, "the orphan is gone at create");
+    }
+
+    /// <summary>AS_UPDATE_VISITED_SECTION_LIST with the real 16-byte entries (4th = GuardData continent):
+    /// cap_final2b 956 (character 1, four sections) and 741 (1003, one).</summary>
+    [Test] public static void T172_the_visited_list_to_world_is_the_real_16_byte_layout()
+    {
+        DatasheetLoader.GuardContinents.UseBuiltIn();
+        var four = new[] { (1, 1, 1), (1, 25, 599001), (9999, 1, 978101), (9999, 25, 9827) }
+            .Select(v => new TeraSharp.Arbiter.Persistence.CharacterStore.VisitedSection(v.Item1, v.Item2, v.Item3)).ToList();
+        Hex.Eq(ArbiterClientHandlers.BuildUpdateVisitedSectionList(1, four), Convert.FromHexString(
+            "120000004000000001000000010000000100000001000000010000000100000019000000d9230900050000000f27000001000000b5ec0e00010000000f270000190000006326000005000000"),
+            "956");
+        Hex.Eq(ArbiterClientHandlers.BuildUpdateVisitedSectionList(1003, four.Skip(1).Take(1).ToList()),
+            Convert.FromHexString("1200000010000000eb0300000100000019000000d923090005000000"), "741");
+        var dir = Directory.CreateTempSubdirectory("t172g").FullName;
+        try
+        {
+            File.WriteAllText(Path.Combine(dir, "GuardData.xml"),
+                "<GuardData><Continent id=\"1\"><Guard id=\"1\"/><Guard id=\"2\"/></Continent><Continent id=\"5\"><Guard id=\"25\"/></Continent></GuardData>");
+            var g = DatasheetLoader.ReadGuardContinents(dir)!;
+            Hex.True(g.Count == 3 && g[1] == 1 && g[2] == 1 && g[25] == 5, "GuardData.xml read");
+        }
+        finally { Directory.Delete(dir, true); }
+        Hex.True(DatasheetLoader.GuardContinentOf(63) == -1, "an unknown guard is -1, as the real lookup's miss");
+    }
+
+    /// <summary>AS_UPDATE_GUILD_QUEST_POINT_INFO as the load burst carries it (cap_final2b 743: guild 2;
+    /// the guild-3 bursts for character 1).</summary>
+    [Test] public static void T172_guild_quest_point_info_matches_the_load_burst()
+    {
+        Hex.Eq(GuildWiring.BuildGuildQuestPointInfo(2), "02 00 00 00 00 00 00 00 84 03 00 00 00 00 00 00", "743");
+        Hex.Eq(GuildWiring.BuildGuildQuestPointInfo(3), "03 00 00 00 00 00 00 00 84 03 00 00 00 00 00 00", "guild 3");
+    }
+
+    /// <summary>AS_RESET_PURCHASE_LIMIT: the day-reset BuyMenus of BuyMenuData*.xml; the built-in is the
+    /// capture's 24 (09:00:54, ascending); after the first check a menu resets at its resetTime hour.</summary>
+    [Test] public static void T172_purchase_limits_reset_daily_from_buy_menu_data()
+    {
+        Hex.Eq(PurchaseLimitReset.Build(1005), "ED 03 00 00 01", "cap_final2b, first of 24");
+        var b = DatasheetLoader.BuiltInDailyBuyMenus;
+        Hex.True(b.Length == 24 && b[0] == (1005, 5) && b[12] == (10070, 5) && b[13] == (20000, 9) && b[23] == (60000, 9),
+            "the 24 of the capture, in its order");
+        var dir = Directory.CreateTempSubdirectory("t172b").FullName;
+        try
+        {
+            File.WriteAllText(Path.Combine(dir, "BuyMenuData.xml"), "<BuyMenuData><BuyMenu id=\"1006\" resetType=\"day\" resetTime=\"5\"/>" +
+                "<BuyMenu id=\"1008\" resetType=\"none\" resetTime=\"5\"/><BuyMenu id=\"1005\" resetType=\"day\" resetTime=\"5\"/></BuyMenuData>");
+            File.WriteAllText(Path.Combine(dir, "BuyMenuData_KR.xml"), "<BuyMenuData><BuyMenu id=\"20000\" resetType=\"day\" resetTime=\"9\"/></BuyMenuData>");
+            var m = DatasheetLoader.ReadDailyBuyMenus(dir)!;
+            Hex.True(m.SequenceEqual(new[] { (1005, 5), (1006, 5), (20000, 9) }), "day menus of every file, ascending; 'none' skipped");
+            var off = TimeSpan.FromHours(-7);
+            var t0 = new DateTimeOffset(2026, 9, 22, 4, 58, 0, off);
+            Hex.True(PurchaseLimitReset.Due(m, null, t0).Count == 3, "first check: all (the capture's startup)");
+            Hex.True(PurchaseLimitReset.Due(m, t0, t0.AddMinutes(1)).Count == 0, "05:00 not reached");
+            Hex.True(PurchaseLimitReset.Due(m, t0.AddMinutes(1), t0.AddMinutes(2)).SequenceEqual(new[] { 1005, 1006 }), "05:00 crossed");
+            Hex.True(PurchaseLimitReset.Due(m, t0.AddHours(4), t0.AddHours(4).AddMinutes(2)).SequenceEqual(new[] { 20000 }), "09:00 crossed");
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    // ============ T169: the real Arbiter's item tooltip (cap_final2a/2b) ==========
+
+    // cli_2026-09-22T09-49-53: the Forge picker's hover on 初階平衡防具強化石 (89771 ENCHANT_MATERIAL, item
+    // 10106, 15 in bag slot 27) - its 536-B record from the 0x27A4 load (cap_final2b 36153) and the tooltip.
+    static readonly byte[] T169MatRecord = Convert.FromHexString(
+        "7A27000000000000AB5E01000000000001000000000000000F00000000000000000000001B00000000000000000000000000000000000000000000000000000000000000000000000000000000000000" +
+        "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" +
+        "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" +
+        "000000000000000000000000000000000000000000000000000000000000000000000000B2070100010000000000000000000000B2070100010000000000000000000000000000000000760000000000" +
+        "000000000000000000000000000000000000BCC5CCB97CD00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000700000000000000" +
+        "04000000972B00000000668117020000690076000000000000000000000000000700000000000000000019C228B8C4B300000000000000000000000000000000B2070100010000000000000000000000" +
+        "000074D50000803F000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
+    static readonly byte[] T169MatTooltip = Convert.FromHexString(
+        "A20346560000000002003201000000000200C6013001150000007A27000000000000AB5E01007A27000000000000010000000000000000000000000000001B0000000F0000000F000000000000000000" +
+        "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" +
+        "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000FFFFFFFFFFFFFFFFFEFFFF" +
+        "FFFFFFFFFFFFFFFFFFFFFFFFFF0000000000000000000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF00000000000000000000000000000000000000000032016A020F004E01000000000000" +
+        "00000000000000000000000000004E0156010000000056015E01000000005E0166010000000066016E01000000006E0176010000000076017E01000000007E0186010000000086018E01000000008E01" +
+        "96010000000096019E01000000009E01A60100000000A601AE0100000000AE01B60100000000B601BE0100000000BE01000000000000C601FE020000000018FCFFFF18FCFFFF18FCFFFF18FCFFFF18FC" +
+        "FFFF00007AC400007AC400007AC418FCFFFF18FCFFFF18FCFFFF18FCFFFF00007AC400007AC400007AC40000000000000000000000000000000000000000000000000000000000000000FEFEFEFEFEFE" +
+        "FEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFE6A0200000F0086020100000000000000000000000000" +
+        "00000000000086028E02000000008E0296020000000096029E02000000009E02A60200000000A602AE0200000000AE02B60200000000B602BE0200000000BE02C60200000000C602CE0200000000CE02" +
+        "D60200000000D602DE0200000000DE02E60200000000E602EE0200000000EE02F60200000000F602000000000000FE0200000100000018FCFFFF18FCFFFF18FCFFFF18FCFFFF18FCFFFF00007AC40000" +
+        "7AC400007AC418FCFFFF18FCFFFF18FCFFFF18FCFFFF00007AC400007AC400007AC40000000000000000000000000000000000000000000000000000000000000000FEFEFEFEFEFEFEFEFEFEFEFEFEFE" +
+        "FEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFE");
+    // cap_final2b 49640 / 49641 and cap_final2a_client2: item 1 (59053, bag slot 26) compared with the worn weapon.
+    static readonly byte[] T169CmpRecord = Convert.FromHexString(
+        "0100000000000000ADE600007E01000001000000000000000100000000000000000000001A000000000000001E0000000000000000000000000000000000000000000000000000000000000000000000" +
+        "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" +
+        "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" +
+        "000000000000000000000000000000000000000000000000000000000000000000000000B2070100010000000000000000000000B2070100010000000000000000000000000000000000000000000000" +
+        "000000007C0100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000049238BDC00008C00000000000000" +
+        "00000000000000000700000000000000010000003D0100000000CAC07C010000E006A1EF7C010000000000000000000000000000000000000000000000000000B2070100010000000000000000000000" +
+        "000000000000803F0000000000000000000000000000000000000000000000000000000000000000000000000000000000006F0074006900");
+    static readonly byte[] T169CmpAsk = Convert.FromHexString(
+        "0300F00A00800000150000000000000000000000010000000000000001000000");
+    static readonly byte[] T169CmpAnswer = Convert.FromHexString(
+        "120000005001000001000000150000000000000000000000000000005527000000000000551A0100000000000100000000000000ADE600000F0100000F0100000F0100000F01000018FCFFFF18FCFFFF" +
+        "0A0000000A00000018FCFFFF18FCFFFF00007AC400007AC400007AC400007AC400007AC400007AC418FCFFFF18FCFFFF18FCFFFF18FCFFFF640000006400000018FCFFFF18FCFFFF00007AC400007AC4" +
+        "00007AC400007AC400007AC400007AC40000000000000000000000000000000000000000000000000000000000000000FFFFFFFF0815D7FF0815D7FF0815D7FF0815D7FF00000000000000003535DBFF" +
+        "3535DBFF000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000FCFFFFFFFCFFFFFF0000000000000000000000000000000000000000" +
+        "0000000000000000000000009AA98245D3128FC4D3128FC401000000");
+    static readonly byte[] T169CmpTooltip = Convert.FromHexString(
+        "A20346560000000002003201000000000200C6013001150000000100000000000000ADE600000100000000000000010000000000000000000000000000001A0000000100000001000000000000001E00" +
+        "0000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" +
+        "000000000000000000000000000000000000000000000000000000000000000000000000009AA9824500000000000000000000000000000000000000000000000000000000FFFFFFFFFFFFFFFFFEFFFF" +
+        "FFFFFFFFFFFFFFFFFFFFFFFFFF0000000000000000000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF00000000000000000000000000000000000000000032016A020F004E01000000000000" +
+        "00000000A0400000A0400000A0404E0156010000000056015E01000000005E0166010000000066016E01000000006E0176010000000076017E01000000007E0186010000000086018E01000000008E01" +
+        "96010000000096019E01000000009E01A60100000000A601AE0100000000AE01B60100000000B601BE0100000000BE01000000000000C601FE02000000000F0100000F01000018FCFFFF0A00000018FC" +
+        "FFFF00007AC400007AC400007AC418FCFFFF18FCFFFF6400000018FCFFFF00007AC400007AC400007AC40000000000000000000000000000000000000000000000000000000000000000000000000000" +
+        "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000006A0200000F00860201000000000000000000A0400000" +
+        "A0400000A04086028E02000000008E0296020000000096029E02000000009E02A60200000000A602AE0200000000AE02B60200000000B602BE0200000000BE02C60200000000C602CE0200000000CE02" +
+        "D60200000000D602DE0200000000DE02E60200000000E602EE0200000000EE02F60200000000F602000000000000FE020000010000000F0100000F01000018FCFFFF0A00000018FCFFFF00007AC40000" +
+        "7AC400007AC418FCFFFF18FCFFFF6400000018FCFFFF00007AC400007AC400007AC400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" +
+        "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
+
+    [Test] public static void T169_the_forge_material_tooltip_is_byte_exact()
+    {
+        var row = new TeraSharp.Arbiter.Persistence.CharacterStore.ItemRow(10106, 1, 0, 27, 89771, 15, T169MatRecord);
+        Hex.Eq(ArbiterClientHandlers.BuildShowItemTooltip(21, row), T169MatTooltip, "S_SHOW_ITEM_TOOLTIP, 930 B, no compare");
+    }
+
+    /// <summary>The compare exchange: the ask (0x282E) and the tooltip from World's answer (0x282F).
+    /// Equal to the capture but the six item-level floats, which come from a sheet we do not have.</summary>
+    [Test] public static void T169_the_compare_ask_and_tooltip_match_the_capture()
+    {
+        Hex.Eq(ArbiterClientHandlers.BuildSimulateItemTooltipAsk(0x80000AF00003UL | (1UL << 63), 21, 0, 1, 1), T169CmpAsk,
+            "DBS_SIMULATE_ITEM_TOOLTIP: [gameId & 0x7FFF..][type][content][item][owner]");
+        var rec = ArbiterClientHandlers.ReadSimulateItemTooltip(T169CmpAnswer);
+        Hex.True(rec != null && rec.Length == 0x150 && BitConverter.ToInt64(rec, 0x20) == 1
+                 && BitConverter.ToInt32(rec, 0x14C) == 1, "the record: item 1, character 1");
+        var row = new TeraSharp.Arbiter.Persistence.CharacterStore.ItemRow(1, 1, 0, 26, 59053, 1, T169CmpRecord);
+        var p = ArbiterClientHandlers.BuildShowItemTooltip(BitConverter.ToInt32(rec!, 0), row, compare: rec);
+        Hex.True(p.Length == T169CmpTooltip.Length, $"length {p.Length}");
+        int opt = BitConverter.ToUInt16(p, ArbiterClientHandlers.TtOptionSetOffset);
+        var diff = Enumerable.Range(0, p.Length).Where(i => p[i] != T169CmpTooltip[i]).ToArray();
+        Hex.True(diff.All(i => i - opt is >= 0x10 and < 0x1C or >= 0x148 and < 0x154),
+            "only the item-level floats differ: " + string.Join(",", diff.Select(i => i.ToString("X"))));
+        Hex.True(p[ArbiterClientHandlers.TtHavePaperDollCompare] == 1
+                 && BitConverter.ToSingle(p, ArbiterClientHandlers.TtCurrentSlotItemLevel) == BitConverter.ToSingle(rec!, 0x140),
+            "paper-doll compare on, CurrentSlotItemLevel = record +0x140");
+    }
+
+    [Test] public static void T169_the_ask_goes_only_for_a_worn_counterpart()
+    {
+        TeraSharp.Arbiter.Persistence.CharacterStore.ItemRow R(int id, int inv, int slot, int tpl) => new(id, 1, inv, slot, tpl, 1, null);
+        int SlotOf(int tpl) => tpl switch { 59053 => 1, 900 => 6, 901 => 8, _ => 0 };
+        var worn = new[] { R(10, 14, 1, 59053), R(11, 14, 7, 900) };
+        Hex.True(ArbiterClientHandlers.CompareSlotFor(21, R(1, 0, 26, 59053), worn, SlotOf) == 1, "bag weapon vs the worn one");
+        Hex.True(ArbiterClientHandlers.CompareSlotFor(21, R(10, 14, 1, 59053), worn, SlotOf) == null, "type 21 on the worn item: no ask");
+        Hex.True(ArbiterClientHandlers.CompareSlotFor(27, R(1, 0, 26, 59053), worn, SlotOf) == null, "type 27: never");
+        Hex.True(ArbiterClientHandlers.CompareSlotFor(21, R(2, 0, 3, 900), worn, SlotOf) == 7, "earring: slot 6 empty, 7 worn");
+        Hex.True(ArbiterClientHandlers.CompareSlotFor(21, R(3, 0, 4, 901), worn, SlotOf) == null, "ring: neither finger worn");
+        Hex.True(ArbiterClientHandlers.CompareSlotFor(21, R(4, 0, 5, 89771), worn, SlotOf) == null, "a material has no part");
+        var dir = Directory.CreateTempSubdirectory("t169").FullName;
+        try
+        {
+            File.WriteAllText(Path.Combine(dir, "ItemTemplate.xml"), "<ItemTemplate>" +
+                "<Item id=\"72277\" combatItemType=\"EQUIP_WEAPON\" category=\"glaive\" />" +
+                "<Item id=\"5\" combatItemType=\"EQUIP_ACCESSORY\" category=\"earring\" />" +
+                "<Item id=\"6\" combatItemType=\"EQUIP_ACCESSORY\" category=\"accessoryFace\" />" +
+                "<Item id=\"7\" combatItemType=\"EQUIP_STYLE_BODY\" category=\"style_body\" />" +
+                "<Item id=\"89771\" combatItemType=\"ENCHANT_MATERIAL\" category=\"enchant_material\" /></ItemTemplate>");
+            var d = DatasheetLoader.ReadEquipSlots(dir)!;
+            Hex.True(d.Count == 2 && d[72277] == 1 && d[5] == 6, "weapon 1, earring 6; face / style / material have no compare slot");
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    /// <summary>0x1437 (cap_final2b 53725) -> S_SYSTEM_MESSAGE "@4133" on both clients (cli 09-49-53 3417,
+    /// 09-50-23 3046); 0x1436 carries the same shape. 0x15BC is accepted with no reply.</summary>
+    [Test] public static void T172_world_broadcasts_become_system_messages()
+    {
+        var p37 = Convert.FromHexString("12000000000000007f000000400034003100330033000000");
+        Hex.True(DbProxyHandlers.ReadBroadcastMessage(p37) == "@4133", "0x1437 text");
+        Hex.Eq(DbProxyHandlers.BuildSystemMessage("@4133"), "12 00 0E F3 06 00 40 00 34 00 31 00 33 00 33 00 00 00", "S_SYSTEM_MESSAGE");
+        var p36 = Convert.FromHexString("12000000000000007f000000400034003100380034000b0072006500670069006f006e004e0061006d0065000b004000720067006e003a003200310033000b006e00700063004e0061006d0065000b004000630072006500610074007500720065003a0032003600230035003000300031000000");
+        Hex.True(DbProxyHandlers.ReadBroadcastMessage(p36) == "@4184\vregionName\v@rgn:213\vnpcName\v@creature:26#5001", "0x1436 text");
+        Hex.True(RunHandler(DbProxyHandlers.SA_BROADCAST_SYSTEM_MESSAGE_NOT_IN_SPECIAL_PLACE, p37, 0).Count == 0, "no World reply");
+        Hex.True(RunHandler(DbProxyHandlers.SA_SYNC_DATE_TIME, Convert.FromHexString("4743b26a00000000"), 0).Count == 0, "0x15BC: handled, silent");
+    }
+
+    /// <summary>SA_CREST_USE_LIST -> AS_CREST_USE_LIST [ref][0][DlmId][ok], cap_final2b 4746 -> 4747.</summary>
+    [Test] public static void T172_crest_use_list_is_acked_with_its_dlm_id()
+    {
+        var req = Convert.FromHexString("1300000022000000220000000000000020e066c77d01000094020000220000002e000000f18000002e0000003a000000f38000003a0000004600000001810000460000005200000002810000520000005e0000000a8100005e0000006a0000000b8100006a00000076000000118100007600000082000000ed800000820000008e000000f48000008e0000009a000000fa8000009a000000a6000000fb800000a6000000b200000004810000b2000000be00000005810000be000000ca00000003810000ca000000d6000000f7800000d6000000e2000000f0800000e2000000ee00000008810000ee000000fa0000000d810000fa00000000000000fd800000");
+        var (op, body) = RunHandler1(DbProxyHandlers.SA_CREST_USE_LIST, req);
+        Hex.True(op == DbProxyHandlers.AS_CREST_USE_LIST, $"0x{op:X4}");
+        Hex.Eq(body, "13 00 00 00 00 00 00 00 94 02 00 00 01", "4747");
+    }
+
+    /// <summary>SDB_CHANGE_CITY_WAR_STATE -> DBS echo with ok 1: cap_final2b 57115 -> 57116, 57117 -> 57119.</summary>
+    [Test] public static void T172_city_war_state_is_answered()
+    {
+        var (op, body) = RunHandler1(DbProxyHandlers.SDB_CHANGE_CITY_WAR_STATE, Convert.FromHexString("010000000200000003000000"));
+        Hex.True(op == DbProxyHandlers.DBS_CHANGE_CITY_WAR_STATE, $"0x{op:X4}");
+        Hex.Eq(body, "01 00 00 00 01 00 00 00 02 00 00 00 03 00 00 00", "57116");
+        Hex.Eq(DbProxyHandlers.BuildChangeCityWarStateReply(Convert.FromHexString("010000000200000004000000")),
+            "01 00 00 00 01 00 00 00 02 00 00 00 04 00 00 00", "57119");
+    }
+
+    /// <summary>/@goto a player on the GM's own World: AS_CHAR_LOC [gm gameId][target gameId],
+    /// cap_final2b 7277 -> 7278.</summary>
+    [Test] public static void T172_goto_on_the_same_world_answers_with_char_loc()
+    {
+        Hex.Eq(GmAdminTool.BuildCharLoc(0x80000AF00001UL, 0x80000AF00002UL | (1UL << 63)),
+            "01 00 F0 0A 00 80 00 00 02 00 F0 0A 00 80 00 00", "7278");
     }
 
 }

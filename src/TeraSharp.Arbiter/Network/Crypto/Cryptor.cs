@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 the TeraSharp contributors
+
 using System.Buffers.Binary;
 
 namespace TeraSharp.Arbiter.Network.Crypto;

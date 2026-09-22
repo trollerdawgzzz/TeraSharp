@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 the TeraSharp contributors
+
 using Microsoft.Extensions.Logging;
 using TeraSharp.Arbiter.Network;
 
@@ -6,7 +9,7 @@ namespace TeraSharp.Arbiter.World;
 // =============================================================================================
 // MatchQueueManager - the instance-matching queue, T136. RAM only.
 //
-// Ground truth: D:\packetlogs\classic_live3.log, the LEADER side. T134 decoded classic_live2 and
+// Ground truth: <captures>\classic_live3.log, the LEADER side. T134 decoded classic_live2 and
 // T134b's note established that capture was a party MEMBER - it only ever showed the pushes.
 // classic_live3 is the human queueing Kelsaik (instance 9739) as party leader, matching, and
 // cancelling once, so it pins the REQUEST half for the first time.
@@ -88,10 +91,18 @@ public static class MatchQueueManager
     /// <param name="CharacterId">The <c>characters.id</c> behind it, 0 if unknown.</param>
     /// <param name="CharacterClass">Warrior 0 .. Glaiver 12.</param>
     /// <param name="Level">For the level-gated second positions.</param>
-    public readonly record struct Queuer(uint PlayerId, int CharacterId, int CharacterClass, int Level)
+    /// <param name="Chosen">T138f: the position this player picked in the matching window, as
+    /// C_MATCH_ADD's trailing int32 carries it (0 tank, 1 DPS, 2 healer).
+    /// <see cref="MatchComposition.NoChoice"/> when none was stated.</param>
+    public readonly record struct Queuer(uint PlayerId, int CharacterId, int CharacterClass, int Level,
+                                         int Chosen = MatchComposition.NoChoice)
     {
-        /// <summary>The position this class is slotted as unless something else is needed.</summary>
-        public MatchRole Role => MatchComposition.RoleOf(CharacterClass);
+        /// <summary>The position this queuer is treated as when nothing is matching on it -
+        /// their own choice when they can fill it, else the class default.</summary>
+        public MatchRole Role => MatchComposition.EffectiveRole(CharacterClass, Level, Chosen);
+
+        /// <summary>The position they asked for, or null.</summary>
+        public MatchRole? ChosenRole => MatchComposition.ChosenRole(Chosen);
     }
 
     /// <summary>Where a queue entry is. There is no "cancelled": cancelling removes the row.</summary>
@@ -225,14 +236,12 @@ public static class MatchQueueManager
     }
 
     /// <summary>
-    /// C_MATCH_ADD's second array, which is NOT a member list. All four captured frames carry
-    /// two elements with the SAME first int32 - the queuing player's own id (4742 in
-    /// classic_live3, echoed as the pool player's id in record 8662; 1 in cap_multiworld; 1003
-    /// in cap_social4) - and a second int32 that is 1 on the first queue and 0 on the second.
-    /// The server echoes that second value into S_ADD_INTER_PARTY_MATCH_POOL's player tail
-    /// (record 8662 tail 1, record 10333 tail 0), so it is read here and echoed rather than
-    /// named. Layout: <c>[u16 count][u16 offset]</c> at body 4, elements
-    /// <c>[u16 here][u16 next][i32 playerId][i32 flag]</c>.
+    /// C_MATCH_ADD's second array, which is NOT a member list: all four captured frames carry two
+    /// elements with the SAME first int32, the queuing player's own id (4742 in classic_live3,
+    /// echoed as the pool player's id in record 8662; 1 in cap_multiworld; 1003 in cap_social4).
+    /// The second int32 is the POSITION they picked - see MatchComposition's ChoiceToRole, which
+    /// has the four samples and the one that proves it. Layout: <c>[u16 count][u16 offset]</c> at
+    /// body 4, elements <c>[u16 here][u16 next][i32 playerId][i32 position]</c>.
     /// </summary>
     public static int ReadQueueFlag(ReadOnlyMemory<byte> body)
     {
@@ -242,6 +251,50 @@ public static class MatchQueueManager
         int off = BitConverter.ToUInt16(b.Slice(6, 2)) - 4;
         if (count <= 0 || off < 0 || off + 12 > b.Length) return 0;
         return BitConverter.ToInt32(b.Slice(off + 8, 4));
+    }
+
+    /// <summary>
+    /// Every <c>(playerId, position)</c> pair in that array. The captures only ever show one
+    /// player - twice - so a party queue's shape is unpinned; reading it as a list keyed by
+    /// player id is what makes the leader's own choice land whatever the rest turns out to be.
+    /// </summary>
+    public static List<(int PlayerId, int Choice)> ReadQueueChoices(ReadOnlyMemory<byte> body)
+    {
+        var list = new List<(int, int)>();
+        var b = body.Span;
+        if (b.Length < 8) return list;
+        int count = BitConverter.ToUInt16(b.Slice(4, 2));
+        int off = BitConverter.ToUInt16(b.Slice(6, 2)) - 4;
+        for (int i = 0; i < count && off >= 0 && off + 12 <= b.Length; i++)
+        {
+            int next = BitConverter.ToUInt16(b.Slice(off + 2, 2)) - 4;
+            list.Add((BitConverter.ToInt32(b.Slice(off + 4, 4)),
+                      BitConverter.ToInt32(b.Slice(off + 8, 4))));
+            if (next < 0) break;
+            off = next;
+        }
+        return list;
+    }
+
+    /// <summary>
+    /// Stamp each queuer with the position they asked for, matched by player id. A member the
+    /// array does not name keeps <see cref="MatchComposition.NoChoice"/> and is seated on their
+    /// class alone.
+    /// </summary>
+    public static List<Queuer> WithChoices(IReadOnlyList<Queuer> members,
+        IReadOnlyList<(int PlayerId, int Choice)> choices)
+    {
+        var outp = new List<Queuer>(members?.Count ?? 0);
+        if (members == null) return outp;
+        foreach (var m in members)
+        {
+            int pick = MatchComposition.NoChoice;
+            if (choices != null)
+                foreach (var (id, choice) in choices)
+                    if (id == (int)m.PlayerId) { pick = choice; break; }
+            outp.Add(m with { Chosen = pick });
+        }
+        return outp;
     }
 
     // ---- builders ------------------------------------------------------------------------
@@ -311,6 +364,27 @@ public static class MatchQueueManager
     /// <para>The 730 B and 1290 B frames at records 10580/10581 are the same layout with 90 and
     /// 160 quest ids - the full vanguard roster, pushed when the state changes for real.</para>
     /// </summary>
+    /// <summary>
+    /// T161b. The frames the real Arbiter sends for a change of matching state on
+    /// <paramref name="instances"/> (WorldOfPartyMatchHelper::SendChangeEventMatchingState, and
+    /// DoAddToUserPool for the queued one): the EventMatching.xml events whose TargetList holds
+    /// one of them - dungeon events in the flag-1 frame, battleground events in the flag-0 frame -
+    /// and a frame ONLY when its list is not empty. classic_live3 10335 is 9739's dungeon events
+    /// (2154 and 92151 in our sheet; its third, 800029, is a newer datacenter's).
+    /// </summary>
+    public static List<byte[]> EventMatchingFrames(IEnumerable<int>? instances, bool queued)
+    {
+        var table = DatasheetLoader.EventMatchingTargets.Value;
+        var dungeon = new List<int>();
+        var battle = new List<int>();
+        foreach (int i in instances ?? Array.Empty<int>())
+            if (table.TryGetValue(i, out var ev)) { dungeon.AddRange(ev.Dungeon); battle.AddRange(ev.BattleField); }
+        var outp = new List<byte[]>(3);
+        if (dungeon.Count > 0) outp.Add(BuildChangeEventMatchingState(dungeon, queued, 1));
+        if (battle.Count > 0) outp.Add(BuildChangeEventMatchingState(battle, queued, 0));
+        return outp;
+    }
+
     public static byte[] BuildChangeEventMatchingState(IReadOnlyList<int> questIds, bool queued, byte unk = 1)
     {
         var q = questIds ?? Array.Empty<int>();
@@ -437,11 +511,12 @@ public static class MatchQueueManager
     // DUNGEONS. <see cref="TryForm"/> walks the pool in QUEUE ORDER and takes whole entries:
     // a party that queued together is never split, which is what "party-queued groups keep
     // slots and fill from solo queuers" means - the party seeds the group and the leftover
-    // slots are filled from whoever queued next. Each member is slotted in their default
-    // position when one is free and in any position MatchComposition.CanFill allows otherwise,
-    // least-flexible member first, so a Lancer never loses the tank slot to a Warrior who
-    // could have DPSed. An entry that cannot be slotted whole is SKIPPED, not rejected: it
-    // stays in the pool for the next pass.
+    // slots are filled from whoever queued next. The SEATING is a bipartite matching over
+    // everybody accepted so far (TryAssign), re-run as each entry is added, so an entry that
+    // would make the group unseatable is SKIPPED and stays in the pool for the next pass. It
+    // is a matching rather than a greedy because classic_live3 record 10587 has a Warrior in
+    // the tank slot: positions have to be handed out with the whole group in view, or the
+    // first Warrior through the door takes a DPS slot and the group never forms.
     //
     // BATTLEGROUNDS. Same walk, but two teams, and the side is chosen at random among the
     // sides that will still accept the entry - "random fill in queue order". The per-team caps
@@ -482,6 +557,25 @@ public static class MatchQueueManager
     /// <summary>The group size for an instance - <see cref="RaidSizes"/>, else a party.</summary>
     public static int GroupSize(int instanceId)
         => RaidSizes.TryGetValue(instanceId, out int n) && n > 0 ? n : MatchComposition.PartySize;
+
+    /// <summary>
+    /// T138d, A TEST KNOB AND NOTHING ELSE. When set to a whole number above zero, a pool forms
+    /// at that many queued players and the composition is not consulted at all - no roles, no
+    /// per-team caps, no healer floors. It exists so two people can queue and actually get into
+    /// a dungeon on a server with two accounts on it; it makes the matcher wrong on purpose, so
+    /// <c>Program</c> logs a warning at startup whenever it is set.
+    ///
+    /// <para>Read fresh on every call, not cached, so it can be turned off without a restart.</para>
+    /// </summary>
+    public const string MinMembersVariable = "TERASHARP_MATCH_MIN_MEMBERS";
+
+    /// <summary><see cref="MinMembersVariable"/>'s value, or 0 when unset or not a number.</summary>
+    public static int MinMembersOverride()
+    {
+        var raw = Environment.GetEnvironmentVariable(MinMembersVariable);
+        return !string.IsNullOrWhiteSpace(raw) && int.TryParse(raw.Trim(), out int v) && v > 0
+            ? v : 0;
+    }
 
     /// <summary>
     /// C_MATCH_ADD with the roles resolved. Keeps <see cref="Entry.MemberPlayerIds"/> in step
@@ -552,48 +646,91 @@ public static class MatchQueueManager
     /// A group the pass put together. <see cref="TeamB"/> is empty for a dungeon and is the
     /// second side for a battleground; <see cref="Members"/> is everybody either way, which is
     /// the FIN recipient list.
+    ///
+    /// <para><see cref="Roles"/> is T138d, and it lines up with <see cref="Members"/> index for
+    /// index: the position each member was actually SEATED in, which is not always their default
+    /// one. classic_live3 record 10587 proves the difference matters - its slot 0 is player 4742,
+    /// templateId 11001, an Elin Warrior (defaultPosition 1, DPS) sitting in the party as
+    /// position 0, a TANK. S_SYS_PARTY_INFO carries these numbers, so they have to survive the
+    /// formation pass rather than be recomputed from the class afterwards.</para>
     /// </summary>
     public sealed record FormedGroup(
         int InstanceId,
         IReadOnlyList<Entry> Entries,
         IReadOnlyList<Queuer> Members,
         IReadOnlyList<Queuer> TeamA,
-        IReadOnlyList<Queuer> TeamB);
-
-    /// <summary>How many of the three positions a class can be slotted into at this level.</summary>
-    private static int Flexibility(in Queuer q)
-    {
-        int n = 0;
-        for (int r = 0; r < 3; r++)
-            if (MatchComposition.CanFill(q.CharacterClass, (MatchRole)r, q.Level)) n++;
-        return n;
-    }
+        IReadOnlyList<Queuer> TeamB,
+        IReadOnlyList<MatchRole> Roles);
 
     /// <summary>
-    /// Try to seat every member of one entry in <paramref name="free"/> (indexed by
-    /// <see cref="MatchRole"/>). <paramref name="free"/> is only decremented when the WHOLE
-    /// entry fits, so a half-seated party never leaves the pool short.
+    /// Seat <paramref name="members"/> into <paramref name="template"/>'s slots, or say it
+    /// cannot be done. On success <paramref name="seats"/> - when given - says where each
+    /// member went, IN <paramref name="members"/>' OWN ORDER.
+    ///
+    /// <para><b>T138e: this replaced a per-entry greedy, which was wrong.</b> The greedy took
+    /// each queue entry in turn and gave each member their default position if one was free.
+    /// classic_live3 record 10587 is the counter-example: a Warrior (defaultPosition DPS,
+    /// secondPosition tank) is in the matched party AS THE TANK. The greedy would have put the
+    /// first-queued Warrior in a DPS slot, and the fifth queuer - who can only DPS - would then
+    /// have had nowhere to stand, so a group the real server formed would not form here.</para>
+    ///
+    /// <para>So the seating is a bipartite matching over the whole candidate set: members on one
+    /// side, the template's slots on the other, an edge wherever
+    /// <see cref="MatchComposition.CanFill"/> allows it, and Kuhn's augmenting path. Kuhn gets
+    /// the Warrior case right for free and it also gets the reverse right: a Warrior who took
+    /// the tank slot is pushed back out to DPS the moment a Lancer - who can fill nothing else -
+    /// needs it. At five to thirty members and three slot kinds the cost is nothing.</para>
     /// </summary>
-    private static bool TrySeat(IReadOnlyList<Queuer> members, int[] free)
+    private static bool TryAssign(IReadOnlyList<Queuer> members, in RoleTemplate template,
+                                  MatchRole[]? seats = null)
     {
-        var order = new List<Queuer>(members);
-        order.Sort((a, b) => Flexibility(a).CompareTo(Flexibility(b)));
-        var taken = new int[3];
-        foreach (var m in order)
+        int total = template.Size;
+        if (members == null || members.Count > total) return false;
+        if (members.Count == 0) return true;
+
+        var slotRole = new MatchRole[total];
+        int k = 0;
+        for (int i = 0; i < template.Tanks; i++) slotRole[k++] = MatchRole.Tank;
+        for (int i = 0; i < template.Healers; i++) slotRole[k++] = MatchRole.Healer;
+        for (int i = 0; i < template.Dps; i++) slotRole[k++] = MatchRole.Dps;
+
+        var slotOwner = new int[total];
+        Array.Fill(slotOwner, -1);
+        var memberSlot = new int[members.Count];
+        Array.Fill(memberSlot, -1);
+        var seen = new bool[total];
+
+        for (int m = 0; m < members.Count; m++)
         {
-            int slot = -1;
-            int def = (int)m.Role;
-            if (free[def] - taken[def] > 0) slot = def;
-            else
-                for (int r = 0; r < 3; r++)
-                    if (free[r] - taken[r] > 0
-                        && MatchComposition.CanFill(m.CharacterClass, (MatchRole)r, m.Level))
-                    { slot = r; break; }
-            if (slot < 0) return false;
-            taken[slot]++;
+            Array.Clear(seen, 0, seen.Length);
+            if (!Augment(m, members, slotRole, slotOwner, memberSlot, seen)) return false;
         }
-        for (int r = 0; r < 3; r++) free[r] -= taken[r];
+        if (seats != null)
+            for (int m = 0; m < members.Count && m < seats.Length; m++)
+                seats[m] = slotRole[memberSlot[m]];
         return true;
+    }
+
+    /// <summary>Kuhn's augmenting path: find member <paramref name="m"/> a slot, displacing
+    /// whoever holds it if that one can move somewhere else.</summary>
+    private static bool Augment(int m, IReadOnlyList<Queuer> members, MatchRole[] slotRole,
+                                int[] slotOwner, int[] memberSlot, bool[] seen)
+    {
+        var q = members[m];
+        for (int slot = 0; slot < slotRole.Length; slot++)
+        {
+            if (seen[slot]) continue;
+            if (!MatchComposition.CanFill(q.CharacterClass, slotRole[slot], q.Level, q.Chosen)) continue;
+            seen[slot] = true;
+            if (slotOwner[slot] < 0
+                || Augment(slotOwner[slot], members, slotRole, slotOwner, memberSlot, seen))
+            {
+                slotOwner[slot] = m;
+                memberSlot[m] = slot;
+                return true;
+            }
+        }
+        return false;
     }
 
     /// <summary>
@@ -609,27 +746,46 @@ public static class MatchQueueManager
     /// <summary>1 tank / 1 healer / 3 DPS, or the raid counts for a larger group.</summary>
     public static FormedGroup? TryFormDungeon(int instanceId, int size, DateTimeOffset now)
     {
-        var template = MatchComposition.DungeonTemplate(size);
+        int over = MinMembersOverride();
+        var template = over > 0 ? new RoleTemplate(0, 0, over) : MatchComposition.DungeonTemplate(size);
         if (template.Size <= 0) return null;
         var pool = Pool(instanceId);
         if (pool.Count == 0) return null;
 
-        var free = new[] { template.Tanks, template.Dps, template.Healers };
+        // Entries stay ATOMIC - a queued party is taken whole or skipped - but the seating is
+        // checked over the WHOLE candidate set each time one is added, so an entry that would
+        // make the group unseatable is dropped rather than discovered too late. T138e; see
+        // TryAssign for the Warrior-as-tank case that forced it.
         var taken = new List<Entry>();
         var members = new List<Queuer>();
         foreach (var e in pool)
         {
             if (e.Members.Length == 0) continue;           // legacy entry, no roles to seat
             if (members.Count + e.Members.Length > template.Size) continue;
-            if (!TrySeat(e.Members, free)) continue;
-            taken.Add(e);
+            int before = members.Count;
             members.AddRange(e.Members);
-            if (members.Count == template.Size) break;
+            if (over <= 0 && !TryAssign(members, template))
+            {
+                members.RemoveRange(before, members.Count - before);
+                continue;
+            }
+            taken.Add(e);
+            if (members.Count >= template.Size) break;
         }
         if (members.Count != template.Size) return null;
 
+        var roles = new MatchRole[members.Count];
+        if (over > 0)
+        {
+            // The knob: everybody is a body. Their DEFAULT position is still reported, so
+            // S_SYS_PARTY_INFO says something true about the class even though nothing was
+            // matched on it.
+            for (int i = 0; i < roles.Length; i++) roles[i] = members[i].Role;
+        }
+        else if (!TryAssign(members, template, roles)) return null;
+
         Mark(taken, instanceId);
-        return new FormedGroup(instanceId, taken, members, members, Array.Empty<Queuer>());
+        return new FormedGroup(instanceId, taken, members, members, Array.Empty<Queuer>(), roles);
     }
 
     /// <summary>
@@ -640,8 +796,10 @@ public static class MatchQueueManager
     public static FormedGroup? TryFormBattleground(int battleFieldId, DateTimeOffset now,
         Random? rng = null)
     {
+        int over = MinMembersOverride();
         var rule = MatchComposition.RuleFor(battleFieldId);
-        if (rule.TeamSize <= 0) return null;
+        int teamSize = over > 0 ? Math.Max(1, over / 2) : rule.TeamSize;
+        if (teamSize <= 0) return null;
         var pool = Pool(battleFieldId);
         if (pool.Count == 0) return null;
         rng ??= Random.Shared;
@@ -655,20 +813,27 @@ public static class MatchQueueManager
             for (int t = 0; t < 2; t++)
             {
                 var team = teams[(first + t) & 1];
-                if (!TeamTakes(rule, team, e.Members)) continue;
+                if (over > 0)
+                {
+                    if (team.Count + e.Members.Length > teamSize) continue;
+                }
+                else if (!TeamTakes(rule, team, e.Members)) continue;
                 team.AddRange(e.Members);
                 taken.Add(e);
                 break;
             }
-            if (teams[0].Count == rule.TeamSize && teams[1].Count == rule.TeamSize) break;
+            if (teams[0].Count == teamSize && teams[1].Count == teamSize) break;
         }
-        if (teams[0].Count != rule.TeamSize || teams[1].Count != rule.TeamSize) return null;
-        if (!Satisfies(rule, teams[0]) || !Satisfies(rule, teams[1])) return null;
+        if (teams[0].Count != teamSize || teams[1].Count != teamSize) return null;
+        // The floors are a composition rule, so the knob skips them with everything else.
+        if (over <= 0 && (!Satisfies(rule, teams[0]) || !Satisfies(rule, teams[1]))) return null;
 
         var all = new List<Queuer>(teams[0]);
         all.AddRange(teams[1]);
+        var roles = new List<MatchRole>(all.Count);
+        foreach (var q in all) roles.Add(MatchComposition.RoleOf(q.CharacterClass));
         Mark(taken, battleFieldId);
-        return new FormedGroup(battleFieldId, taken, all, teams[0], teams[1]);
+        return new FormedGroup(battleFieldId, taken, all, teams[0], teams[1], roles);
     }
 
     /// <summary>Whether a whole entry still fits one side's caps, counted as it is added.</summary>

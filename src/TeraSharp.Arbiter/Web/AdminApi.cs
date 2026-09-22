@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 the TeraSharp contributors
+
 using System.Globalization;
 using System.Text;
 using Microsoft.Extensions.Logging;
@@ -128,6 +131,7 @@ public sealed class AdminApi
         if (method == "GET" && path == "/api/log") return LogTail(query);
         if (method == "GET" && path == "/api/game-log") return GameLog(query);
         if (method == "POST" && path == "/api/restore-character") return RestoreCharacter(body, sourceIp);
+        if (method == "POST" && path == "/api/delete-character") return DeleteCharacterNow(body, sourceIp);
 
         // ---- phase 2 (T101b) ----
         if (method == "POST" && path == "/api/set-money") return SetMoney(body, sourceIp);
@@ -527,6 +531,22 @@ public sealed class AdminApi
 
     // ------------------------------------------------------------------------- phase 2 (T101b)
 
+    /// <summary>POST /api/delete-character {"id":N,"reason":"..."} - immediate HARD delete (no 72 h
+    /// window, no restore). For test characters and GM clean-up; the row and its dependent rows go.
+    /// Refused while the character is online.</summary>
+    private AdminResponse DeleteCharacterNow(string? body, string? sourceIp)
+    {
+        int id = (int)(JsonNumber(body, "id") ?? -1);
+        string reason = JsonString(body, "reason") ?? string.Empty;
+        if (id <= 0) return Json(400, ResultInvalid, "id is required");
+        var c = _store.GetCharacter(id);
+        if (c == null) { Log(sourceIp, "delete-character", id.ToString(CultureInfo.InvariantCulture), reason, ResultNotFound); return Json(404, ResultNotFound, "no such character"); }
+        // (log the character out first - a live session keeps its own state in World until it leaves)
+        bool ok = _store.DeleteCharacter(id, c.AccountId);
+        Log(sourceIp, "delete-character", c.Name, reason, ok ? ResultOk : ResultRefused);
+        return ok ? Json(200, ResultOk, $"{c.Name} deleted") : Json(500, ResultRefused, "the store refused the delete (dependent rows?)");
+    }
+
     /// <summary>Resolve the target of a write: {"id":N} or {"name":"X"}.</summary>
     private CharacterRecord? Target(string? body)
     {
@@ -566,6 +586,10 @@ public sealed class AdminApi
         if (l == null || l < 1 || l > MaxLevel) { Log(ip, "set-level", c.Name, reason, ResultInvalid); return Json(400, ResultInvalid, $"level must be 1..{MaxLevel}"); }
 
         bool ok = _store.UpdateLevelAndExp(c.Id, (int)l.Value, c.Exp);
+        // T152b: and let World make the same change, so its level commit auto-learns the skills
+        // that come with the level. Storing the number alone left `test` at 70 with its
+        // creation skills. Sent now if the character is in the world, else after its next spawn.
+        if (ok) Handlers.WorldLevelSync.Queue(c.Id, (int)l.Value);
         Log(ip, "set-level", c.Name, reason, ok ? ResultOk : ResultRefused);
         return ok ? Json(200, ResultOk, $"{c.Name} is level {(int)l.Value}")
                   : Json(500, ResultRefused, "the store refused the update");

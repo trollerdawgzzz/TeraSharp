@@ -1,0 +1,11 @@
+diff -ru a/src/TeraSharp.Arbiter/Handlers/HandlerRegistry.cs b/src/TeraSharp.Arbiter/Handlers/HandlerRegistry.cs
+--- a/src/TeraSharp.Arbiter/Handlers/HandlerRegistry.cs	2026-09-22 11:15:31.488417818 +0000
++++ b/src/TeraSharp.Arbiter/Handlers/HandlerRegistry.cs	2026-09-22 11:15:31.503134853 +0000
+@@ -93,6 +93,7 @@
+                     ArbiterClientHandlers.BuildUpdateVisitedSectionList(s.PlayerId,
+                         Program.Store?.GetVisitedSections((int)s.SelectedCharacter!.Id)
+                             ?? Array.Empty<TeraSharp.Arbiter.Persistence.CharacterStore.VisitedSection>()));
++                GuildWiring.SendGuildQuestPointInfo(s);   // T172: 0x1453 after 0x1439, before 0x1390 (cap_final2a/2b, 88 frames)
+                 Program.World?.NotifyTopoLoaded(s.CurrentWorldId, s.PlayerId);
+                 // Real Arbiter sends these to the client right after C_LOAD_TOPO_FIN (lobby_proxy.log
+                 // 263-268), in this order. S_LOAD_CLIENT_USER_SETTING here is what makes the chat

@@ -1,4 +1,7 @@
-﻿using Microsoft.Extensions.Logging;
+﻿// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 the TeraSharp contributors
+
+using Microsoft.Extensions.Logging;
 using TeraSharp.Arbiter.Network;
 using TeraSharp.Arbiter.Protocol;
 using TeraSharp.Arbiter.World;
@@ -81,7 +84,9 @@ public static class HandlerRegistry
                 s.Send(ArbiterClientHandlers.BuildChangeCardPreset());         // T83: card preset (frames 329/375)
                 if (GmCommandHandlers.LevelOf(s, Program.Store) >= 1)   // T107: the real server sends these only to GMs
                 {
-                    s.Send(ArbiterClientHandlers.BuildAdminHoldCharacter());       // T89: frame 402
+                    // S_ADMIN_HOLD_CHARACTER removed here (2026-09-20): sent before spawn it FREEZES the GM in
+                    // place and blocks item use ("You can't use that now"). The real Arbiter sends it ~106 frames
+                    // after S_SPAWN_ME with a constant 00 - i.e. "not held" - so nothing is lost by not sending it.
                     // S_ADMIN_GM_SKILL moved to the S_LOGIN burst (T120: frame 99, before S_LOAD_TOPO - the Alt+A gate)
                 }
                 s.Send(ArbiterClientHandlers.BuildPvpLeaderBoardInfo());       // T91: frame 288
@@ -91,6 +96,7 @@ public static class HandlerRegistry
                     ArbiterClientHandlers.BuildUpdateVisitedSectionList(s.PlayerId,
                         Program.Store?.GetVisitedSections((int)s.SelectedCharacter!.Id)
                             ?? Array.Empty<TeraSharp.Arbiter.Persistence.CharacterStore.VisitedSection>()));
+                GuildWiring.SendGuildQuestPointInfo(s);   // T172: 0x1453 after 0x1439, before 0x1390 (cap_final2a/2b, 88 frames)
                 Program.World?.NotifyTopoLoaded(s.CurrentWorldId, s.PlayerId);
                 // Real Arbiter sends these to the client right after C_LOAD_TOPO_FIN (lobby_proxy.log
                 // 263-268), in this order. S_LOAD_CLIENT_USER_SETTING here is what makes the chat
@@ -279,6 +285,7 @@ public static class HandlerRegistry
             "C_REQUEST_COUPON_DATA", "C_REQUEST_RECV_DAILY_TOKEN", "C_QUERY_COIN", "C_REQUEST_CHANGE_PARTY_NAME",
             "C_PARTY_NOTIFY_MY_POSITION", "C_CANCEL_CHANGE_USER_APPEARANCE", "C_CANCEL_PREPARE_CHANGE_USER_APPEARANCE",
             "C_CUSTOM_USER_CUSTOMIZING", "C_SAVE_CHAT_SETTING", "C_UPDATE_SKILL_SCRIPT",
+            "C_SET_VISIBLE_RANGE",   // T158: World has no handler ("not been implemented yet"), cap_play1 client 9
         })
             Reg(name, 0, (s, b) => ArbiterClientHandlers.OnAcceptSilently(s, b, misc));
 
@@ -413,7 +420,7 @@ public static class HandlerRegistry
         // --- Telemetry / world packets: noop standalone, forward in-world ---
         // (T45 moved C_TRADE_BROKER_HIGHEST_ITEM_LEVEL, C_UPDATE_CONTENTS_PLAYTIME, C_EVENT_GUIDE and
         //  C_VISIT_NEW_SECTION to real Arbiter-side handlers above - they must NOT be forwarded.)
-        RegNoop("C_SET_VISIBLE_RANGE");
+        // C_SET_VISIBLE_RANGE is in the accept-silently list above (T158)
         RegNoop("C_HARDWARE_INFO");
         RegNoop("C_CHANGE_USER_LOBBY_SLOT_ID");
         // C_RQ_SKILL_POLISHING_LIST / _EXP_INFO: real replies since T82 (registered above)

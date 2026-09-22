@@ -1,0 +1,21 @@
+# T161b - WorldBridge.cs (human-owned). Apply from the repo root: git apply status/T161b-PATCH.diff
+# One hunk: NotifyPlayerLeave holds a leave while World is still loading the user. The rest of the
+# fix is Cowork-owned and already on the branch: LeaveGate (World/TunnelRouting.cs), the Entering
+# mark (SocialHandlers.RegisterChat) and the SA_ENTER_WORLD flush (DbProxyHandlers). Without this
+# hunk they are inert. Test: T161b_a_leave_while_world_loads_waits_for_sa_enter_world.
+--- a/src/TeraSharp.Arbiter/World/WorldBridge.cs
++++ b/src/TeraSharp.Arbiter/World/WorldBridge.cs
+@@ -716,6 +716,13 @@
+     /// </summary>
+     public void NotifyPlayerLeave(int worldId, ulong gameId, uint playerId, LeaveMode mode)
+     {
++        // T161b: User::LeaveWorldStart [Pending] - World is still loading this user (no
++        // SA_ENTER_WORLD yet) and drops a leave for it; DbProxyHandlers sends it on SA_ENTER_WORLD.
++        if (LeaveGate.Shared.TryReserve(gameId, worldId, playerId, mode))
++        {
++            _log.LogInformation("AS_LEAVE_WORLD for gameId {G:X} held until SA_ENTER_WORLD (World is still loading it)", gameId);
++            return;
++        }
+         SendFrame(worldId, OpCancelSkillStrictly, BitConverter.GetBytes(playerId));
+         SendFrame(worldId, OpLeaveWorld, BuildLeaveWorldPayload(gameId, playerId, mode));
+         var (type, reason) = LeaveValues(mode);

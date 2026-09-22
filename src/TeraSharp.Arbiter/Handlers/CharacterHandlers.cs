@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 the TeraSharp contributors
+
 using System.Text;
 using Microsoft.Extensions.Logging;
 using TeraSharp.Arbiter.Game;
@@ -46,10 +49,10 @@ public sealed class CreateUserRequest
 ///   C_CREATE_USER      -> S_CREATE_USER      { bool success }  (opcode 0x7160)
 ///   C_DELETE_USER      -> S_DELETE_USER      { bool success }
 ///
-/// <para>Ground truth for the whole flow: D:\packetlogs\cap_newchar_client.log packets 30-38
+/// <para>Ground truth for the whole flow: <captures>\cap_newchar_client.log packets 30-38
 /// (C_CAN_CREATE_USER -> S_CAN_CREATE_USER 01, C_CHECK_USERNAME "Test" -> S_CHECK_USERNAME 01,
 /// C_CREATE_USER 146 B -> S_CREATE_USER 01, then C_GET_USER_LIST returns two characters), and
-/// D:\packetlogs\cap_newchar.log 05:49:03 for that character's first enter-world.</para>
+/// <captures>\cap_newchar.log 05:49:03 for that character's first enter-world.</para>
 ///
 /// <para>Decompile: <c>Handler_C_CREATE_USER</c> Arb_part_079.c:9510,
 /// <c>Handler_C_CHECK_USERNAME</c> Arb_part_079.c:9369, <c>Handler_C_CAN_CREATE_USER</c>
@@ -333,7 +336,7 @@ public sealed class CharacterHandlers
             Gender = req.Gender,
             Race = req.Race,
             Class = req.Class,
-            Level = 1,
+            Level = TeraSharp.Arbiter.World.StarterInventory.CreatedLevelFor(req.Class),   // T162: CreateCharData createdLevel
             TemplateId = ComputeTemplateId(req.Race, req.Gender, req.Class),
             Appearance = req.Appearance,
             Details = req.Details,
@@ -516,6 +519,10 @@ public sealed class CharacterHandlers
         store.SaveWorldBlob(id, record.WorldBlob);
 
         s.Account.Characters.Add(FakeCharacter.FromRecord(record));
+
+        // T162: made above level 1 by the sheet - World runs its own level commit (skills) at the
+        // first spawn, the way T152b hands it a level set from outside.
+        if (record.Level > 1) WorldLevelSync.Queue(id, record.Level);
 
         _log.LogInformation(
             "C_CREATE_USER from {Id}: created '{Name}' id={CId} template={T} race={R} gender={G} class={C} " +

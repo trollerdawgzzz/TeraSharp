@@ -101,7 +101,7 @@ one is missing):
 |---|---|
 | `tera-server-proxy\data\data.json` | the client opcode map, key `"376012"` |
 | `tera_v100_MASTER_FINAL\` | 4548 `.def` files — the client packet codec |
-| `D:\packetlogs\arb_world.log` | the captured World conversation `WorldReplayTable` is built from |
+| `<captures>\arb_world.log` | the captured World conversation `WorldReplayTable` is built from |
 | `data\starter_blob.bin` (15312 B) | a new character's world blob, patched per character |
 | `data\starter_inventory.bin` | the starter kit as a `0x27A4` payload |
 | `data\promotions_147E.bin`, `data\handshake_burst.bin` | the login-time pushes, byte-exact |
@@ -113,7 +113,7 @@ catalogue and none of the items in the captures. Loading is lazy — a server wh
 never opened never pays for it.
 
 `data\*.bin` + `data\*.md` pairs are capture fixtures for byte-exact tests, not runtime data.
-The SQLite database is `D:\packetlogs\terasharp.db`, created and migrated on start.
+The SQLite database is `<TERASHARP_LOGS>\terasharp.db`, created and migrated on start.
 
 ---
 
@@ -126,7 +126,7 @@ warnings for the four settings that are legal, silent and almost always wrong.
 | Variable | Default | Effect |
 |---|---|---|
 | `TERASHARP_DATA` | `D:\v100\TERA_SERVER.100` | root for defs, opcodes, strsheets |
-| `TERASHARP_LOGS` | `D:\packetlogs` | capture input and the daily `arbiter-<date>.log` |
+| `TERASHARP_LOGS` | `logs` | capture input and the daily `arbiter-<date>.log` |
 | `TERASHARP_DB` | `<logs>\terasharp.db` | the SQLite file |
 | `TERASHARP_BIND` | `127.0.0.1` | client listener address. **Leave it on loopback** |
 | `TERASHARP_AUTH` | unset (off) | `true` validates the login ticket against tera-api, fail closed |
@@ -137,13 +137,19 @@ warnings for the four settings that are legal, silent and almost always wrong.
 | `TERASHARP_LOG_LEVEL` | `Warning` | console only; the daily file always takes Debug |
 | `TERASHARP_ITEM_STRSHEET` | unset | explicit path to a `StrSheet_Item*.xml` |
 | `TERASHARP_ITEM_NAMES` | unset | explicit path to a two-column `templateId<TAB>name` file |
-| `TERASHARP_DATASHEET` | unset | datasheet folder override (`--selftest`) |
+| `TERASHARP_DATASHEET` | `<data>\Executable\Datasheet` | the sheets server policy is read from (`status/DATASHEETS.md`) |
+| `TERASHARP_SERVERCONFIG` | `<data>\Executable\ServerConfig.xml` | the World list and continents (`WorldServerList`) |
 | `TERASHARP_STARTER_BLOB` | `data\starter_blob.bin` | new-character blob |
 | `TERASHARP_STARTER_INVENTORY` | `data\starter_inventory.bin` | starter kit payload |
 | `TERASHARP_START_OVERRIDE` | unset | `"zone,x,y,z"` — forces where a new character starts. Experiment knob |
 | `TERASHARP_API_GATEWAY` | `127.0.0.1:8040` | tera-api's **gateway** API, host:port — one half of the Alt+A gate (T124) |
 | `TERASHARP_DB_SERVER_NAME` | `PlanetDB_2800` | `S_LOGIN_ACCOUNT_INFO.dbServerName` |
 | `TERASHARP_API_JWT_SECRET` | **none** | HS256 key for the Alt+A token; set it to tera-api's `API_PORTAL_SECRET`. Unset = a per-process key |
+| `TERASHARP_MATCH_ENTRY_SECONDS` | `300` | how long a formed match stays claimable |
+| `TERASHARP_BG_MAX_HEALERS` / `_TANKS` | `2` / `3` | per-team caps for a battleground type with no rule of its own |
+| `TERASHARP_MATCH_MIN_MEMBERS` | unset | **test only**: pool at N players, roles ignored; warned at start |
+| `TERASHARP_BROKER_FEE_PERCENT` | `10` | broker fee, 0..100 |
+| `TERASHARP_TEST_FILTER` | unset | test runner only: run the tests whose name contains it |
 
 ---
 

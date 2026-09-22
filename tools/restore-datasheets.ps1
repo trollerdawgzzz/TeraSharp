@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 the TeraSharp contributors
 <#
 .SYNOPSIS
     Undo a trim-datasheets.ps1 run, using the manifest it wrote.

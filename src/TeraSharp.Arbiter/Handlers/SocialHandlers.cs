@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 the TeraSharp contributors
+
 using System.Collections.Concurrent;
 using Microsoft.Extensions.Logging;
 using TeraSharp.Arbiter.Network;
@@ -179,6 +182,9 @@ public sealed class SocialHandlers
     {
         var chr = session?.SelectedCharacter;
         if (chr == null) return;
+        // T161b: WorldEntry calls this one line before AS_ENTER_WORLD goes out - a leave from now
+        // until SA_ENTER_WORLD is held (World/TunnelRouting.cs LeaveGate). Idempotent per gameId.
+        if (session!.InWorld) LeaveGate.Shared.Entering(session.GameId);
         Chat.Register(new ChatPlayer((int)chr.Id, chr.Name, session!.GameId, chr.Level, chr.Class,
                                      IsAdmin: false));
         // T49: parties key on the tunnel Ticket and need exactly the same "who is online" edge,
@@ -199,6 +205,8 @@ public sealed class SocialHandlers
         // T80: guild war pushes AS_NOTIFY_GUILD_WAR_INFO to World and S_TOTAL_GUILD_WAR_DATA
         // to the client on this same edge - tap 5094/5846/5950 all sit at an enter-world.
         GuildWarManager.OnEnterWorld(session);
+        // T172: the daily AS_RESET_PURCHASE_LIMIT check starts with the first player (idempotent).
+        PurchaseLimitReset.EnsureStarted();
     }
 
     internal static void UnregisterSession(string characterName)
@@ -451,6 +459,11 @@ public sealed class SocialHandlers
             ? new Dictionary<string, object> { ["blockList"] = new List<object>() }
             : BuildBlockListFields(store, (int)chr.Id);
         s.SendByDef("S_USER_BLOCK_LIST", fields);
+        // T161 (a): a formed match nobody has entered yet is offered again at enter-world. This
+        // call is the C_LOAD_TOPO_FIN burst's only Cowork-owned line, so the re-offer rides it -
+        // the choice T49/T51/T76 made with RegisterChat - rather than a line in the human-owned
+        // HandlerRegistry. Once per world entry; a zone change does not repeat it.
+        MatchWiring.ReofferPending(s);
     }
 
     /// <summary>The S_USER_BLOCK_LIST field set for one character, from the blocks table.</summary>

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 the TeraSharp contributors
 // =============================================================================================
 // ContinentRouting - FOLDED INTO World/WorldInstances.cs (T138b). This file is a tombstone.
 //

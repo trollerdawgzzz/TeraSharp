@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 the TeraSharp contributors
+
 using Microsoft.Extensions.Logging;
 
 namespace TeraSharp.Arbiter.World;
@@ -404,7 +407,7 @@ public static class DungeonRouting
 /// <see cref="WorldServerList.SeedDefault"/> seeds from config. Live data wins because it arrives
 /// later; config is the fallback for a World that never sends one.
 ///
-/// <para>Layout, pinned against D:\packetlogs\cap_multiworld3.log (T137c). Payload-relative:</para>
+/// <para>Layout, pinned against <captures>\cap_multiworld3.log (T137c). Payload-relative:</para>
 /// <code>
 ///   0   i32 count / 4 i32 unk (22 in every captured frame) / 8 i32 planetId / 12 i32 worldId
 ///   16  count x 16 B:  i32 minLevel / i32 maxLevel / i32 continentId / i32 unk

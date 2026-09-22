@@ -1,6 +1,6 @@
 # Guild war - declare, view, withdraw (T80)
 
-Ground truth: `D:\packetlogs\cap_social4_client.log` frames **1621..4453** and
+Ground truth: `<captures>\cap_social4_client.log` frames **1621..4453** and
 `cap_social4_ctl.txt` taps **6023** and **7468**. Implementation: `World/GuildWarManager.cs`,
 `Persistence/CharacterStore.cs` (tables `guild_wars`, `guild_war_history`),
 `Protocol/V100Definitions.cs` (two corrected defs). Tests:
@@ -195,3 +195,25 @@ and the pushes `S_CARD_DATA` (x3), `S_ACTIVATE_CARD_COMBINE_LIST_DATA` (x3),
 `S_CHANGE_CARD_PRESET` (x45). There is no `C_MOUNT_CARD`, no `C_ACTIVATE_CARD_COMBINE_LIST` and no
 `C_CHANGE_CARD_PRESET` - so there is no learn/equip write in this capture to verify against, and
 nothing was added on a guess.
+
+## 8. T170 - declare back, withdraw one side, surrender
+
+cap_final2a_client1 (sdg, guild 2) / client2 (fdh, guild 3) + the cap_final2b tap; pinned in
+`T170_guild_war_accept_and_surrender_match_the_capture`.
+
+| Client | Arbiter answers | World gets | State |
+|---|---|---|---|
+| C_DECLARE_GUILD_WAR (client2 2174) | S_GUILD_MONEY_INFO_CHANGED (paid), S_NOTIFY to both guilds | AS_UPDATE_GUILD_DATA, AS_DECLARE (6800, 6801) | 6 |
+| C_CHECK_TO_OPPOSITE_DECLARE_GUILD_WAR [opp] (4067) | S_CHECK_TO_OPPOSITE_DECLARE_GUILD_WAR [opp][cost] | - | - |
+| C_OPPOSITE_DECLARE_GUILD_WAR [opp] (4072) | money (paid), S_NOTIFY to both | AS_UPDATE_GUILD_DATA, AS_OPPOSITE_DECLARE (6900, 6901) | 8 |
+| C_WITHDRAW_GUILD_WAR, war mutual (10341) | S_NOTIFY to both | AS_WITHDRAW [war][att][def][new state] (14883) | 6 or 7 |
+| C_WITHDRAW_GUILD_WAR, only mine declared | S_NOTIFY to both | AS_END reason 1 (T80) | history 1 |
+| C_REQUEST_GUILD_WAR_PENALTY_INFO [opp] (10378) | S_GUILD_WAR_PENALTY_INFO [opp][i64] = rate x winner's money | - | - |
+| C_GIVE_UP_GUILD_WAR [opp] (10380) | money both guilds (reparation moves), S_NOTIFY to both | 2x AS_UPDATE_GUILD_DATA, AS_END reason 4 (14987-14989) | history 4 |
+
+- The window is viewer-relative: first block = the viewer's guild (flag = declared, money = its
+  declaration), second = the opponent. T80's attacker-first rows were the attacker's view.
+- T80 missed the payment: cap_social4_client 3385 and tap 6022 are the same money + guild-data pair.
+- S_START_GUILD_WAR (client1 4616) and the SMT 3891/3892/3893 notices are World's (GuildWar
+  ticks; SA_BROADCAST_SYSTEM_MESSAGE 0x1436, which WorldBridge still drops).
+- The capture's costs (100 / 10) are an admin override (spLoadGuildWarAdmin*); TeraSharp uses the sheet.

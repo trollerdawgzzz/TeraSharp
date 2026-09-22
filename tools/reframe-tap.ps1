@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 the TeraSharp contributors
 <#
 .SYNOPSIS
     Reframe an Arbiter<->World tap log into a condensed control listing plus an
@@ -36,13 +38,13 @@
 .PARAMETER Skip
     Opcodes to leave out of the condensed listing. The default is the ten
     high-volume frames that drown everything else out; it reproduces
-    D:\packetlogs\cap_relog9827_ctl.txt from its source log.
+    <captures>\cap_relog9827_ctl.txt from its source log.
 
 .PARAMETER Link
     Only process this World socket id (1-based). Needs a post-T56 log.
 
 .EXAMPLE
-    .\reframe-tap.ps1 -Log D:\packetlogs\arb_world_2026-09-13T11-33-30-680Z.log `
+    .\reframe-tap.ps1 -Log <captures>\arb_world_2026-09-13T11-33-30-680Z.log `
                       -Opcodes 0x138E,0x138D,0x1390,0x13BE,0x13C0,0x2711,0x2738
 
 .NOTES

@@ -1,4 +1,7 @@
-﻿using Microsoft.Extensions.Logging;
+﻿// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 the TeraSharp contributors
+
+using Microsoft.Extensions.Logging;
 using TeraSharp.Arbiter.Auth;
 using TeraSharp.Arbiter.Network;
 using TeraSharp.Arbiter.Game;
@@ -79,7 +82,7 @@ public sealed class LoginHandlers
                 ["weapon"] = c.Weapon, ["earring1"] = 0, ["earring2"] = 0,
                 ["body"] = c.Body, ["hand"] = c.Hand, ["feet"] = c.Feet, ["unkItem7"] = 0,
                 ["ring1"] = 0, ["ring2"] = 0, ["underwear"] = 0, ["head"] = 0, ["face"] = 0,
-                ["appearance"] = c.Appearance, ["isSecondCharacter"] = false, ["adminLevel"] = 0,
+                ["appearance"] = c.Appearance, ["isSecondCharacter"] = false, ["adminLevel"] = GmCommandHandlers.LevelOf(s, Program.Store) > 0 ? 1 : 0,   // T144: the [GM] tag; the real Arbiter sends 1
                 ["isBanned"] = false, ["banEndTime"] = 0L, ["banRemainSec"] = 0, ["canUseStatus"] = 0,
                 ["weaponModel"] = 0, ["unkModel2"] = 0, ["unkModel3"] = 0,
                 ["bodyModel"] = 0u, ["handModel"] = 0u, ["feetModel"] = 0u,
@@ -177,7 +180,8 @@ public sealed class LoginHandlers
 
         if (PureReplay) { SpawnReplay.ReplayPhase1(s, _log); return true; }
 
-        s.SendByDef("S_SELECT_USER", ArbiterClientHandlers.BuildSelectUserFields());   // T124
+        s.SendByDef("S_SELECT_USER", ArbiterClientHandlers.BuildSelectUserFields(
+            accepted: true, adminLevel: GmCommandHandlers.LevelOf(s, Program.Store)));   // T124, T144b
         s.SendByDef("S_BROCAST_GUILD_FLAG", new Dictionary<string, object>());
         ArbiterClientHandlers.SendCurrentElectionState(s);   // T106: frame 49, constant
         SendContentFlags(s);

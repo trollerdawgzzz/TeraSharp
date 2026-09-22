@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 the TeraSharp contributors
+
 using Microsoft.Extensions.Logging;
 using TeraSharp.Arbiter.Persistence;
 
@@ -122,12 +125,26 @@ public static class WarehouseHandlers
     public const int AtomDstInven = 0x40;
     public const int AtomDstSlot = 0x48;
     public const int AtomDelta = 0x50;      // i64, signed
+    /// <summary>T151. The bind owner World writes for op 51/63 (PrepareChangeSealItem:
+    /// <c>atom+0x168 = User::GetDbId()</c>). DO_TS_UNBIND_ITEM passes it, with +0x1c4, straight to
+    /// ItemUtil::UpdateItemBound.</summary>
+    public const int AtomBoundOwner = 0x168;
+    public const int AtomBoundExtra = 0x1C4;
+
+    // ItemData fields ItemUtil::UpdateItemBound writes. ItemData is the 536-byte record itself
+    // (the Arbiter copies 0x218 bytes of it into 0x27A4), so these are record offsets too.
+    public const int RecordBoundFlag = 0x34;    // bool: bound
+    public const int RecordBoundOwner = 0x38;   // i32: who it is bound to
+    public const int RecordBoundExtra = 0x1C4;  // i32: carried over on bind, set from the atom on unbind
 
     // Sub-operations. 0x0D/0x0E/0x0F are written by PrepareWareSendTransaction and 0x0D/0x11 by
     // PrepareWareRecvTransaction; the names are the Arbiter's DO_TS_WARE_* set, matched by what
     // each branch fills in. 2/7/11 are the general item ops already used by SDB_ITEM_SINGLE.
     public const uint TsChangeItemAmount = 2;
     public const uint TsInsertItem = 7;
+    /// <summary>T153. 8: the NON-stackable insert (GM makeitem, reward gear) - DO_TS_INSERT_NONSTACKABLE_ITEM.
+    /// Arrives with id 0 like 7; the stored record is built from the atom by <see cref="ItemCreate"/>.</summary>
+    public const uint TsInsertNonStackItem = 8;
     public const uint TsDeleteItem = 11;
     // T44: the rest of the ops a bag actually sees. Indices from the World-side Prepare*
     // builders (status/INVENTORY-DESIGN.md section 4); 2, 6+11, 7 and 9 are the only four an
@@ -136,6 +153,13 @@ public static class WarehouseHandlers
     public const uint TsDetachStack = 6;      // first half of "this stack is now empty", paired with 11
     public const uint TsChangeMoney = 9;      // CHARACTER money (template id 0), not warehouse money
     public const uint TsSwapItemPos = 36;     // swap two OCCUPIED slots
+    /// <summary>T151. 51: bind the item to its owner - Inventory::PrepareChangeSealItem, which is
+    /// what an equip of a bind-on-equip item puts in SDB_EQUIP_ITEM. The atom carries the item's
+    /// CURRENT position in both triples ("0:2 -&gt; 0:2"): it changes the item, not where it is.
+    /// The Arbiter's DO_TS_BIND_ITEM is ItemUtil::UpdateItemBound(item, owner, owner, item+0x1c4).</summary>
+    public const uint TsBindItem = 51;
+    /// <summary>T151. 63: DO_TS_UNBIND_ITEM - UpdateItemBound(item, 0, atom+0x168, atom+0x1c4).</summary>
+    public const uint TsUnbindItem = 63;
     public const uint TsWareChangeMoney = 0x0D;   // src=dst=(wareOwner, wareType); +0x50 = delta
     public const uint TsWareMoveItem = 0x0E;      // whole row moves to (dstOwner, dstInven, dstSlot)
     public const uint TsWareInsertItem = 0x0F;    // new row in the warehouse (a split stack)
@@ -167,6 +191,17 @@ public static class WarehouseHandlers
     public const uint TsBrokerCalcSold = 56;
     public const uint TsBrokerCalcBought = 57;
 
+    /// <summary>
+    /// T170. 37: DO_TS_RECV_PARCEL - the last atom of EVERY collect step 2 (cap_social 1555,
+    /// cap_social2 2374 / 2508, cap_final 3379, cap_final2b x4). No item, no owner triple: the
+    /// Arbiter calls ParcelManager with the atom's i64 at +8 and the parcel id at
+    /// <see cref="AtomRecvParcelId"/> to mark the parcel collected. OnRecvParcel already does that
+    /// (SetParcelRecved), so like the broker markers it is echoed and intentionally inert.
+    /// </summary>
+    public const uint TsRecvParcel = 37;
+    /// <summary>T170. The parcel id an op-37 atom carries (1 in cap_social 1555, 3 in cap_social2 2374).</summary>
+    public const int AtomRecvParcelId = 0x278;
+
     /// <summary>Is this one of the five inert broker markers?</summary>
     public static bool IsBrokerMarker(uint op)
         => op >= TsBrokerRegister && op <= TsBrokerCalcBought;
@@ -179,7 +214,7 @@ public static class WarehouseHandlers
         int Index, uint Op, long ItemDbId, int TemplateId,
         long SrcOwner, uint SrcInven, uint SrcSlot,
         long DstOwner, uint DstInven, uint DstSlot,
-        long Delta);
+        long Delta, int BoundOwner = 0, int BoundExtra = 0);
 
     // ------------------------------------------------------- request layouts
     // Payload index = frame offset - 6. Each Min* is the real handler's guard, and in every case
@@ -291,7 +326,7 @@ public static class WarehouseHandlers
         for (int o = 0; o + recordSize <= atoms.Length; o += recordSize)
         {
             uint op = BitConverter.ToUInt32(atoms, o + AtomOp);
-            if (op != TsInsertItem && op != TsWareInsertItem) continue;
+            if (op != TsInsertItem && op != TsWareInsertItem && op != TsInsertNonStackItem) continue;
             if (BitConverter.ToInt64(atoms, o + AtomItemDbId) != 0) continue;
             BitConverter.GetBytes(allocateItemId()).CopyTo(atoms, o + AtomItemDbId);
         }
@@ -333,7 +368,9 @@ public static class WarehouseHandlers
         DstOwner: BitConverter.ToInt64(buf, a + AtomDstOwner),
         DstInven: BitConverter.ToUInt32(buf, a + AtomDstInven),
         DstSlot: BitConverter.ToUInt32(buf, a + AtomDstSlot),
-        Delta: BitConverter.ToInt64(buf, a + AtomDelta));
+        Delta: BitConverter.ToInt64(buf, a + AtomDelta),
+        BoundOwner: a + AtomBoundExtra + 4 <= buf.Length ? BitConverter.ToInt32(buf, a + AtomBoundOwner) : 0,
+        BoundExtra: a + AtomBoundExtra + 4 <= buf.Length ? BitConverter.ToInt32(buf, a + AtomBoundExtra) : 0);
 
     // --------------------------------------------------------------- builders
 
@@ -477,6 +514,28 @@ public static class WarehouseHandlers
     /// <param name="CharacterMoneyDelta">Net CHARACTER money applied (op 9) - T59. It lands on
     /// <c>characters.money</c>, not in <c>items</c>, so it is counted separately from the
     /// warehouse total and is not an "ignored" atom any more.</param>
+    /// <summary>
+    /// T151. Op 51/63 on the stored record: the bound flag and owner, as UpdateItemBound writes
+    /// them. The position is left alone - it is the same on both sides of the atom. A row with
+    /// no stored record gets the synthesised one first, so the bind survives the next 0x27A4.
+    /// </summary>
+    public static bool ApplyBound(CharacterStore store, WarehouseAtom a, bool bind)
+    {
+        ArgumentNullException.ThrowIfNull(store);
+        var row = a.ItemDbId != 0 ? store.GetItem((int)a.ItemDbId)
+                                  : store.FindItemAt(a.SrcOwner, (int)a.SrcInven, (int)a.SrcSlot);
+        if (row is null) return false;
+        var rec = row.Record is { Length: >= RecordBoundExtra + 4 } r ? (byte[])r.Clone()
+            : BuildItemRecord(row.ItemDbId, row.TemplateId, (int)row.OwnerDbId, (int)row.Amount, row.InvenType, row.Slot);
+        if (rec.Length < RecordBoundExtra + 4) return false;
+        rec[RecordBoundFlag] = (byte)(bind ? 1 : 0);
+        int owner = bind ? (a.BoundOwner != 0 ? a.BoundOwner : (int)row.OwnerDbId) : a.BoundOwner;
+        BitConverter.GetBytes(owner).CopyTo(rec, RecordBoundOwner);
+        if (!bind) BitConverter.GetBytes(a.BoundExtra).CopyTo(rec, RecordBoundExtra);
+        store.UpsertItem(row.ItemDbId, row.OwnerDbId, row.InvenType, row.Slot, row.TemplateId, row.Amount, rec);
+        return true;
+    }
+
     public readonly record struct ApplyResult(int Inserted, int Moved, int AmountChanged, int Deleted,
                                               long MoneyDelta, int Ignored, long CharacterMoneyDelta);
 
@@ -546,6 +605,7 @@ public static class WarehouseHandlers
                 // ---- insert ----
                 case TsInsertItem:
                 case TsWareInsertItem:
+                case TsInsertNonStackItem:   // T153; its record is stored by ItemCreate.StoreRecords
                 {
                     int id = a.ItemDbId != 0 ? (int)a.ItemDbId : allocateItemId();
                     store.UpsertItem(id, dstOwner, (int)dstInven, (int)dstSlot,
@@ -672,6 +732,19 @@ public static class WarehouseHandlers
                     ignored++;
                     break;
 
+                // ---- bind / unbind (T151) ----
+                case TsBindItem:
+                case TsUnbindItem:
+                    if (ApplyBound(store, a, bind: a.Op == TsBindItem)) changed++;
+                    else ignored++;
+                    break;
+
+                case TsRecvParcel:
+                    // T170: the collect's "parcel taken" marker - the recv path marks the row.
+                    log?.LogDebug("items: recv-parcel marker (op 37) - handled by the parcel path");
+                    ignored++;
+                    break;
+
                 case TsBrokerRegister:
                 case TsBrokerCancel:
                 case TsBrokerBuy:
@@ -681,6 +754,14 @@ public static class WarehouseHandlers
                     // the atom beside them does the row move. Not an unmodelled-op gap.
                     log?.LogDebug("items: broker marker op {Op} for item {Id} - handled by the broker path",
                         a.Op, a.ItemDbId);
+                    ignored++;
+                    break;
+
+                // ---- T166: per-attribute record edits (enchant, awaken, option reset ...) ----
+                case var edit when ItemEdits.IsRecordEdit(edit):
+                    // Applied from the raw atom by ItemEdits (BagItems.ApplyReplyAtoms): the
+                    // fields it rewrites are not in the parsed atom.
+                    log?.LogDebug("items: record edit op {Op} for item {Id} - applied by ItemEdits", a.Op, a.ItemDbId);
                     ignored++;
                     break;
 

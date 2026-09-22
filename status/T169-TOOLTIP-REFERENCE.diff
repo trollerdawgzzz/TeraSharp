@@ -1,0 +1,479 @@
+diff -ruN rb/src/TeraSharp.Arbiter/Handlers/ArbiterClientHandlers.cs rn/src/TeraSharp.Arbiter/Handlers/ArbiterClientHandlers.cs
+--- a/src/TeraSharp.Arbiter/Handlers/ArbiterClientHandlers.cs	2026-09-22 10:49:43.244082779 +0000
++++ b/src/TeraSharp.Arbiter/Handlers/ArbiterClientHandlers.cs	2026-09-22 10:49:43.261122309 +0000
+@@ -327,29 +327,51 @@
+     public const int TtExteriorItemTemplateId = 0xC9;
+     public const int TtDamaged = 0x12F;
+ 
++    // --- T169: the real shape, pinned to cap_final2a/2b (164 client samples, 94 compare pairs) ---
++    // After the bound-owner string the real Arbiter always writes TWO option sets and TWO compare
++    // sets, interleaved and linked (u16 self, u16 next):
++    //   [OptionSet 0: 0x1C head + 15 x 8 passive][CompareSet 0: 0xA4][OptionSet 1 ...][CompareSet 1 ...]
++    // OptionSet head: [self][next][u16 15][u16 passives][i32 CurOptionIndex = k][i32 0]
++    //                 [f32 ItemLevel][f32 ItemMinLevel][f32 ItemMaxLevel]
++    // CompareSet:     [self][next][i32 k][15 x i32 stat][8 x i32 0][8 x i64]; without a compare the
++    //                 15 stats are "no value" (-1000, or -1000f at 6-8 and 13-15) and the i64s 0xFE-fill.
++    // What is NOT reproduced (the only bytes that differ from the capture): the three item-level
++    // floats, CumulatedEnchantAmount and DecompositionCost of equipment. The real Arbiter computes
++    // them from EquipmentItemLevelData / its equipment tables, which are not among our datasheets;
++    // they are 0 / -1 here. Consumables and materials (the Forge picker) are byte-exact.
++    public const int TtOptionSetHead = 0x1C, TtPassiveSlots = 15, TtPassiveEntry = 8, TtCompareSetSize = 0xA4;
++    public const int TtSetPair = TtOptionSetHead + TtPassiveSlots * TtPassiveEntry + TtCompareSetSize;   // 0x138
++    public const int TtOpenDateTime = 0xE5, TtRemainPeriodInSec = 0xED;
++    public const int TtEquipmentSetId = 0xF5, TtCompareEquipmentSetId = 0xF9;
++    public const int TtCumulatedEnchantAmount = 0x111, TtDecompositionCost = 0x115;
++    // The 536-byte item record fields the tooltip copies (ItemEdits' names).
++    public const int TipRecEnchant = 0x28, TipRecDurability = 0x2C, TipRecBound = 0x34,
++                     TipRecPassives = 0x54, TipRecPassiveSet = 0x3C, TipRecGrade = 0x134;
++    private static readonly int NoStatFloat = BitConverter.SingleToInt32Bits(-1000f);
++
+     /// <summary>
+-    /// S_SHOW_ITEM_TOOLTIP for one stored item row. Built as a raw frame rather than through
+-    /// <c>SendByDef</c> for the same reason <see cref="ParcelHandlers"/> builds its three: there
+-    /// is no .def to drive the encoder with.
+-    ///
+-    /// <para>The fields that matter to the client's item cache — <c>ItemDbId</c>,
+-    /// <c>TemplateId</c>, <c>InvenType</c>, <c>InvenPos</c>, <c>Count</c> and
+-    /// <c>SavedCount</c> — come from the row. Everything else is zero, which is what a stack of
+-    /// consumables actually is: no enchant, no options, no colouring, not bound.</para>
++    /// S_SHOW_ITEM_TOOLTIP for one stored item row (raw frame: there is no .def). The row gives the
++    /// ids, place and count; its 536-byte record (when we have one) the enchant, durability, bound
++    /// flag, grade and both passive sets. <paramref name="compare"/> is World's 0x150-byte
++    /// CompareItemToolTip (SDB_SIMULATE_ITEM_TOOLTIP): with it the paper-doll compare is on, the
++    /// compare sets carry its stats and CurrentSlotItemLevel its +0x140.
+     /// </summary>
+     public static byte[] BuildShowItemTooltip(int toolTipType, CharacterStore.ItemRow row,
+-                                              string boundOwner = "")
++                                              string boundOwner = "", byte[]? compare = null)
+     {
+         ArgumentNullException.ThrowIfNull(row);
+         boundOwner ??= string.Empty;
++        if (compare != null && compare.Length < CmpSize) compare = null;
+         int textBytes = (boundOwner.Length + 1) * 2;
+-        int len = TooltipFixedSize + textBytes;
++        int optOff = TooltipFixedSize + textBytes;
++        int len = optOff + 2 * TtSetPair;
+         var p = new byte[len];
+         p[0] = (byte)len; p[1] = (byte)(len >> 8);
+         p[2] = unchecked((byte)S_SHOW_ITEM_TOOLTIP); p[3] = (byte)(S_SHOW_ITEM_TOOLTIP >> 8);
+ 
+-        // The four arrays stay empty: count 0, offset 0.
+-        BitConverter.GetBytes((ushort)TooltipFixedSize).CopyTo(p, TtItemBoundOwner);
++        W16(p, TtOptionSetCount, 2); W16(p, TtOptionSetOffset, optOff);
++        W16(p, TtCompareStatCount, 2); W16(p, TtCompareStatOffset, optOff + TtOptionSetHead + TtPassiveSlots * TtPassiveEntry);
++        W16(p, TtItemBoundOwner, TooltipFixedSize);
+         System.Text.Encoding.Unicode.GetBytes(boundOwner).CopyTo(p, TooltipFixedSize);
+ 
+         BitConverter.GetBytes(toolTipType).CopyTo(p, TtToolTipType);
+@@ -361,9 +383,133 @@
+         BitConverter.GetBytes(row.Slot).CopyTo(p, TtInvenPos);
+         BitConverter.GetBytes((int)row.Amount).CopyTo(p, TtSavedCount);
+         BitConverter.GetBytes((int)row.Amount).CopyTo(p, TtCount);
++
++        var rec = row.Record != null && row.Record.Length >= TipRecGrade + 4 ? row.Record : null;
++        if (rec != null)
++        {
++            Array.Copy(rec, TipRecEnchant, p, TtEnchantCount, 4);
++            Array.Copy(rec, TipRecDurability, p, TtDurability, 4);
++            p[TtIsBound] = rec[TipRecBound];
++            Array.Copy(rec, TipRecGrade, p, TtCurrentUnidentifiedItemGrade, 4);
++        }
++        if (compare != null)
++        {
++            p[TtHavePaperDollCompare] = 1;
++            Array.Copy(compare, CmpSlotItemLevel, p, TtCurrentSlotItemLevel, 4);
++        }
++        BitConverter.GetBytes(-1L).CopyTo(p, TtOpenDateTime);
++        BitConverter.GetBytes(-2L).CopyTo(p, TtRemainPeriodInSec);
++        BitConverter.GetBytes(-1).CopyTo(p, TtEquipmentSetId);
++        BitConverter.GetBytes(-1).CopyTo(p, TtCompareEquipmentSetId);
++        BitConverter.GetBytes(-1).CopyTo(p, TtCumulatedEnchantAmount);
++        BitConverter.GetBytes(-1L).CopyTo(p, TtDecompositionCost);
++
++        for (int k = 0; k < 2; k++)
++        {
++            int o = optOff + k * TtSetPair, sub = o + TtOptionSetHead;
++            int cmp = sub + TtPassiveSlots * TtPassiveEntry;
++            int next = k == 0 ? o + TtSetPair : 0;
++            W16(p, o, o); W16(p, o + 2, next); W16(p, o + 4, TtPassiveSlots); W16(p, o + 6, sub);
++            BitConverter.GetBytes(k).CopyTo(p, o + 8);
++            for (int j = 0; j < TtPassiveSlots; j++)
++            {
++                int e = sub + j * TtPassiveEntry;
++                W16(p, e, e); W16(p, e + 2, j < TtPassiveSlots - 1 ? e + TtPassiveEntry : 0);
++                if (rec != null) Array.Copy(rec, TipRecPassives + k * TipRecPassiveSet + 4 * j, p, e + 4, 4);
++            }
++            W16(p, cmp, cmp); W16(p, cmp + 2, k == 0 ? cmp + TtSetPair : 0);
++            BitConverter.GetBytes(k).CopyTo(p, cmp + 4);
++            for (int s = 1; s <= 15; s++)
++            {
++                int v = compare != null ? BitConverter.ToInt32(compare, CmpStats + 8 * (s - 1) + 4 * k)
++                      : (s is >= 6 and <= 8 or >= 13) ? NoStatFloat : -1000;
++                BitConverter.GetBytes(v).CopyTo(p, cmp + 4 + 4 * s);
++            }
++            if (compare == null) p.AsSpan(cmp + 4 + 96, 64).Fill(0xFE);
++        }
+         return p;
+     }
+ 
++    private static void W16(byte[] p, int at, int v) { p[at] = (byte)v; p[at + 1] = (byte)(v >> 8); }
++
++    // --- T169: the compare exchange (cap_final2b 94 pairs, e.g. 3954 -> 3955 -> client tooltip) ---
++    // User::AskItemCompareTooltip (Arb_part_067.c:3671) asks World to simulate the hovered item on
++    // the paper doll - A->W 0x282E DBS_SIMULATE_ITEM_TOOLTIP
++    //   [u64 gameId & 0x7FFF..][i32 ToolTipType][i64 ContentId][i64 ItemDbId][i32 owner character]
++    // - and sends no tooltip. World answers W->A 0x282F SDB_SIMULATE_ITEM_TOOLTIP
++    //   [u32 off 0x12 (frame-relative)][u32 0x150][u32 character][CompareItemToolTip 0x150]
++    // and AnswerItemCompareTooltipLock (:3530) sends the tooltip from the record: type at +0, item
++    // at +0x20, character at +0x14C. It asks only for the user's own item, type != 27, whose
++    // template has an equipment part the switch maps to a worn slot that is occupied (ear and
++    // finger fall back to the second slot), and - for type 21 - not when the item is itself worn.
++    public const ushort DBS_SIMULATE_ITEM_TOOLTIP = 0x282E;
++    public const ushort SDB_SIMULATE_ITEM_TOOLTIP = 0x282F;
++    public const int CmpSize = 0x150, CmpType = 0x00, CmpItemDbId = 0x20, CmpStats = 0x2C,
++                     CmpSlotItemLevel = 0x140, CmpCharacter = 0x14C;
++    public const int SimulateAskSize = 32;
++    public const int WornInvenType = 14;
++
++    public static byte[] BuildSimulateItemTooltipAsk(ulong gameId, int toolTipType, long contentId,
++                                                     long itemDbId, int ownerDbId)
++    {
++        var p = new byte[SimulateAskSize];
++        BitConverter.GetBytes(gameId & 0x7FFFFFFFFFFFFFFFUL).CopyTo(p, 0);
++        BitConverter.GetBytes(toolTipType).CopyTo(p, 8);
++        BitConverter.GetBytes(contentId).CopyTo(p, 12);
++        BitConverter.GetBytes(itemDbId).CopyTo(p, 20);
++        BitConverter.GetBytes(ownerDbId).CopyTo(p, 28);
++        return p;
++    }
++
++    /// <summary>The worn slot the real switch compares <paramref name="row"/> against, or null for
++    /// "no compare, answer at once". <paramref name="wornSlotOf"/> is the template's slot
++    /// (DatasheetLoader.EquipSlots).</summary>
++    public static int? CompareSlotFor(int toolTipType, CharacterStore.ItemRow row,
++                                      IEnumerable<CharacterStore.ItemRow> inventory, Func<int, int> wornSlotOf)
++    {
++        if (toolTipType == 27) return null;
++        if (toolTipType == 21 && row.InvenType == WornInvenType && row.Slot != 0) return null;
++        int slot = wornSlotOf(row.TemplateId);
++        if (slot <= 0) return null;
++        var worn = inventory.Where(r => r.InvenType == WornInvenType).Select(r => r.Slot).ToHashSet();
++        if (worn.Contains(slot)) return slot;
++        if (slot == 6 && worn.Contains(7)) return 7;
++        if (slot == 8 && worn.Contains(9)) return 9;
++        return null;
++    }
++
++    /// <summary>SDB_SIMULATE_ITEM_TOOLTIP: the CompareItemToolTip record, or null on a bad frame.</summary>
++    public static byte[]? ReadSimulateItemTooltip(byte[]? payload)
++    {
++        if (payload == null || payload.Length < 12) return null;
++        int off = BitConverter.ToInt32(payload, 0) - 6, n = BitConverter.ToInt32(payload, 4);   // offsets count the 6-B frame head
++        if (n != CmpSize || off < 12 || off + n > payload.Length) return null;
++        return payload.AsSpan(off, n).ToArray();
++    }
++
++    /// <summary>World's answer: the tooltip, with the compare, to the character it names.</summary>
++    public static bool OnSimulateItemTooltip(WorldBridge? bridge, byte[] payload, ILogger log)
++    {
++        var rec = ReadSimulateItemTooltip(payload);
++        if (rec == null)
++        {
++            log.LogWarning("SDB_SIMULATE_ITEM_TOOLTIP: {Len} B, not [off][0x150][char][record] - dropped", payload?.Length ?? 0);
++            return true;
++        }
++        int character = BitConverter.ToInt32(rec, CmpCharacter);
++        long itemDbId = BitConverter.ToInt64(rec, CmpItemDbId);
++        var s = bridge?.InWorldSessions().FirstOrDefault(o => o.SelectedCharacter != null && (int)o.SelectedCharacter.Id == character);
++        var store = Program.Store;
++        var row = s == null || store == null ? null : FindItem(store, character, itemDbId);
++        if (s == null || row == null)
++        {
++            log.LogDebug("SDB_SIMULATE_ITEM_TOOLTIP: character {C} / item {I} not found - no tooltip", character, itemDbId);
++            return true;
++        }
++        s.Send(BuildShowItemTooltip(BitConverter.ToInt32(rec, CmpType), row, compare: rec));
++        return true;
++    }
++
+     /// <summary>
+     /// C_SHOW_ITEM_TOOLTIP_EX. The real handler resolves the item's owner (by name when the
+     /// request carries one, otherwise by <c>ItemOwnerDbId</c>) and calls
+@@ -399,6 +545,13 @@
+             return true;
+         }
+ 
++        // T169: an equipment item of the user's own with a worn counterpart is World's to simulate
++        // first (0x282E); the tooltip goes out when 0x282F comes back (OnSimulateItemTooltip).
++        if (owner == chr.Id
++            && CompareSlotFor(req.Value.ToolTipType, match, store.GetInventoryItems(owner), DatasheetLoader.EquipSlotOf) != null
++            && SendToWorld(s, DBS_SIMULATE_ITEM_TOOLTIP, BuildSimulateItemTooltipAsk(s.GameId, req.Value.ToolTipType,
++                   req.Value.ContentId, req.Value.ItemDbId, (int)chr.Id)))
++            return true;
+         s.Send(BuildShowItemTooltip(req.Value.ToolTipType, match));
+         return true;
+     }
+diff -ruN rb/src/TeraSharp.Arbiter/World/DatasheetLoader.cs rn/src/TeraSharp.Arbiter/World/DatasheetLoader.cs
+--- a/src/TeraSharp.Arbiter/World/DatasheetLoader.cs	2026-09-22 10:49:43.204227132 +0000
++++ b/src/TeraSharp.Arbiter/World/DatasheetLoader.cs	2026-09-22 10:49:43.262003281 +0000
+@@ -196,11 +196,18 @@
+         "EventMatching.xml <Event><TargetList>", "S_CHANGE_EVENT_MATCHING_STATE id lists (MatchQueueManager)",
+         new Dictionary<int, (int[] Dungeon, int[] BattleField)>(), ReadEventMatchingTargets, r => r.Count);
+ 
++    /// <summary>T169. Per equipment template, the worn slot the tooltip compare looks at.</summary>
++    public static readonly SheetValue<IReadOnlyDictionary<int, int>> EquipSlots = new(
++        "ItemTemplate.xml combatItemType/category", "tooltip compare slot (ArbiterClientHandlers.CompareSlotFor)",
++        new Dictionary<int, int>(), ReadEquipSlots, r => r.Count);
++
++    public static int EquipSlotOf(int templateId) => EquipSlots.Value.TryGetValue(templateId, out int s) ? s : 0;
++
+     /// <summary>Every sheet, in report order.</summary>
+     public static IReadOnlyList<ISheetValue> All => new ISheetValue[]
+     {
+         GuildSizes, ClassPositions, DefaultSkills, StarterKits, CreatedLevels, PvpBoardIds, PveBoardIds, DungeonTimelineIds,
+-        EventMatchingTargets,
++        EventMatchingTargets, EquipSlots,
+         BattleFieldSheet.Entry,   // T163: T157's reader, on master since T161
+     };
+ 
+@@ -399,6 +406,43 @@
+         return d.Count == 0 ? null : d.ToDictionary(kv => kv.Key, kv => (kv.Value.D.ToArray(), kv.Value.B.ToArray()));
+     }
+ 
++    /// <summary>
++    /// T169. The worn slot (INVTYPE, ItemEquipRestriction.xml's list) of an equipment part, as
++    /// User::AskItemCompareTooltip's switch (Arb_part_067.c:3712) maps it: weapon 1, body 3, hands 4,
++    /// feet 5, ear 6, finger 8, neck 10, underwear 11, hair accessory 12, belt 19, brooch 20, relic 23.
++    /// Face accessories, style and inheritance items fall to its default: no compare.
++    /// </summary>
++    public static int WornSlotOf(string? combatItemType, string? category) => combatItemType switch
++    {
++        "EQUIP_WEAPON" => 1, "EQUIP_ARMOR_BODY" => 3, "EQUIP_ARMOR_ARM" => 4, "EQUIP_ARMOR_LEG" => 5,
++        "EQUIP_UNDERWEAR" => 11,
++        "EQUIP_ACCESSORY" => category switch
++        {
++            "earring" => 6, "ring" => 8, "necklace" => 10, "accessoryHair" => 12,
++            "belt" => 19, "brooch" => 20, "relic" => 23, _ => 0,
++        },
++        _ => 0,
++    };
++
++    /// <summary>T169. ItemTemplate.xml (44 MB, streamed): template id -> worn slot, equipment only.</summary>
++    public static IReadOnlyDictionary<int, int>? ReadEquipSlots(string dir)
++    {
++        var path = Path.Combine(dir, "ItemTemplate.xml");
++        if (!File.Exists(path)) return null;
++        var d = new Dictionary<int, int>();
++        using var xr = XmlReader.Create(path, new XmlReaderSettings
++            { DtdProcessing = DtdProcessing.Ignore, IgnoreComments = true, IgnoreWhitespace = true });
++        while (xr.Read())
++        {
++            if (xr.NodeType != XmlNodeType.Element || xr.Name != "Item") continue;
++            var type = xr.GetAttribute("combatItemType");
++            if (type == null || !type.StartsWith("EQUIP_", StringComparison.Ordinal)) continue;
++            int slot = WornSlotOf(type, xr.GetAttribute("category"));
++            if (slot > 0 && int.TryParse(xr.GetAttribute("id"), out int id)) d[id] = slot;
++        }
++        return d.Count == 0 ? null : d;
++    }
++
+     /// <summary>BattleFieldData.xml's battlegrounds with &lt;RankingCompetition active="true"&gt;, ascending.</summary>
+     public static int[]? ReadPvpBoardIds(string dir)
+     {
+diff -ruN rb/src/TeraSharp.Arbiter/World/DbAckGroups.cs rn/src/TeraSharp.Arbiter/World/DbAckGroups.cs
+--- a/src/TeraSharp.Arbiter/World/DbAckGroups.cs	2026-09-22 10:49:43.213483859 +0000
++++ b/src/TeraSharp.Arbiter/World/DbAckGroups.cs	2026-09-22 10:49:43.262236855 +0000
+@@ -118,7 +118,7 @@
+         "2815|GROUP_DUEL_RETURN|W:3013731 atoms + SentAllByParcel@17",
+         "2821|TRADE_BROKER_START_DEAL|W:3024674 no DlmId (never wedges); reply names, item and prices of the deal (76B) from the broker store (walk-found)",
+         "2824|TRADE_BROKER_CANCEL_DEAL|W:3024558 no DlmId (never wedges); reply [UserDbId@6] (10B) (walk-found)",
+-        "282F|SIMULATE_ITEM_TOOLTIP|W:3022673 item tooltip from the item store (no generic completion). LEFT (T168): no DlmId; needs the item-link system",
++        "282F|SIMULATE_ITEM_TOOLTIP|W:3022673 the answer to the Arbiter's own 0x282E ask (no DlmId): T169 sends the compare tooltip (ArbiterClientHandlers.OnSimulateItemTooltip)",
+         "2835|LOAD_USER_VIP_INFO|W:3019662 VIP exp/pub exp/tokens/slot list",
+         "2839|BUY_VIP_STORE_ITEM|W:3009788 store purchase: 568-B GiveTake records echoed (as 0x27CD) + the point/currency the DB deducts",
+         "283B|ADD_VIP_GAME_EXP|W:3009316 [DlmId@6][ok@0A][NewResult i32@0B] - World sets VIP exp to the new TOTAL",
+diff -ruN rb/src/TeraSharp.Arbiter/World/DbProxyHandlers.cs rn/src/TeraSharp.Arbiter/World/DbProxyHandlers.cs
+--- a/src/TeraSharp.Arbiter/World/DbProxyHandlers.cs	2026-09-22 10:49:43.231623766 +0000
++++ b/src/TeraSharp.Arbiter/World/DbProxyHandlers.cs	2026-09-22 10:49:43.262843967 +0000
+@@ -1435,6 +1435,7 @@
+             case SA_ENTER_WORLD_FAIL:               // 0x148D pushes + a re-sent 0x138E (T21)
+             case SA_ENTER_WORLD:                    // 0x138C, T161b: flush a held leave (LeaveGate)
+             case SA_CHAR_LOC:                       // 0x1443, T161b: /@goto -> 0x2825 ask
++            case Handlers.ArbiterClientHandlers.SDB_SIMULATE_ITEM_TOOLTIP: // 0x282F, T169: World's simulated item -> the compare tooltip
+             case SDB_LOAD_2869:          // 0x15E0 push + 0x286A, both carrying the live reset time
+             case AS_PROMOTION_LIST_REQ:  // 0x147D -> 0x1484 + 24 x 0x147E (timestamps = now) + 0x1480
+             // --- T15: the per-user writes World sends during play. Each one is a DLM item; a
+@@ -1914,6 +1915,8 @@
+             case SA_ENTER_WORLD_FAIL: return OnEnterWorldFail(link, payload);
+             case SA_ENTER_WORLD: return OnSaEnterWorld(bridge, payload);
+             case SA_CHAR_LOC: Handlers.GmAdminTool.OnSaCharLoc(bridge, payload, _log); return true;
++            case Handlers.ArbiterClientHandlers.SDB_SIMULATE_ITEM_TOOLTIP:
++                return Handlers.ArbiterClientHandlers.OnSimulateItemTooltip(bridge, payload, _log);
+ 
+             // --- Login-time: empty-list Type 1 [off=19][count=0][reqId][ok=1], reqId at payload[0] ---
+             // (0x27A2 inventory is handled by OnLoadInventory above)
+diff -ruN rb/src/TeraSharp.Arbiter.Tests/Program.cs rn/src/TeraSharp.Arbiter.Tests/Program.cs
+--- a/src/TeraSharp.Arbiter.Tests/Program.cs	2026-09-22 10:49:43.251855143 +0000
++++ b/src/TeraSharp.Arbiter.Tests/Program.cs	2026-09-22 10:49:43.265895487 +0000
+@@ -16449,8 +16449,8 @@
+         var p = ArbiterClientHandlers.BuildShowItemTooltip(toolTipType: 0, row);
+         Hex.True(BitConverter.ToUInt16(p, 0) == p.Length, "length field");
+         Hex.True(BitConverter.ToUInt16(p, 2) == ArbiterClientHandlers.S_SHOW_ITEM_TOOLTIP, "opcode");
+-        Hex.True(p.Length == ArbiterClientHandlers.TooltipFixedSize + 2,
+-            "an empty bound-owner is just the terminator");
++        Hex.True(p.Length == ArbiterClientHandlers.TooltipFixedSize + 2 + 2 * ArbiterClientHandlers.TtSetPair,
++            "an empty bound-owner is just the terminator; then the two option/compare set pairs (T169)");
+ 
+         Hex.True(BitConverter.ToInt64(p, ArbiterClientHandlers.TtItemDbId) == 1042, "ItemDbId");
+         Hex.True(BitConverter.ToInt32(p, ArbiterClientHandlers.TtTemplateId) == 6550, "TemplateId");
+@@ -16461,20 +16461,22 @@
+             "Count - the stack size the client was never told about");
+         Hex.True(BitConverter.ToInt32(p, ArbiterClientHandlers.TtSavedCount) == 19, "SavedCount");
+ 
+-        // the four arrays are empty and the string ref points past the fixed part
++        // customizing / combine-passive stay empty; T169: two option sets and two compare sets
+         foreach (int at in new[]
+         {
+             ArbiterClientHandlers.TtCustomizingCount, ArbiterClientHandlers.TtCustomizingOffset,
+-            ArbiterClientHandlers.TtOptionSetCount, ArbiterClientHandlers.TtOptionSetOffset,
+             ArbiterClientHandlers.TtCombinePassiveCount, ArbiterClientHandlers.TtCombinePassiveOffset,
+-            ArbiterClientHandlers.TtCompareStatCount, ArbiterClientHandlers.TtCompareStatOffset,
+         })
+             Hex.True(BitConverter.ToUInt16(p, at) == 0, $"array slot 0x{at:X2} is empty");
++        Hex.True(BitConverter.ToUInt16(p, ArbiterClientHandlers.TtOptionSetCount) == 2
++                 && BitConverter.ToUInt16(p, ArbiterClientHandlers.TtOptionSetOffset) == 0x132
++                 && BitConverter.ToUInt16(p, ArbiterClientHandlers.TtCompareStatCount) == 2
++                 && BitConverter.ToUInt16(p, ArbiterClientHandlers.TtCompareStatOffset) == 0x132 + 0x94, "the set refs");
+         Hex.True(BitConverter.ToUInt16(p, ArbiterClientHandlers.TtItemBoundOwner)
+                  == ArbiterClientHandlers.TooltipFixedSize, "ItemBoundOwner ref");
+ 
+         var named = ArbiterClientHandlers.BuildShowItemTooltip(0, row, "t1");
+-        Hex.True(named.Length == ArbiterClientHandlers.TooltipFixedSize + 6, "\"t1\" + NUL = 6 bytes");
++        Hex.True(named.Length == ArbiterClientHandlers.TooltipFixedSize + 6 + 2 * ArbiterClientHandlers.TtSetPair, "\"t1\" + NUL = 6 bytes");
+         Hex.True(named[ArbiterClientHandlers.TooltipFixedSize] == (byte)'t', "the string lands at the ref");
+     }
+ 
+@@ -29788,7 +29790,7 @@
+     // ============ T168: group C, slice 3 - the rest of the C table ==========
+ 
+     /// <summary>What T168 left in group C on purpose - the walk's pending list must be exactly this.</summary>
+-    static readonly ushort[] T168DeliberatelyLeft = { 0x275C, 0x27E6, 0x282F, 0x2969 };
++    static readonly ushort[] T168DeliberatelyLeft = { 0x275C, 0x27E6, 0x2969 };   // 0x282F: T169
+ 
+     /// <summary>Every echo-family row through TryHandle with an empty item list: the twin, the
+     /// reply size, the request's DlmId where World reads it, ok 1, empty refs, and the request
+@@ -30512,4 +30514,114 @@
+             "0022f600b500000000000000190500000829f600"), "50068");
+     }
+ 
++
++    // ============ T169: the real Arbiter's item tooltip (cap_final2a/2b) ==========
++
++    // cli_2026-09-22T09-49-53: the Forge picker's hover on 初階平衡防具強化石 (89771 ENCHANT_MATERIAL, item
++    // 10106, 15 in bag slot 27) - its 536-B record from the 0x27A4 load (cap_final2b 36153) and the tooltip.
++    static readonly byte[] T169MatRecord = Convert.FromHexString(
++        "7A27000000000000AB5E01000000000001000000000000000F00000000000000000000001B00000000000000000000000000000000000000000000000000000000000000000000000000000000000000" +
++        "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" +
++        "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" +
++        "000000000000000000000000000000000000000000000000000000000000000000000000B2070100010000000000000000000000B2070100010000000000000000000000000000000000760000000000" +
++        "000000000000000000000000000000000000BCC5CCB97CD00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000700000000000000" +
++        "04000000972B00000000668117020000690076000000000000000000000000000700000000000000000019C228B8C4B300000000000000000000000000000000B2070100010000000000000000000000" +
++        "000074D50000803F000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
++    static readonly byte[] T169MatTooltip = Convert.FromHexString(
++        "A20346560000000002003201000000000200C6013001150000007A27000000000000AB5E01007A27000000000000010000000000000000000000000000001B0000000F0000000F000000000000000000" +
++        "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" +
++        "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000FFFFFFFFFFFFFFFFFEFFFF" +
++        "FFFFFFFFFFFFFFFFFFFFFFFFFF0000000000000000000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF00000000000000000000000000000000000000000032016A020F004E01000000000000" +
++        "00000000000000000000000000004E0156010000000056015E01000000005E0166010000000066016E01000000006E0176010000000076017E01000000007E0186010000000086018E01000000008E01" +
++        "96010000000096019E01000000009E01A60100000000A601AE0100000000AE01B60100000000B601BE0100000000BE01000000000000C601FE020000000018FCFFFF18FCFFFF18FCFFFF18FCFFFF18FC" +
++        "FFFF00007AC400007AC400007AC418FCFFFF18FCFFFF18FCFFFF18FCFFFF00007AC400007AC400007AC40000000000000000000000000000000000000000000000000000000000000000FEFEFEFEFEFE" +
++        "FEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFE6A0200000F0086020100000000000000000000000000" +
++        "00000000000086028E02000000008E0296020000000096029E02000000009E02A60200000000A602AE0200000000AE02B60200000000B602BE0200000000BE02C60200000000C602CE0200000000CE02" +
++        "D60200000000D602DE0200000000DE02E60200000000E602EE0200000000EE02F60200000000F602000000000000FE0200000100000018FCFFFF18FCFFFF18FCFFFF18FCFFFF18FCFFFF00007AC40000" +
++        "7AC400007AC418FCFFFF18FCFFFF18FCFFFF18FCFFFF00007AC400007AC400007AC40000000000000000000000000000000000000000000000000000000000000000FEFEFEFEFEFEFEFEFEFEFEFEFEFE" +
++        "FEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFE");
++    // cap_final2b 49640 / 49641 and cap_final2a_client2: item 1 (59053, bag slot 26) compared with the worn weapon.
++    static readonly byte[] T169CmpRecord = Convert.FromHexString(
++        "0100000000000000ADE600007E01000001000000000000000100000000000000000000001A000000000000001E0000000000000000000000000000000000000000000000000000000000000000000000" +
++        "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" +
++        "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" +
++        "000000000000000000000000000000000000000000000000000000000000000000000000B2070100010000000000000000000000B2070100010000000000000000000000000000000000000000000000" +
++        "000000007C0100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000049238BDC00008C00000000000000" +
++        "00000000000000000700000000000000010000003D0100000000CAC07C010000E006A1EF7C010000000000000000000000000000000000000000000000000000B2070100010000000000000000000000" +
++        "000000000000803F0000000000000000000000000000000000000000000000000000000000000000000000000000000000006F0074006900");
++    static readonly byte[] T169CmpAsk = Convert.FromHexString(
++        "0300F00A00800000150000000000000000000000010000000000000001000000");
++    static readonly byte[] T169CmpAnswer = Convert.FromHexString(
++        "120000005001000001000000150000000000000000000000000000005527000000000000551A0100000000000100000000000000ADE600000F0100000F0100000F0100000F01000018FCFFFF18FCFFFF" +
++        "0A0000000A00000018FCFFFF18FCFFFF00007AC400007AC400007AC400007AC400007AC400007AC418FCFFFF18FCFFFF18FCFFFF18FCFFFF640000006400000018FCFFFF18FCFFFF00007AC400007AC4" +
++        "00007AC400007AC400007AC400007AC40000000000000000000000000000000000000000000000000000000000000000FFFFFFFF0815D7FF0815D7FF0815D7FF0815D7FF00000000000000003535DBFF" +
++        "3535DBFF000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000FCFFFFFFFCFFFFFF0000000000000000000000000000000000000000" +
++        "0000000000000000000000009AA98245D3128FC4D3128FC401000000");
++    static readonly byte[] T169CmpTooltip = Convert.FromHexString(
++        "A20346560000000002003201000000000200C6013001150000000100000000000000ADE600000100000000000000010000000000000000000000000000001A0000000100000001000000000000001E00" +
++        "0000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" +
++        "000000000000000000000000000000000000000000000000000000000000000000000000009AA9824500000000000000000000000000000000000000000000000000000000FFFFFFFFFFFFFFFFFEFFFF" +
++        "FFFFFFFFFFFFFFFFFFFFFFFFFF0000000000000000000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF00000000000000000000000000000000000000000032016A020F004E01000000000000" +
++        "00000000A0400000A0400000A0404E0156010000000056015E01000000005E0166010000000066016E01000000006E0176010000000076017E01000000007E0186010000000086018E01000000008E01" +
++        "96010000000096019E01000000009E01A60100000000A601AE0100000000AE01B60100000000B601BE0100000000BE01000000000000C601FE02000000000F0100000F01000018FCFFFF0A00000018FC" +
++        "FFFF00007AC400007AC400007AC418FCFFFF18FCFFFF6400000018FCFFFF00007AC400007AC400007AC40000000000000000000000000000000000000000000000000000000000000000000000000000" +
++        "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000006A0200000F00860201000000000000000000A0400000" +
++        "A0400000A04086028E02000000008E0296020000000096029E02000000009E02A60200000000A602AE0200000000AE02B60200000000B602BE0200000000BE02C60200000000C602CE0200000000CE02" +
++        "D60200000000D602DE0200000000DE02E60200000000E602EE0200000000EE02F60200000000F602000000000000FE020000010000000F0100000F01000018FCFFFF0A00000018FCFFFF00007AC40000" +
++        "7AC400007AC418FCFFFF18FCFFFF6400000018FCFFFF00007AC400007AC400007AC400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" +
++        "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
++
++    [Test] public static void T169_the_forge_material_tooltip_is_byte_exact()
++    {
++        var row = new TeraSharp.Arbiter.Persistence.CharacterStore.ItemRow(10106, 1, 0, 27, 89771, 15, T169MatRecord);
++        Hex.Eq(ArbiterClientHandlers.BuildShowItemTooltip(21, row), T169MatTooltip, "S_SHOW_ITEM_TOOLTIP, 930 B, no compare");
++    }
++
++    /// <summary>The compare exchange: the ask (0x282E) and the tooltip from World's answer (0x282F).
++    /// Equal to the capture but the six item-level floats, which come from a sheet we do not have.</summary>
++    [Test] public static void T169_the_compare_ask_and_tooltip_match_the_capture()
++    {
++        Hex.Eq(ArbiterClientHandlers.BuildSimulateItemTooltipAsk(0x80000AF00003UL | (1UL << 63), 21, 0, 1, 1), T169CmpAsk,
++            "DBS_SIMULATE_ITEM_TOOLTIP: [gameId & 0x7FFF..][type][content][item][owner]");
++        var rec = ArbiterClientHandlers.ReadSimulateItemTooltip(T169CmpAnswer);
++        Hex.True(rec != null && rec.Length == 0x150 && BitConverter.ToInt64(rec, 0x20) == 1
++                 && BitConverter.ToInt32(rec, 0x14C) == 1, "the record: item 1, character 1");
++        var row = new TeraSharp.Arbiter.Persistence.CharacterStore.ItemRow(1, 1, 0, 26, 59053, 1, T169CmpRecord);
++        var p = ArbiterClientHandlers.BuildShowItemTooltip(BitConverter.ToInt32(rec!, 0), row, compare: rec);
++        Hex.True(p.Length == T169CmpTooltip.Length, $"length {p.Length}");
++        int opt = BitConverter.ToUInt16(p, ArbiterClientHandlers.TtOptionSetOffset);
++        var diff = Enumerable.Range(0, p.Length).Where(i => p[i] != T169CmpTooltip[i]).ToArray();
++        Hex.True(diff.All(i => i - opt is >= 0x10 and < 0x1C or >= 0x148 and < 0x154),
++            "only the item-level floats differ: " + string.Join(",", diff.Select(i => i.ToString("X"))));
++        Hex.True(p[ArbiterClientHandlers.TtHavePaperDollCompare] == 1
++                 && BitConverter.ToSingle(p, ArbiterClientHandlers.TtCurrentSlotItemLevel) == BitConverter.ToSingle(rec!, 0x140),
++            "paper-doll compare on, CurrentSlotItemLevel = record +0x140");
++    }
++
++    [Test] public static void T169_the_ask_goes_only_for_a_worn_counterpart()
++    {
++        TeraSharp.Arbiter.Persistence.CharacterStore.ItemRow R(int id, int inv, int slot, int tpl) => new(id, 1, inv, slot, tpl, 1, null);
++        int SlotOf(int tpl) => tpl switch { 59053 => 1, 900 => 6, 901 => 8, _ => 0 };
++        var worn = new[] { R(10, 14, 1, 59053), R(11, 14, 7, 900) };
++        Hex.True(ArbiterClientHandlers.CompareSlotFor(21, R(1, 0, 26, 59053), worn, SlotOf) == 1, "bag weapon vs the worn one");
++        Hex.True(ArbiterClientHandlers.CompareSlotFor(21, R(10, 14, 1, 59053), worn, SlotOf) == null, "type 21 on the worn item: no ask");
++        Hex.True(ArbiterClientHandlers.CompareSlotFor(27, R(1, 0, 26, 59053), worn, SlotOf) == null, "type 27: never");
++        Hex.True(ArbiterClientHandlers.CompareSlotFor(21, R(2, 0, 3, 900), worn, SlotOf) == 7, "earring: slot 6 empty, 7 worn");
++        Hex.True(ArbiterClientHandlers.CompareSlotFor(21, R(3, 0, 4, 901), worn, SlotOf) == null, "ring: neither finger worn");
++        Hex.True(ArbiterClientHandlers.CompareSlotFor(21, R(4, 0, 5, 89771), worn, SlotOf) == null, "a material has no part");
++        var dir = Directory.CreateTempSubdirectory("t169").FullName;
++        try
++        {
++            File.WriteAllText(Path.Combine(dir, "ItemTemplate.xml"), "<ItemTemplate>" +
++                "<Item id=\"72277\" combatItemType=\"EQUIP_WEAPON\" category=\"glaive\" />" +
++                "<Item id=\"5\" combatItemType=\"EQUIP_ACCESSORY\" category=\"earring\" />" +
++                "<Item id=\"6\" combatItemType=\"EQUIP_ACCESSORY\" category=\"accessoryFace\" />" +
++                "<Item id=\"7\" combatItemType=\"EQUIP_STYLE_BODY\" category=\"style_body\" />" +
++                "<Item id=\"89771\" combatItemType=\"ENCHANT_MATERIAL\" category=\"enchant_material\" /></ItemTemplate>");
++            var d = DatasheetLoader.ReadEquipSlots(dir)!;
++            Hex.True(d.Count == 2 && d[72277] == 1 && d[5] == 6, "weapon 1, earring 6; face / style / material have no compare slot");
++        }
++        finally { Directory.Delete(dir, true); }
++    }
++
+ }

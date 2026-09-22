@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 the TeraSharp contributors
+
 using System.Globalization;
 using Microsoft.Extensions.Logging;
 using TeraSharp.Arbiter.Persistence;
@@ -845,14 +848,19 @@ public sealed class GuildHandlers
             starterDbId = running.StarterDbId;
             starterName = _store.GetGuildMember(running.StarterDbId)?.Name ?? string.Empty;
         }
+        // T170: more than one quest can run (cap_final2a_client2 1548 / 1565 start 10002 then
+        // 10003, both answered result 1) - each row counts down its own.
+        var runningById = new Dictionary<int, CharacterStore.GuildQuestState>();
+        foreach (var q in _store.GetGuildQuests(g.GuildId))
+            if (q.Status == GuildQuestRunning) runningById[q.QuestId] = q;
 
         var rows = new List<GuildPackets.GuildQuestRow>(GuildPackets.GuildQuestCatalogue.Length);
         foreach (var q in GuildPackets.GuildQuestCatalogue)
         {
             int remain = q.RemainSec;
-            if (running != null && running.QuestId == q.QuestId)
+            if (runningById.TryGetValue(q.QuestId, out var mineRunning))
             {
-                long left = running.EndsAt - nowUnix;
+                long left = mineRunning.EndsAt - nowUnix;
                 remain = left < 0 ? 0 : (left > int.MaxValue ? int.MaxValue : (int)left);
             }
             rows.Add(q with { RemainSec = remain });
@@ -871,8 +879,32 @@ public sealed class GuildHandlers
     /// right after the roster changes (client3 3020 and 4130, client4 2751).
     /// </summary>
     private void SendGuildQuestList(GuildActions a, int characterId, CharacterStore.GuildRow g)
-        => a.Client(GuildClientAction.Raw(characterId, "S_GUILD_QUEST_LIST",
+    {
+        a.Client(GuildClientAction.Raw(characterId, "S_GUILD_QUEST_LIST",
             BuildGuildQuestList(g, DateTimeOffset.UtcNow.ToUnixTimeSeconds())));
+    }
+
+    /// <summary>
+    /// T170. AS_UPDATE_GUILD_QUEST_POINT_INFO (0x1453): [i64 guild][i64 900]. cap_final2b sends
+    /// one beside every S_GUILD_QUEST_LIST a member gets (5528 x2 for two online members of
+    /// guild 3, 7776 for guild 2's start of 10003); all 58 carry <see cref="QuestMaxPoint"/>.
+    /// TeraSharp sends it for the two verbs the capture pins (start, cancel), one per verb rather
+    /// than one per online member; the login and join boards are left as they were.
+    /// </summary>
+    public static byte[] BuildQuestPointPush(int guildId)
+    {
+        var p = new byte[16];
+        BitConverter.GetBytes((long)guildId).CopyTo(p, 0);
+        BitConverter.GetBytes((long)QuestMaxPoint).CopyTo(p, 8);
+        return p;
+    }
+
+    /// <summary>T170. The quest's name id in StrSheet_GuildQuest: quest 10003 is
+    /// <c>@GuildQuest:10003001</c> (cap_final2a_client1 4612).</summary>
+    public static string QuestNameRef(int questId) => "@GuildQuest:" + ((long)questId * 1000 + 1).ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+    /// <summary>T170. SMT 3809 on a start, 3909 on a cancel (client1 4612 / 4656).</summary>
+    public const int SmtGuildQuestStarted = 3809, SmtGuildQuestCanceled = 3909;
 
     /// <summary>
     /// T135: the same board to the whole guild, built once. Every quest verb ends here -
@@ -932,9 +964,9 @@ public sealed class GuildHandlers
         var row = Catalogue(questId);
         if (row == null) return a.Reject($"C_REQUEST_START_GUILD_QUEST: {questId} is not on the board");
 
-        var running = _store.GetRunningGuildQuest(g.GuildId);
-        if (running != null)
-            return a.Reject($"C_REQUEST_START_GUILD_QUEST: quest {running.QuestId} is already running");
+        // T170: only the SAME quest blocks a start (client2 1565 started 10003 beside 10002).
+        if (_store.GetGuildQuests(g.GuildId).Any(q => q.QuestId == questId && q.Status == GuildQuestRunning))
+            return a.Reject($"C_REQUEST_START_GUILD_QUEST: quest {questId} is already running");
 
         long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         _store.SetGuildQuest(g.GuildId, questId, GuildQuestRunning, now, now + row.RemainSec,
@@ -946,9 +978,15 @@ public sealed class GuildHandlers
         {
             ["result"] = (byte)1, ["questId"] = questId, ["guildName"] = g.Name,
         };
+        // T170: cap_final2a_client1 4612 -> 4613 -> 4614: the notice, the start, the board.
+        var notice = World.ChatPackets.SystemMessageFields(SmtGuildQuestStarted, "guildQuestName", QuestNameRef(questId));
         foreach (var m in _store.GetGuildMembers(g.GuildId))
+        {
+            a.Client(GuildClientAction.Def(m.UserDbId, "S_SYSTEM_MESSAGE", notice));
             a.Client(GuildClientAction.Def(m.UserDbId, "S_START_GUILD_QUEST", fields));
+        }
         BroadcastGuildQuestList(a, g);
+        a.World(GuildPackets.AS_UPDATE_GUILD_QUEST_POINT_INFO, BuildQuestPointPush(g.GuildId));
         return a;
     }
 
@@ -1017,14 +1055,26 @@ public sealed class GuildHandlers
         var g = MyGuild(characterId);
         if (g == null) return a.Reject("C_REQUEST_CANCEL_GUILD_QUEST: not in a guild");
 
-        var running = _store.GetRunningGuildQuest(g.GuildId);
-        if (running == null || running.QuestId != questId)
-            return a.Reject($"C_REQUEST_CANCEL_GUILD_QUEST: {questId} is not the running quest");
+        var running = _store.GetGuildQuests(g.GuildId)
+            .FirstOrDefault(q => q.QuestId == questId && q.Status == GuildQuestRunning);
+        if (running == null)
+            return a.Reject($"C_REQUEST_CANCEL_GUILD_QUEST: {questId} is not a running quest");
         if (running.StarterDbId != characterId && g.ChiefDbId != characterId)
             return a.Reject("C_REQUEST_CANCEL_GUILD_QUEST: only the starter or the chief may cancel");
 
         _store.SetGuildQuest(g.GuildId, questId, GuildQuestAvailable, 0, 0, 0, progress: 0);
+        // T170, now captured: cap_final2a_client1 4653 -> 4654 S_FAIL_GUILD_QUEST [i32 quest],
+        // 4655 the board, 4656 SMT 3909 naming who cancelled (client2 1592..1595 the same).
+        var fail = BitConverter.GetBytes(questId);
+        foreach (var m in _store.GetGuildMembers(g.GuildId))
+            a.Client(GuildClientAction.Raw(m.UserDbId, "S_FAIL_GUILD_QUEST", fail));
         BroadcastGuildQuestList(a, g);
+        a.World(GuildPackets.AS_UPDATE_GUILD_QUEST_POINT_INFO, BuildQuestPointPush(g.GuildId));
+        var who = _store.GetGuildMember(characterId)?.Name ?? string.Empty;
+        var notice = World.ChatPackets.SystemMessageFields(SmtGuildQuestCanceled,
+            "userName", who, "guildQuestName", QuestNameRef(questId));
+        foreach (var m in _store.GetGuildMembers(g.GuildId))
+            a.Client(GuildClientAction.Def(m.UserDbId, "S_SYSTEM_MESSAGE", notice));
         return a;
     }
 

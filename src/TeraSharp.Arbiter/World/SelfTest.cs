@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 the TeraSharp contributors
+
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging;
 using TeraSharp.Arbiter.Protocol;
@@ -514,6 +517,11 @@ public static class SelfTest
         sb.Append(Environment.NewLine).Append("  resolved").Append(Environment.NewLine);
         foreach (var (label, value) in resolved)
             sb.Append("    ").Append(label.PadRight(30)).Append(value).Append(Environment.NewLine);
+
+        // T159: where every sheet-backed value came from - the sheet, or the built-in copy.
+        sb.Append(Environment.NewLine).Append("  datasheets").Append(Environment.NewLine);
+        foreach (var line in DatasheetLoader.Describe())
+            sb.Append("    ").Append(line).Append(Environment.NewLine);
 
         sb.Append(Environment.NewLine).Append("  notes").Append(Environment.NewLine);
         foreach (var note in Notes())

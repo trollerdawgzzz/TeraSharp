@@ -1,4 +1,7 @@
-﻿using System.Net;
+﻿// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 the TeraSharp contributors
+
+using System.Net;
 using System.Net.Sockets;
 using Microsoft.Extensions.Logging;
 using TeraSharp.Arbiter.Network;
@@ -97,6 +100,8 @@ public sealed class WorldBridge
     /// packet to a world 0 player (MULTIWORLD-DESIGN.md section 4 item 5).
     /// </summary>
     private readonly Dictionary<(int World, uint Ticket), TunnelReorderBuffer> _tunnels = new();
+    /// <summary>T161: Tickets whose session has gone - never borrowed for (World/TunnelRouting.cs).</summary>
+    private readonly DepartedTickets _departed = new();
     private const int StallMs = 150;
 
     /// <summary>
@@ -125,7 +130,10 @@ public sealed class WorldBridge
     {
         lock (_playersLock) _players[s.GameId] = s;
         lock (_reorderLock)
+        {
             _tunnels[(s.CurrentWorldId, s.TunnelKey)] = new TunnelReorderBuffer { Deliver = p => Handlers.ArbiterClientHandlers.DeliverTunnelled(s, p) };   // T121: inject S_ADMIN_GM_SKILL before the tunnelled S_LOAD_TOPO
+            _departed.ForgetEverywhere(s.TunnelKey);   // T161 (+ 2026-09-22: a reissued ticket is live on every world)
+        }
     }
 
     public void UnregisterPlayer(ulong gameId, uint tunnelKey)
@@ -135,7 +143,11 @@ public sealed class WorldBridge
     public void UnregisterPlayer(ulong gameId, int worldId, uint tunnelKey)
     {
         lock (_playersLock) _players.Remove(gameId);
-        lock (_reorderLock) _tunnels.Remove((worldId, tunnelKey));
+        lock (_reorderLock)
+        {
+            _tunnels.Remove((worldId, tunnelKey));
+            _departed.Add(worldId, tunnelKey);   // T161: World keeps addressing it until SA_LEAVE_WORLD
+        }
         _tickets.For(worldId).Free(tunnelKey);
     }
 
@@ -184,7 +196,10 @@ public sealed class WorldBridge
     internal void RegisterTunnelRoute(int worldId, uint key, Action<byte[]> callback)
     {
         lock (_reorderLock)
+        {
             _tunnels[(worldId, key)] = new TunnelReorderBuffer { Deliver = callback };
+            _departed.ForgetEverywhere(key);   // T161 (+ 2026-09-22)
+        }
     }
 
     /// <summary>Remove a tunnel route by key (test-facing).</summary>
@@ -194,7 +209,11 @@ public sealed class WorldBridge
     /// <summary>The same, in one World's ticket space.</summary>
     internal void UnregisterTunnelRoute(int worldId, uint key)
     {
-        lock (_reorderLock) _tunnels.Remove((worldId, key));
+        lock (_reorderLock)
+        {
+            _tunnels.Remove((worldId, key));
+            _departed.Add(worldId, key);   // T161
+        }
     }
 
     private GameSession? FindPlayer(ulong gameId)
@@ -249,6 +268,7 @@ public sealed class WorldBridge
                 buf.NextSeq = 0;
                 buf.LastDelivery = DateTime.UtcNow;
             }
+            _departed.Clear();   // T161: World restarted - its ticket table went with it
         }
     }
 
@@ -286,15 +306,21 @@ public sealed class WorldBridge
         // clients ended up with each other's spawn (MULTIPLAYER-DESIGN.md section 6).
         Action<byte[]>? deliver = null;
         int count;
+        bool departed;
         lock (_reorderLock)
         {
             count = _tunnels.Count;
-            if (_tunnels.TryGetValue((worldId, key), out var buf)) deliver = buf.Deliver;
-            else if (count == 1) foreach (var b in _tunnels.Values) { deliver = b.Deliver; break; }
+            departed = _departed.Contains(worldId, key);
+            _tunnels.TryGetValue((worldId, key), out var own);
+            switch (TunnelRouting.Decide(own != null, departed, count))   // T161
+            {
+                case TunnelRouting.Route.Own: deliver = own!.Deliver; break;
+                case TunnelRouting.Route.Borrow: foreach (var b in _tunnels.Values) { deliver = b.Deliver; break; } break;
+            }
         }
         if (deliver != null) { deliver(packet); return; }
-        _log.LogDebug("Tunnel ticket {Key} on world {W} unknown with {N} session(s) - dropped",
-            key, worldId, count);
+        _log.LogDebug("Tunnel ticket {Key} on world {W} {Why} with {N} session(s) - dropped",
+            key, worldId, departed ? "has left" : "unknown", count);
     }
 
     private void RouteToClientLegacyBroadcast(int worldId, uint key, byte[] packet)
@@ -405,6 +431,36 @@ public sealed class WorldBridge
 
     public void HandleFrame(WorldLink link, ushort op, byte[] payload)
     {
+        // ---- T138b: the cross-World hand-off (status/MULTIWORLD-DESIGN.md T137c) ----
+        // ONLY the cross-link case is taken here; everything else (including a same-World zone
+        // change, which also travels 0x13BE/0x13C0 and is completed by the T108 DbProxy handlers)
+        // continues into the switch below. Intercepting the same-World case wedged every zone change.
+        if (op == 0x164D)   // SA_WORLD_SERVER_STATUS: this link's continent roster -> the continent table
+        {
+            int n = WorldContinentList.Apply(DungeonRouting.Channels, payload, _log);
+            _log.LogInformation("Link #{Id} world {W}: {N} continent(s) rostered", link.Id, link.WorldId, n);
+        }
+        else if (op == ContinentHandoff.SA_REQUEST_ENTER_CONTINENT)   // 0x13BE: main World asks
+        {
+            int? continent = ContinentHandoff.ContinentOf(payload);
+            int owner = continent is int c ? (DungeonRouting.Channels.WorldForContinent(c) ?? link.WorldId) : link.WorldId;
+            if (owner != link.WorldId && LinksOf(owner).Count > 0)
+            {
+                var reply = ContinentHandoff.EnterReply(payload);
+                if (reply != null)
+                {
+                    _log.LogInformation("0x13BE continent {C} from world {From} -> 0x13BF to world {To}", continent, link.WorldId, owner);
+                    SendFrame(owner, ContinentHandoff.AS_ENTER_CONTINENT, reply);
+                    return;
+                }
+            }
+        }
+        else if (op == ContinentHandoff.SA_CONTINENT_READY && link.WorldId != 0 && LinksOf(0).Count > 0)   // 0x13C0 on an owner link
+        {
+            var reply = ContinentHandoff.ReadyReply(payload);
+            if (reply != null) { SendFrame(0, ContinentHandoff.AS_CONTINENT_READY, reply); return; }
+        }
+
         switch (op)
         {
             case WorldRegistration.SA_REGISTER:
@@ -433,47 +489,22 @@ public sealed class WorldBridge
             case OpHeartbeat6:
                 return;
 
-            // ---- T138b: the cross-World hand-off (status/MULTIWORLD-DESIGN.md T137c) ----
-            case 0x164D:   // SA_WORLD_SERVER_STATUS: this link's continent roster -> the continent table
+            case Handlers.ArbiterClientHandlers.SA_ADMIN_REQUEST_USERACTION:
             {
-                int n = WorldContinentList.Apply(DungeonRouting.Channels, payload, _log);
-                _log.LogInformation("Link #{Id} world {W}: {N} continent(s) rostered", link.Id, link.WorldId, n);
-                return;   // the real Arbiter only relays this to MatchServer; nothing to answer
-            }
-            case ContinentHandoff.SA_REQUEST_ENTER_CONTINENT:   // 0x13BE: main World asks
-            {
-                int? continent = ContinentHandoff.ContinentOf(payload);
-                var reply = ContinentHandoff.EnterReply(payload);
-                if (continent == null || reply == null)
+                // T155: World filled in the live position for a GM "go to" / summon; forward the
+                // record verbatim as 0x2827 to the requester's World (cap_final 917 -> 918,
+                // 1082 -> 1083). Handler_SA_ADMIN_REQUEST_USERACTION drops it when the requester
+                // (payload 84) is gone.
+                int requester = Handlers.ArbiterClientHandlers.UserActionRequester(payload);
+                var gm = requester > 0 ? SessionForPlayerId(requester) : null;
+                if (gm == null)
                 {
-                    _log.LogWarning("0x13BE on link #{Id}: {Len} B - too short", link.Id, payload.Length);
+                    _log.LogInformation("0x2826 for player {Id}: not online - dropped", requester);
                     return;
                 }
-                int owner = DungeonRouting.Channels.WorldForContinent(continent.Value) ?? link.WorldId;
-                if (owner != link.WorldId && LinksOf(owner).Count == 0) owner = link.WorldId;   // owner not linked: keep it on the asker
-                _log.LogInformation("0x13BE continent {C} from world {From} -> 0x13BF to world {To}", continent, link.WorldId, owner);
-                if (owner == link.WorldId) link.SendFrame(ContinentHandoff.AS_ENTER_CONTINENT, reply);
-                else SendFrame(owner, ContinentHandoff.AS_ENTER_CONTINENT, reply);
+                SendFrame(gm.CurrentWorldId, Handlers.ArbiterClientHandlers.AS_ADMIN_REQUEST_USERACTION, payload);
                 return;
             }
-            case ContinentHandoff.SA_CONTINENT_READY:   // 0x13C0: owning World is ready -> 0x13C1 back to the main World
-            {
-                var reply = ContinentHandoff.ReadyReply(payload);
-                if (reply == null) return;
-                var mains = LinksOf(0);
-                if (link.WorldId != 0 && mains.Count > 0) SendFrame(0, ContinentHandoff.AS_CONTINENT_READY, reply);
-                else link.SendFrame(ContinentHandoff.AS_CONTINENT_READY, reply);
-                return;
-            }
-            case 0x13C5:   // SA_ADD_DUNGEON_CHANNEL: the owner registers the instance channel
-            {
-                var ch = DungeonRouting.Channels.Add(link.WorldId, payload);
-                if (ch != null) _log.LogInformation("Link #{Id} world {W}: dungeon channel added {Ch}", link.Id, link.WorldId, ch);
-                return;
-            }
-            case 0x13C6:   // SA_REMOVE_DUNGEON_CHANNEL
-                DungeonRouting.Channels.Remove(link.WorldId, payload);
-                return;
 
             case OpHeartbeat14:
                 // DSA_DUNGEON_TIMELINE_OPEN_INFO. 909 of the 911 frames across the four captures
@@ -573,9 +604,15 @@ public sealed class WorldBridge
         List<((int World, uint Ticket) k, byte[] p)>? deliver = null;
         lock (_reorderLock)
         {
+            // T161: a departed Ticket's frames never enter the survivor's buffer - their sequence
+            // numbers are not the survivor's (cap_queue1: "expected 1362, have 2730").
             TunnelReorderBuffer? buf = null;
-            if (!_tunnels.TryGetValue((worldId, ticket), out buf) && _tunnels.Count == 1)
-                foreach (var b in _tunnels.Values) { buf = b; break; }
+            _tunnels.TryGetValue((worldId, ticket), out var own);
+            switch (TunnelRouting.Decide(own != null, _departed.Contains(worldId, ticket), _tunnels.Count))
+            {
+                case TunnelRouting.Route.Own: buf = own; break;
+                case TunnelRouting.Route.Borrow: foreach (var b in _tunnels.Values) { buf = b; break; } break;
+            }
             if (buf != null)
             {
                 buf.Pending[seq] = clientPkt;
@@ -682,6 +719,13 @@ public sealed class WorldBridge
     /// </summary>
     public void NotifyPlayerLeave(int worldId, ulong gameId, uint playerId, LeaveMode mode)
     {
+        // T161b: User::LeaveWorldStart [Pending] - World is still loading this user (no
+        // SA_ENTER_WORLD yet) and drops a leave for it; DbProxyHandlers sends it on SA_ENTER_WORLD.
+        if (LeaveGate.Shared.TryReserve(gameId, worldId, playerId, mode))
+        {
+            _log.LogInformation("AS_LEAVE_WORLD for gameId {G:X} held until SA_ENTER_WORLD (World is still loading it)", gameId);
+            return;
+        }
         SendFrame(worldId, OpCancelSkillStrictly, BitConverter.GetBytes(playerId));
         SendFrame(worldId, OpLeaveWorld, BuildLeaveWorldPayload(gameId, playerId, mode));
         var (type, reason) = LeaveValues(mode);

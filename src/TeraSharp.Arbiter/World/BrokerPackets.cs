@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 the TeraSharp contributors
+
 using TeraSharp.Arbiter.Protocol;
 
 namespace TeraSharp.Arbiter.World;
@@ -444,6 +447,26 @@ public static class BrokerPackets
     public const int WlTotalPriceWithTax = 43;
     public const int WlSellerDbId = 55;
 
+    /// <summary>
+    /// T141. Two u8 flags in the waiting-list element that this builder leaves 0, measured
+    /// across 85 live rows.
+    /// <list type="bullet">
+    /// <item><b>+51 varies per row.</b> On nine live Classic+ search pages (classic_live4.log
+    /// seq 5938, 5954, 5979, 5983, 5993, 5996, 5999, 6002, 6034) it is 1 on 40 of 80 rows and
+    /// 0 on the other 40, and the split follows neither template, amount, price, seller nor
+    /// page. It is a per-listing attribute and nothing captured says which one.</item>
+    /// <item><b>+83 is 1 on all 80</b> of those rows.</item>
+    /// <item>Both are <b>0 on all 5 rows</b> of this project's own 100.02 listings
+    /// (cap_social3_client.log seq 1419 and 1472), which is what the builder emits and what
+    /// <c>T141_the_live_waiting_page_round_trips</c> pins.</item>
+    /// </list>
+    /// They are named here so the tail of the element is not mistaken for padding. Driving
+    /// either one needs a meaning first, and a per-row source for +51.
+    /// </summary>
+    public const int WlUnknownFlagA = 51;
+    /// <summary>See <see cref="WlUnknownFlagA"/>. 1 on every live Classic+ row, 0 on ours.</summary>
+    public const int WlUnknownFlagB = 83;
+
     /// <summary>Bytes of an S_TRADE_BROKER_BOUGHT_ITEM_LIST element before the seller name.</summary>
     public const int BoughtElementFixedSize = 98;
     public const int BlTradeId = 6;
@@ -457,10 +480,54 @@ public static class BrokerPackets
     public const int BlSellerDbId = 55;
     public const int BlSoldFlag = 59;
     public const int BlSoldTime = 60;
+    /// <summary>
+    /// +68, i64: what the BUYER paid, i.e. <see cref="PriceWithTax"/> of the listing price and
+    /// not the price itself. T141 settled it on a live Classic+ purchase: classic_live4.log's
+    /// bought row (seq 6056) reads price 6562 and TotalPaid 7546, and the same trade's search
+    /// row on seq 5938 carries TotalPriceWithTax 7546 - the same number, from the same frame
+    /// set. The one row T74 had was priced at 1, where price and price-plus-fee are both 1,
+    /// which is why it read as the price.
+    /// </summary>
     public const int BlTotalPaid = 68;
 
-    /// <summary>The broker's cut: a tenth, truncated.</summary>
-    public static long PriceWithTax(long price) => price + price / 10;
+    /// <summary>
+    /// The broker's cut as whole percent. <b>10 on this project's own 100.02 server</b>, which
+    /// is what the shipped captures prove (cap_social3_client.log: 10001 comes back 11001, and
+    /// 1 comes back 1). T141 measured a live Classic+ server at <b>15</b>: all 80 rows of
+    /// classic_live4.log's nine search pages satisfy <c>tax == price + price * 15 / 100</c>
+    /// exactly and none of them satisfy the tenth rule. So the shape is
+    /// <c>price + price * rate / 100</c> truncated, and the rate is server configuration.
+    /// </summary>
+    public const int DefaultBrokerFeePercent = 10;
+
+    /// <summary>Overrides <see cref="BrokerFeePercent"/>, 0..100. Classic+ runs 15.</summary>
+    public const string BrokerFeeEnvVariable = "TERASHARP_BROKER_FEE_PERCENT";
+
+    private static int? _feePercent;
+
+    /// <summary>
+    /// <see cref="BrokerFeeEnvVariable"/> when it parses to 0..100, else
+    /// <see cref="DefaultBrokerFeePercent"/>. Cached, because it is read once per listed row.
+    /// </summary>
+    public static int BrokerFeePercent
+    {
+        get
+        {
+            if (_feePercent is int c) return c;
+            int v = DefaultBrokerFeePercent;
+            var raw = Environment.GetEnvironmentVariable(BrokerFeeEnvVariable);
+            if (!string.IsNullOrWhiteSpace(raw) && int.TryParse(raw.Trim(), out int parsed)
+                && parsed >= 0 && parsed <= 100) v = parsed;
+            _feePercent = v;
+            return v;
+        }
+    }
+
+    /// <summary>Tests only: forget the cached fee so the next read takes the env again.</summary>
+    public static void ResetBrokerFeePercent() => _feePercent = null;
+
+    /// <summary>The broker's cut, truncated. See <see cref="BrokerFeePercent"/>.</summary>
+    public static long PriceWithTax(long price) => price + price * BrokerFeePercent / 100;
 
     /// <summary>
     /// S_TRADE_BROKER_WAITING_ITEM_LIST (0xFD2C) - the search result page. The empty form is
@@ -550,7 +617,7 @@ public static class BrokerPackets
             BitConverter.GetBytes(r.SellerDbId).CopyTo(p, at + BlSellerDbId);
             p[at + BlSoldFlag] = 1;
             BitConverter.GetBytes(r.SoldTime).CopyTo(p, at + BlSoldTime);
-            BitConverter.GetBytes(r.Price).CopyTo(p, at + BlTotalPaid);
+            BitConverter.GetBytes(PriceWithTax(r.Price)).CopyTo(p, at + BlTotalPaid);
             WriteName(p, at + BoughtElementFixedSize, r.SellerName);
             at += sizes[i];
         }
@@ -1032,7 +1099,7 @@ public static class BrokerPackets
             BitConverter.GetBytes(r.SellerDbId).CopyTo(p, at + BlSellerDbId);
             p[at + BlSoldFlag] = 1;
             BitConverter.GetBytes(r.SoldTime).CopyTo(p, at + BlSoldTime);
-            BitConverter.GetBytes(r.Price).CopyTo(p, at + BlTotalPaid);
+            BitConverter.GetBytes(PriceWithTax(r.Price)).CopyTo(p, at + BlTotalPaid);
             BitConverter.GetBytes(r.Price).CopyTo(p, at + SlSellerProceeds);
             WriteName(p, at + SoldElementFixedSize, r.SellerName);
             at += sizes[i];

@@ -1,4 +1,7 @@
-﻿using Microsoft.Extensions.Logging;
+﻿// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 the TeraSharp contributors
+
+using Microsoft.Extensions.Logging;
 using TeraSharp.Arbiter.Persistence;
 
 namespace TeraSharp.Arbiter.World;
@@ -32,7 +35,7 @@ namespace TeraSharp.Arbiter.World;
 /// Type 1: 0x27A2, 0x2760, 0x2764, 0x27A7, 0x28BB, 0x28CF, 0x28FE, 0x28C9, 0x28C5, 0x2922, 0x2967
 /// Type 2: 0x2912, 0x2916, 0x2895, 0x1521, 0x2833
 /// </summary>
-public sealed class DbProxyHandlers
+public sealed partial class DbProxyHandlers
 {
     public const ushort SDB_USER_ENTERWORLD = 0x2711;
     public const ushort DBS_USER_ENTERWORLD = 0x2738;
@@ -58,6 +61,73 @@ public sealed class DbProxyHandlers
     public const ushort SDB_UPDATE_LEFT_COOLTIME_PREMIUM_SLOT = 0x28C1;
     public const ushort DBS_UPDATE_LEFT_COOLTIME_PREMIUM_SLOT = 0x28C2;
     public const ushort SDB_SAVE_2768 = 0x2768; public const ushort DBS_SAVE_2769 = 0x2769; // reqId @16
+
+    // --- T145: the two wedges cap_bag.log shows ---
+    //
+    // SDB_SET_QUESTLIST_INFO (0x2732) -> DBS_SET_QUESTLIST_INFO (0x2733). THE LOGIN WEDGE for a
+    // character whose starting quests World sets in one batch. cap_bag.log record 314 (00:34:00.600,
+    // character `test`, 9 quests, 759 B) is the last SDB_ frame for that character in the whole
+    // capture: no 0x2930 hold-status load (every real spawn has one ~4 s later), no learn-skill
+    // write for its nine C_SKILL_LEARN_REQUESTs, no bind/equip write - they all queued behind it.
+    // arbiter-2026-09-20.log 14:29:10 / 14:31:20: "no replay for 0x2732", same wedge.
+    //
+    // Request, payload offsets: [u32 offA frame-rel][u32 lenA = 80 x n][u32 offB][u32 lenB]
+    // [u32 offC][u32 lenC][u32 reqId][u32 playerId][u8 1] then n 80-byte quest records - the
+    // record SDB_SET_QUEST_INFO carries (dbId +0, questId +4, status +8, step +12).
+    // Reply (Handler_DBS_SET_QUESTLIST_INFO, frame >= 0x24): [offA][lenA = 8 x n][offB][0]
+    // [offC][0][reqId][u8 ok][u8 apply] then n (questId, questDbId) pairs - World keys its quest
+    // map with them. apply = 0 makes World ignore the reply and leave the transaction open, so
+    // it is always 1. Byte-exact against cap_social4.log 2935->2936, 3244->3245, 7843->7844.
+    public const ushort SDB_SET_QUESTLIST_INFO = 0x2732; public const ushort DBS_SET_QUESTLIST_INFO = 0x2733;
+    public const int QuestListRequestHeader = 33;
+    public const int SetQuestListReplyHeader = 30;
+
+    // SDB_EQUIP_ITEM (0x2813) -> DBS_EQUIP_ITEM (0x2814). World's writer (FUN_140941b10) is the
+    // same generated template as SDB_ITEM_SINGLE's (FUN_140a48c40): four ref slots, reqId,
+    // playerId, then two lists of 856-byte transaction atoms - 886 B is one atom. And
+    // Handler_DBS_EQUIP_ITEM reads exactly what Handler_DBS_ITEM_SINGLE does (frame >= 0x1b,
+    // lists at +6/+0xe, reqId +0x16, ok +0x1a). So it is answered and applied by the same code.
+    // No tap has one yet - cap_bag's never left World, it was behind 0x2732.
+    public const ushort SDB_EQUIP_ITEM = 0x2813; public const ushort DBS_EQUIP_ITEM = 0x2814;
+
+    /// <summary>
+    /// DBS_SET_QUESTLIST_INFO from the request. <paramref name="assign"/> gets each record's
+    /// questId and the 80-byte record and returns the row id World is to use for it.
+    /// A request too short to read still gets a reply with no pairs - silence is the wedge.
+    /// </summary>
+    public static byte[] BuildDbs2733(byte[] request, Func<int, byte[], int> assign)
+    {
+        ArgumentNullException.ThrowIfNull(assign);
+        var records = new List<byte[]>();
+        uint reqId = 0;
+        if (request != null && request.Length >= QuestListRequestHeader)
+        {
+            int at = (int)BitConverter.ToUInt32(request, 0) - 6;
+            int n = (int)(BitConverter.ToUInt32(request, 4) / QuestRecordSize);
+            reqId = BitConverter.ToUInt32(request, 24);
+            for (int i = 0; i < n && at >= 0 && at + (i + 1) * QuestRecordSize <= request.Length; i++)
+                records.Add(request.AsSpan(at + i * QuestRecordSize, QuestRecordSize).ToArray());
+        }
+        else if (request != null && request.Length >= 28) reqId = BitConverter.ToUInt32(request, 24);
+
+        int pairs = records.Count * 8;
+        uint end = (uint)(6 + SetQuestListReplyHeader + pairs);
+        var r = new byte[SetQuestListReplyHeader + pairs];
+        BitConverter.GetBytes(6u + SetQuestListReplyHeader).CopyTo(r, 0);
+        BitConverter.GetBytes((uint)pairs).CopyTo(r, 4);
+        BitConverter.GetBytes(end).CopyTo(r, 8);
+        BitConverter.GetBytes(end).CopyTo(r, 16);
+        BitConverter.GetBytes(reqId).CopyTo(r, 24);
+        r[28] = 1;   // ok
+        r[29] = 1;   // apply
+        for (int i = 0; i < records.Count; i++)
+        {
+            int questId = BitConverter.ToInt32(records[i], QuestRecordQuestIdOffset);
+            BitConverter.GetBytes(questId).CopyTo(r, SetQuestListReplyHeader + i * 8);
+            BitConverter.GetBytes(assign(questId, records[i])).CopyTo(r, SetQuestListReplyHeader + i * 8 + 4);
+        }
+        return r;
+    }
 
     // --- SDB_ITEM_SINGLE (0x2768) -> DBS_ITEM_SINGLE (0x2769), T13 ---
     // Not a logout-only save: this is every inventory write World makes (pick up, use, move,
@@ -144,7 +214,7 @@ public sealed class DbProxyHandlers
     //   [42] i32  > 0 -> FUN_140572d20(user, pid) (unused by us; 0 in every captured frame)
     // Reply writer: FUN_140350eb0(pkt, 0x273c), FUN_14013d0b0 = u32 reqId, FUN_1403513d0 = u8 ok.
     //
-    // Ground truth (D:\packetlogs\cap_newchar.log, real ArbiterServer, playerId 2, reframed):
+    // Ground truth (<captures>\cap_newchar.log, real ArbiterServer, playerId 2, reframed):
     //   1351 W->A 0x273B 46 B  5D 00 00 00 | 02 00 00 00 | 00 00 00 00 | C7 00 .. (exp 199)
     //   1352 A->W 0x273C 11 B  5D 00 00 00 01
     //   2687 W->A 0x273B        8A 00 00 00 | 02 00 00 00 | 02 00 00 00 | 6B 03 .. (level 2, exp 875)
@@ -203,8 +273,8 @@ public sealed class DbProxyHandlers
     // spawn. Handler_SA_LEARN_ALL_CREST_ACQUIRABLE (Arb_part_062.c:8760):
     //   req frame: [6]u32 count [10]u32 listOff [14]u64 gameId [22]u32 reqId, entries of 16 B at listOff:
     //              [u32 thisOff][u32 nextOff][i32 crestId][i32 value] (frame-relative offsets, 0 = end)
-    //   rsp frame: [6]u32 count [10]u32 firstOff [14]u32 reqId [18]u8 ok, then the LEARNED entries in
-    //              the same 16-B shape (User::LearnAllCrest output). We learn everything requested.
+    //   rsp frame: [6]u32 count [10]u32 firstOff [14]u32 reqId [18]u8 ok, then entries in the same
+    //              16-B shape - the crests World must NOT learn (T151, see BuildLearnAllCrest). Empty.
     public const ushort SA_LEARN_ALL_CREST_ACQUIRABLE = 0x1463; public const ushort AS_LEARN_ALL_CREST_ACQUIRABLE = 0x1464;
 
     // SDB_UPDATE_USER_ACTPOINT (0x297B) -> DBS_UPDATE_USER_ACTPOINT (0x297C). Per-user DLM, sent after
@@ -234,7 +304,7 @@ public sealed class DbProxyHandlers
     // Handler_SA_RESPONSE_ENTER_DUNGEON in ArbiterServer.exe.c, cross-checked against the
     // padding gaps already documented for DungeonReplyPaddingBytes below (payload 51 is the
     // pad after the u8 at 50; payload 153..155 the pad after the u8 at 152), and against
-    // D:\packetlogs\arb_world_2026-09-13T11-33-30-680Z.log seq 1137 (0x13BE) / 1159 (0x13C0).
+    // <captures>\arb_world_2026-09-13T11-33-30-680Z.log seq 1137 (0x13BE) / 1159 (0x13C0).
     public const int DungeonCtxOffset = 8;                 // ctx+0
     public const int DungeonCtxDungeonId = 8;              // ctx+0    9827 in the capture
     public const int DungeonCtxWorldId = 28;               // ctx+20   0x0AF0
@@ -272,6 +342,12 @@ public sealed class DbProxyHandlers
     // seq 836 -> 841/842/843 is exactly 3.014 s apart, which is that timer.
     public const ushort SA_ENTER_WORLD_FAIL = 0x138D;
     public const ushort AS_ENTER_WORLD = 0x138E;
+    /// <summary>T161b. World has the user (Handler_SA_ENTER_WORLD -> User::EnterWorldEnd): a leave
+    /// held while it loaded goes out now (LeaveGate). The user is the u64 at payload 16.</summary>
+    public const ushort SA_ENTER_WORLD = 0x138C;
+    /// <summary>T161b. World's <c>/@goto name</c>: [u32 nameOffset (frame)][u64 requester gameId][name].
+    /// Answered with the T155 "go to" ask (GmAdminTool.OnSaCharLoc).</summary>
+    public const ushort SA_CHAR_LOC = 0x1443;
     public const int EnterWorldFailMinPayload = 0x26 - 6;      // 32
     public const int EnterWorldFailArbiterClientOffset = 0;
     public const int EnterWorldFailArbiterUserOffset = 8;
@@ -398,6 +474,81 @@ public sealed class DbProxyHandlers
     // 0x2736 has no replay entry (its captured 0x2737 was attributed to 0x15AE), so it was
     // never answered with a live id and head-blocked the user from spawn onward.
     public const ushort SDB_END_START_QUEST_LIST = 0x2736; public const ushort DBS_END_START_QUEST_LIST = 0x2737; // req [u32 reqId]; rsp [reqId][ok=1]
+
+    // T142. SDB_SET_TASK_SHOW_TOGGLE (0x2734) -> DBS_SET_TASK_SHOW_TOGGLE (0x2735). THE LEVEL
+    // WEDGE: it arrives exactly once, at the END of the quest burst a level jump kicks off
+    // (arbiter-2026-09-20.log 14:31:11, the last W->A frame of that burst), it was in no table,
+    // so WorldBridge fell through to the replay and found nothing. World's per-user DB queue
+    // then waits for 0x2735 forever and every later command for that user no-ops - which is
+    // exactly "perfect_level applies the LEVEL but the gear grant does not land".
+    //
+    // BYTE-EXACT against the real Arbiter: cap_social4.log records 3195-3238, twenty-two
+    // request/reply pairs at 01:25:54.
+    //   W->A 23 B  17 00 00 00 34 27 | A2 03 00 00 | 01 00 00 00 | 01 00 00 00 | 00 | 00 00 00 00
+    //   A->W 19 B  13 00 00 00 35 27 | A2 03 00 00 | 01 00 00 00 | 01 00 00 00 | 01
+    // request payload 17 B = [u32 reqId][i32 1][i32 taskId][u8 toggle][i32 0]
+    // reply   payload 13 B = the request's first TWELVE bytes then 0x01.
+    // The last byte is an OK flag, not the toggle echoed: record 3195 carries toggle 00 and is
+    // answered 01, record 3233 carries 01 and is answered 01. (Handler_DBS_SET_TASK_SHOW_TOGGLE,
+    // WorldServer.exe.c:3022585, guards frame >= 0x13 and reads that byte at frame+0x12 - the
+    // decompile alone would have had us echo the toggle, which the capture disproves.)
+    public const ushort SDB_SET_TASK_SHOW_TOGGLE = 0x2734; public const ushort DBS_SET_TASK_SHOW_TOGGLE = 0x2735;
+    /// <summary>Payload of DBS_SET_TASK_SHOW_TOGGLE: 12 echoed bytes then the ok flag.</summary>
+    public const int SetTaskShowToggleReplySize = 13;
+
+    /// <summary>
+    /// DBS_SET_TASK_SHOW_TOGGLE (0x2735) - the request's first twelve bytes and <c>01</c>.
+    /// A request too short to fill them is answered zero-padded rather than not at all: an
+    /// unanswered DB request is the wedge this exists to prevent.
+    /// </summary>
+    public static byte[] BuildSetTaskShowToggleReply(byte[] request)
+    {
+        var r = new byte[SetTaskShowToggleReplySize];
+        if (request != null)
+            Array.Copy(request, 0, r, 0, Math.Min(request.Length, SetTaskShowToggleReplySize - 1));
+        r[SetTaskShowToggleReplySize - 1] = 1;
+        return r;
+    }
+    // T148. 0x2930 is World's LoadHoldCharacterStatus, sent for EVERY character at spawn:
+    // [reqId][u64 User+0xAA00][playerId]. Its reply is [reqId][u8 ok][u8 held]; World's
+    // Handler_DBS_UPDATE_HOLD_CHARACTER_STATUS passes payload[5] to SetRecvData(bool), which
+    // sets the hold flag (User+0xA610 -> +0x175, it freezes C_PLAYER_LOCATION) and sends the
+    // client S_ADMIN_HOLD_CHARACTER. The real Arbiter answers held = 0 every time, GM or not
+    // (cap_social4 x7, cap_final x16) and so do we: nothing here ever holds a character.
+    //
+    // SDB_USER_VAPORIZED (0x282D) is World's User::SetVaporized telling the DB: [u32 playerId]
+    // [u8 vaporized]. No DBS_ twin (0x282E is DBS_SIMULATE_ITEM_TOOLTIP), so fire-and-forget -
+    // and nothing reads it back: World's vaporized flag is written ONLY by SetVaporized, which
+    // User::EnterWorld calls with 1 when World's admin level is > 0. It is not persisted here.
+    // It is used for one thing: it is World telling us the GM's real visibility, so
+    // ArbiterClientHandlers.IsGmInvisible follows World instead of guessing.
+    public const ushort SDB_USER_VAPORIZED = 0x282D;
+    public const int UserVaporizedPayloadSize = 5;
+
+    /// <summary>SDB_USER_VAPORIZED's two fields, or false on a short payload.</summary>
+    public static bool TryReadUserVaporized(byte[]? payload, out int playerId, out bool vaporized)
+    {
+        playerId = 0; vaporized = false;
+        if (payload == null || payload.Length < UserVaporizedPayloadSize) return false;
+        playerId = BitConverter.ToInt32(payload, 0);
+        vaporized = payload[4] != 0;
+        return true;
+    }
+
+    /// <summary>World's report of a vaporize change: track it, answer nothing, store nothing.</summary>
+    public static void OnUserVaporized(byte[] payload, ILogger? log = null)
+    {
+        if (!TryReadUserVaporized(payload, out int playerId, out bool vaporized))
+        {
+            log?.LogWarning("SDB_USER_VAPORIZED: {Len} B payload, want {Want} - ignored",
+                payload?.Length ?? 0, UserVaporizedPayloadSize);
+            return;
+        }
+        Handlers.ArbiterClientHandlers.SetGmInvisible(playerId, vaporized);
+        log?.LogInformation("SDB_USER_VAPORIZED: player {Id} is {State} on World", playerId,
+            vaporized ? "vaporized" : "visible");
+    }
+
     public const ushort SDB_LOAD_2930 = 0x2930;              public const ushort DBS_LOAD_2931 = 0x2931;          // req [reqId][u64 gameId][pid]; rsp 82 00 00 00 01 00
 
     // --- Remaining login-time SDB_* (programmatic builders) ---
@@ -598,9 +749,9 @@ public sealed class DbProxyHandlers
     // logout saves and UserLeaveWorld itself - for the life of the World process
     // (status/HANDOFF.md section 1). Before T15 they were all "no replay for 0xNNNN".
     //
-    // Ground truth: D:\packetlogs\cap_newchar.log (real ArbiterServer, new character "Test",
+    // Ground truth: <captures>\cap_newchar.log (real ArbiterServer, new character "Test",
     // playerId 2, Island of Dawn, 05:49-05:53). The frames used by the tests are extracted into
-    // data/cap_t15.bin (TSIS container, see data/cap_t15.md) so the tests do not need D:\packetlogs.
+    // data/cap_t15.bin (TSIS container, see data/cap_t15.md) so the tests do not need <captures>.
     // All offsets in the comments below are PAYLOAD-relative (the decompile's frame offset - 6).
     // =====================================================================
 
@@ -874,6 +1025,32 @@ public sealed class DbProxyHandlers
     public const ushort SDB_INCREASE_WAREHOUSE_SIZE = 0x283F;
     public const ushort DBS_INCREASE_INVENTORY_SIZE = 0x283E;
     public const ushort DBS_INCREASE_WAREHOUSE_SIZE_UNUSED = 0x2840;
+    // T150b: the inventory twin, SDB_INCREASE_INVENTORY_SIZE (0x283D, 38 B, dumper guard 0x25):
+    // ItemBinary ref@06, DlmId@0E, UserDbId@12, TabIndex@16, NewInvenSize@1A,
+    // ExpandInvenCountDelta@1E, Reason@22 - payload 0, 8, 12, 16, 20, 24, 28. World sends it at
+    // login when the character's level grants bag slots, and waits for 0x283E on the DLM queue.
+    public const ushort SDB_INCREASE_INVENTORY_SIZE = 0x283D;
+    public const int IncInvReqDlmId = 8, IncInvReqUserDbId = 12, IncInvReqTab = 16,
+                     IncInvReqNewSize = 20, IncInvReqExpandDelta = 24, IncInvReqReason = 28,
+                     IncInvReqFixed = 32;
+
+    // T150b: the four generic acks with a live pair (DbAckTable). Opt-in, one case each.
+    public const ushort SDB_GUILD_LEARN_PERK = 0x279A;        // -> 0x279B
+    public const ushort SDB_CONDITIONAL_TELEPORT = 0x27C3;    // -> 0x27C4
+    public const ushort SDB_ITEM_SIMPLE_ATOM = 0x27CD;        // -> 0x27CE
+    public const ushort SDB_MAIN_MENU_COMMAND = 0x27DE;       // -> 0x27DF
+    // T162: the level-jump family (DbAckTable, decompile-proven). The scroll's item goes; World
+    // then levels the character itself and sends S_UPDATE_EXP_LEVEL.
+    public const ushort SDB_INCREMENT_CHARACTER_LEVEL = 0x28D9;               // -> 0x28DA
+    public const ushort SDB_INCREMENT_CHARACTER_LEVEL_JUMP = 0x28DB;          // -> 0x28DC
+    public const ushort SDB_INCREMENT_CHARACTER_LEVEL_PERFECT_JUMP = 0x28DD;  // -> 0x28DE
+    // T166: the enchanting family (DbAckTable + ItemEdits). SDB_ITEM_DECOMPOSE (0x275C) is left
+    // out on purpose: dead on both sides (the Arbiter's handler returns without a reply, World
+    // never builds it; DECOMPOSITION 0x2920 is the live one).
+    public const ushort SDB_ITEM_EXTRACT = 0x275A, SDB_ITEM_ENCHANT = 0x276E, SDB_ITEM_ENCHANT_IDENTIFY = 0x2770,
+                        SDB_ITEM_MERGE = 0x2774, SDB_ITEM_UNIDENTIFY = 0x28A1, SDB_ENCHANT_ITEM_BOOST = 0x28F4,
+                        SDB_ITEM_DECOMPOSITION = 0x2920, SDB_ITEM_AWAKEN = 0x2932, SDB_ITEM_UNBIND = 0x2934,
+                        SDB_EQUIPMENT_INHERITANCE = 0x295F;
 
     // ===================== T45: parcels (status/MAIL-WAREHOUSE.md section 3) =====================
     // The six W<->A pairs T42 left unimplemented. Layouts and reply builders are in
@@ -1066,7 +1243,9 @@ public sealed class DbProxyHandlers
     // cap_newchar.log seq 505 -> 507, 58 B -> 11 B.
     // Handler_SDB_UPDATE_USER_DAILY_EVENT_COUNT (Arb_part_064.c:14404) needs frame >= 0x26 and
     // reads [0] u32 recordOffset [4] u32 recordLength (20) [8] u32 reqId [12] u32 playerId
-    //       [16] i64 flag  [24] u64 timestamp.  Reply: [u32 reqId][u8 ok] - reqId at payload[8].
+    //       [16] i64 extra-reward reset stamp  [24] i64 party id, then the 20-byte record.
+    //       Reply: [u32 reqId][u8 ok] - reqId at payload[8]. T156: stored, and the handler pushes
+    //       AS_EVENT_MATCHING_INFO_LIST first, as the real one does - see OnUpdateUserDailyEventCount.
     public const ushort SDB_UPDATE_USER_DAILY_EVENT_COUNT = 0x293C; public const ushort DBS_UPDATE_USER_DAILY_EVENT_COUNT = 0x293D;
 
     // --- SDB_UPDATE_GET_EXTRA_REWARD (0x293E) -> DBS_UPDATE_GET_EXTRA_REWARD (0x293F) ---
@@ -1090,6 +1269,8 @@ public sealed class DbProxyHandlers
 
     private readonly CharacterStore _store;
     private readonly ILogger _log;
+    // T165: unpinned generic acks already announced (one Information line per opcode).
+    private readonly HashSet<ushort> _unpinnedSeen = new();
 
     public DbProxyHandlers(CharacterStore store, ILogger log)
     {
@@ -1147,8 +1328,7 @@ public sealed class DbProxyHandlers
         SA_LOAD_SERVANT_ADVENTURE_DATA,             // 0x153B
         // 0x1554 SA_LOAD_EXTRAPOINT_DATA moved to the allow-list in T77 (served from characters.ep_*)
         SA_LOAD_BATTLE_FIELD_ENTER_COUNT,           // 0x155D
-        SDB_LOAD_ITEM_RECIPE,                       // 0x2760
-        SDB_LOAD_SKILL_PROF,                        // 0x2764
+        // 0x2760 / 0x2764 moved to the allow-list in T147 (per-character recipes and proficiencies)
         SDB_LOAD_TELEPORT_TO_POS_LIST,              // 0x27A7
         SDB_LOAD_USER_RESTRICTION,                  // 0x2833
         SDB_LOAD_BATTLE_FIELD_LIST,                 // 0x2895
@@ -1158,16 +1338,13 @@ public sealed class DbProxyHandlers
         SDB_LOAD_SKILLPERIOD,                       // 0x28C9
         SDB_LOAD_LEARNED_SOCIAL,                    // 0x28CF
         SDB_LOAD_TOKEN_EXCHANGE,                    // 0x28FE
-        SDB_LOAD_2900,                              // 0x2900
+        // 0x2900 / 0x2981 moved to the allow-list in T168 (their builders are the empty, captured form)
         SDB_LOAD_QUEST_PROGRESS,                    // 0x2902
         SDB_LOAD_PROMOTION_LIST,                    // 0x2912
         SDB_LOAD_PROMOTION_COND_LIST,               // 0x2916
         SDB_LOAD_PASSIVITY_COOLTIME,                // 0x2922
-        SDB_LOAD_293A,                              // 0x293A
-        SDB_LOAD_ADDITIONAL_REWARD,                 // 0x2967
-        SDB_LOAD_2975,                              // 0x2975
-        SDB_LOAD_ACHIEVE_LIST,                      // 0x2981
-        SDB_LOAD_2986,                              // 0x2986
+        // 0x293A / 0x2967 moved to the allow-list in T156 (daily_event / event_matching_reward)
+        // 0x2975 / 0x2986 moved to the allow-list in T167 (skill polishing / card data from the store)
     };
 
     /// <summary>
@@ -1196,6 +1373,19 @@ public sealed class DbProxyHandlers
             case SDB_UPDATE_LEFT_COOLTIME_PREMIUM_SLOT:   // 0x28C1, T64
             case SDB_LOAD_REFER_A_FRIEND:   // 0x28B0, T69
             case SDB_USER_FORGET_SKILL:                 // 0x2792, T79
+            // --- T147: crafting (status/CRAFTING.md) ---
+            case SDB_LOAD_ITEM_RECIPE:                  // 0x2760, was replay-served
+            case SDB_LOAD_SKILL_PROF:                   // 0x2764, was replay-served
+            case SDB_LEARN_ITEM_RECIPE:                 // 0x275E
+            case SDB_DELETE_ITEM_RECIPE_LIST:           // 0x2762
+            case SDB_SET_RECIPE_BOOKMARK:               // 0x288A
+            case SDB_ITEM_PRODUCE_STEP1:                // 0x2756
+            case SDB_ITEM_PRODUCE_STEP2:                // 0x2758
+            case SDB_UPDATE_SKILL_PROF:                 // 0x2766
+            case S_UPDATE_PROF_MINERAL:                 // 0x273D
+            case S_UPDATE_PROF_BUG:                     // 0x273E
+            case S_UPDATE_PROF_ENERGY:                  // 0x273F
+            case S_UPDATE_PROF_HERB:                    // 0x2740
             // --- T77: cap_social4's fifteen ---
             case SDB_UPDATE_DAILY_EXTRA_POINT:
             case SDB_UPDATE_EXTRA_POINT:
@@ -1209,10 +1399,16 @@ public sealed class DbProxyHandlers
             case SDB_LOAD_FEUDAL_LORD_FLAG:
             case SDB_TBA_REQUEST_BATTLEPASS_SEASONDATA:
             case SA_CREST_POINT:
+            case SA_CREST_USE:             // 0x1469, T158: the glyph toggle that wedged test
+            case SDB_PEGASUS_FEE:          // 0x27A5, T158: the flight master's fee
+            case SDB_MARK_AS_QUEST_COMPLETED:        // 0x28AE, T164: the scroll's last request
+            case SDB_USER_LEARN_SKILL_FOR_MULTIPLE:  // 0x2790, T164
             case SA_MAKE_SYS_PARCEL:
             case SDB_LOAD_28B7:             // 0x28B7, T69
             case GuildPackets.SDB_CREATE_GUILD2:   // 0x27D4, T69
             case SDB_SAVE_2768:
+            case SDB_EQUIP_ITEM:           // 0x2814, T145: the 0x2769 shape, applied the same way
+            case SDB_SET_QUESTLIST_INFO:   // 0x2733, T145: the login wedge - quest ids for the batch
             case SDB_ITEM_TRADE:   // 0x276A, T65
             case SDB_SAVE_2936:
             case SDB_DAILY_QUEST:
@@ -1228,9 +1424,11 @@ public sealed class DbProxyHandlers
             case SDB_LOAD_290C:          // 0x290D = [01][reqId]  (capture: 01 3E 00 00 00)
             case SDB_EP_PERK:            // 0x27BA = static, reqId@8 (capture: 05.. 27.. 3F 00 00 00)
             // Post-spawn steps (lobby_tap.log 02:52:07.09x-.11x).
+            case SDB_SET_TASK_SHOW_TOGGLE: // 0x2735 = the request's first 13 bytes (T142 wedge)
             case SDB_END_START_QUEST_LIST: // 0x2737 = [reqId][01]
             case SDB_USER_LOAD_INVENTORY:  // 0x27A3 + 0x27A4: starter inventory for every character except the captured one
             case SDB_LOAD_2930:            // 0x2931 = [reqId][01][00]   (capture: 82 00 00 00 01 00)
+            case SDB_USER_VAPORIZED:       // 0x282D, T148: one-way, tracked not stored
             case SDB_LOAD_WORLD_EVENT:     // 0x27B4 = [reqId][01]       (capture: 83 00 00 00 01)
             case SA_CLEAR_BATTLE_FIELD_ENTER_COUNT: // 0x1563 = [01][reqId@8]  (decompile Arb_part_062.c:4769)
             case SA_LEARN_ALL_CREST_ACQUIRABLE:     // 0x1464 = learned-crest list (all of them)
@@ -1238,6 +1436,14 @@ public sealed class DbProxyHandlers
             case SA_REQUEST_ENTER_DUNGEON:          // 0x13BF (zone change step 1)
             case SA_RESPONSE_ENTER_DUNGEON:         // 0x13C1 (zone change step 2)
             case SA_ENTER_WORLD_FAIL:               // 0x148D pushes + a re-sent 0x138E (T21)
+            case SA_ENTER_WORLD:                    // 0x138C, T161b: flush a held leave (LeaveGate)
+            case SA_CHAR_LOC:                       // 0x1443, T161b: /@goto -> 0x2825 ask
+            case SA_BROADCAST_SYSTEM_MESSAGE_TO_WHOLE_WORLD:        // 0x1436, T172: S_SYSTEM_MESSAGE to all
+            case SA_BROADCAST_SYSTEM_MESSAGE_NOT_IN_SPECIAL_PLACE:  // 0x1437, T172
+            case SA_CREST_USE_LIST:                 // 0x1467, T172: -> 0x1468 [DlmId][ok]
+            case SA_SYNC_DATE_TIME:                 // 0x15BC, T172: World's clock echo, no reply
+            case SDB_CHANGE_CITY_WAR_STATE:         // 0x2958, T172: -> 0x295A echo, ok 1
+            case Handlers.ArbiterClientHandlers.SDB_SIMULATE_ITEM_TOOLTIP: // 0x282F, T169: World's simulated item -> the compare tooltip
             case SDB_LOAD_2869:          // 0x15E0 push + 0x286A, both carrying the live reset time
             case AS_PROMOTION_LIST_REQ:  // 0x147D -> 0x1484 + 24 x 0x147E (timestamps = now) + 0x1480
             // --- T15: the per-user writes World sends during play. Each one is a DLM item; a
@@ -1287,6 +1493,15 @@ public sealed class DbProxyHandlers
             // --- T23: city-war result. Not a DLM item (no reqId), but the reply echoes two
             // u32s out of the live request, so a replayed 0x295D would carry captured ones. ---
             case SDB_RESULT_CITY_WAR:             // 0x15ED + 0x295D, both echoing request+16/+20
+            case SDB_LOAD_CITY_GUILD_INFO:        // 0x2954 -> 0x2955 from city_guild, T154
+            // --- T156: the Vanguard Initiative, the Arbiter's half (status/PERSISTENCE-MAP.md T156) ---
+            case SA_AVAILABLE_EVENT_MATCHING_LIST:              // 0x1507 -> 0x1591 for the live user
+            case SA_LOAD_EVENT_MATCHING_INFO:                   // 0x1592 -> 0x1595 + 0x1582
+            case SA_UPDATE_PLAYGUIDE_EXTRA_REWARD_RESETTIME:    // 0x1598 -> 0x1599, stored
+            case SA_UPDATE_EVENT_MATCHING_ADD_REWARD_RESETTIME: // 0x159A -> 0x159B, stored, counts cleared
+            case SDB_LOAD_293A:                                 // 0x293A -> 0x293B from daily_event
+            case SDB_UPDATE_ADDITIONAL_REWARD_RECV_COUNT:       // 0x2965 -> 0x2966
+            case SDB_LOAD_ADDITIONAL_REWARD:                    // 0x2967 -> 0x2968 from event_matching_reward
             // --- T33: World's dungeon-timeline broadcast. Not a DLM item and usually empty;
             // the non-empty form is echoed back one 0x1581 per record. ---
             case DSA_DUNGEON_TIMELINE_OPEN_INFO:  // 0x13F2 -> N x 0x1581
@@ -1301,6 +1516,25 @@ public sealed class DbProxyHandlers
             case SDB_CLEAR_WAREHOUSE:             // 0x27E1 = [reqId][ok]
             case SDB_WAREHOUSE_AUTO_SORT:         // 0x27E3, the request's fields echoed back
             case SDB_INCREASE_WAREHOUSE_SIZE:     // -> 0x283E, NOT 0x2840 (trap 1 above)
+            case SDB_INCREASE_INVENTORY_SIZE:     // 0x283D -> 0x283E, T150b
+            // --- T150b: generic acks, each proven by a live pair (DbAckTable) ---
+            case SDB_GUILD_LEARN_PERK:
+            case SDB_CONDITIONAL_TELEPORT:
+            case SDB_ITEM_SIMPLE_ATOM:
+            case SDB_MAIN_MENU_COMMAND:
+            case SDB_INCREMENT_CHARACTER_LEVEL:                // T162
+            case SDB_INCREMENT_CHARACTER_LEVEL_JUMP:
+            case SDB_INCREMENT_CHARACTER_LEVEL_PERFECT_JUMP:
+            case SDB_ITEM_EXTRACT:                              // T166
+            case SDB_ITEM_ENCHANT:
+            case SDB_ITEM_ENCHANT_IDENTIFY:
+            case SDB_ITEM_MERGE:
+            case SDB_ITEM_UNIDENTIFY:
+            case SDB_ENCHANT_ITEM_BOOST:
+            case SDB_ITEM_DECOMPOSITION:
+            case SDB_ITEM_AWAKEN:
+            case SDB_ITEM_UNBIND:
+            case SDB_EQUIPMENT_INHERITANCE:
 
             // --- T45: the mailbox. Six live requests; before T45 none of them was answered at
             // all, and no capture has one either, so the replay table could not cover for us.
@@ -1325,9 +1559,75 @@ public sealed class DbProxyHandlers
             case SDB_TRADE_BROKER_CALC_SOLD_ITEM:  // 0x281B -> 0x281C, frame 0x22
             case SDB_TRADE_BROKER_CALC_BOUGHT_ITEM:// 0x281D -> 0x281E, frame 0x22
             case SDB_TRADE_BROKER_BUY_IT_NOW:      // 0x281F -> 0x2820, frame 0x27
+            // --- T167 (World/DbProxyT167.cs): cards, EP pages, skill polishing, dungeon rank ---
+            case SDB_LOAD_2986:                          // 0x2986 SDB_REQUEST_CARD_DATA
+            case SDB_CHANGE_CARD_PRESET:
+            case SDB_INCREASE_CARD_PRESET:
+            case SDB_CREATE_CARD_INFO:
+            case SDB_ACTIVATE_CARD_COMBINE_LIST:
+            case SDB_DEACTIVATE_CARD_COMBINE_LIST:
+            case SDB_CHANGE_EP_PAGE:
+            case SDB_EXPAND_EP_PAGE:
+            case SDB_RESET_EXTRA_POINT_DATA:
+            case SDB_USER_INCREASE_EP_POINT_BY_ITEM:
+            case SDB_LOAD_2975:                          // 0x2975 SDB_LOAD_SKILL_POLISHING
+            case SDB_SKILL_POLISHING_ADD_EXP:
+            case SDB_SKILL_POLISHING_CHANGE_OPTION:
+            case SDB_SKILL_POLISHING_UNLOCK_OPTION:
+            case SDB_SKILL_POLISHING_UPGRADE_LEVEL:
+            case SDB_UPDATE_DUNGEON_RANK_RECORD:         // no DlmId, no reply
+            // --- T168 (World/DbProxyT168.cs): the rest of group C ---
+            case SDB_OPEN_DUAL_OPTION:
+            case SDB_CHANGE_DUAL_OPTION_IDX:
+            case SDB_ALCHEMY:
+            case SDB_CHANGE_EQUIPMENT_EXP:
+            case SDB_UPDATE_CUSTOMIZING_COMBINE_RESULT:
+            case SDB_UPDATE_ITEM_CUSTOMEXITEM:
+            case SDB_ITEM_CUSTOMIZING:
+            case SDB_ITEM_POINT_STORE:
+            case SDB_POLITICS_POINT_STORE:
+            case SDB_ITEM_FLOATING_CASTLE_PASTS_STORE:
+            case SDB_BUY_VIP_STORE_ITEM:
+            case SDB_ITEM_GUILD_STORE:
+            case SDB_ITEM_DELIVER:
+            case SDB_CHANGE_ACCESSORY_TRANSFORM:
+            case SDB_SERVANT_ADVENTURE_RECEIVE_REWARD:
+            case SDB_RECEIVE_COLLECTION_BOOK_REWARD:
+            case SDB_REQUEST_GUILD_QUEST_WEEKLY_REWARD_ITEM_TRANSACTION:
+            case SDB_SHARED_ACCOUNT_DATA:
+            case SDB_UPDATE_REDUCE_SERVANT_PERIOD:
+            case SDB_UPDATE_REDUCE_SKILLPERIOD:
+            case SDB_DELETE_USER_ACHIEVEMENT:
+            case SDB_USE_RIGHT_ITEM:
+            case SDB_SET_MONEY:
+            case SDB_GET_MONEY:
+            case SDB_CHANGE_GOLD_CONSUMPTION:
+            case SDB_ADD_VIP_GAME_EXP:
+            case SDB_LOAD_USER_VIP_INFO:
+            case SDB_ADMIN_USER_DAILY_ATTENDANCE:
+            case SDB_CHECK_PLAYTIME_REWARD:
+            case SDB_LOAD_ADDITIONAL_FATIGUEPOINT:
+            case SDB_INITIALIZE_LEFT_COOL_TIME_PREMIUM_SLOT:
+            case SDB_USER_LEARN_HIDE_PASSIVE_SKILL:
+            case SDB_ADD_SERVANT:
+            case SDB_RIGHT_ITEM_LIST:
+            case SDB_ADD_GUILDMEMBER2:
+            case SDB_ASK_CHANGE_GUILD_NAME:
+            case SDB_EQUIP_PARTNER_STYLE_ITEM:
+            case SDB_UNEQUIP_PARTNER_STYLE_ITEM:
+            case SDB_GROUP_DUEL_RETURN:
+            case SDB_OPEN_FLOATING_CASTLE_PARTS_STORE:
+            case SDB_TRADE_BROKER_START_DEAL:
+            case SDB_TRADE_BROKER_CANCEL_DEAL:
+            case SDB_LOAD_2900:                          // 0x2900 LOAD_LIMITED_DROP_POINT, empty (captured)
+            case SDB_LOAD_ACHIEVE_LIST:                  // 0x2981 LOAD_PURCHASE_LIMIT, empty (captured)
+            case SDB_USER_CLEAR_ALL_SKILL:               // 0x27E6, T170: cap_clearallskill 902/903
+            case SDB_UPDATE_EVENTSYSTEM_PROGRESS:        // 0x2969, T170: decompile-derived, no DlmId
                 return true;
             default:
-                return false;        // -> replay table
+                // T165 group A: DbAckTable's unpinned rows (it refuses any B/C opcode). Everything
+                // else -> replay table.
+                return DbAckTable.Covers(op);
         }
     }
 
@@ -1364,6 +1664,8 @@ public sealed class DbProxyHandlers
             case SDB_UPDATE_EXTRA_POINT:       return OnUpdateExtraPoint(link, payload);
             case SDB_UPDATE_PRE_EP_INFO:       return OnUpdatePreEpInfo(link, payload);
             case SDB_USER_LEARN_EP_PERK:
+                // T167: EpPerkList ref@0, UserDbId@12, UseEpPoint@16 - into the current page.
+                _store?.LearnEpPerks(Ep32i(payload, 12), ReadEpPerkList(payload), Ep32i(payload, 16));
                 link.SendFrame(DBS_USER_LEARN_EP_PERK, BuildReqIdAck(payload, 8)); return true;
             case SDB_USER_RESET_EP_PERK:       return OnResetEpPerk(link, payload);
 
@@ -1394,6 +1696,66 @@ public sealed class DbProxyHandlers
                 link.SendFrame(DBS_UNMOUNT_CARD, BuildDbsMountCard(
                     Ep32(payload, 0), Ep32i(payload, 16), Ep32i(payload, 20))); return true;
 
+            // --- T167: cards, EP pages, skill polishing, dungeon rank (World/DbProxyT167.cs) ---
+            case SDB_CHANGE_CARD_PRESET:            return OnChangeCardPreset(link, payload);
+            case SDB_INCREASE_CARD_PRESET:          return OnIncreaseCardPreset(link, payload);
+            case SDB_CREATE_CARD_INFO:              return OnCreateCardInfo(link, payload);
+            case SDB_ACTIVATE_CARD_COMBINE_LIST:    return OnCardCombine(link, payload, activate: true);
+            case SDB_DEACTIVATE_CARD_COMBINE_LIST:  return OnCardCombine(link, payload, activate: false);
+            case SDB_CHANGE_EP_PAGE:                return OnChangeEpPage(link, payload);
+            case SDB_EXPAND_EP_PAGE:                return OnExpandEpPage(link, payload);
+            case SDB_RESET_EXTRA_POINT_DATA:        return OnResetExtraPointData(link, payload);
+            case SDB_USER_INCREASE_EP_POINT_BY_ITEM: return OnIncreaseEpPointByItem(link, payload);
+            case SDB_SKILL_POLISHING_ADD_EXP:       return OnPolishingAddExp(link, payload);
+            case SDB_SKILL_POLISHING_CHANGE_OPTION: return OnPolishingChangeOption(link, payload);
+            case SDB_SKILL_POLISHING_UNLOCK_OPTION: return OnPolishingUnlockOption(link, payload);
+            case SDB_SKILL_POLISHING_UPGRADE_LEVEL: return OnPolishingUpgradeLevel(link, payload);
+            case SDB_UPDATE_DUNGEON_RANK_RECORD:    return OnUpdateDungeonRankRecord(payload);
+
+            // --- T168: the rest of group C (World/DbProxyT168.cs) ---
+            case SDB_OPEN_DUAL_OPTION:
+            case SDB_CHANGE_DUAL_OPTION_IDX:
+            case SDB_ALCHEMY:
+            case SDB_CHANGE_EQUIPMENT_EXP:
+            case SDB_UPDATE_CUSTOMIZING_COMBINE_RESULT:
+            case SDB_UPDATE_ITEM_CUSTOMEXITEM:
+            case SDB_ITEM_CUSTOMIZING:
+            case SDB_ITEM_POINT_STORE:
+            case SDB_POLITICS_POINT_STORE:
+            case SDB_ITEM_FLOATING_CASTLE_PASTS_STORE:
+            case SDB_BUY_VIP_STORE_ITEM:
+            case SDB_ITEM_GUILD_STORE:
+            case SDB_ITEM_DELIVER:
+            case SDB_CHANGE_ACCESSORY_TRANSFORM:
+            case SDB_SERVANT_ADVENTURE_RECEIVE_REWARD:
+            case SDB_RECEIVE_COLLECTION_BOOK_REWARD:
+            case SDB_REQUEST_GUILD_QUEST_WEEKLY_REWARD_ITEM_TRANSACTION:
+            case SDB_SHARED_ACCOUNT_DATA:
+            case SDB_UPDATE_REDUCE_SERVANT_PERIOD:
+            case SDB_UPDATE_REDUCE_SKILLPERIOD:
+            case SDB_DELETE_USER_ACHIEVEMENT:
+            case SDB_USE_RIGHT_ITEM: return OnT168Echo(link, op, payload);
+            case SDB_SET_MONEY:                              return OnSetMoney(link, payload);
+            case SDB_GET_MONEY:                              return OnGetMoney(link, payload);
+            case SDB_CHANGE_GOLD_CONSUMPTION:                return OnChangeGoldConsumption(link, payload);
+            case SDB_ADD_VIP_GAME_EXP:                       return OnAddVipGameExp(link, payload);
+            case SDB_LOAD_USER_VIP_INFO:                     return OnLoadUserVipInfo(link, payload);
+            case SDB_ADMIN_USER_DAILY_ATTENDANCE:            return OnAdminDailyAttendance(link, payload);
+            case SDB_CHECK_PLAYTIME_REWARD:                  return OnCheckPlaytimeReward(link, payload);
+            case SDB_LOAD_ADDITIONAL_FATIGUEPOINT:           return OnLoadAdditionalFatiguePoint(link, payload);
+            case SDB_INITIALIZE_LEFT_COOL_TIME_PREMIUM_SLOT: return OnInitializePremiumSlotCooltime(link, payload);
+            case SDB_USER_LEARN_HIDE_PASSIVE_SKILL:          return OnLearnHidePassiveSkill(link, payload);
+            case SDB_ADD_SERVANT:                            return OnAddServant(link, payload);
+            case SDB_RIGHT_ITEM_LIST:                        return OnRightItemList(link, payload);
+            case SDB_ADD_GUILDMEMBER2:                       return OnAddGuildMember2(link, payload);
+            case SDB_ASK_CHANGE_GUILD_NAME:                  return OnAskChangeGuildName(link, payload);
+            case SDB_EQUIP_PARTNER_STYLE_ITEM:               return OnT168Refusal(link, op, payload);
+            case SDB_UNEQUIP_PARTNER_STYLE_ITEM:             return OnT168Refusal(link, op, payload);
+            case SDB_GROUP_DUEL_RETURN:                      return OnT168Refusal(link, op, payload);
+            case SDB_OPEN_FLOATING_CASTLE_PARTS_STORE:       return OnT168Refusal(link, op, payload);
+            case SDB_TRADE_BROKER_START_DEAL:                return OnBrokerDeal(op, payload);
+            case SDB_TRADE_BROKER_CANCEL_DEAL:               return OnBrokerDeal(op, payload);
+
             // --- T77: the rest ---
             case SDB_INIT_LIMIT_REMAIN_REPUTATION:
                 link.SendFrame(DBS_INIT_LIMIT_REMAIN_REPUTATION, BuildDbsInitLimitRemainReputation(
@@ -1409,6 +1771,15 @@ public sealed class DbProxyHandlers
                 // answered the frame and dropped both numbers.
                 StoreCrestPoints(payload);
                 link.SendFrame(AS_CREST_POINT, BuildAsCrestPoint(Ep32(payload, 16))); return true;
+            case SA_CREST_USE:
+                // T158: World has already switched the glyph; this only confirms the write.
+                _log.LogInformation("SA_CREST_USE: dlm {Dlm} crest {Crest} {State}",
+                    Ep32(payload, CrestUseReqDlmId), Ep32(payload, CrestUseReqCrestId),
+                    payload.Length > CrestUseReqApply && payload[CrestUseReqApply] != 0 ? "applied" : "removed");
+                link.SendFrame(AS_CREST_USE, BuildReqIdAck(payload, CrestUseReqDlmId)); return true;
+            case SDB_PEGASUS_FEE: return OnPegasusFee(link, payload);
+            case SDB_MARK_AS_QUEST_COMPLETED: return OnMarkAsQuestCompleted(link, payload);
+            case SDB_USER_LEARN_SKILL_FOR_MULTIPLE: return OnUserLearnSkillForMultiple(link, payload);
             case SA_MAKE_SYS_PARCEL: return OnMakeSysParcel(link, payload);
             case SDB_LOAD_28B7:
                 link.SendFrame(DBS_LOAD_28B6,
@@ -1417,6 +1788,8 @@ public sealed class DbProxyHandlers
             case SDB_UPDATE_LEFT_COOLTIME_PREMIUM_SLOT:
                 link.SendFrame(DBS_UPDATE_LEFT_COOLTIME_PREMIUM_SLOT, BuildReqIdAck(payload, 8)); return true;
             case SDB_SAVE_2768: return OnItemSingle(link, payload);
+            case SDB_EQUIP_ITEM: return OnItemSingle(link, payload, DBS_EQUIP_ITEM, "SDB_EQUIP_ITEM");
+            case SDB_SET_QUESTLIST_INFO: return OnSetQuestListInfo(link, payload);
             case SDB_ITEM_TRADE: return OnItemTrade(link, payload);
             case SDB_SAVE_2936: link.SendFrame(DBS_SAVE_2937, BuildDbs2937(payload)); return true;
             case SDB_DAILY_QUEST: link.SendFrame(DBS_DAILY_QUEST, BuildReqIdAck(payload, 16)); return true;
@@ -1434,11 +1807,19 @@ public sealed class DbProxyHandlers
             case SA_WATCH_MOVIE:                    return OnWatchMovie(payload);
             case SA_START_CHANGE_APPEARANCE:        return OnStartChangeAppearance(payload);
             case SDB_GIVE_GUILD_MONEY_INCENTIVE:    return OnGiveGuildMoneyIncentive(link, payload);
-            case SDB_UPDATE_USER_DAILY_EVENT_COUNT: link.SendFrame(DBS_UPDATE_USER_DAILY_EVENT_COUNT, BuildReqIdAck(payload, 8)); return true;
-            case SDB_UPDATE_GET_EXTRA_REWARD:       link.SendFrame(DBS_UPDATE_GET_EXTRA_REWARD, BuildReqIdAck(payload, 0)); return true;
+            case SDB_UPDATE_USER_DAILY_EVENT_COUNT: return OnUpdateUserDailyEventCount(link, payload);   // T156: stored + 0x1591 push
+            case SDB_UPDATE_GET_EXTRA_REWARD:       return OnUpdateGetExtraReward(link, payload);        // T156: stored
 
             // --- T23 ---
             case SDB_RESULT_CITY_WAR:               return OnResultCityWar(link, payload);
+            case SDB_LOAD_CITY_GUILD_INFO:          return OnLoadCityGuildInfo(link, payload);
+
+            // --- T156 ---
+            case SA_AVAILABLE_EVENT_MATCHING_LIST:              return OnAvailableEventMatchingList(link, payload);
+            case SA_LOAD_EVENT_MATCHING_INFO:                   return OnLoadEventMatchingInfo(link);
+            case SA_UPDATE_PLAYGUIDE_EXTRA_REWARD_RESETTIME:    return OnUpdateExtraRewardResetTime(link, payload);
+            case SA_UPDATE_EVENT_MATCHING_ADD_REWARD_RESETTIME: return OnUpdateAddRewardResetTime(link, payload);
+            case SDB_UPDATE_ADDITIONAL_REWARD_RECV_COUNT:       return OnUpdateAdditionalRewardRecvCount(link, payload);
 
             // --- T33 ---
             case DSA_DUNGEON_TIMELINE_OPEN_INFO:    return OnDungeonTimelineOpenInfo(link, payload);
@@ -1455,6 +1836,24 @@ public sealed class DbProxyHandlers
             case SDB_WAREHOUSE_AUTO_SORT:     return OnWarehouseAutoSort(link, payload);
             case SDB_PAY_WAREHOUSE_COMMISION: return OnPayWarehouseCommision(link, payload);
             case SDB_INCREASE_WAREHOUSE_SIZE: return OnIncreaseWarehouseSize(link, payload);
+            case SDB_INCREASE_INVENTORY_SIZE: return OnIncreaseInventorySize(link, payload);
+            case SDB_GUILD_LEARN_PERK:
+            case SDB_CONDITIONAL_TELEPORT:
+            case SDB_ITEM_SIMPLE_ATOM:
+            case SDB_MAIN_MENU_COMMAND:
+            case SDB_INCREMENT_CHARACTER_LEVEL:
+            case SDB_INCREMENT_CHARACTER_LEVEL_JUMP:
+            case SDB_INCREMENT_CHARACTER_LEVEL_PERFECT_JUMP: return OnGenericAck(link, op, payload);
+            case SDB_ITEM_EXTRACT:
+            case SDB_ITEM_ENCHANT:
+            case SDB_ITEM_ENCHANT_IDENTIFY:
+            case SDB_ITEM_MERGE:
+            case SDB_ITEM_UNIDENTIFY:
+            case SDB_ENCHANT_ITEM_BOOST:
+            case SDB_ITEM_DECOMPOSITION:
+            case SDB_ITEM_AWAKEN:
+            case SDB_ITEM_UNBIND:
+            case SDB_EQUIPMENT_INHERITANCE: return OnItemUpgrade(link, op, payload);   // T166, DbAckGroups Handled
 
             // --- T45: parcels ---
             case SDB_LIST_PARCEL:             return OnListParcel(link, payload);
@@ -1480,15 +1879,18 @@ public sealed class DbProxyHandlers
 
             // --- Post-spawn (reqId at payload[0] for all three) ---
             case SDB_END_START_QUEST_LIST: link.SendFrame(DBS_END_START_QUEST_LIST, BuildReqIdAck(payload, 0)); return true;
+            case SDB_SET_TASK_SHOW_TOGGLE: link.SendFrame(DBS_SET_TASK_SHOW_TOGGLE, BuildSetTaskShowToggleReply(payload)); return true;
             case SDB_LOAD_2930:            link.SendFrame(DBS_LOAD_2931, Build2931(payload)); return true;
+            case SDB_USER_VAPORIZED:       OnUserVaporized(payload, _log); return true;
             case SA_CLEAR_BATTLE_FIELD_ENTER_COUNT: link.SendFrame(AS_CLEAR_BATTLE_FIELD_ENTER_COUNT, BuildOkReqId(payload, 8)); return true;
             case SDB_UPDATE_USER_ACTPOINT: link.SendFrame(DBS_UPDATE_USER_ACTPOINT, BuildReqIdAck(payload, 0)); return true;
             case SA_LEARN_ALL_CREST_ACQUIRABLE:
             {
                 var r = BuildLearnAllCrest(payload);
                 if (r == null) return false;
-                _log.LogInformation("SA_LEARN_ALL_CREST_ACQUIRABLE: learned {N} crest(s)", BitConverter.ToUInt32(r, 0));
-                StoreLearnedCrests(payload, r);
+                _log.LogInformation("SA_LEARN_ALL_CREST_ACQUIRABLE: {N} crest(s) granted (empty refusal list)",
+                    ReadCrestEntries(payload).Count);
+                StoreLearnedCrests(payload);
                 link.SendFrame(AS_LEARN_ALL_CREST_ACQUIRABLE, r);
                 return true;
             }
@@ -1521,11 +1923,31 @@ public sealed class DbProxyHandlers
                 return true;
             }
             case SA_ENTER_WORLD_FAIL: return OnEnterWorldFail(link, payload);
+            case SA_ENTER_WORLD: return OnSaEnterWorld(bridge, payload);
+            case SA_CHAR_LOC: Handlers.GmAdminTool.OnSaCharLoc(bridge, payload, _log); return true;
+            case SA_BROADCAST_SYSTEM_MESSAGE_TO_WHOLE_WORLD:
+            case SA_BROADCAST_SYSTEM_MESSAGE_NOT_IN_SPECIAL_PLACE: return OnWorldBroadcast(bridge, payload);
+            case SA_CREST_USE_LIST: link.SendFrame(AS_CREST_USE_LIST, BuildCrestUseListReply(payload)); return true;
+            case SA_SYNC_DATE_TIME: return true;   // DateTimeSync::CheckDateTime only compares clocks
+            case SDB_CHANGE_CITY_WAR_STATE: link.SendFrame(DBS_CHANGE_CITY_WAR_STATE, BuildChangeCityWarStateReply(payload)); return true;
+            case Handlers.ArbiterClientHandlers.SDB_SIMULATE_ITEM_TOOLTIP:
+                return Handlers.ArbiterClientHandlers.OnSimulateItemTooltip(bridge, payload, _log);
 
             // --- Login-time: empty-list Type 1 [off=19][count=0][reqId][ok=1], reqId at payload[0] ---
             // (0x27A2 inventory is handled by OnLoadInventory above)
-            case SDB_LOAD_ITEM_RECIPE:          link.SendFrame((ushort)(op + 1), BuildEmptyListType1(payload, 0)); return true;
-            case SDB_LOAD_SKILL_PROF:           link.SendFrame((ushort)(op + 1), BuildEmptyListType1(payload, 0)); return true;
+            // T147: the two artisan loads are per-character now (see OnLoadItemRecipe).
+            case SDB_LOAD_ITEM_RECIPE:          return OnLoadItemRecipe(link, payload);
+            case SDB_LOAD_SKILL_PROF:           return OnLoadSkillProf(link, payload);
+            case SDB_LEARN_ITEM_RECIPE:         return OnLearnItemRecipe(link, payload);
+            case SDB_DELETE_ITEM_RECIPE_LIST:   return OnDeleteItemRecipeList(link, payload);
+            case SDB_SET_RECIPE_BOOKMARK:       return OnSetRecipeBookmark(link, payload);
+            case SDB_ITEM_PRODUCE_STEP1:        return OnProduceStep1(link, payload);
+            case SDB_ITEM_PRODUCE_STEP2:        return OnProduceStep2(link, payload);
+            case SDB_UPDATE_SKILL_PROF:         return OnUpdateSkillProf(link, payload);
+            case S_UPDATE_PROF_MINERAL:
+            case S_UPDATE_PROF_BUG:
+            case S_UPDATE_PROF_ENERGY:
+            case S_UPDATE_PROF_HERB:            return OnUpdateGatheringProf(link, op, payload);
             case SDB_LOAD_TELEPORT_TO_POS_LIST: link.SendFrame((ushort)(op + 1), BuildEmptyListType1(payload, 0)); return true;
             case SDB_LOAD_ACCOUNT_BENEFIT:      link.SendFrame((ushort)(op + 1), BuildEmptyListType1(payload, 0)); return true;
             case SDB_LOAD_LEARNED_SOCIAL:       link.SendFrame((ushort)(op + 1), BuildEmptyListType1(payload, 0)); return true;
@@ -1533,7 +1955,7 @@ public sealed class DbProxyHandlers
             case SDB_LOAD_SKILLPERIOD:          link.SendFrame((ushort)(op + 1), BuildEmptyListType1(payload, 0)); return true;
             case SDB_LOAD_SERVANT_PERIOD:       link.SendFrame((ushort)(op + 1), BuildEmptyListType1(payload, 0)); return true;
             case SDB_LOAD_PASSIVITY_COOLTIME:   link.SendFrame((ushort)(op + 1), BuildEmptyListType1(payload, 0)); return true;
-            case SDB_LOAD_ADDITIONAL_REWARD:    link.SendFrame((ushort)(op + 1), BuildEmptyListType1(payload, 0, ok: 0)); return true;
+            case SDB_LOAD_ADDITIONAL_REWARD:    return OnLoadAdditionalRewardRecvCount(link, payload);   // T156
 
             // --- Login-time: empty-list Type 2 [off=19][count=0][ok=1][reqId], reqId at payload[0] ---
             case SDB_LOAD_PROMOTION_LIST:       link.SendFrame((ushort)(op + 1), BuildEmptyListType2(payload, 0)); return true;
@@ -1557,6 +1979,8 @@ public sealed class DbProxyHandlers
             // --- Other login-time handlers ---
             case SDB_LOAD_QUEST_PROGRESS: link.SendFrame(0x2903, BuildQuestProgress(payload)); return true;
             case SDB_LOAD_ACHIEVE_LIST:   link.SendFrame(0x2982, BuildAchieveList(payload)); return true;
+            case SDB_USER_CLEAR_ALL_SKILL: return OnUserClearAllSkill(link, payload);
+            case SDB_UPDATE_EVENTSYSTEM_PROGRESS: return OnUpdateEventSystemProgress(link, payload);
             case SDB_LOAD_WORLD_EVENT:    link.SendFrame(0x27B4, BuildReqIdAck(payload, 0)); return true;
             case SDB_LOAD_FRIEND_INFO:    return OnUpdateFatigability(link, payload);
 
@@ -1592,8 +2016,8 @@ public sealed class DbProxyHandlers
             }
             case SDB_LOAD_2900: link.SendFrame(0x2901, Build2901_TwoEmptyLists(payload)); return true;
             // 0x28B7 / 0x28B0 answered byte-exact by the T69 cases above (Build28B6 / Build28B1_ReferAFriend retired).
-            case SDB_LOAD_2975: link.SendFrame(0x2976, Build2976(payload)); return true;
-            case SDB_LOAD_2986: link.SendFrame(0x2987, Build2987(payload)); return true;
+            case SDB_LOAD_2975: return OnLoadSkillPolishing(link, payload);   // T167
+            case SDB_LOAD_2986: return OnRequestCardData(link, payload);      // T167
             case SDB_LOAD_290C:
             {
                 // Real Arbiter (lobby_tap.log 02:51:10.846-.870) pushes, in this order:
@@ -1612,14 +2036,15 @@ public sealed class DbProxyHandlers
             // --- Remaining login-time: static-data handlers (clone template, patch reqId) ---
             case SDB_TUTORIAL_SIMPLE_TIP: return OnLoadTutorialTips(link, payload);
             case SDB_REPUTATION_LIST:     return OnLoadReputationList(link, payload);
-            case SDB_LOAD_293A:           link.SendFrame(0x293B, BuildFromStaticData(DbProxyStaticData.Load293B, DbProxyStaticData.Load293BReqIdOffset, payload)); return true;
+            case SDB_LOAD_293A:           return OnLoadUserDailyEvent(link, payload);   // T156: from daily_event
             case SDB_FATIGABILITY_LIST:   return OnLoadFatigability(link, payload);
             case SDB_SEREN_GUIDE:         return OnLoadSerenGuide(link, payload);
-            case SDB_EP_PERK:             link.SendFrame(0x27BA, BuildFromStaticData(DbProxyStaticData.EpPerk, DbProxyStaticData.EpPerkReqIdOffset, payload)); return true;
+            case SDB_EP_PERK:             return OnLoadEpPerk(link, payload);   // T167: from the store, was the captured template
             case SDB_QUEST_LIST:          return OnLoadQuestList(link, payload);
             case SDB_USER_ACHIEVEMENT:    return OnLoadUserAchievement(link, payload);
 
             default:
+                if (DbAckTable.Covers(op)) return OnGenericAck(link, op, payload);   // T165 group A
                 // IsHandledRequest said yes and there is no case for it: the request now falls
                 // through to the replay table, which answers with the CAPTURED DLM id. That is
                 // a wedge (status/HANDOFF.md section 1), so say so rather than failing quietly.
@@ -1696,6 +2121,51 @@ public sealed class DbProxyHandlers
     /// NewPoint@1A, NewExPoint@1E`. The guild crest point write.</summary>
     public const ushort SA_CREST_POINT = 0x1465;
     public const ushort AS_CREST_POINT = 0x1466;
+    /// <summary>T158. 0x1469 SA_CREST_USE, guard 0x17: <c>ArbiterUser@06 (i64), DlmId@0E,
+    /// CrestId@12, Apply@16 (u8)</c> - a glyph switched on or off. Handler_SA_CREST_USE runs
+    /// User::UpdateUserCrestApplyNoLock (spUpdateCrestUse) and answers AS_CREST_USE
+    /// <c>[DlmId][bool]</c>, which World's Handler_AS_CREST_USE reads at @06 / @0A. It is a DLM
+    /// request: unanswered it shuts the user's DB queue. cap_play1 13074 (test, 05:37:19) is the
+    /// last DB frame World ever sent for player 10 - the gathering item, fatigue, mail list and
+    /// periodic saves after it were all queued behind it.</summary>
+    public const ushort SA_CREST_USE = 0x1469;
+    public const ushort AS_CREST_USE = 0x146A;
+    public const int CrestUseReqDlmId = 8, CrestUseReqCrestId = 12, CrestUseReqApply = 16;
+    /// <summary>T158. 0x27A5 SDB_PEGASUS_FEE: <c>[ref@0 -> one 568-byte give/take record]
+    /// [DlmId@8][UserDbId@12]</c>. The record is a TS_CHANGE_MONEY (op 9) of minus the route's
+    /// fee - cap_play1 31914 carries -1000, the 1000 the flight list (0x538e) showed. World's
+    /// Handler_DBS_PEGASUS_FEE reads DlmId@06 and the ok byte @0A; unanswered, the flight never
+    /// starts and the user's queue stays shut (31996 / 32127: two more C_RIDE_PEGASUS, no second
+    /// fee request).</summary>
+    public const ushort SDB_PEGASUS_FEE = 0x27A5;
+    public const ushort DBS_PEGASUS_FEE = 0x27A6;
+    public const int PegasusFeeReqDlmId = 8, PegasusFeeReqUserDbId = 12;
+    /// <summary>T164. 0x28AE SDB_MARK_AS_QUEST_COMPLETED: <c>[ref @6 -> i32 quest ids][DlmId @0E]
+    /// [UserDbId @12]</c>, frame &gt;= 0x16. The Arbiter (ArbiterServer.exe.c:1278022) runs every id
+    /// not yet complete through dbo.spInsertQuestComplete and answers 0x28AF
+    /// <c>[ref @6 -> the ids it newly completed][DlmId @0E]</c>; World's reader
+    /// (WorldServer.exe.c:3019867, frame &gt;= 0x12) applies the list and calls it a success only
+    /// when it is non-empty. World sends it at the end of a perfect level jump
+    /// (DBIncrementCharacterLevelPerfectJump::ExecuteCommitSQL, WorldServer.exe.c:1130501).
+    /// cap_scroll 18110 (player 11, dlm 0x33D) carries an EMPTY list; unanswered, it was the
+    /// last DB request that user ever got an answer to.</summary>
+    public const ushort SDB_MARK_AS_QUEST_COMPLETED = 0x28AE;
+    public const ushort DBS_MARK_AS_QUEST_COMPLETED = 0x28AF;
+    public const int MarkQuestReqDlmId = 8, MarkQuestReqUserDbId = 12, MarkQuestReqFixed = 16, MarkQuestReplyFixed = 12;
+    /// <summary>T164. 0x2790 SDB_USER_LEARN_SKILL_FOR_MULTIPLE, 0x278E's list form
+    /// (ArbiterServer.exe.c:1563583, frame &gt;= 0x30): <c>[ref @6 -> 856-byte atoms]
+    /// [ref @0E -> 8-byte {skillId, flag} pairs][DlmId @16][UserDbId @1A][skillId @1E]
+    /// [u8 flag @22][u32 @23][u8 @27][i32 period @28][i32 period @2C]</c>. Reply 0x2791
+    /// (writer FUN_1408e7ca0): <c>[ref @6 atoms][ref @0E SkillPeriodData, 0x18 each]
+    /// [ref @16 {skillId, result} pairs][DlmId @1E][u8 ok @22][u8 hasPeriods @23]
+    /// [u8 alreadyLearned @24]</c> = a 31-byte fixed part, lists in that order behind it; World's
+    /// reader (WorldServer.exe.c:3027355, frame &gt;= 0x25) reads the second and third lists, the
+    /// DlmId and the three bytes. cap_scroll 14359: caludesucks (9) learns 111110 with flag 1,
+    /// two atoms (op 6 + 11) using up item 1100 (template 70, bag slot 14), no pairs.</summary>
+    public const ushort SDB_USER_LEARN_SKILL_FOR_MULTIPLE = 0x2790;
+    public const ushort DBS_USER_LEARN_SKILL_FOR_MULTIPLE = 0x2791;
+    public const int LearnMultiReqPairs = 8, LearnMultiReqDlmId = 16, LearnMultiReqUserDbId = 20,
+                     LearnMultiReqSkillId = 24, LearnMultiReqFixed = 42, LearnMultiReplyFixed = 31;
     /// <summary>0x1479, guard 0x2A: two wstr refs (Writer, Title) then `DlmId@1A,
     /// ReceiverDbId@1E, SendMoney@22 (i64), ForceNotShowMessage@2A (u8)`. System mail - the
     /// levelling rewards in this capture.</summary>
@@ -1857,9 +2327,9 @@ public sealed class DbProxyHandlers
     /// second copy of the request walk. Reply header:
     /// <c>[u32 count][u32 firstOff][u32 reqId][u8 ok]</c>, offsets frame-relative.
     /// </summary>
-    private void StoreLearnedCrests(byte[] request, byte[] reply)
+    private void StoreLearnedCrests(byte[] request)
     {
-        if (_store is null || request.Length < 16 || reply.Length < 17) return;
+        if (_store is null || request.Length < 16) return;
         ulong gameId = BitConverter.ToUInt64(request, 8);
         int playerId = PlayerIdForGameId?.Invoke(gameId) ?? 0;
         if (playerId <= 0)
@@ -1869,17 +2339,10 @@ public sealed class DbProxyHandlers
             return;
         }
 
-        int at = (int)BitConverter.ToUInt32(reply, 4) - 6;      // frame-relative -> payload
-        int stored = 0, guard = 0;
-        while (at >= 0 && at + CrestEntrySize <= reply.Length && guard++ < CrestEntryMax)
-        {
-            int crestId = BitConverter.ToInt32(reply, at + 8);
-            int value = BitConverter.ToInt32(reply, at + 12);
+        // T151: from the REQUEST - the reply is now empty (see BuildLearnAllCrest).
+        int stored = 0;
+        foreach (var (crestId, value) in ReadCrestEntries(request))
             if (crestId != 0 && _store.AddCrest(playerId, crestId, value)) stored++;
-            int next = (int)BitConverter.ToUInt32(reply, at + 4);
-            if (next == 0) break;
-            at = next - 6;
-        }
         if (stored > 0)
             _log.LogInformation("SA_LEARN_ALL_CREST_ACQUIRABLE: player {Pid} learned {N} new crest(s)",
                 playerId, stored);
@@ -1926,6 +2389,7 @@ public sealed class DbProxyHandlers
     {
         int owner = Ep32i(payload, 4);
         _store?.SetCharacterEpLevel(owner, Ep32i(payload, 8), Ep32i(payload, 12));
+        _store?.SetEpPre(owner, Ep32i(payload, 8), Ep32i(payload, 12));   // T167: DBS_USER_LOAD_EP_PERK's PreEp pair
         link.SendFrame(DBS_UPDATE_PRE_EP_INFO, BuildReqIdAck(payload, 0));
         return true;
     }
@@ -1957,6 +2421,7 @@ public sealed class DbProxyHandlers
                 payload, 0, ResetEpPerkRequestHeader, _store.NextItemId);
             atoms = cloned.Atoms;
             WarehouseHandlers.Apply(_store, cloned.Parsed, _store.NextItemId, _log);
+            _store.ResetEpPerks(owner);   // T167: the current page empties, used EP back to 0
         }
         _log.LogInformation("SDB_USER_RESET_EP_PERK: player {Owner} reset their perks ({N} atom(s))",
             owner, atoms.Length / ItemAtomSize);
@@ -1969,6 +2434,116 @@ public sealed class DbProxyHandlers
     /// capture the level-up reward parcels. It goes through the same parcels table a player
     /// parcel does, so it survives a relog and shows up in the inbox T61 fixed.
     /// </summary>
+    /// <summary>SDB_PEGASUS_FEE -&gt; DBS_PEGASUS_FEE. T158: the fee is charged to the stored
+    /// money the way any TS_CHANGE_MONEY is, then the flight is confirmed.</summary>
+    private bool OnPegasusFee(WorldLink link, byte[] payload)
+    {
+        var applied = _store is null ? default : ApplyPegasusFee(_store, payload, _log);
+        _log.LogInformation("SDB_PEGASUS_FEE: player {Pid} charged {Fee}",
+            Ep32(payload, PegasusFeeReqUserDbId), -applied.CharacterMoneyDelta);
+        link.SendFrame(DBS_PEGASUS_FEE, BuildReqIdAck(payload, PegasusFeeReqDlmId));
+        return true;
+    }
+
+    /// <summary>The fee record, applied at the 568-byte give/take stride.</summary>
+    public static WarehouseHandlers.ApplyResult ApplyPegasusFee(CharacterStore store, byte[] payload, ILogger? log = null)
+        => WarehouseHandlers.Apply(store, WarehouseHandlers.ParseAtoms(payload, 0, ItemGiveTakeSize), store.NextItemId, log);
+
+    /// <summary>SDB_MARK_AS_QUEST_COMPLETED -&gt; DBS_MARK_AS_QUEST_COMPLETED. T164: each quest is
+    /// stored complete (so 0x272D serves it after a relog) and the reply lists only the new ones.</summary>
+    private bool OnMarkAsQuestCompleted(WorldLink link, byte[] payload)
+    {
+        int user = Ep32i(payload, MarkQuestReqUserDbId);
+        var ids = ReadI32List(payload, 0, MarkQuestReqFixed);
+        var fresh = new List<int>();
+        if (_store is not null)
+            foreach (int q in ids)
+                if (_store.MarkQuestCompleted(user, q)) fresh.Add(q);
+        _log.LogInformation("SDB_MARK_AS_QUEST_COMPLETED: player {Pid} {N} quest(s) [{Ids}], {F} newly complete",
+            user, ids.Count, string.Join(",", ids), fresh.Count);
+        link.SendFrame(DBS_MARK_AS_QUEST_COMPLETED, BuildDbs28AF(Ep32(payload, MarkQuestReqDlmId), fresh));
+        return true;
+    }
+
+    /// <summary>DBS_MARK_AS_QUEST_COMPLETED: <c>[ref][DlmId]</c> then the ids. An empty list's
+    /// offset is the end of the fixed part, which is also the end of the frame.</summary>
+    public static byte[] BuildDbs28AF(uint dlmId, IReadOnlyList<int> completed)
+    {
+        ArgumentNullException.ThrowIfNull(completed);
+        var r = new byte[MarkQuestReplyFixed + completed.Count * 4];
+        BitConverter.GetBytes((uint)(6 + MarkQuestReplyFixed)).CopyTo(r, 0);
+        BitConverter.GetBytes((uint)(completed.Count * 4)).CopyTo(r, 4);
+        BitConverter.GetBytes(dlmId).CopyTo(r, 8);
+        for (int i = 0; i < completed.Count; i++)
+            BitConverter.GetBytes(completed[i]).CopyTo(r, MarkQuestReplyFixed + i * 4);
+        return r;
+    }
+
+    /// <summary>SDB_USER_LEARN_SKILL_FOR_MULTIPLE -&gt; DBS_. T164: 0x278E's rule for a list - the
+    /// atoms go back with insert ids and are applied, every pair is answered as learned. The skills
+    /// themselves persist the way 0x278E's do: in the blob World saves (SDB_UPDATE_USER_DATA).</summary>
+    private bool OnUserLearnSkillForMultiple(WorldLink link, byte[] payload)
+    {
+        Func<int> alloc = _store is null ? () => 0 : _store.NextItemId;
+        var reply = BuildDbs2791(payload, alloc);
+        int rows = 0;
+        if (_store is not null)
+        {
+            var r = BagItems.ApplyReplyAtoms(_store, reply, 0, _store.NextItemId, _log);
+            rows = r.Inserted + r.Moved + r.AmountChanged + r.Deleted;
+        }
+        _log.LogInformation("SDB_USER_LEARN_SKILL_FOR_MULTIPLE: player {Pid} skill {Skill} + {N} listed, {A} atom(s), {R} item row(s)",
+            Ep32(payload, LearnMultiReqUserDbId), Ep32(payload, LearnMultiReqSkillId),
+            Ep32(reply, 20) / 8, Ep32(reply, 4) / ItemAtomSize, rows);
+        link.SendFrame(DBS_USER_LEARN_SKILL_FOR_MULTIPLE, reply);
+        return true;
+    }
+
+    /// <summary>DBS_USER_LEARN_SKILL_FOR_MULTIPLE (0x2791): the 31-byte fixed part, the request's
+    /// atoms echoed with insert ids filled in, an empty SkillPeriodData list, and one
+    /// {skillId, 1 = learned} pair per requested pair. ok 1, hasPeriods 0, alreadyLearned 0.</summary>
+    public static byte[] BuildDbs2791(byte[] request, Func<int> allocateItemId)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(allocateItemId);
+        byte[] atoms = CloneAtomList(request, 0, allocateItemId, LearnMultiReqFixed);
+        var skills = ReadI32List(request, LearnMultiReqPairs, LearnMultiReqFixed, 8);
+
+        var r = new byte[LearnMultiReplyFixed + atoms.Length + skills.Count * 8];
+        uint at = 6 + LearnMultiReplyFixed;                            // 37, frame-relative
+        BitConverter.GetBytes(at).CopyTo(r, 0);
+        BitConverter.GetBytes((uint)atoms.Length).CopyTo(r, 4);
+        at += (uint)atoms.Length;
+        BitConverter.GetBytes(at).CopyTo(r, 8);                        // SkillPeriodData: empty
+        BitConverter.GetBytes(at).CopyTo(r, 16);
+        BitConverter.GetBytes((uint)(skills.Count * 8)).CopyTo(r, 20);
+        BitConverter.GetBytes(Ep32(request, LearnMultiReqDlmId)).CopyTo(r, 24);
+        r[28] = 1;                                                     // ok
+        atoms.CopyTo(r, LearnMultiReplyFixed);
+        for (int i = 0; i < skills.Count; i++)
+        {
+            int o = LearnMultiReplyFixed + atoms.Length + i * 8;
+            BitConverter.GetBytes(skills[i]).CopyTo(r, o);
+            BitConverter.GetBytes(1).CopyTo(r, o + 4);                 // learned
+        }
+        return r;
+    }
+
+    /// <summary>The first i32 of every <paramref name="stride"/>-byte element behind the
+    /// <c>[u32 frame-relative offset][u32 length]</c> ref at <paramref name="refOffset"/>; empty
+    /// for an absent or malformed ref, so the caller can always answer.</summary>
+    public static List<int> ReadI32List(byte[] p, int refOffset, int minStart, int stride = 4)
+    {
+        ArgumentNullException.ThrowIfNull(p);
+        var list = new List<int>();
+        if (refOffset < 0 || refOffset + 8 > p.Length || stride < 4) return list;
+        long start = (long)BitConverter.ToUInt32(p, refOffset) - 6;
+        long len = BitConverter.ToUInt32(p, refOffset + 4);
+        if (len == 0 || start < minStart || len % stride != 0 || start + len > p.Length) return list;
+        for (long o = start; o < start + len; o += stride) list.Add(BitConverter.ToInt32(p, (int)o));
+        return list;
+    }
+
     private bool OnMakeSysParcel(WorldLink link, byte[] payload)
     {
         uint dlmId = Ep32(payload, 20);
@@ -1988,13 +2563,43 @@ public sealed class DbProxyHandlers
         if (_store is null || receiver <= 0) errorNo = 1;
         else
         {
-            int id = _store.CreateParcel(0, SystemParcelSender, receiver,
-                string.Empty, string.Empty, money);
+            // T151: the Writer / Title / Message refs (payload 8 / 12 / 16, frame-relative) were
+            // dropped here, so every system mail listed with a blank title - cap_social4 seq 4560
+            // shows the real rows carry them verbatim: SenderName "@Achievement:6903" at +0x04,
+            // Title "@2051" at +0x960. They are localisation keys; the client resolves them.
+            var (writer, title, message) = ReadSysParcelText(payload);
+            int id = _store.CreateParcel(0, writer.Length > 0 ? writer : SystemParcelSender, receiver,
+                title, message, money, ParcelDbHandlers.ParcelTypeSystem);
             _log.LogInformation("SA_MAKE_SYS_PARCEL: parcel {Id} to player {To}, {Money} money",
                 id, receiver, money);
         }
         link.SendFrame(AS_MAKE_SYS_PARCEL, BuildAsMakeSysParcel(dlmId, errorNo));
         return true;
+    }
+
+    /// <summary>
+    /// T151. SA_MAKE_SYS_PARCEL's three strings: frame-relative offsets at payload 8 (Writer),
+    /// 12 (Title) and 16 (Message), each a NUL-terminated UTF-16 string. cap_social4 seq 2962:
+    /// "@Achievement:6903", "@2051", "@2052\vAchievementName\v@Achievement:6900". A missing or
+    /// out-of-range ref reads as empty rather than throwing - the reply must always go out.
+    /// </summary>
+    public static (string Writer, string Title, string Message) ReadSysParcelText(byte[] payload)
+    {
+        string At(int refAt)
+        {
+            if (payload == null || refAt + 4 > payload.Length) return string.Empty;
+            long o = (long)BitConverter.ToUInt32(payload, refAt) - 6;
+            if (o < 0 || o >= payload.Length) return string.Empty;
+            var sb = new System.Text.StringBuilder();
+            for (long i = o; i + 1 < payload.Length && sb.Length < 1024; i += 2)
+            {
+                char c = (char)BitConverter.ToUInt16(payload, (int)i);
+                if (c == '\0') break;
+                sb.Append(c);
+            }
+            return sb.ToString();
+        }
+        return (At(8), At(12), At(16));
     }
 
     /// <summary>The sender name a system parcel is filed under. The capture's Writer string is a
@@ -2128,6 +2733,23 @@ public sealed class DbProxyHandlers
     /// AS_ENTER_WORLD with the stored return point. Both steps need facts only that layer has,
     /// so both are behind hooks; with neither wired this still logs the failure in full.
     /// </summary>
+    /// <summary>
+    /// T161b. SA_ENTER_WORLD (0x138C): World finished loading the user. A leave NotifyPlayerLeave
+    /// held meanwhile is sent now - User::EnterWorldEnd's <c>+0x4008</c> branch calls LeaveWorldStart
+    /// with the reserved type and reason. cap_crash 28475: the frame that should have released
+    /// ...AF00003 (left at 28218).
+    /// </summary>
+    private bool OnSaEnterWorld(WorldBridge? bridge, byte[] payload)
+    {
+        ulong gameId = LeaveGate.GameIdOf(payload);
+        var held = LeaveGate.Shared.Entered(gameId);
+        if (held == null) return true;
+        _log.LogInformation("SA_ENTER_WORLD for gameId {G:X}: its session left while World was loading it - "
+            + "sending the held AS_LEAVE_WORLD now", gameId);
+        bridge?.NotifyPlayerLeave(held.WorldId, held.GameId, held.PlayerId, held.Mode);
+        return true;
+    }
+
     private bool OnEnterWorldFail(WorldLink link, byte[] payload)
     {
         var parsed = ParseEnterWorldFail(payload);
@@ -2149,6 +2771,7 @@ public sealed class DbProxyHandlers
             _log.LogError(
                 "SA_ENTER_WORLD_FAIL: reason {R} is outside 1-3, which is where the real Arbiter "
                 + "stops retrying and drops the user. Not retrying.", f.FailReason);
+            LeaveGate.Shared.Forget(f.ArbiterUser);   // T161b: World never had the user - nothing to leave
             return true;
         }
 
@@ -2310,17 +2933,18 @@ public sealed class DbProxyHandlers
         int pdId = (int)BitConverter.ToUInt32(payload, DungeonCtxInstancePdId);
         _store.SaveInstancePdId(playerId, pdId);
         _log.LogInformation("Player {Pid} is in dungeon {Dg}, instance 0x{Pd:X8}", playerId, dungeonId, pdId);
+        MatchWiring.OnDungeonEntered(playerId, dungeonId);   // T161 (c): a matched member claims their entry
     }
 
     /// <summary>
-    /// AS_LEARN_ALL_CREST_ACQUIRABLE (0x1464): every requested (crestId, value) echoed back as learned.
-    /// Payload: [u32 count][u32 firstOff=19][u32 reqId][u8 ok=1] + 16-B entries with frame-relative links.
+    /// The (crestId, value) entries SA_LEARN_ALL_CREST_ACQUIRABLE asks for - the crests World
+    /// has decided this character may learn at its level. Payload: [u32 count][u32 firstOff]
+    /// [u64 gameId][u32 reqId] + 16-B entries with frame-relative links.
     /// </summary>
-    public static byte[]? BuildLearnAllCrest(byte[] req)
+    public static List<(int id, int val)> ReadCrestEntries(byte[] req)
     {
-        if (req.Length < 20) return null;
-        uint reqId = BitConverter.ToUInt32(req, 16);
         var entries = new List<(int id, int val)>();
+        if (req == null || req.Length < 20) return entries;
 
         // T50. Three things here, all of them found by the fuzz or by the walk that follows it:
         //
@@ -2350,19 +2974,25 @@ public sealed class DbProxyHandlers
             if (next == 0) break;
             off = next - 6;
         }
-        var r = new byte[13 + 16 * entries.Count];
-        BitConverter.GetBytes((uint)entries.Count).CopyTo(r, 0);
-        BitConverter.GetBytes(entries.Count > 0 ? 19u : 0u).CopyTo(r, 4);
-        BitConverter.GetBytes(reqId).CopyTo(r, 8);
+        return entries;
+    }
+
+    /// <summary>
+    /// AS_LEARN_ALL_CREST_ACQUIRABLE (0x1464): <c>[u32 0][u32 0][u32 reqId][u8 ok=1]</c>, no entries.
+    ///
+    /// <para><b>T151: the list is the crests World must NOT learn.</b> World's
+    /// DBUserAutoLearnCrestContext::SetRecvData walks the reply's map and ERASES every id in it
+    /// from the set it asked for; whatever is left is learned. So echoing the request - what we did
+    /// since T50 - erased all of them, and every glyph stayed locked. The real Arbiter answers the
+    /// 42-crest request after a level jump with an empty list: cap_social4.log seq 2820 -&gt; 2821,
+    /// <c>13 00 00 00 64 14 00 00 00 00 00 00 00 00 dd 01 00 00 01</c>.</para>
+    /// </summary>
+    public static byte[]? BuildLearnAllCrest(byte[] req)
+    {
+        if (req == null || req.Length < 20) return null;
+        var r = new byte[13];
+        BitConverter.GetBytes(BitConverter.ToUInt32(req, 16)).CopyTo(r, 8);
         r[12] = 1;
-        for (int i = 0; i < entries.Count; i++)
-        {
-            int p = 13 + 16 * i;
-            BitConverter.GetBytes((uint)(19 + 16 * i)).CopyTo(r, p);
-            BitConverter.GetBytes(i + 1 < entries.Count ? (uint)(19 + 16 * (i + 1)) : 0u).CopyTo(r, p + 4);
-            BitConverter.GetBytes(entries[i].id).CopyTo(r, p + 8);
-            BitConverter.GetBytes(entries[i].val).CopyTo(r, p + 12);
-        }
         return r;
     }
 
@@ -2379,7 +3009,8 @@ public sealed class DbProxyHandlers
     /// <summary>
     /// SDB_ITEM_SINGLE (0x2768) -> DBS_ITEM_SINGLE (0x2769). See the constants above.
     /// </summary>
-    private bool OnItemSingle(WorldLink link, byte[] payload)
+    private bool OnItemSingle(WorldLink link, byte[] payload,
+        ushort replyOp = DBS_SAVE_2769, string what = "SDB_ITEM_SINGLE")
     {
         int declaredA = DeclaredAtomCount(payload, 0), declaredB = DeclaredAtomCount(payload, 8);
         var reply = BuildDbs2769(payload, _store.NextItemId);
@@ -2389,11 +3020,11 @@ public sealed class DbProxyHandlers
 
         if (echoedA != declaredA || echoedB != declaredB)
             _log.LogWarning(
-                "SDB_ITEM_SINGLE: could not echo the atom lists for player {Pid} (declared {DA}/{DB}, echoed {EA}/{EB}, "
-                + "payload {Len} B) - World will lose the items it just wrote", playerId, declaredA, declaredB, echoedA, echoedB, payload.Length);
+                "{What}: could not echo the atom lists for player {Pid} (declared {DA}/{DB}, echoed {EA}/{EB}, "
+                + "payload {Len} B) - World will lose the items it just wrote", what, playerId, declaredA, declaredB, echoedA, echoedB, payload.Length);
         else if (declaredA + declaredB > 0)
-            _log.LogInformation("SDB_ITEM_SINGLE: echoed {N} transaction atom(s) for player {Pid}",
-                declaredA + declaredB, playerId);
+            _log.LogInformation("{What}: echoed {N} transaction atom(s) for player {Pid}",
+                what, declaredA + declaredB, playerId);
 
         // T44: the atoms are applied to the item rows, not just echoed. Always from the REPLY -
         // it is the copy that has the allocated item DB ids in it, so the id World is handed and
@@ -2406,12 +3037,12 @@ public sealed class DbProxyHandlers
                         + b.Inserted + b.Moved + b.AmountChanged + b.Deleted;
             if (touched > 0)
                 _log.LogInformation(
-                    "SDB_ITEM_SINGLE: player {Pid} -> {Ins} inserted, {Mov} moved, {Chg} amount, {Del} deleted ({Ign} atom(s) changed no row)",
-                    playerId, a.Inserted + b.Inserted, a.Moved + b.Moved,
+                    "{What}: player {Pid} -> {Ins} inserted, {Mov} moved, {Chg} amount, {Del} deleted ({Ign} atom(s) changed no row)",
+                    what, playerId, a.Inserted + b.Inserted, a.Moved + b.Moved,
                     a.AmountChanged + b.AmountChanged, a.Deleted + b.Deleted, a.Ignored + b.Ignored);
         }
 
-        link.SendFrame(DBS_SAVE_2769, reply);
+        link.SendFrame(replyOp, reply);
         return true;
     }
 
@@ -2662,6 +3293,213 @@ public sealed class DbProxyHandlers
         return true;
     }
 
+    // =====================================================================================
+    // T147: crafting (status/CRAFTING.md). The crafting window's two client packets,
+    // S_ARTISAN_SKILL_LIST and S_ARTISAN_RECIPE_LIST, are built by WorldServer and tunnelled
+    // through SA_BYPASS_TO_CLIENT - the Arbiter never writes them. What it owns is the data
+    // behind them, and until T147 it answered only the two loads (always empty). The six
+    // writes below carry a DlmId and had no answer at all, so the first recipe scroll read,
+    // the first craft or the first bookmark head-blocked that character's DB queue.
+    //
+    // Record formats, request layouts and the builders are in ArtisanDb; these wrappers read
+    // the live DlmId, touch the store and send. Success follows the real handlers
+    // (ArbiterServer.exe.c, Handler_SDB_*): true once the user is loaded and the SQL ran,
+    // except DELETE_ITEM_RECIPE_LIST, whose flag starts false and so stays false for an empty
+    // list.
+    // =====================================================================================
+
+    public const ushort SDB_ITEM_PRODUCE_STEP1 = 0x2756;        // -> 0x2757, 16 B request
+    public const ushort DBS_ITEM_PRODUCE_STEP1 = 0x2757;
+    public const ushort SDB_ITEM_PRODUCE_STEP2 = 0x2758;        // -> 0x2759, 32 B request + atoms
+    public const ushort DBS_ITEM_PRODUCE_STEP2 = 0x2759;
+    public const ushort SDB_LEARN_ITEM_RECIPE = 0x275E;         // -> 0x275F, 21 B request + atoms
+    public const ushort DBS_LEARN_ITEM_RECIPE = 0x275F;
+    public const ushort DBS_LOAD_ITEM_RECIPE = 0x2761;
+    public const ushort SDB_DELETE_ITEM_RECIPE_LIST = 0x2762;   // -> 0x2763, 16 B request + ids
+    public const ushort DBS_DELETE_ITEM_RECIPE_LIST = 0x2763;
+    public const ushort DBS_LOAD_SKILL_PROF = 0x2765;
+    public const ushort SDB_UPDATE_SKILL_PROF = 0x2766;         // -> 0x2767, 16 B request
+    public const ushort DBS_UPDATE_SKILL_PROF = 0x2767;
+    public const ushort SDB_SET_RECIPE_BOOKMARK = 0x288A;       // -> 0x288B, 13 B request
+    public const ushort DBS_SET_RECIPE_BOOKMARK = 0x288B;
+    // Gathering proficiency: four one-int writes sharing one reply (ArtisanDb.GatheringKindOf).
+    public const ushort S_UPDATE_PROF_MINERAL = 0x273D;         // -> 0x2741, 12 B request
+    public const ushort S_UPDATE_PROF_BUG = 0x273E;             // -> 0x2741
+    public const ushort S_UPDATE_PROF_ENERGY = 0x273F;          // -> 0x2741
+    public const ushort S_UPDATE_PROF_HERB = 0x2740;            // -> 0x2741
+    public const ushort D_UPDATE_PROF_RESULT = 0x2741;
+
+    /// <summary>SDB_LOAD_ITEM_RECIPE (0x2760) -&gt; DBS (0x2761): the learned recipes, 28 bytes
+    /// each. A character with none gets the same 13 bytes every capture shows.</summary>
+    private bool OnLoadItemRecipe(WorldLink link, byte[] payload)
+    {
+        var q = ArtisanDb.ParseLoad(payload);
+        List<ArtisanDb.Recipe>? rows = q is { } r ? _store?.GetItemRecipes(r.OwnerDbId) : null;
+        if (rows is { Count: > 0 })
+            _log.LogInformation("SDB_LOAD_ITEM_RECIPE: player {Owner} -> {N} recipe(s)", q!.Value.OwnerDbId, rows.Count);
+        link.SendFrame(DBS_LOAD_ITEM_RECIPE, ArtisanDb.BuildDbsLoadItemRecipe(q?.DlmId ?? WhU32(payload, 0), rows));
+        return true;
+    }
+
+    /// <summary>SDB_LOAD_SKILL_PROF (0x2764) -&gt; DBS (0x2765): the production proficiencies,
+    /// 8 bytes each. Empty is byte-identical to the captures.</summary>
+    private bool OnLoadSkillProf(WorldLink link, byte[] payload)
+    {
+        var q = ArtisanDb.ParseLoad(payload);
+        List<ArtisanDb.SkillProf>? rows = q is { } r ? _store?.GetSkillProfs(r.OwnerDbId) : null;
+        if (rows is { Count: > 0 })
+            _log.LogInformation("SDB_LOAD_SKILL_PROF: player {Owner} -> {N} proficiency row(s)", q!.Value.OwnerDbId, rows.Count);
+        link.SendFrame(DBS_LOAD_SKILL_PROF, ArtisanDb.BuildDbsLoadSkillProf(q?.DlmId ?? WhU32(payload, 0), rows));
+        return true;
+    }
+
+    /// <summary>
+    /// SDB_LEARN_ITEM_RECIPE (0x275E) -&gt; DBS (0x275F). Reading a recipe scroll: the scroll's
+    /// consumption arrives as ItemTransactionAtoms and the reply echoes them (the ITEM_SINGLE
+    /// rule). Once the atoms apply, the real handler calls User::LearnItemRecipeNoLock(recipe,
+    /// extract), which stamps the current time and leaves the bookmark clear.
+    /// </summary>
+    private bool OnLearnItemRecipe(WorldLink link, byte[] payload)
+    {
+        var q = ArtisanDb.ParseLearn(payload);
+        uint dlmId = q?.DlmId ?? WhU32(payload, ArtisanDb.LearnReqDlmId);
+        byte[] atoms = Array.Empty<byte>();
+        if (q is { } r && _store is not null)
+        {
+            var cloned = WarehouseHandlers.CloneAtomsWithIds(
+                payload, ArtisanDb.LearnReqBinaryRef, ArtisanDb.LearnRequestSize, _store.NextItemId);
+            atoms = cloned.Atoms;
+            WarehouseHandlers.Apply(_store, cloned.Parsed, _store.NextItemId, _log);
+            bool added = _store.LearnItemRecipe(r.OwnerDbId, r.RecipeId, r.Extract,
+                DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+            _log.LogInformation("SDB_LEARN_ITEM_RECIPE: player {Owner} learned recipe {R}{Ex}{Dup} ({N} atom(s))",
+                r.OwnerDbId, r.RecipeId, r.Extract ? " (extract)" : "", added ? "" : " - already known",
+                atoms.Length / ItemAtomSize);
+        }
+        WarnIfAtomsLost("SDB_LEARN_ITEM_RECIPE", payload, ArtisanDb.LearnReqBinaryRef, atoms);
+        link.SendFrame(DBS_LEARN_ITEM_RECIPE, ArtisanDb.BuildRefReply(atoms, dlmId, ok: q is not null));
+        return true;
+    }
+
+    /// <summary>SDB_DELETE_ITEM_RECIPE_LIST (0x2762) -&gt; DBS (0x2763). Forgetting recipes. The
+    /// real handler's flag starts false and is set per id, so an empty list answers false.</summary>
+    private bool OnDeleteItemRecipeList(WorldLink link, byte[] payload)
+    {
+        var q = ArtisanDb.ParseDeleteHeader(payload);
+        uint dlmId = q?.DlmId ?? WhU32(payload, ArtisanDb.DeleteReqDlmId);
+        var ids = ArtisanDb.ParseDeleteRecipeIds(payload);
+        int removed = 0;
+        if (q is { } r && _store is not null)
+            foreach (int id in ids)
+                if (_store.DeleteItemRecipe(r.OwnerDbId, id)) removed++;
+        if (q is { } h)
+            _log.LogInformation("SDB_DELETE_ITEM_RECIPE_LIST: player {Owner} -> {N} of {M} recipe(s) removed",
+                h.OwnerDbId, removed, ids.Count);
+        link.SendFrame(DBS_DELETE_ITEM_RECIPE_LIST, ArtisanDb.BuildDbsDeleteRecipeList(q is not null && ids.Count > 0, dlmId));
+        return true;
+    }
+
+    /// <summary>SDB_SET_RECIPE_BOOKMARK (0x288A) -&gt; DBS (0x288B). The real
+    /// SetItemRecipeBookmarkNoLock answers true whenever its SQL ran, found or not.</summary>
+    private bool OnSetRecipeBookmark(WorldLink link, byte[] payload)
+    {
+        var q = ArtisanDb.ParseBookmark(payload);
+        if (q is { } r && _store is not null && !_store.SetItemRecipeBookmark(r.OwnerDbId, r.RecipeId, r.Flag))
+            _log.LogWarning("SDB_SET_RECIPE_BOOKMARK: player {Owner} has no stored recipe {R} - acknowledged, as the real server does",
+                r.OwnerDbId, r.RecipeId);
+        link.SendFrame(DBS_SET_RECIPE_BOOKMARK, ArtisanDb.BuildDlmThenSuccess(q?.DlmId ?? WhU32(payload, 0), q is not null));
+        return true;
+    }
+
+    /// <summary>
+    /// SDB_ITEM_PRODUCE_STEP1 (0x2756) -&gt; DBS (0x2757). The production-point charge. The real
+    /// handler calls the same FatigabilityController function as SDB_UPDATE_FATIGABILITY_POINT
+    /// with (Type, DeltaPoint), so the delta lands on the account's fatigability row exactly as
+    /// that handler applies it (type not split out - T26 stores one bucket). Success is
+    /// "the user was loaded".
+    /// </summary>
+    private bool OnProduceStep1(WorldLink link, byte[] payload)
+    {
+        var q = ArtisanDb.ParseStep1(payload);
+        if (q is { } r && _store is not null && r.DeltaPoint != 0)
+        {
+            var chr = r.OwnerDbId > 0 ? _store.GetCharacter(r.OwnerDbId) : null;
+            if (chr != null)
+            {
+                var row = _store.AddFatigabilityPoints(chr.AccountId, r.DeltaPoint, EncodeDbDateTime(DateTime.UtcNow));
+                _log.LogInformation("SDB_ITEM_PRODUCE_STEP1: account {Acc} type {T} delta {D} fatigue -> {Total}",
+                    chr.AccountId, r.Type, r.DeltaPoint, row.CurPoint);
+            }
+        }
+        link.SendFrame(DBS_ITEM_PRODUCE_STEP1, ArtisanDb.BuildDlmThenSuccess(q?.DlmId ?? WhU32(payload, 0), q is not null));
+        return true;
+    }
+
+    /// <summary>
+    /// SDB_ITEM_PRODUCE_STEP2 (0x2758) -&gt; DBS (0x2759). The craft itself: materials out and
+    /// product in as ItemTransactionAtoms, echoed back with fresh item ids. After the atoms the
+    /// real handler calls User::UpdateSkillProfNoLock(id, value) when value &gt; 0 - an absolute
+    /// set, not a delta. The ItemEnchantData ref is not stored (no enchant rows are modelled).
+    /// </summary>
+    private bool OnProduceStep2(WorldLink link, byte[] payload)
+    {
+        var q = ArtisanDb.ParseStep2(payload);
+        uint dlmId = q?.DlmId ?? WhU32(payload, ArtisanDb.Step2ReqDlmId);
+        byte[] atoms = Array.Empty<byte>();
+        if (q is { } r && _store is not null)
+        {
+            var cloned = WarehouseHandlers.CloneAtomsWithIds(
+                payload, ArtisanDb.Step2ReqBinaryRef, ArtisanDb.Step2RequestSize, _store.NextItemId);
+            atoms = cloned.Atoms;
+            var a = WarehouseHandlers.Apply(_store, cloned.Parsed, _store.NextItemId, _log);
+            if (r.SkillProfValue > 0) _store.SetSkillProf(r.OwnerDbId, r.SkillProfId, r.SkillProfValue);
+            _log.LogInformation(
+                "SDB_ITEM_PRODUCE_STEP2: player {Owner} -> {Ins} inserted, {Chg} amount, {Del} deleted; proficiency {P} = {V}",
+                r.OwnerDbId, a.Inserted, a.AmountChanged, a.Deleted, r.SkillProfId, r.SkillProfValue);
+        }
+        WarnIfAtomsLost("SDB_ITEM_PRODUCE_STEP2", payload, ArtisanDb.Step2ReqBinaryRef, atoms);
+        link.SendFrame(DBS_ITEM_PRODUCE_STEP2, ArtisanDb.BuildRefReply(atoms, dlmId, ok: q is not null));
+        return true;
+    }
+
+    /// <summary>SDB_UPDATE_SKILL_PROF (0x2766) -&gt; DBS (0x2767): one proficiency, set
+    /// absolutely (UpdateSkillProfNoLock overwrites the value).</summary>
+    private bool OnUpdateSkillProf(WorldLink link, byte[] payload)
+    {
+        var q = ArtisanDb.ParseUpdateProf(payload);
+        if (q is { } r) _store?.SetSkillProf(r.OwnerDbId, r.SkillProfId, r.Value);
+        link.SendFrame(DBS_UPDATE_SKILL_PROF, ArtisanDb.BuildDlmThenSuccess(q?.DlmId ?? WhU32(payload, 0), q is not null));
+        return true;
+    }
+
+    /// <summary>
+    /// S_UPDATE_PROF_MINERAL/BUG/ENERGY/HERB (0x273D-0x2740) -&gt; D_UPDATE_PROF_RESULT (0x2741).
+    /// A gathering level, set absolutely (User::UpdateUserProf* assigns it and answers true), and
+    /// stamped back into the world blob at the next enter-world - see OnUserEnterWorld.
+    /// </summary>
+    private bool OnUpdateGatheringProf(WorldLink link, ushort op, byte[] payload)
+    {
+        var q = ArtisanDb.ParseGatheringProf(payload);
+        int kind = ArtisanDb.GatheringKindOf(op);
+        if (q is { } r && kind >= 0)
+        {
+            _store?.SetGatheringProf(r.OwnerDbId, kind, r.Value);
+            _log.LogInformation("{Op}: player {Owner} -> {V}", DbProxyOpcodeNames.Describe(op), r.OwnerDbId, r.Value);
+        }
+        link.SendFrame(D_UPDATE_PROF_RESULT, ArtisanDb.BuildDlmThenSuccess(q?.DlmId ?? WhU32(payload, 0), q is not null));
+        return true;
+    }
+
+    /// <summary>World counts the atoms it sent from the ref's byte count; echoing fewer loses
+    /// items on World's side, so say so (the SDB_ITEM_SINGLE warning, for the crafting ops).</summary>
+    private void WarnIfAtomsLost(string what, byte[] payload, int refOffset, byte[] echoed)
+    {
+        int declared = DeclaredAtomCount(payload, refOffset);
+        if (_store is not null && declared != echoed.Length / ItemAtomSize)
+            _log.LogWarning("{What}: declared {D} atom(s), echoed {E} ({Len} B payload) - World will lose the items",
+                what, declared, echoed.Length / ItemAtomSize, payload.Length);
+    }
+
     /// <summary>SDB_CLEAR_WAREHOUSE (0x27E0) -> 0x27E1. dbo.spClearWarehouse.</summary>
     private bool OnClearWarehouse(WorldLink link, byte[] payload)
     {
@@ -2723,7 +3561,163 @@ public sealed class DbProxyHandlers
         return true;
     }
 
+    /// <summary>
+    /// T150b. SDB_INCREASE_INVENTORY_SIZE (0x283D) -> DBS_INCREASE_INVENTORY_SIZE (0x283E,
+    /// <c>[u8 Success][u32 DlmId]</c>, cap_social4.log seq 3040 <c>01 63 02 00 00</c>).
+    /// The real handler (Arb_part_063.c:8426) stores the new size, rounded down to a multiple of 8,
+    /// through User::UpdateMaxInvenSlotCountNoLock (Arb_part_030.c:12399) at User + 0x3BA0 =
+    /// world blob + 0x3AF0 (User + 0xB0 is the blob), and the expand count at + 0x3B00.
+    /// <para>Proven on the wire: in cap_social4.log character 1 enters with 40 at +0x3AF0
+    /// (seq 250), asks for 48 (seq 3039), and every later enter-world blob (seq 5715; cap_final.log
+    /// 411, 4377, 6413, 9576, 9981) carries 48 there, with level 70 at +0xCC untouched.</para>
+    /// <para>Deviation: the original answers 0 when the stored size is already at least the new
+    /// one; we answer 1 either way (World has already resized its bag). Pockets (tab != 0) are
+    /// acked, not stored. Only the two i32s are written; the rest of the stored blob is untouched.</para>
+    /// </summary>
+    private bool OnIncreaseInventorySize(WorldLink link, byte[] payload)
+    {
+        uint dlmId = Ep32(payload, IncInvReqDlmId);
+        int owner = Ep32i(payload, IncInvReqUserDbId);
+        int tab = Ep32i(payload, IncInvReqTab);
+        int newSize = Ep32i(payload, IncInvReqNewSize);
+        int delta = Ep32i(payload, IncInvReqExpandDelta);
+        int reason = Ep32i(payload, IncInvReqReason);
+
+        if (tab == 0 && _store is not null && payload.Length >= IncInvReqFixed)
+        {
+            var (found, slots, expand) = _store.IncreaseInventorySize(owner, newSize, delta);
+            _log.LogInformation("SDB_INCREASE_INVENTORY_SIZE: player {Id} bag -> {Req} (stored {Slots}, expand {Expand}, "
+                + "reason {Reason}){Missing}", owner, newSize, slots, expand, reason,
+                found ? "" : " - no world blob, nothing stored");
+        }
+        else
+            _log.LogInformation("SDB_INCREASE_INVENTORY_SIZE: player {Id} tab {Tab} -> {Req} acked, not stored (reason {Reason})",
+                owner, tab, newSize, reason);
+
+        link.SendFrame(DBS_INCREASE_INVENTORY_SIZE, WarehouseHandlers.BuildDbsIncreaseSize(ok: true, dlmId));
+        return true;
+    }
+
+    /// <summary>
+    /// T150b. The generic ack for the opt-in rows of <see cref="DbAckTable"/> - each one proven by a
+    /// live pair. Echoed item records are applied from the REPLY, as SDB_ITEM_SINGLE's are, so the
+    /// ids World gets are the ids we store.
+    /// </summary>
+    /// <summary>
+    /// T166 - the enchanting family, real handlers (DbAckGroups: Handled, not a DbAckTable row:
+    /// the reply carries item state). On the real Arbiter each is one generic item transaction
+    /// (ArbiterServer.exe.c:1266212..1272486): request [ref @6 -&gt; 856-byte atoms][DlmId @0E]
+    /// [UserDbId @12], frame &gt;= 0x16; ExecTrans; reply [ref @6 -&gt; the atoms][DlmId @0E][ok @12]
+    /// (writers FUN_1406eb9f0 &amp; co.), which World's Handler_DBS_* read at &gt;= 0x13. The echo gets
+    /// the allocated ids (op 7/8 outputs) and identify's masterwork write-back, then is applied,
+    /// record edits included (ItemEdits). 0x28A1 has a live pair (cap_multiworld 10859 -&gt; 10860):
+    /// byte-exact but for the empty passive slots the real Arbiter fills from template data.
+    /// SDB_ITEM_MERGE answers [DlmId @6][ok @0A] only; its atoms are applied, not echoed.
+    /// Row syntax is DbAckTable's.
+    /// </summary>
+    public static readonly IReadOnlyDictionary<ushort, DbAckTable.Spec> ItemUpgradeSpecs = new[]
+    {
+        "275A>275B q22 r19 d14:14 o18 b6=6 k18",   // SDB_ITEM_EXTRACT
+        "276E>276F q22 r19 d14:14 o18 b6=6 k18",   // SDB_ITEM_ENCHANT
+        "2770>2771 q22 r19 d14:14 o18 b6=6 k18",   // SDB_ITEM_ENCHANT_IDENTIFY
+        "28A1>28A2 q22 r19 d14:14 o18 b6=6 k18",   // SDB_ITEM_UNIDENTIFY (= item option reset, op 92)
+        "28F4>28F5 q22 r19 d14:14 o18 b6=6 k18",   // SDB_ENCHANT_ITEM_BOOST
+        "2920>2921 q22 r19 d14:14 o18 b6=6 k18",   // SDB_ITEM_DECOMPOSITION
+        "2932>2933 q22 r19 d14:14 o18 b6=6 k18",   // SDB_ITEM_AWAKEN
+        "2934>2935 q22 r19 d14:14 o18 b6=6 k18",   // SDB_ITEM_UNBIND
+        "295F>2960 q22 r19 d14:14 o18 b6=6 k18",   // SDB_EQUIPMENT_INHERITANCE
+        "2774>2775 q22 r11 d14:6 o18 k10 a6",       // SDB_ITEM_MERGE
+    }.Select(r => DbAckTable.Parse(r)).ToDictionary(s => s.Op);
+
+    /// <summary>The reply for one T166 request, with <paramref name="allocateItemId"/> filling op 7/8 ids.</summary>
+    public static DbAckTable.Ack BuildItemUpgradeReply(ushort op, byte[] payload, Func<int>? allocateItemId)
+    {
+        var ack = DbAckTable.Build(ItemUpgradeSpecs[op], payload, allocateItemId);
+        foreach (var a in ack.Atoms)
+            if (a.RecordSize == ItemAtomSize) ItemEdits.PatchReply(ack.Reply, a.SlotPayloadOffset);
+        return ack;
+    }
+
+    private bool OnItemUpgrade(WorldLink link, ushort op, byte[] payload)
+    {
+        var spec = ItemUpgradeSpecs[op];
+        var ack = BuildItemUpgradeReply(op, payload, _store is null ? null : new Func<int>(_store.NextItemId));
+        int rows = 0;
+        if (_store is not null)
+        {
+            foreach (var a in ack.Atoms)
+            {
+                var r = BagItems.ApplyReplyAtoms(_store, ack.Reply, a.SlotPayloadOffset, _store.NextItemId, _log, a.RecordSize);
+                rows += r.Inserted + r.Moved + r.AmountChanged + r.Deleted;
+            }
+            foreach (var at in spec.Applies)
+            {
+                var r = WarehouseHandlers.Apply(_store, WarehouseHandlers.ParseAtoms(payload, at.Req - 6, at.Stride), _store.NextItemId, _log);
+                rows += r.Inserted + r.Moved + r.AmountChanged + r.Deleted;
+            }
+        }
+        _log.LogInformation("{Op} -> 0x{Rop:X4}: player {Id} dlm {Dlm}, {Rows} item row(s)",
+            DbProxyOpcodeNames.Describe(op), spec.ReplyOp, (int)DbAckTable.U32(payload, spec.ReqOwner - 6), ack.DlmId, rows);
+        link.SendFrame(spec.ReplyOp, ack.Reply);
+        return true;
+    }
+
+    private bool OnGenericAck(WorldLink link, ushort op, byte[] payload)
+    {
+        var spec = DbAckTable.For(op);
+        if (spec is null || DbAckGroups.Refused(op)) return false;   // B/C: DbAckTable already refuses them
+        if (!spec.Pinned)
+            lock (_unpinnedSeen)
+                if (_unpinnedSeen.Add(op))
+                    _log.LogInformation("generic ack 0x{Op:X4} {Name} - capture a real pair to pin",
+                        op, DbProxyOpcodeNames.Name(op) ?? "?");
+        int owner = spec.ReqOwner >= 6 ? (int)DbAckTable.U32(payload, spec.ReqOwner - 6) : 0;
+        var ack = DbAckTable.Build(spec, payload, _store is null ? null : new Func<int>(_store.NextItemId));
+        int rows = 0;
+        if (_store is not null)
+            foreach (var a in ack.Atoms)
+            {
+                var r = BagItems.ApplyReplyAtoms(_store, ack.Reply, a.SlotPayloadOffset, _store.NextItemId, _log, a.RecordSize);
+                rows += r.Inserted + r.Moved + r.AmountChanged + r.Deleted;
+            }
+        // T162: request atoms that are applied but not echoed (the level-jump scroll).
+        if (_store is not null)
+            foreach (var ap in spec.Applies)
+            {
+                var r = WarehouseHandlers.Apply(_store, WarehouseHandlers.ParseAtoms(payload, ap.Req - 6, ap.Stride), _store.NextItemId, _log);
+                rows += r.Inserted + r.Moved + r.AmountChanged + r.Deleted;
+            }
+        if (ack.DroppedRefs > 0)
+            _log.LogWarning("DbAck {Op}: {N} ref(s) pointed outside the request and went back empty",
+                DbProxyOpcodeNames.Describe(op), ack.DroppedRefs);
+        _log.LogInformation("DbAck {Op} -> 0x{Rop:X4}: player {Id} dlm {Dlm}{Rows}",
+            DbProxyOpcodeNames.Describe(op), spec.ReplyOp, owner, ack.DlmId, rows > 0 ? $", {rows} item row(s)" : "");
+
+        link.SendFrame(spec.ReplyOp, ack.Reply);
+        return true;
+    }
+
     // ---- Quests: SDB_SET_QUEST_INFO (0x272E) / SDB_LOAD_QUEST_LIST (0x272C) ----
+
+    /// <summary>
+    /// SDB_SET_QUESTLIST_INFO (0x2732), T145: a batch of quest records. Each is stored the way
+    /// a single SDB_SET_QUEST_INFO record is (last-write-wins on playerId + questId) and the row
+    /// id goes back in the reply. Always answered.
+    /// </summary>
+    private bool OnSetQuestListInfo(WorldLink link, byte[] payload)
+    {
+        int playerId = payload.Length >= QuestListRequestHeader ? (int)BitConverter.ToUInt32(payload, 28) : 0;
+        if (payload.Length < QuestListRequestHeader)
+            _log.LogWarning("SDB_SET_QUESTLIST_INFO: {Len} B payload, want >= {Want} - answering with no quests",
+                payload.Length, QuestListRequestHeader);
+        var reply = BuildDbs2733(payload, (questId, record) => _store?.UpsertQuest(playerId, questId,
+            BitConverter.ToInt32(record, QuestRecordStatusOffset),
+            BitConverter.ToInt32(record, QuestRecordStepOffset), record) ?? 0);
+        _log.LogInformation("SDB_SET_QUESTLIST_INFO: player {Pid} - {N} quest(s) stored and answered",
+            playerId, (reply.Length - QuestListReplyHeader) / 8);
+        link.SendFrame(DBS_SET_QUESTLIST_INFO, reply);
+        return true;
+    }
 
     /// <summary>
     /// One quest write. Stores the 80-byte record last-write-wins on (playerId, questId) and
@@ -2963,7 +3957,10 @@ public sealed class DbProxyHandlers
         Array.Copy(request, start, atoms, 0, length);
         for (int o = 0; o + recordSize <= atoms.Length; o += recordSize)
         {
-            if (BitConverter.ToUInt32(atoms, o + ItemAtomOpOffset) != TsInsertItem) continue;
+            // T153: op 8 (the non-stackable insert) is allocated exactly like 7 - cap_final.log
+            // 5914 -> 5915 is byte-exact with the id at +0x10 and nothing else changed.
+            if (BitConverter.ToUInt32(atoms, o + ItemAtomOpOffset)
+                    is not (TsInsertItem or WarehouseHandlers.TsInsertNonStackItem)) continue;
             // An insert that already carries an id is World re-stating one it knows; only a 0
             // means "give me one".
             if (BitConverter.ToUInt32(atoms, o + ItemAtomDbIdOffset) != 0) continue;
@@ -4535,6 +5532,9 @@ public sealed class DbProxyHandlers
 
         var chr = _store.GetCharacter(playerId);
         bool found = chr?.WorldBlob != null && chr.WorldBlob.Length == WorldBlobSize;
+        // T147: gathering levels live in their own rows, like money; put them back where the
+        // real Arbiter's column binding puts them (UserData +0x1C8..+0x1D4).
+        if (found) ArtisanDb.StampGatheringProfs(chr!.WorldBlob, _store.GetGatheringProfs(playerId));
         if (!found)
             _log.LogWarning("SDB_USER_ENTERWORLD: player {Id} has no world blob (found={F}, len={L}) - replying not-found",
                 playerId, chr != null, chr?.WorldBlob?.Length ?? 0);
@@ -4803,7 +5803,7 @@ public sealed class DbProxyHandlers
     // ---- Post-handshake config burst (T23) ----
     // 63 one-way A->W pushes the real Arbiter sends straight after the handshake, right after the
     // 0x294F -> 0x2955 + 0x2952 replay and before any player exists
-    // (D:\packetlogs\arb_world_2026-09-13T11-33-30-680Z.log seq 104-126, 11:42:22.403-.408).
+    // (<captures>\arb_world_2026-09-13T11-33-30-680Z.log seq 104-126, 11:42:22.403-.408).
     // Nothing in them carries a reqId or a DLM id, so none of it can head-block a user - which is
     // why login worked without them - but between them they configure VIP store slots, achievement
     // seasons, dark rift, GM events, play-guide rewards, five festivals, the in-game shop
@@ -4964,10 +5964,355 @@ public sealed class DbProxyHandlers
             _log.LogInformation("Post-handshake: 0x1581 fallback burst disabled - waiting for World's 0x13F2 echo");
             return;
         }
-        foreach (var id in PostHandshakeDungeonIds)
-            link.SendFrame(AS_DUNGEON_OPEN_1581, Build1581(id));
+        // T159: the ids from the four sheets (DatasheetLoader.DungeonTimelineIds); PostHandshakeDungeonIds
+        // is their built-in - identical, order included, when the sheets are the capture's.
+        var ids = DatasheetLoader.DungeonTimelineIds.Value;
+        foreach (var id in ids)
+            link.SendFrame(AS_DUNGEON_OPEN_1581, Build1581((uint)id));
         _log.LogInformation("Post-handshake: sent {N} x 0x1581 dungeon-open pushes (fallback; World's 0x13F2 echo supersedes them)",
-            PostHandshakeDungeonIds.Length);
+            ids.Length);
+    }
+
+    // ---- T154: SDB_LOAD_CITY_GUILD_INFO (0x2954) -> DBS_LOAD_CITY_GUILD_INFO (0x2955) ----
+    // World asks for the guilds holding a Civil Unrest city once per boot and then on its own
+    // schedule (~25 a day live). The boot one was only ever answered because the replay table
+    // files the captured 0x2955 under 0x294F, the request that follows it; every later one was
+    // "no replay". No DlmId, so it never wedged a user - it just went unanswered.
+    // Request (Arbiter dumper, guard 0xd): LeagueId@06, SeasonId@0A - payload 0, 4.
+    // Reply - written by FUN_1406526f0 (Arb_part_054.c:13406), read by
+    // Handler_DBS_LOAD_CITY_GUILD_INFO (WorldServer.exe.c:3016303, frame >= 0x16):
+    //   [u32 count][u32 first element, frame offset, 0 = none][u32 LeagueId][u32 SeasonId]
+    //   then 44-byte elements [u32 self][u32 next, 0 = last][u32 GuildDbId]
+    //   [i64 GuildTowerBuildTime][i64 GuildTowerDestroyTime][u32 TotalKill][u32 TotalDeath]
+    //   [u32 TotalDestroy][u32 GuildTowerMaintainBonus].
+    // World walks the elements from the first offset, checking each one's self offset, and
+    // registers each guild; an empty list changes nothing, so the boot duplicate the 0x294F
+    // replay still sends is harmless. Live, empty: arb_world.log / cap_invensize (league 1,
+    // season 1) and cap_social4 / cap_final (1, 2) are all 00*8 + LeagueId + SeasonId.
+    public const ushort SDB_LOAD_CITY_GUILD_INFO = 0x2954;
+    public const ushort DBS_LOAD_CITY_GUILD_INFO = 0x2955;
+    public const int CityGuildReplyHeader = 16, CityGuildElementSize = 0x2C;
+
+    public static byte[] BuildDbsLoadCityGuildInfo(int leagueId, int seasonId,
+                                                   IReadOnlyList<CharacterStore.CityGuildRow>? rows)
+    {
+        rows ??= Array.Empty<CharacterStore.CityGuildRow>();
+        var r = new byte[CityGuildReplyHeader + rows.Count * CityGuildElementSize];
+        BitConverter.GetBytes(rows.Count).CopyTo(r, 0);
+        BitConverter.GetBytes(rows.Count == 0 ? 0 : 6 + CityGuildReplyHeader).CopyTo(r, 4);
+        BitConverter.GetBytes(leagueId).CopyTo(r, 8);
+        BitConverter.GetBytes(seasonId).CopyTo(r, 12);
+        for (int i = 0; i < rows.Count; i++)
+        {
+            var g = rows[i];
+            int at = CityGuildReplyHeader + i * CityGuildElementSize;
+            int self = 6 + at;
+            BitConverter.GetBytes(self).CopyTo(r, at);
+            BitConverter.GetBytes(i + 1 < rows.Count ? self + CityGuildElementSize : 0).CopyTo(r, at + 4);
+            BitConverter.GetBytes(g.GuildDbId).CopyTo(r, at + 8);
+            BitConverter.GetBytes(g.TowerBuildTime).CopyTo(r, at + 12);
+            BitConverter.GetBytes(g.TowerDestroyTime).CopyTo(r, at + 20);
+            BitConverter.GetBytes(g.TotalKill).CopyTo(r, at + 28);
+            BitConverter.GetBytes(g.TotalDeath).CopyTo(r, at + 32);
+            BitConverter.GetBytes(g.TotalDestroy).CopyTo(r, at + 36);
+            BitConverter.GetBytes(g.MaintainBonus).CopyTo(r, at + 40);
+        }
+        return r;
+    }
+
+    private bool OnLoadCityGuildInfo(WorldLink link, byte[] payload)
+    {
+        int league = Ep32i(payload, 0), season = Ep32i(payload, 4);
+        var rows = _store is null ? null : _store.GetCityGuilds(league, season);
+        if (rows is { Count: > 0 })
+            _log.LogInformation("SDB_LOAD_CITY_GUILD_INFO: league {League} season {Season} -> {N} guild(s)",
+                league, season, rows.Count);
+        else
+            _log.LogDebug("SDB_LOAD_CITY_GUILD_INFO: league {League} season {Season} -> no owning guild", league, season);
+        link.SendFrame(DBS_LOAD_CITY_GUILD_INFO, BuildDbsLoadCityGuildInfo(league, season, rows));
+        return true;
+    }
+
+    // ---- T156: the Vanguard Initiative (event matching) - the Arbiter's half ----
+    // Every client packet of the window is World-built: S_AVAILABLE_EVENT_MATCHING_LIST (0x810D,
+    // serializer FUN_140456950, WorldServer.exe.c:800772), S_ADD_NEW / S_REMOVE_EVENT_MATCHING_QUEST
+    // and S_UPDATE_EVENT_MATCHING_BONUS_INFO all have their writers in WorldServer.exe and reach
+    // the client through SA_BYPASS_TO_CLIENT; the Arbiter has no writer for any of them. World
+    // fills the quest list from its own EventMatching datasheet. What it asks the Arbiter for:
+    //
+    //   0x1507 SA_AVAILABLE_EVENT_MATCHING_LIST [i64 ArbiterUser][i64 PartyId][u8 ByPlayer]
+    //     -> 0x1591 AS_EVENT_MATCHING_INFO_LIST [BattleFieldList ref][DungeonList ref]
+    //        [i32 UserDbId][u8 ByPlayer]. World (Handler_AS_EVENT_MATCHING_INFO_LIST,
+    //        WorldServer.exe.c:2986781) finds the user by UserDbId and only then sends the
+    //        client its list. The two lists are the ids the user is queued for in the Arbiter's
+    //        match pool (WorldOfPartyMatchHelper::SendEventMatchingInfoToWorldServer); every
+    //        capture has both empty. Until T156 the replay table answered with the captured
+    //        UserDbId 1 - World looked up the wrong user and the window stayed empty.
+    //   0x293C SDB_UPDATE_USER_DAILY_EVENT_COUNT -> the same 0x1591 push (ByPlayer 0), then 0x293D.
+    //        That is the Arbiter's push on a quest state change (cap_social4 seq 421 -> 422, 423).
+    //   0x1592 SA_LOAD_EVENT_MATCHING_INFO (once per boot) -> 0x1595 AS_EVENT_MATCHING_INFO
+    //        [OffPairList ref][i64 ExtraRewardLastWeeklyResetTime][i64 AddRewardLastResetTime],
+    //        then 0x1582 AS_INIT_TIMELINE_CHANGES - both in every capture, in that order.
+    //   0x1598 / 0x159A: World moves those two stamps forward; answered [u8 Result][i64 time].
+    //        Unanswered, World re-sends them - 80+ times in a TeraSharp session.
+    //   0x2965 / 0x2967: per-character add-reward receive counts, DLM items.
+    //   0x293A / 0x293E: the per-character daily_event row (see CharacterStore.DailyEventRow).
+    public const ushort SA_AVAILABLE_EVENT_MATCHING_LIST = 0x1507;
+    public const ushort AS_EVENT_MATCHING_INFO_LIST = 0x1591;
+    public const ushort SA_LOAD_EVENT_MATCHING_INFO = 0x1592;
+    public const ushort AS_EVENT_MATCHING_INFO = 0x1595;
+    public const ushort SA_UPDATE_PLAYGUIDE_EXTRA_REWARD_RESETTIME = 0x1598;
+    public const ushort AS_UPDATE_PLAYGUIDE_EXTRA_REWARD_RESETTIME = 0x1599;
+    public const ushort SA_UPDATE_EVENT_MATCHING_ADD_REWARD_RESETTIME = 0x159A;
+    public const ushort AS_UPDATE_EVENT_MATCHING_ADD_REWARD_RESETTIME = 0x159B;
+    public const ushort SDB_UPDATE_ADDITIONAL_REWARD_RECV_COUNT = 0x2965;
+    public const ushort DBS_UPDATE_ADDITIONAL_REWARD_RECV_COUNT = 0x2966;
+    public const ushort DBS_LOAD_ADDITIONAL_REWARD_RECV_COUNT = 0x2968;
+    public const ushort DBS_LOAD_USER_DAILY_EVENT = 0x293B;
+
+    /// <summary>Handler_SA_AVAILABLE_EVENT_MATCHING_LIST's guard: frame 0x17.</summary>
+    public const int AvailableEventMatchingListMinPayload = 0x17 - 6;
+    /// <summary>The two reset-time updates' guard: frame 0xE.</summary>
+    public const int ResetTimeUpdateMinPayload = 0xE - 6;
+    /// <summary>SDB_UPDATE_ADDITIONAL_REWARD_RECV_COUNT's guard: frame 0x15.</summary>
+    public const int UpdateAdditionalRewardMinPayload = 0x15 - 6;
+    /// <summary>DailyEventCompletionInfo: five i32s, the record 0x293C carries and 0x293B returns.</summary>
+    public const int DailyEventRecordLength = 20;
+
+    /// <summary>counters keys for the two global stamps 0x1595 carries.</summary>
+    public const string ExtraRewardWeeklyResetKey = "em_extra_reward_weekly_reset";
+    public const string AddRewardResetKey = "em_add_reward_reset";
+    /// <summary>
+    /// What an empty DB answers 0x1592 with: arb_world.log seq 11 (2026-09-09T14:50Z weekly,
+    /// 2026-09-11T15:00Z daily) - the bytes the replay table sent before T156, so a first boot
+    /// changes nothing. World then sends 0x1598 / 0x159A with the current boundaries, and the
+    /// stored values take over from there.
+    /// </summary>
+    public const long DefaultExtraRewardWeeklyReset = 0x6AA17218;
+    public const long DefaultAddRewardReset = 0x6AA41770;
+
+    /// <summary>
+    /// 0x1582 as the real Arbiter sends it right after 0x1595 - identical in all seven captures
+    /// that have the pair. (The handshake burst's 0x1582 is the all-zero variant.)
+    /// </summary>
+    public static readonly byte[] InitTimelineChangesOnLoad = { 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0 };
+
+    /// <summary>Test seam for the one timestamp T156 makes up: a new daily_event row's stamp.</summary>
+    public Func<DateTimeOffset> EventClock { get; set; } = () => DateTimeOffset.UtcNow;
+
+    /// <summary>
+    /// AS_EVENT_MATCHING_INFO_LIST, 27-byte frame, both lists empty (offset = frame end, length 0).
+    /// Byte-exact against cap_social seq 459 / 547 and cap_social4 seq 8039 (ByPlayer 1).
+    /// </summary>
+    public static byte[] BuildEventMatchingInfoList(int userDbId, byte byPlayer)
+    {
+        var p = new byte[21];
+        BitConverter.GetBytes(0x1Bu).CopyTo(p, 0);    // BattleFieldList
+        BitConverter.GetBytes(0x1Bu).CopyTo(p, 8);    // DungeonList
+        BitConverter.GetBytes(userDbId).CopyTo(p, 16);
+        p[20] = byPlayer;
+        return p;
+    }
+
+    /// <summary>AS_EVENT_MATCHING_INFO, 30-byte frame, OffPairList empty. Byte-exact against every captured 0x1595.</summary>
+    public static byte[] BuildEventMatchingInfo(long extraRewardWeeklyReset, long addRewardReset)
+    {
+        var p = new byte[24];
+        BitConverter.GetBytes(0x1Eu).CopyTo(p, 0);    // OffPairList (8-byte records; none stored)
+        BitConverter.GetBytes(extraRewardWeeklyReset).CopyTo(p, 8);
+        BitConverter.GetBytes(addRewardReset).CopyTo(p, 16);
+        return p;
+    }
+
+    /// <summary>0x1599 / 0x159B: [u8 Result][i64 the time World sent]. World applies the time only when Result != 0.</summary>
+    public static byte[] BuildResetTimeReply(bool ok, long time)
+    {
+        var p = new byte[9];
+        p[0] = (byte)(ok ? 1 : 0);
+        BitConverter.GetBytes(time).CopyTo(p, 1);
+        return p;
+    }
+
+    /// <summary>
+    /// DBS_LOAD_ADDITIONAL_REWARD_RECV_COUNT: [list frame offset 0x13][list byte length]
+    /// [DlmId][u8 Success] then 8-byte records [i32 EventId][i32 AcquireNum]. Success is 1 only
+    /// when the character has records - the empty reply is cap_social4 seq 285 byte for byte.
+    /// </summary>
+    public static byte[] BuildDbsLoadAdditionalRewardRecvCount(uint dlmId, IReadOnlyList<(int EventId, int AcquireNum)>? rows)
+    {
+        int n = rows?.Count ?? 0;
+        var p = new byte[13 + 8 * n];
+        BitConverter.GetBytes(0x13u).CopyTo(p, 0);
+        BitConverter.GetBytes((uint)(8 * n)).CopyTo(p, 4);
+        BitConverter.GetBytes(dlmId).CopyTo(p, 8);
+        p[12] = (byte)(n > 0 ? 1 : 0);
+        for (int i = 0; i < n; i++)
+        {
+            BitConverter.GetBytes(rows![i].EventId).CopyTo(p, 13 + 8 * i);
+            BitConverter.GetBytes(rows[i].AcquireNum).CopyTo(p, 17 + 8 * i);
+        }
+        return p;
+    }
+
+    /// <summary>
+    /// DBS_LOAD_USER_DAILY_EVENT, 52-byte frame (Handler_SDB_LOAD_USER_DAILY_EVENT,
+    /// ArbiterServer.exe.c:1277606): [record frame offset 0x20][record length 20][reqId]
+    /// [u8 Success][i64 ExtraRewardLastResetTime][u8 GotExtraReward][i32 ExtraRewardValue]
+    /// [20-byte record]. No row: Success 0 and zeros - cap_newchar seq 338.
+    /// </summary>
+    public static byte[] BuildDbsLoadUserDailyEvent(uint reqId, CharacterStore.DailyEventRow? row)
+    {
+        var p = new byte[26 + DailyEventRecordLength];
+        BitConverter.GetBytes(0x20u).CopyTo(p, 0);
+        BitConverter.GetBytes((uint)DailyEventRecordLength).CopyTo(p, 4);
+        BitConverter.GetBytes(reqId).CopyTo(p, 8);
+        if (row is null) return p;
+        p[12] = 1;
+        BitConverter.GetBytes(row.ExtraRewardReset).CopyTo(p, 13);
+        p[21] = (byte)(row.GotExtraReward ? 1 : 0);
+        BitConverter.GetBytes(row.ExtraRewardValue).CopyTo(p, 22);
+        for (int i = 0; i < 5 && i < row.Counts.Length; i++)
+            BitConverter.GetBytes(row.Counts[i]).CopyTo(p, 26 + 4 * i);
+        return p;
+    }
+
+    /// <summary>
+    /// The five counts out of 0x293C's record ref ([0] frame offset, [4] length). A ref that is
+    /// zero, short, or points outside the frame reads as zeros - the real handler copies nothing
+    /// from an offset it rejects.
+    /// </summary>
+    public static int[] ReadDailyEventRecord(byte[] payload)
+    {
+        var counts = new int[5];
+        if (payload.Length < 8) return counts;
+        uint frameOff = BitConverter.ToUInt32(payload, 0);
+        uint len = Math.Min(BitConverter.ToUInt32(payload, 4), (uint)DailyEventRecordLength);
+        if (frameOff < 6) return counts;
+        ulong start = frameOff - 6u;
+        uint n = len / 4;
+        if (start + 4ul * n > (ulong)payload.Length) return counts;
+        for (int i = 0; i < n; i++) counts[i] = BitConverter.ToInt32(payload, (int)start + 4 * i);
+        return counts;
+    }
+
+    /// <summary>A World i64 stamp for the log. The fuzz test sends ones DateTimeOffset rejects, so never throw.</summary>
+    private static string UnixText(long t)
+        => t is >= 0 and <= 253402300799 ? DateTimeOffset.FromUnixTimeSeconds(t).UtcDateTime.ToString("u") : t.ToString();
+
+    private bool OnAvailableEventMatchingList(WorldLink link, byte[] payload)
+    {
+        if (payload.Length < AvailableEventMatchingListMinPayload)
+        {
+            _log.LogWarning("SA_AVAILABLE_EVENT_MATCHING_LIST: {Len} B, shorter than the 0x17-byte frame World sends - dropped",
+                payload.Length + 6);
+            return true;
+        }
+        ulong gameId = (ulong)Ep64(payload, 0);
+        byte byPlayer = payload[16];
+        int userDbId = PlayerIdForGameId?.Invoke(gameId) ?? 0;
+        if (userDbId <= 0)
+        {
+            // The real Arbiter does nothing for a user it cannot find. Not a DLM item, so
+            // staying silent wedges nothing; a replayed reply would name the wrong user.
+            _log.LogWarning("SA_AVAILABLE_EVENT_MATCHING_LIST: no character for ArbiterUser 0x{Game:X} - not answered", gameId);
+            return true;
+        }
+        link.SendFrame(AS_EVENT_MATCHING_INFO_LIST, BuildEventMatchingInfoList(userDbId, byPlayer));
+        _log.LogDebug("SA_AVAILABLE_EVENT_MATCHING_LIST: user {User} byPlayer {By} party 0x{Party:X} -> 0x1591",
+            userDbId, byPlayer, Ep64(payload, 8));
+        return true;
+    }
+
+    private bool OnLoadEventMatchingInfo(WorldLink link)
+    {
+        long weekly = _store?.GetCounterValue(ExtraRewardWeeklyResetKey, DefaultExtraRewardWeeklyReset) ?? DefaultExtraRewardWeeklyReset;
+        long daily = _store?.GetCounterValue(AddRewardResetKey, DefaultAddRewardReset) ?? DefaultAddRewardReset;
+        link.SendFrame(AS_EVENT_MATCHING_INFO, BuildEventMatchingInfo(weekly, daily));
+        link.SendFrame(AS_INIT_TIMELINE_CHANGES, (byte[])InitTimelineChangesOnLoad.Clone());
+        _log.LogInformation("SA_LOAD_EVENT_MATCHING_INFO: weekly extra-reward reset {Weekly}, add-reward reset {Daily}",
+            UnixText(weekly), UnixText(daily));
+        return true;
+    }
+
+    private bool OnUpdateExtraRewardResetTime(WorldLink link, byte[] payload)
+    {
+        if (payload.Length < ResetTimeUpdateMinPayload) return true;
+        long t = Ep64(payload, 0);
+        _store?.SetCounterValue(ExtraRewardWeeklyResetKey, t);
+        link.SendFrame(AS_UPDATE_PLAYGUIDE_EXTRA_REWARD_RESETTIME, BuildResetTimeReply(true, t));
+        _log.LogInformation("SA_UPDATE_PLAYGUIDE_EXTRA_REWARD_RESETTIME: weekly extra-reward reset -> {T}", UnixText(t));
+        return true;
+    }
+
+    private bool OnUpdateAddRewardResetTime(WorldLink link, byte[] payload)
+    {
+        if (payload.Length < ResetTimeUpdateMinPayload) return true;
+        long t = Ep64(payload, 0);
+        int cleared = 0;
+        if (_store is not null)
+        {
+            _store.SetCounterValue(AddRewardResetKey, t);
+            cleared = _store.ClearEventMatchingRewards();   // ClearEventMatchingAddRewardCount, unconditional
+        }
+        link.SendFrame(AS_UPDATE_EVENT_MATCHING_ADD_REWARD_RESETTIME, BuildResetTimeReply(true, t));
+        _log.LogInformation("SA_UPDATE_EVENT_MATCHING_ADD_REWARD_RESETTIME: add-reward reset -> {T}, {N} count(s) cleared",
+            UnixText(t), cleared);
+        return true;
+    }
+
+    private bool OnUpdateAdditionalRewardRecvCount(WorldLink link, byte[] payload)
+    {
+        int user = Ep32i(payload, 4), eventId = Ep32i(payload, 8), acquire = Ep32i(payload, 12);
+        if (_store is not null && user > 0 && payload.Length >= UpdateAdditionalRewardMinPayload)
+            _store.SetEventMatchingReward(user, eventId, acquire);
+        link.SendFrame(DBS_UPDATE_ADDITIONAL_REWARD_RECV_COUNT, BuildReqIdAck(payload, 0));   // [DlmId][1]
+        return true;
+    }
+
+    private bool OnLoadAdditionalRewardRecvCount(WorldLink link, byte[] payload)
+    {
+        int user = Ep32i(payload, 4);
+        var rows = _store is null || user <= 0 ? null : _store.GetEventMatchingRewards(user);
+        link.SendFrame(DBS_LOAD_ADDITIONAL_REWARD_RECV_COUNT, BuildDbsLoadAdditionalRewardRecvCount(Ep32(payload, 0), rows));
+        return true;
+    }
+
+    private bool OnLoadUserDailyEvent(WorldLink link, byte[] payload)
+    {
+        int user = Ep32i(payload, 4);
+        var row = _store is null || user <= 0 ? null : _store.GetDailyEvent(user);
+        link.SendFrame(DBS_LOAD_USER_DAILY_EVENT, BuildDbsLoadUserDailyEvent(Ep32(payload, 0), row));
+        return true;
+    }
+
+    /// <summary>
+    /// 0x293C: store the five counts (and a positive extra-reward stamp), push 0x1591 for the
+    /// user - the real handler calls User::SendAvailableEventMatchingListFromArbiter(false, party)
+    /// between the store and the reply - then answer 0x293D.
+    /// </summary>
+    private bool OnUpdateUserDailyEventCount(WorldLink link, byte[] payload)
+    {
+        int user = Ep32i(payload, 12);
+        if (_store is not null && user > 0)
+            _store.SetDailyEventCounts(user, ReadDailyEventRecord(payload), Ep64(payload, 16), EventClock().ToUnixTimeSeconds());
+        if (user > 0)
+            link.SendFrame(AS_EVENT_MATCHING_INFO_LIST, BuildEventMatchingInfoList(user, 0));
+        link.SendFrame(DBS_UPDATE_USER_DAILY_EVENT_COUNT, BuildReqIdAck(payload, 8));
+        return true;
+    }
+
+    /// <summary>
+    /// 0x293E: User::UpdateGetExtraReward(bool, int, bool). The bool and int are what the
+    /// daily_event load returns at +21 / +22 (both zero in every capture, as every captured
+    /// 0x293E writes 0 / 0); the trailing flag (1 in every capture) is not stored.
+    /// </summary>
+    private bool OnUpdateGetExtraReward(WorldLink link, byte[] payload)
+    {
+        int user = Ep32i(payload, 4);
+        if (_store is not null && user > 0 && payload.Length >= 13)
+            _store.SetDailyEventExtraReward(user, payload[8] != 0, Ep32i(payload, 9), EventClock().ToUnixTimeSeconds());
+        link.SendFrame(DBS_UPDATE_GET_EXTRA_REWARD, BuildReqIdAck(payload, 0));
+        return true;
     }
 
     // ---- SDB_RESULT_CITY_WAR (0x295C) -> 0x15ED + DBS_RESULT_CITY_WAR (0x295D), T23 ----
@@ -5089,6 +6434,14 @@ public sealed class DbProxyHandlers
     public const int StarterInventoryItemStart = 13;
     public const int StarterInventoryItemSize = 536;
     public const int StarterInventoryOwnerOffset = 16;
+    /// <summary>
+    /// The playerId the 2026-09-13 replay capture belongs to. T142b: this is NO LONGER a
+    /// special case in <c>OnLoadInventory</c>. Character 1 is dob, a live character with a
+    /// level and gear, and short-circuiting her to the replay meant her store rows were never
+    /// read OR seeded - so every QA grant landed in `items` where nothing read it back, and the
+    /// admin API showed an empty bag that had in fact always been empty. The constant stays
+    /// because the character-creation test asserts new characters do not land on it.
+    /// </summary>
     public const int CapturedInventoryPlayerId = 1;
     private static byte[]? _starterInventory;
 
@@ -5097,7 +6450,8 @@ public sealed class DbProxyHandlers
         if (payload.Length < 8) return false;
         uint reqId = BitConverter.ToUInt32(payload, 0);
         int playerId = (int)BitConverter.ToUInt32(payload, 4);
-        if (playerId == CapturedInventoryPlayerId) return false;     // dob: replay-table capture
+        // T142b: character 1 used to return false here and be served the replay capture. See
+        // CapturedInventoryPlayerId - she is a live character and is loaded like everyone else.
 
         var template = LoadStarterInventory();
         if (template == null)

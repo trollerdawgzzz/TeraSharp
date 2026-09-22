@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 the TeraSharp contributors
 <#
 .SYNOPSIS
     Re-list a client<->Arbiter packet-logger capture into a condensed listing plus
@@ -42,7 +44,7 @@
     tap there is no tunnel noise here, and S_CHAT is usually what you came for.
 
 .EXAMPLE
-    .\reframe-client.ps1 -Log D:\packetlogs\capture_2026-09-13T11-42-27-513Z.log `
+    .\reframe-client.ps1 -Log <captures>\capture_2026-09-13T11-42-27-513Z.log `
                          -Packets S_SPAWN_ME,S_LOGIN,C_LOAD_TOPO_FIN
 
 .NOTES

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 the TeraSharp contributors
+
 using Microsoft.Extensions.Logging;
 using TeraSharp.Arbiter.Persistence;
 
@@ -338,6 +341,9 @@ public static class ParcelDbHandlers
     /// <summary>T79. +0xA4 is ParcelType: 102 for system mail, 1 for a player parcel
     /// (cap_social2 seq 417 vs 2420). World already sends it, so it is echoed, not stamped.</summary>
     public const int ParcelDataParcelType = 0xA4;
+    /// <summary>T151. ParcelType of system mail (SA_MAKE_SYS_PARCEL): 102 in every system row captured
+    /// (cap_social2 seq 417, cap_social4 seq 4560 x5, cap_final seq 3365).</summary>
+    public const int ParcelTypeSystem = 102;
     /// <summary>
     /// T79. +0xA8 is the READ flag. Three captures agree: the first DBS_LIST_PARCEL that shows a
     /// parcel has it 0 and every later listing of the same parcel has it 1 - cap_social2 seq 417
@@ -457,9 +463,14 @@ public static class ParcelDbHandlers
         if (stored is not null && stored.Length >= ParcelDataNoMsgSize)
             Buffer.BlockCopy(stored, 0, rec, 0, Math.Min(stored.Length, size));
         else
+        {
+            // T151: a system parcel has no World-built record to replay, so this form is all the
+            // client ever sees of it. The real rows carry the receiver's name and the type too.
             BuildParcelDataNoMsg(row.ParcelId, row.ReceiverDbId, row.SenderDbId, row.SenderName,
-                                 receiverName: null, row.Money, row.Title)
+                                 store.GetCharacter(row.ReceiverDbId)?.Name, row.Money, row.Title)
                 .CopyTo(rec, 0);
+            BitConverter.GetBytes(row.ParcelType).CopyTo(rec, ParcelDataParcelType);
+        }
 
         BitConverter.GetBytes(row.ParcelId).CopyTo(rec, ParcelDataParcelId);
         BitConverter.GetBytes(row.ReceiverDbId).CopyTo(rec, ParcelDataReceiverDbId);

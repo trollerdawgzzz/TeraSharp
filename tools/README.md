@@ -7,6 +7,8 @@
 | `npcap-to-capture.ps1` | a Noctenium `.npcap` | unpacks it into the `capture_*.log` text the two reframers read |
 | `trim-datasheets.ps1` | the server's `Datasheet\` folder | cuts it down to a keep-list of continent ids so the real servers fit in memory |
 | `restore-datasheets.ps1` | a trim manifest | puts it all back |
+| `capture-tune.ps1` | the server's `Executable\` folder | T149: temporary guild-war / guild-quest / Civil Unrest tweaks for a capture session, `-Revert` restores byte for byte (status/CAPTURE-T149-GUILD.md) |
+| `level70-start.ps1` | the server's `Executable\` folder | T160: comments out ClassException's TeleportRestriction rows; `-StarterScroll` adds jump scroll 207631 to CreateCharData (ArbiterServer only); `-Revert` restores byte for byte (status/QUEST-DESIGN.md T160) |
 
 ## The two reframers
 
@@ -23,10 +25,10 @@ Outputs, for either script:
 ```powershell
 cd D:\v100\TERA_SERVER.100\TeraSharp\tools
 
-.\reframe-tap.ps1    -Log D:\packetlogs\arb_world_2026-09-15T20-00-00-000Z.log `
+.\reframe-tap.ps1    -Log <captures>\arb_world_2026-09-15T20-00-00-000Z.log `
                      -Opcodes 0x139E,0x139F,0x13BB,0x13F8
 
-.\reframe-client.ps1 -Log D:\packetlogs\capture_2026-09-15T20-00-05-000Z.log `
+.\reframe-client.ps1 -Log <captures>\capture_2026-09-15T20-00-05-000Z.log `
                      -Packets S_GUILD_INFO,S_PARTY_MEMBER_LIST
 ```
 
@@ -99,7 +101,7 @@ kept, because every existing note that cites a frame number cites one of these.
 ```
 
 On `arb_world_2026-09-13T11-33-30-680Z.log` that is 1845 frames of 2366 — the listing goes from
-unreadable to 521 lines. The two existing listings in `D:\packetlogs` used slightly different
+unreadable to 521 lines. The two existing listings in `<captures>` used slightly different
 lists; `cap_newchar_ctl.txt` kept `0x147E` and dropped `0x13CC`, `0x164D` and `0x2958` instead.
 Pass `-Skip` explicitly to reproduce that one exactly, or `-Skip @()` to keep everything.
 
@@ -139,7 +141,7 @@ Neither script throws on a bad log; both count what they could not use and print
 
 Feeding the wrong script a log produces a warning naming the other one, not a stack trace.
 
-## Dry run over `D:\packetlogs`, 2026-09-15
+## Dry run over `<captures>`, 2026-09-15
 
 Every existing capture, both scripts, PowerShell 7.4.
 
@@ -172,7 +174,7 @@ disagrees — so the captures and the map are from the same build.
 
 ## `-Names` on the tap side is advisory
 
-`-Names D:\packetlogs\world_opcodes.txt` adds a name column. That table covers `AS_`/`SA_`
+`-Names <captures>\world_opcodes.txt` adds a name column. That table covers `AS_`/`SA_`
 (0x1389-0x16xx) and **not** the `SDB_`/`DBS_` range above 0x2700, and it disagrees with the
 repo in places — it calls `0x147D` `SA_LOAD_GUARD` where `DbProxyHandlers` calls it
 `AS_PROMOTION_LIST_REQ`, and `0x1484` `AS_ELECTION_STATE`. Use it to skim, not to cite. The
@@ -334,13 +336,13 @@ them is the one thing that would make the capture lie to you.
 
 ```powershell
 # the packet view (default) - one record per frame, and the complete list
-.\npcap-to-capture.ps1 -Npcap D:\packetlogs\classic_live.npcap
+.\npcap-to-capture.ps1 -Npcap <captures>\classic_live.npcap
 
 # the socket view instead
-.\npcap-to-capture.ps1 -Npcap D:\packetlogs\classic_live.npcap -Stream Raw -Out raw.log
+.\npcap-to-capture.ps1 -Npcap <captures>\classic_live.npcap -Stream Raw -Out raw.log
 
 # then read it like any other client capture
-.\reframe-client.ps1 -Log D:\packetlogs\classic_live.log
+.\reframe-client.ps1 -Log <captures>\classic_live.log
 ```
 
 Runs on **Windows PowerShell 5.1** as well as pwsh 7. Two things in the first cut did not:
@@ -398,7 +400,7 @@ Two were already listed above. This one cost an hour:
 ```powershell
 .\audit-release.ps1                        # walk the working tree
 .\audit-release.ps1 -Tracked                # only what git tracks, for CI
-.\audit-release.ps1 -AllowAddress 52.199.108.189
+.\audit-release.ps1 -AllowAddress 203.0.113.9
 ```
 
 Exits non-zero on anything that must not be published:

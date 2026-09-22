@@ -2,7 +2,7 @@
 
 Research and implementation for **T45**. Sources: the ArbiterServer 100.02 decompile
 (`D:\v100\TERA_SERVER.100\Arb_part_0*.c`), `tera-server-proxy/data/data.json` map `376012`,
-the `.def` files in `tera_v100_MASTER_FINAL`, and `D:\packetlogs\{arb_world,cap_newchar,
+the `.def` files in `tera_v100_MASTER_FINAL`, and `<captures>\{arb_world,cap_newchar,
 cap_newchar_client}.log`.
 
 A live WorldServer prints

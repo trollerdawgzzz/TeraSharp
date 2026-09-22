@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 the TeraSharp contributors
+
 namespace TeraSharp.Arbiter.World;
 
 /// <summary>
@@ -12,7 +15,7 @@ namespace TeraSharp.Arbiter.World;
 /// SDB_/DBS_ prefixes are kept because the DB-proxy path also pushes AS_/SA_ messages in this range
 /// (e.g. 0x2847 AS_LOAD_POCKET_NAME_INFO).
 ///
-/// Opcodes outside this range are named by <c>D:\packetlogs\world_opcodes.txt</c> (AS_/SA_/DSA_/BSA_).
+/// Opcodes outside this range are named by <c><captures>\world_opcodes.txt</c> (AS_/SA_/DSA_/BSA_).
 /// </summary>
 public static class DbProxyOpcodeNames
 {
@@ -21,6 +24,9 @@ public static class DbProxyOpcodeNames
 
     /// <summary>Name for <paramref name="op"/>, or null when it is not in the 0x2700-0x29FF table.</summary>
     public static string? Name(ushort op) => Names.TryGetValue(op, out var n) ? n : null;
+
+    /// <summary>Every opcode and its name (T165: the walk over the SDB_/DBS_ twins).</summary>
+    public static IReadOnlyDictionary<ushort, string> All => Names;
 
     /// <summary>"0xNNNN NAME" for log lines; "0xNNNN" alone when the opcode is unknown.</summary>
     public static string Describe(ushort op)

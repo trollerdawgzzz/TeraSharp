@@ -1,8 +1,8 @@
 # status/ALTA-DIFF.md - T129, the full-payload Alt+A diff
 
-Real: `D:\packetlogs\cap_final_gm_client2.log` - the original ArbiterServer.exe, panel OPENS
+Real: `<captures>\cap_final_gm_client2.log` - the original ArbiterServer.exe, panel OPENS
 (`C_ADMIN_REQUEST_CUSTOM_BOOKMARK` at record 524).
-Ours: `D:\packetlogs\cap_t124.log` - TeraSharp after T124, same D:\Tera 100-class client,
+Ours: `<captures>\cap_t124.log` - TeraSharp after T124, same D:\Tera 100-class client,
 panel does NOT open (zero `C_ADMIN_*` in the whole capture; 25 `C_REQUEST_PVE_RANKING` instead).
 
 Window: every `S->C` frame from `S_LOGIN_ARBITER` (record 7 in both) to the first
@@ -253,7 +253,7 @@ were checked and none of them carries the path:
 
 | Source | What is actually there |
 |---|---|
-| `ArbiterServer.exe.c` (59 MB, grepped) | No admin-tool path. Its ONLY URL is `L"http://%s/Default.aspx?v=%s"` at line 1440066, filled with the hardcoded `"52.199.108.189:80"` and `"Live-100.02 TW #9 (Gold)"` and fired through `InternetOpenUrlW` as `ArbiterServer` - a retail phone-home at startup, unrelated to Alt+A. (Worth blocking before going public.) |
+| `ArbiterServer.exe.c` (59 MB, grepped) | No admin-tool path. Its ONLY URL is `L"http://%s/Default.aspx?v=%s"` at line 1440066, filled with the hardcoded a hardcoded retail address and `"Live-100.02 TW #9 (Gold)"` and fired through `InternetOpenUrlW` as `ArbiterServer` - a retail phone-home at startup, unrelated to Alt+A. (Worth blocking before going public.) |
 | `WebApp\ContentsControl\Awesomium\*` | A DIFFERENT feature. `AwesomiumUrlControl.aspx` is a GM page managing a per-server (Title, Url) list - the in-game web panel. All logic is compiled into `WebApp\bin\*.dll`; the .aspx files are markup only. |
 | `S_RESPONSE_SERVER_ADMINTOOL_AWESOMIUM_URL` | Serves that same list. Body in the working capture is `08 00 0A 00 00 00 00 00` = TWO string refs at packet 8 and 10, BOTH EMPTY. The panel opened with an empty admin-tool URL, which is the proof the URL does not come from this packet. (The shipped def declares only `string title` - it under-declares the second string.) |
 | `tera-api` | `API_GATEWAY_LISTEN_PORT=8040`, and its own `.env.example` calls it the API "for receiving connections from the external website (like billing)". Not an admin tool. |
@@ -308,3 +308,260 @@ line saying nothing is serving the address and returns null, so adding it is saf
 1. Add the wiring line, set the four env vars, restart.
 2. Press Alt+A on a GM account and read the `api-gateway probe:` log line.
 3. That line is T133's specification: the path, the query, and where the token rides.
+
+
+---
+
+## T143 - the replay bisection, and why it cannot find a packet
+
+**Asked for:** replay `cap_final_gm_client2`'s S->C stream to a client, press Alt+A, and if it
+opens, bisect prefixes to the single packet whose presence flips the panel.
+
+**Result: there is no such packet, and the two captures already on disk prove it.** No replay
+was run - this was settled by reading `cap_final_gm_client2.log` (real, panel OPENS) against
+`cap_t124.log` (ours, panel does NOT open) directly.
+
+### The proof
+
+The client's Alt+A handler is GM-gated on the client side, and the first thing it does past
+that gate is ask the server for the admin-tool URL. Both stacks get that far:
+
+| | real | ours |
+|---|---|---|
+| client asks `C_REQUEST_SERVER_ADMINTOOL_AWESOMIUM_URL` | record 405 | record **132** (and again at 376) |
+| server answers `S_RESPONSE_SERVER_ADMINTOOL_AWESOMIUM_URL` | 412 | 133 (and 377) |
+| the answer, whole frame | `0C 00 CE F2 08 00 0A 00 00 00 00 00` | **byte-identical** |
+| panel populates (`C_ADMIN_REQUEST_CUSTOM_BOOKMARK`) | 524 | never - zero `C_ADMIN_*` in 659 records |
+
+So **Alt+A already fires on TeraSharp and our answer is already correct byte-for-byte.** Whatever
+stops the panel happens after that exchange, in the client.
+
+**The reply carries no URL.** Its body is `08 00 | 0A 00 00 00 00 00` - a packet-relative string
+ref pointing at offset 8, where the two bytes are `00 00`, i.e. the empty string. The real server
+tells the real client "your admin-tool URL is empty" and the real client opens the panel anyway.
+The page the Awesomium view loads is therefore built client-side, from `apiServerAddress` in
+`S_LOGIN_ACCOUNT_INFO` - which is section 3's measured difference, 127.0.0.1:**8800** real
+against 127.0.0.1:**8040** ours.
+
+**The 111 records between the identical answer and the panel populating are world simulation.**
+Every S->C opcode in real's 412..524 window: `S_NPC_LOCATION` x25, `S_ABNORMALITY_BEGIN` x12,
+`S_NPC_STATUS` x10, `S_ABNORMALITY_END` x9, `S_CREATURE_ROTATE` x6, `S_ACTION_END` x6,
+`S_ACTION_STAGE` x5, `S_SIMPLE_TIP_REPEAT_CHECK` x5, `S_SOCIAL` x5, `S_NPC_AI_EVENT` x3, and
+fourteen more of the same kind. Not one is account-, GM- or admin-scoped.
+
+**Across the whole login-to-panel window** (`S_LOGIN_ARBITER` record 7 to the first `C_ADMIN_*`)
+real sends 129 distinct S->C opcodes and we send 107. Of the 28 real-only ones, 27 are guild,
+party, event or world content (`S_GUILD_INFO`, `S_SPAWN_USER`, `S_EACH_SKILL_RESULT`, ...). The
+twenty-eighth is `S_VERSION_INFO`, already named in section 4 - and it cannot be the Alt+A gate,
+because it arrives at real record 286 while our client fires Alt+A at record 132 having never
+received it.
+
+### Why a prefix bisection was the wrong instrument
+
+A prefix bisection finds a packet whose **presence** flips a behaviour. The difference here is
+not presence: both sides send the same GM packets, and the one packet that matters
+(`S_LOGIN_ACCOUNT_INFO`) is present in both and differs only in **content** - a port number
+inside a 544-byte body. Halving the stream would never isolate it; it would either be in every
+prefix or in none.
+
+A full replay of `cap_final_gm_client2` would in fact carry the real `apiServerAddress` of
+:8800, so if something answers on 8800 on that box the panel would likely open - and the
+bisection would then converge on `S_LOGIN_ACCOUNT_INFO` and blame the wrong thing, its presence
+rather than one field in it.
+
+### Conclusion, and the correction to the brief's second branch
+
+The gate is outside the Arbiter->client stream, but it is **not** a hub or launcher GM flag. The
+GM flag demonstrably works: `S_LOGIN_ARBITER` status 33, `S_ADMIN_GM_SKILL` at record 72, and
+above all the client voluntarily emitting the GM-gated `C_REQUEST_SERVER_ADMINTOOL_AWESOMIUM_URL`
+all say the client considers this account a GM. The gate is the **Awesomium view's HTTP fetch of
+the admin page at `apiServerAddress`**, which on our stack points at a port where nothing is
+listening.
+
+### The cheap decisive experiment (replaces the bisection)
+
+`Program.cs` now has T132's wiring line, so:
+
+1. `TERASHARP_API_GATEWAY=127.0.0.1:8800`, `TERASHARP_API_GATEWAY_SERVE=1`, and
+   `TERASHARP_API_JWT_SECRET` set to tera-api's `API_PORTAL_SECRET`.
+2. Restart the Arbiter, log in on a GM account, press Alt+A.
+3. Read the `api-gateway probe:` log line. It prints the path, the query and where the token
+   rides - which is the specification for the real handler, and is the thing no capture in this
+   project contains.
+
+If no probe line appears, the client is not fetching at all and `S_VERSION_INFO` becomes worth
+sending. If one appears, the panel's requirement is an HTTP response, and no packet change can
+substitute for it.
+
+---
+
+## T144b - Alt+A, full-payload diff: the gate is in S_SELECT_USER
+
+Captures: `cap_altA_gm.log` (ours, T144 build, 851 records) against `cap_final_gm_client2.log`
+(real, 3418 records, panel opens at 524), with `cap_final_client2.log` (real, ordinary account)
+and `cap_final_gm_client.log` (real, **same GM account, different character**) as controls.
+Windows aligned on the post-spawn Alt+A: real 2..412, ours 2..380.
+
+### The control that settles it
+
+`cap_final_gm_client` is the same GM account, same `S_LOGIN_ARBITER` status 33, same
+`S_ADMIN_GM_SKILL`, Alt+A pressed at record 323 - and no panel. It selected character 1003,
+whose `adminLevel` is 0. So the gate is neither the account, nor the status byte, nor the
+GM-skill packet, nor the URL response - it is per-character, and it is set at character select.
+
+| capture | acct status | S_ADMIN_GM_SKILL | S_GET_USER_LIST adminLevel | S_SELECT_USER body | panel |
+|---|---|---|---|---|---|
+| cap_final_gm_client2 (real) | 33 | sent | **1** | `01 01000000 00000000 00 00` | **OPENS** |
+| cap_final_gm_client (real) | 33 | sent | 0 | `01 00000000 00000000 00 00` | no |
+| cap_final_client2 (real) | 31 | not sent | 0 | `01 00000000 00000000 00 00` | no |
+| cap_altA_gm (**ours**) | 33 | sent | **5** | `01 00000000 00000000 01 01` | no |
+
+### S_SELECT_USER is mis-typed in the shipped def
+
+The def says `byte unk1 / uint16 unk2 / uint64 unk3`. The writer says otherwise. Its PDL
+signature is `PKT_S_SELECT_USER_WRITE, bool, int, enum SelectUserErrorCode, bool, bool`, and the
+two emit helpers fix the widths - `FUN_140351320` advances the cursor by 1, `FUN_1400554e0` by 4:
+
+| body | type | name | source |
+|---|---|---|---|
+| 0 | bool | accepted | literal `1` on the success path |
+| 1 | **int32** | **adminLevel** | `*(int *)(User + 0x3B98)` |
+| 5 | int32 | SelectUserErrorCode | literal `0` on the success path |
+| 9 | bool | isFirstLoginToday | `User::IsFirstLoginToday()` |
+| 10 | bool | isFirstLoginTodayByAccount | `User::IsFirstLoginTodayByAccount()` |
+
+1 + 4 + 4 + 1 + 1 = 11 = the captured body. `User+0x3B98` is written by
+`User::UpdateAdminLevel(int)` (persisted through `dbo.spUpdateUserAdminLevel`) and is the same
+field `S_GET_USER_LIST.adminLevel` reads, which is why the two frames always agree on the real
+server and disagreed on ours.
+
+### The defect
+
+`WorldEntry.EnterWorld` - the path taken whenever World is connected, i.e. every live login -
+still carried the pre-T123 literal `unk2 = 0, unk3 = 72339069014638592UL`. That writes
+`adminLevel = 0` and sets **both** first-login bools. T123 fixed only
+`ArbiterClientHandlers.BuildSelectUserFields`, which the standalone path uses; the World path
+was never updated, so the fix never reached a live session. Both call sites now go through the
+helper and pass `GmCommandHandlers.LevelOf`.
+
+### Everything else in the window
+
+| opcode | field | real | ours | verdict |
+|---|---|---|---|---|
+| S_CHECK_VERSION, S_LOADING_SCREEN_CONTROL_INFO, S_REMAIN_PLAY_TIME | whole frame | - | identical | - |
+| S_LOGIN_ARBITER | status | 33 | 33 | identical (ordinary account: 31) |
+| S_LOGIN_ACCOUNT_INFO | accountId, dbServerName | 1, PlanetDB_2800 | same | - |
+| S_LOGIN_ACCOUNT_INFO | antiCheatChecksumSeed, apiServerAuthToken | 619351, JWT | 941901, JWT | session nonce |
+| S_LOGIN_ACCOUNT_INFO | apiServerAddress | 127.0.0.1:8800 | 203.0.113.10:8800 | deploy config, not a gate - see below |
+| S_GET_USER_LIST | veteran, maxCharacters | 1, 3 | 0, 8 | account state |
+| S_GET_USER_LIST | adminLevel (elem+142) | 1 | 5 | both > 0; T144 works |
+| S_GET_USER_LIST | level, hp, guildName, achievementPoints, guildLogoId | - | - | character state |
+| **S_SELECT_USER** | **body 1 adminLevel** | **1** | **0** | **the gate** |
+| **S_SELECT_USER** | **body 9/10 first-login bools** | **0, 0** | **1, 1** | **same defect** |
+| S_ADMIN_GM_SKILL | whole frame | `09 00 BE 64 00 00 00 00 01` | identical | - |
+| S_ADMIN_HOLD_CHARACTER | whole frame | `05 00 0E A3 00` | identical | - |
+| S_CURRENT_CHANNEL | whole frame | `14 00 23 6D ...` | identical | - |
+| S_VERSION_INFO | revision, description, display | 0, "", 1 | identical | T131 shipped |
+| S_RESPONSE_SERVER_ADMINTOOL_AWESOMIUM_URL | whole frame | `0C 00 CE F2 08 00 0A 00 00 00 00 00` | identical | identical on the NON-GM session too |
+| S_USER_STATUS | gameId | ...F00002 | ...F00001 | entity id |
+| S_LOGIN, S_SPAWN_ME, S_LOAD_TOPO, S_PLAYER_STAT_UPDATE, S_SERVER_TIME | all | - | - | character state; real-GM = real-normal, so no admin bit |
+| S_GUILD_*, S_GET_USER_GUILD_LOGO, S_EVENT_QUEST_SUMMARY, S_SKILL_CATEGORY, S_NPC_*, S_ABNORMALITY_*, S_ACTION_* | - | present | absent | our character has no guild and the zone is empty |
+| C->S, whole window | - | 27 frames | 26 frames | only `C_GET_USER_GUILD_LOGO` x2 extra (guild) |
+
+Between the real URL response (412) and the panel (524) the client sends only
+`C_SIMPLE_TIP_REPEAT_CHECK` x5, `C_GUARD_PK_POLICY` and `C_VISIT_NEW_SECTION`, and the server
+sends nothing but ambient world traffic. There is no second keypress and no handshake: the
+panel opens off state the client already had.
+
+### Correction to the T129/T131/T132 conclusion above
+
+The earlier sections concluded the gate was the Awesomium view's HTTP fetch at
+`apiServerAddress`. That is wrong, and the probe never firing was the evidence against it rather
+than for it: `S_RESPONSE_SERVER_ADMINTOOL_AWESOMIUM_URL` is byte-identical in all three real
+sessions, including the two where the panel never opened, so it cannot be what distinguishes
+them. The client decides whether to open the panel before it would fetch anything, and it
+decides on `S_SELECT_USER` body 1. `apiServerAddress` still matters for what the panel then
+*shows*, and should be set to an address the client can reach, but it is not the gate.
+
+### Note, not acted on
+
+`User+0x3B98` is reset to 0 at LeaveWorld when it equals exactly 5 (`leaveType != 2`) - the real
+server treats level 5 as a session-scoped GM grant. `GmCommandHandlers.LevelOf` returns 5 for
+listed operators. Harmless here (the checks around it are all `> 0`), but it is why the real GM
+capture carries 1 and not 5.
+
+---
+
+## T148 - GM held/vaporized: the World half of the invisibility toggle
+
+| frame (cap_final.log, real) | what | ours before | ours now |
+|---|---|---|---|
+| 408 AS_ENTER_WORLD `[111]` | adminLevel 1 | LevelOf (T142b) | same |
+| 495 SDB_USER_VAPORIZED `01 00 00 00 01` | World: `User::EnterWorld` -> `SetVaporized(1)` when admin > 0 | dropped | tracked -> `IsGmInvisible` |
+| 618/619 0x2930 -> 0x2931 `[reqId] 01 00` | LoadHoldCharacterStatus, every character; payload[5] = held | `01 00` | same - never held |
+| 769 AS_ADMIN_REQUEST_USERACTION (0x2827) | tool's C_ADMIN_GM_SKILL(0) -> action 0x65, arg = skill | **never sent** - answered the client locally | sent; World answers |
+| 774 SDB_USER_VAPORIZED `... 00` | World releases | - | tracked |
+| 775 S_ADMIN_GM_SKILL 00, then S_LOAD_TOPO | World's reply + respawn (the short loading screen) | ours, local, no respawn | World's, through the tunnel |
+
+- **Hold is not it.** 0x2930 is a load at every spawn; the real Arbiter answers held = 0 for GMs
+  too (cap_social4 x7, cap_final x16), and so do we. The hold flag (User+0xA610 -> +0x175) only
+  freezes C_PLAYER_LOCATION.
+- **Vaporize is.** Since T142b sent the admin level in AS_ENTER_WORLD, World vaporizes every GM at
+  spawn. Our Alt+A toggle flipped the client only, so World kept the character vaporized for the
+  whole session while the client showed it visible.
+- 0x2827 payload: `[u32 14 = record frame offset][u32 208]` + record: name/dbId x2 (8/84, 88/164),
+  zone 168, position 176-187 (= last S_LOAD_TOPO), action 188, arg 192. World's case 0x65 reads
+  164, 188, 192 only. Bytes past the names and the 20-byte tail are uninitialised stack on the real
+  Arbiter; ours are zero.
+- Learn path (`User::LearnSkillWithoutContract` -> `IsSkillLearnable`) does not read the vaporize
+  flag directly; the refusal is expected to clear once the GM toggles Invisible OFF. If it does
+  not, the next suspect is World's admin level itself (AS_ENTER_WORLD[111] = 0 restores the
+  pre-T142b state; cap_social4's GM ran with 0 and learned 210 skills).
+- Not changed: `/@vis` `/@invis` still flip the client switch only (T128); `/@vaporize`
+  `/@invisible` still also forward the World QA command.
+
+---
+
+## T152 - learns refused after relog: the spawn push inverted the GM's visibility
+
+cap_skills2.log holds both sessions of character `test` (10), adminLevel 5 in AS_ENTER_WORLD both times.
+
+| | session A 02:38 (learns work) | session B 03:14 (learns refused) |
+|---|---|---|
+| AS_LEARN_ALL_CREST_ACQUIRABLE | 691 B (pre-T151 echo) | 19 B empty (T151) - skills unaffected: S_SKILL_LIST / S_SKILL_LEARN_LIST in B carry every A learn and offer the next ranks |
+| SDB_INCREASE_INVENTORY_SIZE (T150b) | not sent | not sent |
+| 0x282D at spawn | none | none - World does not vaporize at adminLevel 5 |
+| client told at spawn | - | **our** S_ADMIN_GM_SKILL 01 "invisible" (client 76) |
+| GM panel | untouched | Invisible OFF -> 0x2827 -> World **vaporizes** (5896 `0a 00 00 00 01`, @1435); panel re-toggles 51 ms later (@1436) but no 0x282D 00 ever follows |
+| learn attempts | 48 x SDB_USER_LEARN_SKILL answered | 2 x C_SKILL_LEARN_REQUEST (skills 60401301, 60199, isActive 0) -> @3534 (0xDCE, IsSkillLearnable false); no SDB write |
+
+The spawn S_ADMIN_GM_SKILL is World's, not the Arbiter's: cap_final 495 SDB_USER_VAPORIZED 01 then 496 SA_BYPASS_TO_CLIENT
+`09 00 BE 64 00 00 00 00 01`. Our World-path push duplicated it when World vaporizes and contradicted it when World does not.
+Removed; the tracker follows SDB_USER_VAPORIZED only. Not changed: the injected S_ADMIN_HOLD_CHARACTER 00 after S_SPAWN_ME
+(World sends its own through the 0x2931 reply; ours is a harmless duplicate).
+
+## T155 - the GM tool's World-bound buttons
+
+Coordinate teleport sample: cap_multiworld_client 2497 C_ADMIN_GM_TELEPORT (zone 5, 16920 / 1232 / -4427) -> A->W 3060
+0x2827 action 100 with the packet's zone and position -> 2501/2502 S_FESTIVAL_LIST / S_LOAD_TOPO. (cap_final_gm_client2
+548-549 follow C_ADMIN_GM_SKILL 542, the T148 toggle, not a teleport.) World's Handler_AS_ADMIN_REQUEST_USERACTION has six
+cases (12, 13, 100, 0x65, 0x66, 0x67) and drops the rest.
+
+| Button | Client packet | Route (T155) | Sample |
+|---|---|---|---|
+| Coordinate teleport | C_ADMIN_GM_TELEPORT | 0x2827 action 100 - wired | mw 2497 -> 3060; 2243 / 5101 -> 2768 / 6171 |
+| Map teleport | C_ADMIN_GM_MAPTELEPORT `[nameOff][zone][x][y]` | 0x2827 action 0x67, z = 0x4b7fffff - wired | none |
+| Go to | C_ADMIN_REQUEST_USERACTION 12 | 0x2825 (GM's pos) -> World 0x2826 (target's pos) -> 0x2827 verbatim - wired | cf 916 / 917 / 918 |
+| Summon | C_ADMIN_REQUEST_USERACTION 13 | same chain - wired; the real one first runs a 10 s AdminTargetUserCallJob (@1337 to the target), ours asks at once | cf 1081 / 1082 / 1083 |
+| Resurrection | C_ADMIN_REQUEST_USERACTION 11 | 0x2825 only, World runs User::ResurrectNow - wired | none |
+| Kick | C_ADMIN_REQUEST_USERACTION 10 | Arbiter-local AdminTargetUserDisconnectJob (@1333, 3 s) - logged, not carried out | none |
+| Delete monster | C_ADMIN_REMOVE_NPC `[i64 gameId]` | 0x2827 action 0x66, id at payload 200 - wired | none |
+| Kill NPCs / Restrict | C_ADMIN_KILL_NPC, C_ADMIN_HOLD_CHARACTER, C_ADMIN_CHAT_BAN | World's own User:: handlers - tunnelled, unchanged | mw 11557 (kill) |
+| Movement speed | C_ADMIN `speed N` | AS_ADMIN_COMMAND - unchanged | mw 3682 |
+| Hide from mobs / Invincible | C_ADMIN_GM_SKILL 2 / 1 | 0x2827 0x65 (T148) | mw 2923 / 2974 |
+| Warn, bookmarks | C_ADMIN_WARNING_MESSAGE, *_BOOKMARK | Arbiter-local, answered (T89 / T99) | gm_client2 1399, 524, 1167 |
+| Collision | none identified | - | none |
+
+Records: payload 8 / 84 requester name / dbId, 88 / 164 target, 168 zone, 172 channel, 176 x y z, 188 action, 192 arg,
+200 i64 game id; 82-83, 162-163, 196-199, 209-215 are stack junk on the real Arbiter, zero on ours.
+0x2826 is routed by payload 84 (Handler_SA_ADMIN_REQUEST_USERACTION); dropped when the requester is offline.

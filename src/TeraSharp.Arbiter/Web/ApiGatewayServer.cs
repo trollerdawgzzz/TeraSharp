@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 the TeraSharp contributors
+
 using System.Net;
 using System.Text;
 using Microsoft.Extensions.Logging;
@@ -14,7 +17,7 @@ namespace TeraSharp.Arbiter.Web;
 // not read it:
 //
 //   * ArbiterServer.exe.c has no admin-tool path at all. Its only URL is a hardcoded retail
-//     phone-home, FUN_14016dad0(.., L"http://%s/Default.aspx?v=%s", "52.199.108.189:80",
+//     phone-home, FUN_14016dad0(.., L"http://%s/Default.aspx?v=%s", a hardcoded retail address,
 //     "Live-100.02 TW #9 (Gold)"), fired through InternetOpenUrlW at startup. Unrelated.
 //   * WebApp\ContentsControl\Awesomium\* is a DIFFERENT feature - the GM pages that manage the
 //     per-server (Title, Url) list behind C_/S_REQUEST_SERVER_ADMINTOOL_AWESOMIUM_URL. In the

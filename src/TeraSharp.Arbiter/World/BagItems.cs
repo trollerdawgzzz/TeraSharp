@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 the TeraSharp contributors
+
 using Microsoft.Extensions.Logging;
 using TeraSharp.Arbiter.Persistence;
 
@@ -111,6 +114,15 @@ public static class BagItems
             // owner is answered with SA_ENTER_WORLD_FAILED. Patch it even on a stored record,
             // so a row that was seeded for one playerId can never be served under another.
             BitConverter.GetBytes(ownerId).CopyTo(payload, at + RecordOwnerOffset);
+            // T153: and the row is the truth for where the item is and how many - a stored
+            // record keeps the position it was created at, and moves only update the row.
+            if (stored is not null && stored.Length == RecordSize)
+            {
+                BitConverter.GetBytes(row.ItemDbId).CopyTo(payload, at + StarterInventory.RecordIdOffset);
+                BitConverter.GetBytes((int)row.Amount).CopyTo(payload, at + StarterInventory.RecordAmountOffset);
+                BitConverter.GetBytes(row.InvenType).CopyTo(payload, at + StarterInventory.RecordPocketOffset);
+                BitConverter.GetBytes(row.Slot).CopyTo(payload, at + StarterInventory.RecordSlotOffset);
+            }
         }
         return payload;
     }
@@ -147,6 +159,16 @@ public static class BagItems
         ArgumentNullException.ThrowIfNull(store);
         ArgumentNullException.ThrowIfNull(reply);
         var atoms = WarehouseHandlers.ParseAtoms(reply, refOffset, recordSize);
-        return WarehouseHandlers.Apply(store, atoms, allocateItemId, log);
+        var result = WarehouseHandlers.Apply(store, atoms, allocateItemId, log);
+        // T153: an op-8 create carries the whole item (enchant and the rest); keep it as the
+        // row's record so the next 0x27A4 serves it. 856-byte atoms only - the 568-byte
+        // give/take records have a different tail.
+        if (recordSize <= 0 || recordSize == DbProxyHandlers.ItemAtomSize)
+        {
+            int kept = ItemCreate.StoreRecords(store, reply, refOffset);
+            if (kept > 0) log?.LogInformation("items: {N} created item record(s) stored (op 8)", kept);
+            ItemEdits.Apply(store, reply, refOffset, log);   // T166: enchant / awaken / option edits
+        }
+        return result;
     }
 }

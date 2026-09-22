@@ -1,4 +1,7 @@
-﻿using Microsoft.Extensions.Logging;
+﻿// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 the TeraSharp contributors
+
+using Microsoft.Extensions.Logging;
 using TeraSharp.Arbiter.Game;
 using TeraSharp.Arbiter.Network;
 using TeraSharp.Arbiter.Persistence;
@@ -24,10 +27,13 @@ public static class WorldEntry
         if (chr == null) { log.LogWarning("EnterWorld: no selected character"); return false; }
 
         // 1. Arbiter-side acknowledgement â€” closes the character select screen.
-        s.SendByDef("S_SELECT_USER", new Dictionary<string, object>
-        {
-            ["unk1"] = 1, ["unk2"] = 0, ["unk3"] = 72339069014638592UL,
-        });
+        //    T144b: the int32 at body 1 is the selected character's admin level (User+0x3B98 on
+        //    the real Arbiter), and it is what the client gates the Alt+A admin panel on - the
+        //    same GM account on an adminLevel-0 character never opens it. The old literals put
+        //    0 there and set isFirstLoginToday/ByAccount instead. BuildSelectUserFields is the
+        //    one place that shape lives now, shared with the standalone path in LoginHandlers.
+        s.SendByDef("S_SELECT_USER", ArbiterClientHandlers.BuildSelectUserFields(
+            accepted: true, adminLevel: GmCommandHandlers.LevelOf(s, Program.Store)));
         s.SendByDef("S_BROCAST_GUILD_FLAG", new Dictionary<string, object>());
         ArbiterClientHandlers.SendCurrentElectionState(s);   // T106
         int[] contents = { 2, 3, 4, 8, 9, 22, 23, 20, 21, 34 };

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 the TeraSharp contributors
+
 namespace TeraSharp.Arbiter.Protocol;
 
 /// <summary>Field kinds in a TERA packet definition.</summary>

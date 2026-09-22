@@ -271,7 +271,7 @@ is what the server does when `Rank()` misses its tree.
 
 ## 8. Against the live Classic+ server (T133)
 
-`D:\packetlogs\classic_live_ctl.txt` (T130) is the first capture of a leaderboard that
+`<captures>\classic_live_ctl.txt` (T130) is the first capture of a leaderboard that
 **answers**. The real Arbiter on 100.02 never did, so everything in sections 6 and 7 came from
 the decompile alone. Five frames are kept in `data/classic-live/` and the tests round-trip
 them.

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 the TeraSharp contributors
 <#
 .SYNOPSIS
     Trim a TERA 100.02 Datasheet folder down to a keep-list of continent ids, so the real

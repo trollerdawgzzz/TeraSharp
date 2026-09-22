@@ -2,7 +2,7 @@
 
 Sources: `Executable/ServerConfig.xml`, `Executable/DeploymentConfig.xml`, the `.bat` launchers,
 `ArbiterServer.exe.c` (Arb_part_*), `world_decompiled/WorldServer.exe.c`, and the current
-`World/WorldBridge.cs`. Opcodes are from `D:\packetlogs\world_opcodes.txt`, layouts from the PDL
+`World/WorldBridge.cs`. Opcodes are from `<captures>\world_opcodes.txt`, layouts from the PDL
 dumpers (offsets below are FRAME-relative: payload index = offset - 6).
 
 ## 0. There is only one WorldServer.exe
@@ -370,7 +370,7 @@ the way the file actually lands on disk.
 
 ## T134 - matchmaking and the battleground lifecycle (classic_live2)
 
-Source: `D:\packetlogs\classic_live2.log` - a LIVE Classic+ reference, 364273 records, carrying a
+Source: `<captures>\classic_live2.log` - a LIVE Classic+ reference, 364273 records, carrying a
 Corsairs battleground queue -> enter -> play -> leave and a Kelsaik dungeon queue. Its opcode map is
 the same 376012 map our 100.02 captures use (spot-checked on nine known opcodes), so the frames
 below are directly comparable to ours.
@@ -491,7 +491,7 @@ The cool-time half was applied by hand at :285 and needs nothing further.
 
 ## T136 - the leader side, from classic_live3
 
-The leader-side capture T134b said was needed now exists: `D:\packetlogs\classic_live3.log`, the
+The leader-side capture T134b said was needed now exists: `<captures>\classic_live3.log`, the
 human queueing Kelsaik (instance **9739**) as party leader, matching, and cancelling once. 56085
 records. It pins the REQUEST half, which classic_live2 could not.
 
@@ -597,7 +597,7 @@ one that should wait; `C_MATCH_PROGRESS` and `C_MATCH_ROOM_LIST` are read-only a
 
 ## T137 - the hand-off capture does NOT contain a cross-server hand-off
 
-`D:\packetlogs\cap_multiworld.log` (tap, 1207 reframed frames) plus `cap_multiworld_client.log`
+`<captures>\cap_multiworld.log` (tap, 1207 reframed frames) plus `cap_multiworld_client.log`
 (14349 client records). The brief's premise was that a player entered a dungeon instance on a
 SECOND linked World and was handed over. **The capture does not show that.** Everything below is
 measured, and it changes what parts 2 and 3 of T137 can honestly be.
@@ -694,7 +694,7 @@ MULTIWORLD-PATCH.diff is solving a problem this deployment does not have.
 
 ## T137b - a real cross-World hand-off exists. Half of it was captured.
 
-`D:\packetlogs\cap_multiworld2_ctl.txt` (216 frames) + `cap_multiworld2_client.log` (1389
+`<captures>\cap_multiworld2_ctl.txt` (216 frames) + `cap_multiworld2_client.log` (1389
 records). The player entered **Velik's Sanctuary, dungeon `35 26 00 00` = 9781**, hosted on the
 DungeonServer. This **supersedes T137's conclusion**: T137 saw dungeon 9827 served by the main
 World and concluded no cross-server hand-off happens on this box. It does - for the dungeons the
@@ -774,7 +774,7 @@ is missing.
 
 ## T137c - THE HAND-OFF, both links, complete
 
-`D:\packetlogs\cap_multiworld3.log` (47436 raw chunks -> **19046 frames** after splitting the
+`<captures>\cap_multiworld3.log` (47436 raw chunks -> **19046 frames** after splitting the
 coalesced `[u32 len][u16 op]` stream) + `cap_multiworld3_client.log` (7928 records). The player
 entered **Velik's Sanctuary (9781)** three times and came back each time.
 
@@ -982,7 +982,7 @@ job.
 
 **Naming note.** 0x13BE/0x13BF/0x13C0/0x13C1 are `SA_REQUEST_ENTER_DUNGEON` /
 `AS_REQUEST_ENTER_DUNGEON` / `SA_RESPONSE_ENTER_DUNGEON` / `AS_RESPONSE_ENTER_DUNGEON`
-(`D:\packetlogs\world_opcodes.txt` lines 54-57). T138b's `ContinentHandoff` calls them
+(`<captures>\world_opcodes.txt` lines 54-57). T138b's `ContinentHandoff` calls them
 `SA_REQUEST_ENTER_CONTINENT` / `AS_ENTER_CONTINENT` / `SA_CONTINENT_READY` / `AS_CONTINENT_READY`.
 The bytes are pinned and unchanged; only the names are ours, and the real ones are recorded here.
 
@@ -1112,3 +1112,108 @@ foreach (var (matchName, matchOp) in MatchWiring.ClientOpcodes)
     Reg(matchName, MatchWiring.MinBodyLength(matchOp),
         (s, body) => MatchWiring.OnClientPacket(s, matchOp, body));
 ```
+
+---
+
+## T138e - the seating was a greedy, and the capture said it had to be a matching
+
+Three failures on the real build, one of them a genuine defect in T138c's formation pass.
+
+### 1. The Warrior could not be seated (T138d_the_matcher_hands_the_seating_to_the_party_layer)
+
+`TryFormDungeon` seated each queue entry as it arrived, giving every member their default
+position if one was still free. With the capture's own party - Warrior, Priest, Slayer, Archer,
+Sorcerer - that produces:
+
+```
+Warrior  default DPS   -> DPS   (a DPS slot was free)
+Priest                 -> Healer
+Slayer                 -> DPS
+Archer                 -> DPS
+Sorcerer               -> can only DPS, and there are none left   -> ENTRY SKIPPED
+```
+
+four members, no tank, no group. The real server formed exactly this group - record 10587 has the
+Warrior in the **tank** slot - so the greedy was wrong, not the test.
+
+The seating is now a bipartite matching over the whole candidate set: members on one side, the
+template's slots on the other, an edge wherever `MatchComposition.CanFill` allows it, and Kuhn's
+augmenting path (`MatchQueueManager.TryAssign`). It is re-run each time an entry is added, so
+entries stay atomic - a queued party is taken whole or skipped - while positions are handed out
+with the whole group in view.
+
+Kuhn gets both directions right, which a greedy cannot:
+
+| pool (queue order) | seating |
+|---|---|
+| Warrior, Priest, Slayer, Archer, Sorcerer | **Tank**, Healer, DPS, DPS, DPS |
+| Warrior, **Lancer**, Priest, Slayer, Archer | DPS, **Tank**, Healer, DPS, DPS |
+
+In the second row the Warrior takes the tank slot first and is pushed back out to DPS the moment
+the Lancer - who can fill nothing else - arrives. At five to thirty members and three slot kinds
+the cost is nothing.
+
+### 2. T119_the_two_boards_come_from_real_stored_progress
+
+T138d made the PvP board the rating ladder and missed this test, which was still asserting the
+kill counts through `GetPvpRankingScores`. Its three PvP assertions now go through
+`GetPvpKillScores` - the same query under its new name - and it gained one line asserting that
+two kills put nobody on the ladder, so the test records the move rather than hiding it.
+
+### 3. T138c_battle_field_result_and_the_rating_round_trip
+
+The floor block T138c added - character 1 set to 3, losing a roll of 8, landing at 0 - was not in
+the committed test file, so character 1 finished that test holding a rating of 28..35 instead of
+0. Once T138d made the ladder select on `bg_rating > 0`, the board came back with **two** rows
+where the test expected one. The block is restored (it is the only thing exercising
+`Result.Applied`, which is what `OnTunnelled` writes to the client), and the ladder assertion is
+now preceded by an explicit check that character 1 is at the floor, so the next person to read it
+knows why exactly one row is expected.
+
+---
+
+## T138f - the queue window's position choice
+
+C_MATCH_ADD's trailing int32 is not T138c's "first queue" flag. It is the **position the player
+picked in the matching window**, in `DungeonMatching.xml`'s own numbering.
+
+| capture | record | character | value | reads as |
+|---|---|---|---|---|
+| classic_live3 | 8643 | Elin Warrior (templateId 11001) | 1 | DPS - cancelled at 9476 |
+| classic_live3 | 10322 | **the same character** | **0** | **Tank** - matched at 10585 |
+| cap_multiworld | 3889 | Castanic Glaiver (10813) | 1 | DPS |
+| cap_social4 | 5294 | Human Warrior (10201) | 1 | DPS |
+
+Rows 1 and 2 are the same player, the same instance and the same 55 bytes apart from that field,
+and `S_SYS_PARTY_INFO` record 10587 seats him at position **0, a tank** - his *second* position,
+not his default. He cancelled a DPS queue and re-sent it as a tank. That is both the confirmation
+the value is a position and the reason it is **binding**: the real server did not re-slot him.
+
+`MatchComposition.ChoiceToRole` is the table - `{ Tank, Dps, Healer }`, one line to correct.
+Value 2 is the numbering, not a sample: the only healers in the captures are Priest and
+Elementalist, which have no second position to choose.
+
+### What it changes
+
+- `Queuer` carries `Chosen` (default `MatchComposition.NoChoice`), read per player id from the
+  array by `ReadQueueChoices` and stamped on by `WithChoices` in `OnMatchAdd`.
+- `MatchComposition.CanFill(class, role, level, chosen)` narrows: a stated position the class can
+  fill is the *only* one it may be seated in. A stated position the class **cannot** fill is
+  ignored - a client narrows its own options, never widens them, so a Priest claiming the tank
+  slot is still a Priest.
+- `TryAssign`'s edges use it, so the choice survives the bipartite matching.
+- The pool-add tail is now each member's `EffectiveRole`, which reproduces both captured frames:
+  record 8662 carries 1 for the DPS queue, record 10333 carries 0 for the tank one.
+
+### The two T138e rows, with and without a choice
+
+| pool (queue order) | seating |
+|---|---|
+| Warrior, Priest, Slayer, Archer, Sorcerer - nothing stated | **Tank**, Healer, DPS, DPS, DPS |
+| Warrior, **Lancer**, Priest, Slayer, Archer - nothing stated | DPS, **Tank**, Healer, DPS, DPS |
+| Warrior **as tank**, Lancer, Priest, Slayer, Archer, Sorcerer | Warrior tanks; **the Lancer is skipped** and stays queued |
+| Warrior **as DPS**, Priest, Slayer, Archer, Sorcerer | no group at all - nobody can tank |
+
+The third row is the visible consequence: with a choice stated the Warrior holds the slot a
+Lancer would otherwise take, and the Lancer waits for the next group. The fourth is the one the
+capture itself shows - it is why that player had to queue again.

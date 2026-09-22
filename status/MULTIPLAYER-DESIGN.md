@@ -5,7 +5,7 @@ T27, research only. Nothing in this document is implemented. `World/WorldBridge.
 diffs rather than editing them.
 
 Sources: the decompiled `ArbiterServer.exe` (`Arb_part_000.c` … `Arb_part_095.c`), the four
-Arbiter↔World taps in `D:\packetlogs\`, and `ServerConfig.xml`. Every claim carries a
+Arbiter↔World taps in `<captures>\`, and `ServerConfig.xml`. Every claim carries a
 `FUN_…` / `file:line`. `WorldServer.exe.c` is a single 125 MB file and could not be staged
 into the research container, so every "what World expects" answer below is derived from the
 Arbiter's side of the contract and is flagged where that matters.
@@ -53,9 +53,7 @@ recipients the header is 48 bytes and the packet starts at payload+48.
 
 ### 1.2 The lookup
 
-`Arb_part_062.c:3762`: the handler keeps only the entries whose `PlanetId` equals its own,
-recovers the sequence number by shifting the entry's +12 u32 right by 19, and looks the session
-up by the low 32 bits of the `Ticket` at +8.
+`Arb_part_062.c:3762`:
 
 `FUN_1405b3840` is `PacketBypassManager::GetSession(int)` (`Arb_part_048.c:11975`) - it indexes
 the flat array at `+0x60` by the Ticket and returns whatever is there, with no bounds check.

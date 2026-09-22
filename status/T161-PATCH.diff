@@ -1,0 +1,115 @@
+# T161 - WorldBridge.cs (human-owned). Apply from the repo root: git apply status/T161-PATCH.diff
+# Then set Tests.T161PatchApplied = true; T161_a_leave_during_fan_out_does_not_stall_the_survivor
+# goes from PENDING to a hard test. World/TunnelRouting.cs (Cowork-owned, already on the branch)
+# holds the rule and the DepartedTickets set this patch calls.
+--- a/src/TeraSharp.Arbiter/World/WorldBridge.cs
++++ b/src/TeraSharp.Arbiter/World/WorldBridge.cs
+@@ -97,6 +97,8 @@
+     /// packet to a world 0 player (MULTIWORLD-DESIGN.md section 4 item 5).
+     /// </summary>
+     private readonly Dictionary<(int World, uint Ticket), TunnelReorderBuffer> _tunnels = new();
++    /// <summary>T161: Tickets whose session has gone - never borrowed for (World/TunnelRouting.cs).</summary>
++    private readonly DepartedTickets _departed = new();
+     private const int StallMs = 150;
+ 
+     /// <summary>
+@@ -125,7 +127,10 @@
+     {
+         lock (_playersLock) _players[s.GameId] = s;
+         lock (_reorderLock)
++        {
+             _tunnels[(s.CurrentWorldId, s.TunnelKey)] = new TunnelReorderBuffer { Deliver = p => Handlers.ArbiterClientHandlers.DeliverTunnelled(s, p) };   // T121: inject S_ADMIN_GM_SKILL before the tunnelled S_LOAD_TOPO
++            _departed.Forget(s.CurrentWorldId, s.TunnelKey);   // T161
++        }
+     }
+ 
+     public void UnregisterPlayer(ulong gameId, uint tunnelKey)
+@@ -135,7 +140,11 @@
+     public void UnregisterPlayer(ulong gameId, int worldId, uint tunnelKey)
+     {
+         lock (_playersLock) _players.Remove(gameId);
+-        lock (_reorderLock) _tunnels.Remove((worldId, tunnelKey));
++        lock (_reorderLock)
++        {
++            _tunnels.Remove((worldId, tunnelKey));
++            _departed.Add(worldId, tunnelKey);   // T161: World keeps addressing it until SA_LEAVE_WORLD
++        }
+         _tickets.For(worldId).Free(tunnelKey);
+     }
+ 
+@@ -184,7 +193,10 @@
+     internal void RegisterTunnelRoute(int worldId, uint key, Action<byte[]> callback)
+     {
+         lock (_reorderLock)
++        {
+             _tunnels[(worldId, key)] = new TunnelReorderBuffer { Deliver = callback };
++            _departed.Forget(worldId, key);   // T161
++        }
+     }
+ 
+     /// <summary>Remove a tunnel route by key (test-facing).</summary>
+@@ -194,7 +206,11 @@
+     /// <summary>The same, in one World's ticket space.</summary>
+     internal void UnregisterTunnelRoute(int worldId, uint key)
+     {
+-        lock (_reorderLock) _tunnels.Remove((worldId, key));
++        lock (_reorderLock)
++        {
++            _tunnels.Remove((worldId, key));
++            _departed.Add(worldId, key);   // T161
++        }
+     }
+ 
+     private GameSession? FindPlayer(ulong gameId)
+@@ -249,6 +265,7 @@
+                 buf.NextSeq = 0;
+                 buf.LastDelivery = DateTime.UtcNow;
+             }
++            _departed.Clear();   // T161: World restarted - its ticket table went with it
+         }
+     }
+ 
+@@ -286,15 +303,21 @@
+         // clients ended up with each other's spawn (MULTIPLAYER-DESIGN.md section 6).
+         Action<byte[]>? deliver = null;
+         int count;
++        bool departed;
+         lock (_reorderLock)
+         {
+             count = _tunnels.Count;
+-            if (_tunnels.TryGetValue((worldId, key), out var buf)) deliver = buf.Deliver;
+-            else if (count == 1) foreach (var b in _tunnels.Values) { deliver = b.Deliver; break; }
++            departed = _departed.Contains(worldId, key);
++            _tunnels.TryGetValue((worldId, key), out var own);
++            switch (TunnelRouting.Decide(own != null, departed, count))   // T161
++            {
++                case TunnelRouting.Route.Own: deliver = own!.Deliver; break;
++                case TunnelRouting.Route.Borrow: foreach (var b in _tunnels.Values) { deliver = b.Deliver; break; } break;
++            }
+         }
+         if (deliver != null) { deliver(packet); return; }
+-        _log.LogDebug("Tunnel ticket {Key} on world {W} unknown with {N} session(s) - dropped",
+-            key, worldId, count);
++        _log.LogDebug("Tunnel ticket {Key} on world {W} {Why} with {N} session(s) - dropped",
++            key, worldId, departed ? "has left" : "unknown", count);
+     }
+ 
+     private void RouteToClientLegacyBroadcast(int worldId, uint key, byte[] packet)
+@@ -578,9 +601,15 @@
+         List<((int World, uint Ticket) k, byte[] p)>? deliver = null;
+         lock (_reorderLock)
+         {
++            // T161: a departed Ticket's frames never enter the survivor's buffer - their sequence
++            // numbers are not the survivor's (cap_queue1: "expected 1362, have 2730").
+             TunnelReorderBuffer? buf = null;
+-            if (!_tunnels.TryGetValue((worldId, ticket), out buf) && _tunnels.Count == 1)
+-                foreach (var b in _tunnels.Values) { buf = b; break; }
++            _tunnels.TryGetValue((worldId, ticket), out var own);
++            switch (TunnelRouting.Decide(own != null, _departed.Contains(worldId, ticket), _tunnels.Count))
++            {
++                case TunnelRouting.Route.Own: buf = own; break;
++                case TunnelRouting.Route.Borrow: foreach (var b in _tunnels.Values) { buf = b; break; } break;
++            }
+             if (buf != null)
+             {
+                 buf.Pending[seq] = clientPkt;

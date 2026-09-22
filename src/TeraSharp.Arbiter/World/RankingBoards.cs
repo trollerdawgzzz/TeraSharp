@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 the TeraSharp contributors
+
 using TeraSharp.Arbiter.Persistence;
 
 namespace TeraSharp.Arbiter.World;
@@ -78,7 +81,7 @@ public static class RankingBoards
 {
     /// <summary>
     /// The season number the live Classic+ server was on when
-    /// <c>D:\packetlogs\classic_live.npcap</c> was taken (T130): both
+    /// <c><captures>\classic_live.npcap</c> was taken (T130): both
     /// <c>S_P*_LEADER_BOARD_INFO</c> frames carry <c>season = 15</c>, and every
     /// <c>C_REQUEST_P*_RANKING</c> in that capture asks for 15. T119 assumed 1, which was
     /// T91's own capture from 2022 and is four years of seasons out of date.
@@ -279,14 +282,14 @@ public static class RankingBoards
     /// <c>changedRank</c> is 0 - no previous season to diff against - and <c>rookie</c> follows
     /// from it, as on the PvE board.
     ///
-    /// <para><b>T138c: what <c>rating</c> carries.</b> A row's own
+    /// <para><b>T138c/T138d: what <c>rating</c> carries.</b> A row's own
     /// <see cref="RankingRow.Rating"/> when it has one - <c>characters.bg_rating</c>, the
     /// number every battleground result moves by 5..12 - and otherwise the score, which is what
-    /// T119 shipped and what keeps the old frames byte-identical. The board is still ORDERED by
-    /// the score (kills), so a player with a rating and no kills is not on it; making the
-    /// rating the ranking key as well is a one-line change in
-    /// <see cref="CharacterStore.GetPvpRankingScores"/> and deliberately not made here, because
-    /// it would empty the board on a server where nobody has finished a battleground yet.</para>
+    /// T119 shipped and what keeps the old frames byte-identical. T138d made the rating the
+    /// RANKING key too (<see cref="CharacterStore.GetPvpRankingScores"/>), so the column and the
+    /// order are the same number and the board is the ladder the client's own field name says it
+    /// is. A server where nobody has finished a battleground has an empty PvP board; that is the
+    /// correct answer for a ladder with no games played, not a regression.</para>
     /// </summary>
     public static byte[] BuildPvpRankingList(IReadOnlyList<RankingRow>? rows, int viewerRank = 0)
     {

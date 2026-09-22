@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 the TeraSharp contributors
+
 using System.Collections.Concurrent;
 using Microsoft.Extensions.Logging;
 using TeraSharp.Arbiter.Network;

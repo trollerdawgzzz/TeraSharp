@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 the TeraSharp contributors
+
 namespace TeraSharp.Arbiter.World;
 
 /// <summary>One item in a class's starting kit, already placed.</summary>
@@ -93,8 +96,13 @@ public static class StarterInventory
     /// CreateCharData.xml, one row per class, in datasheet order — which is the order ids are
     /// allocated in. The <c>hero</c> row in the file is deliberately absent: "hero" is not a name
     /// <c>DataSheetReadClass</c> knows, so the real Arbiter cannot parse that row either.
+    /// <para>T159: read from the sheet (<see cref="DatasheetLoader.StarterKits"/>); the table
+    /// below is the sheet as transcribed, used only when the sheet is missing.</para>
     /// </summary>
-    private static readonly StarterItem[][] ByClass =
+    private static StarterItem[][] ByClass => DatasheetLoader.StarterKits.Value;
+
+    /// <summary>The transcribed CreateCharData.xml - the built-in for <see cref="ByClass"/>.</summary>
+    public static readonly StarterItem[][] BuiltInKits =
     {
         new StarterItem[] { new(10001, 1, 14, 1), new(15004, 1, 14, 3), new(15005, 1, 14, 4), new(15006, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // warrior
         new StarterItem[] { new(10002, 1, 14, 1), new(15001, 1, 14, 3), new(15002, 1, 14, 4), new(15003, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // lancer
@@ -110,6 +118,20 @@ public static class StarterInventory
         new StarterItem[] { new(58171, 1, 14, 1), new(15007, 1, 14, 3), new(15008, 1, 14, 4), new(15009, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // assassin
         new StarterItem[] { new(59053, 1, 14, 1), new(15004, 1, 14, 3), new(15005, 1, 14, 4), new(15006, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // glaiver
     };
+
+    /// <summary>
+    /// T162. CreateCharData.xml's <c>createdLevel</c> per class id, transcribed - the built-in for
+    /// <see cref="DatasheetLoader.CreatedLevels"/>. Every row says 1 except soulless (50).
+    /// </summary>
+    public static readonly int[] BuiltInCreatedLevels = { 1, 1, 1, 1, 1, 1, 1, 1, 50, 1, 1, 1, 1 };
+
+    /// <summary>The level a new character of this class is made at: the sheet's createdLevel, 1
+    /// for a class id outside the 13.</summary>
+    public static int CreatedLevelFor(int classId)
+    {
+        var levels = DatasheetLoader.CreatedLevels.Value;
+        return classId >= 0 && classId < levels.Length ? levels[classId] : 1;
+    }
 
     /// <summary>The kit for a class, or null when the class id is not one of the 13.</summary>
     public static IReadOnlyList<StarterItem>? ForClass(int classId)

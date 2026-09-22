@@ -2,7 +2,7 @@
 
 Everything the client's Friends and Blocked-Users panels do, from rows instead of statics.
 Sources: the eleven `Handler_C_*` in `Arb_part_*.c`, the `.def` files in `tera_v100_MASTER_FINAL`,
-and the client-side capture `D:\packetlogs\cap_newchar_client.log` (frames 304-307).
+and the client-side capture `<captures>\cap_newchar_client.log` (frames 304-307).
 
 **No build was possible in the Cowork container** — every byte claim below was reproduced in
 Python against the capture, and the tests assert the same bytes.

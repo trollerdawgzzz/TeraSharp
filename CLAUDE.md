@@ -16,7 +16,7 @@ in one worktree. The human works on `master` and merges each branch when it's gr
    tell the human which files you wrote; he commits on the branch, builds, tests, merges, removes the worktree.
    If the worktree folder does not exist, STOP and ask for it — do not write anywhere else.
 3. Generated data (opcode tables, extracted bytes) goes in the worktree under `data/` or `status/`, not in
-   `D:\packetlogs\` or anywhere else on D:. Never create new top-level folders on D:.
+   `<captures>\` or anywhere else on D:. Never create new top-level folders on D:.
 4. Only the files in the "diffs welcome" list below. Human-owned files: describe the change in chat, do not
    edit.
 5. You may build/test in your own container by copying sources out, but say so explicitly — the human
@@ -53,7 +53,7 @@ landed in a stray `D:\TeraSharp` copy and had to be merged by hand. Branch-only 
   376012, one per packet (`C_*` / `S_*`), with field names and types. This is the authority for any
   client<->Arbiter packet layout; the codec in `Protocol/` is driven by these files. Opcode numbers come from
   `tera-server-proxy\data\data.json` (`maps."376012"`). Use both before decoding anything by hand.
-- Arbiter<->World opcodes: `D:\packetlogs\world_opcodes.txt` (`AS_/SA_/DSA_/BSA_`) and the opcode->name switch
+- Arbiter<->World opcodes: `<captures>\world_opcodes.txt` (`AS_/SA_/DSA_/BSA_`) and the opcode->name switch
   in `WorldServer.exe.c` ~line 247000 (covers `SDB_/DBS_` too). There are no `.def` files for the internal
   protocol — layouts come from the decompiled writers/handlers (section 5 recipe).
 
@@ -127,6 +127,10 @@ a task brief has named explicitly and thereby created — `World/ChatManager.cs`
   merged with nothing committed and the worktree removed — the work was lost and redone as T44.
 - **Cowork must never copy a file from master into its worktree by hand.** If the worktree is
   behind, STOP and ask the human to rebase (T39 lost 60 tests this way).
+- **No new sheet-derived constant without a loader** (T159). A value copied out of
+  `Executable\Datasheet\*.xml` goes through `World/DatasheetLoader.cs`: a `SheetValue` that reads
+  the sheet, keeps the transcribed value only as its built-in fallback, and gets a startup /
+  `--check-config` line. The audit of what is covered is `status/DATASHEETS.md`.
 - **No `"` inside C# verbatim strings** (`@"..."`) — a lone double quote terminates the string and
   the build fails with 300+ errors. Cowork cannot build, so this has broken merges.
 - **Never send a `DBS_*` reply World did not ask for.** Every `DBS_` carries a DLM id World looks
@@ -327,7 +331,7 @@ D:\v100\TERA_SERVER.100\
   tera-server-proxy\data\data.json      client opcode map (maps."376012")
   tera-api\                             Node auth/API server (for task E)
 
-D:\packetlogs\
+<captures>\
   arb_world.log            raw Arbiter<->World tap (TCP chunks; one login + one DISCONNECT logout)
   full_capture.log         client<->Arbiter capture of the real server (has C_CREATE_USER)
   world_opcodes.txt        2705 lines "0xNNNN|NAME" for AS_/SA_/DSA_/BSA_ (Arb_part_003.c case table)

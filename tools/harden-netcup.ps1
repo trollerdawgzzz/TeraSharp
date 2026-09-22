@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 the TeraSharp contributors
 #Requires -Version 5.1
 <#
 .SYNOPSIS

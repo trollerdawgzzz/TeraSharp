@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 the TeraSharp contributors
+
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging;
 
@@ -156,7 +159,7 @@ public sealed class CharacterIdentity
 /// <c>User::SendMySkillList</c> (WorldServer.exe.c:2193096) walks exactly those two arrays to
 /// build <c>S_SKILL_LIST</c>. Verified against the capture: the 7 active + 17 passive ids in
 /// <c>data/starter_blob.bin</c> are byte-identical to the 24 entries of the first
-/// <c>S_SKILL_LIST</c> in <c>D:\packetlogs\cap_newchar_client.log</c> (packet 81).</para>
+/// <c>S_SKILL_LIST</c> in <c><captures>\cap_newchar_client.log</c> (packet 81).</para>
 ///
 /// <para><b>The bug this fixes.</b> <c>data/starter_blob.bin</c> is a Popori-female Glaiver's
 /// blob ("Test", race 4 / gender 1 / class 12 = Elin valkyrie), so before T18 every character we
@@ -281,7 +284,15 @@ public static class DefaultSkillSet
         "5,0,7|10100;170100;180100;9020100;60401301|10002;19601;19602",  // Baraka Male Elementalist
     };
 
-    private static readonly Dictionary<(int race, int gender, int cls), (int[] active, int[] passive)> Table = Parse();
+    /// <summary>
+    /// T159: the rows in use - DefaultSkillSet.xml itself when it is on this machine
+    /// (<see cref="World.DatasheetLoader.DefaultSkills"/>), else <see cref="BuiltInTable"/>.
+    /// </summary>
+    private static IReadOnlyDictionary<(int Race, int Gender, int Class), (int[] Active, int[] Passive)> Table
+        => World.DatasheetLoader.DefaultSkills.Value;
+
+    /// <summary><see cref="Rows"/> parsed - the built-in the loader falls back to.</summary>
+    public static readonly IReadOnlyDictionary<(int Race, int Gender, int Class), (int[] Active, int[] Passive)> BuiltInTable = Parse();
 
     private static Dictionary<(int, int, int), (int[], int[])> Parse()
     {
@@ -310,7 +321,7 @@ public static class DefaultSkillSet
     /// </summary>
     public static bool TryGet(int race, int gender, int cls, out int[] active, out int[] passive)
     {
-        if (Table.TryGetValue((race, gender, cls), out var v)) { active = v.active; passive = v.passive; return true; }
+        if (Table.TryGetValue((race, gender, cls), out var v)) { active = v.Active; passive = v.Passive; return true; }
         active = Array.Empty<int>();
         passive = Array.Empty<int>();
         return false;
@@ -322,7 +333,7 @@ public static class DefaultSkillSet
 ///
 /// Ground truth: <c>data/starter_blob.bin</c> — the blob the real ArbiterServer sent in
 /// <c>DBS_USER_ENTERWORLD</c> (0x2738, <c>found=1</c>) for "Test", playerId 2, on its very
-/// first enter-world (D:\packetlogs\cap_newchar.log packet 133, 05:49:03). The real server
+/// first enter-world (<captures>\cap_newchar.log packet 133, 05:49:03). The real server
 /// answers <c>found=1</c> with a complete starter blob; it never answers <c>found=0</c>, so
 /// creation must produce a blob, not leave it null.
 ///
@@ -497,6 +508,18 @@ public static class StarterBlob
         BitConverter.TryWriteBytes(blob.AsSpan(MoneyOffset, 8), money);
         return true;
     }
+
+    // --- bag size (T150) ---
+    /// <summary>
+    /// i32 MaxInvenSlotCount at blob offset 15088 (0x3AF0): the real Arbiter's
+    /// User::UpdateMaxInvenSlotCountNoLock (Arb_part_030.c:12399) stores it at User + 0x3BA0, and
+    /// the world blob is User + 0xB0 (the same base that puts the player id at User + 0x120 =
+    /// blob + 0x70, our <see cref="PlayerIdOffset"/>). 40 in <c>data/starter_blob.bin</c>.
+    /// </summary>
+    public const int MaxInvenSlotCountOffset = 0x3AF0;
+    /// <summary>i32 expandInvenCount at blob offset 0x3B00 (User + 0x3BB0,
+    /// User::UpdateExpandInvenCountNoLock, Arb_part_030.c:10492). 0 in the starter blob.</summary>
+    public const int ExpandInvenCountOffset = 0x3B00;
 
     // --- default skills (T18) ---
     // The two skill arrays inside the blob, both proven from BOTH sides of the wire:
@@ -1422,6 +1445,189 @@ CREATE INDEX IF NOT EXISTS ix_game_log_char ON game_log(character_id, log_id);
 CREATE INDEX IF NOT EXISTS ix_game_log_acct ON game_log(account_id, log_id);
 CREATE INDEX IF NOT EXISTS ix_game_log_cat ON game_log(category, log_id);
 CREATE INDEX IF NOT EXISTS ix_game_log_time ON game_log(logged_at);
+
+-- T147: crafting. The real Arbiter keeps both per character (User+0x120 is the key it binds):
+-- dbo.spLoadItemRecipe returns recipe id, extract bit, learn time and bookmark bit, and
+-- dbo.spLoadSkillProf returns skill-prof id and value. status/CRAFTING.md.
+CREATE TABLE IF NOT EXISTS item_recipes (
+  character_id INTEGER NOT NULL,
+  recipe_id    INTEGER NOT NULL,
+  extract      INTEGER NOT NULL DEFAULT 0,
+  bookmark     INTEGER NOT NULL DEFAULT 0,
+  learned_at   INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (character_id, recipe_id)
+);
+CREATE TABLE IF NOT EXISTS skill_profs (
+  character_id  INTEGER NOT NULL,
+  skill_prof_id INTEGER NOT NULL,
+  value         INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (character_id, skill_prof_id)
+);
+-- T147: gathering proficiency. Not a skill_profs row - four ints of UserData the real Arbiter
+-- binds from its profMineral/profBug/profEnergy/profHerb columns at enter-world. kind 0..3 in
+-- that order; only rows written by S_UPDATE_PROF_* exist, and only they are stamped.
+CREATE TABLE IF NOT EXISTS gathering_profs (
+  character_id INTEGER NOT NULL,
+  kind         INTEGER NOT NULL,
+  value        INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (character_id, kind)
+);
+
+-- T154: the guilds holding a Civil Unrest city, per league and season - what
+-- SDB_LOAD_CITY_GUILD_INFO (0x2954) is answered from. Empty means no owning guild, which is what
+-- the real Arbiter answered in every capture; a CU winner can be written here later. The two
+-- times are World's i64s, stored as they come (their encoding is not pinned yet).
+CREATE TABLE IF NOT EXISTS city_guild (
+  league_id          INTEGER NOT NULL,
+  season_id          INTEGER NOT NULL,
+  guild_db_id        INTEGER NOT NULL,
+  tower_build_time   INTEGER NOT NULL DEFAULT 0,
+  tower_destroy_time INTEGER NOT NULL DEFAULT 0,
+  total_kill         INTEGER NOT NULL DEFAULT 0,
+  total_death        INTEGER NOT NULL DEFAULT 0,
+  total_destroy      INTEGER NOT NULL DEFAULT 0,
+  maintain_bonus     INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (league_id, season_id, guild_db_id)
+);
+
+-- T156: the Vanguard Initiative (event matching), the Arbiter's half. World builds every client
+-- packet of that window itself from its own EventMatching datasheet; what it keeps in the
+-- Arbiter is per-character progress and three reset stamps.
+-- daily_event is spLoadUserDailyEventCompleted's row: the five completion counts
+-- (DailyEventCompletionInfo, SDB_UPDATE_USER_DAILY_EVENT_COUNT's 20-byte record), the
+-- character's extra-reward reset stamp (unix seconds, as World sends it), and the bool + int
+-- SDB_UPDATE_GET_EXTRA_REWARD writes. SDB_LOAD_USER_DAILY_EVENT answers from it; no row is the
+-- never-played answer (success 0, all zero).
+CREATE TABLE IF NOT EXISTS daily_event (
+  character_id         INTEGER PRIMARY KEY,
+  count0               INTEGER NOT NULL DEFAULT 0,
+  count1               INTEGER NOT NULL DEFAULT 0,
+  count2               INTEGER NOT NULL DEFAULT 0,
+  count3               INTEGER NOT NULL DEFAULT 0,
+  count4               INTEGER NOT NULL DEFAULT 0,
+  extra_reward_reset   INTEGER NOT NULL DEFAULT 0,
+  got_extra_reward     INTEGER NOT NULL DEFAULT 0,
+  extra_reward_value   INTEGER NOT NULL DEFAULT 0
+);
+
+-- T156: per-character add-reward receive counts (SDB_UPDATE / SDB_LOAD_ADDITIONAL_REWARD_RECV_COUNT).
+-- World's daily add-reward reset (SA_UPDATE_EVENT_MATCHING_ADD_REWARD_RESETTIME) empties it.
+CREATE TABLE IF NOT EXISTS event_matching_reward (
+  character_id  INTEGER NOT NULL,
+  event_id      INTEGER NOT NULL,
+  acquire_num   INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (character_id, event_id)
+);
+
+-- T167: what DBS_RESPONSE_CARD_DATA (0x2987) is answered from, beside `cards` and `card_mounts`.
+-- card_info is the account's preset count and collection-book level/points (no row = 1, 1, 0,
+-- the captured defaults); card_combines the activated combine lists (id -> level). The selected
+-- preset is per character: characters.card_preset_index.
+CREATE TABLE IF NOT EXISTS card_info (
+  account_id     INTEGER PRIMARY KEY,
+  preset_amount  INTEGER NOT NULL DEFAULT 1,
+  book_level     INTEGER NOT NULL DEFAULT 1,
+  book_point     INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS card_combines (
+  account_id       INTEGER NOT NULL,
+  combine_list_id  INTEGER NOT NULL,
+  level            INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (account_id, combine_list_id)
+);
+
+-- T167: learned EP perks per page (DBS_USER_LOAD_EP_PERK's five page maps). The page scalars
+-- are characters.ep_used_point / ep_current_page / ep_max_page / ep_pre_level / ep_pre_total_point.
+CREATE TABLE IF NOT EXISTS ep_perks (
+  character_id  INTEGER NOT NULL,
+  page_index    INTEGER NOT NULL,
+  perk_id       INTEGER NOT NULL,
+  perk_level    INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (character_id, page_index, perk_id)
+);
+
+-- T167: skill polishing - DBS_LOAD_SKILL_POLISHING's level/point/total/exp, its option list
+-- (polishing id, effect id) -> applied, and its level list polishing id -> effect id.
+CREATE TABLE IF NOT EXISTS skill_polishing (
+  character_id  INTEGER PRIMARY KEY,
+  level         INTEGER NOT NULL DEFAULT 0,
+  point         INTEGER NOT NULL DEFAULT 0,
+  total_point   INTEGER NOT NULL DEFAULT 0,
+  exp           INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS skill_polishing_options (
+  character_id  INTEGER NOT NULL,
+  polishing_id  INTEGER NOT NULL,
+  effect_id     INTEGER NOT NULL,
+  applied       INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (character_id, polishing_id, effect_id)
+);
+CREATE TABLE IF NOT EXISTS skill_polishing_levels (
+  character_id  INTEGER NOT NULL,
+  polishing_id  INTEGER NOT NULL,
+  effect_id     INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (character_id, polishing_id)
+);
+
+-- T167: SDB_UPDATE_DUNGEON_RANK_RECORD - World's best point / time per character, dungeon and
+-- season, with the last run's breakdown. The PvE board ranks by these points.
+CREATE TABLE IF NOT EXISTS dungeon_rank_records (
+  character_id  INTEGER NOT NULL,
+  dungeon_id    INTEGER NOT NULL,
+  season        INTEGER NOT NULL,
+  top_point     INTEGER NOT NULL DEFAULT 0,
+  top_time      INTEGER NOT NULL DEFAULT 0,
+  play_date     INTEGER NOT NULL DEFAULT 0,
+  new_score     INTEGER NOT NULL DEFAULT 0,
+  time_point    INTEGER NOT NULL DEFAULT 0,
+  kill_point    INTEGER NOT NULL DEFAULT 0,
+  bonus_point   INTEGER NOT NULL DEFAULT 0,
+  mvp_name      TEXT    NOT NULL DEFAULT '',
+  PRIMARY KEY (character_id, dungeon_id, season)
+);
+
+-- T168: VIP (DBS_LOAD_USER_VIP_INFO / ADD_VIP_GAME_EXP), per account.
+CREATE TABLE IF NOT EXISTS vip_info (
+  account_id       INTEGER PRIMARY KEY,
+  pub_exp          INTEGER NOT NULL DEFAULT 0,
+  game_exp         INTEGER NOT NULL DEFAULT 0,
+  token_amount     INTEGER NOT NULL DEFAULT 0,
+  last_reset_time  INTEGER NOT NULL DEFAULT 0,
+  reset_count      INTEGER NOT NULL DEFAULT 0
+);
+-- T168: SDB_USER_LEARN_HIDE_PASSIVE_SKILL.
+CREATE TABLE IF NOT EXISTS hidden_passives (
+  character_id  INTEGER NOT NULL,
+  passive_id    INTEGER NOT NULL,
+  PRIMARY KEY (character_id, passive_id)
+);
+-- T168: SDB_ADD_SERVANT. The servant loads (SA_LOAD_SERVANT_*) are still the replay table's.
+CREATE TABLE IF NOT EXISTS servants (
+  servant_db_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+  character_id   INTEGER NOT NULL,
+  type           INTEGER NOT NULL DEFAULT 0,
+  template_id    INTEGER NOT NULL DEFAULT 0,
+  name           TEXT    NOT NULL DEFAULT '',
+  energy         INTEGER NOT NULL DEFAULT 0,
+  period         INTEGER NOT NULL DEFAULT 0
+);
+-- T168: collection-book rewards received (DBS_RESPONSE_CARD_DATA's last list).
+CREATE TABLE IF NOT EXISTS card_book_rewards (
+  account_id  INTEGER NOT NULL,
+  reward_id   INTEGER NOT NULL,
+  PRIMARY KEY (account_id, reward_id)
+);
+-- T170: EventSystemManager's progress map, keyed like the Arbiter's (event, user, account);
+-- spUpdateUserEventSystemProgressInfo's six columns. Decompile-derived: no capture.
+CREATE TABLE IF NOT EXISTS eventsystem_progress (
+  event_id    INTEGER NOT NULL,
+  user_id     INTEGER NOT NULL,
+  account_id  INTEGER NOT NULL,
+  value       INTEGER NOT NULL DEFAULT 0,
+  flag1       INTEGER NOT NULL DEFAULT 0,
+  flag2       INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (event_id, user_id, account_id)
+);
 ");
         // CREATE TABLE IF NOT EXISTS does nothing to a DB that already has `characters`, so
         // columns added later need their own idempotent step. terasharp.db predates `exp`.
@@ -1492,6 +1698,27 @@ CREATE INDEX IF NOT EXISTS ix_game_log_time ON game_log(logged_at);
         // neither, so S_CREST_INFO had nothing but zeros to show.
         AddColumnIfMissing("characters", "crest_point", "INTEGER NOT NULL DEFAULT 0");
         AddColumnIfMissing("characters", "crest_ex_point", "INTEGER NOT NULL DEFAULT 0");
+
+        // T167: the selected card preset and the EP page state (DBS_RESPONSE_CARD_DATA,
+        // DBS_USER_LOAD_EP_PERK). All zero for a character that never used them - the captures.
+        AddColumnIfMissing("characters", "card_preset_index", "INTEGER NOT NULL DEFAULT 0");
+        AddColumnIfMissing("characters", "ep_used_point", "INTEGER NOT NULL DEFAULT 0");
+        AddColumnIfMissing("characters", "ep_current_page", "INTEGER NOT NULL DEFAULT 0");
+        AddColumnIfMissing("characters", "ep_max_page", "INTEGER NOT NULL DEFAULT 0");
+        AddColumnIfMissing("characters", "ep_pre_level", "INTEGER NOT NULL DEFAULT 0");
+        AddColumnIfMissing("characters", "ep_pre_total_point", "INTEGER NOT NULL DEFAULT 0");
+        // T168: gold consumption (SDB_CHANGE_GOLD_CONSUMPTION) and the attendance bitmap a GM set
+        // (SDB_ADMIN_USER_DAILY_ATTENDANCE); attend_set tells "never set" from "set to 0".
+        AddColumnIfMissing("characters", "gold_consumption", "INTEGER NOT NULL DEFAULT 0");
+        AddColumnIfMissing("characters", "attend_bitmap", "INTEGER NOT NULL DEFAULT 0");
+        AddColumnIfMissing("characters", "attend_set", "INTEGER NOT NULL DEFAULT 0");
+        // T170: the guild war's two sides (cap_final2a/2b - declare, opposite declare, withdraw,
+        // give up). T80 rows are one-sided: the attacker declared, the defender did not.
+        AddColumnIfMissing("guild_wars", "attack_declared", "INTEGER NOT NULL DEFAULT 1");
+        AddColumnIfMissing("guild_wars", "defend_declared", "INTEGER NOT NULL DEFAULT 0");
+        AddColumnIfMissing("guild_wars", "defend_money", "INTEGER NOT NULL DEFAULT 0");
+        AddColumnIfMissing("guild_wars", "defend_declares", "INTEGER NOT NULL DEFAULT 0");
+        AddColumnIfMissing("guild_war_history", "defend_declares", "INTEGER NOT NULL DEFAULT 0");
 
         MigrateCardsToAccount();
         MigrateSharedStarterItemIds();
@@ -1892,6 +2119,9 @@ SELECT last_insert_rowid();";
             cmd.Parameters.AddWithValue("$money", c.Money);          // T59, normally 0
             int id = (int)(long)cmd.ExecuteScalar()!;
             c.Id = id;
+            // T172: characters.id is a plain INTEGER PRIMARY KEY, so a new character takes the id
+            // of a deleted one - and inherited its visited sections (isFirstVisit 0, no cinematic).
+            PurgeCharacterStateLocked(id);
             _log.LogInformation("Created character '{Name}' id={Id} account={A}", c.Name, id, c.AccountId);
             return id;
         }
@@ -1942,6 +2172,48 @@ SELECT last_insert_rowid();";
             else
                 _log.LogInformation("Saved world blob ({Len} bytes) for character {Id} (too short for a position)",
                     blob.Length, characterId);
+        }
+    }
+
+    // ============================================================ T150: bag size
+
+    /// <summary>
+    /// SDB_INCREASE_INVENTORY_SIZE, tab 0. Rounds <paramref name="newSlotCount"/> down to a
+    /// multiple of 8 (as the original does) and raises the world blob's MaxInvenSlotCount to it -
+    /// never lowers it - then adds <paramref name="expandDelta"/> to expandInvenCount. Patches the
+    /// stored blob in place: the column is read raw (GetCharacter would stamp money and level into
+    /// its copy) and written without touching last_logout or the position columns.
+    /// Returns found = false when the character or its blob is missing.
+    /// </summary>
+    public (bool Found, int Slots, int Expand) IncreaseInventorySize(int characterId, int newSlotCount, int expandDelta)
+    {
+        lock (_lock)
+        {
+            byte[]? blob;
+            using (var get = _db.CreateCommand())
+            {
+                get.CommandText = "SELECT world_blob FROM characters WHERE id = $id";
+                get.Parameters.AddWithValue("$id", characterId);
+                blob = get.ExecuteScalar() as byte[];
+            }
+            if (blob == null || blob.Length < StarterBlob.ExpandInvenCountOffset + 4) return (false, 0, 0);
+
+            int slots = BitConverter.ToInt32(blob, StarterBlob.MaxInvenSlotCountOffset);
+            int expand = BitConverter.ToInt32(blob, StarterBlob.ExpandInvenCountOffset);
+            int want = newSlotCount - newSlotCount % 8;   // truncates toward zero, like the original
+            bool dirty = false;
+            if (want > slots) { slots = want; dirty = true; }
+            if (expandDelta != 0) { expand += expandDelta; dirty = true; }
+            if (!dirty) return (true, slots, expand);
+
+            BitConverter.TryWriteBytes(blob.AsSpan(StarterBlob.MaxInvenSlotCountOffset, 4), slots);
+            BitConverter.TryWriteBytes(blob.AsSpan(StarterBlob.ExpandInvenCountOffset, 4), expand);
+            using var put = _db.CreateCommand();
+            put.CommandText = "UPDATE characters SET world_blob = $b WHERE id = $id";
+            put.Parameters.AddWithValue("$b", blob);
+            put.Parameters.AddWithValue("$id", characterId);
+            put.ExecuteNonQuery();
+            return (true, slots, expand);
         }
     }
 
@@ -2387,6 +2659,55 @@ SELECT last_insert_rowid();";
         }
     }
 
+    /// <summary>
+    /// T164. SDB_MARK_AS_QUEST_COMPLETED: <paramref name="questId"/> is complete. A row in
+    /// progress keeps its record with +8 set to 2; a quest never started gets a minimal 80-byte
+    /// QuestData (questId at +4, status 2, 0xFFFFFFFF at +76 - status/QUEST-DESIGN.md). Returns
+    /// true only when it was not complete before, which is what the Arbiter's reply lists.
+    /// </summary>
+    public bool MarkQuestCompleted(int ownerId, int questId)
+    {
+        if (questId <= 0 || NoSuchOwner("MarkQuestCompleted", ownerId)) return false;
+        lock (_lock)
+        {
+            int id = 0, status = 0;
+            byte[]? record = null;
+            using (var sel = _db.CreateCommand())
+            {
+                sel.CommandText = "SELECT id, status, record FROM quests WHERE owner_id = $o AND quest_id = $q";
+                sel.Parameters.AddWithValue("$o", ownerId);
+                sel.Parameters.AddWithValue("$q", questId);
+                using var r = sel.ExecuteReader();
+                if (r.Read()) { id = r.GetInt32(0); status = r.GetInt32(1); record = (byte[])r["record"]; }
+            }
+            if (id != 0 && status == QuestStatusComplete) return false;
+
+            if (record == null || record.Length < 80)
+            {
+                var fresh = new byte[80];
+                if (record != null) Array.Copy(record, fresh, record.Length);
+                record = fresh;
+            }
+            BitConverter.GetBytes(questId).CopyTo(record, 4);
+            BitConverter.GetBytes(QuestStatusComplete).CopyTo(record, 8);
+            BitConverter.GetBytes(0).CopyTo(record, 12);
+            if (id == 0) BitConverter.GetBytes(-1).CopyTo(record, 76);
+
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = id != 0
+                ? "UPDATE quests SET status = $s, step = 0, record = $r, updated_at = datetime('now') WHERE id = $id"
+                : "INSERT INTO quests(owner_id, quest_id, status, step, record) VALUES($o, $q, $s, 0, $r)";
+            cmd.Parameters.AddWithValue("$id", id);
+            cmd.Parameters.AddWithValue("$o", ownerId);
+            cmd.Parameters.AddWithValue("$q", questId);
+            cmd.Parameters.AddWithValue("$s", QuestStatusComplete);
+            cmd.Parameters.AddWithValue("$r", record);
+            cmd.ExecuteNonQuery();
+            _log.LogInformation("Quest {Q} marked complete for character {Id}", questId, ownerId);
+            return true;
+        }
+    }
+
     /// <summary>Total quest rows for a character, of any status.</summary>
     public int CountQuests(int ownerId)
     {
@@ -2430,6 +2751,36 @@ SELECT last_insert_rowid();";
     /// with a row it cannot key - and the caller still sends its DLM ack, which is what keeps the
     /// user's DB queue moving (status/HANDOFF.md section 1).</para>
     /// </summary>
+    /// <summary>T168b. The guild / account twins of <see cref="NoSuchOwner"/>: guild_members.guild_id
+    /// REFERENCES guilds, so an id World (or a hostile frame) invents must never reach the INSERT -
+    /// the SqliteException would close the World link. vip_info and card_book_rewards have no FK,
+    /// but a row for an account that does not exist is garbage all the same.</summary>
+    private bool NoSuchGuild(string what, int guildId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT COUNT(*) FROM guilds WHERE guild_id=$g";
+            cmd.Parameters.AddWithValue("$g", guildId);
+            if ((long)cmd.ExecuteScalar()! > 0) return false;
+        }
+        _log.LogWarning("{What}: no guild row for id {Id} - write dropped", what, guildId);
+        return true;
+    }
+
+    private bool NoSuchAccount(string what, long accountId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT COUNT(*) FROM accounts WHERE id=$a";
+            cmd.Parameters.AddWithValue("$a", accountId);
+            if ((long)cmd.ExecuteScalar()! > 0) return false;
+        }
+        _log.LogWarning("{What}: no account row for id {Id} - write dropped", what, accountId);
+        return true;
+    }
+
     private bool NoSuchOwner(string what, params long[] ids)
     {
         foreach (long id in ids)
@@ -3191,9 +3542,13 @@ DELETE FROM guild_applies     WHERE user_db_id = $id;
 DELETE FROM guild_wanted      WHERE user_db_id = $id;
 DELETE FROM guild_invites     WHERE user_db_id = $id;
 DELETE FROM guild_members     WHERE user_db_id = $id;
+DELETE FROM item_recipes      WHERE character_id = $id;
+DELETE FROM skill_profs       WHERE character_id = $id;
+DELETE FROM gathering_profs   WHERE character_id = $id;
 DELETE FROM restrictions      WHERE character_id = $id;";
             kids.Parameters.AddWithValue("$id", id);
             kids.ExecuteNonQuery();
+            PurgeCharacterStateLocked(id);   // T172
 
             using var cmd = _db.CreateCommand();
             cmd.CommandText = "DELETE FROM characters WHERE id = $id AND account_id = $a";
@@ -4013,7 +4368,8 @@ DELETE FROM restrictions      WHERE character_id = $id;";
 
     /// <summary>One live war. <paramref name="State"/> is the war record s +0xcc field.</summary>
     public sealed record GuildWarRow(
-        long WarId, int AttackGuildId, int DefendGuildId, long DeclaredAt, long Money, int State);
+        long WarId, int AttackGuildId, int DefendGuildId, long DeclaredAt, long Money, int State,
+        bool AttackDeclared = true, bool DefendDeclared = false, long DefendMoney = 0, int DefendDeclares = 0);
 
     /// <summary>One finished war. <paramref name="Result"/> is S_VIEW_GUILD_WAR.result:
     /// 0 declared, 1 withdrew, 2 surrendered.</summary>
@@ -4052,6 +4408,57 @@ DELETE FROM restrictions      WHERE character_id = $id;";
         }
     }
 
+    /// <summary>War states - the record's +0xcc (GuildWarManager::OppositeDeclareGuildWar): 6 only
+    /// the attacker has declared, 7 only the defender, 8 both (mutual).</summary>
+    public const int GuildWarStateDefenderOnly = 7, GuildWarStateMutual = 8;
+
+    /// <summary>T170. One side declares (or re-declares) on a live war: that side's flag and money,
+    /// the state from both flags, and the defender's declaration counter. False: no such war.</summary>
+    public bool DeclareGuildWarSide(long warId, bool defenderSide, long money)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = defenderSide
+                ? "UPDATE guild_wars SET defend_declared=1, defend_money=$m, defend_declares=defend_declares+1, " +
+                  "state=CASE WHEN attack_declared=1 THEN 8 ELSE 7 END WHERE war_id=$w"
+                : "UPDATE guild_wars SET attack_declared=1, money=$m, " +
+                  "state=CASE WHEN defend_declared=1 THEN 8 ELSE 6 END WHERE war_id=$w";
+            cmd.Parameters.AddWithValue("$m", money);
+            cmd.Parameters.AddWithValue("$w", warId);
+            return cmd.ExecuteNonQuery() == 1;
+        }
+    }
+
+    /// <summary>T170. One side of a MUTUAL war takes its declaration back: its flag and money go to
+    /// 0 and the state becomes the other side's alone (cap_final2b 14883: 8 -&gt; 6). Returns the new
+    /// state, 0 when there was no such war.</summary>
+    public int WithdrawGuildWarSide(long warId, bool defenderSide)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = defenderSide
+                ? "UPDATE guild_wars SET defend_declared=0, defend_money=0, state=6 WHERE war_id=$w"
+                : "UPDATE guild_wars SET attack_declared=0, money=0, state=7 WHERE war_id=$w";
+            cmd.Parameters.AddWithValue("$w", warId);
+            return cmd.ExecuteNonQuery() == 1 ? (defenderSide ? GuildWarStateDeclared : GuildWarStateDefenderOnly) : 0;
+        }
+    }
+
+    /// <summary>T170. Guild money moves (a war declaration, a surrender's reparation). Clamped at 0;
+    /// returns the new total, -1 when the guild does not exist.</summary>
+    public long AddGuildMoney(int guildId, long delta)
+    {
+        if (!AddGuildQuestReward(guildId, 0, delta)) return -1;
+        return GetGuild(guildId)?.Money ?? -1;
+    }
+
+    /// <summary>T170: one guild_wars row, both sides.</summary>
+    private static GuildWarRow ReadGuildWar(Microsoft.Data.Sqlite.SqliteDataReader r)
+        => new(r.GetInt64(0), r.GetInt32(1), r.GetInt32(2), r.GetInt64(3), r.GetInt64(4), r.GetInt32(5),
+               r.GetInt64(6) != 0, r.GetInt64(7) != 0, r.GetInt64(8), r.GetInt32(9));
+
     /// <summary>The state a freshly declared war carries - the value the capture s window shows.</summary>
     public const int GuildWarStateDeclared = 6;
 
@@ -4062,14 +4469,14 @@ DELETE FROM restrictions      WHERE character_id = $id;";
         {
             using var cmd = _db.CreateCommand();
             cmd.CommandText =
-                "SELECT war_id, attack_guild_id, defend_guild_id, declared_at, money, state " +
+                "SELECT war_id, attack_guild_id, defend_guild_id, declared_at, money, state, " +
+                "attack_declared, defend_declared, defend_money, defend_declares " +
                 "FROM guild_wars WHERE attack_guild_id=$g OR defend_guild_id=$g ORDER BY war_id";
             cmd.Parameters.AddWithValue("$g", guildId);
             var rows = new List<GuildWarRow>();
             using var r = cmd.ExecuteReader();
             while (r.Read())
-                rows.Add(new GuildWarRow(r.GetInt64(0), r.GetInt32(1), r.GetInt32(2),
-                                         r.GetInt64(3), r.GetInt64(4), r.GetInt32(5)));
+                rows.Add(ReadGuildWar(r));
             return rows;
         }
     }
@@ -4095,13 +4502,13 @@ DELETE FROM restrictions      WHERE character_id = $id;";
             using (var get = _db.CreateCommand())
             {
                 get.CommandText =
-                    "SELECT war_id, attack_guild_id, defend_guild_id, declared_at, money, state " +
+                    "SELECT war_id, attack_guild_id, defend_guild_id, declared_at, money, state, " +
+                "attack_declared, defend_declared, defend_money, defend_declares " +
                     "FROM guild_wars WHERE war_id=$w";
                 get.Parameters.AddWithValue("$w", warId);
                 using var r = get.ExecuteReader();
                 if (r.Read())
-                    live = new GuildWarRow(r.GetInt64(0), r.GetInt32(1), r.GetInt32(2),
-                                           r.GetInt64(3), r.GetInt64(4), r.GetInt32(5));
+                    live = ReadGuildWar(r);
             }
             if (live == null) return null;
 
@@ -4109,7 +4516,8 @@ DELETE FROM restrictions      WHERE character_id = $id;";
             {
                 ins.CommandText =
                     "INSERT INTO guild_war_history(war_id, attack_guild_id, defend_guild_id, " +
-                    "declared_at, ended_at, result) VALUES($w,$a,$d,$t,$e,$r)";
+                    "declared_at, ended_at, result, defend_declares) VALUES($w,$a,$d,$t,$e,$r,$dd)";
+                ins.Parameters.AddWithValue("$dd", live.DefendDeclares);
                 ins.Parameters.AddWithValue("$w", live.WarId);
                 ins.Parameters.AddWithValue("$a", live.AttackGuildId);
                 ins.Parameters.AddWithValue("$d", live.DefendGuildId);
@@ -4162,7 +4570,11 @@ DELETE FROM restrictions      WHERE character_id = $id;";
             using var cmd = _db.CreateCommand();
             cmd.CommandText =
                 "SELECT (SELECT COUNT(*) FROM guild_wars WHERE attack_guild_id=$g) + " +
-                "(SELECT COUNT(*) FROM guild_war_history WHERE attack_guild_id=$g)";
+                "(SELECT COUNT(*) FROM guild_war_history WHERE attack_guild_id=$g) + " +
+                // T170: an opposite declaration counts for the defender (cap_final2a_client1
+                // 4077: sdg's counter goes 0 -> 1 when it declares back, and stays 1 after).
+                "(SELECT COALESCE(SUM(defend_declares), 0) FROM guild_wars WHERE defend_guild_id=$g) + " +
+                "(SELECT COALESCE(SUM(defend_declares), 0) FROM guild_war_history WHERE defend_guild_id=$g)";
             cmd.Parameters.AddWithValue("$g", guildId);
             return Convert.ToInt32(cmd.ExecuteScalar(), System.Globalization.CultureInfo.InvariantCulture);
         }
@@ -4804,7 +5216,7 @@ DELETE FROM restrictions      WHERE character_id = $id;";
         int gender, int level, long accountId, int guildGroupId = DefaultGuildGroupId, long joinDate = 0)
     {
         ArgumentNullException.ThrowIfNull(name);
-        if (NoSuchOwner("AddGuildMember", userDbId)) return 0;
+        if (NoSuchOwner("AddGuildMember", userDbId) || NoSuchGuild("AddGuildMember", guildId)) return 0;
         lock (_lock)
         {
             using var probe = _db.CreateCommand();
@@ -5205,6 +5617,689 @@ DELETE FROM restrictions      WHERE character_id = $id;";
         }
     }
 
+    // ============================================================ T167: cards, EP pages, polishing, dungeon rank
+
+    /// <summary>T167. The account half of DBS_RESPONSE_CARD_DATA's header. An account with no row
+    /// reads as the defaults every capture shows for one that never touched cards: one preset,
+    /// collection book level 1, no points (cap_social4 447, 670, 5070, 5692).</summary>
+    public sealed record CardInfoRow(int PresetAmount, int BookLevel, int BookPoint);
+    public static readonly CardInfoRow DefaultCardInfo = new(1, 1, 0);
+
+    public CardInfoRow GetCardInfo(long accountId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT preset_amount, book_level, book_point FROM card_info WHERE account_id=$a";
+            cmd.Parameters.AddWithValue("$a", accountId);
+            using var r = cmd.ExecuteReader();
+            return r.Read() ? new CardInfoRow(r.GetInt32(0), r.GetInt32(1), r.GetInt32(2)) : DefaultCardInfo;
+        }
+    }
+
+    /// <summary>SDB_CREATE_CARD_INFO: the row World asks for, replacing any earlier one.</summary>
+    public void SetCardInfo(long accountId, CardInfoRow row)
+    {
+        ArgumentNullException.ThrowIfNull(row);
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "INSERT OR REPLACE INTO card_info (account_id, preset_amount, book_level, book_point) "
+                            + "VALUES ($a, $n, $l, $p)";
+            cmd.Parameters.AddWithValue("$a", accountId);
+            cmd.Parameters.AddWithValue("$n", row.PresetAmount);
+            cmd.Parameters.AddWithValue("$l", row.BookLevel);
+            cmd.Parameters.AddWithValue("$p", row.BookPoint);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>SDB_INCREASE_CARD_PRESET: one more preset (spChangeCardPresetAmount with the
+    /// current amount + 1). Returns the new amount.</summary>
+    public int IncreaseCardPresetAmount(long accountId)
+    {
+        var cur = GetCardInfo(accountId);
+        var next = cur with { PresetAmount = cur.PresetAmount + 1 };
+        SetCardInfo(accountId, next);
+        return next.PresetAmount;
+    }
+
+    /// <summary>The preset a character has selected (the Arbiter's per-character map on the
+    /// account); 0 for one that never chose.</summary>
+    public int GetCardPresetIndex(int characterId)
+        => (int)ScalarLong("SELECT card_preset_index FROM characters WHERE id=$c", characterId);
+
+    public bool SetCardPresetIndex(int characterId, int presetIndex)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE characters SET card_preset_index=$p WHERE id=$c";
+            cmd.Parameters.AddWithValue("$p", presetIndex);
+            cmd.Parameters.AddWithValue("$c", characterId);
+            return cmd.ExecuteNonQuery() == 1;
+        }
+    }
+
+    public sealed record CardCombineRow(int CombineListId, int Level);
+
+    /// <summary>SDB_ACTIVATE_CARD_COMBINE_LIST: the combine list at this level (map insert or replace).</summary>
+    public void SetCardCombine(long accountId, int combineListId, int level)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "INSERT OR REPLACE INTO card_combines (account_id, combine_list_id, level) VALUES ($a, $i, $l)";
+            cmd.Parameters.AddWithValue("$a", accountId);
+            cmd.Parameters.AddWithValue("$i", combineListId);
+            cmd.Parameters.AddWithValue("$l", level);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>SDB_DEACTIVATE_CARD_COMBINE_LIST. False when the list was not active.</summary>
+    public bool RemoveCardCombine(long accountId, int combineListId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "DELETE FROM card_combines WHERE account_id=$a AND combine_list_id=$i";
+            cmd.Parameters.AddWithValue("$a", accountId);
+            cmd.Parameters.AddWithValue("$i", combineListId);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    public IReadOnlyList<CardCombineRow> GetCardCombines(long accountId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT combine_list_id, level FROM card_combines WHERE account_id=$a ORDER BY combine_list_id";
+            cmd.Parameters.AddWithValue("$a", accountId);
+            var rows = new List<CardCombineRow>();
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) rows.Add(new CardCombineRow(r.GetInt32(0), r.GetInt32(1)));
+            return rows;
+        }
+    }
+
+    /// <summary>T167. DBS_USER_LOAD_EP_PERK's five scalars (the Arbiter's user +0x8910..+0x8920).
+    /// A character that never touched EP reads all zeros, as every capture does.</summary>
+    public sealed record EpPageRow(int UsedEp, int PreEpLevel, int PreEpTotalPoint, int CurrentPage, int MaxPage);
+    public sealed record EpPerkRow(int Page, int PerkId, int Level);
+
+    /// <summary>The number of perk pages DBS_USER_LOAD_EP_PERK always carries (the Arbiter's
+    /// fixed array of five maps, cap_social4 432).</summary>
+    public const int EpPageCount = 5;
+
+    public EpPageRow GetEpPages(int characterId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT ep_used_point, ep_pre_level, ep_pre_total_point, ep_current_page, ep_max_page "
+                            + "FROM characters WHERE id=$c";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            using var r = cmd.ExecuteReader();
+            return r.Read() ? new EpPageRow(r.GetInt32(0), r.GetInt32(1), r.GetInt32(2), r.GetInt32(3), r.GetInt32(4))
+                            : new EpPageRow(0, 0, 0, 0, 0);
+        }
+    }
+
+    /// <summary>Every learned perk, page then perk id - the order the Arbiter's maps iterate.</summary>
+    public IReadOnlyList<EpPerkRow> GetEpPerks(int characterId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT page_index, perk_id, perk_level FROM ep_perks WHERE character_id=$c ORDER BY page_index, perk_id";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            var rows = new List<EpPerkRow>();
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) rows.Add(new EpPerkRow(r.GetInt32(0), r.GetInt32(1), r.GetInt32(2)));
+            return rows;
+        }
+    }
+
+    /// <summary>SDB_CHANGE_EP_PAGE (spChangeCurrentEpPage): the page and the points used on it.</summary>
+    public bool ChangeEpPage(int characterId, int page, int usedEp)
+        => ExecCharacter("UPDATE characters SET ep_current_page=$a, ep_used_point=$b WHERE id=$c", characterId, page, usedEp);
+
+    /// <summary>SDB_EXPAND_EP_PAGE (spExpandEpPage): one more page, which becomes the current one.</summary>
+    public bool ExpandEpPage(int characterId)
+        => ExecCharacter("UPDATE characters SET ep_max_page=ep_max_page+1, ep_current_page=ep_max_page+1 WHERE id=$c", characterId, 0, 0);
+
+    /// <summary>SDB_UPDATE_PRE_EP_INFO (spUpdateUserPreEPInfo) - DBS_USER_LOAD_EP_PERK's PreEpLevel / PreEpTotalPoint.</summary>
+    public bool SetEpPre(int characterId, int level, int totalPoint)
+        => ExecCharacter("UPDATE characters SET ep_pre_level=$a, ep_pre_total_point=$b WHERE id=$c", characterId, level, totalPoint);
+
+    /// <summary>SDB_USER_LEARN_EP_PERK: each (perk, level) into the CURRENT page (spUpdateEpPerk),
+    /// then the used points go up by what the request spent (spAddUsedExtraPoint).</summary>
+    public void LearnEpPerks(int characterId, IEnumerable<(int PerkId, int Level)> perks, int usedEpDelta)
+    {
+        ArgumentNullException.ThrowIfNull(perks);
+        int page = GetEpPages(characterId).CurrentPage;
+        lock (_lock)
+        {
+            using var tx = _db.BeginTransaction();
+            foreach (var (perk, level) in perks)
+            {
+                using var cmd = _db.CreateCommand();
+                cmd.Transaction = tx;
+                cmd.CommandText = "INSERT OR REPLACE INTO ep_perks (character_id, page_index, perk_id, perk_level) VALUES ($c, $p, $k, $l)";
+                cmd.Parameters.AddWithValue("$c", characterId);
+                cmd.Parameters.AddWithValue("$p", page);
+                cmd.Parameters.AddWithValue("$k", perk);
+                cmd.Parameters.AddWithValue("$l", level);
+                cmd.ExecuteNonQuery();
+            }
+            using (var up = _db.CreateCommand())
+            {
+                up.Transaction = tx;
+                up.CommandText = "UPDATE characters SET ep_used_point=ep_used_point+$d WHERE id=$c";
+                up.Parameters.AddWithValue("$d", usedEpDelta);
+                up.Parameters.AddWithValue("$c", characterId);
+                up.ExecuteNonQuery();
+            }
+            tx.Commit();
+        }
+    }
+
+    /// <summary>SDB_USER_RESET_EP_PERK (spResetEpPerk + spResetUserExtraPointData): the current
+    /// page's perks go and the used points drop to 0.</summary>
+    public void ResetEpPerks(int characterId)
+    {
+        int page = GetEpPages(characterId).CurrentPage;
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "DELETE FROM ep_perks WHERE character_id=$c AND page_index=$p; "
+                            + "UPDATE characters SET ep_used_point=0 WHERE id=$c";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            cmd.Parameters.AddWithValue("$p", page);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>SDB_RESET_EXTRA_POINT_DATA (spResetExtraPointData): the EP progress T77 stores
+    /// goes back to zero - exp, level, points, daily exp, reserve bonus and its reset stamp
+    /// (the six fields the Arbiter clears). The daily limit is a setting, not progress, and stays.</summary>
+    public bool ResetExtraPointData(int characterId)
+        => ExecCharacter("UPDATE characters SET ep_exp=0, ep_level=0, ep_point=0, ep_daily_exp=0, "
+                       + "ep_reserve_bonus=0, ep_reset_time=0 WHERE id=$c", characterId, 0, 0);
+
+    /// <summary>SDB_USER_INCREASE_EP_POINT_BY_ITEM: the item's points on top of the stored ones.</summary>
+    public bool AddEpPoint(int characterId, int gain)
+        => ExecCharacter("UPDATE characters SET ep_point=ep_point+$a WHERE id=$c", characterId, gain, 0);
+
+    /// <summary>T167. DBS_LOAD_SKILL_POLISHING's scalars (the Arbiter's user +0x8980..+0x8990).</summary>
+    public sealed record PolishingRow(int Level, int Point, int TotalPoint, long Exp);
+    public sealed record PolishingOptionRow(int PolishingId, int EffectId, bool Applied);
+    public sealed record PolishingLevelRow(int PolishingId, int EffectId);
+
+    public PolishingRow GetPolishing(int characterId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT level, point, total_point, exp FROM skill_polishing WHERE character_id=$c";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            using var r = cmd.ExecuteReader();
+            return r.Read() ? new PolishingRow(r.GetInt32(0), r.GetInt32(1), r.GetInt32(2), r.GetInt64(3))
+                            : new PolishingRow(0, 0, 0, 0);
+        }
+    }
+
+    /// <summary>SDB_SKILL_POLISHING_ADD_EXP: World sends the four new values, not a delta.</summary>
+    public void SetPolishing(int characterId, PolishingRow row)
+    {
+        ArgumentNullException.ThrowIfNull(row);
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "INSERT OR REPLACE INTO skill_polishing (character_id, level, point, total_point, exp) "
+                            + "VALUES ($c, $l, $p, $t, $e)";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            cmd.Parameters.AddWithValue("$l", row.Level);
+            cmd.Parameters.AddWithValue("$p", row.Point);
+            cmd.Parameters.AddWithValue("$t", row.TotalPoint);
+            cmd.Parameters.AddWithValue("$e", row.Exp);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>The Arbiter's point spend (FUN_1403c9260): refused unless 0 &lt;= required &lt;= point.</summary>
+    public bool SpendPolishingPoint(int characterId, int required)
+    {
+        var cur = GetPolishing(characterId);
+        if (required < 0 || required > cur.Point) return false;
+        SetPolishing(characterId, cur with { Point = cur.Point - required });
+        return true;
+    }
+
+    /// <summary>SDB_SKILL_POLISHING_UPGRADE_LEVEL (spUpgradeSkillPolishingLevel): the level map's
+    /// entry for this polishing id becomes the new effect.</summary>
+    public void SetPolishingLevel(int characterId, int polishingId, int effectId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "INSERT OR REPLACE INTO skill_polishing_levels (character_id, polishing_id, effect_id) VALUES ($c, $i, $e)";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            cmd.Parameters.AddWithValue("$i", polishingId);
+            cmd.Parameters.AddWithValue("$e", effectId);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>The option map is keyed (polishing id, effect id) -&gt; applied. Unlock
+    /// (spUnlockSkillPolishingOption) and change (spChangeSkillPolishingOption) both clear the
+    /// applied flag of the effect that was applied and set it on the new one; unlock also creates
+    /// the new one, change needs it to exist already. Returns false when change finds no such option.</summary>
+    public bool ApplyPolishingOption(int characterId, int polishingId, int newEffectId, int previousEffectId, bool create)
+    {
+        lock (_lock)
+        {
+            using var tx = _db.BeginTransaction();
+            if (!create)
+            {
+                using var q = _db.CreateCommand();
+                q.Transaction = tx;
+                q.CommandText = "SELECT COUNT(*) FROM skill_polishing_options WHERE character_id=$c AND polishing_id=$i AND effect_id=$e";
+                q.Parameters.AddWithValue("$c", characterId);
+                q.Parameters.AddWithValue("$i", polishingId);
+                q.Parameters.AddWithValue("$e", newEffectId);
+                if (Convert.ToInt64(q.ExecuteScalar()) == 0) return false;
+            }
+            using var cmd = _db.CreateCommand();
+            cmd.Transaction = tx;
+            cmd.CommandText = "UPDATE skill_polishing_options SET applied=0 WHERE character_id=$c AND polishing_id=$i AND effect_id=$o; "
+                            + "INSERT INTO skill_polishing_options (character_id, polishing_id, effect_id, applied) VALUES ($c, $i, $e, 1) "
+                            + "ON CONFLICT(character_id, polishing_id, effect_id) DO UPDATE SET applied=1";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            cmd.Parameters.AddWithValue("$i", polishingId);
+            cmd.Parameters.AddWithValue("$o", previousEffectId);
+            cmd.Parameters.AddWithValue("$e", newEffectId);
+            cmd.ExecuteNonQuery();
+            tx.Commit();
+            return true;
+        }
+    }
+
+    public IReadOnlyList<PolishingOptionRow> GetPolishingOptions(int characterId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT polishing_id, effect_id, applied FROM skill_polishing_options WHERE character_id=$c "
+                            + "ORDER BY polishing_id, effect_id";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            var rows = new List<PolishingOptionRow>();
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) rows.Add(new PolishingOptionRow(r.GetInt32(0), r.GetInt32(1), r.GetInt32(2) != 0));
+            return rows;
+        }
+    }
+
+    public IReadOnlyList<PolishingLevelRow> GetPolishingLevels(int characterId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT polishing_id, effect_id FROM skill_polishing_levels WHERE character_id=$c ORDER BY polishing_id";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            var rows = new List<PolishingLevelRow>();
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) rows.Add(new PolishingLevelRow(r.GetInt32(0), r.GetInt32(1)));
+            return rows;
+        }
+    }
+
+    /// <summary>T167. One SDB_UPDATE_DUNGEON_RANK_RECORD: a character's best point / time for a
+    /// dungeon in a season, as World computed them, plus this run's breakdown.</summary>
+    public sealed record DungeonRankRow(int CharacterId, int DungeonId, int Season, int TopPoint, int TopTime,
+                                        long PlayDate, bool NewScore, int TimePoint, int KillPoint, int BonusPoint,
+                                        string MvpName);
+
+    /// <summary>Keeps one row per (character, dungeon, season): World's TopPointRecord and
+    /// TopTimeRecord are already the bests, so the latest frame simply replaces the row.</summary>
+    public void RecordDungeonRank(DungeonRankRow row)
+    {
+        ArgumentNullException.ThrowIfNull(row);
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "INSERT OR REPLACE INTO dungeon_rank_records (character_id, dungeon_id, season, top_point, "
+                + "top_time, play_date, new_score, time_point, kill_point, bonus_point, mvp_name) "
+                + "VALUES ($c, $d, $s, $p, $t, $pd, $n, $tp, $kp, $bp, $m)";
+            cmd.Parameters.AddWithValue("$c", row.CharacterId);
+            cmd.Parameters.AddWithValue("$d", row.DungeonId);
+            cmd.Parameters.AddWithValue("$s", row.Season);
+            cmd.Parameters.AddWithValue("$p", row.TopPoint);
+            cmd.Parameters.AddWithValue("$t", row.TopTime);
+            cmd.Parameters.AddWithValue("$pd", row.PlayDate);
+            cmd.Parameters.AddWithValue("$n", row.NewScore ? 1 : 0);
+            cmd.Parameters.AddWithValue("$tp", row.TimePoint);
+            cmd.Parameters.AddWithValue("$kp", row.KillPoint);
+            cmd.Parameters.AddWithValue("$bp", row.BonusPoint);
+            cmd.Parameters.AddWithValue("$m", row.MvpName ?? string.Empty);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    public IReadOnlyList<DungeonRankRow> GetDungeonRanks(int characterId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT character_id, dungeon_id, season, top_point, top_time, play_date, new_score, "
+                + "time_point, kill_point, bonus_point, mvp_name FROM dungeon_rank_records WHERE character_id=$c "
+                + "ORDER BY season, dungeon_id";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            var rows = new List<DungeonRankRow>();
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                rows.Add(new DungeonRankRow(r.GetInt32(0), r.GetInt32(1), r.GetInt32(2), r.GetInt32(3), r.GetInt32(4),
+                    r.GetInt64(5), r.GetInt32(6) != 0, r.GetInt32(7), r.GetInt32(8), r.GetInt32(9), r.GetString(10)));
+            return rows;
+        }
+    }
+
+    private bool ExecCharacter(string sql, int characterId, int a, int b)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = sql;
+            cmd.Parameters.AddWithValue("$c", characterId);
+            if (sql.Contains("$a")) cmd.Parameters.AddWithValue("$a", a);
+            if (sql.Contains("$b")) cmd.Parameters.AddWithValue("$b", b);
+            return cmd.ExecuteNonQuery() == 1;
+        }
+    }
+
+    private long ScalarLong(string sql, int characterId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = sql;
+            cmd.Parameters.AddWithValue("$c", characterId);
+            var v = cmd.ExecuteScalar();
+            return v is null or DBNull ? 0 : Convert.ToInt64(v);
+        }
+    }
+
+    // ============================================================ T168: VIP, gold, attendance, hidden passives, servants, book rewards
+
+    /// <summary>T168. DBS_LOAD_USER_VIP_INFO's scalars, per account (the Arbiter's VIP object hangs
+    /// off the account, +0x3F40 +0x30F8). No row reads as all zeros.</summary>
+    public sealed record VipInfoRow(int PubExp, int GameExp, long TokenAmount, long LastResetTime, int ResetCount);
+
+    public VipInfoRow GetVipInfo(long accountId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT pub_exp, game_exp, token_amount, last_reset_time, reset_count FROM vip_info WHERE account_id=$a";
+            cmd.Parameters.AddWithValue("$a", accountId);
+            using var r = cmd.ExecuteReader();
+            return r.Read() ? new VipInfoRow(r.GetInt32(0), r.GetInt32(1), r.GetInt64(2), r.GetInt64(3), r.GetInt32(4))
+                            : new VipInfoRow(0, 0, 0, 0, 0);
+        }
+    }
+
+    /// <summary>SDB_ADD_VIP_GAME_EXP: the delta on top of the stored exp; returns the new total
+    /// (DBS_ADD_VIP_GAME_EXP's NewResult, which World sets the exp to).</summary>
+    public int AddVipGameExp(long accountId, int delta)
+    {
+        if (NoSuchAccount("AddVipGameExp", accountId)) return 0;
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "INSERT INTO vip_info (account_id, game_exp) VALUES ($a, $d) "
+                            + "ON CONFLICT(account_id) DO UPDATE SET game_exp = MAX(-2147483648, MIN(2147483647, game_exp + $d))";
+            cmd.Parameters.AddWithValue("$a", accountId);
+            cmd.Parameters.AddWithValue("$d", delta);
+            cmd.ExecuteNonQuery();
+            using var q = _db.CreateCommand();
+            q.CommandText = "SELECT game_exp FROM vip_info WHERE account_id=$a";
+            q.Parameters.AddWithValue("$a", accountId);
+            return Convert.ToInt32(q.ExecuteScalar());
+        }
+    }
+
+    /// <summary>SDB_CHANGE_GOLD_CONSUMPTION (spUpdateGoldConsumption): stored as World sends it.</summary>
+    public bool SetGoldConsumption(int characterId, long gold)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE characters SET gold_consumption=$g WHERE id=$c";
+            cmd.Parameters.AddWithValue("$g", gold);
+            cmd.Parameters.AddWithValue("$c", characterId);
+            return cmd.ExecuteNonQuery() == 1;
+        }
+    }
+
+    public long GetGoldConsumption(int characterId)
+        => ScalarLong("SELECT gold_consumption FROM characters WHERE id=$c", characterId);
+
+    /// <summary>The attendance bitmap (DBS_*_DAILY_ATTENDANCE's AttendBitmap), or null when the
+    /// character has none stored.</summary>
+    public long? GetAttendance(int characterId)
+    {
+        long v = ScalarLong("SELECT attend_bitmap FROM characters WHERE id=$c", characterId);
+        long set = ScalarLong("SELECT attend_set FROM characters WHERE id=$c", characterId);
+        return set != 0 ? v : null;
+    }
+
+    /// <summary>SDB_ADMIN_USER_DAILY_ATTENDANCE (GM): mark one login day; returns the bitmap.</summary>
+    public long SetAttendanceDay(int characterId, int loginDay)
+    {
+        long cur = GetAttendance(characterId) ?? 0;
+        if (loginDay >= 0 && loginDay < 64) cur |= 1L << loginDay;
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE characters SET attend_bitmap=$b, attend_set=1 WHERE id=$c";
+            cmd.Parameters.AddWithValue("$b", cur);
+            cmd.Parameters.AddWithValue("$c", characterId);
+            cmd.ExecuteNonQuery();
+        }
+        return cur;
+    }
+
+    /// <summary>SDB_USER_LEARN_HIDE_PASSIVE_SKILL: each id learned; the bool is true for an id this
+    /// call added (false: already known).</summary>
+    public List<(int PassiveId, bool Learned)> LearnHiddenPassives(int characterId, IEnumerable<int> passiveIds)
+    {
+        ArgumentNullException.ThrowIfNull(passiveIds);
+        var result = new List<(int, bool)>();
+        if (NoSuchOwner("LearnHiddenPassives", characterId)) return result;
+        lock (_lock)
+        {
+            foreach (int id in passiveIds)
+            {
+                using var cmd = _db.CreateCommand();
+                cmd.CommandText = "INSERT OR IGNORE INTO hidden_passives (character_id, passive_id) VALUES ($c, $p)";
+                cmd.Parameters.AddWithValue("$c", characterId);
+                cmd.Parameters.AddWithValue("$p", id);
+                result.Add((id, cmd.ExecuteNonQuery() == 1));
+            }
+        }
+        return result;
+    }
+
+    public IReadOnlyList<int> GetHiddenPassives(int characterId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT passive_id FROM hidden_passives WHERE character_id=$c ORDER BY passive_id";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            var rows = new List<int>();
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) rows.Add(r.GetInt32(0));
+            return rows;
+        }
+    }
+
+    /// <summary>T168. One servant, as SDB_ADD_SERVANT creates it.</summary>
+    public sealed record ServantRow(long ServantDbId, int CharacterId, int Type, int TemplateId, string Name, int Energy, int Period);
+
+    /// <summary>SDB_ADD_SERVANT: a new servant with a fresh db id (returned).</summary>
+    public long AddServant(int characterId, int type, int templateId, string name, int energy, int period)
+    {
+        ArgumentNullException.ThrowIfNull(name);
+        if (NoSuchOwner("AddServant", characterId)) return 0;
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "INSERT INTO servants (character_id, type, template_id, name, energy, period) "
+                            + "VALUES ($c, $t, $tp, $n, $e, $p)";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            cmd.Parameters.AddWithValue("$t", type);
+            cmd.Parameters.AddWithValue("$tp", templateId);
+            cmd.Parameters.AddWithValue("$n", name);
+            cmd.Parameters.AddWithValue("$e", energy);
+            cmd.Parameters.AddWithValue("$p", period);
+            cmd.ExecuteNonQuery();
+            using var id = _db.CreateCommand();
+            id.CommandText = "SELECT last_insert_rowid()";
+            return Convert.ToInt64(id.ExecuteScalar());
+        }
+    }
+
+    public IReadOnlyList<ServantRow> GetServants(int characterId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT servant_db_id, character_id, type, template_id, name, energy, period FROM servants "
+                            + "WHERE character_id=$c ORDER BY servant_db_id";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            var rows = new List<ServantRow>();
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                rows.Add(new ServantRow(r.GetInt64(0), r.GetInt32(1), r.GetInt32(2), r.GetInt32(3), r.GetString(4), r.GetInt32(5), r.GetInt32(6)));
+            return rows;
+        }
+    }
+
+    /// <summary>SDB_RECEIVE_COLLECTION_BOOK_REWARD (spReceiveCollectionBookReward): false when the
+    /// account already has it. DBS_RESPONSE_CARD_DATA's ReceivedCollectionBookRewards list.</summary>
+    public bool AddCardBookReward(long accountId, int rewardId)
+    {
+        if (NoSuchAccount("AddCardBookReward", accountId)) return false;
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "INSERT OR IGNORE INTO card_book_rewards (account_id, reward_id) VALUES ($a, $r)";
+            cmd.Parameters.AddWithValue("$a", accountId);
+            cmd.Parameters.AddWithValue("$r", rewardId);
+            return cmd.ExecuteNonQuery() == 1;
+        }
+    }
+
+    public IReadOnlyList<int> GetCardBookRewards(long accountId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT reward_id FROM card_book_rewards WHERE account_id=$a ORDER BY reward_id";
+            cmd.Parameters.AddWithValue("$a", accountId);
+            var rows = new List<int>();
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) rows.Add(r.GetInt32(0));
+            return rows;
+        }
+    }
+
+    // ============================================================ T170: clear all skills, event progress
+
+    /// <summary>
+    /// SDB_USER_CLEAR_ALL_SKILL (User::ClearAllSkill): spClearAllSkill, then the Arbiter memsets
+    /// 0x10E0 bytes at User+0x1B90 - blob 6880..11200, both skill regions (40 passive + 500 active
+    /// slots). Nothing survives: cap_clearallskill 903 answers 4000 + 320 zero bytes. False when the
+    /// character does not exist; a character with no blob yet has nothing to clear.
+    /// </summary>
+    public bool ClearAllSkills(int characterId)
+    {
+        if (NoSuchOwner("ClearAllSkills", characterId)) return false;
+        const int start = StarterBlob.PassiveSkillsOffset;
+        const int size = StarterBlob.PassiveSkillSlots * StarterBlob.SkillEntrySize
+                       + StarterBlob.ActiveSkillSlots * StarterBlob.SkillEntrySize;
+        lock (_lock)
+        {
+            using var q = _db.CreateCommand();
+            q.CommandText = "SELECT world_blob FROM characters WHERE id=$id";
+            q.Parameters.AddWithValue("$id", characterId);
+            if (q.ExecuteScalar() is not byte[] blob || blob.Length < start + size) return true;
+            Array.Clear(blob, start, size);
+            using var u = _db.CreateCommand();
+            u.CommandText = "UPDATE characters SET world_blob=$b WHERE id=$id";
+            u.Parameters.AddWithValue("$b", blob);
+            u.Parameters.AddWithValue("$id", characterId);
+            u.ExecuteNonQuery();
+        }
+        return true;
+    }
+
+    public sealed record EventProgressRow(long EventId, int UserId, long AccountId, int Value, bool Flag1, bool Flag2);
+
+    /// <summary>
+    /// EventSystemManager::UpdateUserProgressInfoInDb: the value is SET, not added. Flag1 is kept
+    /// from the stored row unless <paramref name="overwriteFlag1"/> (the request's header flag).
+    /// Returns what GetProgressInfo would read back - the reply's element.
+    /// </summary>
+    public EventProgressRow SetEventProgress(long eventId, int userId, long accountId, int value,
+                                             bool flag1, bool flag2, bool overwriteFlag1)
+    {
+        lock (_lock)
+        {
+            if (!overwriteFlag1)
+            {
+                using var q = _db.CreateCommand();
+                q.CommandText = "SELECT flag1 FROM eventsystem_progress WHERE event_id=$e AND user_id=$u AND account_id=$a";
+                q.Parameters.AddWithValue("$e", eventId);
+                q.Parameters.AddWithValue("$u", userId);
+                q.Parameters.AddWithValue("$a", accountId);
+                if (q.ExecuteScalar() is long kept) flag1 = kept != 0;
+            }
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "INSERT INTO eventsystem_progress (event_id, user_id, account_id, value, flag1, flag2) "
+                            + "VALUES ($e, $u, $a, $v, $f1, $f2) ON CONFLICT(event_id, user_id, account_id) "
+                            + "DO UPDATE SET value=$v, flag1=$f1, flag2=$f2";
+            cmd.Parameters.AddWithValue("$e", eventId);
+            cmd.Parameters.AddWithValue("$u", userId);
+            cmd.Parameters.AddWithValue("$a", accountId);
+            cmd.Parameters.AddWithValue("$v", value);
+            cmd.Parameters.AddWithValue("$f1", flag1 ? 1 : 0);
+            cmd.Parameters.AddWithValue("$f2", flag2 ? 1 : 0);
+            cmd.ExecuteNonQuery();
+        }
+        return new EventProgressRow(eventId, userId, accountId, value, flag1, flag2);
+    }
+
+    public IReadOnlyList<EventProgressRow> GetEventProgress(int userId)
+    {
+        var list = new List<EventProgressRow>();
+        lock (_lock)
+        {
+            using var q = _db.CreateCommand();
+            q.CommandText = "SELECT event_id, user_id, account_id, value, flag1, flag2 FROM eventsystem_progress "
+                          + "WHERE user_id=$u ORDER BY event_id";
+            q.Parameters.AddWithValue("$u", userId);
+            using var r = q.ExecuteReader();
+            while (r.Read())
+                list.Add(new EventProgressRow(r.GetInt64(0), r.GetInt32(1), r.GetInt64(2), r.GetInt32(3),
+                                              r.GetInt64(4) != 0, r.GetInt64(5) != 0));
+        }
+        return list;
+    }
+
     // ============================================================ T89: GM bookmarks
 
     /// <summary>One saved teleport shortcut. The coordinates are whole numbers - see the DDL.</summary>
@@ -5301,20 +6396,52 @@ DELETE FROM restrictions      WHERE character_id = $id;";
     /// <c>game_log</c> dungeon category; there is no such category (T115 created eight, and
     /// none of the five log opcodes carries a dungeon clear), so this is the nearest real
     /// source rather than an invented one.</para>
+    ///
+    /// <para>T167: a character with SDB_UPDATE_DUNGEON_RANK_RECORD rows is ranked by rank points
+    /// instead - the sum over dungeons of its best TopPointRecord (any season). Clear counts
+    /// stay the score of a character without one, so a server with no ranked dungeon run
+    /// shows the same board as before.</para>
     /// </summary>
     public List<RankingScore> GetPveRankingScores(int limit = RankingScoreLimit)
         => RankingScores(
-            "SELECT c.id, c.name, c.class, c.level, SUM(d.clear_count) AS score " +
-            "FROM dungeon_cooldowns d JOIN characters c ON c.id = d.owner_id " +
-            "WHERE c.deleted_at = 0 GROUP BY c.id HAVING score > 0 " +
+            "SELECT id, name, class, level, score FROM (" +
+            "SELECT c.id, c.name, c.class, c.level, COALESCE(rp.pts, dc.clears, 0) AS score " +
+            "FROM characters c " +
+            "LEFT JOIN (SELECT character_id, SUM(best) AS pts FROM (SELECT character_id, dungeon_id, " +
+            "MAX(top_point) AS best FROM dungeon_rank_records GROUP BY character_id, dungeon_id) " +
+            "GROUP BY character_id) rp ON rp.character_id = c.id " +
+            "LEFT JOIN (SELECT owner_id, SUM(clear_count) AS clears FROM dungeon_cooldowns GROUP BY owner_id) dc " +
+            "ON dc.owner_id = c.id WHERE c.deleted_at = 0) WHERE score > 0 " +
+            "ORDER BY score DESC, id LIMIT $take", limit);
+
+    /// <summary>
+    /// The PvP board: <b>battleground rating</b> per character, T138d.
+    ///
+    /// <para>T119 shipped this as a KILL board, counted out of the game log T115 fills from
+    /// <c>SDB_ADD_PVP_USER_LOG</c> (0x27FE), because there was no rating to rank by. T138c
+    /// added <c>characters.bg_rating</c> and put it in the frame's <c>rating</c> field while
+    /// leaving the ORDER on kills, which meant the column and the ordering disagreed. They
+    /// agree now: the board is the rating ladder the client's own field name says it is, and
+    /// the score and the rating are the same number.</para>
+    ///
+    /// <para>A server where nobody has finished a battleground therefore has an EMPTY PvP
+    /// board, which is correct - a ladder with no games played has no standings. The kill
+    /// counts are still in <c>game_log</c> and still queryable; they are simply not this
+    /// board.</para>
+    /// </summary>
+    public List<RankingScore> GetPvpRankingScores(int limit = RankingScoreLimit)
+        => RankingScores(
+            "SELECT c.id, c.name, c.class, c.level, c.bg_rating AS score, c.bg_rating " +
+            "FROM characters c WHERE c.deleted_at = 0 AND c.bg_rating > 0 " +
             "ORDER BY score DESC, c.id LIMIT $take", limit);
 
     /// <summary>
-    /// The PvP board: kills per character, counted out of the game log T115 fills from
-    /// <c>SDB_ADD_PVP_USER_LOG</c> (0x27FE). Only rows where the character is the ACTOR count -
-    /// being the target of a kill is the other player's score, not yours.
+    /// Kills per character, the number T119's PvP board used to rank by. Kept because the data
+    /// is real and the admin views read it; <see cref="GetPvpRankingScores"/> no longer does.
+    /// Only rows where the character is the ACTOR count - being the target of a kill is the
+    /// other player's score, not yours.
     /// </summary>
-    public List<RankingScore> GetPvpRankingScores(int limit = RankingScoreLimit)
+    public List<RankingScore> GetPvpKillScores(int limit = RankingScoreLimit)
         => RankingScores(
             "SELECT c.id, c.name, c.class, c.level, COUNT(*) AS score, c.bg_rating " +
             "FROM game_log g JOIN characters c ON c.id = g.character_id " +
@@ -6350,11 +7477,32 @@ DELETE FROM restrictions      WHERE character_id = $id;";
     /// the 536-byte <c>record</c> is kept verbatim so the rebuilt 0x27A4 is byte-identical to
     /// what StarterInventory produced.
     /// </summary>
-    public void ReplaceInventory(long ownerDbId, IReadOnlyList<ItemRow> rows)
+    /// <summary>
+    /// T142b. <paramref name="allowEmpty"/> is the ONLY way to clear a bag through this method.
+    /// Without it an empty <paramref name="rows"/> over a character who owns something is
+    /// refused and logged, because every way this has gone wrong has looked the same: a caller
+    /// that could not resolve the owner, or could not parse a kit, hands us nothing and the
+    /// character's bag is gone. Deleting a bag is <see cref="DeleteAllItems"/>'s job, and it is
+    /// called from exactly one place (DeleteCharacter). An empty replace on an already-empty
+    /// bag is a no-op either way, so the guard never blocks a legitimate caller.
+    /// </summary>
+    public void ReplaceInventory(long ownerDbId, IReadOnlyList<ItemRow> rows, bool allowEmpty = false)
     {
         ArgumentNullException.ThrowIfNull(rows);
         lock (_lock)
         {
+            if (rows.Count == 0 && !allowEmpty)
+            {
+                int had = CountInventoryItems(ownerDbId);
+                if (had > 0)
+                {
+                    _log.LogWarning(
+                        "ReplaceInventory: REFUSED an empty bag over {N} item row(s) for owner {Owner}. "
+                        + "Pass allowEmpty to clear a bag on purpose; DeleteAllItems is the delete path.",
+                        had, ownerDbId);
+                    return;
+                }
+            }
             using (var del = _db.CreateCommand())
             {
                 del.CommandText =
@@ -6772,6 +7920,27 @@ DELETE FROM restrictions      WHERE character_id = $id;";
     /// exactly what <c>S_VISIT_NEW_SECTION.isFirstVisit</c> carries and what the exploration
     /// quests key on.
     /// </summary>
+    /// <summary>
+    /// T172. The per-character tables with no foreign key to characters(id): nothing stops their
+    /// rows outliving the character, and the next character gets the same id. Cleared on delete
+    /// and again on create (for rows a delete before T172 left behind). game_log is kept.
+    /// </summary>
+    public static readonly string[] CharacterStateTables =
+    {
+        "visited_sections", "watched_movies", "crests", "card_mounts", "daily_event", "event_matching_reward",
+        "ep_perks", "skill_polishing", "skill_polishing_options", "skill_polishing_levels",
+        "dungeon_rank_records", "hidden_passives", "servants", "deleted_items",
+    };
+
+    private void PurgeCharacterStateLocked(int characterId)
+    {
+        using var cmd = _db.CreateCommand();
+        cmd.CommandText = string.Concat(CharacterStateTables.Select(t => $"DELETE FROM {t} WHERE character_id = $id;"));
+        cmd.Parameters.AddWithValue("$id", characterId);
+        int n = cmd.ExecuteNonQuery();
+        if (n > 0) _log.LogInformation("Character {Id}: {N} stale row(s) of an earlier character with this id removed", characterId, n);
+    }
+
     public bool AddVisitedSection(int characterId, int mapId, int guardId, int sectionId)
     {
         lock (_lock)
@@ -6924,6 +8093,334 @@ DELETE FROM restrictions      WHERE character_id = $id;";
             cmd.Parameters.AddWithValue("$g", guardId);
             cmd.Parameters.AddWithValue("$s", sectionId);
             return Convert.ToInt64(cmd.ExecuteScalar()!) > 0;
+        }
+    }
+
+    // =====================================================================
+    // T147 - crafting: learned recipes and skill proficiencies. status/CRAFTING.md.
+    // =====================================================================
+
+    /// <summary>A character's learned recipes, in the order they were learned - the order the
+    /// real Arbiter's in-memory vector keeps, since LearnItemRecipeNoLock appends.</summary>
+    public List<TeraSharp.Arbiter.World.ArtisanDb.Recipe> GetItemRecipes(int characterId)
+    {
+        var list = new List<TeraSharp.Arbiter.World.ArtisanDb.Recipe>();
+        if (characterId <= 0) return list;
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT recipe_id, extract, learned_at, bookmark FROM item_recipes "
+                            + "WHERE character_id = $c ORDER BY rowid";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                list.Add(new TeraSharp.Arbiter.World.ArtisanDb.Recipe(r.GetInt32(0), r.GetInt64(1) != 0, r.GetInt64(2), r.GetInt64(3) != 0));
+        }
+        return list;
+    }
+
+    /// <summary>Learn a recipe. False when the character already knew it - the row is left as
+    /// it was, learn time and bookmark included.</summary>
+    public bool LearnItemRecipe(int characterId, int recipeId, bool extract, long learnedAtUnix)
+    {
+        if (characterId <= 0) return false;
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "INSERT OR IGNORE INTO item_recipes (character_id, recipe_id, extract, bookmark, learned_at) "
+                            + "VALUES ($c, $r, $e, 0, $t)";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            cmd.Parameters.AddWithValue("$r", recipeId);
+            cmd.Parameters.AddWithValue("$e", extract ? 1 : 0);
+            cmd.Parameters.AddWithValue("$t", learnedAtUnix);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    /// <summary>Forget one recipe. False when the character did not know it.</summary>
+    public bool DeleteItemRecipe(int characterId, int recipeId)
+    {
+        if (characterId <= 0) return false;
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "DELETE FROM item_recipes WHERE character_id = $c AND recipe_id = $r";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            cmd.Parameters.AddWithValue("$r", recipeId);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    /// <summary>Set or clear a recipe's bookmark. False when the character does not know it.</summary>
+    public bool SetItemRecipeBookmark(int characterId, int recipeId, bool bookmark)
+    {
+        if (characterId <= 0) return false;
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE item_recipes SET bookmark = $b WHERE character_id = $c AND recipe_id = $r";
+            cmd.Parameters.AddWithValue("$b", bookmark ? 1 : 0);
+            cmd.Parameters.AddWithValue("$c", characterId);
+            cmd.Parameters.AddWithValue("$r", recipeId);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    /// <summary>A character's skill proficiencies, by id.</summary>
+    public List<TeraSharp.Arbiter.World.ArtisanDb.SkillProf> GetSkillProfs(int characterId)
+    {
+        var list = new List<TeraSharp.Arbiter.World.ArtisanDb.SkillProf>();
+        if (characterId <= 0) return list;
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT skill_prof_id, value FROM skill_profs WHERE character_id = $c ORDER BY skill_prof_id";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) list.Add(new TeraSharp.Arbiter.World.ArtisanDb.SkillProf(r.GetInt32(0), r.GetInt32(1)));
+        }
+        return list;
+    }
+
+    /// <summary>Set one proficiency outright - World sends the new value, not a delta.</summary>
+    public void SetSkillProf(int characterId, int skillProfId, int value)
+    {
+        if (characterId <= 0) return;
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "INSERT INTO skill_profs (character_id, skill_prof_id, value) VALUES ($c, $p, $v) "
+                            + "ON CONFLICT(character_id, skill_prof_id) DO UPDATE SET value = $v";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            cmd.Parameters.AddWithValue("$p", skillProfId);
+            cmd.Parameters.AddWithValue("$v", value);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>T147. The gathering proficiencies World has written, kind (0 mineral, 1 bug,
+    /// 2 energy, 3 herb) -&gt; value. Kinds never written are absent, not 0.</summary>
+    public Dictionary<int, int> GetGatheringProfs(int characterId)
+    {
+        var map = new Dictionary<int, int>();
+        if (characterId <= 0) return map;
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT kind, value FROM gathering_profs WHERE character_id = $c";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) map[r.GetInt32(0)] = r.GetInt32(1);
+        }
+        return map;
+    }
+
+    /// <summary>T154. One city-owning guild, as DBS_LOAD_CITY_GUILD_INFO carries it.</summary>
+    public sealed record CityGuildRow(int LeagueId, int SeasonId, int GuildDbId, long TowerBuildTime,
+                                      long TowerDestroyTime, int TotalKill, int TotalDeath,
+                                      int TotalDestroy, int MaintainBonus);
+
+    /// <summary>T154. The guilds holding a city in this league and season, by guild id. Empty is
+    /// "no owning guild".</summary>
+    public IReadOnlyList<CityGuildRow> GetCityGuilds(int leagueId, int seasonId)
+    {
+        var list = new List<CityGuildRow>();
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT guild_db_id, tower_build_time, tower_destroy_time, total_kill, total_death, "
+                + "total_destroy, maintain_bonus FROM city_guild WHERE league_id = $l AND season_id = $s ORDER BY guild_db_id";
+            cmd.Parameters.AddWithValue("$l", leagueId);
+            cmd.Parameters.AddWithValue("$s", seasonId);
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                list.Add(new CityGuildRow(leagueId, seasonId, r.GetInt32(0), r.GetInt64(1), r.GetInt64(2),
+                                          r.GetInt32(3), r.GetInt32(4), r.GetInt32(5), r.GetInt32(6)));
+        }
+        return list;
+    }
+
+    /// <summary>T154. Store (or replace) one city-owning guild - for a Civil Unrest result.</summary>
+    public void SetCityGuild(CityGuildRow row)
+    {
+        ArgumentNullException.ThrowIfNull(row);
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "INSERT OR REPLACE INTO city_guild (league_id, season_id, guild_db_id, tower_build_time, "
+                + "tower_destroy_time, total_kill, total_death, total_destroy, maintain_bonus) "
+                + "VALUES ($l, $s, $g, $b, $d, $k, $x, $y, $m)";
+            cmd.Parameters.AddWithValue("$l", row.LeagueId);
+            cmd.Parameters.AddWithValue("$s", row.SeasonId);
+            cmd.Parameters.AddWithValue("$g", row.GuildDbId);
+            cmd.Parameters.AddWithValue("$b", row.TowerBuildTime);
+            cmd.Parameters.AddWithValue("$d", row.TowerDestroyTime);
+            cmd.Parameters.AddWithValue("$k", row.TotalKill);
+            cmd.Parameters.AddWithValue("$x", row.TotalDeath);
+            cmd.Parameters.AddWithValue("$y", row.TotalDestroy);
+            cmd.Parameters.AddWithValue("$m", row.MaintainBonus);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    // ------------------------------------------------ T156: the Vanguard Initiative
+
+    /// <summary>T156. One character's daily_event row - what DBS_LOAD_USER_DAILY_EVENT carries.
+    /// <paramref name="Counts"/> is always five long.</summary>
+    public sealed record DailyEventRow(int CharacterId, int[] Counts, long ExtraRewardReset,
+                                       bool GotExtraReward, int ExtraRewardValue);
+
+    /// <summary>T156. The character's daily_event row, or null when it has never had one.</summary>
+    public DailyEventRow? GetDailyEvent(int characterId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT count0, count1, count2, count3, count4, extra_reward_reset, got_extra_reward, "
+                + "extra_reward_value FROM daily_event WHERE character_id = $c";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            using var r = cmd.ExecuteReader();
+            if (!r.Read()) return null;
+            var counts = new int[5];
+            for (int i = 0; i < 5; i++) counts[i] = r.GetInt32(i);
+            return new DailyEventRow(characterId, counts, r.GetInt64(5), r.GetInt32(6) != 0, r.GetInt32(7));
+        }
+    }
+
+    /// <summary>
+    /// T156. SDB_UPDATE_USER_DAILY_EVENT_COUNT: replace the five completion counts and, when
+    /// <paramref name="extraRewardReset"/> is positive, the extra-reward stamp too (the real
+    /// Arbiter only calls spSetUserDailyEventExtraRewardResetTime for a positive time). A row
+    /// created here starts stamped <paramref name="nowUnix"/>: a brand-new character's first
+    /// write carries time 0 and its next load reads back the time of that write.
+    /// </summary>
+    public void SetDailyEventCounts(int characterId, int[] counts, long extraRewardReset, long nowUnix)
+    {
+        ArgumentNullException.ThrowIfNull(counts);
+        if (characterId <= 0) return;
+        lock (_lock)
+        {
+            EnsureDailyEventRow(characterId, nowUnix);
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE daily_event SET count0 = $a, count1 = $b, count2 = $d, count3 = $e, count4 = $f"
+                + (extraRewardReset > 0 ? ", extra_reward_reset = $t" : "") + " WHERE character_id = $c";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            cmd.Parameters.AddWithValue("$a", counts.Length > 0 ? counts[0] : 0);
+            cmd.Parameters.AddWithValue("$b", counts.Length > 1 ? counts[1] : 0);
+            cmd.Parameters.AddWithValue("$d", counts.Length > 2 ? counts[2] : 0);
+            cmd.Parameters.AddWithValue("$e", counts.Length > 3 ? counts[3] : 0);
+            cmd.Parameters.AddWithValue("$f", counts.Length > 4 ? counts[4] : 0);
+            if (extraRewardReset > 0) cmd.Parameters.AddWithValue("$t", extraRewardReset);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>T156. SDB_UPDATE_GET_EXTRA_REWARD: the bool and int the daily_event load returns.</summary>
+    public void SetDailyEventExtraReward(int characterId, bool got, int value, long nowUnix)
+    {
+        if (characterId <= 0) return;
+        lock (_lock)
+        {
+            EnsureDailyEventRow(characterId, nowUnix);
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE daily_event SET got_extra_reward = $g, extra_reward_value = $v WHERE character_id = $c";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            cmd.Parameters.AddWithValue("$g", got ? 1 : 0);
+            cmd.Parameters.AddWithValue("$v", value);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    private void EnsureDailyEventRow(int characterId, long nowUnix)
+    {
+        using var cmd = _db.CreateCommand();
+        cmd.CommandText = "INSERT OR IGNORE INTO daily_event (character_id, extra_reward_reset) VALUES ($c, $t)";
+        cmd.Parameters.AddWithValue("$c", characterId);
+        cmd.Parameters.AddWithValue("$t", nowUnix);
+        cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>T156. The character's add-reward receive counts, by event id.</summary>
+    public IReadOnlyList<(int EventId, int AcquireNum)> GetEventMatchingRewards(int characterId)
+    {
+        var list = new List<(int, int)>();
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT event_id, acquire_num FROM event_matching_reward WHERE character_id = $c ORDER BY event_id";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) list.Add((r.GetInt32(0), r.GetInt32(1)));
+        }
+        return list;
+    }
+
+    /// <summary>T156. Set (or overwrite) one add-reward receive count.</summary>
+    public void SetEventMatchingReward(int characterId, int eventId, int acquireNum)
+    {
+        if (characterId <= 0) return;
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "INSERT INTO event_matching_reward (character_id, event_id, acquire_num) VALUES ($c, $e, $n) "
+                + "ON CONFLICT(character_id, event_id) DO UPDATE SET acquire_num = $n";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            cmd.Parameters.AddWithValue("$e", eventId);
+            cmd.Parameters.AddWithValue("$n", acquireNum);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>T156. The daily add-reward reset: every character's counts go. Returns the rows removed.</summary>
+    public int ClearEventMatchingRewards()
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "DELETE FROM event_matching_reward";
+            return cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>T156. A named value in <c>counters</c>, or <paramref name="fallback"/> when it was never set.</summary>
+    public long GetCounterValue(string name, long fallback)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT value FROM counters WHERE name = $k";
+            cmd.Parameters.AddWithValue("$k", name);
+            var v = cmd.ExecuteScalar();
+            return v is null or DBNull ? fallback : Convert.ToInt64(v);
+        }
+    }
+
+    /// <summary>T156. Set a named value in <c>counters</c>.</summary>
+    public void SetCounterValue(string name, long value)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "INSERT INTO counters(name, value) VALUES($k, $v) ON CONFLICT(name) DO UPDATE SET value = $v";
+            cmd.Parameters.AddWithValue("$k", name);
+            cmd.Parameters.AddWithValue("$v", value);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>Set one gathering proficiency outright - User::UpdateUserProf* assigns it.</summary>
+    public void SetGatheringProf(int characterId, int kind, int value)
+    {
+        if (characterId <= 0) return;
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "INSERT INTO gathering_profs (character_id, kind, value) VALUES ($c, $k, $v) "
+                            + "ON CONFLICT(character_id, kind) DO UPDATE SET value = $v";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            cmd.Parameters.AddWithValue("$k", kind);
+            cmd.Parameters.AddWithValue("$v", value);
+            cmd.ExecuteNonQuery();
         }
     }
 

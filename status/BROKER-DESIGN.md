@@ -669,3 +669,63 @@ why T81 had three row counts of the same packet to pin the element against.
 `BrokerHandlers.ReplyFor(C_TRADE_BROKER_REGISTERED_ITEM_LIST, store, sellerDbId)` so the push and
 the tab the client asks for cannot drift apart. It is skipped when the seller is not in world: the
 list is a UI refresh, not state, and he gets it from the tab on the way back in.
+
+
+---
+
+## T141 - checked against a live Classic+ server
+
+`<captures>\classic_live4.log` is a client capture of a third-party 100.02 server driven
+through one whole broker episode: register, the waiting list new/page/sort, buy-it-now,
+calc-bought, and the bought / sold / registered tabs. Every S_ the Arbiter builds was rebuilt
+from the frame's own decoded values and diffed byte-for-byte.
+
+| packet | live frames | result |
+|---|---|---|
+| `S_TRADE_BROKER_HIGHEST_ITEM_LEVEL` | 130 | byte-exact as one IEEE float. Classic+ caps at **9000**, our 100.02 at 469 - server config |
+| `S_TRADE_BROKER_CALC_NOTIFY` | 5456, 6019, 6071 | byte-exact. 6019 reads (0, 1) with one purchase uncollected and 6071 (0, 0) after - **SoldCount first, BoughtCount second** confirmed |
+| `S_TRADE_BROKER_INPUT_PRICE` | 5853 | byte-exact, five i64 with only the first set. Still cannot tell MinPrice from AvgPrice |
+| `S_TRADE_BROKER_REGISTERED_ITEM_LIST` | 5818, 5877, 6083 | byte-exact, empty and one row. All six T81 offsets land on live values |
+| `S_TRADE_BROKER_WAITING_ITEM_LIST` | 5938, 5954, 5979, 5983, 5993, 5996, 5999, 6002, 6034 | 80 rows. Two findings below |
+| `S_TRADE_BROKER_BUY_IT_NOW` | 6027 | byte-exact, one byte |
+| `S_TRADE_BROKER_SOLD_ITEM_LIST` | 6039, 6080 | byte-exact, empty form. No live row with a seller's proceeds in it |
+| `S_TRADE_BROKER_BOUGHT_ITEM_LIST` | 6056, 6070 | one row and empty. **One real bug, below** |
+| `S_SHOW_PARCEL_MESSAGE` | 7163, 7186, 7256, 7263, 7266 | byte-exact all five, ids echoed from the request |
+| `S_PARCEL_READ_RECV_STATUS` | 5459, 6970, 7054, 7164, 7172, 7187, 7216 | byte-exact all seven. 7164 is the first frame anywhere with the **second** u32 set |
+
+`S_LIST_PARCEL_EX`, `S_SEND_PARCEL_TAX`, `S_VIEW_WARE_EX`, `S_ADD_TRADE_BAG`, `S_TRADE_BOX`,
+`S_TRADE_ACCEPT` and `S_TRADE_BAG_DONE` have **no builder in TeraSharp** - World writes them and
+the Arbiter only feeds the `DBS_` rows behind them, so there was nothing of ours to diff. The
+capture is a client-side one of someone else's server, so there is no A-W tap to check the fed
+fields against either.
+
+### The bug: `TotalPaid` is the price WITH the fee
+
+`BlTotalPaid` (+68) was being written as the listing price. The live purchase settles it inside
+one frame set: the bought row at seq 6056 reads `Price` 6562 and `TotalPaid` **7546**, and the
+same trade (492483) in the search page at seq 5938 reads `TotalPriceWithTax` **7546**. Same
+number, same capture. T74 read it as the price because the only row it had was priced at 1,
+where price and price-plus-fee are both 1.
+
+Fixed in both `BuildSBoughtItemListBody` and `BuildSSoldItemListBody`. `SlSellerProceeds` (+76)
+is left as the price: no captured row separates the seller's proceeds from the price either, and
+paying the seller the buyer's fee would be wrong on its face.
+
+### The fee rate is configuration
+
+All 80 live rows satisfy `tax == price + price * 15 / 100` exactly and **none** satisfy the
+tenth rule the code had hard-coded. Our own 100.02 charges a tenth (10001 lists at 11001). So
+the shape is `price + price * rate / 100` truncated and the rate is per server:
+`DefaultBrokerFeePercent` 10, overridable with `TERASHARP_BROKER_FEE_PERCENT`.
+
+### Two bytes we still cannot name
+
+Inside the 92-byte waiting element, `+51` and `+83` are u8 flags the builder writes as 0.
+
+* `+51` is **per row**: 1 on 40 of the 80 live rows, 0 on the other 40, and the split follows
+  neither template, amount, price, seller nor page.
+* `+83` is 1 on all 80.
+* Both are 0 on all five rows of our own server, which is what we send and what T72 pins.
+
+They are named `WlUnknownFlagA` / `WlUnknownFlagB` so the element tail is not read as padding.
+Driving either needs a meaning first, and a per-row source for `+51`.

@@ -166,7 +166,7 @@ The box is a VPS. The defaults assume a workstation.
 
 ```
 setx /M TERASHARP_LOG_LEVEL Warning
-setx /M TERASHARP_LOGS D:\packetlogs
+setx /M TERASHARP_LOGS <captures>
 ```
 
 Item names in the admin web come from the client's own strsheet, loaded lazily on the
@@ -194,7 +194,7 @@ The memory is mostly not TeraSharp's:
       workload. 256 MB is plenty for `teraapi`, `box2db`, `steer3db`.
 - [ ] **tera-api (node)** - one process per service; do not run the four services you
       are not using.
-- [ ] **Rotate `D:\packetlogs`** - the tap logs are hundreds of MB each. Keep the
+- [ ] **Rotate `<captures>`** - the tap logs are hundreds of MB each. Keep the
       `arbiter-*.log` files, delete the `cap_*` captures once a pass is committed.
 - [ ] **Turn the packet tap off in production.** It writes every frame to disk.
 - [ ] Leave the Arbiter's own GC alone. It is the small one here.

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 the TeraSharp contributors
+
 using System.Text.RegularExpressions;
 
 namespace TeraSharp.Arbiter.World;
@@ -418,7 +421,7 @@ internal static class DbProxyStaticData
     // -----------------------------------------------------------------------
     // 0x272D DBS_LOAD_QUEST_LIST — the EMPTY-DAILY-SEED form (153B payload, 159B frame).
     //
-    // Ground truth: D:\packetlogs\lobby_tap.log, real ArbiterServer, 2026-09-13T02:51:10.648Z,
+    // Ground truth: <captures>\lobby_tap.log, real ArbiterServer, 2026-09-13T02:51:10.648Z,
     // first login of the day for playerId 1. Same 53-byte header as `QuestList` above, but the
     // dailyQuestSeed section is EMPTY:
     //     [24] dailyQuestSeedOff = 0x8B (139)   [28] dailyQuestSeedSize = 0
@@ -508,6 +511,21 @@ public static class PartyPackets
     public const ushort AS_VIEW_INTER_PARTY_MATCH_DUNGEON_LIST_EXTENDED = 0x1644;
     /// <summary>T64. The battleground half - cap_social.log seq 1723.</summary>
     public const ushort AS_VIEW_INTER_PARTY_MATCH_BATTLEFIELD_LIST_EXTENDED = 0x1645;
+    /// <summary>
+    /// T163. [i32 PlanetId][i32 UserDbId], frame 14: "this member left a system party before it
+    /// was cleared". Writer FUN_140982610 (ArbiterServer.exe.c), sent by the leave job
+    /// FUN_1409752e0 when Party::GetWithdrawalPenalty was true. World's handler
+    /// (WorldServer.exe.c:2992925) finds the user and adds the dropout abnormality.
+    /// </summary>
+    public const ushort AS_NOTIFY_ABOUT_SYS_PARTY_WITHDRAWAL = 0x13F5;
+
+    public static byte[] BuildAsNotifyAboutSysPartyWithdrawal(int planetId, int userDbId)
+    {
+        var p = new byte[8];
+        BitConverter.GetBytes(planetId).CopyTo(p, 0);
+        BitConverter.GetBytes(userDbId).CopyTo(p, 4);
+        return p;
+    }
 
     // ---- World -> Arbiter ----
     public const ushort SA_JOIN_PARTY = 0x1395;
@@ -522,6 +540,12 @@ public static class PartyPackets
     public const ushort SA_JOIN_PARTY_IN_ARBITER = 0x13AB;
     public const ushort SA_MERGE_PARTY_TO_RAID = 0x13AC;
     public const ushort SA_BYPASS_TO_GROUP = 0x13F8;
+    /// <summary>
+    /// T163. [i64 PartyId][i32 DungeonId], frame 0x12 - World's DungeonManager::
+    /// BroadcastDungeonClear for the party owning a cleared dungeon (WorldServer.exe.c:848975).
+    /// </summary>
+    public const ushort DSA_NOTIFY_ABOUT_DUNGEON_CLEAR = 0x13F0;
+    public const int DungeonClearMinPayload = 0x12 - 6;
 
     // ---- Client opcodes (data.json maps."376012"; the opcode= comments in the MASTER_FINAL
     //      .def files are from another build and are WRONG) ----
@@ -556,6 +580,7 @@ public static class PartyPackets
         SA_JOIN_PARTY_IN_ARBITER => 0x0F,
         SA_MERGE_PARTY_TO_RAID => 0x16,
         SA_BYPASS_TO_GROUP => 0x22,
+        DSA_NOTIFY_ABOUT_DUNGEON_CLEAR => 0x12,   // T163: Handler_DSA_NOTIFY_ABOUT_DUNGEON_CLEAR's guard
         _ => 0,
     };
 
@@ -656,6 +681,74 @@ public static class PartyPackets
         int Method, int RareGradeForDicing, int RareItemDistributionMethod,
         bool EquipmentForDicing, bool FindClassForDicing,
         int BoundOnLootItemDistributionMethod, bool ForbidLootingInBattle);
+
+    // ------------------------------- S -> C, the matched party ----------------------------
+
+    /// <summary>S_SYS_PARTY_INFO - the matched party's roster, with each member's POSITION.</summary>
+    public const ushort S_SYS_PARTY_INFO = 0x74C7;
+
+    /// <summary>
+    /// One slot of <see cref="BuildSysPartyInfo"/>. <paramref name="Role"/> is the matching
+    /// position in the datasheet's own numbering - 0 tank, 1 DPS, 2 healer - the same numbers
+    /// <c>MatchRole</c> carries.
+    /// </summary>
+    public readonly record struct SysPartySlot(int PlanetId, int PlayerId, int Role);
+
+    /// <summary>The empty-slot triple: planet -1, player 0, role -1.</summary>
+    public static readonly SysPartySlot EmptySysPartySlot = new(-1, 0, -1);
+
+    /// <summary>
+    /// S_SYS_PARTY_INFO (0x74C7), T138d. classic_live3 record 10587, 488 bytes, sent right after
+    /// S_FIN_INTER_PARTY_MATCH (10585) and before the player presses enter:
+    /// <code>
+    ///   00  E8 01        len 488
+    ///   02  C7 74        opcode
+    ///   04  1E 00        u16 count = 30          &lt;- MaxRaidMembers, ALWAYS
+    ///   06  08 00        u16 offset = 8
+    ///   element 16 B: u16 here / u16 next / i32 planetId / i32 playerId / i32 role
+    /// </code>
+    /// <para>The capture's five filled slots are</para>
+    /// <code>
+    ///   2800 / 4742   role 0      2800 / 138395 role 2      2800 / 100402 role 1
+    ///   2800 / 134744 role 1      2800 / 117771 role 1
+    /// </code>
+    /// <para>- <b>1 tank, 1 healer, 3 DPS</b>, in <c>DungeonMatching.xml</c>'s own position
+    /// numbering, which is the first independent confirmation of T138c's composition rule AND of
+    /// <c>MatchRole</c>'s numbers. The remaining 25 slots are
+    /// <see cref="EmptySysPartySlot"/>. Player 4742 is the capture's own character, templateId
+    /// 11001 - an Elin <b>Warrior</b>, whose <c>defaultPosition</c> is 1 (DPS) and whose
+    /// <c>secondPosition</c> is 0 (tank). He is in the frame as a TANK, so the field is the
+    /// matched POSITION and not the class, and the second-position mechanic
+    /// <c>MatchComposition.CanFill</c> implements is real.</para>
+    /// <para>The count is 30 whatever the party size - the capture's five-man group still sends
+    /// all thirty - so the frame is a fixed 488 bytes and <paramref name="slots"/> is padded.
+    /// Whether slot 0 is the LEADER or the RECIPIENT cannot be told from one capture, where they
+    /// are the same character; we put the leader first.</para>
+    /// </summary>
+    public static byte[] BuildSysPartyInfo(IReadOnlyList<SysPartySlot>? slots)
+    {
+        const int Count = MaxRaidMembers, Stride = 16, Head = 8;
+        int len = Head + Count * Stride;
+        var p = new byte[len];
+        BitConverter.GetBytes((ushort)len).CopyTo(p, 0);
+        BitConverter.GetBytes(S_SYS_PARTY_INFO).CopyTo(p, 2);
+        BitConverter.GetBytes((ushort)Count).CopyTo(p, 4);
+        BitConverter.GetBytes((ushort)Head).CopyTo(p, 6);
+
+        int at = Head;
+        for (int i = 0; i < Count; i++)
+        {
+            var slot = slots != null && i < slots.Count ? slots[i] : EmptySysPartySlot;
+            int next = i + 1 < Count ? at + Stride : 0;
+            BitConverter.GetBytes((ushort)at).CopyTo(p, at);
+            BitConverter.GetBytes((ushort)next).CopyTo(p, at + 2);
+            BitConverter.GetBytes(slot.PlanetId).CopyTo(p, at + 4);
+            BitConverter.GetBytes(slot.PlayerId).CopyTo(p, at + 8);
+            BitConverter.GetBytes(slot.Role).CopyTo(p, at + 12);
+            at = next;
+        }
+        return p;
+    }
 
     // ---------------------------------- A -> W builders ----------------------------------
 

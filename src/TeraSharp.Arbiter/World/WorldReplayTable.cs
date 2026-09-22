@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 the TeraSharp contributors
+
 using Microsoft.Extensions.Logging;
 
 namespace TeraSharp.Arbiter.World;
@@ -43,13 +46,13 @@ public sealed class WorldReplayTable
     /// thing that emits SA_LEAVE_WORLD - waits forever (status/HANDOFF.md section 1).
     /// That is exactly what 0x143F -> 0x290D did.
     ///
-    /// Measured against D:\packetlogs\arb_world.log (the file the table is loaded from): this set
+    /// Measured against <captures>\arb_world.log (the file the table is loaded from): this set
     /// removes 8 request entries that had ZERO responses - 0x13AA 0x13CC 0x13FA 0x1436 0x15A8
     /// 0x15B5 0x1626 0x164D, pure "no replay for" noise - and strips three frames that the
     /// heartbeats had let 0x27B3 inherit (0x15FB, 0x1449 and, worst, 0x14FF AS_USER_REQUEST_EXIT).
     /// No legitimate request -> response mapping is lost.
     ///
-    /// Names from D:\packetlogs\world_opcodes.txt and the opcode switch in WorldServer.exe.c.
+    /// Names from <captures>\world_opcodes.txt and the opcode switch in WorldServer.exe.c.
     /// SA_BYPASS_TO_CLIENT (0x13F7) is deliberately NOT here: it is the tunnel, it interleaves
     /// constantly, and sealing on it would break every attribution.
     /// </summary>
@@ -90,16 +93,24 @@ public sealed class WorldReplayTable
 
     public static readonly IReadOnlySet<ushort> OneWayFromWorld = new HashSet<ushort>
     {
-        0x1436, // SA_BROADCAST_SYSTEM_MESSAGE_TO_WHOLE_WORLD
+        // 0x1436 SA_BROADCAST_SYSTEM_MESSAGE_TO_WHOLE_WORLD was here until T172: it is a DbProxy
+        // handler now (S_SYSTEM_MESSAGE to every player), still one-way.
         0x15A8, // SA_BROADCAST_FLOATING_CASTLE_NAMEPLATE
-        0x159A, // SA_UPDATE_EVENT_MATCHING_ADD_REWARD_RESETTIME
-        0x2958, // SDB_CHANGE_CITY_WAR_STATE   - see the note below
+        // 0x159A SA_UPDATE_EVENT_MATCHING_ADD_REWARD_RESETTIME was here until T156. It is not
+        // one-way: the real Arbiter answers it with 0x159B (Handler at ArbiterServer.exe.c:1256128),
+        // and unanswered World re-sends it all day. DbProxyHandlers answers it now; it stays in
+        // QuietInLog above.
+        // 0x2958 SDB_CHANGE_CITY_WAR_STATE left in T172: cap_final2a/2b answer it (0x295A) and
+        // DbProxyHandlers does too - the note below is history.
         0x13FA, // SA_DUMMY_PACKET
         0x13CC, // SA_EQUIP_ITEM_LEVEL
         0x1626, // SA_SEND_USE_OPTIONAL_ITEM
         0x1441, // SA_UPDATE_FIELD_POINT_RECEIVED_INDEX
         0x143F, // SA_UPDATE_FIELD_POINT       - World's answer to our 0x143E push
         0x15B5, // SA_REQUEST_SEND_SKILL_SCRIPT_LIST
+        0x15AE, // SA_USER_ON_SPAWN_COMPLETE - T158: the real handler only sends the client 0x709F;
+                //   its replayed "response" was a captured DBS_END_START_QUEST_LIST (DLM 50),
+                //   sent after every spawn in cap_play1 (694, 1057 ... 30805)
         0x13AA, // SA_DEL_FROM_INTER_PARTY_MATCH_POOL
         0x13F2, // DSA_DUNGEON_TIMELINE_OPEN_INFO      (periodic heartbeat)
         0x13E5, // BSA_REQUEST_BOUNTY_HUNT_SEASON_INFO (periodic heartbeat)
@@ -128,7 +139,7 @@ public sealed class WorldReplayTable
         0x28B8, // SDB_PUBLISH_INVITE_CODE  - `UserDbId@06`, nothing else
         0x14CE, // SA_DARK_RIFT_EVENT_OPEN  - five i32s of event config
 
-        // --- T15: proven one-way in D:\packetlogs\cap_newchar.log (a real ArbiterServer
+        // --- T15: proven one-way in <captures>\cap_newchar.log (a real ArbiterServer
         // playing for five minutes). Each was checked frame by frame: no A->W frame follows
         // any occurrence, and the Arbiter's handler has no SendToSession at all. ---
         0x2927, // SDB_CANCEL_NPC_ARENA_BET  - 5 occurrences (the logout-countdown ticks),

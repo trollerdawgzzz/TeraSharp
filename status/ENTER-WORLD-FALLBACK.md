@@ -6,7 +6,7 @@
 > Arbiter waits three seconds and re-sends `AS_ENTER_WORLD` pointed at the character's stored
 > return point.
 
-**Ground truth**: `D:\packetlogs\arb_world_2026-09-13T11-33-30-680Z.log`, the "Test" (playerId 2)
+**Ground truth**: `<captures>\arb_world_2026-09-13T11-33-30-680Z.log`, the "Test" (playerId 2)
 login at seq 835-2036. Condensed listing `cap_relog9827_ctl.txt`, full frames
 `cap_relog9827_frames.txt`. Decompile: `ArbiterServer.exe.c` (the one-file Ghidra output staged
 for this session; the same functions are in `Arb_part_*.c`).
@@ -438,3 +438,18 @@ level instead; it exists to document the bug, not to defend it.
   likely source.
 * `LastIndex` (0x138D payload 20) is 0 in the only sample.
 * Whether World cares about the 3000 ms delay. We answer immediately.
+
+## 10. A leave while World is still loading the user (T161b)
+
+The real Arbiter never sends AS_LEAVE_WORLD before SA_ENTER_WORLD (0x138C): `User::LeaveWorldStart`
+with LoginState 1 only reserves it ("[Pending]", User+0x4008/0x400C/0x4010) and `User::EnterWorldEnd`
+sends it. We sent it at once, and World drops a leave for a user it is loading: cap_crash 28079
+(relog, ...AF00003, ticket 7) stalled 188 s on World, the client was closed at 28218, World finished
+at 28475 and kept the user; the next relog (28813, ticket 9) was spawned as ...AF00003 on ticket 7
+(29068) - dropped as departed, loading-screen hang. `CurrentWorldId` was 0 throughout.
+
+`LeaveGate` (World/TunnelRouting.cs): `Entering` at RegisterChat (one line before AS_ENTER_WORLD),
+`TryReserve` in `WorldBridge.NotifyPlayerLeave` (**status/T161b-PATCH.diff**, human-owned),
+`Entered` on SA_ENTER_WORLD in DbProxyHandlers, which sends the held pair; `Forget` on a final
+SA_ENTER_WORLD_FAIL. The 188 s World-side stall after DBS_LOAD_QUEST_LIST (our 0x272D identical to
+every good load) is still unexplained.

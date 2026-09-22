@@ -1,4 +1,7 @@
-﻿using System.Text;
+﻿// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 the TeraSharp contributors
+
+using System.Text;
 using Microsoft.Extensions.Logging;
 using TeraSharp.Arbiter.Game;
 using TeraSharp.Arbiter.Network;
@@ -744,6 +747,78 @@ public static class GmAdminTool
         return all is { Count: > 0 } ? all : new[] { s };
     }
 
+    // ---- T161b: World's /@goto <name> - SA_CHAR_LOC (0x1443) ----
+    // cap_crash 27181 / 27227 / 27822 (World -> us, 42 / 42 / 28 B): [u32 0x12 = the name's FRAME
+    // offset][u64 requester gameId][wchar name]; World then waits. The real Handler_SA_CHAR_LOC finds
+    // the target by name and answers AS_REQUEST_TELEPORT (0x13B1) with its cached position
+    // (cap_social4 882 -> 883), or AS_CHAR_LOC (0x1444, two game ids) when the target is in an
+    // instance on the same World; nothing when nobody has the name (cap_social4 8289, 8308). We
+    // run the panel's "go to" instead (T155, cap_final 916-918): World fills in the target's LIVE
+    // position and the 0x2826 answer goes on as 0x2827 - our cached position is only the last
+    // S_LOAD_TOPO.
+
+    /// <summary>SA_CHAR_LOC's requester (payload 4) and the name at the frame offset in payload 0.</summary>
+    public static (ulong Requester, string Name) ReadCharLoc(ReadOnlySpan<byte> payload)
+    {
+        if (payload.Length < 12) return (0, "");
+        ulong gameId = BitConverter.ToUInt64(payload[4..]);
+        uint off = BitConverter.ToUInt32(payload);
+        if (off < 6 || off - 6 >= (uint)payload.Length) return (gameId, "");
+        var s = payload[(int)(off - 6)..];
+        int n = 0;
+        while (n + 1 < s.Length && (s[n] | s[n + 1]) != 0) n += 2;
+        return (gameId, System.Text.Encoding.Unicode.GetString(s[..n]));
+    }
+
+    /// <summary>The ask for it: the T155 record, action 12, the GM who typed it as requester.</summary>
+    public static byte[] BuildCharLocAsk(int gmId, string? gmName, int targetId, string? targetName)
+        => ArbiterClientHandlers.BuildAskUserAction(gmId, gmName, targetId, targetName, ArbiterClientHandlers.UserActionGoTo);
+
+    /// <summary>SA_CHAR_LOC: ask the target's World (0x2825); WorldBridge forwards the 0x2826 as 0x2827.</summary>
+    public const ushort AS_CHAR_LOC = 0x1444;
+
+    /// <summary>AS_CHAR_LOC: the two gameIds, requester first.</summary>
+    public static byte[] BuildCharLoc(ulong gmGameId, ulong targetGameId)
+    {
+        var p = new byte[16];
+        BitConverter.GetBytes(gmGameId & 0x7FFFFFFFFFFFFFFFUL).CopyTo(p, 0);
+        BitConverter.GetBytes(targetGameId & 0x7FFFFFFFFFFFFFFFUL).CopyTo(p, 8);
+        return p;
+    }
+
+    public static bool OnSaCharLoc(WorldBridge? bridge, byte[] payload, ILogger log)
+    {
+        var (gameId, name) = ReadCharLoc(payload);
+        var gm = bridge?.PlayerForGameId(gameId);
+        if (gm?.SelectedCharacter == null || name.Length == 0)
+        {
+            log.LogInformation("SA_CHAR_LOC: requester 0x{G:X} / '{Name}' unresolved - dropped", gameId, name);
+            return false;
+        }
+        var t = bridge!.InWorldSessions().FirstOrDefault(o =>
+            string.Equals(o.SelectedCharacter?.Name, name, StringComparison.OrdinalIgnoreCase));
+        if (t?.SelectedCharacter == null)
+        {
+            log.LogInformation("SA_CHAR_LOC: '{Name}' is not online - nothing sent, as the real handler", name);
+            return false;
+        }
+        // T172: Handler_SA_CHAR_LOC (Arb_part_062.c:4486) answers a target on the GM's own World with
+        // AS_CHAR_LOC [u64 gm gameId][u64 target gameId] and World moves the GM itself (cap_final2b
+        // 7277 -> 7278, 26202 -> 26203); only a target elsewhere takes the ask path below.
+        if (t.CurrentWorldId == gm.CurrentWorldId)
+        {
+            bool here = ArbiterClientHandlers.SendToWorld(gm, AS_CHAR_LOC, BuildCharLoc(gm.GameId, t.GameId));
+            log.LogInformation("SA_CHAR_LOC: /@goto '{Name}' for '{Gm}' {How}", name, gm.SelectedCharacter.Name,
+                here ? "answered (0x1444, same World)" : "- no World");
+            return here;
+        }
+        bool sent = ArbiterClientHandlers.SendToWorld(t, ArbiterClientHandlers.AS_ASK_ADMIN_REQUEST_USERACTION,
+            BuildCharLocAsk((int)gm.PlayerId, gm.SelectedCharacter.Name, (int)t.PlayerId, t.SelectedCharacter.Name));
+        log.LogInformation("SA_CHAR_LOC: /@goto '{Name}' for '{Gm}' {How}", name, gm.SelectedCharacter.Name,
+            sent ? "asked of World (0x2825)" : "- no World");
+        return sent;
+    }
+
     /// <summary>The gate. Same level the chat commands need, resolved the same way.</summary>
     private static bool Allowed(GameSession s, ILogger log, string what)
     {
@@ -997,11 +1072,19 @@ public static class GmAdminTool
     /// with a log line rather than guessed at.</para>
     /// </summary>
     public const int UserActionOffset = 14;       // body index; packet +18
-    /// <summary>Action 12: the zone reload at frames 786..796 says teleport.</summary>
-    public const int UserActionTeleport = 12;
-    /// <summary>Action 13: captured once, with nothing to name it by.</summary>
-    public const int UserActionUnnamed13 = 13;
+    /// <summary>Action 12, "go to": the zone reload at frames 786..796 is the GM arriving (T155).</summary>
+    public const int UserActionTeleport = ArbiterClientHandlers.UserActionGoTo;
+    /// <summary>Action 13: summon - the TARGET moves, so the GM's client shows nothing (T155).</summary>
+    public const int UserActionUnnamed13 = ArbiterClientHandlers.UserActionSummon;
 
+    /// <summary>
+    /// T155: Handler_C_ADMIN_REQUEST_USERACTION finds the target by dbId (by name when it is 0)
+    /// and sends 11 / 12 / 13 to the TARGET's World as AS_ASK_ADMIN_REQUEST_USERACTION; World's
+    /// SA answer comes back through WorldBridge and goes on as 0x2827 (cap_final 916-918,
+    /// 1081-1083). 10 is the Arbiter's own disconnect job and stays a log line here, like
+    /// C_ADMIN_LOBBY. The real 13 first runs a 10-second AdminTargetUserCallJob countdown
+    /// (@1337 to the target each second); ours asks at once.
+    /// </summary>
     public static bool OnRequestUserAction(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
     {
         if (!Allowed(s, log, "C_ADMIN_REQUEST_USERACTION")) return true;
@@ -1010,16 +1093,45 @@ public static class GmAdminTool
         int action = b.Length >= UserActionOffset + 4 ? BitConverter.ToInt32(b[UserActionOffset..]) : 0;
         string name = ArbiterClientHandlers.ReadWString(b, 0);
 
-        if (action is UserActionTeleport or UserActionUnnamed13)
+        if (action is ArbiterClientHandlers.UserActionGoTo or ArbiterClientHandlers.UserActionSummon
+            or ArbiterClientHandlers.UserActionResurrect)
         {
-            log.LogInformation("C_ADMIN_REQUEST_USERACTION: action {Action} on '{Name}' (player {Id})",
-                action, name, target);
+            var t = FindTarget(s, target, name);
+            if (t?.SelectedCharacter == null)
+            {
+                log.LogInformation("C_ADMIN_REQUEST_USERACTION: '{Name}' (player {Id}) is not online - action {Action} dropped",
+                    name, target, action);
+                return true;
+            }
+            var ask = ArbiterClientHandlers.BuildAskUserAction((int)s.PlayerId, s.SelectedCharacter?.Name,
+                (int)t.PlayerId, t.SelectedCharacter.Name, action);
+            bool sent = ArbiterClientHandlers.SendToWorld(t, ArbiterClientHandlers.AS_ASK_ADMIN_REQUEST_USERACTION, ask);
+            log.LogInformation("C_ADMIN_REQUEST_USERACTION: action {Action} on '{Name}' (player {Id}) {How}",
+                action, name, t.PlayerId, sent ? "asked of World (0x2825)" : "- no World, standalone");
             return true;
         }
 
-        log.LogWarning("C_ADMIN_REQUEST_USERACTION: action {Action} on '{Name}' is not one of the two "
-            + "the capture presses (12, 13) - refused", action, name);
+        if (action == ArbiterClientHandlers.UserActionKick)
+        {
+            log.LogInformation("C_ADMIN_REQUEST_USERACTION: kick '{Name}' (player {Id}) - the Arbiter's disconnect job, not carried out",
+                name, target);
+            return true;
+        }
+
+        log.LogWarning("C_ADMIN_REQUEST_USERACTION: action {Action} on '{Name}' is none of 10-13 - refused", action, name);
         return true;
+    }
+
+    /// <summary>The online target: by player id, or by name when the id is 0 (the binary's order).</summary>
+    private static GameSession? FindTarget(GameSession s, int playerId, string name)
+    {
+        var hit = playerId > 0 ? Program.World?.SessionForPlayerId(playerId) : null;
+        if (hit != null) return hit;
+        foreach (var o in Online(s))
+            if (playerId > 0 ? o.PlayerId == playerId
+                : name.Length > 0 && string.Equals(o.SelectedCharacter?.Name, name, StringComparison.OrdinalIgnoreCase))
+                return o;
+        return null;
     }
 
     // =========================== T99: the rest of the tool ===========================
@@ -1028,7 +1140,7 @@ public static class GmAdminTool
     // rejects with GM_NOT_ENOUGH_AUTHORITY - which is the same admin level Allowed() tests.
 
     public const int GmTeleportBodySize = 0x16 - 4;
-    public const int GmMapTeleportBodySize = 10 - 4;
+    public const int GmMapTeleportBodySize = 0x12 - 4;   // T155: the handler's own guard, zone + x + y
     public const int AdminLobbyBodySize = 10 - 4;
     public const int GameIdBodySize = 8;
     public const int DungeonIdBodySize = 4;
@@ -1037,12 +1149,10 @@ public static class GmAdminTool
 
     /// <summary>
     /// C_ADMIN_GM_TELEPORT (0xEC4B): <c>[u16 _][i32 zone][f32 x][f32 y][f32 z]</c> - 22 bytes,
-    /// the handler's own guard. It builds a teleport request and hands it to World as
-    /// inter-server message <c>0xd0</c>; the Arbiter never moves anybody itself.
-    /// <para>So does this: the destination is logged and the packet is answered, because moving
-    /// a character is World's to do and the bridge is not ours to drive from here. The same
-    /// holds for C_ADMIN_GM_MAPTELEPORT, C_ADMIN_REMOVE_NPC and C_ADMIN_VANISH_PET - all four
-    /// end in the same forward.</para>
+    /// the handler's own guard. T155: handed to World as AS_ADMIN_REQUEST_USERACTION action 100
+    /// with the packet's zone and position (cap_multiworld 2497 -&gt; 3060); World moves the GM
+    /// and its S_LOAD_TOPO comes back through the tunnel. A zone World refuses (2243, 5101 -
+    /// position 0) is answered by World too.
     /// </summary>
     public static bool OnGmTeleport(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
     {
@@ -1053,21 +1163,27 @@ public static class GmAdminTool
             log.LogWarning("C_ADMIN_GM_TELEPORT: {Len} B body (want {Want})", b.Length, GmTeleportBodySize);
             return true;
         }
-        log.LogInformation("C_ADMIN_GM_TELEPORT: zone {Zone} ({X}, {Y}, {Z}) - World's to do",
+        bool sent = ArbiterClientHandlers.SendToWorld(s, ArbiterClientHandlers.AS_ADMIN_REQUEST_USERACTION,
+            ArbiterClientHandlers.BuildGmTeleportRequest((int)s.PlayerId, s.SelectedCharacter?.Name, b));
+        log.LogInformation("C_ADMIN_GM_TELEPORT: zone {Zone} ({X}, {Y}, {Z}) {How}",
             BitConverter.ToInt32(b[2..]), BitConverter.ToSingle(b[6..]),
-            BitConverter.ToSingle(b[10..]), BitConverter.ToSingle(b[14..]));
+            BitConverter.ToSingle(b[10..]), BitConverter.ToSingle(b[14..]),
+            sent ? "handed to World (0x2827 action 100)" : "- no World, standalone");
         return true;
     }
 
-    /// <summary>C_ADMIN_GM_MAPTELEPORT (0xDC53): <c>[u16 nameOffset][i32 ContinentId]</c> then
-    /// the name - teleport to a continent by name.</summary>
+    /// <summary>C_ADMIN_GM_MAPTELEPORT (0xDC53): <c>[u16 nameOffset][i32 zone][f32 x][f32 y]</c>
+    /// then the name. T155: action 0x67 with z = 16777215, World finds the ground (no sample).</summary>
     public static bool OnGmMapTeleport(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
     {
         if (!Allowed(s, log, "C_ADMIN_GM_MAPTELEPORT")) return true;
         var b = body.Span;
-        int continent = b.Length >= GmMapTeleportBodySize ? BitConverter.ToInt32(b[2..]) : 0;
-        log.LogInformation("C_ADMIN_GM_MAPTELEPORT: '{Name}' to continent {Id} - World's to do",
-            ArbiterClientHandlers.ReadWString(b, 0), continent);
+        if (b.Length < GmMapTeleportBodySize) return true;
+        bool sent = ArbiterClientHandlers.SendToWorld(s, ArbiterClientHandlers.AS_ADMIN_REQUEST_USERACTION,
+            ArbiterClientHandlers.BuildMapTeleportRequest((int)s.PlayerId, s.SelectedCharacter?.Name, b));
+        log.LogInformation("C_ADMIN_GM_MAPTELEPORT: '{Name}' zone {Id} {How}",
+            ArbiterClientHandlers.ReadWString(b, 0), BitConverter.ToInt32(b[2..]),
+            sent ? "handed to World (0x2827 action 0x67)" : "- no World, standalone");
         return true;
     }
 
@@ -1088,9 +1204,19 @@ public static class GmAdminTool
     }
 
     /// <summary>C_ADMIN_REMOVE_NPC (0x830D) and C_ADMIN_VANISH_PET (0x6F81): one
-    /// <c>[i64 gameId]</c> each, both forwarded to World in the binary.</summary>
+    /// <c>[i64 gameId]</c> each, both forwarded to World in the binary. T155: REMOVE_NPC is
+    /// 0x2827 action 0x66 (no sample); VANISH_PET is its own opcode and still a log line.</summary>
     public static bool OnAdminRemoveNpc(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
-        => LogGameIdOrder(s, body, log, "C_ADMIN_REMOVE_NPC");
+    {
+        if (!Allowed(s, log, "C_ADMIN_REMOVE_NPC")) return true;
+        var b = body.Span;
+        long gameId = b.Length >= GameIdBodySize ? BitConverter.ToInt64(b) : 0;
+        bool sent = gameId != 0 && ArbiterClientHandlers.SendToWorld(s, ArbiterClientHandlers.AS_ADMIN_REQUEST_USERACTION,
+            ArbiterClientHandlers.BuildRemoveNpcRequest((int)s.PlayerId, s.SelectedCharacter?.Name, gameId));
+        log.LogInformation("C_ADMIN_REMOVE_NPC: game id 0x{Id:X} {How}", gameId,
+            sent ? "handed to World (0x2827 action 0x66)" : "- not sent");
+        return true;
+    }
 
     public static bool OnAdminVanishPet(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
         => LogGameIdOrder(s, body, log, "C_ADMIN_VANISH_PET");
@@ -1182,6 +1308,17 @@ public static class GmAdminTool
         int skill = b.Length >= 12 ? BitConverter.ToInt32(b[8..]) : ArbiterClientHandlers.GmSkillInvisible;
         int playerId = (int)s.PlayerId;   // the key the enter-world push uses
 
+        // T148: with a World behind us the toggle is World's - it vaporized this GM at spawn and
+        // only it can release them. Every reply (S_ADMIN_GM_SKILL, @1436/@1439, the respawn)
+        // then comes back through the tunnel, as frames 775 / 546-549 do on the real server.
+        // The local answers below are the standalone path only.
+        if (ArbiterClientHandlers.RequestWorldGmSkill(s, skill))
+        {
+            log.LogInformation("C_ADMIN_GM_SKILL: skill {Skill} for player {Id} handed to World (0x2827)",
+                skill, playerId);
+            return true;
+        }
+
         if (skill == ArbiterClientHandlers.GmSkillInvisible)
         {
             bool now = !ArbiterClientHandlers.IsGmInvisible(playerId);
@@ -1203,3 +1340,58 @@ public static class GmAdminTool
     private static void Smt(GameSession s, int id)
         => s.SendByDef("S_SYSTEM_MESSAGE", new Dictionary<string, object> { ["message"] = "@" + id });
 }
+
+/// <summary>
+/// T152b. A level set OUTSIDE World (the web tool's /api/set-level) is handed to World as the QA
+/// command <c>perfect_level N</c>, so World runs its own level commit.
+///
+/// <para>Why: World learns a character's skill ranks itself, in
+/// <c>DBLevelExpContext::ExecuteCommitSQL</c> -&gt; <c>AutoLearnSkills</c>, which learns every
+/// type-11 row IsSkillLearnable allows. cap_social4 1401 <c>perfect_level 65</c> -&gt; 1402
+/// SDB_UPDATE_EXP_LEVEL -&gt; 168 SDB_USER_LEARN_SKILL in 0.8 s; 7539 <c>perfect_level 20</c> -&gt;
+/// 43. A real level-70 valkyrie's blob holds 164 active / 22 passive entries (cap_final 411).
+/// `test` (10) was put at 70 by the store alone: no 0x273B in any of its taps, and its blob still
+/// held the seven creation skills (cap_skills3 714) - every rank World would have granted was
+/// missing, which is what the Learned Skills window shows as "[Click to obtain]".</para>
+///
+/// <para>Offline characters are queued and sent right behind their next S_SPAWN_ME. The queue
+/// is in memory: a restart before that login drops it, and set-level is simply run again.</para>
+/// </summary>
+public static class WorldLevelSync
+{
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, int> Pending = new();
+
+    /// <summary>The QA command World levels with - the one the real GM tool sends.</summary>
+    public static string CommandLine(int level) => "perfect_level " + level.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+    /// <summary>AS_ADMIN_COMMAND for it: cap_social4 1401 is BuildFrame(1, 65), byte for byte.</summary>
+    public static byte[] BuildFrame(int playerId, int level)
+        => GmCommandHandlers.BuildWorldForward(playerId, GmCommandHandlers.BypassModeWorld, CommandLine(level));
+
+    /// <summary>Queue a level for World; sent now if the character is in the world.</summary>
+    public static void Queue(int playerId, int level)
+    {
+        if (playerId <= 0 || level <= 0) return;
+        Pending[playerId] = level;
+        var s = Program.World?.SessionForPlayerId(playerId);
+        if (s is { InWorld: true }) OnSpawn(s);
+    }
+
+    /// <summary>Take the queued level, if any. Once only.</summary>
+    public static bool TryTake(int playerId, out int level) => Pending.TryRemove(playerId, out level);
+
+    /// <summary>Is anything queued for this character? Tests and the log.</summary>
+    public static bool IsPending(int playerId) => Pending.ContainsKey(playerId);
+
+    /// <summary>Called behind the tunnelled S_SPAWN_ME: send the queued level, if any.</summary>
+    public static void OnSpawn(GameSession s)
+    {
+        if (s == null) return;
+        var w = Program.World;
+        if (w == null || !TryTake((int)s.PlayerId, out int level)) return;
+        w.SendFrame(s.CurrentWorldId, GmCommandHandlers.AS_ADMIN_COMMAND, BuildFrame((int)s.PlayerId, level));
+        s.Log?.LogInformation("level sync: {Line} handed to World for player {Id} (auto-learns follow)",
+            CommandLine(level), s.PlayerId);
+    }
+}
+
