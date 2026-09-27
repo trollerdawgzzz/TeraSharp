@@ -38,12 +38,12 @@ Both save paths open with the same bound, so a bigger blob is dropped by the rea
 
 | Function | Decompile | Code |
 |---|---|---|
-|`User::SaveClientSetting(const unsigned char *, int)`|`Arb_part_029.c:18757`|`if ((param_3 == 0) \|\| (9000 < param_3)) { log; }`|
+|`User::SaveClientSetting(const unsigned char *, int)`|`Arb_part_029.c:18757`|rejects a zero length and any length above 9000, logging the refusal|
 |`Account::SaveClientSetting(const unsigned char *, int)`|`Arb_part_065.c:9793`|same test|
 
-It is the physical buffer size, not a policy number: on success `User::` copies the blob to
-`param_1 + 0x6290` and writes the length to `param_1 + 0x85bc` - 0x85bc - 0x6290 = 9004 bytes
-apart; `Account::` copies to `param_1 + 0xf5` (pointer-indexed, 0x7a8 bytes) and writes the length
+It is the physical buffer size, not a policy number: on success the user path copies the blob into
+a fixed field of the user record and stores the length in the field 9004 bytes further on; the account path
+copies into a pointer-indexed field (0x7a8 bytes) and stores the length
 at byte 0x2ad4, again 9004 apart. The refusal branch is a log call and no reply, which is what
 TeraSharp already does. So `CharacterStore.MaxClientSettingBytes` stays 9000: raising it would
 store blobs the real Arbiter rejects, and with the duplicate send gone the blob stays near a
