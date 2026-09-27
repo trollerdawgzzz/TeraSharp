@@ -90,6 +90,13 @@ public sealed class GameSession : IDisposable
         if (w != null && InWorld) w.SendUserRequestExit(PlayerId);
     }
 
+    /// <summary>T201 native QA logout starts the leave immediately, without a client countdown request.</summary>
+    public void ForceLeaveToWorld(LeaveMode mode)
+    {
+        PendingLeaveMode = mode;
+        CompleteLeaveToWorld();
+    }
+
     /// <summary>
     /// Countdown finished. Send AS_CANCEL_SKILL_STRICTLY + AS_LEAVE_WORLD and wait for World's
     /// save sequence + SA_LEAVE_WORLD (0x1393). The tunnel stays subscribed so the client

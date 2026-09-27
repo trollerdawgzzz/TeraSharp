@@ -110,7 +110,7 @@ public static class DbAckTable
         "285A>285B q26 r19 d18:14 o22 k18 b6 a10", // DO_CHANGE_GUILD_NAME W:3012948 DlmId@E ok@12; apply A:1265451
         "285C>285D q34 r11 d22:6 o26 k10 a14", // DO_CHANGE_LOOK W:3012991 DlmId@6 ok@A; apply A:1265935
         "2860>2861 q30 r11 d14:6 o18 k10", // CHANGE_FACE_CUSTOM W:3010233 DlmId@6 ok@A; bare A:1561614
-        "2870>2871 q22 r11 d6:6 o10 k10", // DONT_REPEAT_TUTORIAL_SIMPLE_TIP W:3012862 DlmId@6 ok@A; bare A:1265285
+        // 2870 DONT_REPEAT_TUTORIAL_SIMPLE_TIP: T191 real additive popup-count persistence.
         "287E>287F q22 r19 d14:14 o18 k18 b6=6", // CHANGE_ITEM_EXTERIOR W:3010417 DlmId@E ItemBinary@6 ok@12; echo A:1262545
         "2880>2881 q22 r19 d14:14 o18 k18 b6=6", // RESTORE_ITEM_EXTERIOR W:3021559 DlmId@E ItemBinary@6 ok@12; echo A:1282190
         "2882>2883 q22 r19 d14:14 o18 k18 b6=6", // CHANGE_ITEM_COLORING W:3010359 DlmId@E ItemBinary@6 ok@12; echo A:1262419
@@ -137,7 +137,7 @@ public static class DbAckTable
         "296F>2970 q18 r11 d6:6 o10 k10", // UPDATE_USERAWAKENGRADE W:3026422 DlmId@6 ok@A; bare A:1293296
         "297D>297E q18 r11 d6:6 o10 k10", // APPLY_MAXACTPOINT_ACCOUNTTRAIT W:3009501 DlmId@6 ok@A; bare A:1260514
         "297F>2980 q14 r11 d6:6 o10 k10", // DISAPPLY_MAXACTPOINT_ACCOUNTTRAIT W:3012819 DlmId@6 ok@A; bare A:1265189
-        "2983>2984 q38 r11 d6:6 o10 k10", // UPDATE_PURCHASE_LIMIT W:3026005 DlmId@6 ok@A; bare A:1292548
+        // T201 UPDATE_PURCHASE_LIMIT2983 now has real additive persistence and its native2984 ack.
     };
 
     private static readonly Dictionary<ushort, Spec> ByOp = Index(Rows, Unpinned);

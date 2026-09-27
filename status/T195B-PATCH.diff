@@ -1,0 +1,45 @@
+--- a/src/TeraSharp.Arbiter/World/WorldBridge.cs
++++ b/src/TeraSharp.Arbiter/World/WorldBridge.cs
+@@ -624,9 +624,9 @@
+                 var move = CrossWorldHandoff.Parse(payload);
+                 var user = move == null ? null : PlayerForGameId(move.UserHandle);
+                 if (move == null || user == null || user.CurrentWorldId != link.WorldId) return;
+-                int? owner = move.TargetWorld >= 0 ? move.TargetWorld
+-                    : DungeonRouting.Channels.WorldForChannel(move.Continent, unchecked((int)move.Channel))
+-                        ?? DungeonRouting.Channels.WorldForContinent(move.Continent);
++                int? owner = CrossWorldHandoff.ResolveDestination(move,
++                    channel => DungeonRouting.Channels.WorldForChannel(move.Continent, unchecked((int)channel)),
++                    DungeonRouting.Channels.WorldForContinent, DungeonRouting.Channels.CatchAllWorldId);
+                 if (owner is not int target || !HasLinks(target)
+                     || !_crossWorld.Begin(link.WorldId, target, move, user.PlayerId))
+                 {
+@@ -644,7 +644,7 @@
+ 
+             default:
+                 if (PartyWiring.TryHandleWorldFrame(op, payload)) return;   // T49: the twelve party SA_ opcodes incl. SA_BYPASS_TO_GROUP
+-                if (GuildWiring.TryHandleWorldFrame(op, payload)) return;   // T52: guild SA_ opcodes (membership test, not a length gate)
++                if (GuildWiring.TryHandleWorldFrame(op, payload, link.SendFrame)) return;   // T52: guild SA_ opcodes (membership test, not a length gate)
+                 if (ContractBroker.TryHandleWorldFrame(op, payload)) return;   // T60: 0x2809/0x280C/0x280D/0x280E - party invites travel as contracts
+                 if (WorldReplayTable.LogsAtDebug(op))
+                     _log.LogDebug("W->A #{Id} 0x{Op:X4} len={Len}", link.Id, op, payload.Length + 6);   // T106: quiet set
+@@ -767,14 +767,18 @@
+     /// </summary>
+     public void SendUserRequestExit(uint playerId)
+     {
+-        SendFrame(OpUserRequestExit, BitConverter.GetBytes(playerId));
++        var user = SessionForPlayerId(unchecked((int)playerId));
++        if (user == null || !user.InWorld || !HasLinks(user.CurrentWorldId)) return;
++        SendFrame(user.CurrentWorldId, OpUserRequestExit, BitConverter.GetBytes(playerId));
+         _log.LogInformation("Sent AS_USER_REQUEST_EXIT (0x14FF) for player {Id}", playerId);
+     }
+ 
+     /// <summary>Countdown cancelled. Writer FUN_140353530: AS_USER_CANCEL_REQUEST_EXIT [u32 playerId].</summary>
+     public void SendUserCancelRequestExit(uint playerId)
+     {
+-        SendFrame(OpUserCancelRequestExit, BitConverter.GetBytes(playerId));
++        var user = SessionForPlayerId(unchecked((int)playerId));
++        if (user == null || !user.InWorld || !HasLinks(user.CurrentWorldId)) return;
++        SendFrame(user.CurrentWorldId, OpUserCancelRequestExit, BitConverter.GetBytes(playerId));
+         _log.LogInformation("Sent AS_USER_CANCEL_REQUEST_EXIT (0x1500) for player {Id}", playerId);
+     }
+ 

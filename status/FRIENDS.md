@@ -2,7 +2,7 @@
 
 Everything the client's Friends and Blocked-Users panels do, from rows instead of statics.
 Sources: the eleven `Handler_C_*` in `Arb_part_*.c`, the `.def` files in `tera_v100_MASTER_FINAL`,
-and the client-side capture `<captures>\cap_newchar_client.log` (frames 304-307).
+and the client-side capture `D:\packetlogs\cap_newchar_client.log` (frames 304-307).
 
 **No build was possible in the Cowork container** — every byte claim below was reproduced in
 Python against the capture, and the tests assert the same bytes.
@@ -21,7 +21,7 @@ Python against the capture, and the tests assert the same bytes.
 Friends are **per character**, not per account: every stored procedure the real Arbiter calls
 (`spAddFriendOnList`, `spDeleteFriendOnList`, `spLoadAllFriendList`) is keyed on `playerId`.
 The account appears only as a *guard* — `User::CanAddFriendNoLock` (Arb_part_028.c:6721) refuses
-a request when the two users' account ids (the i64 at `User+0xB0`) are equal, i.e. two
+a request when the two users' account ids — the eight bytes at `+0xb0` on each — are equal, i.e. two
 characters of one account cannot be friends.
 
 **None of this goes through the DB-proxy protocol.** There is no `SDB_ADD_FRIEND`; the real
@@ -38,7 +38,7 @@ DLM item.
 `dungeonGauntletDifficultyId` after `sectionId`. The 100.02 writer does not:
 
 ```
-User::SendFriendListNoLock   (Arb_part_030.c:8)      advances the cursor by 0x3f   // 63 bytes
+User::SendFriendListNoLock   (Arb_part_030.c:8)      runningLen += 0x3f;   // 63 bytes per element
   here 2 | next 2 | name 2 | myNote 2 | theirNote 2
   playerId 4 | group 4 | level 4 | race 4 | class 4 | gender 4 | worldId 4 | guardId 4 | sectionId 4
   summonable 1 | lastOnline 8 | type 4 | bonds 4                                   = 63
@@ -243,9 +243,15 @@ is empty; in 1437 `myNote` is empty and `theirNote` carries the friend's own pro
 
 `User::SendFriendListNoLock` (Arb_part_030.c) computes it as a subtraction, not a stored value:
 
-It reads a `time_t` at `UserFriendInfo+0xEC`, and when that is not the unset default it
-subtracts it from now; the difference — 0 when unset — is stored as the eight bytes at
-element +47.
+```
+elapsed = 0;
+loadTime(&friendTime, friendInfo + 0xEC);              // FUN_140034490, a time_t at UserFriendInfo+0xEC
+if (friendTime != unsetTime) {                         // != the default/unset time
+  elapsed = toSeconds(now) - toSeconds(&friendTime);   // FUN_1400346a0 on each
+}
+...
+*(int64 *)(element + 0x2f) = elapsed;                  // element +47, eight bytes
+```
 
 So the wire value is an **elapsed second count from a fixed origin**, and 0 when the origin is
 unset. Three facts pick login over logout: the two frames differ by 3 (they are seconds apart);

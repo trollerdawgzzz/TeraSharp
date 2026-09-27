@@ -21,7 +21,7 @@ public static class WorldEntry
     public static bool EnterWorld(GameSession s, ILogger log)
     {
         var w = Program.World;
-        if (w == null || !w.IsReady) { if (w != null && w.IsConnected) log.LogWarning("World connected but not ready - using standalone"); return false; }
+        if (!WorldAvailability.Ready(w)) return false;
 
         var chr = s.SelectedCharacter;
         if (chr == null) { log.LogWarning("EnterWorld: no selected character"); return false; }
@@ -209,11 +209,13 @@ public static class WorldEntry
         w.U8(0);
         w.U8(0);
 
-        // [94..101] Unknown u64 (param_18). Capture=0.
-        w.U64(0);
+        // [94..101] Existing PartyId. Arb028:15773-15781 / 15847-15850;
+        // cap_2man_b raw13799: a matched character's lobby return retains its party.
+        var party = PartyWiring.Manager.FindByMember((int)chr.Id);
+        w.U64((ulong)(party?.Id ?? 0));
 
-        // [102] Unknown u8 (param_19). Capture=0.
-        w.U8(0);
+        // [102] IsSysParty from the same party; normal/no party sends zero.
+        w.U8(party?.IsSys == true ? (byte)1 : (byte)0);
 
         // [103..106] From WorldSession+0x758 (param_20). Capture=6.
         w.U32(6);

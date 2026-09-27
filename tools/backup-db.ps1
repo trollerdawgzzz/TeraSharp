@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 the TeraSharp contributors
+
 #Requires -Version 5.1
 <#
 .SYNOPSIS
@@ -30,7 +31,7 @@
     Where backups go. Default D:\backups\terasharp.
 
 .PARAMETER Database
-    The SQLite file. Default follows TERASHARP_DB, else logs\terasharp.db.
+    The SQLite file. Default follows TERASHARP_DB, else D:\packetlogs\terasharp.db.
 
 .PARAMETER KeepDays
     Delete archives older than this. Default 14. 0 keeps everything.
@@ -92,7 +93,7 @@ $ErrorActionPreference = 'Stop'
 
 if (-not $Database) {
     $Database = $env:TERASHARP_DB
-    if (-not $Database) { $Database = 'logs\terasharp.db' }
+    if (-not $Database) { $Database = 'D:\packetlogs\terasharp.db' }
 }
 
 function Write-Step { param([string] $Text) Write-Host "  $Text" }

@@ -421,7 +421,7 @@ internal static class DbProxyStaticData
     // -----------------------------------------------------------------------
     // 0x272D DBS_LOAD_QUEST_LIST — the EMPTY-DAILY-SEED form (153B payload, 159B frame).
     //
-    // Ground truth: <captures>\lobby_tap.log, real ArbiterServer, 2026-09-13T02:51:10.648Z,
+    // Ground truth: D:\packetlogs\lobby_tap.log, real ArbiterServer, 2026-09-13T02:51:10.648Z,
     // first login of the day for playerId 1. Same 53-byte header as `QuestList` above, but the
     // dailyQuestSeed section is EMPTY:
     //     [24] dailyQuestSeedOff = 0x8B (139)   [28] dailyQuestSeedSize = 0
@@ -500,6 +500,7 @@ public static class PartyPackets
     public const ushort AS_DO_CHANGE_PARTY_MEMBER_AUTHORITY = 0x13A5;
     public const ushort AS_DO_SET_LOOTING_METHOD = 0x13A6;
     public const ushort AS_DO_SET_PARTY_OWNER = 0x13A7;
+    public const ushort AS_RESET_ALL_DUNGEON = 0x13B9;
     public const ushort AS_DISMISS_PARTY = 0x13BA;
     public const ushort AS_PARTY_LOOTING_METHOD = 0x13BB;
     public const ushort AS_BAN_PARTY_MEMBER = 0x13BC;
@@ -527,6 +528,23 @@ public static class PartyPackets
         return p;
     }
 
+    /// <summary>T184f: Arb_part_039.c:10042-10110, cap_2man raw record 7888.
+    /// PDId + 24-byte DungeonOwnerInfo + online count. A solo owner uses its own PDId;
+    /// a party owner uses PartyId/IsSys and the empty PDId (-1, 0).</summary>
+    public static byte[] BuildAsResetAllDungeon(int planetId, int userDbId,
+        long partyId, bool isSys, int onlineCount)
+    {
+        var p = new byte[36];
+        BitConverter.GetBytes(planetId).CopyTo(p, 0);
+        BitConverter.GetBytes(userDbId).CopyTo(p, 4);
+        BitConverter.GetBytes(partyId).CopyTo(p, 8);
+        p[16] = isSys ? (byte)1 : (byte)0;
+        BitConverter.GetBytes(partyId == 0 ? planetId : -1).CopyTo(p, 20);
+        BitConverter.GetBytes(partyId == 0 ? userDbId : 0).CopyTo(p, 24);
+        BitConverter.GetBytes(onlineCount).CopyTo(p, 32);
+        return p;
+    }
+
     // ---- World -> Arbiter ----
     public const ushort SA_JOIN_PARTY = 0x1395;
     public const ushort SA_LEAVE_PARTY = 0x1396;
@@ -540,6 +558,7 @@ public static class PartyPackets
     public const ushort SA_JOIN_PARTY_IN_ARBITER = 0x13AB;
     public const ushort SA_MERGE_PARTY_TO_RAID = 0x13AC;
     public const ushort SA_BYPASS_TO_GROUP = 0x13F8;
+    public const ushort SA_EQUIP_ITEM_LEVEL = 0x13CC;
     /// <summary>
     /// T163. [i64 PartyId][i32 DungeonId], frame 0x12 - World's DungeonManager::
     /// BroadcastDungeonClear for the party owning a cleared dungeon (WorldServer.exe.c:848975).
@@ -556,9 +575,36 @@ public static class PartyPackets
     public const ushort C_PARTY_LOOTING_METHOD = 0x5D24;
     public const ushort C_MERGE_PARTY_TO_RAID = 0xB8D0;
     public const ushort C_REQUEST_PARTY_INFO = 0xFD35;
+    public const ushort C_RESET_ALL_DUNGEON = 0x5867;
     public const ushort S_PARTY_MEMBER_LIST = 0x8BC6;
+    public const ushort S_SEND_PARTY_NAME_LIST = 0xCCBC;
     public const ushort S_LEAVE_PARTY = 0x9A8E;
     public const ushort S_PARTY_LOOTING_METHOD = 0x63C0;
+
+    /// <summary>Arb_part_067.c:13507-13603, Party::SendRaidPartyName.
+    /// Each 10-byte linked element has its UTF16Z name immediately after it.
+    /// cap_2man_client1:1280 is the six default names, 116 bytes.</summary>
+    public static byte[] BuildPartyNameList(IReadOnlyList<string> names)
+    {
+        var strings = names.Select(s => System.Text.Encoding.Unicode.GetBytes(s + "\0")).ToArray();
+        var p = new byte[8 + strings.Sum(s => 10 + s.Length)];
+        BitConverter.GetBytes((ushort)p.Length).CopyTo(p, 0);
+        BitConverter.GetBytes(S_SEND_PARTY_NAME_LIST).CopyTo(p, 2);
+        BitConverter.GetBytes((ushort)strings.Length).CopyTo(p, 4);
+        BitConverter.GetBytes((ushort)(strings.Length == 0 ? 0 : 8)).CopyTo(p, 6);
+        int at = 8;
+        for (int i = 0; i < strings.Length; i++)
+        {
+            int next = at + 10 + strings[i].Length;
+            BitConverter.GetBytes((ushort)at).CopyTo(p, at);
+            BitConverter.GetBytes((ushort)(i + 1 == strings.Length ? 0 : next)).CopyTo(p, at + 2);
+            BitConverter.GetBytes((ushort)(at + 10)).CopyTo(p, at + 4);
+            BitConverter.GetBytes(i).CopyTo(p, at + 6);
+            strings[i].CopyTo(p, at + 10);
+            at = next;
+        }
+        return p;
+    }
 
     /// <summary>
     /// Minimum FRAME length each SA_ handler demands. A short frame is not a dropped packet on
@@ -598,8 +644,8 @@ public static class PartyPackets
     // PartyMemberBasicInfo - 0xA0 bytes, the wire form of a member.
     // The first 0xA0 bytes of Party's own PartyMemberInfo (Party+0x1C8, stride 0xC0); the
     // stride is confirmed twice in PartyManager::New_CreateParty (Arb_part_079.c) - the
-    // encoder's bound check demands 0xa0 more bytes per record, and the cursor advances 0x28
-    // ints (0xa0 bytes) per member.
+    // encoder's bound check that the write cursor stays below the recorded length + 0xa0, and its
+    // destination u32 pointer stepping forward 0x28 words (0xa0 bytes) per member.
     //   [0x00] i32 PlanetId   [0x04] i32 UserDbId   [0x08] i64 GameId (masked 0x7FFF...)
     //   [0x10] i32 Level      [0x14] i32 Class      [0x18] i32 Race    [0x1C] i32 Gender
     //   [0x20] i32 Role (-1)  [0x24] wchar Name[0x25]
@@ -612,7 +658,9 @@ public static class PartyPackets
     public readonly record struct PartyMember(
         int PlanetId, int UserDbId, ulong GameId, int Level, int Class, int Race, int Gender,
         int Role, string Name, bool CanInvite, bool Alive, bool Online,
-        int AchievementGrade, int AwakenGrade);
+        int AchievementGrade, int AwakenGrade, float TrueItemLevel = 0,
+        int CountOfDungeonClear = 0, int WinRate = 0, int WinCount = 0, int BattleFieldScore = 0,
+        bool SupplementCompensation = false, bool IsSoloMatching = false);
 
     /// <summary>One 0xA0-byte PartyMemberBasicInfo. The name is UTF-16LE, NUL-terminated,
     /// truncated to 0x24 characters so the terminator always fits the 0x25-wchar field.</summary>
@@ -633,6 +681,15 @@ public static class PartyPackets
         b[0x70] = (byte)(m.Online ? 1 : 0);
         BitConverter.GetBytes(m.AchievementGrade).CopyTo(b, 0x74);
         BitConverter.GetBytes(m.AwakenGrade).CopyTo(b, 0x78);
+        // Arb068:14433-14464 assigns these semantic fields. Only 0x71..73 and
+        // 0x92..97 are alignment padding; 0x98..9F is explicitly initialized to zero.
+        BitConverter.GetBytes(m.TrueItemLevel).CopyTo(b, 0x7C);
+        BitConverter.GetBytes(m.CountOfDungeonClear).CopyTo(b, 0x80);
+        BitConverter.GetBytes(m.WinRate).CopyTo(b, 0x84);
+        BitConverter.GetBytes(m.WinCount).CopyTo(b, 0x88);
+        BitConverter.GetBytes(m.BattleFieldScore).CopyTo(b, 0x8C);
+        b[0x90] = m.SupplementCompensation ? (byte)1 : (byte)0;
+        b[0x91] = m.IsSoloMatching ? (byte)1 : (byte)0;
         return b;
     }
 
@@ -648,7 +705,10 @@ public static class PartyPackets
             BitConverter.ToInt32(b, off + 0x20),
             ReadName(b, off + MemberNameOffset, MemberNameMaxChars),
             b[off + 0x6E] != 0, b[off + 0x6F] != 0, b[off + 0x70] != 0,
-            BitConverter.ToInt32(b, off + 0x74), BitConverter.ToInt32(b, off + 0x78));
+            BitConverter.ToInt32(b, off + 0x74), BitConverter.ToInt32(b, off + 0x78),
+            BitConverter.ToSingle(b, off + 0x7C), BitConverter.ToInt32(b, off + 0x80),
+            BitConverter.ToInt32(b, off + 0x84), BitConverter.ToInt32(b, off + 0x88),
+            BitConverter.ToInt32(b, off + 0x8C), b[off + 0x90] != 0, b[off + 0x91] != 0);
     }
 
     private static void WriteName(byte[] b, int off, string name, int maxChars)
@@ -1276,9 +1336,9 @@ public static class HandshakeData
     /// &lt;TERASHARP_DATA&gt;\Executable\Datasheet; then the dev-box default.</summary>
     public static string DatasheetDirectory()
     {
-        var explicitDir = Environment.GetEnvironmentVariable("TERASHARP_DATASHEET");
+        var explicitDir = TerasConfig.Get("TERASHARP_DATASHEET");
         if (!string.IsNullOrEmpty(explicitDir)) return explicitDir;
-        var root = Environment.GetEnvironmentVariable("TERASHARP_DATA") ?? @"D:\v100\TERA_SERVER.100";
+        var root = TerasConfig.Get("TERASHARP_DATA") ?? @"D:\v100\TERA_SERVER.100";
         return Path.Combine(root, "Executable", "Datasheet");
     }
 

@@ -78,8 +78,8 @@ public static class ClientSettingsHandlers
     // capture: [u16 offset][u16 count][count bytes]. The offset is PACKET-relative — it counts the
     // 4-byte [u16 len][u16 opcode] header — so a blob that starts right after the descriptor has
     // offset 8, and its first byte is body[4]. The real handler reads exactly that:
-    // Handler_C_SAVE_CLIENT_USER_SETTING (Arb_part_041.c:11024) treats its pointer as the PACKET
-    // start and reads the packet's third and fourth u16 as the offset and the count.
+    // Handler_C_SAVE_CLIENT_USER_SETTING (Arb_part_041.c:11024) is handed the PACKET start and
+    // reads the offset from the u16 at packet+4 and the count from the u16 at packet+6.
     //
     // What the real Arbiter does with it:
     //   * User::SaveClientSetting (Arb_part_029.c:18757) / Account::SaveClientSetting

@@ -271,7 +271,8 @@ public static class PartyMatchManager
     /// <summary>
     /// A null-terminated UTF-16LE string at a PACKET-relative offset, read out of the BODY.
     /// An offset of 0, or one outside the body, is the codec's "no string" and the real
-    /// handler's own bounds check - zero, or not below the packet length.
+    /// handler's bounds check, which rejects an offset of 0 and any offset the packet length at
+    /// packet+0 is less than or equal to.
     /// </summary>
     public static string ReadWString(ReadOnlySpan<byte> body, int packetOffset)
     {
@@ -403,6 +404,29 @@ public static class PartyMatchManager
         a.ToPlayer(playerId, S_SHOW_PARTY_MATCH_INFO, BuildShowFields(Matching(filter)));
         Log.LogInformation("party match: player {Id} withdrew ({Had}), {N} left on the board",
             playerId, had ? "had a listing" : "had none", Count);
+        return a;
+    }
+
+    /// <summary>T201: the QA command calls RequestUnregisterPartyInfo alone
+    /// (Arb044:7196; Arb072:1221-1246), without the client's subsequent page job.</summary>
+    internal static ArbiterActions OnQaUnregister(int playerId)
+    {
+        var a = New(playerId);
+        bool removed;
+        lock (Gate) removed = Board.Remove(playerId);
+        if (removed) a.ToPlayer(playerId, S_SYSTEM_MESSAGE, BuildSmtFields(SmtUnregistered));
+        return a;
+    }
+
+    /// <summary>T201: Arb040:7829 -> Arb072:481-509; success has no reply.</summary>
+    internal static ArbiterActions OnChangePr(int playerId, string message)
+    {
+        var a = New(playerId);
+        lock (Gate)
+        {
+            if (Board.TryGetValue(playerId, out var old)) Board[playerId] = old with { Message = message };
+            else a.ToPlayer(playerId, S_SYSTEM_MESSAGE, BuildSmtFields(1003));
+        }
         return a;
     }
 

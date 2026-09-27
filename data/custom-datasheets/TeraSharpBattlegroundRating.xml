@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- TeraSharp leaderboard policy; this is not a retail World/MatchServer setting. -->
+<TeraSharpBattlegroundRating>
+  <Rating minDelta="5" maxDelta="12" />
+</TeraSharpBattlegroundRating>

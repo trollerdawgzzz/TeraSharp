@@ -25,10 +25,10 @@ Outputs, for either script:
 ```powershell
 cd D:\v100\TERA_SERVER.100\TeraSharp\tools
 
-.\reframe-tap.ps1    -Log <captures>\arb_world_2026-09-15T20-00-00-000Z.log `
+.\reframe-tap.ps1    -Log D:\packetlogs\arb_world_2026-09-15T20-00-00-000Z.log `
                      -Opcodes 0x139E,0x139F,0x13BB,0x13F8
 
-.\reframe-client.ps1 -Log <captures>\capture_2026-09-15T20-00-05-000Z.log `
+.\reframe-client.ps1 -Log D:\packetlogs\capture_2026-09-15T20-00-05-000Z.log `
                      -Packets S_GUILD_INFO,S_PARTY_MEMBER_LIST
 ```
 
@@ -101,7 +101,7 @@ kept, because every existing note that cites a frame number cites one of these.
 ```
 
 On `arb_world_2026-09-13T11-33-30-680Z.log` that is 1845 frames of 2366 — the listing goes from
-unreadable to 521 lines. The two existing listings in `<captures>` used slightly different
+unreadable to 521 lines. The two existing listings in `D:\packetlogs` used slightly different
 lists; `cap_newchar_ctl.txt` kept `0x147E` and dropped `0x13CC`, `0x164D` and `0x2958` instead.
 Pass `-Skip` explicitly to reproduce that one exactly, or `-Skip @()` to keep everything.
 
@@ -141,7 +141,7 @@ Neither script throws on a bad log; both count what they could not use and print
 
 Feeding the wrong script a log produces a warning naming the other one, not a stack trace.
 
-## Dry run over `<captures>`, 2026-09-15
+## Dry run over `D:\packetlogs`, 2026-09-15
 
 Every existing capture, both scripts, PowerShell 7.4.
 
@@ -174,7 +174,7 @@ disagrees — so the captures and the map are from the same build.
 
 ## `-Names` on the tap side is advisory
 
-`-Names <captures>\world_opcodes.txt` adds a name column. That table covers `AS_`/`SA_`
+`-Names D:\packetlogs\world_opcodes.txt` adds a name column. That table covers `AS_`/`SA_`
 (0x1389-0x16xx) and **not** the `SDB_`/`DBS_` range above 0x2700, and it disagrees with the
 repo in places — it calls `0x147D` `SA_LOAD_GUARD` where `DbProxyHandlers` calls it
 `AS_PROMOTION_LIST_REQ`, and `0x1484` `AS_ELECTION_STATE`. Use it to skim, not to cite. The
@@ -336,13 +336,13 @@ them is the one thing that would make the capture lie to you.
 
 ```powershell
 # the packet view (default) - one record per frame, and the complete list
-.\npcap-to-capture.ps1 -Npcap <captures>\classic_live.npcap
+.\npcap-to-capture.ps1 -Npcap D:\packetlogs\classic_live.npcap
 
 # the socket view instead
-.\npcap-to-capture.ps1 -Npcap <captures>\classic_live.npcap -Stream Raw -Out raw.log
+.\npcap-to-capture.ps1 -Npcap D:\packetlogs\classic_live.npcap -Stream Raw -Out raw.log
 
 # then read it like any other client capture
-.\reframe-client.ps1 -Log <captures>\classic_live.log
+.\reframe-client.ps1 -Log D:\packetlogs\classic_live.log
 ```
 
 Runs on **Windows PowerShell 5.1** as well as pwsh 7. Two things in the first cut did not:
@@ -400,7 +400,7 @@ Two were already listed above. This one cost an hour:
 ```powershell
 .\audit-release.ps1                        # walk the working tree
 .\audit-release.ps1 -Tracked                # only what git tracks, for CI
-.\audit-release.ps1 -AllowAddress 203.0.113.9
+.\audit-release.ps1 -AllowAddress <retail-phone-home-address>
 ```
 
 Exits non-zero on anything that must not be published:
@@ -416,3 +416,79 @@ Exits non-zero on anything that must not be published:
 
 The hash list is the point: renaming `starter_blob.bin` does not get it past the check. Add a
 line when a new blob is identified; never remove one.
+
+---
+
+## `dupe-battlefield.ps1` / `dupe-dungeon.ps1` — a copy of a BG or a dungeon (T177)
+
+The reasoning, the per-sheet table and the decompile lines are in `status/DUPLICATE-CONTENT.md`.
+
+| | battlefield | dungeon |
+|---|---|---|
+| copies | `<BattleField>` row (same continent), and a `MatchingRoleTemplate` role when `-TeamSize` changes | AreaList + ContinentData rows, `DungeonData_<new>`, every per-zone file of the source zone under a new zone, DungeonMatching + role, DungeonConstraint, AreaData, DynamicGeo |
+| size | `-TeamSize` (role `totalUser` and `maxTeamMember`) | `-MaxMembers` (`maxMemberCount` and role `totalUser`, which World requires to match) |
+| options | `-RuleId`, `-NewRuleId`, `-NameId`, `-EqualizedFrom <bf>`, `-KeepRanking`, `-NoSortPriority` | `-NewHuntingZone`, `-RoleId`, `-NewRoleId`, `-NoMatching`, `-NoConstraint` |
+
+Both take `-Datasheet`, `-DryRun` / `-WhatIf` (lists every edit and runs the checks), `-Revert` and
+`-Force`. Shared code is in `dupe-common.ps1`, which is dot-sourced.
+
+- Rows are fenced with `<!-- dupe:<kind>:<id> begin/end -->`, and created files carry a
+  `created from` marker line. `-Revert` removes exactly those; nothing is restored over newer edits.
+- Changed sheets are copied to `Executable\dupe-backup\` first. That folder is outside `Datasheet\`,
+  which the servers walk recursively.
+- Text edits only: BOM, CRLF and comments survive. Commented-out rows (for example
+  `<!--Dungeon id="9981"`) are never matched.
+
+Stop TopographyServer (for a dungeon), the Arbiter, every World, MatchServer and TeraSharp before
+running either script. The client DataCenter is not touched.
+
+---
+
+## `setup.ps1` — one command from an unzipped server to a running one (T204)
+
+```powershell
+.\setup.ps1                 # four questions, then everything
+.\setup.ps1 -Check          # change nothing; print what it would do
+```
+
+Writes `teras.json` (with the admin token and Alt+A key generated once and kept for ever), makes
+`Executable\DeploymentConfig.xml` and `ServerConfig.xml` agree with it - text-level, BOM- and
+CRLF-safe, one `.bak` per file - points `tera-server-proxy\config.json` at the Arbiter, runs
+`--check-config`, and writes `start.ps1` / `stop.ps1`. Idempotent: existing answers become the
+defaults and an attribute that is already right is not rewritten. `docs\QUICKSTART.md` is the
+five-step version.
+
+`deployment.worldIds` in `teras.json` is what `start.ps1` boots, one `WorldServer.exe --id=` per
+entry. It is derived from the tree's own `WorldServerList`, because a stock 100.02 tree's main
+world is id **0** and an id with no `<WorldServer>` row loads nothing and exits, which looks
+exactly like a crash.
+
+## `sync-public.ps1` — refresh the public mirror, with the strip (T204b)
+
+```powershell
+.\sync-public.ps1 -Check                        # what would change, plus the audit as it stands
+.\sync-public.ps1                               # apply
+.\sync-public.ps1 -Prune                        # and delete files public has that master no longer does
+```
+
+A one-way file sync, master -> `D:\TeraSharp-public`, ending in `audit-release.ps1 -Strict` inside
+the public tree. **It runs no git commands**: you review `git status` / `git diff` there and commit
+yourself, because the strip is mechanical and the judgement is not.
+
+Four rule tables at the top of the script are the whole policy, and each entry carries its reason:
+
+| table | what it decides |
+|---|---|
+| `$Scope` | what is mirrored: `src`, `status`, `docs`, `tools`, the listed root files, and the two parts of `data\` that are ours |
+| `$Drop` | what never leaves: capture fixtures and evidence under `data\`, the per-task `.py` research scripts, `ship.ps1`, the generated per-install files, build output |
+| `$Keep` | public-only files that are never touched: `LICENSE`, `CHANGELOG.md`, `CONTRIBUTING.md`, `.env.example`, `.gitattributes`, `.gitignore`, `.git` |
+| `$Rewrites` | the literal-for-prose substitutions the public tree carries, e.g. the retail phone-home address in a comment |
+
+Bytes are copied unchanged, line endings included - the public tree is a mix and its
+`.gitattributes` (`* text=auto`) is what normalises on commit; rewriting newlines here would show
+every file as modified. Source files get the two SPDX lines prepended when they have none.
+
+Two things it deliberately does NOT do. It does not scrub developer paths in general: the public
+tree already contains `D:\...` in comments, and a blanket rewrite would touch a hundred files
+nobody asked about. And it does not pass `-AllowAddress` to the audit - if a routable public
+address survives, the run names the **master** file to fix and exits non-zero.

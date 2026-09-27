@@ -71,11 +71,12 @@ then ships near-matches as `S_COMMAND_HELP` (0x4F79). TeraSharp sends the first,
 
 ```c
 FUN_140350eb0(&pkt,0x2829);                 // [u32 frameLen][u16 opcode]
-// reserve the u32 string-offset slot by writing 0 into it
-FUN_14013d0b0(&pkt,(int)lVar6);                   // u32 userId   (User+0x120 = playerId)
-FUN_14013d0b0(&pkt,(int)lVar18);                  // u32 bypass mode (1 = bucket 4)
-// backpatch that slot with the running frame length: 18, frame-relative
-FUN_140351030(&pkt,line);                         // wcscpy_s -> UTF-16LE + a u16 0
+slot = bufferBase + frameLen;               // remember where the offset u32 lands
+*slot = 0;  FUN_14013d0b0(&pkt,*slot);      // u32 string offset, reserved as 0
+FUN_14013d0b0(&pkt,(int)playerId);          // u32 userId   (User+0x120 = playerId)
+FUN_14013d0b0(&pkt,(int)bypassMode);        // u32 bypass mode (1 = bucket 4)
+*slot = frameLen;                           // backpatch: 18, frame-relative
+FUN_140351030(&pkt,line);                   // wcscpy_s -> UTF-16LE + a u16 0
 ```
 
 So the payload (frame minus its 6-byte header) is
@@ -194,8 +195,8 @@ fields and their frame offsets, with a `0x11 < len` guard:
 | 0x12 | 12 | wchar[] | the command line, UTF-16LE, NUL-terminated |
 
 The third field is `CommandType`, not a "bypass mode", but T32's **value** is right and for the
-right reason: the writer fills it from a constant stored on the *handler object itself*
-(`Arb_part_067.c:6898`), not from the client packet.
+right reason: the writer fills it from the *handler object's* own constant
+at `this+0x24` (`Arb_part_067.c:6898`), not from the client packet.
 `ArbiterBypassCommandHandler` is constructed twice, with 1 and 0
 (`Arb_part_033.c:13685`/`:13691`), and World commands live in the bucket that carries **1**. So
 `ForwardToWorld` ignoring its own `commandType` argument is correct, not an oversight.
@@ -603,3 +604,28 @@ s.SendByDef("S_SELECT_USER", ArbiterClientHandlers.BuildSelectUserFields());
 
 Also fixed here: `SelfTest.IsSecret` matched only `_TOKEN` and `_PASSWORD`, so `--check-config`
 would have printed the new signing key in full. It now masks `_SECRET` and `_KEY` too.
+
+## T195 — GM routing after a cross-World transfer
+
+| Path | Evidence and result |
+|---|---|
+| `0x2829` command | Fixed `ForwardToWorld`'s default-World overload: use the session's `CurrentWorldId` through the shared admin sender. Native `Arb_part_067.c:6893–6912` uses `User::GetBypassSession`; `Arb_part_028.c:17295–17311` selects the user's current continent/instance World. |
+| Capture pin | `cap_2man_b` raw16350: `kill 1000000`, user1, mode1, 44 B on physical link#54; registration11532/11533 identifies World13. `cap_final2b` raw30646 also pins the 30 B `nodie` frame on World0/link#51. The requested `cap_final2b` tap contains no literal `kill` or dungeon-owner link. |
+| `0x2827` T148/T155 panels | Already use the GM session's `CurrentWorldId`; unchanged builders. |
+| `0x2825` ask / `0x2826` result | Ask already uses the target session's World; filled result already forwards as `0x2827` to the requester's current World. |
+| Missing owner link | Shared sender now checks `HasLinks(CurrentWorldId)`; another connected World cannot make the send succeed or receive a fallback frame. |
+
+Regression `T195_admin_frames_follow_current_world_and_target_without_main_fallback` uses both
+World0 and World13 sockets, pins both complete captured command frames, exercises skill/teleport
+panels and the target/requester ask cycle, and checks authorization and absent-owner refusal.
+No human-owned patch or wire-layout change is required.
+
+Files: `src/TeraSharp.Arbiter/Handlers/GmCommands.cs`,
+`src/TeraSharp.Arbiter/Handlers/ArbiterClientHandlers.cs`, `src/TeraSharp.Arbiter.Tests/T195.cs`,
+`tools/t195-evidence.py`, `data/t195/selected.json`, `data/t195/source-manifest.json`, this section.
+The evidence exporter records the six relevant registration/entry/command frames and source hashes;
+the regression embeds only the two command frames and needs no optional binary fixture.
+
+Validation: isolated source copy based on master `dff8c98` builds successfully; **1032 passed /
+0 failed / 26 skipped**, including the new routing regression. All edited C# files match the tested
+copy by SHA-256. Live command use inside9781 remains for the next deployed run.

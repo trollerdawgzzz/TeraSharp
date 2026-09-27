@@ -515,7 +515,7 @@ public static class BrokerPackets
         {
             if (_feePercent is int c) return c;
             int v = DefaultBrokerFeePercent;
-            var raw = Environment.GetEnvironmentVariable(BrokerFeeEnvVariable);
+            var raw = TerasConfig.Get(BrokerFeeEnvVariable);
             if (!string.IsNullOrWhiteSpace(raw) && int.TryParse(raw.Trim(), out int parsed)
                 && parsed >= 0 && parsed <= 100) v = parsed;
             _feePercent = v;

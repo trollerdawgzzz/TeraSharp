@@ -61,9 +61,8 @@ decompile. Our stored pocket ids are the right key — they are just read by a d
 | `TransSQLExec` (ctors, `GetInven`, `IsAccountDbIdInvenType`) | `Arb_part_037.c:11701`, `Arb_part_038.c:5918`, `:11173` |
 | PDL dumpers — the authoritative field names + offsets | `Arb_part_015.c`–`Arb_part_018.c` |
 
-Singletons, by data-symbol address: `DAT_141299b00` = `ParcelManager`;
-`DAT_141214fe8` = `UserManager`;
-`DAT_140f02a78` = `ReturnUserManager`.
+Singletons, by the address of the global instance pointer: `ParcelManager` at `0x141299b00`,
+`UserManager` at `0x141214fe8`, `ReturnUserManager` at `0x140f02a78`.
 
 Every offset below is **frame-relative** for `SDB_`/`DBS_` messages (payload offset = frame − 6,
 the usual TeraSharp convention) and **packet-absolute** for client packets (body index = offset − 4).
@@ -235,8 +234,8 @@ the writer after the fixed fields; the writer sets the offset slot to the runnin
 apply unchanged. Proof of the stride: both the parcel and the warehouse handlers size the vector
 with `(byteCount - 1) / 0x358 + 1` (e.g. `Arb_part_063.c:8550`).
 
-`ParcelDataNoMsg` is **0x9e8 = 2536 bytes** — read directly from the `DBS_LIST_PARCEL` writer's
-bounds check, which demands 0x9e8 more bytes of room per record (`Arb_part_071.c:15396`). The full `ParcelData`
+`ParcelDataNoMsg` is **0x9e8 = 2536 bytes** — read off the `DBS_LIST_PARCEL` writer's own room check,
+which tests the frame limit against the cursor plus `0x9e8` (`Arb_part_071.c:15396`). The full `ParcelData`
 with the message body is larger (a `memset` of `0xdd8` appears at `Arb_part_082.c:11099`); the
 receiver dbId sits at `+0x50` (§2.1). **The rest of the struct's interior is not pinned** — it is
 the Arbiter's own SQL row shape, and for a byte-exact `DBS_LIST_PARCEL` we would have to pin all
@@ -424,10 +423,19 @@ FUN_140483290   Arb_part_037.c:11701   TransSQLExec::TransSQLExec(class BaseInve
 ### 6.2 `GetInven` resolves an atom against the bound inventories only
 
 `TransSQLExec::GetInven(__int64 ownerDbId, enum INVEN_TYPE)` = `FUN_140497f00`
-(`Arb_part_038.c`, tracer `:5918`) tries each of its two bound inventories in turn: it compares
-the caller's `ownerDbId` against the inventory's own at `+0x60`, asks the inventory whether it
-accepts this `INVEN_TYPE`, and returns the first that answers yes. When neither does it returns
-NULL and the transaction fails.
+(`Arb_part_038.c`, tracer `:5918`), in full:
+
+```c
+inven = exec->bound[0];                              // bound inventory #1
+if (ownerDbId == inven->OwnerDbId) {                 // OwnerDbId, inventory slot 0xc (+0x60)
+    if (inven->AcceptsInvenType(invenType)) return inven;   // virtual call, vtable +0x20
+}
+inven = exec->bound[1];                              // bound inventory #2
+if (ownerDbId == inven->OwnerDbId) {
+    if (inven->AcceptsInvenType(invenType)) return inven;
+}
+return 0;                                            // -> NULL -> transaction fails
+```
 
 There is no third lookup and no global inventory registry. An atom whose `(OwnerDbId, InvenType)`
 pair matches neither bound inventory resolves to NULL.
@@ -437,7 +445,9 @@ pair matches neither bound inventory resolves to NULL.
 `Handler_SDB_ITEM_SINGLE` = `FUN_14074aca0`, `Arb_part_063.c:11656–11811`. The only
 `TransSQLExec` construction in the whole function is at `:11756`:
 
-It constructs a `TransSQLExec` over a single inventory — `User+0x3c80`, the bag.
+```c
+TransSQLExec exec(user + 0x3c80);   // FUN_1404832f0, the one-inventory ctor; User+0x3c80 = the bag
+```
 
 Contrast the siblings, which bind two:
 
@@ -746,3 +756,123 @@ op 0x11 sits on the warehouse row, is positive both times, and **only ever appea
 it carries the amount to REMOVE. Adding it grew the bank by whatever was being taken out of it,
 every withdraw. The money pair is the other way round and is untouched: op 0x0D really does go
 negative on a withdraw (seq 2149).
+
+## 14. T202 — "Receive all" is a different opcode, and it never reaches step 2
+
+Research pass. `cap_mail1.log` (ours) holds **three collects and not one `SDB_RECV_PARCEL`**: the
+client's "Receive all" button sends `0xAB24`, so World issues **`SDB_RECV_PARCEL_EX` (0x277D)**,
+which T74's two-step split never covered. `OnRecvParcelEx` ignores `Step`, answers step 1 with
+`ParcelCount = 0` and empty lists, and in the same pass calls `SetParcelRecved` on every parcel and
+pays the gold. World reads "0 parcels", never sends step 2, and step 2 is the only frame that
+carries the insert atoms. Parcel consumed, item never created.
+
+| # | req seq | rsp seq | DlmId | owner | IsAllParcel | our `ParcelCount` |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 1300 | 1301 | 95 | 9 | 1 | 0 |
+| 2 | 21483 | 21484 | 983 | 10 | 1 | 0 |
+| 3 | 29420 | 29423 | 1738 | 13 | 1 | 0 |
+
+### `SDB/DBS_RECV_PARCEL_EX` fixed header (payload offsets; frame = payload + 6)
+
+| off | request | reply |
+| --- | --- | --- |
+| +0x00 | parcel-id chain **count** | ParcelData chain **count** (ours writes 35; the real writer leaves **0** when empty) |
+| +0x04 | chain head, frame-relative | chain head |
+| +0x08 | ParcelTransList ref offset | same |
+| +0x0C | ParcelTransList ref byteLen | same |
+| +0x10 | DlmId | DlmId |
+| +0x14 | **Step** (1 or 2) | Step |
+| +0x18 | OwnerDbId | **ParcelCount** |
+| +0x1C | u8 IsAllParcel | u8 Success |
+
++0x00/+0x04 is an offset **chain** (`[count][head]`, nodes `[here][next][value]`), not a binary ref.
+`Handler_SDB_RECV_PARCEL_EX` (`Arb_part_071.c:15981`) dispatches on +0x14 exactly as `0x277B` does;
+step 1 is `FUN_14083f090` (`Arb_part_072.c:5890`), step 2 `FUN_14083fcd0` (`:6461`).
+
+### The id rule, pinned across every real collect
+
+op **7 / 8 / 15** arriving with `ItemDbId 0` get a freshly allocated id in the reply (4-byte LE in
+the i64 at atom +0x10); op **2, 9, 36, 37** are echoed byte-identically. One global counter, shared
+with `DBS_ITEM_SINGLE`. `WarehouseHandlers.CloneAtomsWithIds` already does this.
+
+| capture | step 2 req -> rsp | frame lens | atoms | fresh ids |
+| --- | --- | --- | --- | --- |
+| `cap_final2b` | 10032 -> 10033 | 2594 -> 6143 | op7 tpl 202090, op7 tpl 202243, op37 | 10078, 10079 |
+| `cap_social2` | 2374 -> 2375 | 2594 -> 6143 | op7 tpl 202089, op7 tpl 202238, op37 | 10022, 10023 |
+| `cap_final2b` | 28088 -> 28089 | 1738 -> 5287 | op7 tpl 90089, op37 | 10104 |
+| `cap_final2b` | 52758 -> 52759 | 1738 -> 5287 | op7 tpl 7214 x3, op37 | 10133 |
+| `cap_final2b` | 28069 -> 28070 | 1738 -> 5287 | op2 merge, op37 | none |
+| `cap_social`  | 1555 -> 1556 | 1738 -> 5287 | op2 merge, op37 | none |
+| `cap_social2` | 2508 -> 2509 | 2594 -> 6143 | op9 +1230000, op2, op37 | none |
+
+Step 1 always returns the **full 3544-byte** record (frame 3575) and zero atoms
+(`cap_final2b` 10030 -> 10031, `cap_social` 1553 -> 1554). **World** picks the destination pocket
+and slot, not us. The op-37 atom carries its **ParcelId at atom +0x278**.
+
+### Why the single-parcel path would have failed too
+
+The attachment slots live at ParcelData **+0xD8 + i*0x1B0**, five of them,
+`[i64 ItemDbId = 0][u32 TemplateId][u32 Amount]` — and the real **list** rows (0x9e8) carry them as
+well (`cap_final2b` 9987: parcel 12 -> `(0, 202090, 1)`, `(0, 202243, 1)`). Ours are all zero
+(`cap_mail1` 21474, everything past 0xD8 except the title at 0x960), because `CharacterStore` fills
+`parcel_items` but has **no reader**, and `ServedParcelRecord(full: true)` falls back to the
+2536-byte form for a system parcel. With no attachment in the record World has nothing to build
+step-2 atoms from.
+
+### System sender / type 102: T151 is confirmed and the brief's second half is stale
+
+| field | off | system mail | player mail |
+| --- | --- | --- | --- |
+| SenderDbId | +0x00 | **0** | 1003 |
+| SenderName | +0x04 | `@Achievement:6913` | `New` |
+| ParcelType | +0xA4 | **102** | 1 |
+
+`cap_mail1` 21474 rows 2-6 already store `senderDbId 0`, `@Achievement:…`, type 102 — rows 0-1 are
+pre-T151 leftovers. What IS wrong is the **Sent box**: `FUN_140965bc0` (`Arb_part_082.c:5336`)
+selects `ParcelOwner::GetRecvList` when `ViewType == 0` and `GetSentList` for **any** non-zero value
+(1 and 0xFFFFFFFF alike). `cap_final2b` 52741 (view 0, 3 system mails) versus 52834 (view
+0xFFFFFFFF, **0 rows**) is the direct pin. `BuildParcelList` only ever queries
+`GetParcelsFor(receiver)` and `OnListParcel` echoes `ViewType` without reading it, so
+`arbiter-mail1.log` `user 13 view 4294967295 -> 6 parcel(s)` serves the inbox as Sent.
+`ViewType != 0` must filter on `sender_db_id`; a system mail has sender 0 and drops out by itself.
+
+### What T202 implements
+
+1. **`SDB_RECV_PARCEL_EX` is two-step.** `OnRecvParcelEx` dispatches on Step, and step 1 is the new
+   `RecvParcelExRead`: it **enumerates only** - one chain node per collectable parcel,
+   `[here][next][dataOffset][0xdd8]`, each followed by that parcel's full record, the count at
+   +0x00, the head at +0x04, the total at `ParcelCount` (+0x18) - and touches nothing. Step 2
+   allocates ids, applies the atoms, and per parcel marks it collected and credits `row.Money` when
+   no op-9 atom carried it. Parcel ids come from the op-37 markers, falling back to the request's
+   own chain.
+2. **`BuildDbsRecvParcelEx`** got a chain-aware overload; the old signature now writes **0** into
+   +0x00 for an empty list instead of the frame length.
+3. **`SDB_LIST_PARCEL` honours `ViewType`.** New `CharacterStore.GetParcelsSentBy` and a
+   `BuildParcelList(store, user, viewType, ...)` overload: 0 is the inbox, any non-zero value is the
+   Sent box. A system reward has sender 0 and leaves the Sent box by itself.
+
+The attachment slots needed no work: **T196 already stores the full 0xdd8 record** for a system
+parcel (`SystemParcelAttachments.BuildRecord`, slots at +0xd8 + i*0x1b0), and a player parcel
+replays World's own MAKE record, which carries them. `ParcelDbHandlers.FullParcelRecord` only pads
+the older 0x9e8 rows up to 0xdd8.
+
+Tests (`T202.cs`, fixture `data/cap_t202.bin`): step 1 enumerates two parcels and claims nothing;
+step 2 lands both attachments in the slots the atoms named, pays the gold once and survives a relog;
+the id rule is byte-exact against `cap_final2b` 10032 -> 10033 and `cap_social2` 2508 -> 2509; and a
+system reward is in the inbox and never in the Sent box, pinned to `cap_final2b` 9986/9987 and
+52833/52834 and `cap_social2` 2419/2420.
+
+### Two deliberate deviations, and what is still not verified
+
+* **Step 1 sends one page, not many.** The real writer pages at ten records per frame and sends the
+  pages back to back, but no capture holds the real Arbiter answering `0x277D` at all - and repeating
+  a DlmId on a second frame is the one mistake that head-blocks a user for the life of the World
+  process (HANDOFF.md section 1). So we serve ten and log the rest; the player presses the button
+  again. `RecvExRecordsPerFrame` is the one constant to change when a capture settles it.
+* **Step 2 does not delete the row**, only marks it collected. T196 pinned status 2 = attachments
+  claimed (`cap_final2b` 28054 -> 28068 -> 28113), so the row demonstrably outlives the claim on the
+  real server, and `cap_mail1` 21518 shows World issuing its own `SDB_DELETE_PARCEL` afterwards.
+* The +0x0C backpatch in step 2 and the multi-page framing are decompile-only. `+0xA8` has a third
+  state (2) that the Receive-all enumerator skips (`Arb_part_072.c:6028`); T79 calls that field
+  IsRead. `cap_social2` 2442 returns one row with `ParcelCount 0` for a Sent view and that is
+  unexplained.

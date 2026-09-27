@@ -2,7 +2,7 @@
 
 Sources: `Executable/ServerConfig.xml`, `Executable/DeploymentConfig.xml`, the `.bat` launchers,
 `ArbiterServer.exe.c` (Arb_part_*), `world_decompiled/WorldServer.exe.c`, and the current
-`World/WorldBridge.cs`. Opcodes are from `<captures>\world_opcodes.txt`, layouts from the PDL
+`World/WorldBridge.cs`. Opcodes are from `D:\packetlogs\world_opcodes.txt`, layouts from the PDL
 dumpers (offsets below are FRAME-relative: payload index = offset - 6).
 
 ## 0. There is only one WorldServer.exe
@@ -370,7 +370,7 @@ the way the file actually lands on disk.
 
 ## T134 - matchmaking and the battleground lifecycle (classic_live2)
 
-Source: `<captures>\classic_live2.log` - a LIVE Classic+ reference, 364273 records, carrying a
+Source: `D:\packetlogs\classic_live2.log` - a LIVE Classic+ reference, 364273 records, carrying a
 Corsairs battleground queue -> enter -> play -> leave and a Kelsaik dungeon queue. Its opcode map is
 the same 376012 map our 100.02 captures use (spot-checked on nine known opcodes), so the frames
 below are directly comparable to ours.
@@ -491,7 +491,7 @@ The cool-time half was applied by hand at :285 and needs nothing further.
 
 ## T136 - the leader side, from classic_live3
 
-The leader-side capture T134b said was needed now exists: `<captures>\classic_live3.log`, the
+The leader-side capture T134b said was needed now exists: `D:\packetlogs\classic_live3.log`, the
 human queueing Kelsaik (instance **9739**) as party leader, matching, and cancelling once. 56085
 records. It pins the REQUEST half, which classic_live2 could not.
 
@@ -597,7 +597,7 @@ one that should wait; `C_MATCH_PROGRESS` and `C_MATCH_ROOM_LIST` are read-only a
 
 ## T137 - the hand-off capture does NOT contain a cross-server hand-off
 
-`<captures>\cap_multiworld.log` (tap, 1207 reframed frames) plus `cap_multiworld_client.log`
+`D:\packetlogs\cap_multiworld.log` (tap, 1207 reframed frames) plus `cap_multiworld_client.log`
 (14349 client records). The brief's premise was that a player entered a dungeon instance on a
 SECOND linked World and was handed over. **The capture does not show that.** Everything below is
 measured, and it changes what parts 2 and 3 of T137 can honestly be.
@@ -694,7 +694,7 @@ MULTIWORLD-PATCH.diff is solving a problem this deployment does not have.
 
 ## T137b - a real cross-World hand-off exists. Half of it was captured.
 
-`<captures>\cap_multiworld2_ctl.txt` (216 frames) + `cap_multiworld2_client.log` (1389
+`D:\packetlogs\cap_multiworld2_ctl.txt` (216 frames) + `cap_multiworld2_client.log` (1389
 records). The player entered **Velik's Sanctuary, dungeon `35 26 00 00` = 9781**, hosted on the
 DungeonServer. This **supersedes T137's conclusion**: T137 saw dungeon 9827 served by the main
 World and concluded no cross-server hand-off happens on this box. It does - for the dungeons the
@@ -774,7 +774,7 @@ is missing.
 
 ## T137c - THE HAND-OFF, both links, complete
 
-`<captures>\cap_multiworld3.log` (47436 raw chunks -> **19046 frames** after splitting the
+`D:\packetlogs\cap_multiworld3.log` (47436 raw chunks -> **19046 frames** after splitting the
 coalesced `[u32 len][u16 op]` stream) + `cap_multiworld3_client.log` (7928 records). The player
 entered **Velik's Sanctuary (9781)** three times and came back each time.
 
@@ -982,7 +982,7 @@ job.
 
 **Naming note.** 0x13BE/0x13BF/0x13C0/0x13C1 are `SA_REQUEST_ENTER_DUNGEON` /
 `AS_REQUEST_ENTER_DUNGEON` / `SA_RESPONSE_ENTER_DUNGEON` / `AS_RESPONSE_ENTER_DUNGEON`
-(`<captures>\world_opcodes.txt` lines 54-57). T138b's `ContinentHandoff` calls them
+(`D:\packetlogs\world_opcodes.txt` lines 54-57). T138b's `ContinentHandoff` calls them
 `SA_REQUEST_ENTER_CONTINENT` / `AS_ENTER_CONTINENT` / `SA_CONTINENT_READY` / `AS_CONTINENT_READY`.
 The bytes are pinned and unchanged; only the names are ours, and the real ones are recorded here.
 
@@ -1217,3 +1217,87 @@ Elementalist, which have no second position to choose.
 The third row is the visible consequence: with a choice stated the Warrior holds the slot a
 Lancer would otherwise take, and the Lancer waits for the next group. The fourth is the one the
 capture itself shows - it is why that player had to queue again.
+
+## T192 — live hand-off identity and World-restart cleanup
+
+The raw tap corrects the reported stopping point: cap_handoff1 contains both13C0 and13C1. The first attempt is24732 (13BE, World0/link51) →24733 (13BF, World13/link76) →24734 (13C5) →24735 (13C0) →24736 (13C1, back to link51). Two further attempts repeat the same fault. The recorded client's Enter button is client2799 → tap25380 →25381/25382/25383/25385; no S_LOAD_TOPO follows through clientEOF2966. The first attempt follows conditional teleport rather than that button.
+
+| Finding | Evidence / fix |
+|---|---|
+| Wrong character in13BF | The live character is10, but full10–13 contains `01000000` (player1); it must be `0A000000`. `ContinentHandoff.EnterReply` copied retail character1 as a constant. Arb062:12947 writes the resolved user's PDId. Resolve the13BE handle through the registered session and stamp its actual planet/player pair. |
+| Wrong13C1 destination assumption | Native Arb062:13719 resolves the returned PDId to the user and sends to that user's current World. Replace the fixedWorld0 destination with that lookup. Unknown users receive no fabricated reply. |
+| Cross-World entry state skipped | The early cross-World interception bypassed `DbProxyHandlers.RecordDungeonEntry`, including the returned instance PDId and pending-match claim. Reuse that existing path for both request and response; native Arb062:13738 stores the admitted instance context. |
+| Missing continuation after ready | Retail source1445:7882 →1392:7884 (leave type2) →1393:7906 →1433:7907 precedes owner138E:7908. The old code had no1445 transfer handler and treated1393 as normal logout. The transfer needs a destination ticket/current-World switch and AS_ENTER_WORLD type2, preserving the client session instead of sending it to the lobby. |
+| No missing acknowledgement before ready | cap_multiworld3:7827–7831 is the complete retail13BE/13BF/13C5/13C0/13C1 sequence. No A→owner frame occurs between13BF and13C0. The owner asks for user data at7910, after ready. Its13C2/13C3 pairs8164/8165 and8320/8321 concern later departure. |
+| Restart retains session caches | The last-link callback marked World down but never reset character transient state. Reset the failed World's tunnel state and call the existing `CharacterTransientState.Reset` repair for its characters, including clients that disconnected first; preserve characters owned by other Worlds. |
+
+Full frames, byte comparisons and capture limitations are in [data/t192/README.md](../data/t192/README.md). The human-owned WorldBridge changes are delivered in `status/T192-PATCH.diff`; its production source remains unchanged until that patch is applied.
+
+The continuation is SA_TELEPORT (`1445`, not SA_CHAR_LOC). Native references: Arb066:5447–5467 → Arb062:15151–15183; Arb030:6937–6986; Arb029:3639–3719; Arb028:15702–15755. Type2 retains the GameId and session fields, allocates a destination ticket, sets the destination continent/channel/position and signed direction, and copies EtcData. `CrossWorldHandoff` uses the last live AS_ENTER_WORLD as the source of those retained fields; it does not replay retail identities or run the character-selection acknowledgement again.
+
+After the source's final save, the destination must also reach the character blob: cap_multiworld3:7903 →7911 proves position220/224/228, continent236, channel240, World244 and direction304. Other opaque blob differences are retained in the evidence report and are not copied into our character. The destination's SA_ENTER_WORLD must complete before a pending client leave is released, even though this type2 transition keeps its GameId.
+
+Matching can form a party after the initial login. Destination entry therefore refreshes PartyId at payload94 and IsSysParty at102 from the current party, as the existing login builder does (Arb028:15773–15781/15847–15850). The transfer regression creates that party after caching the login packet.
+
+### Changed files
+
+| Path | Change |
+|---|---|
+| `src/TeraSharp.Arbiter/World/WorldInstances.cs` | Replace the captured player1 constant with the resolved PDId. |
+| `src/TeraSharp.Arbiter/World/CrossWorldHandoff.cs` | New captured1445 parser, type2 leave/entry builders, pending transfer and location stamping. |
+| `src/TeraSharp.Arbiter/World/DbProxyHandlers.cs` | Reuse entry-state updates with the resolved entrant; commit the destination after source saves. |
+| `src/TeraSharp.Arbiter/World/CharacterTransientState.cs` | Reset characters belonging to the failed World, including clients that disconnected first. |
+| `src/TeraSharp.Arbiter/World/TunnelRouting.cs` | Clear only the failed World's departed tickets; restart the loading gate for type2 entry. |
+| `status/T192-PATCH.diff` | All human-owned WorldBridge integration: identity/routing, complete transfer and disconnect cleanup. Apply this single patch. |
+| `src/TeraSharp.Arbiter.Tests/T192Handoff.cs` | Three capture and routing regressions, including the complete transfer and newly formed party. |
+| `src/TeraSharp.Arbiter.Tests/T192Reset.cs` | Last-link cleanup, client-first disconnect, other-World isolation and repeated restart. |
+| `src/TeraSharp.Arbiter.Tests/Program.cs` | Two existing builder calls now supply their captured planet/player IDs. |
+| `tools/t192-evidence.py`, `data/t192/` | Reproducible complete-frame evidence, hashes, byte comparisons and source/destination blobs. |
+| `status/MULTIWORLD-DESIGN.md` | This diagnosis, change list and validation record. |
+
+Validation: the final isolated copy with the exact combined patch builds successfully and runs **1024 passed / 0 failed / 26 skipped** (four existing nullable warnings). All edited C# files match the tested copy by SHA-256. Production WorldBridge remains unchanged, and the final patch applies cleanly.
+
+New tests: `T192_handoff_layouts_match_all_three_multiworld3_pairs`; `T192_handoff_routes_resolved_user_and_records_owner_instance`; `T192_teleport_type2_continues_to_owner_without_lobby_and_loads_destination_blob`; `T192_last_world_link_resets_registered_and_departed_characters_only`. Pure builders match complete retail frames without normalization. The socket integration adapts the native opaque User pointer, allocated ticket and live party identity explicitly; destination blob assertions change only the capture-proven location fields.
+
+Live verification remains: enter9781 from the popup and capture source1445/1392/1393/1433 followed by destination138E/2711/S_LOAD_TOPO/138F; then restart a World with a character in-world and confirm the next login can use items and skills without `/api/reset-character`. No live success is claimed from the harness.
+
+### T192b — optional capture blobs
+
+The complete-transfer regression now reports `SKIP` with each missing path when `data/t192/source-world-blob.bin` or `data/t192/destination-world-blob.bin` is absent. It checks and loads both optional fixtures before creating sockets, stores, temporary files or changing shared state. With both files present, the existing capture assertions run unchanged; the retail blobs remain ignored and are not required in a clean checkout.
+
+Verified against an isolated copy of master `c41b839`: missing fixtures → **0 failed / 1 skipped**; both fixtures present → **1 passed / 0 failed**. The copy is nested beyond the fixture resolver's ancestor limit, so it cannot accidentally borrow the ignored files from the worktree.
+
+## T195 remainder — instance chat, party UI and return transfer
+
+| Path/action | Captured or native proof | Change / verdict |
+|---|---|---|
+| Say/team chat | cap_instance1 client2:12289 → tap152756 sends1449 to main link81 although user10 is on World13/link106. Arb047:7966–8058 resolves the user's World; team types5/22 use144A. | `ChatHandlers` sends these per-character requests to `CurrentWorldId`; an unavailable owner gets no main-link fallback. |
+| Party chat | client1:5035 / tap152568 sends channel1 as1449. Native Arb047:7997–8003 → Arb079:3639–3732 → Arb067:12789–12946 fans S_CHAT to the party directly. | Arbiter fan-out to members including sender; raid channel1 stays within its five-member group; block list and raid-only32 guard retained. No successful retail party-chat frame occurs in the supplied2man taps: this path is decompile-marked. |
+| Party recipient identity | main138E136991/137332 assign users10/9 tickets5/6; owner138E146976/147327 assign users9/10 tickets5/6. Tickets also overlap while members occupy different Worlds. | Live `PartyWiring` uses stable character IDs as its internal recipient tokens and resolves clients by character. Wire bypass tickets and every packet layout stay unchanged. |
+| Disband / loot / kick votes | cap_instance1:153239 (13BA),153535/153619 (13BB) only reach main81. Native Arb041:1489–1535,5113–5137; Arb039:1996–2070 broadcasts13BC. | Broadcast requests to every registered World, as retail does; extend the same rule to party mirrors139E–13A7. Loot mirror proof: Arb067:5364–5389. |
+| Reset vote | client2:12649 → tap153291/153292 (13B9 on both Worlds) → client2:12650 (E24C); client1:5382 → tap153306 (F783 on106) → client1:5383 (@1193). | Vote routing already works. @1193 is the successful reset branch (World954674–954735,954812–954844). The ensuing return transfer was discarded. No synthetic vote or port is added. |
+| Leave/dropout | cap_instance1:153942 already sends13F5 on106, matching retail2man_b:19061 on54. Both live users subsequently send13C2/13C3 and1445. | Preserve current-World13F5 and native main-only15CD. Leave's absent port shares the return resolver defect. |
+| Unstuck / nearest town | client2:13333/13338/13344 and client1:5636/5638/5642 send944C `[1][0]`, contract type16, then944C `[1][2]`. Menu packets reach106 at154334/154353 and154412/154426; World sends1445 at154360/154433. Native World582147–582178, ContractNearTown constructor1211152, DBMainMenu1131359–1131392 identify this escape path. | Input routing already works; both returns target7005 with no explicit World and channel0AF00001. Channel lookup is keyed by destination continent too, so9781's same channel does not resolve7005. The catch-all fix permits these returns; preserve World's XYZ and channel. |
+| Return to World0 | live153328 and153336+150 request targetWorld=-1, continent7005, channelFFFFFFFF, savedXYZ(-1271,7490,2173). Main164D136913 omits7005/7021 while its config is loadAllContinents. | `CrossWorldHandoff.ResolveDestination`: explicit World → channel owner → continent owner → configured catch-all. Existing online-link guard remains; known offline owners are never redirected. |
+| Existing departure and continuation | live153313/153314 →153315/153329 already completes13C2/13C3 on13. Retail multiworld3:8164→8165,8168→8169→8191→8192/8193,8279+702S_LOAD_TOPO. | Keep departure/type2 continuation. Preserve the complete World-supplied return point, channel, direction and EtcData; do not substitute default spawn. |
+
+Human-owned integration: apply `status/T195B-PATCH.diff` (WorldBridge SA_TELEPORT destination lookup, per-character14FF/1500 countdown routing and the incoming guild request's reply link). Captured frames are tracked in `data/t195/instance-frames.json`; no ignored binary is required. Synthetic308-byte blob in the return regression is explicitly synthetic. Full private reassembly remains in ignored `obj/t195-instance/`.
+
+Tests: `T195_instance_say_party_chat_and_party_menu_reach_their_native_destinations`; `T195_party_mirrors_broadcast_and_party_chat_excludes_outsiders`; `T195_return_from_instance_resolves_catchall_and_preserves_retail_destination`. They cover swapped/overlapping tickets, both vote destinations, existing per-character vote/leave tunnels, exact reverse layouts, departure, no lobby, restored location, World0 S_LOAD_TOPO, post-return routing and explicit offline-owner refusal. Build/test validation is recorded by the coordinating session; no live success is inferred from the harness.
+
+### T195 — remaining per-character send inventory
+
+| Frames | Destination and native evidence |
+|---|---|
+| 1637 trade bag | Sender's current World, Arb040:17165–17207. |
+| 1458 broker close | Existing payload now follows sender. Native close emission remains unverified: the client-close path traced through Arb041:12747 →056:19779 →054:4949 only clears cached broker data. No new payload/behavior is inferred. |
+| 2862 friend count | Resolve each side separately, Arb029:19831–19895; offline participants get no World push. |
+| 1475/1476 block/unblock | Blocker's current World, Arb030:7713–7769 /8649–8699. |
+| 280A/280B contracts | Initiator receives fetch verdict; each opponent receives its ask, Arb079:14270–14350. |
+| 280F/2810 contracts | Each ending/replying participant receives280F on their own World; requestor receives2810, Arb041:6385–6442. Native layouts remain the existing T64 cap_social650/652/653/655/744 goldens. |
+| 2866 guild joined /14AF war notification | Named member's current World, Arb069:4373–4380 →067:17036; Arb029:12285–12335. |
+| Guild mirrors | Broadcast to all Worlds: data144E (Arb045:4804–4867), logo/title/name (4885–5067), quest1453 (Arb027:1219–1265), membership/group changes (existing `GUILD-DESIGN.md` §12). Guild-war global operations retain their previous destination; their explicit World parameter is separate from per-character notification. |
+| SA_LOAD_GUILD13FB snapshot | Its144D/27D0/27D1/27D2 replies go only to the requesting link, not to the global mirror broadcast. Arb072:14163 stores input WorldServerSession param2;14244 gates it;14286–14300 and14490–14560 send each reply through that session. The WorldBridge patch passes `link.SendFrame`; a missing callback never guesses a destination. |
+| 14FF request exit /1500 cancel | Resolve player → current World, no default fallback. Arb029:13257–13278,13349–13374 and13131/13209; writers Arb027:2554/2512. cap_2man_b:12875 pins14FF's4-byte UserDbId;1500 remains native-marked in this capture set. |
+
+`ChatManager`/`PartyMatchManager`/`SocialHandlers.ChatDispatcher` World callbacks have no producing World actions; their dormant callbacks are unchanged. Request/reply DB frames continue back to the requesting link with the live DLM id. Tests `T195_contract_participants_follow_their_own_worlds_and_refuse_missing_owners` and `T195_social_trade_guild_and_exit_countdown_use_current_character_world` exercise the live handlers on separate World0/13 sockets, per-participant fan-out, guild broadcast exceptions, unsupported-contract refusal and unavailable-owner refusal.

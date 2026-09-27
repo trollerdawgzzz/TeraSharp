@@ -1,0 +1,60 @@
+diff --git a/src/TeraSharp.Arbiter/Handlers/LoginHandlers.cs b/src/TeraSharp.Arbiter/Handlers/LoginHandlers.cs
+--- a/src/TeraSharp.Arbiter/Handlers/LoginHandlers.cs
++++ b/src/TeraSharp.Arbiter/Handlers/LoginHandlers.cs
+@@ -154,6 +154,10 @@
+         var chr = s.Account.Characters.Find(c => c.Id == (uint)id) ?? s.Account.Characters.FirstOrDefault();
+         if (chr == null) { _log.LogWarning("C_SELECT_USER: no character {Id}", id); return true; }
+ 
++        // T185: reject before allocating an identity or sending any spawn/replay frames.
++        if (!WorldAvailability.Ready(Program.World) && !WorldAvailability.StandaloneEnabled)
++            return WorldAvailability.RefuseSelection(s, _log);
++
+         s.SelectedCharacter = chr;
+         // gameId from capture S_LOGIN/S_SPAWN_ME: 140737671856129 = 0x80000AF00001
+         // Per-login counter from the World bridge (restarts at 1 per World process), like the real Arbiter.
+@@ -163,17 +167,9 @@
+ 
+         _log.LogInformation("C_SELECT_USER: entering world as '{Name}' (gameId {GameId})", chr.Name, s.GameId);
+ 
+-        // If the real WorldServer is connected, hand the player to it and let it drive.
+-        var world = Program.World;
+-        if (world != null && world.IsConnected && !world.IsReady)
+-        {
+-            // World still loading: reject like the real Arbiter does (client shows "You can't enter right now").
+-            _log.LogWarning("C_SELECT_USER while World not ready - rejecting");
+-            s.SendByDef("S_SYSTEM_MESSAGE", new Dictionary<string, object> { ["message"] = "@769" });
+-            s.SendByDef("S_SELECT_USER", ArbiterClientHandlers.BuildSelectUserFields(accepted: false));   // T124
+-            return true;
+-        }
++        // The ready World owns entry. Only the explicit harness option permits fallback.
+         if (WorldEntry.EnterWorld(s, _log)) return true;
++        if (!WorldAvailability.StandaloneEnabled) return WorldAvailability.RefuseSelection(s, _log);
+ 
+         if (PureReplay) { SpawnReplay.ReplayPhase1(s, _log); return true; }
+ 
+@@ -246,6 +242,13 @@
+     /// </summary>
+     public bool OnLoadTopoFin(GameSession s, ReadOnlyMemory<byte> body)
+     {
++        // In-world C_LOAD_TOPO_FIN is routed by HandlerRegistry. This is standalone only.
++        if (!WorldAvailability.StandaloneEnabled)
++        {
++            _log.LogWarning("C_LOAD_TOPO_FIN ignored outside World: standalone spawn is disabled");
++            return true;
++        }
++
+         var chr = s.SelectedCharacter;
+         if (chr == null) { _log.LogWarning("C_LOAD_TOPO_FIN without a selected character"); return true; }
+ 
+diff --git a/src/TeraSharp.Arbiter/Handlers/WorldEntry.cs b/src/TeraSharp.Arbiter/Handlers/WorldEntry.cs
+--- a/src/TeraSharp.Arbiter/Handlers/WorldEntry.cs
++++ b/src/TeraSharp.Arbiter/Handlers/WorldEntry.cs
+@@ -18,7 +18,7 @@
+     public static bool EnterWorld(GameSession s, ILogger log)
+     {
+         var w = Program.World;
+-        if (w == null || !w.IsReady) { if (w != null && w.IsConnected) log.LogWarning("World connected but not ready - using standalone"); return false; }
++        if (!WorldAvailability.Ready(w)) return false;
+ 
+         var chr = s.SelectedCharacter;
+         if (chr == null) { log.LogWarning("EnterWorld: no selected character"); return false; }

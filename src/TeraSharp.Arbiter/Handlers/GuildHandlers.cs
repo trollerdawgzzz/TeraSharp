@@ -427,7 +427,7 @@ public sealed class GuildHandlers
     private GuildActions RequestRejoinCooltime(GuildActions a, int characterId)
     {
         long leftAt = _store.GetGuildLeaveTime(characterId);
-        long endsAt = leftAt == 0 ? 0 : leftAt + RejoinCooldownSeconds;
+        long endsAt = leftAt == 0 || !QaGuildCommands.CooldownEnabled ? 0 : leftAt + RejoinCooldownSeconds;
         bool onCooltime = endsAt > DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         a.Client(GuildClientAction.Def(characterId, "S_REQUEST_COOLTIME_TO_JOIN_GUILD",
             new Dictionary<string, object>
@@ -838,7 +838,7 @@ public sealed class GuildHandlers
     /// <paramref name="nowUnix"/> is a parameter: the number on the wire is <c>ends_at - now</c>,
     /// not a stored value.</para>
     /// </summary>
-    public byte[] BuildGuildQuestList(CharacterStore.GuildRow g, long nowUnix)
+    public byte[] BuildGuildQuestList(CharacterStore.GuildRow g, long nowUnix, int characterId = 0)
     {
         var running = _store.GetRunningGuildQuest(g.GuildId);
         string starterName = string.Empty;
@@ -869,7 +869,7 @@ public sealed class GuildHandlers
         return GuildPackets.BuildSGuildQuestListBody(
             g.GuildId, starterDbId, QuestUnk1, (int)g.Point, QuestUnk2, QuestUnk3, QuestUnk4,
             g.Money, QuestUnk5, QuestUnk6, QuestUnk7, nowUnix, QuestUnk8, QuestMaxPoint,
-            QuestFlag, g.Name, starterName,
+            QaFirstSeasonFlag(g.GuildId, characterId, nowUnix), g.Name, starterName,
             GuildPackets.GuildQuestTiers, rows);
     }
 
@@ -881,7 +881,7 @@ public sealed class GuildHandlers
     private void SendGuildQuestList(GuildActions a, int characterId, CharacterStore.GuildRow g)
     {
         a.Client(GuildClientAction.Raw(characterId, "S_GUILD_QUEST_LIST",
-            BuildGuildQuestList(g, DateTimeOffset.UtcNow.ToUnixTimeSeconds())));
+            BuildGuildQuestList(g, DateTimeOffset.UtcNow.ToUnixTimeSeconds(), characterId)));
     }
 
     /// <summary>
@@ -913,9 +913,51 @@ public sealed class GuildHandlers
     /// </summary>
     private void BroadcastGuildQuestList(GuildActions a, CharacterStore.GuildRow g)
     {
-        var frame = BuildGuildQuestList(g, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         foreach (var m in _store.GetGuildMembers(g.GuildId))
-            a.Client(GuildClientAction.Raw(m.UserDbId, "S_GUILD_QUEST_LIST", frame));
+            a.Client(GuildClientAction.Raw(m.UserDbId, "S_GUILD_QUEST_LIST", BuildGuildQuestList(g, now, m.UserDbId)));
+    }
+
+    // Native MakeUsableSeasonUser changes only the in-memory member join date, not its DB row
+    // (Arb029:10283-10333). The preexisting board remains unchanged until this QA override is used.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<int, (int GuildId, long StoredJoinDate, long Joined)>
+        _qaQuestJoinDates = new();
+
+    private byte QaFirstSeasonFlag(int guildId, int characterId, long nowUnix)
+    {
+        if (!_qaQuestJoinDates.TryGetValue(characterId, out var member) || member.GuildId != guildId
+            || _store.GetGuildMember(characterId)?.GuildJoinDate != member.StoredJoinDate)
+            return QuestFlag;
+        var reset = GuildLevelSheet.QuestEntry.Value;
+        return reset.Available && member.Joined <= reset.LastReset(nowUnix) ? (byte)0 : (byte)1;
+    }
+
+    public GuildActions SetQaGuildQuestUsable(int characterId, bool usable, long? nowUnix = null)
+    {
+        var actions = new GuildActions();
+        var guild = MyGuild(characterId);
+        if (guild == null) return actions;
+        if (!GuildLevelSheet.QuestEntry.Value.Available)
+            return actions.Reject("GuildQuestConfig weekly reset is unavailable");
+        long now = nowUnix ?? DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        if (!usable || QaFirstSeasonFlag(guild.GuildId, characterId, now) != 0)
+            _qaQuestJoinDates[characterId] = (guild.GuildId, _store.GetGuildMember(characterId)!.GuildJoinDate,
+                usable ? now - 7 * 86400L : now);
+        // The flag is per member, so a guild-wide refresh must build a separate header for each.
+        foreach (var member in _store.GetGuildMembers(guild.GuildId))
+            actions.Client(GuildClientAction.Raw(member.UserDbId, "S_GUILD_QUEST_LIST",
+                BuildGuildQuestList(guild, now, member.UserDbId)));
+        return actions;
+    }
+
+    public GuildActions ResetQaGuildQuest(int characterId)
+    {
+        var actions = new GuildActions();
+        var guild = MyGuild(characterId);
+        if (guild == null) return actions;
+        _store.ResetGuildQuestStatus(guild.GuildId);
+        SendGuildQuestList(actions, characterId, guild);
+        return actions;
     }
 
     // =======================================================================================

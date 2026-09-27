@@ -10,7 +10,7 @@ Sources, in the order they win when they disagree:
   writer (`FUN_1406f6f40`, 1213482).
 - `D:\v100\TERA_SERVER.100\world_decompiled\WorldServer.exe.c` — the `Inventory::Prepare*`
   functions that build the transaction atoms, which is where the operation enum comes from.
-- `<captures>\cap_newchar.log` — real ArbiterServer, new character "Test" playerId 2, Island of
+- `D:\packetlogs\cap_newchar.log` — real ArbiterServer, new character "Test" playerId 2, Island of
   Dawn: create, enter, gather, combine, drink two potions, kill, zone change, logout. Reframed by
   u32 length. Every byte quoted below was checked against it with Python (no build here).
 
@@ -166,8 +166,9 @@ Atom-relative offsets, from the nine atoms in the capture plus the World-side bu
 `TransSQLExec::OnTransError` logs the atom's `+0x20` and `+0x38`, which are the two playerId slots —
 source owner and destination owner. A cross-character move is presumably where they differ.
 
-The i64 at +0x50 is unambiguous: `PrepareChangeInvenPos` writes the moved amount into `atom+0x50`
-for one half of a stack merge and its negation for the other.
+The i64 at +0x50 is unambiguous: `PrepareChangeInvenPos` writes the moved amount straight into
+`atom + 0x50` as a signed 64-bit value, once as `+amount` and once negated as `-amount`, for the
+two halves of a stack merge.
 
 Everything past ~offset 100 in the atom is the same kind of mostly-zero-plus-garbage as the item
 record, including three of the same `{1970-01-01}` DateTime blocks and the same 1.0f.
@@ -176,12 +177,10 @@ record, including three of the same `{1970-01-01}` DateTime blocks and the same 
 
 ## 4. Sub-operations
 
-The operation is a plain **enum index at atom+4**, dispatched through four function-pointer
-tables in the Arbiter — two for `TransSQLExec::CanExecTrans`, at data symbols
-`DAT_140f02f30`
-and `DAT_140f03260`, and two for `TransSQLExec::ExecuteTrans`, at
-`DAT_140f03590`
-and `DAT_140f038c0`. Index < 100. Each entry is a
+The operation is a plain **enum index at atom+4**, dispatched through four function-pointer tables
+in the Arbiter: the pair of tables at `0x140f02f30` and `0x140f03260` serves
+`TransSQLExec::CanExecTrans`, the pair at `0x140f03590` and `0x140f038c0` serves
+`TransSQLExec::ExecuteTrans`. Index < 100. Each entry is a
 `DO_TS_*` function; the Arbiter contains 82 of them (`DO_TS_CHANGE_ITEM_AMOUNT`,
 `DO_TS_CHANGE_ITEM_POS`, `DO_TS_DELETE_ITEM`, `DO_TS_INSERT_STACKABLE_ITEM`, … the full list is in
 the decompile, `grep -o 'DO_TS_[A-Z_0-9]*'`).
@@ -488,18 +487,18 @@ items: character money 10000000000 for owner 4 - not stored
 three ways over:
 
 ```c
-if (param_2 != 0) {                                    // amount 0 -> NO atom at all
-    // a negative amount is refused when it would take Inventory+0x78 (the money already
-    // held) below zero -> error 0x18/0x1a; a positive one is refused when GetAddableMoney
-    // reports less room than the amount -> error 0x19
+if (amount != 0) {                                     // amount 0 -> NO atom at all
+    if ((amount < 0) && (*(i64 *)(inventory + 0x78) + amount < 0)) { error 0x18/0x1a; }
+    //                   ^ Inventory+0x78 is the money it already holds
+    if (0 < amount) { ... GetAddableMoney ... if (addable < amount) error 0x19; }
     atom = new;
-    *(u32     *)(atom + 4)     = 9;                    // op
-    *(longlong*)(atom + 0x20)  = playerId;             // srcOwner
-    *(longlong*)(atom + 0x38)  = playerId;             // dstOwner
-    *(u32     *)(atom + 0x28)  = 0;                    // srcInven
-    *(u32     *)(atom + 0x40)  = 0;                    // dstInven
-    *(longlong*)(atom + 0x50)  = param_2;              // <- the delta, verbatim
-    *(u32     *)(atom + 0x204) = reason;               // ChangeMoneyReason
+    *(u32 *)(atom + 4)     = 9;                        // op
+    *(i64 *)(atom + 0x20)  = playerId;                 // srcOwner
+    *(i64 *)(atom + 0x38)  = playerId;                 // dstOwner
+    *(u32 *)(atom + 0x28)  = 0;                        // srcInven
+    *(u32 *)(atom + 0x40)  = 0;                        // dstInven
+    *(i64 *)(atom + 0x50)  = amount;                   // <- the delta, verbatim
+    *(u32 *)(atom + 0x204) = reason;                   // ChangeMoneyReason
 }
 ```
 
@@ -616,7 +615,7 @@ it. Recorded so the next session does not re-derive it.
 
 ### What the log does and does not contain
 
-`<captures>\arbiter-2026-09-20.log` (183 KB, UTF-16LE, 974 lines, 14:27:42 - 14:32:40):
+`D:\packetlogs\arbiter-2026-09-20.log` (183 KB, UTF-16LE, 974 lines, 14:27:42 - 14:32:40):
 
 | the brief says | the log says |
 |---|---|
@@ -728,3 +727,32 @@ Every op below is the same handler on the real Arbiter: request `[ref @6 -> 856-
 Record edits (`World/ItemEdits.cs`, DO_TS pairing inferred from the fields each side touches): 4 +0x28 <- +0x5C; 86 the same plus masterwork/grade/passive (+0x138/+0x134/+0x13C) and awaken +0x139; 73 +0x160 <- +0x16C; 75 +0x16C/+0x168 <- +0x174/+0x178; 80 +0x1C0; 81 +0x139 = 1; 92 +0x54..0xCB / +0xD0..0xE7 / +0x134 <- +0x60..0xD7 / +0xEC..0x103 / +0x104; 93 +0x170 <- +0x1D0. Op 6 reads as DO_TS_POP_ITEM (medium).
 
 **Pinned:** 0x28A1 against cap_multiworld 10859/10860 and 11043/11044 - our reply equals the real one except atom +0x74..0xC6, the empty passive slots the real Arbiter fills from template/EnchantData (not loaded). Everything else is decompile-derived; no capture holds another of these ops. **Not modelled:** that fill, op 86's rolled passive, op 67's time transfer, and the Arbiter's owner/old-level checks (logged, not enforced - our record can lag World's item).
+
+---
+
+## T187 - an equip is a PAIR of op-36 atoms, and op 36 is anchored on the item it names
+
+`SDB_EQUIP_ITEM` (0x2813) carries its atoms in **list B** (the ref pair at payload offset 8);
+list A is empty. Every equip in every capture is the same shape:
+
+| capture | seq | atoms |
+|---|---|---|
+| cap_final2b (real Arbiter, GM) | 4162 -> 4163 | op 36 item 10011 (14:1 -> 0:9), op 36 item 10073 (0:9 -> 14:1), op 51 bind 10073 |
+| cap_final2b | 53820 -> 53821 | op 36 item 10069 (14:1 -> 0:26), op 36 item 1 (0:26 -> 14:1) |
+| cap_queue4 (ours, non-GM) | 5034 | op 36 item 1058 (14:1 -> 0:2), op 36 item 1070 (0:2 -> 14:1) |
+
+Worn is pocket 14 and the slot is the equip slot (1 weapon, 3 body, 4 gloves, 5 boots), which is
+the same numbering the starter kit uses. The bind (op 51, T151) names the item being put on and
+carries its position in both triples, so it moves nothing.
+
+**The bug T187 fixed.** `WarehouseHandlers.Apply` read op 36 as "swap whatever is at src with
+whatever is at dst". The pair then applied the same swap twice and the rows ended up exactly where
+they started, so `DBS_USER_LOAD_INVENTORY` served the pre-equip set on the next login - the
+"equipped items revert to the starter set on relog" report. Op 36 is now anchored on the item the
+atom NAMES: that row ends up at the destination and whatever sits there takes its place. One atom
+(a client drag onto an occupied slot, T44) and two atoms (an equip) reach the same end state, and
+a repeated frame is a no-op rather than an undo.
+
+No capture holds an unequip into an EMPTY slot - every equip swapped with the worn item - so that
+case is covered by construction (the destination is empty, the row simply moves) and by a
+synthetic test, not by a pin.

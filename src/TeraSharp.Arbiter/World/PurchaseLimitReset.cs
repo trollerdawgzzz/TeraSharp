@@ -53,6 +53,7 @@ public static class PurchaseLimitReset
         List<int> due;
         lock (Gate) { due = Due(DatasheetLoader.DailyBuyMenus.Value, _lastCheck, now); _lastCheck = now; }
         if (due.Count == 0 || bridge == null || !bridge.IsConnected) return 0;
+        foreach (int id in due) Program.Store?.ResetPurchaseLimits(id); // T201: the normal reset and QA reset share the real persisted counters.
         var worlds = bridge.InWorldSessions().Select(s => s.CurrentWorldId).Append(WorldRegistration.DefaultWorldId)
                            .Distinct().Where(bridge.HasLinks).ToList();
         foreach (int w in worlds)

@@ -214,7 +214,7 @@ public sealed partial class DbProxyHandlers
     //   [42] i32  > 0 -> FUN_140572d20(user, pid) (unused by us; 0 in every captured frame)
     // Reply writer: FUN_140350eb0(pkt, 0x273c), FUN_14013d0b0 = u32 reqId, FUN_1403513d0 = u8 ok.
     //
-    // Ground truth (<captures>\cap_newchar.log, real ArbiterServer, playerId 2, reframed):
+    // Ground truth (D:\packetlogs\cap_newchar.log, real ArbiterServer, playerId 2, reframed):
     //   1351 W->A 0x273B 46 B  5D 00 00 00 | 02 00 00 00 | 00 00 00 00 | C7 00 .. (exp 199)
     //   1352 A->W 0x273C 11 B  5D 00 00 00 01
     //   2687 W->A 0x273B        8A 00 00 00 | 02 00 00 00 | 02 00 00 00 | 6B 03 .. (level 2, exp 875)
@@ -304,7 +304,7 @@ public sealed partial class DbProxyHandlers
     // Handler_SA_RESPONSE_ENTER_DUNGEON in ArbiterServer.exe.c, cross-checked against the
     // padding gaps already documented for DungeonReplyPaddingBytes below (payload 51 is the
     // pad after the u8 at 50; payload 153..155 the pad after the u8 at 152), and against
-    // <captures>\arb_world_2026-09-13T11-33-30-680Z.log seq 1137 (0x13BE) / 1159 (0x13C0).
+    // D:\packetlogs\arb_world_2026-09-13T11-33-30-680Z.log seq 1137 (0x13BE) / 1159 (0x13C0).
     public const int DungeonCtxOffset = 8;                 // ctx+0
     public const int DungeonCtxDungeonId = 8;              // ctx+0    9827 in the capture
     public const int DungeonCtxWorldId = 28;               // ctx+20   0x0AF0
@@ -463,7 +463,7 @@ public sealed partial class DbProxyHandlers
     // --- Other login-time handlers with simple ack patterns ---
     public const ushort SDB_LOAD_QUEST_PROGRESS = 0x2902;       // -> 0x2903: [u32 reqId][u32 pid][u32 0][u32 0][u8 0]
     public const ushort SDB_LOAD_ACHIEVE_LIST = 0x2981;          // -> 0x2982: [u64 0][u32 reqId][u8 ok]
-    public const ushort SDB_LOAD_WORLD_EVENT = 0x27B3;           // -> 0x27B4: [u32 reqId][u8 ok] (5B)
+    public const ushort SDB_LOAD_WORLD_EVENT = 0x27B3;           // legacy alias: UPDATE_DAILY_LIMIT_EP_EXP
     // MISNAMED, kept as an alias because the live path and several tests use it: 0x2910 is
     // SDB_UPDATE_FATIGABILITY_POINT, not a friend-info load. WorldServer's own opcode table says
     // so, and the payload is a fatigue delta. Prefer SDB_FATIGABILITY_UPDATE in new code. T26.
@@ -514,7 +514,7 @@ public sealed partial class DbProxyHandlers
     // Handler_DBS_UPDATE_HOLD_CHARACTER_STATUS passes payload[5] to SetRecvData(bool), which
     // sets the hold flag (User+0xA610 -> +0x175, it freezes C_PLAYER_LOCATION) and sends the
     // client S_ADMIN_HOLD_CHARACTER. The real Arbiter answers held = 0 every time, GM or not
-    // (cap_social4 x7, cap_final x16) and so do we: nothing here ever holds a character.
+    // (cap_social4 x7, cap_final x16) except an active T180 panel hold (cap_final2b 51509).
     //
     // SDB_USER_VAPORIZED (0x282D) is World's User::SetVaporized telling the DB: [u32 playerId]
     // [u8 vaporized]. No DBS_ twin (0x282E is DBS_SIMULATE_ITEM_TOOLTIP), so fire-and-forget -
@@ -633,13 +633,11 @@ public sealed partial class DbProxyHandlers
 
     // --- Remaining login-time SDB_* (static data from capture, reqId patched at runtime) ---
     // --- SDB_LOAD_TUTORIAL_SIMPLE_TIP (0x2872) -> DBS_LOAD_TUTORIAL_SIMPLE_TIP (0x2873), T22 ---
-    // Fed by SDB_ADD_TUTORIAL_SIMPLE_TIP (0x286E), one tip id per write.
+    // Fed by ADD (0x286E, count += 1) and DONT_REPEAT (0x2870, count += supplied delta).
     //   req  [0] u32 reqId  [4] u32 playerId                       (handler needs frame >= 0x0e)
     //   rsp  [0] u32 listOff=19 [4] u32 listLen [8] u32 reqId [12] u8 ok=1, then 8 B per tip
-    //   tip  [u32 tipId][u32 1]   - the second word is 1 in every record of every capture
-    // cap_newchar.log adds tips 1, 2, 35 and 39 (seq 719/765/864/911); the relog capture serves
-    // exactly those four, in that order, to both characters. Empty list for a fresh character
-    // (cap_newchar seq 176).
+    //   tip  [i32 tipId][i32 popupCount], ascending tipId (Arb_part_028.c:19197).
+    // cap_2man_b 17469 / 17491 and cap_final2b 34423 / 33788 pin six/seven entries, all count 1.
     public const ushort SDB_TUTORIAL_SIMPLE_TIP = 0x2872;   // -> 0x2873 (45B, reqId@8)
     public const ushort DBS_TUTORIAL_SIMPLE_TIP = 0x2873;
     public const int TutorialTipReplyHeader = 13;
@@ -749,9 +747,9 @@ public sealed partial class DbProxyHandlers
     // logout saves and UserLeaveWorld itself - for the life of the World process
     // (status/HANDOFF.md section 1). Before T15 they were all "no replay for 0xNNNN".
     //
-    // Ground truth: <captures>\cap_newchar.log (real ArbiterServer, new character "Test",
+    // Ground truth: D:\packetlogs\cap_newchar.log (real ArbiterServer, new character "Test",
     // playerId 2, Island of Dawn, 05:49-05:53). The frames used by the tests are extracted into
-    // data/cap_t15.bin (TSIS container, see data/cap_t15.md) so the tests do not need <captures>.
+    // data/cap_t15.bin (TSIS container, see data/cap_t15.md) so the tests do not need D:\packetlogs.
     // All offsets in the comments below are PAYLOAD-relative (the decompile's frame offset - 6).
     // =====================================================================
 
@@ -848,6 +846,22 @@ public sealed partial class DbProxyHandlers
     public const int AchievementRecordSize = 0x18;
     /// <summary>The achievement id at record+0. The rest of the record is stored verbatim.</summary>
     public const int AchievementRecordIdOffset = 0;
+    /// <summary>
+    /// T203. record+4 - the field ACHIEVEMENTS.md section 1 called <c>[u32 0]</c> - is the
+    /// sheet's <b>serverUnique</b>, copied there by World from <c>AchievementList.xml</c>
+    /// (World decodes the string attribute to an int at <c>WorldServer.exe.c:364358</c>; the
+    /// Arbiter reads the same attribute at <c>Arb_part_006.c:7670</c>). So the Arbiter never
+    /// needs the sheet: World hands the flag over with every record.
+    /// <list type="bullet">
+    /// <item>0 - an ordinary achievement. Granted with no shared check at all.</item>
+    /// <item>1 - server first. Exactly one character on the planet may ever hold it.</item>
+    /// <item>2 / 3 - server first AND party-shared: once claimed, the party that claimed it may
+    /// still be granted it (<c>CanAccomplishPartyAchievementNoLock</c>, Arb_part_056.c:16992).</item>
+    /// </list>
+    /// </summary>
+    public const int AchievementRecordServerUniqueOffset = 4;
+    /// <summary>The lowest <c>serverUnique</c> value that also shares the claim with a party.</summary>
+    public const uint AchievementServerUniqueParty = 2;
 
     // --- SDB_LOAD_USER_ACHIEVEMENT (0x27F8) -> DBS_LOAD_USER_ACHIEVEMENT (0x27F9),
     //     fed by SDB_UPDATE_USER_ACHIEVEMENT (0x27FA) and SDB_ACCOMPLISH_USER_ACHIEVEMENT (0x2802).
@@ -1144,6 +1158,8 @@ public sealed partial class DbProxyHandlers
     //   [0] u32 reqId  [4] u32 playerId  [8] u32 tipId
     // Reply: [u32 reqId][u8 ok] (capture: 51 00 00 00 01).
     public const ushort SDB_ADD_TUTORIAL_SIMPLE_TIP = 0x286E; public const ushort DBS_ADD_TUTORIAL_SIMPLE_TIP = 0x286F;
+    public const ushort SDB_DONT_REPEAT_TUTORIAL_SIMPLE_TIP = 0x2870;
+    public const ushort DBS_DONT_REPEAT_TUTORIAL_SIMPLE_TIP = 0x2871;
 
     // --- SDB_UPDATE_SEREN_GUIDE_INFO (0x2944) -> DBS_UPDATE_SEREN_GUIDE_INFO (0x2945) ---
     // cap_newchar.log seq 634 -> 635 and 2713 -> 2716, 22 B -> 15 B.
@@ -1269,6 +1285,7 @@ public sealed partial class DbProxyHandlers
 
     private readonly CharacterStore _store;
     private readonly ILogger _log;
+    public WorldUserControls UserControls { get; } = new();
     // T165: unpinned generic acks already announced (one Information line per opcode).
     private readonly HashSet<ushort> _unpinnedSeen = new();
 
@@ -1276,6 +1293,28 @@ public sealed partial class DbProxyHandlers
     {
         _store = store;
         _log = log;
+    }
+
+    private bool OnLoadAccountBenefit(WorldLink link, byte[] payload)
+    {
+        // Request is [DlmId][UserDbId], NOT AccountDbId (Arb_part_063.c:12662).
+        if (payload.Length < 8) return true;
+        uint dlmId = BitConverter.ToUInt32(payload, 0);
+        int userDbId = BitConverter.ToInt32(payload, 4);
+        var character = _store.GetCharacter(userDbId);
+        var account = character == null ? null : _store.GetAccountById(character.AccountId);
+        IReadOnlyList<CharacterStore.AccountBenefitRow> rows = Array.Empty<CharacterStore.AccountBenefitRow>();
+        if (account != null)
+        {
+            // Deliberately account names only, not character-name aliases or stored admin_level.
+            bool listed = Handlers.GmAccounts.IsListed(account.Name);
+            _store.SyncTeleportExperiment(account.Id, listed);
+            rows = _store.GetAccountBenefits(account.Id);
+            _log.LogInformation("T181 account benefits: user {User} account {Account} operator={Operator} packages=[{Packages}]",
+                userDbId, account.Name, listed, string.Join(",", rows.Select(r => r.PackageId)));
+        }
+        link.SendFrame(0x28BC, AccountBenefitExperiment.BuildReply(dlmId, account != null, rows));
+        return true;
     }
 
     // ---- Session hooks (T21) ----
@@ -1324,16 +1363,15 @@ public sealed partial class DbProxyHandlers
         SA_LOAD_SERVANT_AUTO_POTION_DATA,           // 0x152F
         SA_LOAD_SERVANT_AUTO_FEED_DATA,             // 0x1533
         SA_LOAD_SERVANT_STORAGE_DATA,               // 0x1537
-        SA_LOAD_SERVANT_DATA,                       // 0x1539
-        SA_LOAD_SERVANT_ADVENTURE_DATA,             // 0x153B
+        // 0x1539 / 0x153B moved to the allow-list in T179: the reply carries UserDbId.
         // 0x1554 SA_LOAD_EXTRAPOINT_DATA moved to the allow-list in T77 (served from characters.ep_*)
         SA_LOAD_BATTLE_FIELD_ENTER_COUNT,           // 0x155D
         // 0x2760 / 0x2764 moved to the allow-list in T147 (per-character recipes and proficiencies)
         SDB_LOAD_TELEPORT_TO_POS_LIST,              // 0x27A7
         SDB_LOAD_USER_RESTRICTION,                  // 0x2833
-        SDB_LOAD_BATTLE_FIELD_LIST,                 // 0x2895
+        // 0x2895 moved to the allow-list in T201: native per-user BG statistics.
         // 0x28B0 / 0x28B7 moved to the allow-list in T69 (byte-exact against cap_social2)
-        SDB_LOAD_ACCOUNT_BENEFIT,                   // 0x28BB
+        // 0x28BB moved to the allow-list in T181: account-backed benefits with live DLM echo.
         SDB_LOAD_SERVANT_PERIOD,                    // 0x28C5
         SDB_LOAD_SKILLPERIOD,                       // 0x28C9
         SDB_LOAD_LEARNED_SOCIAL,                    // 0x28CF
@@ -1366,7 +1404,12 @@ public sealed partial class DbProxyHandlers
     {
         switch (op)
         {
+            case 0x13E8: // T201: native local tournament request is one-way; never replay a guessed1518.
+            case 0x162F: // T201: realm purchase count update, SQL plus AS1630 broadcast.
+            case 0x2983: // T201: real account purchase-limit persistence; no longer a generic ack.
             case SDB_USER_ENTERWORLD:
+            case SA_LOAD_SERVANT_DATA:                 // T179: cap_final2b 133 -> 134
+            case SA_LOAD_SERVANT_ADVENTURE_DATA:        // T179: cap_final2b 135 -> 136
             case SDB_UPDATE_USER_DATA:
             case SDB_SAVE_27FA:
             case SDB_SAVE_2924:
@@ -1427,7 +1470,8 @@ public sealed partial class DbProxyHandlers
             case SDB_SET_TASK_SHOW_TOGGLE: // 0x2735 = the request's first 13 bytes (T142 wedge)
             case SDB_END_START_QUEST_LIST: // 0x2737 = [reqId][01]
             case SDB_USER_LOAD_INVENTORY:  // 0x27A3 + 0x27A4: starter inventory for every character except the captured one
-            case SDB_LOAD_2930:            // 0x2931 = [reqId][01][00]   (capture: 82 00 00 00 01 00)
+            case SDB_LOAD_ACCOUNT_BENEFIT: // T181: operator experiment, account-backed list
+            case SDB_LOAD_2930:            // 0x2931 = [reqId][01][held]
             case SDB_USER_VAPORIZED:       // 0x282D, T148: one-way, tracked not stored
             case SDB_LOAD_WORLD_EVENT:     // 0x27B4 = [reqId][01]       (capture: 83 00 00 00 01)
             case SA_CLEAR_BATTLE_FIELD_ENTER_COUNT: // 0x1563 = [01][reqId@8]  (decompile Arb_part_062.c:4769)
@@ -1445,6 +1489,7 @@ public sealed partial class DbProxyHandlers
             case SDB_CHANGE_CITY_WAR_STATE:         // 0x2958, T172: -> 0x295A echo, ok 1
             case Handlers.ArbiterClientHandlers.SDB_SIMULATE_ITEM_TOOLTIP: // 0x282F, T169: World's simulated item -> the compare tooltip
             case SDB_LOAD_2869:          // 0x15E0 push + 0x286A, both carrying the live reset time
+            case SDB_LOAD_BATTLE_FIELD_LIST: // T201: persisted native BG results (not custom rating)
             case AS_PROMOTION_LIST_REQ:  // 0x147D -> 0x1484 + 24 x 0x147E (timestamps = now) + 0x1480
             // --- T15: the per-user writes World sends during play. Each one is a DLM item; a
             // missing reply head-blocks the user's queue for the life of the World process. ---
@@ -1452,6 +1497,7 @@ public sealed partial class DbProxyHandlers
             case SDB_ACCOMPLISH_USER_ACHIEVEMENT: // 0x2803 = the newly-accomplished records echoed
             case SDB_UPDATE_REPUTATION_INFO:      // 0x2892 = [ok][reqId]  (ok-first, the odd one out)
             case SDB_ADD_TUTORIAL_SIMPLE_TIP:     // 0x286F = [reqId][ok]
+            case SDB_DONT_REPEAT_TUTORIAL_SIMPLE_TIP: // T191: persist popup-count delta before ack
             case SDB_UPDATE_SEREN_GUIDE_INFO:     // 0x2945 = [reqId][playerId][ok]
             case SDB_ASK_CHANGE_CHAR_NAME:        // 0x2854, T88 - the rename name check
             case SDB_DO_CHANGE_CHAR_NAME:         // 0x2856, T88 - the rename itself
@@ -1487,6 +1533,8 @@ public sealed partial class DbProxyHandlers
             case GameLogPackets.SDB_ADD_PK_USER_LOG:          // 0x27FF
             case GameLogPackets.SDB_ADD_GROUP_DUEL_USER_LOG:  // 0x2800
             case GameLogPackets.SDB_CASH_ITEM_LOG:            // 0x288C
+            case BattlegroundResults.BSA_END_BATTLE_FIELD_RESULT_LIST: // T199, one-way
+            case BattlegroundResults.BSA_UPDATE_BATTLE_FIELD_LOG:      // T199, one-way
             // --- T26: the last two per-character login loads, rebuilt from rows. ---
             case SDB_REPUTATION_LIST:             // 0x2890 from the stored 0x2891 records
             case SDB_FATIGABILITY_LIST:           // 0x2909 from the account's fatigue row
@@ -1642,6 +1690,14 @@ public sealed partial class DbProxyHandlers
 
         switch (op)
         {
+            case 0x162F:
+            case 0x2983:
+                return Handlers.QaPurchaseCommands.Handle(_store, bridge, link, op, payload);
+            case 0x13E8:
+                // Arb062:10407-10565 -> Arb029:17877-18155. The local two-party branch
+                // builds/discards the party vector without output. Cross-Arbiter queries
+                // need the absent AA1773 transport; do not fabricate a successful creation.
+                return true;
             case SDB_USER_ENTERWORLD: return OnUserEnterWorld(link, payload);
             case SDB_UPDATE_USER_DATA: return OnUpdateUserData(link, payload);
             case SDB_USER_LOAD_INVENTORY: return OnLoadInventory(link, payload);
@@ -1669,7 +1725,7 @@ public sealed partial class DbProxyHandlers
                 link.SendFrame(DBS_USER_LEARN_EP_PERK, BuildReqIdAck(payload, 8)); return true;
             case SDB_USER_RESET_EP_PERK:       return OnResetEpPerk(link, payload);
 
-            // --- T77: collection cards. We keep no card state, so Success 1 and the ids echoed. ---
+            // --- Collection cards: account quantities/book points; per-character mounts. ---
             case SDB_REGISTER_CARD:
                 // T85b, from the dumpers rather than from the reply echo T77 guessed at.
                 // SDB_REGISTER_CARD (Arb_part_017.c:12213, guard 0x19): DlmId@06,
@@ -1680,7 +1736,11 @@ public sealed partial class DbProxyHandlers
                 // the mount pair also names a character, which is the split the table does not
                 // model yet (status/STATUS.md, T85b).
                 // T86: the account at +4 is an i64, and it is the ONLY owner this frame has.
-                _store?.AddCard(Ep64(payload, 4), Ep32i(payload, 12), Ep32i(payload, 16));
+                var cardSheet = CardCollectionSheet.Entry.Value;
+                cardSheet.Templates.TryGetValue(Ep32i(payload, 12), out var cardTemplate);
+                _store?.AddCard(Ep64(payload, 4), Ep32i(payload, 12), Ep32i(payload, 16),
+                    cardTemplate?.BookPoints ?? 0,
+                    cardTemplate != null && cardSheet.Available ? cardSheet.LevelFor : null);
                 link.SendFrame(DBS_REGISTER_CARD, BuildDbsRegisterCard(
                     Ep32(payload, 0), Ep32i(payload, 12), Ep32i(payload, 16))); return true;
             case SDB_MOUNT_CARD:
@@ -1772,11 +1832,7 @@ public sealed partial class DbProxyHandlers
                 StoreCrestPoints(payload);
                 link.SendFrame(AS_CREST_POINT, BuildAsCrestPoint(Ep32(payload, 16))); return true;
             case SA_CREST_USE:
-                // T158: World has already switched the glyph; this only confirms the write.
-                _log.LogInformation("SA_CREST_USE: dlm {Dlm} crest {Crest} {State}",
-                    Ep32(payload, CrestUseReqDlmId), Ep32(payload, CrestUseReqCrestId),
-                    payload.Length > CrestUseReqApply && payload[CrestUseReqApply] != 0 ? "applied" : "removed");
-                link.SendFrame(AS_CREST_USE, BuildReqIdAck(payload, CrestUseReqDlmId)); return true;
+                return OnCrestUse(link, payload);
             case SDB_PEGASUS_FEE: return OnPegasusFee(link, payload);
             case SDB_MARK_AS_QUEST_COMPLETED: return OnMarkAsQuestCompleted(link, payload);
             case SDB_USER_LEARN_SKILL_FOR_MULTIPLE: return OnUserLearnSkillForMultiple(link, payload);
@@ -1800,6 +1856,7 @@ public sealed partial class DbProxyHandlers
             case SDB_ACCOMPLISH_USER_ACHIEVEMENT: return OnAccomplishUserAchievement(link, payload);
             case SDB_UPDATE_REPUTATION_INFO:        return OnUpdateReputation(link, payload);
             case SDB_ADD_TUTORIAL_SIMPLE_TIP:       return OnAddTutorialTip(link, payload);
+            case SDB_DONT_REPEAT_TUTORIAL_SIMPLE_TIP: return OnDontRepeatTutorialTip(link, payload);
             case SDB_UPDATE_SEREN_GUIDE_INFO:       return OnUpdateSerenGuide(link, payload);
             case SDB_ASK_CHANGE_CHAR_NAME:          return OnAskChangeCharName(link, payload);
             case SDB_DO_CHANGE_CHAR_NAME:           return OnDoChangeCharName(link, payload);
@@ -1880,7 +1937,10 @@ public sealed partial class DbProxyHandlers
             // --- Post-spawn (reqId at payload[0] for all three) ---
             case SDB_END_START_QUEST_LIST: link.SendFrame(DBS_END_START_QUEST_LIST, BuildReqIdAck(payload, 0)); return true;
             case SDB_SET_TASK_SHOW_TOGGLE: link.SendFrame(DBS_SET_TASK_SHOW_TOGGLE, BuildSetTaskShowToggleReply(payload)); return true;
-            case SDB_LOAD_2930:            link.SendFrame(DBS_LOAD_2931, Build2931(payload)); return true;
+            case SDB_LOAD_2930:
+                link.SendFrame(DBS_LOAD_2931, Build2931(payload, payload.Length >= 16
+                    && UserControls.IsHeld(BitConverter.ToUInt32(payload, 12), DateTimeOffset.UtcNow)));
+                return true;
             case SDB_USER_VAPORIZED:       OnUserVaporized(payload, _log); return true;
             case SA_CLEAR_BATTLE_FIELD_ENTER_COUNT: link.SendFrame(AS_CLEAR_BATTLE_FIELD_ENTER_COUNT, BuildOkReqId(payload, 8)); return true;
             case SDB_UPDATE_USER_ACTPOINT: link.SendFrame(DBS_UPDATE_USER_ACTPOINT, BuildReqIdAck(payload, 0)); return true;
@@ -1927,7 +1987,7 @@ public sealed partial class DbProxyHandlers
             case SA_CHAR_LOC: Handlers.GmAdminTool.OnSaCharLoc(bridge, payload, _log); return true;
             case SA_BROADCAST_SYSTEM_MESSAGE_TO_WHOLE_WORLD:
             case SA_BROADCAST_SYSTEM_MESSAGE_NOT_IN_SPECIAL_PLACE: return OnWorldBroadcast(bridge, payload);
-            case SA_CREST_USE_LIST: link.SendFrame(AS_CREST_USE_LIST, BuildCrestUseListReply(payload)); return true;
+            case SA_CREST_USE_LIST: return OnCrestUseList(link, payload);
             case SA_SYNC_DATE_TIME: return true;   // DateTimeSync::CheckDateTime only compares clocks
             case SDB_CHANGE_CITY_WAR_STATE: link.SendFrame(DBS_CHANGE_CITY_WAR_STATE, BuildChangeCityWarStateReply(payload)); return true;
             case Handlers.ArbiterClientHandlers.SDB_SIMULATE_ITEM_TOOLTIP:
@@ -1949,7 +2009,7 @@ public sealed partial class DbProxyHandlers
             case S_UPDATE_PROF_ENERGY:
             case S_UPDATE_PROF_HERB:            return OnUpdateGatheringProf(link, op, payload);
             case SDB_LOAD_TELEPORT_TO_POS_LIST: link.SendFrame((ushort)(op + 1), BuildEmptyListType1(payload, 0)); return true;
-            case SDB_LOAD_ACCOUNT_BENEFIT:      link.SendFrame((ushort)(op + 1), BuildEmptyListType1(payload, 0)); return true;
+            case SDB_LOAD_ACCOUNT_BENEFIT:      return OnLoadAccountBenefit(link, payload);
             case SDB_LOAD_LEARNED_SOCIAL:       link.SendFrame((ushort)(op + 1), BuildEmptyListType1(payload, 0)); return true;
             case SDB_LOAD_TOKEN_EXCHANGE:       link.SendFrame((ushort)(op + 1), BuildEmptyListType1(payload, 0)); return true;
             case SDB_LOAD_SKILLPERIOD:          link.SendFrame((ushort)(op + 1), BuildEmptyListType1(payload, 0)); return true;
@@ -1960,7 +2020,9 @@ public sealed partial class DbProxyHandlers
             // --- Login-time: empty-list Type 2 [off=19][count=0][ok=1][reqId], reqId at payload[0] ---
             case SDB_LOAD_PROMOTION_LIST:       link.SendFrame((ushort)(op + 1), BuildEmptyListType2(payload, 0)); return true;
             case SDB_LOAD_PROMOTION_COND_LIST:  link.SendFrame((ushort)(op + 1), BuildEmptyListType2(payload, 0)); return true;
-            case SDB_LOAD_BATTLE_FIELD_LIST:    link.SendFrame((ushort)(op + 1), BuildEmptyListType2(payload, 0)); return true;
+            case SDB_LOAD_BATTLE_FIELD_LIST:
+                link.SendFrame((ushort)(op + 1), Handlers.QaDungeonCommands.BuildBattlefieldLoad(payload,
+                    _store?.GetNativeBattlefieldResults(Ep32i(payload, 4)) ?? Array.Empty<byte[]>())); return true;
             case SDB_LOAD_USER_RESTRICTION:     link.SendFrame((ushort)(op + 1), BuildEmptyListType2(payload, 0)); return true;
 
             // --- SA_ shape: reqId at payload[8] (after u64 gameId) ---
@@ -1978,10 +2040,10 @@ public sealed partial class DbProxyHandlers
 
             // --- Other login-time handlers ---
             case SDB_LOAD_QUEST_PROGRESS: link.SendFrame(0x2903, BuildQuestProgress(payload)); return true;
-            case SDB_LOAD_ACHIEVE_LIST:   link.SendFrame(0x2982, BuildAchieveList(payload)); return true;
+            case SDB_LOAD_ACHIEVE_LIST: return Handlers.QaPurchaseCommands.Handle(_store, bridge, link, op, payload);
             case SDB_USER_CLEAR_ALL_SKILL: return OnUserClearAllSkill(link, payload);
             case SDB_UPDATE_EVENTSYSTEM_PROGRESS: return OnUpdateEventSystemProgress(link, payload);
-            case SDB_LOAD_WORLD_EVENT:    link.SendFrame(0x27B4, BuildReqIdAck(payload, 0)); return true;
+            case SDB_LOAD_WORLD_EVENT:    return OnUpdateDailyLimitEpExp(link, payload);
             case SDB_LOAD_FRIEND_INFO:    return OnUpdateFatigability(link, payload);
 
             // --- Remaining login-time: programmatic builders ---
@@ -1999,6 +2061,10 @@ public sealed partial class DbProxyHandlers
                     "SDB_ADD_GROUP_DUEL_USER_LOG");
             case GameLogPackets.SDB_CASH_ITEM_LOG:
                 return FileGameLog(GameLogPackets.ParseCashItemLog(payload), "SDB_CASH_ITEM_LOG");
+            case BattlegroundResults.BSA_END_BATTLE_FIELD_RESULT_LIST:
+                return BattlegroundResults.FileResults(_store, payload);
+            case BattlegroundResults.BSA_UPDATE_BATTLE_FIELD_LOG:
+                return BattlegroundResults.FileScore(_store, payload);
             case DungeonChannels.SA_ADD_DUNGEON_CHANNEL:    return OnAddDungeonChannel(link, payload);
             case DungeonChannels.SA_REMOVE_DUNGEON_CHANNEL: return OnRemoveDungeonChannel(link, payload);
             case SA_UPDATE_DUNGEON_COOLTIME:    return OnUpdateDungeonCoolTime(payload);
@@ -2006,12 +2072,18 @@ public sealed partial class DbProxyHandlers
             case SA_DELETE_DUNGEON_COOLTIME:    return OnDeleteDungeonCoolTime(payload);
             case SDB_LOAD_2869:
             {
-                // The real Arbiter pushes 0x15E0 first, then answers 0x286A, and both carry the
-                // SAME reset time (see the comment on SDB_LOAD_2869 above).
-                ulong resetTime = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
                 uint pid = payload.Length >= 8 ? BitConverter.ToUInt32(payload, 4) : 0;
-                link.SendFrame(AS_REQUEST_DUNGEON_PHASE_USER_RESET, Build15E0(pid, resetTime));
-                link.SendFrame(DBS_LOAD_DUNGEON_PHASE_LEVEL, Build286A_EmptyListTimestamp(payload, resetTime));
+                var phase = _store?.GetDungeonPhases((int)pid);
+                if (phase == null)
+                {
+                    // First observation retains the captured initial reset, then persists its
+                    // epoch. Repeated logins must not erase QA phaselevel's saved rows.
+                    long epoch = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                    epoch = _store?.InitializeDungeonPhaseReset((int)pid, epoch) ?? epoch;
+                    phase = new CharacterStore.DungeonPhaseState(epoch, Array.Empty<byte[]>());
+                    link.SendFrame(AS_REQUEST_DUNGEON_PHASE_USER_RESET, Build15E0(pid, (ulong)epoch));
+                }
+                link.SendFrame(DBS_LOAD_DUNGEON_PHASE_LEVEL, Handlers.QaDungeonCommands.BuildPhaseLoad(payload, phase));
                 return true;
             }
             case SDB_LOAD_2900: link.SendFrame(0x2901, Build2901_TwoEmptyLists(payload)); return true;
@@ -2241,12 +2313,12 @@ public sealed partial class DbProxyHandlers
         return p;
     }
 
-    /// <summary>DBS_REGISTER_CARD (0x2989), frame 0x12:
+    /// <summary>DBS_REGISTER_CARD (0x2989), frame 0x13 (cap_2man_b15075):
     /// `DlmId@06, Success@0A (u8), CardTemplateId@0B, Amount@0F`.</summary>
     public static byte[] BuildDbsRegisterCard(uint dlmId, int cardTemplateId, int amount)
         => CardReply(dlmId, cardTemplateId, amount);
 
-    /// <summary>DBS_MOUNT_CARD (0x298B) and DBS_UNMOUNT_CARD (0x298D), same frame 0x12:
+    /// <summary>DBS_MOUNT_CARD (0x298B) and DBS_UNMOUNT_CARD (0x298D), same frame 0x13:
     /// `DlmId@06, Success@0A (u8), PresetIndex@0B, CardTemplateId@0F`. Note the order is the
     /// mirror of the register reply's - preset first, card second.</summary>
     public static byte[] BuildDbsMountCard(uint dlmId, int presetIndex, int cardTemplateId)
@@ -2376,21 +2448,28 @@ public sealed partial class DbProxyHandlers
         var ep = new CharacterStore.EpRow(
             Ep64(payload, 8), Ep32i(payload, 16), Ep32i(payload, 20),
             Ep32i(payload, 24), Ep32i(payload, 28), Ep32i(payload, 32));
-        _store?.SetCharacterEp(owner, ep);
+        bool ok = _store?.SetCharacterEp(owner, ep) ?? true;
         _log.LogInformation("SDB_UPDATE_EXTRA_POINT: player {Owner} -> level {Lv}, {Exp} exp, {Pt} point(s)",
             owner, ep.EpLevel, ep.EpExp, ep.EpPoint);
-        link.SendFrame(DBS_UPDATE_EXTRA_POINT, BuildReqIdAck(payload, 0));
+        link.SendFrame(DBS_UPDATE_EXTRA_POINT, DlmOk(Ep32(payload, 0), ok));
         return true;
     }
 
-    /// <summary>SDB_UPDATE_PRE_EP_INFO (0x27C1) -&gt; DBS (0x27C2): the level and point alone,
-    /// written before the full update. Stored so a crash between the two does not lose it.</summary>
+    /// <summary>SDB_UPDATE_PRE_EP_INFO (0x27C1) -&gt; DBS (0x27C2): previous-login counters
+    /// belong to User, not Account progress (Arb_part_030:13049-13112).</summary>
     private bool OnUpdatePreEpInfo(WorldLink link, byte[] payload)
     {
         int owner = Ep32i(payload, 4);
-        _store?.SetCharacterEpLevel(owner, Ep32i(payload, 8), Ep32i(payload, 12));
         _store?.SetEpPre(owner, Ep32i(payload, 8), Ep32i(payload, 12));   // T167: DBS_USER_LOAD_EP_PERK's PreEp pair
         link.SendFrame(DBS_UPDATE_PRE_EP_INFO, BuildReqIdAck(payload, 0));
+        return true;
+    }
+
+    private bool OnUpdateDailyLimitEpExp(WorldLink link, byte[] payload)
+    {
+        // Arb_part_064:11154-11156; cap_final2b 1012->1013. This was only acknowledged.
+        bool ok = _store?.SetCharacterEpDailyLimit(Ep32i(payload, 4), Ep32i(payload, 8)) ?? true;
+        link.SendFrame(0x27B4, DlmOk(Ep32(payload, 0), ok));
         return true;
     }
 
@@ -2399,8 +2478,8 @@ public sealed partial class DbProxyHandlers
     private bool OnUpdateDailyExtraPoint(WorldLink link, byte[] payload)
     {
         int owner = Ep32i(payload, 4);
-        _store?.SetCharacterEpDaily(owner, Ep32i(payload, 8), Ep64(payload, 12));
-        link.SendFrame(DBS_UPDATE_DAILY_EXTRA_POINT, BuildReqIdAck(payload, 0));
+        bool ok = _store?.SetCharacterEpDaily(owner, Ep32i(payload, 8), Ep64(payload, 12)) ?? true;
+        link.SendFrame(DBS_UPDATE_DAILY_EXTRA_POINT, DlmOk(Ep32(payload, 0), ok));
         return true;
     }
 
@@ -2549,29 +2628,44 @@ public sealed partial class DbProxyHandlers
         uint dlmId = Ep32(payload, 20);
         int receiver = Ep32i(payload, 24);
         long money = Ep64(payload, 28);
-
-        // The attachments are NOT delivered yet, and this is the honest reason. seq 2962 carries
-        // them as an ordinary [here][next] list: payload 0 = element count (2), payload 4 = the
-        // first element's frame offset (0xAB), each element 43 bytes with TemplateId at +16 and
-        // Amount at +20 (201577 x1 and 201726 x1 in that frame). Decoding them is easy; filing
-        // them is not, because a parcel only hands its items over when SDB_RECV_PARCEL step 1
-        // returns the ParcelData record World built the atoms from - and for a SYSTEM parcel
-        // there is no SDB_MAKE_PARCEL to have stored that record from. Synthesising one means
-        // inventing the 0x9e8+ interior no capture pins. The gold arrives; the items wait for a
-        // capture of a system parcel being collected.
         int errorNo = 0;
-        if (_store is null || receiver <= 0) errorNo = 1;
+        var character = _store?.GetCharacter(receiver);
+        if (_store is null || character is null || !SystemParcelAttachments.TryRead(payload, out var items))
+        {
+            errorNo = 1;
+            _log.LogWarning("SA_MAKE_SYS_PARCEL: player {To}, {Bytes} B request: missing owner or unsupported/malformed attachment list",
+                receiver, payload.Length);
+        }
         else
         {
-            // T151: the Writer / Title / Message refs (payload 8 / 12 / 16, frame-relative) were
-            // dropped here, so every system mail listed with a blank title - cap_social4 seq 4560
-            // shows the real rows carry them verbatim: SenderName "@Achievement:6903" at +0x04,
-            // Title "@2051" at +0x960. They are localisation keys; the client resolves them.
+            // T196: World has already evaluated AchievementList.xml and sent the reward here.
+            // Creating it at 0x2802 as well would grant twice. cap_final2b 6186 -> 6189 -> 6190;
+            // cap_instance1 139184 contains the four EP reward parcels whose items we dropped.
             var (writer, title, message) = ReadSysParcelText(payload);
-            int id = _store.CreateParcel(0, writer.Length > 0 ? writer : SystemParcelSender, receiver,
-                title, message, money, ParcelDbHandlers.ParcelTypeSystem);
-            _log.LogInformation("SA_MAKE_SYS_PARCEL: parcel {Id} to player {To}, {Money} money",
-                id, receiver, money);
+            if (writer.Length == 0) writer = SystemParcelSender;
+            for (int first = 0; first < Math.Max(1, items.Count); first += CharacterStore.MaxParcelAttachments)
+            {
+                // Native splits a longer reward across five-slot parcels, money on the first.
+                var chunk = items.Skip(first).Take(CharacterStore.MaxParcelAttachments).ToArray();
+                long parcelMoney = first == 0 ? money : 0;
+                int id = _store.CreateParcel(0, writer, receiver, title, message, parcelMoney,
+                    ParcelDbHandlers.ParcelTypeSystem);
+                _store.SetParcelRecord(id, SystemParcelAttachments.BuildRecord(id, receiver, character.Name,
+                    writer, title, message, parcelMoney, chunk));
+                for (int slot = 0; slot < chunk.Length; slot++)
+                    _store.AddParcelItem(id, slot, 0, BitConverter.ToInt32(chunk[slot], 8),
+                        BitConverter.ToInt32(chunk[slot], 12));
+
+                var session = global::TeraSharp.Arbiter.Program.World?.SessionForPlayerId(receiver);
+                if (session is not null)
+                {
+                    var (unread, unclaimed) = _store.GetParcelCounts(receiver);
+                    session.Send(Handlers.ParcelHandlers.BuildReadRecvStatus((uint)unread, (uint)unclaimed,
+                        flag: payload[36] != 0));
+                }
+                _log.LogInformation("SA_MAKE_SYS_PARCEL: parcel {Id} to player {To}, {Money} money, {Items} attachment(s)",
+                    id, receiver, parcelMoney, chunk.Length);
+            }
         }
         link.SendFrame(AS_MAKE_SYS_PARCEL, BuildAsMakeSysParcel(dlmId, errorNo));
         return true;
@@ -2743,7 +2837,12 @@ public sealed partial class DbProxyHandlers
     {
         ulong gameId = LeaveGate.GameIdOf(payload);
         var held = LeaveGate.Shared.Entered(gameId);
-        if (held == null) return true;
+        if (held == null)
+        {
+            TeraSharp.Arbiter.Handlers.QaSocialCommands.OnWorldEntryComplete(bridge?.PlayerForGameId(gameId), _store);
+            PartyWiring.OnWorldEntryComplete(bridge, gameId);
+            return true;
+        }
         _log.LogInformation("SA_ENTER_WORLD for gameId {G:X}: its session left while World was loading it - "
             + "sending the held AS_LEAVE_WORLD now", gameId);
         bridge?.NotifyPlayerLeave(held.WorldId, held.GameId, held.PlayerId, held.Mode);
@@ -2910,10 +3009,10 @@ public sealed partial class DbProxyHandlers
     /// with no fallback at all. We store whatever the context carries and never clear;
     /// CharacterStore.ClearDungeonReturn is there for when that flag's source is found.</para>
     /// </summary>
-    private void RecordDungeonEntry(byte[] payload, bool response)
+    internal void RecordDungeonEntry(byte[] payload, bool response, int? resolvedPlayerId = null)
     {
         if (_store is null || payload.Length < ResponseEnterDungeonMinPayload) return;
-        int playerId = (int)BitConverter.ToUInt32(payload, DungeonCtxPlayerId);
+        int playerId = resolvedPlayerId ?? (int)BitConverter.ToUInt32(payload, DungeonCtxPlayerId);
         if (playerId <= 0) return;
 
         int dungeonId = (int)BitConverter.ToUInt32(payload, DungeonCtxDungeonId);
@@ -2934,6 +3033,19 @@ public sealed partial class DbProxyHandlers
         _store.SaveInstancePdId(playerId, pdId);
         _log.LogInformation("Player {Pid} is in dungeon {Dg}, instance 0x{Pd:X8}", playerId, dungeonId, pdId);
         MatchWiring.OnDungeonEntered(playerId, dungeonId);   // T161 (c): a matched member claims their entry
+    }
+
+    // T192: source save7903 still names zone7005; target load7911 contains the 1445 destination.
+    // Arb029:3675-3712 applies SetPosNoLock/spUpdateUserLoc after source leave completes.
+    internal void CommitTeleportLocation(int playerId, CrossWorldHandoff.Teleport move, int destinationWorld)
+    {
+        var chr = _store.GetCharacter(playerId);
+        if (chr == null) return;
+        if (chr.WorldBlob is { Length: >= 308 } blob)
+            _store.SaveWorldBlob(playerId, CrossWorldHandoff.StampLocation(blob, move, destinationWorld));
+        else
+            _store.UpdateLevelAndPosition(playerId, chr.Level, move.Continent, move.X, move.Y, move.Z);
+        _store.SaveInstancePdId(playerId, unchecked((int)move.Channel));
     }
 
     /// <summary>
@@ -2996,13 +3108,14 @@ public sealed partial class DbProxyHandlers
         return r;
     }
 
-    /// <summary>DBS 0x2931: [u32 reqId][u8 ok=1][u8 0] — 6 bytes (lobby_tap.log 02:52:07.112: 82 00 00 00 01 00).</summary>
-    public static byte[] Build2931(byte[] request)
+    /// <summary>DBS 0x2931: [u32 reqId][u8 ok=1][u8 held] — 6 bytes (lobby_tap.log 02:52:07.112: 82 00 00 00 01 00).</summary>
+    public static byte[] Build2931(byte[] request, bool held = false)
     {
         uint reqId = request.Length >= 4 ? BitConverter.ToUInt32(request, 0) : 0;
         var r = new byte[6];
         BitConverter.GetBytes(reqId).CopyTo(r, 0);
         r[4] = 1;
+        r[5] = held ? (byte)1 : (byte)0;
         return r;
     }
 
@@ -3280,7 +3393,11 @@ public sealed partial class DbProxyHandlers
             _log.LogWarning("{Op}: could not read the atom list ({Len} B payload) - echoing an empty one",
                 DbProxyOpcodeNames.Describe(replyOp), payload.Length);
 
-        var r = WarehouseHandlers.Apply(_store, parsed, _store.NextItemId, _log);
+        WarehouseHandlers.ApplyResult r = default;
+        bool ok = _store.TryApplyWarehouseTransfer(parsed.Where(a => a.Op == WarehouseHandlers.TsWareChangeMoney)
+            .Select(a => (a.DstOwner != 0 ? a.DstOwner : a.SrcOwner, (int)(a.DstOwner != 0 ? a.DstInven : a.SrcInven), a.Delta)),
+            TeraSharp.Arbiter.Handlers.GmCommandHandlers.WarehouseGoldMax,
+            () => r = WarehouseHandlers.Apply(_store, parsed, _store.NextItemId, _log), out uint error);
         if (parsed.Count > 0)
             _log.LogInformation("{Op}: {N} atom(s) -> {Ins} inserted, {Mov} moved, {Chg} amount, {Del} deleted, "
                 + "{Money} ware money, {Gold} character money, {Ign} ignored",
@@ -3289,7 +3406,7 @@ public sealed partial class DbProxyHandlers
 
         // WareCommision is 0 in this build: CommisionPayed() returns 1 and GetWareCommision()
         // returns 0 in the decompile, so the fee path is effectively disabled.
-        link.SendFrame(replyOp, WarehouseHandlers.BuildDbsTransfer(atoms, dlmId, ok: true, error: 0, wareCommision: 0));
+        link.SendFrame(replyOp, WarehouseHandlers.BuildDbsTransfer(atoms, dlmId, ok, error, wareCommision: 0));
         return true;
     }
 
@@ -4004,6 +4121,19 @@ public sealed partial class DbProxyHandlers
     /// store, which keeps the first one per achievement; the reply carries only the ones that
     /// were actually new, which is what makes a re-submitted achievement come back as the
     /// 19-byte empty form the real Arbiter sent (cap_newchar.log seq 2606).
+    ///
+    /// <para><b>T203: server firsts.</b> A record whose <c>serverUnique</c>
+    /// (<see cref="AchievementRecordServerUniqueOffset"/>) is non-zero is gated on the
+    /// planet-wide claim table as well, because "Server's first Valkyrie to reach level 30" can
+    /// only ever be true of one character. We were granting every one of them to everybody.
+    /// There is <b>no refusal reply</b> to write: <c>0x2803</c>'s success byte is a hard-coded 1
+    /// in the real Arbiter (Arb_part_062.c:19023, and all fifty replies in cap_final2b agree) and
+    /// the refusal IS the record's absence from the list - World's
+    /// <c>AchievementManager::SetAccomplishedAchievementList</c> (WorldServer.exe.c:2195421)
+    /// walks only the records it was handed and has no failure branch, so the client hears
+    /// nothing either. cap_final2b 3622 -&gt; 3623 is the pin: twelve ids offered for userDbId
+    /// 1003, the seven with serverUnique 0 granted and exactly the five with serverUnique 1 -
+    /// 730, 731, 732, 737, 2103 - left out, all five already held by userDbId 1.</para>
     /// </summary>
     private bool OnAccomplishUserAchievement(WorldLink link, byte[] payload)
     {
@@ -4012,19 +4142,49 @@ public sealed partial class DbProxyHandlers
 
         var offeredRecords = SliceAchievementRecords(payload);
         var kept = offeredRecords;                     // no store: every record looks new
+        int refused = 0;
         if (_store is not null && playerId > 0)
         {
+            long partyId = PartyOfForAchievement(playerId);
             var offered = new List<(int Id, byte[] Record)>(offeredRecords.Count);
             foreach (var rec in offeredRecords)
-                offered.Add(((int)BitConverter.ToUInt32(rec, AchievementRecordIdOffset), rec));
+            {
+                int id = (int)BitConverter.ToUInt32(rec, AchievementRecordIdOffset);
+                uint unique = BitConverter.ToUInt32(rec, AchievementRecordServerUniqueOffset);
+                if (unique != 0 && !MayClaimServerFirst(id, unique, playerId, partyId)) { refused++; continue; }
+                offered.Add((id, rec));
+            }
             kept = _store.AddAccomplishedAchievements(playerId, offered);
         }
 
-        _log.LogInformation("SDB_ACCOMPLISH_USER_ACHIEVEMENT: player {Pid} offered {O}, {N} newly accomplished",
-            playerId, offeredRecords.Count, kept.Count);
+        if (refused > 0)
+            _log.LogInformation("SDB_ACCOMPLISH_USER_ACHIEVEMENT: player {Pid} offered {O}, {N} newly accomplished, "
+                + "{R} server-first already taken", playerId, offeredRecords.Count, kept.Count, refused);
+        else
+            _log.LogInformation("SDB_ACCOMPLISH_USER_ACHIEVEMENT: player {Pid} offered {O}, {N} newly accomplished",
+                playerId, offeredRecords.Count, kept.Count);
         link.SendFrame(DBS_ACCOMPLISH_USER_ACHIEVEMENT, BuildDbs2803(payload, null, kept));
         return true;
     }
+
+    /// <summary>
+    /// T203. The gate on one server-first achievement, in the real Arbiter's order
+    /// (<c>User::AccomplishAchievement</c>, Arb_part_027.c:16554): claim it if nobody holds it,
+    /// pass it through when the holder is this character (the per-character table then decides,
+    /// and refuses a repeat by itself), and for the party-shared kinds let the party that first
+    /// claimed it through too. Everyone else is refused.
+    /// </summary>
+    private bool MayClaimServerFirst(int achievementId, uint serverUnique, int playerId, long partyId)
+    {
+        var claim = _store!.GetServerAchievementClaim(achievementId);
+        if (claim is null) return _store.TryClaimServerAchievement(achievementId, playerId, partyId);
+        if (claim.OwnerId == playerId) return true;
+        return serverUnique >= AchievementServerUniqueParty && partyId != 0 && claim.PartyId == partyId;
+    }
+
+    /// <summary>The party this character is in, or 0. Only the party-shared kinds look at it.</summary>
+    private static long PartyOfForAchievement(int playerId)
+        => PartyWiring.Manager.FindByMember(playerId)?.Id ?? 0;
 
     /// <summary>The 24-byte records carried by a 0x2802 request, in order. Empty when malformed.</summary>
     public static List<byte[]> SliceAchievementRecords(byte[] request)
@@ -4486,14 +4646,31 @@ public sealed partial class DbProxyHandlers
     /// <summary>SDB_ADD_TUTORIAL_SIMPLE_TIP (0x286E): store the tip, then ack.</summary>
     private bool OnAddTutorialTip(WorldLink link, byte[] payload)
     {
+        bool ok = false;
         if (_store is not null && payload.Length >= TutorialTipIdOffset + 4)
         {
             int playerId = (int)BitConverter.ToUInt32(payload, 4);
             int tipId = (int)BitConverter.ToUInt32(payload, TutorialTipIdOffset);
-            if (playerId > 0 && _store.AddTutorialTip(playerId, tipId))
+            ok = playerId > 0 && _store.AddTutorialTip(playerId, tipId);
+            if (ok)
                 _log.LogInformation("SDB_ADD_TUTORIAL_SIMPLE_TIP: player {Pid} saw tip {Tip}", playerId, tipId);
         }
-        link.SendFrame(DBS_ADD_TUTORIAL_SIMPLE_TIP, BuildReqIdAck(payload, 0));
+        var ack = BuildReqIdAck(payload, 0);
+        ack[4] = ok || (_store is null && payload.Length >= 12) ? (byte)1 : (byte)0;
+        link.SendFrame(DBS_ADD_TUTORIAL_SIMPLE_TIP, ack);
+        return true;
+    }
+
+    // Native Arb_part_063.c:5317 calls the same additive UpdateSimpleTip as ADD, passing
+    // frame+18 (popup-count delta). There is no separate per-character don't-repeat flag.
+    private bool OnDontRepeatTutorialTip(WorldLink link, byte[] payload)
+    {
+        bool ok = payload.Length >= 16 && _store is not null &&
+            _store.AddTutorialTipCount(BitConverter.ToInt32(payload, 4),
+                BitConverter.ToInt32(payload, 8), BitConverter.ToInt32(payload, 12));
+        var ack = BuildReqIdAck(payload, 0);
+        ack[4] = ok ? (byte)1 : (byte)0;
+        link.SendFrame(DBS_DONT_REPEAT_TUTORIAL_SIMPLE_TIP, ack);
         return true;
     }
 
@@ -4502,13 +4679,13 @@ public sealed partial class DbProxyHandlers
     {
         uint reqId = payload.Length >= 4 ? BitConverter.ToUInt32(payload, 0) : 0;
         int playerId = payload.Length >= 8 ? (int)BitConverter.ToUInt32(payload, 4) : 0;
-        if (_store is null || ServesCapturedStatics(playerId))
+        var tips = _store?.GetTutorialTipCounts(playerId);
+        if (tips is null || (tips.Count == 0 && ServesCapturedStatics(playerId) && _store?.TutorialWasCleared(playerId) != true))
         {
             link.SendFrame(DBS_TUTORIAL_SIMPLE_TIP, BuildFromStaticData(
                 DbProxyStaticData.Tutorial, DbProxyStaticData.TutorialReqIdOffset, payload));
             return true;
         }
-        var tips = _store.GetTutorialTips(playerId);
         _log.LogInformation("SDB_LOAD_TUTORIAL_SIMPLE_TIP: player {Pid} -> {N} tip(s)", playerId, tips.Count);
         link.SendFrame(DBS_TUTORIAL_SIMPLE_TIP, BuildDbs2873(tips, reqId));
         return true;
@@ -4521,17 +4698,23 @@ public sealed partial class DbProxyHandlers
     public static byte[] BuildDbs2873(IReadOnlyList<int> tipIds, uint reqId)
     {
         ArgumentNullException.ThrowIfNull(tipIds);
-        int len = tipIds.Count * TutorialTipRecordSize;
+        return BuildDbs2873(tipIds.Select(id => (TipId: id, PopupCount: 1)).ToArray(), reqId);
+    }
+
+    public static byte[] BuildDbs2873(IReadOnlyList<(int TipId, int PopupCount)> tips, uint reqId)
+    {
+        ArgumentNullException.ThrowIfNull(tips);
+        int len = tips.Count * TutorialTipRecordSize;
         var r = new byte[TutorialTipReplyHeader + len];
         BitConverter.GetBytes(6u + TutorialTipReplyHeader).CopyTo(r, 0);   // 19, frame-relative
         BitConverter.GetBytes((uint)len).CopyTo(r, 4);
         BitConverter.GetBytes(reqId).CopyTo(r, 8);
         r[12] = 1;                                                          // ok
         int p = TutorialTipReplyHeader;
-        foreach (int tip in tipIds)
+        foreach (var tip in tips.OrderBy(t => t.TipId))
         {
-            BitConverter.GetBytes(tip).CopyTo(r, p);
-            BitConverter.GetBytes(1).CopyTo(r, p + 4);
+            BitConverter.GetBytes(tip.TipId).CopyTo(r, p);
+            BitConverter.GetBytes(tip.PopupCount).CopyTo(r, p + 4);
             p += TutorialTipRecordSize;
         }
         return r;
@@ -4933,33 +5116,33 @@ public sealed partial class DbProxyHandlers
     // ---- SA_ handler builders (request: [u64 gameId][u32 reqId][u32 playerId]) ----
 
     /// <summary>
-    /// AS_LOAD_SERVANT_DATA (0x153A): [u32 listOff1=0][u32 listOff2=0][u32 reqId][u8 playerId_low][u8 ok=1][u16 0][u8 0].
-    /// Capture frame 261: 17 bytes. No servants → empty reply with reqId echo.
+    /// AS_LOAD_SERVANT_DATA (0x153A): [u32 count=0][u32 first=0][u32 reqId][u8 ok=1][u32 UserDbId].
+    /// cap_final2b 133 -> 134: user 1003, not the replay fixture's user 1. Empty list: 17 bytes.
     /// </summary>
     public static byte[] BuildServantData(byte[] request)
     {
         uint reqId = request.Length >= 12 ? BitConverter.ToUInt32(request, 8) : 0;
-        byte pid = request.Length >= 16 ? (byte)(BitConverter.ToUInt32(request, 12) & 0xFF) : (byte)0;
+        uint playerId = request.Length >= 16 ? BitConverter.ToUInt32(request, 12) : 0;
         var r = new byte[17];
-        // r[0..7] = 0 (two null list offsets)
+        // r[0..7] = 0 (empty list count and first offset)
         BitConverter.GetBytes(reqId).CopyTo(r, 8);
-        r[12] = pid;
-        r[13] = 1; // ok
-        // r[14..16] = 0
+        r[12] = 1;
+        BitConverter.GetBytes(playerId).CopyTo(r, 13);
         return r;
     }
 
     /// <summary>
-    /// AS_LOAD_SERVANT_ADVENTURE_DATA (0x153C): [u64 0][u32 reqId][u8 ok=1][u32 unk=1][u32 0].
-    /// Capture frame 263: 21 bytes. The u32 at [13] is 1 in the capture (default/base entry count).
+    /// AS_LOAD_SERVANT_ADVENTURE_DATA (0x153C): [u64 0][u32 reqId][u8 ok=1][u32 UserDbId][u32 0].
+    /// cap_final2b 135 -> 136: the field at payload 13 is user 1003, not a constant 1.
     /// </summary>
     public static byte[] BuildServantAdventureData(byte[] request)
     {
         uint reqId = request.Length >= 12 ? BitConverter.ToUInt32(request, 8) : 0;
+        uint playerId = request.Length >= 16 ? BitConverter.ToUInt32(request, 12) : 0;
         var r = new byte[21];
         BitConverter.GetBytes(reqId).CopyTo(r, 8);
         r[12] = 1; // ok
-        BitConverter.GetBytes(1u).CopyTo(r, 13); // unk=1 (matches capture)
+        BitConverter.GetBytes(playerId).CopyTo(r, 13);
         return r;
     }
 
@@ -5059,12 +5242,11 @@ public sealed partial class DbProxyHandlers
     /// <summary>
     /// T77: the same reply, filled in from what SDB_UPDATE_EXTRA_POINT last stored. Before T77
     /// the Arbiter kept no EP at all, so every login answered zeros and the panel reset itself
-    /// each time; the six numbers now round-trip through <c>characters.ep_*</c>.
+    /// each time; the six numbers now round-trip through <c>account_ep</c>.
     ///
-    /// <para>Two of the eleven fields still go out as zero because nothing we receive carries
-    /// them: <c>GoldConsumption</c> and <c>TotalEp</c> appear in no W-&gt;A frame in any capture.
-    /// Both captured characters have them zero, so we cannot even see which write would set
-    /// them - guessing a derivation (TotalEp = level * something) would be invention.</para>
+    /// <para>T193: TotalEp is the stored NewEpPoint from 0x27B1, not zero. Native account
+    /// field +0x30C0 is copied by Arb_part_061:16560 and emitted last by Arb_part_062:9506;
+    /// cap_final2b 519 contains 300. GoldConsumption remains the captured zero.</para>
     /// </summary>
     public static byte[] BuildExtrapointData(byte[] request, CharacterStore.EpRow? ep)
     {
@@ -5081,6 +5263,7 @@ public sealed partial class DbProxyHandlers
         BitConverter.GetBytes(ep.ReserveBonus).CopyTo(r, 25);
         BitConverter.GetBytes(ep.DailyLimit).CopyTo(r, 29);
         BitConverter.GetBytes(ep.ResetTime).CopyTo(r, 33);
+        BitConverter.GetBytes(ep.EpPoint).CopyTo(r, 49);
         return r;
     }
 
@@ -5448,6 +5631,20 @@ public sealed partial class DbProxyHandlers
         if (playerId > 0) EnteredAt[playerId] = nowUnix;
     }
 
+    /// <summary>
+    /// T188. Drop the enter stamp and the game id this player is registered under. Used by the
+    /// admin reset, which is the repair for a session that ended without a clean leave-world;
+    /// the play-time difference is deliberately NOT committed here, because a stamp left over
+    /// from a dead World session would bank time the character did not play.
+    /// </summary>
+    public static bool ForgetPlayer(int playerId)
+    {
+        if (playerId <= 0) return false;
+        bool had = EnteredAt.TryRemove(playerId, out _);
+        had |= GameIdByPlayer.TryRemove(playerId, out _);
+        return had;
+    }
+
     /// <summary>Seconds since the enter stamp, or 0 when there is none (never entered, or
     /// already closed out). Does NOT clear the stamp - S_PLAY_TIME asks mid-session.</summary>
     public static long SecondsInWorld(int playerId, long nowUnix)
@@ -5535,6 +5732,7 @@ public sealed partial class DbProxyHandlers
         // T147: gathering levels live in their own rows, like money; put them back where the
         // real Arbiter's column binding puts them (UserData +0x1C8..+0x1D4).
         if (found) ArtisanDb.StampGatheringProfs(chr!.WorldBlob, _store.GetGatheringProfs(playerId));
+        if (found) _store.StampCrests(playerId, chr!.WorldBlob); // T197: separately committed glyph changes survive a World restart.
         if (!found)
             _log.LogWarning("SDB_USER_ENTERWORLD: player {Id} has no world blob (found={F}, len={L}) - replying not-found",
                 playerId, chr != null, chr?.WorldBlob?.Length ?? 0);
@@ -5632,7 +5830,7 @@ public sealed partial class DbProxyHandlers
 
     private static IEnumerable<string?> DataFileCandidates(string name)
     {
-        var blob = Environment.GetEnvironmentVariable("TERASHARP_STARTER_BLOB");
+        var blob = TerasConfig.Get("TERASHARP_STARTER_BLOB");
         if (!string.IsNullOrEmpty(blob)) yield return Path.Combine(Path.GetDirectoryName(blob) ?? ".", name);
         string? dir = AppContext.BaseDirectory;
         for (int i = 0; i < 8 && !string.IsNullOrEmpty(dir); i++)
@@ -5640,7 +5838,7 @@ public sealed partial class DbProxyHandlers
             yield return Path.Combine(dir, "data", name);
             dir = Path.GetDirectoryName(dir.TrimEnd(Path.DirectorySeparatorChar));
         }
-        var root = Environment.GetEnvironmentVariable("TERASHARP_DATA") ?? @"D:\v100\TERA_SERVER.100";
+        var root = TerasConfig.Get("TERASHARP_DATA") ?? @"D:\v100\TERA_SERVER.100";
         yield return Path.Combine(root, "TeraSharp", "data", name);
     }
 
@@ -5715,8 +5913,8 @@ public sealed partial class DbProxyHandlers
     // ---- DSA_DUNGEON_TIMELINE_OPEN_INFO (0x13F2) -> N x AS_DUNGEON_TIMELINE_ON_OFF (0x1581) ----
     //
     // Layout, from the dumper at Arb_part_016.c:2781 (L"OpenInfo", L"DungeonId", L"CurrOpen",
-    // L"NextChange", L"SendSystemMessage") and the handler's own bounds check, which demands
-    // 0x16 more bytes of payload per node:
+    // L"NextChange", L"SendSystemMessage") and the handler's own bounds check, which decodes a
+    // node only while the read cursor plus 0x16 is still <= the frame length:
     //
     //   payload [0] u32 count   [4] u32 listOffset (FRAME-relative, 14)
     //   then count x 0x16-byte nodes:
@@ -5803,7 +6001,7 @@ public sealed partial class DbProxyHandlers
     // ---- Post-handshake config burst (T23) ----
     // 63 one-way A->W pushes the real Arbiter sends straight after the handshake, right after the
     // 0x294F -> 0x2955 + 0x2952 replay and before any player exists
-    // (<captures>\arb_world_2026-09-13T11-33-30-680Z.log seq 104-126, 11:42:22.403-.408).
+    // (D:\packetlogs\arb_world_2026-09-13T11-33-30-680Z.log seq 104-126, 11:42:22.403-.408).
     // Nothing in them carries a reqId or a DLM id, so none of it can head-block a user - which is
     // why login worked without them - but between them they configure VIP store slots, achievement
     // seasons, dark rift, GM events, play-guide rewards, five festivals, the in-game shop
@@ -5952,10 +6150,26 @@ public sealed partial class DbProxyHandlers
             var now = DateTimeOffset.UtcNow;
             ulong reset = DailyResetUnixSeconds(now);
             foreach (var (op, payload) in BuildHandshakeBurst(burst, now))
-                link.SendFrame(op, payload);
+                link.SendFrame(op, op == 0x157E && _store != null
+                    ? Handlers.QaDungeonCommands.BuildDisabledDungeons(_store.GetDisabledDungeons())
+                    : op == 0x14E9 ? Handlers.QaDungeonEvents.BuildRookieSnapshot(_store, now, rememberReplay: true)
+                    : op == 0x156B ? Handlers.QaFestivalCommands.DailySnapshot(_store, now)
+                    : op == 0x13B5 && Handlers.QaInventoryCommands.StyleWarehouseOverride is bool style ? new[] { style ? (byte)1 : (byte)0 }
+                    : Handlers.QaAchievementCommands.BootFrame(_store, op, now) ?? payload);
             _log.LogInformation("Post-handshake: sent {N} config pushes (0x15BD = {Now:u}, 0x14D1 daily reset = {Reset:u})",
                 burst.Count, now.UtcDateTime, DateTimeOffset.FromUnixTimeSeconds((long)reset).UtcDateTime);
         }
+
+        // T201: restore an explicitly persisted contents(type33) selection after the baseline configuration.
+        if (_store?.GetQaDecoUi() is int deco) link.SendFrame(0x1588, Handlers.QaUiCommands.BuildDecoContents(deco));
+        Handlers.QaDungeonEvents.ReplayAbnormalities(_store, link, DateTimeOffset.UtcNow);
+        Handlers.QaFestivalCommands.Replay(_store, link, DateTimeOffset.UtcNow);
+        Handlers.QaUtilityCommands.ReplayNonPk(_store, link);
+        Handlers.QaAwakenCommands.ReplayWorld(_store, link, DateTimeOffset.UtcNow);
+        Handlers.QaStyleShopCommands.ReplayWorld(_store, link, DateTimeOffset.UtcNow);
+        Handlers.QaItemPeriodCommands.Replay(_store, link, DateTimeOffset.UtcNow);
+        Handlers.QaPurchaseCommands.Replay(_store, link);
+        Handlers.QaNpcShopCommands.Replay(_store, link);
 
         // The FALLBACK, not the mechanism - the real Arbiter only ever echoes World's 0x13F2.
         // See the comment on PostHandshakeDungeonIds and status/HANDSHAKE-DATA.md section 0.
@@ -6453,6 +6667,14 @@ public sealed partial class DbProxyHandlers
         // T142b: character 1 used to return false here and be served the replay capture. See
         // CapturedInventoryPlayerId - she is a live character and is loaded like everyone else.
 
+        // T201: clear_inven is an authoritative empty bag, never a request for a fresh starter kit.
+        if (_store?.InventoryWasCleared(playerId) == true)
+        {
+            link.SendFrame(DBS_USER_LOAD_POCKET_DATA, BuildEmptyListType1(payload, 0));
+            link.SendFrame(DBS_USER_LOAD_INVENTORY, BagItems.BuildPayload(_store.GetInventoryItems(playerId), reqId, playerId));
+            return true;
+        }
+
         var template = LoadStarterInventory();
         if (template == null)
         {
@@ -6548,8 +6770,8 @@ public sealed partial class DbProxyHandlers
 
     private static IEnumerable<string?> StarterInventoryCandidates()
     {
-        yield return Environment.GetEnvironmentVariable("TERASHARP_STARTER_INVENTORY");
-        var blob = Environment.GetEnvironmentVariable("TERASHARP_STARTER_BLOB");
+        yield return TerasConfig.Get("TERASHARP_STARTER_INVENTORY");
+        var blob = TerasConfig.Get("TERASHARP_STARTER_BLOB");
         if (!string.IsNullOrEmpty(blob)) yield return Path.Combine(Path.GetDirectoryName(blob) ?? ".", "starter_inventory.bin");
         string? dir = AppContext.BaseDirectory;
         for (int i = 0; i < 8 && !string.IsNullOrEmpty(dir); i++)
@@ -6557,7 +6779,7 @@ public sealed partial class DbProxyHandlers
             yield return Path.Combine(dir, "data", "starter_inventory.bin");
             dir = Path.GetDirectoryName(dir.TrimEnd(Path.DirectorySeparatorChar));
         }
-        var root = Environment.GetEnvironmentVariable("TERASHARP_DATA") ?? @"D:\v100\TERA_SERVER.100";
+        var root = TerasConfig.Get("TERASHARP_DATA") ?? @"D:\v100\TERA_SERVER.100";
         yield return Path.Combine(root, "TeraSharp", "data", "starter_inventory.bin");
     }
 
@@ -6709,7 +6931,8 @@ public sealed partial class DbProxyHandlers
             return true;
         }
 
-        var body = ParcelDbHandlers.BuildParcelList(_store, (int)userDbId, out uint count, out uint maxPage);
+        // T202: ViewType 0 is the inbox, anything else is the Sent box - see BuildParcelList.
+        var body = ParcelDbHandlers.BuildParcelList(_store, (int)userDbId, viewType, out uint count, out uint maxPage);
         _log.LogInformation("SDB_LIST_PARCEL: user {User} view {View} page {Page} -> {N} parcel(s)",
             userDbId, viewType, curPage, count);
         link.SendFrame(DBS_LIST_PARCEL, ParcelDbHandlers.BuildDbsListParcel(
@@ -6750,11 +6973,22 @@ public sealed partial class DbProxyHandlers
             return true;
         }
 
+        int parcelType = record.Length >= ParcelDbHandlers.ParcelDataParcelType + 4
+            ? BitConverter.ToInt32(record, ParcelDbHandlers.ParcelDataParcelType) : 0;
+        if (!Handlers.QaMailBrokerCommands.CanMakeParcel(_store, pf.SenderDbId, recverDbId, parcelType,
+            out uint sendError, out bool senderFull))
+        {
+            if (senderFull) global::TeraSharp.Arbiter.Program.World?.SessionForPlayerId(pf.SenderDbId)
+                ?.Send(BuildSystemMessage("@1219"));
+            link.SendFrame(DBS_MAKE_PARCEL, ParcelDbHandlers.BuildDbsMakeParcel(null, dlmId,
+                ok: false, sendParcelError: sendError, recverDbId: (uint)recverDbId));
+            return true;
+        }
         var (atoms, parsed) = WarehouseHandlers.CloneAtomsWithIds(
             payload, ParcelDbHandlers.MakeReqTransListRef, ParcelDbHandlers.MakeRequestSize, _store.NextItemId);
 
         int parcelId = _store.CreateParcel(pf.SenderDbId, pf.SenderName, recverDbId,
-            pf.Title, message: string.Empty, pf.Money);
+            pf.Title, message: string.Empty, pf.Money, parcelType);
         if (record.Length > 0) _store.SetParcelRecord(parcelId, record);
 
         int slot = 0;
@@ -6850,28 +7084,97 @@ public sealed partial class DbProxyHandlers
             return true;
         }
 
+        // ---- T202, the live bug ---------------------------------------------------------
+        // "Receive all" is this opcode, not SDB_RECV_PARCEL, and it is two-step exactly like
+        // its single-parcel sibling (Handler_SDB_RECV_PARCEL_EX, Arb_part_071.c:15981,
+        // branches on Step at frame +0x1a). We were ignoring Step: step 1 was answered with
+        // ParcelCount 0 and an empty list - so World concluded there was nothing to collect and
+        // never sent step 2, the only frame that carries the insert atoms - while the same pass
+        // already marked every parcel collected and paid the gold. Parcel consumed, item never
+        // created (cap_mail1 21483/21484: 7 parcels claimed, 0 atoms, and no second 0x277d).
+        if (step <= ParcelStepRead) return RecvParcelExRead(link, payload, dlmId, step, ownerDbId);
+
         var (atoms, parsed) = WarehouseHandlers.CloneAtomsWithIds(
             payload, ParcelDbHandlers.RecvExReqRefB, ParcelDbHandlers.RecvExRequestSize, _store.NextItemId);
         var applied = WarehouseHandlers.Apply(_store, parsed, _store.NextItemId, _log);
 
-        uint remaining = 0;
+        // Which parcels this commit is for: the op-37 markers name them one each (T170), and the
+        // request's own id chain is the fallback for a commit that carries none.
+        var ids = ParcelDbHandlers.ParcelIdsFromAtoms(atoms);
+        if (ids.Count == 0)
+            ids = ParcelDbHandlers.ReadParcelIdChain(payload,
+                ParcelDbHandlers.RecvExReqRefA, ParcelDbHandlers.RecvExReqRefA + 4);
+        if (ids.Count == 0)
+            ids = _store.GetParcelsFor((int)ownerDbId).Where(r => !r.IsRecved).Select(r => r.ParcelId).ToList();
+
+        uint claimed = 0;
         long gold = 0;
-        foreach (var row in _store.GetParcelsFor((int)ownerDbId))
+        foreach (int id in ids)
         {
-            if (row.IsRecved) continue;
+            var row = _store.GetParcel(id);
+            if (row is null || row.IsRecved) continue;
             gold += ClaimParcelMoney(row, applied);
             _store.SetParcelRecved(row.ParcelId, row.ReceiverDbId);
-            remaining++;
-            // Only the first parcel of a "receive all" can be the one the atoms carried money
-            // for, so the rest are credited unconditionally.
+            claimed++;
+            // Only one parcel of a receive-all can be the one the atoms carried money for; the
+            // rest are credited from their own row.
             applied = applied with { CharacterMoneyDelta = 0 };
         }
 
         _log.LogInformation(
-            "SDB_RECV_PARCEL_EX: owner {Owner} step {Step} -> {N} parcel(s) claimed, {Gold} gold",
-            ownerDbId, step, remaining, gold);
+            "SDB_RECV_PARCEL_EX: owner {Owner} step {Step} -> {N} parcel(s) claimed, {Ins} inserted, {Chg} amount, {Gold} gold",
+            ownerDbId, step, claimed, applied.Inserted, applied.AmountChanged, gold);
         link.SendFrame(DBS_RECV_PARCEL_EX,
-            ParcelDbHandlers.BuildDbsRecvParcelEx(null, atoms, dlmId, step, noParcel: 0, ok: true));
+            ParcelDbHandlers.BuildDbsRecvParcelEx(null, atoms, dlmId, step, noParcel: claimed, ok: true));
+        return true;
+    }
+
+    /// <summary>
+    /// T202. <c>SDB_RECV_PARCEL_EX</c> step 1: <b>enumerate, mutate nothing</b>. The reply carries
+    /// one chain node per collectable parcel, each followed by that parcel's FULL 0xdd8 record -
+    /// the attachment slots at +0xd8 + i*0x1b0 are what World reads to build the step-2 atoms -
+    /// plus the total at <c>ParcelCount</c>, which is the field World tests before it bothers with
+    /// a step 2.
+    ///
+    /// <para><c>IsAllParcel</c> means every uncollected parcel of the owner; otherwise the request
+    /// names them in its own id chain. An already-collected row is skipped, which is what the real
+    /// enumerator does with a record whose status is 2 (Arb_part_072.c:6028).</para>
+    ///
+    /// <para><b>One deliberate deviation.</b> The real writer pages at ten records per frame and
+    /// sends the pages back to back; no capture holds the real Arbiter answering this opcode at
+    /// all, so rather than repeat a DlmId on a second frame - the one mistake that head-blocks a
+    /// user for the life of the World process - this sends a single page and logs the rest. The
+    /// player presses the button again for them.</para>
+    /// </summary>
+    private bool RecvParcelExRead(WorldLink link, byte[] payload, uint dlmId, uint step, uint ownerDbId)
+    {
+        bool isAll = ParcelDbHandlers.U8(payload, ParcelDbHandlers.RecvExReqIsAllParcel) != 0;
+        var rows = new List<CharacterStore.ParcelRow>();
+        if (isAll)
+        {
+            foreach (var row in _store!.GetParcelsFor((int)ownerDbId))
+                if (!row.IsRecved) rows.Add(row);
+        }
+        else
+        {
+            foreach (int id in ParcelDbHandlers.ReadParcelIdChain(payload,
+                         ParcelDbHandlers.RecvExReqRefA, ParcelDbHandlers.RecvExReqRefA + 4))
+                if (_store!.GetParcel(id) is { IsRecved: false } row) rows.Add(row);
+        }
+
+        int page = Math.Min(rows.Count, ParcelDbHandlers.RecvExRecordsPerFrame);
+        var records = new List<byte[]>(page);
+        for (int i = 0; i < page; i++) records.Add(ParcelDbHandlers.FullParcelRecord(_store!, rows[i]));
+        var (chain, count, head) = ParcelDbHandlers.BuildRecvParcelExRecordList(records);
+
+        if (rows.Count > page)
+            _log.LogWarning("SDB_RECV_PARCEL_EX: owner {Owner} has {N} collectable parcel(s); serving {Page} this pass",
+                ownerDbId, rows.Count, page);
+        _log.LogInformation(
+            "SDB_RECV_PARCEL_EX: owner {Owner} step {Step} all={All} -> {N} record(s), nothing claimed yet",
+            ownerDbId, step, isAll, count);
+        link.SendFrame(DBS_RECV_PARCEL_EX, ParcelDbHandlers.BuildDbsRecvParcelEx(
+            count, head, chain, null, dlmId, step, noParcel: (uint)rows.Count, ok: true));
         return true;
     }
 

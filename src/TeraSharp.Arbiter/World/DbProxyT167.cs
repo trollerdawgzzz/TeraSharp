@@ -14,6 +14,7 @@ namespace TeraSharp.Arbiter.World;
 /// 446/447, 431/432 - every one an empty state) and are byte-exact; everything else is
 /// DECOMPILE-DERIVED and says so where it is built. Offsets below are PAYLOAD offsets (frame - 6).
 /// Every handler answers, whatever the payload length: a short frame reads as zeros.
+/// T190 adds real cap_2man_b pairs for card load/preset/combine writes; see T190Cards.cs.
 /// </summary>
 public sealed partial class DbProxyHandlers
 {

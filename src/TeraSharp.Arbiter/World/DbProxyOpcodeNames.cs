@@ -15,7 +15,7 @@ namespace TeraSharp.Arbiter.World;
 /// SDB_/DBS_ prefixes are kept because the DB-proxy path also pushes AS_/SA_ messages in this range
 /// (e.g. 0x2847 AS_LOAD_POCKET_NAME_INFO).
 ///
-/// Opcodes outside this range are named by <c><captures>\world_opcodes.txt</c> (AS_/SA_/DSA_/BSA_).
+/// Opcodes outside this range are named by <c>D:\packetlogs\world_opcodes.txt</c> (AS_/SA_/DSA_/BSA_).
 /// </summary>
 public static class DbProxyOpcodeNames
 {

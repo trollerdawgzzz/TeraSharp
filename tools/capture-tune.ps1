@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 the TeraSharp contributors
+
 <#
 .SYNOPSIS
     T149 - temporary, capture-only datasheet tweaks so two or three GM characters can drive guild

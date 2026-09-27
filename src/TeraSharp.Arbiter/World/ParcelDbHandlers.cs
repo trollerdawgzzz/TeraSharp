@@ -52,12 +52,12 @@ public static class ParcelDbHandlers
     //   FUN_140350eb0(&pkt, 0x2778)                    opcode
     //   slotA = cursor; *slotA = 0; u32 0              DataList offset
     //   slotB = cursor; *slotB = 0; u32 0              DataList bytes
-    //   u32 uVar3   = *(u32*)(request + 6)             DlmId, echoed
-    //   u8  uVar11                                     Success
-    //   u32 uVar4   = *(u32*)(request + 0xe)           ViewType, echoed
-    //   u32 uVar10  = *(u32*)(request + 0x12)          CurPage, echoed
-    //   u32                                            MaxPage, set by the handler
-    //   u32                                            ParcelCount, likewise
+    //   u32 dlmId    = *(u32*)(request + 6)            DlmId, echoed
+    //   u8  success                                    Success
+    //   u32 viewType = *(u32*)(request + 0xe)          ViewType, echoed
+    //   u32 curPage  = *(u32*)(request + 0x12)         CurPage, echoed
+    //   u32 maxPage                                    MaxPage, a handler local
+    //   u32 parcelCount                                ParcelCount, a handler local
     //   *slotA = frameLength                           ALWAYS - even for an empty list
     //   if (list non-empty) { append N x 0x9e8; *slotB = N * 0x9e8; }
     public const int ListReplyHeader = 29;              // payload bytes before the list
@@ -70,7 +70,7 @@ public static class ParcelDbHandlers
     public const int ListRspParcelCount = 25;
 
     /// <summary><c>ParcelDataNoMsg</c>, 0x9e8 bytes — the stride the writer copies with and the
-    /// size its bounds check demands of the remaining room, per record.</summary>
+    /// size its bounds check tests (<c>capacity &lt; frameLength + 0x9e8</c>).</summary>
     public const int ParcelDataNoMsgSize = 0x9e8;
 
     // --- SDB_MAKE_PARCEL 0x2779 -> DBS_MAKE_PARCEL 0x277a ---
@@ -180,9 +180,9 @@ public static class ParcelDbHandlers
     ///
     /// <para><b>The empty form is byte-exact from the decompile alone.</b> Every field is either
     /// echoed from the request (DlmId, ViewType, CurPage) or a value
-    /// <c>Handler_SDB_LIST_PARCEL</c> sets before it consults the parcel manager:
-    /// MaxPage 1 and ParcelCount 0, both set at Arb_part_071.c:15334.
-    /// The list offset slot is backpatched to the running frame length <i>unconditionally</i>
+    /// <c>Handler_SDB_LIST_PARCEL</c> sets before it consults the parcel manager: MaxPage is
+    /// preset to 1 and ParcelCount to 0 at Arb_part_071.c:15334.
+    /// The list offset slot is backpatched to the running frame length <i>unconditionally</i>,
     /// which for an empty list is exactly 35; the byte-count
     /// slot is only written inside the non-empty branch, so it stays 0. A fresh character's
     /// inbox is therefore the 35-byte frame
@@ -249,15 +249,33 @@ public static class ParcelDbHandlers
         return p;
     }
 
-    /// <summary>DBS_RECV_PARCEL_EX (0x277e).</summary>
+    /// <summary>
+    /// DBS_RECV_PARCEL_EX (0x277e) with no record list: the step-2 shape, and the refusal.
+    ///
+    /// <para><b>T202.</b> The first field pair is NOT a binary ref - it is the ParcelDataList
+    /// offset CHAIN (<c>[u32 count][u32 head frame offset]</c>), so an empty list writes
+    /// <b>0</b> and <b>0</b>, not the running frame length. Writing 35 there made World read
+    /// <i>count = 35</i>; only a zero head offset kept that from being followed.</para>
+    /// </summary>
     public static byte[] BuildDbsRecvParcelEx(byte[]? a, byte[]? b, uint dlmId, uint step,
                                               uint noParcel, bool ok)
+        => BuildDbsRecvParcelEx(listCount: 0, listHead: 0, a, b, dlmId, step, noParcel, ok);
+
+    /// <summary>
+    /// DBS_RECV_PARCEL_EX (0x277e). <paramref name="listCount"/> / <paramref name="listHead"/> are
+    /// the ParcelDataList chain head at payload +0x00/+0x04 and <paramref name="a"/> is the chain
+    /// itself (<see cref="BuildRecvParcelExRecordList"/>); <paramref name="b"/> is the atom ref at
+    /// +0x08/+0x0C. <paramref name="noParcel"/> is the ParcelCount World reads to decide whether a
+    /// step 2 is worth sending.
+    /// </summary>
+    public static byte[] BuildDbsRecvParcelEx(uint listCount, uint listHead, byte[]? a, byte[]? b,
+                                              uint dlmId, uint step, uint noParcel, bool ok)
     {
         a ??= Array.Empty<byte>();
         b ??= Array.Empty<byte>();
         var p = new byte[RecvExReplyHeader + a.Length + b.Length];
-        BitConverter.GetBytes((uint)(6 + RecvExReplyHeader)).CopyTo(p, RecvExRspRefA);
-        BitConverter.GetBytes((uint)a.Length).CopyTo(p, RecvExRspRefA + 4);
+        BitConverter.GetBytes(listCount).CopyTo(p, RecvExRspRefA);
+        BitConverter.GetBytes(listHead).CopyTo(p, RecvExRspRefA + 4);
         BitConverter.GetBytes((uint)(6 + RecvExReplyHeader + a.Length)).CopyTo(p, RecvExRspRefB);
         BitConverter.GetBytes((uint)b.Length).CopyTo(p, RecvExRspRefB + 4);
         BitConverter.GetBytes(dlmId).CopyTo(p, RecvExRspDlmId);
@@ -267,6 +285,97 @@ public static class ParcelDbHandlers
         a.CopyTo(p, RecvExReplyHeader);
         b.CopyTo(p, RecvExReplyHeader + a.Length);
         return p;
+    }
+
+    /// <summary>Records a single DBS_RECV_PARCEL_EX step-1 frame carries. The real writer pages
+    /// at ten; we send one page and say so rather than repeat a DlmId on a second frame.</summary>
+    public const int RecvExRecordsPerFrame = 10;
+    /// <summary>One chain node: <c>[u32 here][u32 next][u32 dataOffset][u32 dataLen]</c>.</summary>
+    public const int RecvExNodeSize = 16;
+
+    /// <summary>
+    /// T202. The step-1 ParcelDataList: one node per parcel, each followed by its full
+    /// <see cref="World.SystemParcelAttachments.ParcelRecordSize"/>-byte record. Offsets are
+    /// FRAME-relative, so the first node sits at <c>6 + RecvExReplyHeader</c>.
+    /// </summary>
+    public static (byte[] Chain, uint Count, uint Head) BuildRecvParcelExRecordList(
+        IReadOnlyList<byte[]> records)
+    {
+        ArgumentNullException.ThrowIfNull(records);
+        if (records.Count == 0) return (Array.Empty<byte>(), 0u, 0u);
+        int rec = SystemParcelAttachments.ParcelRecordSize, stride = RecvExNodeSize + rec;
+        uint first = 6 + (uint)RecvExReplyHeader;
+        var chain = new byte[records.Count * stride];
+        for (int i = 0; i < records.Count; i++)
+        {
+            if (records[i] is null || records[i].Length != rec)
+                throw new ArgumentException("ParcelData record size", nameof(records));
+            uint here = first + (uint)(i * stride);
+            int at = i * stride;
+            BitConverter.GetBytes(here).CopyTo(chain, at);
+            BitConverter.GetBytes(i + 1 < records.Count ? here + (uint)stride : 0u).CopyTo(chain, at + 4);
+            BitConverter.GetBytes(here + (uint)RecvExNodeSize).CopyTo(chain, at + 8);
+            BitConverter.GetBytes((uint)rec).CopyTo(chain, at + 12);
+            records[i].CopyTo(chain, at + RecvExNodeSize);
+        }
+        return (chain, (uint)records.Count, first);
+    }
+
+    /// <summary>
+    /// T202. The full 0xdd8 record for one parcel, padded when the stored one is the shorter
+    /// 0x9e8 form. Step 1 must hand World the long form: the attachment slots live at
+    /// +0xd8 + i*0x1b0, well past 0x9e8, and they are what World builds its step-2 atoms from.
+    /// </summary>
+    public static byte[] FullParcelRecord(CharacterStore store, CharacterStore.ParcelRow row)
+    {
+        var served = ServedParcelRecord(store, row, full: true);
+        if (served.Length == SystemParcelAttachments.ParcelRecordSize) return served;
+        var rec = new byte[SystemParcelAttachments.ParcelRecordSize];
+        Buffer.BlockCopy(served, 0, rec, 0, Math.Min(served.Length, rec.Length));
+        return rec;
+    }
+
+    /// <summary>
+    /// T202. The parcel ids in a request's offset chain at payload +0x00/+0x04: nodes are
+    /// <c>[u32 here][u32 next][u32 parcelId]</c> and the head is frame-relative. A node that
+    /// does not point at itself, repeats, or runs off the payload ends the walk - a malformed
+    /// chain must not throw, because an unanswered DB request head-blocks the user.
+    /// </summary>
+    public static IReadOnlyList<int> ReadParcelIdChain(byte[] payload, int countAt, int headAt)
+    {
+        var ids = new List<int>();
+        if (payload is null) return ids;
+        uint count = U32(payload, countAt), next = U32(payload, headAt);
+        if (count == 0 || count > (uint)(payload.Length / 12)) return ids;
+        var seen = new HashSet<uint>();
+        for (uint i = 0; i < count && next >= 6u; i++)
+        {
+            if (!seen.Add(next)) break;
+            uint at = next - 6u;
+            if (at + 12u > (uint)payload.Length || U32(payload, (int)at) != next) break;
+            ids.Add((int)U32(payload, (int)at + 8));
+            next = U32(payload, (int)at + 4);
+        }
+        return ids;
+    }
+
+    /// <summary>
+    /// T202. The parcel ids the op-37 markers carry, at atom +0x278 (T170). This is the
+    /// authoritative list on a commit: World names one marker per parcel it is collecting.
+    /// </summary>
+    public static IReadOnlyList<int> ParcelIdsFromAtoms(byte[] atoms)
+    {
+        var ids = new List<int>();
+        if (atoms is null) return ids;
+        int size = DbProxyHandlers.ItemAtomSize;
+        for (int at = 0; at + size <= atoms.Length; at += size)
+        {
+            if (BitConverter.ToUInt32(atoms, at + WarehouseHandlers.AtomOp) != WarehouseHandlers.TsRecvParcel)
+                continue;
+            int id = BitConverter.ToInt32(atoms, at + WarehouseHandlers.AtomRecvParcelId);
+            if (id > 0 && !ids.Contains(id)) ids.Add(id);
+        }
+        return ids;
     }
 
     /// <summary>DBS_RETURN_PARCEL (0x2782) and DBS_DELETE_PARCEL (0x2812) share a shape:
@@ -475,7 +584,10 @@ public static class ParcelDbHandlers
         BitConverter.GetBytes(row.ParcelId).CopyTo(rec, ParcelDataParcelId);
         BitConverter.GetBytes(row.ReceiverDbId).CopyTo(rec, ParcelDataReceiverDbId);
         // T79: and the two fields only we know - see the constants above.
-        BitConverter.GetBytes(row.IsRead ? 1 : 0).CopyTo(rec, ParcelDataIsRead);
+        // T196: native status 2 means attachments claimed (cap_final2b 28054 -> 28068 ->
+        // 28113: 0 -> 1 -> 2). A claimed system reward must not advertise itself as claimable.
+        int status = row.ParcelType == ParcelTypeSystem && row.IsRecved ? 2 : row.IsRead ? 1 : 0;
+        BitConverter.GetBytes(status).CopyTo(rec, ParcelDataIsRead);
         WriteRecordDate(rec, ParcelDataCreatedAt, store.GetParcelCreatedUtc(row.ParcelId));
         return rec;
     }
@@ -513,9 +625,23 @@ public static class ParcelDbHandlers
     /// </summary>
     public static byte[] BuildParcelList(CharacterStore store, int receiverDbId,
                                          out uint parcelCount, out uint maxPage)
+        => BuildParcelList(store, receiverDbId, viewType: 0, out parcelCount, out maxPage);
+
+    /// <summary>
+    /// T202. <paramref name="viewType"/> picks the list: <b>0 is the inbox, ANY non-zero value is
+    /// the Sent box</b>. <c>Handler_SDB_LIST_PARCEL</c> passes it to <c>FUN_140965bc0</c>
+    /// (Arb_part_082.c:5336), which branches <c>ParcelOwner::GetRecvList</c> on zero and
+    /// <c>GetSentList</c> on everything else - the client sends 1 and 0xffffffff for Sent and
+    /// both must land there (cap_social2 2420 view 1 and 2442 view -1 return the same sent
+    /// parcel). Ignoring it served the inbox for Sent, so every system reward also appeared in
+    /// Sent; a system parcel has sender 0 and drops out of the sent query by itself
+    /// (cap_final2b 52741 view 0 -> 3 rows, 52834 view -1 -> 0 rows).
+    /// </summary>
+    public static byte[] BuildParcelList(CharacterStore store, int userDbId, uint viewType,
+                                         out uint parcelCount, out uint maxPage)
     {
         ArgumentNullException.ThrowIfNull(store);
-        var rows = store.GetParcelsFor(receiverDbId);
+        var rows = viewType == 0 ? store.GetParcelsFor(userDbId) : store.GetParcelsSentBy(userDbId);
         parcelCount = (uint)rows.Count;
         maxPage = 1;
         if (rows.Count == 0) return Array.Empty<byte>();

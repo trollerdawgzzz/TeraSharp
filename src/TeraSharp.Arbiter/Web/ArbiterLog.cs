@@ -69,7 +69,7 @@ public sealed class ArbiterLogProvider : ILoggerProvider
 
     /// <summary>As above, against the live environment.</summary>
     public static LogLevel ConsoleLevel()
-        => ConsoleLevel(Environment.GetEnvironmentVariable(LevelVariable));
+        => ConsoleLevel(TerasConfig.Get(LevelVariable));
 
     /// <summary>The file this day's lines go to: <c>arbiter-yyyy-MM-dd.log</c>.</summary>
     public static string FileNameFor(DateTime day)

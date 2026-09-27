@@ -98,7 +98,7 @@ public static class WorldRegistration
     /// </code>
     /// The first three are echoed from the request - the link is being told which of its own
     /// sockets this is. Verified byte-for-byte against all 25 pairs in
-    /// <c><captures>\arb_world_2026-09-13T11-33-30-680Z.log</c> (frames 17/18 .. 25 links).
+    /// <c>D:\packetlogs\arb_world_2026-09-13T11-33-30-680Z.log</c> (frames 17/18 .. 25 links).
     /// </summary>
     public static byte[] Build(bool isBypass, int worldId, int bypassIndex, int result,
                                int arbiterVersion = ArbiterVersion)

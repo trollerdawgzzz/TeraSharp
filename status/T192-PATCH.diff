@@ -1,0 +1,239 @@
+--- a/src/TeraSharp.Arbiter/World/WorldBridge.cs
++++ b/src/TeraSharp.Arbiter/World/WorldBridge.cs
+@@ -116,6 +116,7 @@
+     /// </summary>
+     private readonly Dictionary<ulong, GameSession> _players = new();
+     private readonly object _playersLock = new();
++    private readonly CrossWorldHandoff _crossWorld = new();   // T192: live enter data + type-2 continuation
+ 
+     /// <summary>Allocate a unique tunnel Ticket for a new player session.</summary>
+     internal uint AllocateTunnelKey() => AllocateTunnelKey(WorldRegistration.DefaultWorldId);
+@@ -125,7 +126,11 @@
+ 
+     public void RegisterPlayer(GameSession s)
+     {
+-        lock (_playersLock) _players[s.GameId] = s;
++        lock (_playersLock)
++        {
++            _players[s.GameId] = s;
++            CharacterTransientState.PlayerRegistered(this, s.PlayerId);   // T192: supersede a departed owner
++        }
+         lock (_reorderLock)
+         {
+             _tunnels[(s.CurrentWorldId, s.TunnelKey)] = new TunnelReorderBuffer { Deliver = p => Handlers.ArbiterClientHandlers.DeliverTunnelled(s, p) };   // T121: inject S_ADMIN_GM_SKILL before the tunnelled S_LOAD_TOPO
+@@ -139,8 +144,13 @@
+     /// <summary>T111: the Ticket is freed in its own World's space and unkeyed with it.</summary>
+     public void UnregisterPlayer(ulong gameId, int worldId, uint tunnelKey)
+     {
+-        lock (_playersLock) _players.Remove(gameId);
++        lock (_playersLock)
++        {
++            if (_players.Remove(gameId, out var removed))
++                CharacterTransientState.PlayerUnregistered(this, worldId, removed.PlayerId);
++        }
+         DbProxy?.UserControls.Forget(gameId);   // T180: User-owned hold/departure lifetime
++        _crossWorld.Forget(gameId);   // T192: a disconnected session must not finish an old transfer
+         lock (_reorderLock)
+         {
+             _tunnels.Remove((worldId, tunnelKey));
+@@ -268,6 +278,26 @@
+             }
+             _departed.Clear();   // T161: World restarted - its ticket table went with it
+         }
++        _crossWorld.Clear();
++        CharacterTransientState.ResetWorldSessions(this);   // T192: same lifetime as the World process
++    }
++
++    /// <summary>T192. Reset only the World whose final link disconnected.</summary>
++    internal void ResetTunnelSequenceForWorld(int worldId)
++    {
++        lock (_reorderLock)
++        {
++            foreach (var pair in _tunnels.Where(pair => pair.Key.World == worldId))
++            {
++                pair.Value.Pending.Clear();
++                pair.Value.NextSeq = 0;
++                pair.Value.LastDelivery = DateTime.UtcNow;
++            }
++            _departed.ClearWorld(worldId);
++        }
++        _crossWorld.ForgetWorld(worldId);
++        int reset = CharacterTransientState.ResetWorldSessions(this, worldId);
++        if (reset != 0) _log.LogWarning("World {W} disconnected - reset transient state for {N} character(s)", worldId, reset);
+     }
+ 
+     /// <summary>Reset ONE player's reorder buffer (their re-enter), leaving the others' queues alone.</summary>
+@@ -363,27 +393,30 @@
+             var link = new WorldLink(Interlocked.Increment(ref _nextLinkId), sock, this, _log);
+             lock (_lock) _links.Add(link);
+             _log.LogInformation("WorldServer link #{Id} connected ({N} active)", link.Id, _links.Count);
+-            _ = link.RunAsync(ct).ContinueWith(_ =>
+-            {
+-                int remaining, mine;
+-                lock (_lock)
+-                {
+-                    _links.Remove(link);
+-                    remaining = _links.Count;
+-                    mine = _links.Count(l => l.WorldId == link.WorldId);
+-                }
+-                if (mine == 0)
+-                {
+-                    // T108: only THIS World stops taking players, and its instances go with it.
+-                    _worlds.For(link.WorldId).MarkDisconnected();
+-                    DungeonRouting.Channels.ForgetWorld(link.WorldId);
+-                    DungeonRouting.Transfers.ForgetWorld(link.WorldId);
+-                    _log.LogWarning("World {W} fully disconnected - not ready", link.WorldId);
+-                }
+-                _log.LogInformation("WorldServer link #{Id} closed ({N} active)", link.Id, remaining);
+-            }, ct);
++            _ = link.RunAsync(ct).ContinueWith(_ => OnWorldLinkClosed(link), CancellationToken.None);
+         }
+         listener.Stop();
++    }
++
++    // Also used by the disconnect regression: closing a worker must not reset the whole World.
++    internal void OnWorldLinkClosed(WorldLink link)
++    {
++        int remaining, mine;
++        lock (_lock)
++        {
++            if (!_links.Remove(link)) return;   // one cleanup per actual link
++            remaining = _links.Count;
++            mine = _links.Count(l => l.WorldId == link.WorldId);
++            if (mine == 0) _worlds.For(link.WorldId).MarkDisconnected();
++        }
++        if (mine == 0)
++        {
++            ResetTunnelSequenceForWorld(link.WorldId);
++            DungeonRouting.Channels.ForgetWorld(link.WorldId);
++            DungeonRouting.Transfers.ForgetWorld(link.WorldId);
++            _log.LogWarning("World {W} fully disconnected - not ready", link.WorldId);
++        }
++        _log.LogInformation("WorldServer link #{Id} closed ({N} active)", link.Id, remaining);
+     }
+ 
+     private async Task StallWatchdog(CancellationToken ct)
+@@ -470,19 +503,47 @@
+             int owner = continent is int c ? (DungeonRouting.Channels.WorldForContinent(c) ?? link.WorldId) : link.WorldId;
+             if (owner != link.WorldId && LinksOf(owner).Count > 0)
+             {
+-                var reply = ContinentHandoff.EnterReply(payload);
++                // T192: full+6 is an opaque User handle, not UserDbId. The old captured
++                // prefix addressed every request to player 1 (handoff1's requester was 10).
++                var user = payload.Length >= DbProxyHandlers.RequestEnterDungeonMinPayload
++                    ? ResolveControlUser(BitConverter.ToUInt64(payload, 0)) : null;
++                if (user == null)
++                {
++                    _log.LogWarning("0x13BE continent {C}: unknown user handle or short request - dropped", continent);
++                    return;
++                }
++                var reply = ContinentHandoff.EnterReply(payload, user.PlanetId, user.UserDbId);
+                 if (reply != null)
+                 {
+-                    _log.LogInformation("0x13BE continent {C} from world {From} -> 0x13BF to world {To}", continent, link.WorldId, owner);
++                    DbProxy?.RecordDungeonEntry(payload, response: false, resolvedPlayerId: (int)user.UserDbId);
++                    _log.LogInformation("0x13BE player {Pid} continent {C} from world {From} -> 0x13BF to world {To}", user.UserDbId, continent, link.WorldId, owner);
+                     SendFrame(owner, ContinentHandoff.AS_ENTER_CONTINENT, reply);
+                     return;
+                 }
+             }
+         }
+-        else if (op == ContinentHandoff.SA_CONTINENT_READY && link.WorldId != 0 && LinksOf(0).Count > 0)   // 0x13C0 on an owner link
+-        {
+-            var reply = ContinentHandoff.ReadyReply(payload);
+-            if (reply != null) { SendFrame(0, ContinentHandoff.AS_CONTINENT_READY, reply); return; }
++        else if (op == ContinentHandoff.SA_CONTINENT_READY)
++        {
++            // Arb_part_062.c:13719-13741 resolves the returned PDId, then sends to that
++            // user's current World. The source can itself be a DungeonServer, not only 0.
++            var user = payload.Length >= DbProxyHandlers.ResponseEnterDungeonMinPayload
++                ? SessionForPlayerId(BitConverter.ToInt32(payload, ContinentHandoff.UserDbIdOffset)) : null;
++            if (user == null)
++            {
++                _log.LogWarning("0x13C0: unknown user PDId or short response - dropped");
++                return;
++            }
++            if (user.CurrentWorldId != link.WorldId)
++            {
++                if (HasLinks(user.CurrentWorldId))
++                {
++                    DbProxy?.RecordDungeonEntry(payload, response: true, resolvedPlayerId: (int)user.PlayerId);
++                    SendFrame(user.CurrentWorldId, ContinentHandoff.AS_CONTINENT_READY,
++                        ContinentHandoff.ReadyReply(payload)!);
++                }
++                return;
++            }
++            // Same-World requests retain the existing DbProxy path and its state updates.
+         }
+ 
+         switch (op)
+@@ -555,6 +616,25 @@
+                 foreach (var r in frame.Recipients)
+                     DeliverTunnelPacket(link.WorldId, r.Ticket, r.Sequence,
+                         solo ? frame.ClientPacket : (byte[])frame.ClientPacket.Clone());
++                return;
++            }
++
++            case CrossWorldHandoff.SA_TELEPORT:
++            {
++                var move = CrossWorldHandoff.Parse(payload);
++                var user = move == null ? null : PlayerForGameId(move.UserHandle);
++                if (move == null || user == null || user.CurrentWorldId != link.WorldId) return;
++                int? owner = move.TargetWorld >= 0 ? move.TargetWorld
++                    : DungeonRouting.Channels.WorldForChannel(move.Continent, unchecked((int)move.Channel))
++                        ?? DungeonRouting.Channels.WorldForContinent(move.Continent);
++                if (owner is not int target || !HasLinks(target)
++                    || !_crossWorld.Begin(link.WorldId, target, move, user.PlayerId))
++                {
++                    _log.LogWarning("SA_TELEPORT player {Pid}: missing target World, live enter data, or duplicate transfer", user.PlayerId);
++                    return;
++                }
++                // Native TeleportStart calls LeaveWorldStart(type2); no lobby response.
++                link.SendFrame(OpLeaveWorld, CrossWorldHandoff.BuildLeave(move, user.PlayerId));
+                 return;
+             }
+ 
+@@ -615,6 +695,7 @@
+             _log.LogWarning("0x{Op:X4}: world {W} has no links - frame dropped", op, worldId);
+             return;
+         }
++        if (op == OpPlayerEnter) _crossWorld.RememberEnter(worldId, payload);
+         primary.SendFrame(op, payload);
+     }
+ 
+@@ -794,6 +875,35 @@
+         var session = FindPlayer(gameId) ?? FindPlayer(gameId | 0x80000AF00000UL);
+         if (session != null)
+         {
++            if (payload.Length >= 24 && BitConverter.ToUInt32(payload, 16) == 2)
++            {
++                var transfer = _crossWorld.Take(gameId, link.WorldId);
++                if (transfer == null || !session.InWorld || !HasLinks(transfer.DestinationWorld))
++                {
++                    _log.LogWarning("Type-2 SA_LEAVE_WORLD for {G:X}: no live transfer destination", gameId);
++                    return;
++                }
++                // All source saves precede this confirmation (retail7903 -> 7906). Native
++                // LeaveWorldEnd commits the destination before owner138E/2711; preserve login
++                // account/session fields and update only the captured transfer fields.
++                DbProxy?.CommitTeleportLocation((int)session.PlayerId, transfer.Move, transfer.DestinationWorld);
++                UnregisterPlayer(session.GameId, session.CurrentWorldId, session.TunnelKey);
++                session.CurrentWorldId = transfer.DestinationWorld;
++                session.TunnelKey = AllocateTunnelKey(session.CurrentWorldId);
++                RegisterPlayer(session);
++                PartyWiring.Register(session);
++                LeaveGate.Shared.StartTransfer(session.GameId);
++                var enter = CrossWorldHandoff.BuildEnter(transfer.PreviousEnter, transfer.Move, session.TunnelKey);
++                // Matching can form a party after login. Native EnterWorldStart reads the
++                // current Party each time (Arb028:15773-15781/15847-15850), not the login snapshot.
++                var party = PartyWiring.Manager.FindByMember((int)session.PlayerId);
++                BitConverter.GetBytes((ulong)(party?.Id ?? 0)).CopyTo(enter, 94);
++                enter[102] = party?.IsSys == true ? (byte)1 : (byte)0;
++                SendFrame(session.CurrentWorldId, OpPlayerEnter, enter);
++                _log.LogInformation("Transferred player {Pid} from World {From} to {To} ({Continent}/{Channel})",
++                    session.PlayerId, link.WorldId, session.CurrentWorldId, transfer.Move.Continent, transfer.Move.Channel);
++                return;
++            }
+             DbProxy?.CommitPlayTime((int)(session.SelectedCharacter?.Id ?? 0), DateTimeOffset.UtcNow.ToUnixTimeSeconds());   // T113
+             session.OnWorldLeaveConfirmed();
+         }

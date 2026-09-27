@@ -6,7 +6,7 @@
 > Arbiter waits three seconds and re-sends `AS_ENTER_WORLD` pointed at the character's stored
 > return point.
 
-**Ground truth**: `<captures>\arb_world_2026-09-13T11-33-30-680Z.log`, the "Test" (playerId 2)
+**Ground truth**: `D:\packetlogs\arb_world_2026-09-13T11-33-30-680Z.log`, the "Test" (playerId 2)
 login at seq 835-2036. Condensed listing `cap_relog9827_ctl.txt`, full frames
 `cap_relog9827_frames.txt`. Decompile: `ArbiterServer.exe.c` (the one-file Ghidra output staged
 for this session; the same functions are in `Arb_part_*.c`).
@@ -26,8 +26,9 @@ ChannelInstanceId **0**, and no 0x138D.
 
 ## 1. `SA_ENTER_WORLD_FAIL` (0x138D) — 38-byte fixed frame
 
-Field names are the Arbiter's own, from its packet dumper for `"SA_ENTER_WORLD_FAIL"`, which
-labels the frame with that string and rejects anything whose length is not above `0x25`.
+Field names are the Arbiter's own, from its packet dumper for `"SA_ENTER_WORLD_FAIL"`: it
+`wcscpy_s`-es that literal into the caller's `0x100`-wide name buffer, and only after checking the
+length the caller passed is greater than `0x25` - so 38 bytes is the shortest frame it will name.
 Offsets below are **payload** (frame - 6), which is what `DbProxyHandlers` works in.
 
 | payload | frame | type | name | seq 836 |
@@ -44,10 +45,14 @@ reads frame `0x1e` and `0x22`, logs
 `[ERROR] Handler_SA_ENTER_WORLD_FAIL (DbId:%d, Name:%s, LoginState:%d, continent:%d reason:%d)`,
 and schedules a `User::DoTimerJob` **3000 ms** out:
 
-The job it queues carries `User::EnterWorldFail` as its entry point and the `User*` alongside
-it, and copies two fields out of the frame into the job: `ContinuousDungeonId` from frame+0x1E
-into job+0x80, and `FailReason` from frame+0x22 into job+0x84. The job is then scheduled 3000 ms
-out.
+```c
+// the timer job block, filled from the front in 8-byte steps, then queued
+job+0x70 = FUN_140382970;            // the callback: User::EnterWorldFail
+job+0x78 = user;                     // its argument
+job+0x80 = frame[0x1e];              // u32 ContinuousDungeonId, copied out of the packet
+job+0x84 = frame[0x22];              // u32 FailReason
+FUN_14003e660(..., job, 3000, 0);    // queue it: 3000 ms delay, flags 0
+```
 
 seq 836 is at 11:45:56.587 and seq 841/842/843 at 11:45:59.601-.604 — **3.014 s**, i.e. that timer.
 We fire immediately instead; nothing in World depends on the delay.
@@ -69,12 +74,15 @@ Scope tracer `"void __cdecl User::EnterWorldFail(enum EnterWorldFailReason,int)"
    * `FUN_140717090(ContinentManager, &pos, failedContinent)` → `User+0x18c/0x190/0x194` — the
      fallback position from the same table
    * `User+0x3b74 = 0` (u64), `User+0x3b7c = 0` (u8)
-5. **Then the override that actually produced seq 843:**
-
-When `User+0x1a8` holds a stored SysReturnLoc greater than zero, it overrides the five fields
-just set: continent from `+0x1a8`, channelInstanceId from `+0x1ac`, and x/y/z widened from the
-ints at `+0x1b0`, `+0x1b4` and `+0x1b8` into the floats at `+0x18c`, `+0x190` and `+0x194`. It
-then clears the stored return point.
+5. **Then the override that actually produced seq 843.** If the stored SysReturnLoc continent at
+   `User+0x1a8` is **greater than zero**, the whole of step 4 is overwritten from that stored
+   block, in this order:
+   * `User+0x19c` (continent, int) <- `User+0x1a8`
+   * `User+0x1a0` (**ChannelInstanceId**, u32) <- `User+0x1ac`
+   * `User+0x18c` / `0x190` / `0x194` (x / y / z, floats) <- the **ints** at `User+0x1b0` /
+     `0x1b4` / `0x1b8`, each widened with `(float)(int)`
+   * finally `FUN_1403793f0` (`User::CleanSysReturnLoc`) on the same User, so the override is
+     one-shot: the stored point is consumed by the retry that uses it.
 
 The coordinates are stored as **ints** and widened back with `(float)(int)`, which is why the
 capture's fallback is exactly `(16260, 1253, -4410)` and never a fraction.
@@ -92,11 +100,19 @@ session. `User::CleanSysReturnLoc` is `UpdateSysReturnLoc(0,0,0,0,0)`.
 
 The call that matters is in `Handler_SA_RESPONSE_ENTER_DUNGEON`:
 
-It copies the 176-byte `DungeonEnterContext` out of the frame at +0x0E, and then branches on
-two of its bytes. When either the "commit the return point" byte at ctx+42 or the byte at ctx+144
-is zero it calls `CleanSysReturnLoc` — unless the type field at ctx+4 is 1. Otherwise it calls
-`UpdateSysReturnLoc` with the context's coordinates and the user's current
-`channelInstanceId` from `User+0x1a0`.
+```c
+FUN_14016e0d0(&ctx, frame + 0xe);        // copy the 176-byte DungeonEnterContext
+...
+if (ctx.commitReturn == 0 || ctx.success == 0) {   // the two u8 flags, ctx+42 and ctx+144
+    if (ctx.typeField != 1)                        // ctx+4
+        FUN_1403793f0(user);                       // User::CleanSysReturnLoc
+} else {
+    FUN_1403bced0(user,                            // User::UpdateSysReturnLoc
+                  ctx.continent,                   // ctx+56
+                  *(u32 *)(user + 0x1a0),          // channelInstanceId, read at this moment
+                  (int)ctx.x, (int)ctx.y, (int)ctx.z);   // ctx+44 / ctx+48 / ctx+52
+}
+```
 
 Ghidra split the context into consecutive stack slots, so `local_XX` is `ctx + (0xf8 - XX)`:
 
@@ -118,8 +134,10 @@ Two independent confirmations that ctx+42 and ctx+144 are single bytes: the T10 
 which was derived from the *copy* functions, has a gap at payload 51 ("after a u16 + u8 at
 40..42") and at payload 153..155 ("after a lone u8 at 144").
 
-`x` is ctx+44, `y` is ctx+48 and `z` is ctx+52: the last two arguments go on the stack in that
-address order.
+Argument order into `UpdateSysReturnLoc` is `x` from ctx+44, `y` from ctx+48 and `z` from ctx+52.
+`x` is the 4th argument and so goes in a register; `y` and `z` are arguments 5 and 6 and go on the
+stack, `y` into the lower slot and `z` into the higher one - that address order is what fixes which
+coordinate is which.
 
 **The channelInstanceId stored as the return one is `User+0x1a0` at dungeon-entry time**, i.e. the
 open-world value (-1) — which is exactly what seq 843 carries.

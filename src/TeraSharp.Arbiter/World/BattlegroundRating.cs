@@ -2,6 +2,7 @@
 // Copyright (c) 2026 the TeraSharp contributors
 
 using System.Collections.Concurrent;
+using System.Runtime.CompilerServices;
 using Microsoft.Extensions.Logging;
 using TeraSharp.Arbiter.Network;
 using TeraSharp.Arbiter.Persistence;
@@ -28,16 +29,14 @@ namespace TeraSharp.Arbiter.World;
 // `int32 rating # positive for winning, negative(signed bit) for losing`. A[0]'s 2 and B[0]'s
 // 720 are a single sample and are passed through as opaque numbers rather than christened.
 //
-// THE SIGN IS THE WIN FLAG. It is the one field in the frame whose meaning is documented, and
-// the live sample (-8, a loss) sits inside the 5..12 band the T138 brief asked for, which is a
-// pleasing accident and also the reason the band is not obviously wrong. So <see cref="Roll"/>
-// decides the MAGNITUDE and the incoming sign decides the DIRECTION - we never guess a winner
-// out of A[0].
+// T199: the first array is the WINNING PARTY TYPES, not an opaque team value.
+// WorldServer.exe.c:2100574-2100591 appends the winning-party vector. The self party type is
+// S_INIT_ROUND_PVP_BATTLE_FIELD full+16 (writer3389174-3389212). cap_bg1's winner has delta0,
+// so sign alone is insufficient. Use the captured party membership when available.
 //
-// WHERE IT IS HOOKED. Nothing in TeraSharp emits this packet: there is no BattleField server.
-// What there is, is the tunnel - every W->A client packet for a session passes through
-// ArbiterClientHandlers.DeliverTunnelled - so when a real WorldServer/BattleFieldServer does
-// send one, <see cref="OnTunnelled"/> rewrites its delta to our roll and applies the same
+// WHERE IT IS HOOKED. The real BattleFieldServer emits this packet through the tunnel.
+// Every W->A client packet for a session passes through ArbiterClientHandlers.DeliverTunnelled.
+// <see cref="OnTunnelled"/> rewrites its delta to the configured custom roll and applies the same
 // number to characters.bg_rating. The client therefore shows exactly what the database stores,
 // which is the whole point of doing it on the way past instead of after the fact.
 //
@@ -55,10 +54,10 @@ public static class BattlegroundRating
     /// <summary>Where the signed delta sits, as a PACKET index (body 8).</summary>
     public const int RatingOffset = 12;
 
-    /// <summary>The smallest a result may move the rating. The T138 brief's 5.</summary>
-    public const int MinDelta = 5;
-    /// <summary>The largest. The T138 brief's 12.</summary>
-    public const int MaxDelta = 12;
+    /// <summary>Smallest custom movement from TeraSharpBattlegroundRating.xml.</summary>
+    public static int MinDelta => BattlegroundRatingSheet.Entry.Value.Minimum;
+    /// <summary>Largest custom movement from the same policy sheet.</summary>
+    public static int MaxDelta => BattlegroundRatingSheet.Entry.Value.Maximum;
 
     /// <summary>The floor. A rating never goes below it, on any number of losses.</summary>
     public const int Floor = 0;
@@ -124,7 +123,8 @@ public static class BattlegroundRating
     /// </summary>
     public static int Roll(bool win, Random? rng = null)
     {
-        int n = (rng ?? Random.Shared).Next(MinDelta, MaxDelta + 1);
+        var bounds = BattlegroundRatingSheet.Entry.Value;
+        int n = (rng ?? Random.Shared).Next(bounds.Minimum, bounds.Maximum + 1);
         return win ? n : -n;
     }
 
@@ -141,6 +141,29 @@ public static class BattlegroundRating
     }
 
     private static readonly ConcurrentDictionary<int, Result> LastResults = new();
+    private sealed record Team(int PartyType);
+    private static ConditionalWeakTable<GameSession, Team> Teams = new();
+
+    /// <summary>Winning-party list, frame-relative u16 links, 8 bytes per element.</summary>
+    public static bool TryWinningParties(byte[] packet, out int[] parties)
+    {
+        parties = Array.Empty<int>();
+        if (!IsResult(packet) || BitConverter.ToUInt16(packet, 0) != packet.Length) return false;
+        int count = BitConverter.ToUInt16(packet, 4), next = BitConverter.ToUInt16(packet, 6);
+        if (count > (packet.Length - 16) / 8) return false;
+        var values = new int[count];
+        var seen = new HashSet<int>();
+        for (int i = 0; i < count; i++)
+        {
+            if (next < 16 || next > packet.Length - 8 || !seen.Add(next)
+                || BitConverter.ToUInt16(packet, next) != next) return false;
+            values[i] = BitConverter.ToInt32(packet, next + 4);
+            next = BitConverter.ToUInt16(packet, next + 2);
+        }
+        if (next != 0) return false;
+        parties = values;
+        return true;
+    }
 
     /// <summary>
     /// The last result for a character, if this process has seen one.
@@ -153,7 +176,7 @@ public static class BattlegroundRating
         => LastResults.TryGetValue(characterId, out var r) ? r : null;
 
     /// <summary>Tests only.</summary>
-    public static void Reset() => LastResults.Clear();
+    public static void Reset() { LastResults.Clear(); Teams = new(); }
 
     /// <summary>
     /// Roll, store and remember. <paramref name="store"/> may be null - a server running
@@ -173,17 +196,40 @@ public static class BattlegroundRating
 
     /// <summary>
     /// A tunnelled S-&gt;C packet on its way to <paramref name="session"/>. When it is an
-    /// S_BATTLE_FIELD_RESULT, the incoming SIGN says win or loss, our own roll replaces the
-    /// magnitude, the character's row moves by it and the packet is rewritten so the client
-    /// shows the same number the database now holds. Returns the applied result, or null when
-    /// this was some other packet - which is the common case and costs one u16 compare.
+    /// S_BATTLE_FIELD_RESULT uses the prior INIT's party type and the native winner list.
+    /// Outside that captured initialization path, a nonzero native delta still establishes
+    /// direction; zero without team context is left alone. A native empty winner list is a
+    /// draw and does not move the custom rating. Only the delta is rewritten, and its applied
+    /// movement is persisted for the leaderboard.
     /// </summary>
     public static Result? OnTunnelled(GameSession? session, byte[]? packet, ILogger? log = null,
         Random? rng = null)
     {
-        if (session == null || !IsResult(packet)) return null;
+        if (session == null || packet == null || packet.Length < 4) return null;
+        ushort opcode = BitConverter.ToUInt16(packet, 2);
+        if (opcode == 0xC924 && packet.Length >= 24 && BitConverter.ToUInt16(packet, 0) == packet.Length)
+        {
+            Teams.Remove(session);
+            Teams.Add(session, new Team(BitConverter.ToInt32(packet, 16)));
+            return null;
+        }
+        if (opcode is 0x8E90 or 0xF266) { Teams.Remove(session); return null; } // FIN / new S_LOGIN
+        if (!IsResult(packet)) return null;
         int characterId = (int)(session.SelectedCharacter?.Id ?? 0);
-        bool win = ReadDelta(packet) > 0;
+        bool win;
+        if (Teams.TryGetValue(session, out var team))
+        {
+            if (!TryWinningParties(packet, out var winners)) return null;
+            // Native no-winner result is a draw; do not invent a loss from its zero delta.
+            if (winners.Length == 0) return null;
+            win = winners.Contains(team.PartyType);
+        }
+        else
+        {
+            int nativeDelta = ReadDelta(packet);
+            if (nativeDelta == 0) return null; // no established outcome outside the pinned INIT path
+            win = nativeDelta > 0;
+        }
         var r = Apply(Program.Store, characterId, win, rng);
         WriteDelta(packet, r.Applied);
         log?.LogInformation("battleground: character {Id} {Outcome} - rating {From} -> {To}, delta {Delta}",

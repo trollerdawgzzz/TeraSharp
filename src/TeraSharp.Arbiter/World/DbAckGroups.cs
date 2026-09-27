@@ -185,7 +185,7 @@ public static class DbAckGroups
         "280E|SEND_END_THROUGH_ARBITER_CONTRACT|ContractBroker via WorldBridge (T60)",
         "2833|LOAD_USER_RESTRICTION|replay table, login load (DispatchOnlyForTests)",
         "2895|LOAD_BATTLE_FIELD_LIST|replay table, login load (DispatchOnlyForTests)",
-        "28BB|LOAD_ACCOUNT_BENEFIT|replay table, login load (DispatchOnlyForTests)",
+        "28BB|LOAD_ACCOUNT_BENEFIT|real account-backed loader; T181 operator experiment",
         "28C5|LOAD_SERVANT_PERIOD|replay table, login load (DispatchOnlyForTests)",
         "28C9|LOAD_SKILLPERIOD|replay table, login load (DispatchOnlyForTests)",
         "28CF|LOAD_LEARNED_SOCIAL|replay table, login load (DispatchOnlyForTests)",

@@ -86,7 +86,7 @@ public static class ApiGatewayToken
     /// </summary>
     public static string Address(string? configured = null)
     {
-        string v = configured ?? Environment.GetEnvironmentVariable(AddressVariable) ?? string.Empty;
+        string v = configured ?? TerasConfig.Get(AddressVariable) ?? string.Empty;
         if (string.IsNullOrWhiteSpace(v)) return DefaultAddress;
         v = v.Trim();
         // Strip a scheme if somebody pasted a URL; the field is host:port.
@@ -100,18 +100,18 @@ public static class ApiGatewayToken
     /// <summary>The configured db server name, or what the real Arbiter sends.</summary>
     public static string DbServerName(string? configured = null)
     {
-        string v = configured ?? Environment.GetEnvironmentVariable(DbServerNameVariable) ?? string.Empty;
+        string v = configured ?? TerasConfig.Get(DbServerNameVariable) ?? string.Empty;
         return string.IsNullOrWhiteSpace(v) ? DefaultDbServerName : v.Trim();
     }
 
     /// <summary>True when a signing key was configured; false means the session key is in use.</summary>
     public static bool HasConfiguredSecret
-        => !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(SecretVariable));
+        => !string.IsNullOrWhiteSpace(TerasConfig.Get(SecretVariable));
 
     /// <summary>The signing key: the configured one, or this process's random one.</summary>
     public static byte[] Secret()
     {
-        string? v = Environment.GetEnvironmentVariable(SecretVariable);
+        string? v = TerasConfig.Get(SecretVariable);
         return string.IsNullOrWhiteSpace(v) ? SessionSecret : System.Text.Encoding.UTF8.GetBytes(v);
     }
 

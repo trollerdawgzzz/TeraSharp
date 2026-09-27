@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 the TeraSharp contributors
+
 #Requires -Version 5.1
 <#
 .SYNOPSIS
@@ -11,17 +12,14 @@
 
     What it does, in order:
       1. reads .env into the process environment
-      2. announce -> kick -> stop: tells the players, waits -GraceSeconds, kicks everyone still
-         in world (so World's leave path saves them), then stops the Arbiter. Needs
-         TERASHARP_ADMIN_TOKEN; without it the Arbiter is stopped with a warning.
+      2. stops a running Arbiter
       3. backs up the database
       4. installs the new build from -From (a folder, a .zip, or a URL)
       5. runs --check-config and --selftest, and refuses to start on a failure
-      6. restarts WorldServer.exe if -WorldExe is given, then starts the Arbiter with output
-         tee'd to a dated log
+      6. starts the Arbiter with output tee'd to a dated log
 
-    World does NOT survive the Arbiter link dropping - it does not reconnect. Pass -WorldExe, or
-    restart World yourself after the Arbiter is back (docs/SETUP.md section 12).
+    It does NOT touch WorldServer.exe. World keeps running across an Arbiter restart; the
+    Arbiter reconnects. Restart World only when you actually need a fresh one.
 
 .PARAMETER From
     Where the new build comes from. A folder holding TeraSharp.Arbiter.exe, a .zip of one, or
@@ -34,26 +32,13 @@
     The .env to load. Defaults to .env beside this script.
 
 .PARAMETER NoStart
-    Do everything except start the Arbiter (and World). Useful for a dry run on a live box.
-
-.PARAMETER GraceSeconds
-    How long players get between the announcement and the kick. Default 300.
-
-.PARAMETER AnnounceText
-    The in-game notice. {0} is replaced by the grace period in minutes.
-
-.PARAMETER WorldExe
-    Full path to WorldServer.exe. When given, World is stopped and started again right before
-    the new Arbiter starts; World then takes its ~3 minutes to connect.
+    Do everything except start the Arbiter. Useful for a dry run on a live box.
 
 .EXAMPLE
     .\deploy.ps1 -From \\build\share\TeraSharp -WhatIf
 
 .EXAMPLE
     .\deploy.ps1 -From https://your-build-host.example/TeraSharp-bin.zip
-
-.EXAMPLE
-    .\deploy.ps1 -From C:\builds\TeraSharp -GraceSeconds 120 -WorldExe C:\TERA\Executable\WorldServer.exe
 #>
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
@@ -61,10 +46,7 @@ param(
     [string] $InstallTo = 'C:\TeraSharp',
     [string] $EnvFile   = (Join-Path $PSScriptRoot '.env'),
     [string] $LogDir    = 'C:\TeraSharp\logs',
-    [switch] $NoStart,
-    [int]    $GraceSeconds = 300,
-    [string] $AnnounceText = 'Server restart in {0} minute(s). Please log out now.',
-    [string] $WorldExe
+    [switch] $NoStart
 )
 
 $ErrorActionPreference = 'Stop'
@@ -100,51 +82,9 @@ if (-not $env:TERASHARP_API_JWT_SECRET) {
     Write-Warning 'TERASHARP_API_JWT_SECRET is unset - the Alt+A token changes on every restart.'
 }
 
-# ---------------------------------------------------------------- 2. announce -> kick -> stop
-Write-Step "announce -> kick"
-$running = @(Get-Process -Name ([IO.Path]::GetFileNameWithoutExtension($exeName)) -ErrorAction SilentlyContinue)
-if ($running.Count -gt 0) {
-    if (-not $env:TERASHARP_ADMIN_TOKEN) {
-        Write-Warning 'TERASHARP_ADMIN_TOKEN is unset - cannot announce or kick. Anyone still in world loses what World has not saved.'
-    } else {
-        $adminPort = if ($env:TERASHARP_ADMIN_PORT) { $env:TERASHARP_ADMIN_PORT } else { '8050' }
-        $api = "http://127.0.0.1:$adminPort/api"
-        $hdr = @{ 'X-Admin-Token' = $env:TERASHARP_ADMIN_TOKEN }
-        function Invoke-Admin {
-            param([string] $Path, [hashtable] $Body)
-            $json = $Body | ConvertTo-Json -Compress
-            Invoke-RestMethod -Uri "$api/$Path" -Method Post -Headers $hdr `
-                -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($json))
-        }
-        function Get-InWorld {
-            @((Invoke-RestMethod -Uri "$api/online" -Headers $hdr).online | Where-Object { $_.playerId -gt 0 })
-        }
-        try {
-            $inWorld = @(Get-InWorld)
-            if ($inWorld.Count -eq 0) {
-                Write-Host '  nobody in world'
-            } elseif ($PSCmdlet.ShouldProcess(("{0} player(s)" -f $inWorld.Count), 'announce, wait, kick')) {
-                $minutes = [int][Math]::Max(1, [Math]::Ceiling($GraceSeconds / 60.0))
-                Invoke-Admin 'announce' @{ text = ($AnnounceText -f $minutes); reason = 'deploy' } | Out-Null
-                Write-Host ("  announced to {0} player(s); waiting {1} s" -f $inWorld.Count, $GraceSeconds)
-                Start-Sleep -Seconds $GraceSeconds
-                foreach ($p in @(Get-InWorld)) {
-                    try {
-                        Invoke-Admin 'kick' @{ id = [int]$p.playerId; reason = 'deploy' } | Out-Null
-                        Write-Host ("  kicked {0}" -f $p.name)
-                    } catch {
-                        Write-Warning ("  kick {0}: {1}" -f $p.name, $_.Exception.Message)
-                    }
-                }
-                Start-Sleep -Seconds 10   # World's leave path writes each character back
-            }
-        } catch {
-            Write-Warning ("  admin API on {0} did not answer: {1}" -f $api, $_.Exception.Message)
-        }
-    }
-}
-
+# ---------------------------------------------------------------- 2. stop
 Write-Step "stop"
+$running = @(Get-Process -Name ([IO.Path]::GetFileNameWithoutExtension($exeName)) -ErrorAction SilentlyContinue)
 if ($running.Count -eq 0) {
     Write-Host '  not running'
 } elseif ($PSCmdlet.ShouldProcess($exeName, 'stop')) {
@@ -218,19 +158,6 @@ if ($LASTEXITCODE -ne 0) { throw "--selftest failed ($LASTEXITCODE). Not startin
 
 # ---------------------------------------------------------------- 6. start
 if ($NoStart) { Write-Step "done (-NoStart)"; return }
-
-if ($WorldExe) {
-    Write-Step "restart World"
-    $world = @(Get-Process -Name ([IO.Path]::GetFileNameWithoutExtension($WorldExe)) -ErrorAction SilentlyContinue)
-    if ($world.Count -gt 0 -and $PSCmdlet.ShouldProcess('WorldServer', 'stop')) {
-        $world | Stop-Process -Force
-        Start-Sleep -Seconds 3
-    }
-    if ($PSCmdlet.ShouldProcess($WorldExe, 'start')) {
-        Start-Process -FilePath $WorldExe -WorkingDirectory (Split-Path -Parent $WorldExe)
-        Write-Host '  started; it connects in about 3 minutes'
-    }
-}
 
 Write-Step "start"
 New-Item -ItemType Directory -Path $LogDir -Force | Out-Null

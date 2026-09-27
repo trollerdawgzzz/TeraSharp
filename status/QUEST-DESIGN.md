@@ -2,7 +2,7 @@
 
 > ## THE CAPTURE ARRIVED — LIST 2 IS THE COMPLETED IDS
 >
-> `<captures>\arb_world_2026-09-13T11-33-30-680Z.log` **seq 881** is the "Test" login this
+> `D:\packetlogs\arb_world_2026-09-13T11-33-30-680Z.log` **seq 881** is the "Test" login this
 > file was asking for: three completed quests (59901, 59902, 59903) and one in progress (59904).
 > The answers:
 >
@@ -27,9 +27,9 @@ Sources, in the order they win:
 - `D:\v100\TERA_SERVER.100\ArbiterServer.exe.c` — `Handler_SDB_SET_QUEST_INFO` (tracer line
   1283916), `Handler_SDB_LOAD_QUEST_LIST` (1275742), and the `0x272D` writer `FUN_1406edac0`
   (1206774, opcode at 1206795).
-- `<captures>\cap_newchar.log` — real ArbiterServer, brand-new character "Test" playerId 2.
+- `D:\packetlogs\cap_newchar.log` — real ArbiterServer, brand-new character "Test" playerId 2.
   One login, 28 × `0x272E`, one `0x272C`.
-- `<captures>\lobby_tap.log` — "dob", a played character: login + relog, so two `0x272D`
+- `D:\packetlogs\lobby_tap.log` — "dob", a played character: login + relog, so two `0x272D`
   replies, one of which actually has content.
 
 All offsets are **payload**-relative (frame offset − 6) unless a line says "frame". Everything
@@ -141,7 +141,8 @@ That also means a quest write can allocate item ids exactly like `0x2768` does (
 reply echoes the atoms back the same way — `PKT_DBS_SET_QUEST_INFO_WRITE` is templated on
 `vector<ItemTransactionAtom const*>` and its `SendToSession` argument list is
 `int, long, bool&, int, const unsigned char*, int&, vector<Atom>*`, i.e. reqId, op, ok, and the
-80-byte record echoed back as a pointer plus the length 0x50.
+80-byte record echoed back by pointer+length (`&record` and the length `0x50` are staged in two
+adjacent 8-byte stack slots, pointer first).
 
 ### The 80-byte QuestData record
 

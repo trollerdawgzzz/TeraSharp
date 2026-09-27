@@ -5,7 +5,7 @@ the provider that now implements it.
 
 Sources: `Handler_C_LOGIN_ARBITER` and `AuthManager::*` in `Arb_part_*.c`, the packet dumper at
 `Arb_part_014.c:239-303`, tera-api's own source on disk (`D:\v100\TERA_SERVER.100\tera-api`), and
-`<captures>\cap_newchar_client.log` frames 2 and 7.
+`D:\packetlogs\cap_newchar_client.log` frames 2 and 7.
 **No build was possible in the Cowork container**; the packet claims were re-derived in Python
 from the capture and the tests assert them.
 
@@ -169,3 +169,37 @@ is configured with `API_ARBITER_USE_IP_FROM_LAUNCHER=false`, so until then we se
    `127.0.0.1:8080`).
 3. A wrong or stale ticket now logs `50011 authkey mismatch` and the client stops at the login
    screen instead of reaching the lobby.
+
+## 7. T185: World availability at character selection
+
+Authentication still admits the account to the lobby. Character selection requires a ready,
+linked default World; missing links must never start the standalone spawn. `PureReplay` does
+not bypass this check. `TERASHARP_STANDALONE=1` explicitly restores the harness fallback.
+
+| Evidence / case | Result |
+|---|---|
+| `Arb_part_028.c:378-390`, `Arb_part_079.c:10388-10411` | Missing World makes `AdjustContinentOnConnect` fail; selection sends `@769`, then `S_SELECT_USER` with accepted=false, admin=0, error=0. |
+| `cap_social3_client2_ctl.txt` records 32 -> 33/34 | Request body `0200000000`; replies `10000EF3060040003700360039000000`, `0F00FB8A0000000000000000000000` (complete frames). |
+| Default, bridge missing or no linked ready World | Warning; refusal before allocating identity; selected character cleared; late `C_LOAD_TOPO_FIN` cannot spawn. |
+| Literal `TERASHARP_STANDALONE=1` | Existing generated/replay fallback remains available; standalone tests scope and restore this environment variable. |
+
+`WorldAvailability.cs` holds the gate/refusal helper. Apply `status/T185-PATCH.diff` to the
+human-owned `LoginHandlers.cs` and `WorldEntry.cs` before building normally. Validation uses
+patched copies of those two files through a temporary MSBuild target; originals remain untouched.
+`T185_no_world_refuses_selection_and_never_spawns` pins both rejection frames and checks absent,
+unready and stale-ready bridges. `T185_explicit_standalone_retains_select_and_spawn` exercises
+both standalone phases with the scoped opt-in. No existing standalone handler tests needed
+conversion; serializer-only tests do not enter World.
+Validation with the patch copies: build passed; 985 tests passed, 0 failed, 22 skipped.
+
+T185b (master base `7533cb8`): `T185.cs` and `WorldAvailability.cs` match cowork/T8's
+committed blobs (`de9518c4182eaff7c1c5da0a342c437645f84166` and
+`1d5bebfea2dfa4515f0af74da0682eb0181d70d5`), but the login wiring patch was not merged.
+The failing first frame was accepted `S_SELECT_USER`, `0F00FB8A0100000000000000000000`,
+instead of capture record 33, `10000EF3060040003700360039000000`. Original capture HEX
+confirms the expectation. Applied the existing patch to LoginHandlers/WorldEntry using
+`git apply --ignore-space-change status/T185-PATCH.diff` (checkout line endings otherwise
+prevent application). No helper or test expectation changed. Full suite rebuilt against
+the actual master working tree: **982 passed, 0 failed, 25 skipped**, both T185 tests passed.
+The three extra skips versus the cowork run are T157's absent `data/cap_t157.bin` and
+`data/classic-live/S_VIEW_INTER_PARTY_MATCH_DUNGEON_LIST-7964.hex` fixtures.

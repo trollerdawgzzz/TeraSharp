@@ -39,12 +39,13 @@ namespace TeraSharp.Arbiter.World;
 // through <see cref="Deliver"/>.
 //
 // T161 MADE A FORMED MATCH STATE. A <see cref="PendingMatch"/> per member lives from formation
-// until that member enters the instance, turns it down, or it expires: the offer is re-sent at
-// the next enter-world, C_MATCH_ADD is refused while it stands, and "enter later" keeps it
+// until that member enters the instance, turns it down, or it expires: C_MATCH_ADD is refused
+// while it stands, and "enter later" keeps it
 // claimable through C_ENTER_DUNGEON (World's own check: the matched party still carries the
 // dungeon id AS_DO_CREATE_PARTY gave it). classic_live3 has one formed match and it was entered
-// at once, so no re-offer or expiry frame exists to pin: those two are ours, built only from
-// frames the capture does have (FIN, S_SYS_PARTY_INFO, the record-53967 cancel pair).
+// at once. T184f's cap_2man_client2 now proves that a lobby relog while still waiting does NOT
+// resend FIN/SYS (4356 -> 4506 -> 4745 -> 5010); the invented automatic re-offer is suppressed.
+// The expiry policy remains unverified against a real unanswered match held past its deadline.
 //
 // WHERE THE ROLES COME FROM. C_MATCH_ADD carries no class - four captures, MatchComposition's
 // header. The queuing party is read out of PartyManager and each member's class and level come
@@ -106,6 +107,9 @@ public static class MatchWiring
     /// </summary>
     public static Action<MatchQueueManager.Queuer, byte[]> Deliver = DefaultDeliver;
 
+    /// <summary>Queue-state pushes use World's fixed data session0. Tests collect the payload.</summary>
+    public static Action<MatchQueueManager.Queuer, ushort, byte[]> SendWorld = DefaultSendWorld;
+
     /// <summary>
     /// T138d/T161. A formed group becomes a party, and every member it reaches gets the match
     /// frames (<see cref="MatchFoundFrames"/>) after the party exists and before their
@@ -116,7 +120,7 @@ public static class MatchWiring
     public static Func<MatchQueueManager.FormedGroup, IReadOnlyList<byte[]>, IReadOnlyCollection<int>>
         FormParty = DefaultFormParty;
 
-    /// <summary>T161: the S_SYS_PARTY_INFO a re-offer carries, or null for no party.</summary>
+    /// <summary>Legacy test seam for explicit roster construction; relog no longer resends it.</summary>
     public static Func<int, IReadOnlyDictionary<int, int>, byte[]?> SysPartyInfoFor =
         (id, roles) => PartyWiring.Manager.SysPartyInfoFor(id, roles);
 
@@ -128,11 +132,13 @@ public static class MatchWiring
     {
         PartyOf = DefaultPartyOf;
         Deliver = DefaultDeliver;
+        SendWorld = DefaultSendWorld;
         FormParty = DefaultFormParty;
         SysPartyInfoFor = (id, roles) => PartyWiring.Manager.SysPartyInfoFor(id, roles);
         Clock = () => DateTimeOffset.UtcNow;
-        lock (PendingLock) { PendingByChar.Clear(); ReofferedGameIds.Clear(); }
+        lock (PendingLock) PendingByChar.Clear();
         MatchQueueManager.Reset();
+        MatchBrowseStatistics.Reset();
     }
 
     private static ILogger _log = NullLogger.Instance;
@@ -148,7 +154,8 @@ public static class MatchWiring
     {
         var chr = s.SelectedCharacter;
         return new MatchQueueManager.Queuer(s.PlayerId, (int)(chr?.Id ?? 0),
-                                            chr?.Class ?? 0, chr?.Level ?? 1);
+            chr?.Class ?? 0, chr?.Level ?? 1,
+            TrueItemLevel: PartyWiring.Manager.TrueItemLevelFor((int)(chr?.Id ?? 0)));
     }
 
     private static IReadOnlyList<MatchQueueManager.Queuer> DefaultPartyOf(GameSession s)
@@ -162,7 +169,8 @@ public static class MatchWiring
         {
             if (m.UserDbId == me.CharacterId || !m.Online) continue;
             var peer = SessionForCharacter(m.UserDbId);
-            outp.Add(new MatchQueueManager.Queuer(peer?.PlayerId ?? 0, m.UserDbId, m.Class, m.Level));
+            outp.Add(new MatchQueueManager.Queuer(peer?.PlayerId ?? 0, m.UserDbId, m.Class, m.Level,
+                TrueItemLevel: PartyWiring.Manager.TrueItemLevelFor(m.UserDbId)));
         }
         return outp;
     }
@@ -181,6 +189,26 @@ public static class MatchWiring
     private static void DefaultDeliver(MatchQueueManager.Queuer q, byte[] packet)
         => SessionForCharacter(q.CharacterId)?.Send(packet);
 
+    private static void DefaultSendWorld(MatchQueueManager.Queuer q, ushort opcode, byte[] payload)
+    {
+        var session = SessionForCharacter(q.CharacterId);
+        // Arb076:15129 (admission) and Arb077:6151 (removal) explicitly resolve
+        // GetDataSessionByServerId(0), regardless of the member's current dungeon World.
+        if (session != null) Program.World?.SendFrame(WorldRegistration.DefaultWorldId, opcode, payload);
+    }
+
+    private static bool WithdrawApplication(MatchQueueManager.Entry? entry)
+    {
+        if (entry == null || !MatchQueueManager.Remove(entry.LeaderPlayerId)) return false;
+        // Arb076:15693-15700 -> Arb077:6149-6152: World receives whether any application
+        // remains; a member can also be present in another application's member list.
+        foreach (var member in entry.Members)
+            SendWorld(member, PartyPackets.AS_CHANGE_EVENT_MATCHING_STATE,
+                PartyPackets.BuildAsChangeEventMatchingState(member.CharacterId,
+                    isMatching: MatchQueueManager.FindForPlayer(member.PlayerId) != null));
+        return true;
+    }
+
     /// <summary>
     /// T138d. A dungeon match is ONE party; a battleground match is TWO, one per side, each
     /// carrying its own teamIndex. Without this the five matched strangers each walk in alone
@@ -193,19 +221,17 @@ public static class MatchWiring
         var covered = new HashSet<int>();
         if (!MatchQueueManager.IsBattleground(g.InstanceId))
         {
-            var members = new List<PartyManager.MatchedMember>(g.Members.Count);
-            for (int i = 0; i < g.Members.Count; i++)
-                members.Add(new PartyManager.MatchedMember(g.Members[i].CharacterId, RoleAt(g, i)));
+            var members = MatchedMembersFor(g);
             var a = PartyWiring.FormMatchedParty(members,
                 raid: members.Count > MatchComposition.PartySize,
                 dungeonId: g.InstanceId, matchFrames: frames);
             // A party that formed reached every ONLINE member; an offline one is unreachable
-            // either way and gets the offer at their next enter-world.
+            // either way. Enter-world does not repeat the completion notification (T184f).
             if (a.Rejected == null) foreach (var m in members) covered.Add(m.UserDbId);
             return covered;
         }
-        FormTeam(g.TeamA, g.InstanceId, teamIndex: 1, frames, covered);
-        FormTeam(g.TeamB, g.InstanceId, teamIndex: 2, frames, covered);
+        FormTeam(g, g.TeamA, g.InstanceId, teamIndex: 1, frames, covered);
+        FormTeam(g, g.TeamB, g.InstanceId, teamIndex: 2, frames, covered);
         return covered;
     }
 
@@ -213,18 +239,37 @@ public static class MatchWiring
     private static MatchRole RoleAt(MatchQueueManager.FormedGroup g, int i)
         => i < g.Roles.Count ? g.Roles[i] : g.Members[i].Role;
 
+    /// <summary>MA_FIN supplies application metadata; solo means a solo application, not a
+    /// one-member completed party. Arb016:4408-4792 / Arb068:14433-14464.</summary>
+    public static List<PartyManager.MatchedMember> MatchedMembersFor(MatchQueueManager.FormedGroup group)
+    {
+        var members = new List<PartyManager.MatchedMember>(group.Members.Count);
+        for (int i = 0; i < group.Members.Count; i++)
+        {
+            var member = group.Members[i];
+            var application = group.Entries.FirstOrDefault(e => e.Members.Any(q => q.CharacterId == member.CharacterId));
+            int clears = MatchQueueManager.IsBattleground(group.InstanceId) ? 0
+                : Program.Store?.GetDungeonClearCounts(member.CharacterId)
+                    .FirstOrDefault(row => row.DungeonId == group.InstanceId).Clears ?? 0;
+            members.Add(new PartyManager.MatchedMember(member.CharacterId, RoleAt(group, i),
+                TrueItemLevel: member.TrueItemLevel, CountOfDungeonClear: clears,
+                IsSoloMatching: application?.Size == 1));
+        }
+        return members;
+    }
+
     /// <summary>
     /// One battleground side. A team has no template positions - the composition table caps
     /// classes, it does not seat them - so each member's DEFAULT position is what
     /// S_SYS_PARTY_INFO carries here.
     /// </summary>
-    private static void FormTeam(IReadOnlyList<MatchQueueManager.Queuer> team, int battleFieldId,
+    private static void FormTeam(MatchQueueManager.FormedGroup group,
+        IReadOnlyList<MatchQueueManager.Queuer> team, int battleFieldId,
         int teamIndex, IReadOnlyList<byte[]> frames, HashSet<int> covered)
     {
         if (team == null || team.Count < 2) return;
-        var members = new List<PartyManager.MatchedMember>(team.Count);
-        foreach (var q in team)
-            members.Add(new PartyManager.MatchedMember(q.CharacterId, q.Role));
+        var teamIds = team.Select(q => q.CharacterId).ToHashSet();
+        var members = MatchedMembersFor(group).Where(m => teamIds.Contains(m.UserDbId)).ToList();
         var a = PartyWiring.FormMatchedParty(members,
             raid: members.Count > MatchComposition.PartySize,
             dungeonId: 0, battleFieldId: battleFieldId, teamIndex: teamIndex, matchFrames: frames);
@@ -253,19 +298,16 @@ public static class MatchWiring
     }
 
     /// <summary>
-    /// C_MATCH_PROGRESS -&gt; S_MATCH_PROGRESS, from whatever this leader has queued. The client
-    /// asks either about one instance or about <see cref="MatchQueueManager.AnyInstance"/>
-    /// (-9999, record 8670); <see cref="MatchQueueManager.Progress"/> resolves that to the
-    /// entry's own instance. With nothing queued the reply names what was asked for and carries
-    /// zeroes, which is what an empty pool looks like.
+    /// C_MATCH_PROGRESS -&gt; S_MATCH_PROGRESS: tanker/dealer/healer counts for an existing
+    /// application. Arb077:8848 returns silently when the player has no application.
     /// </summary>
     public static bool OnMatchProgress(GameSession session, ReadOnlyMemory<byte> body)
     {
         var ids = MatchQueueManager.ReadInstanceIds(body);
         int asked = ids.Count > 0 ? ids[0] : MatchQueueManager.AnyInstance;
-        var entry = MatchQueueManager.Find(session.PlayerId);
-        var (instance, waiting, needed) = MatchQueueManager.Progress(entry, asked);
-        session.Send(MatchQueueManager.BuildMatchProgress(instance, 0, 0, waiting, needed, waiting));
+        var entry = MatchQueueManager.FindForPlayer(session.PlayerId);
+        var frame = MatchQueueManager.ProgressFrame(entry, asked);
+        if (frame != null) session.Send(frame);
         return true;
     }
 
@@ -311,9 +353,12 @@ public static class MatchWiring
         // picked in the matching window, so it has to reach the seating - a Warrior who queued
         // as DPS is not a tank we can use. MatchComposition.ChoiceToRole has the samples.
         var members = MatchQueueManager.WithChoices(queued, MatchQueueManager.ReadQueueChoices(body));
+        ids.RemoveAll(id => DungeonMatchRules.For(id) is { } rule && !rule.AcceptsApplicant(members.Count));
+        if (ids.Count == 0) return Refuse(session);
 
-        var now = DateTimeOffset.UtcNow;
+        var now = Clock();
         MatchQueueManager.Add(session.PlayerId, ids.ToArray(), members, now);
+        MatchBrowseStatistics.Start();
 
         // The pool-add tail is that same position coming back: record 8662 carries 1 for the
         // DPS queue and record 10333 carries 0 for the tank one, both from the same character.
@@ -322,8 +367,26 @@ public static class MatchWiring
             pool.Add(new MatchQueueManager.PoolPlayer(
                 PartyPackets.PlanetId, (int)m.PlayerId, 0, (int)m.Role));
 
-        session.Send(MatchQueueManager.BuildAddInterPartyMatchPool(ids[0], pool));
-        foreach (var f in MatchQueueManager.EventMatchingFrames(ids, queued: true)) session.Send(f);   // T161b
+        // Arb076:14928-14944 / 15123-15136: every local member gets @2173 when
+        // the accepted application contains a dungeon. cap_2man client2:819 and
+        // client1:1230 put it before C730; refused applications never reach here.
+        var queuedFrames = new List<byte[]>();
+        if (ids.Any(id => !MatchQueueManager.IsBattleground(id)))
+            queuedFrames.Add(DbProxyHandlers.BuildSystemMessage("@2173"));
+        // Arb_part_076:15039-15114: the pool and queued-state frames reach each local member.
+        queuedFrames.Add(MatchQueueManager.BuildAddInterPartyMatchPool(ids, pool,
+            matchingType: MatchQueueManager.IsBattleground(ids[0]) ? 1 : 0));
+        queuedFrames.AddRange(MatchQueueManager.EventMatchingFrames(ids, queued: true));
+        foreach (var member in members)
+            foreach (var frame in queuedFrames)
+                if (member.PlayerId == session.PlayerId) session.Send(frame);
+                else Deliver(member, frame);
+
+        // cap_2man tap records 1463 / 1838: 15CD [UserDbId][01]. Arb076:15123-15139
+        // does this after the client pool/queued notifications, before a match can finish.
+        foreach (var member in members)
+            SendWorld(member, PartyPackets.AS_CHANGE_EVENT_MATCHING_STATE,
+                PartyPackets.BuildAsChangeEventMatchingState(member.CharacterId, isMatching: true));
 
         Log.LogInformation("match: player {P} queued {N} member(s) for [{Ids}]",
             session.PlayerId, members.Count, string.Join(",", ids));
@@ -340,8 +403,10 @@ public static class MatchWiring
     public static List<int> Offered(IReadOnlyList<int> ids)
     {
         var keep = new List<int>(ids.Count);
+        var disabled = Program.Store?.GetDisabledDungeons();
         foreach (int id in ids)
         {
+            if (disabled?.Contains(id) == true) continue;
             if (!MatchQueueManager.IsBattleground(id) || MatchComposition.IsOffered(id)) { keep.Add(id); continue; }
             if (BattleFieldSheet.Current == null)
                 Log.LogWarning("match: battleground {Id} refused - {Sheet} could not be read, so no battleground is offered",
@@ -350,6 +415,27 @@ public static class MatchWiring
                 Log.LogInformation("match: battleground {Id} is not in {Sheet} - refused", id, BattleFieldSheet.Source);
         }
         return keep;
+    }
+
+    /// <summary>T201: DungeonManager::ChangeDungeonOnOff cancels applications for a disabled
+    /// dungeon (Arb061:7753). Reuse the existing removal and client cancellation sequence.</summary>
+    internal static void DisableDungeon(int dungeon)
+    {
+        foreach (var entry in MatchQueueManager.All().Where(e => e.Wants(dungeon)))
+        {
+            // Native ClearAllDungeonMatching removes this dungeon from each application;
+            // applications with other destinations survive (Arb076:13030-13091).
+            var remaining = entry.InstanceIds.Where(id => id != dungeon).ToArray();
+            if (remaining.Length == 0) { if (!WithdrawApplication(entry)) continue; }
+            else entry.InstanceIds = remaining;
+            foreach (var member in entry.Members)
+            {
+                // UnicastMatchRemove writes S_DEL_INTER_PARTY_MATCH_POOL, not the formed
+                // match's S_CANCEL_PARTY_MATCH_POOL (Arb077:9335-9373).
+                Deliver(member, MatchQueueManager.BuildDelPool(dungeon));
+                foreach (var frame in MatchQueueManager.EventMatchingFrames(new[] { dungeon }, queued: false)) Deliver(member, frame);
+            }
+        }
     }
 
     /// <summary>
@@ -362,7 +448,9 @@ public static class MatchWiring
         var group = MatchQueueManager.TryForm(instanceId, now, rng);
         if (group == null) return null;
 
+        MatchBrowseStatistics.Completed(group, now);
         foreach (var e in group.Entries) MatchQueueManager.Remove(e.LeaderPlayerId);
+        MatchBrowseStatistics.Publish(now);
 
         // T161: the party FIRST, then per member the state pair, FIN and S_SYS_PARTY_INFO -
         // classic_live3 10568..10587. Whoever the party layer could not reach still gets the
@@ -390,7 +478,7 @@ public static class MatchWiring
     /// </summary>
     public static IReadOnlyList<byte[]> MatchFoundFrames(int instanceId)
     {
-        var f = MatchQueueManager.EventMatchingFrames(new[] { instanceId }, queued: false);
+        var f = MatchQueueManager.AllEventMatchingFrames();
         f.Add(MatchQueueManager.BuildFinInterPartyMatch(instanceId));
         return f;
     }
@@ -404,14 +492,14 @@ public static class MatchWiring
     {
         var ids = MatchQueueManager.ReadInstanceIds(body);
         int instance = ids.Count > 0 ? ids[0] : MatchQueueManager.AnyInstance;
-        var queuedFor = MatchQueueManager.Find(session.PlayerId)?.InstanceIds ?? ids.ToArray();
-        MatchQueueManager.RemoveByPlayer(session.PlayerId);
+        var application = MatchQueueManager.FindForPlayer(session.PlayerId);
+        var queuedFor = application?.InstanceIds ?? ids.ToArray();
+        WithdrawApplication(application);
         session.Send(MatchQueueManager.BuildDelPool(instance));
         foreach (var f in MatchQueueManager.EventMatchingFrames(queuedFor, queued: false)) session.Send(f);   // T161b
 
-        // T161 (d): leaving the matcher with a formed match standing turns that match down. The
-        // decliner has just had the leave pair above, so the cancel pair goes to the others.
-        Decline(QueuerFor(session).CharacterId, "C_MATCH_DEL");
+        // T184: C_MATCH_DEL removes queue applications (World:583220 -> SA 0x13AA,
+        // Arb062:6233-6281). It is not a rejection of a party already formed by MA_FIN.
         return true;
     }
 
@@ -422,7 +510,7 @@ public static class MatchWiring
     public static void Unregister(GameSession? session)
     {
         if (session == null || session.PlayerId == 0) return;
-        if (MatchQueueManager.RemoveByPlayer(session.PlayerId))
+        if (WithdrawApplication(MatchQueueManager.FindForPlayer(session.PlayerId)))
             Log.LogDebug("match: player {P} left world - queue entry withdrawn", session.PlayerId);
         // T161b: GameSession.LeaveWorld (the socket went) clears InWorld before this runs; the
         // lobby / exit path (OnWorldLeaveConfirmed) still has it set.
@@ -432,7 +520,7 @@ public static class MatchWiring
     /// <summary>
     /// T161b. A member who DISCONNECTED takes their formed match with them - voided, the rest told
     /// with the cancel pair (arbiter-crash.log: both members crashed at 01:11:42 and instance 9781
-    /// stood until 01:13:11). A lobby relog keeps T161 (a)'s re-offer. Returns whether one went.
+    /// stood until 01:13:11). A lobby relog retains the waiting entry. Returns whether one went.
     /// </summary>
     public static bool OnLeftWorld(int characterId, bool disconnected)
         => disconnected && Decline(characterId, "disconnected");
@@ -452,7 +540,7 @@ public static class MatchWiring
                 Deliver(m, MatchQueueManager.BuildCancelPartyMatchPool(instance));
                 foreach (var f in MatchQueueManager.EventMatchingFrames(e.InstanceIds, queued: false)) Deliver(m, f);
             }
-            MatchQueueManager.Remove(e.LeaderPlayerId);
+            WithdrawApplication(e);
         }
         if (expired.Count > 0)
             Log.LogInformation("match: {N} queue entr(ies) timed out after {S}s",
@@ -485,12 +573,11 @@ public static class MatchWiring
 
     private static readonly object PendingLock = new();
     private static readonly Dictionary<int, PendingMatch> PendingByChar = new();
-    private static readonly HashSet<ulong> ReofferedGameIds = new();
     private static Timer? _expiryTimer;
 
     /// <summary>
-    /// How long a formed match stays claimable. OURS: no capture holds an unanswered FIN - the
-    /// one classic_live3 match was entered at once - so the window is a choice, and a knob.
+    /// How long a formed match stays claimable. OURS: cap_2man has no unanswered match held
+    /// through this deadline, so the expiry window remains an unverified local policy.
     /// </summary>
     public const string EntrySecondsVariable = "TERASHARP_MATCH_ENTRY_SECONDS";
     public const int DefaultEntrySeconds = 300;
@@ -498,7 +585,7 @@ public static class MatchWiring
     /// <summary><see cref="EntrySecondsVariable"/>, read fresh; <see cref="DefaultEntrySeconds"/> when unset or not a positive number.</summary>
     public static int EntrySeconds()
     {
-        var raw = Environment.GetEnvironmentVariable(EntrySecondsVariable);
+        var raw = TerasConfig.Get(EntrySecondsVariable);
         return !string.IsNullOrWhiteSpace(raw) && int.TryParse(raw.Trim(), out int v) && v > 0
             ? v : DefaultEntrySeconds;
     }
@@ -567,25 +654,17 @@ public static class MatchWiring
     }
 
     /// <summary>
-    /// (a) The offer again, for a member who relogged or crashed with a match standing: FIN,
-    /// then S_SYS_PARTY_INFO - the last two frames of the original offer, so the client opens
-    /// the same window it would have. Empty when nothing stands.
+    /// cap_2man_client2: FIN 4356, lobby 4506, selection 4745, load-finished 5010;
+    /// there is no second FIN or 488-byte SYS at relog. Pending membership is retained,
+    /// but replaying the completion notification is not part of enter-world.
     /// </summary>
     public static List<byte[]> ReofferFrames(int characterId, DateTimeOffset now)
     {
-        var outp = new List<byte[]>(2);
-        var m = PendingFor(characterId, now);
-        if (m == null) return outp;
-        outp.Add(MatchQueueManager.BuildFinInterPartyMatch(m.InstanceId));
-        var info = SysPartyInfoFor(characterId, m.Roles);
-        if (info != null) outp.Add(info);
-        return outp;
+        return new List<byte[]>();
     }
 
     /// <summary>
-    /// (a) Called from the C_LOAD_TOPO_FIN burst (SocialHandlers.SendBlockList). Once per world
-    /// entry - keyed on the GameId C_SELECT_USER allocates - so a zone change after "enter later"
-    /// does not throw the window up again. Returns whether an offer went out.
+    /// Compatibility hook for SocialHandlers.SendBlockList. World entry does not replay FIN.
     /// </summary>
     public static bool ReofferPending(GameSession? session)
     {
@@ -597,24 +676,12 @@ public static class MatchWiring
     }
 
     /// <summary>
-    /// (a) The re-offer for one world entry: <see cref="ReofferFrames"/> the first time this
-    /// <paramref name="gameId"/> asks, nothing after. Expired matches are swept first, so an
-    /// offer that has run out is cancelled rather than shown.
+    /// Kept for callers/tests of the former re-offer hook. A different GameId does not mean
+    /// another match formed: cap_2man_client2 relogs between its second FIN and later entry.
     /// </summary>
     public static List<byte[]> TakeReoffer(ulong gameId, int characterId, DateTimeOffset now)
     {
-        SweepPending(now);
-        lock (PendingLock)
-        {
-            if (!PendingByChar.ContainsKey(characterId)) return new List<byte[]>();
-            if (ReofferedGameIds.Count > 4096) ReofferedGameIds.Clear();
-            if (!ReofferedGameIds.Add(gameId)) return new List<byte[]>();
-        }
-        var frames = ReofferFrames(characterId, now);
-        if (frames.Count > 0)
-            Log.LogInformation("match: re-offered instance {I} to character {C} at enter-world",
-                PendingFor(characterId, now)?.InstanceId, characterId);
-        return frames;
+        return ReofferFrames(characterId, now);
     }
 
     /// <summary>
@@ -647,12 +714,22 @@ public static class MatchWiring
         return true;
     }
 
-    /// <summary>(d) A member left or was voted out of the matched party: the match is off.</summary>
+    /// <summary>
+    /// Forget the pending entry after PartyManager has handled withdrawal. cap_2man_client1
+    /// 11051-11055 has one reset/leave/cancel sequence; sending another cancel here duplicates it.
+    /// </summary>
     public static bool OnLeftParty(int characterId)
     {
-        var m = PendingFor(characterId, Clock());
-        if (m == null) return false;
-        VoidPending(m, $"character {characterId} left the matched party");
+        lock (PendingLock)
+        {
+            // The leaver may already have entered while another member is still waiting.
+            var m = PendingByChar.Values.FirstOrDefault(p => p.Roles.ContainsKey(characterId));
+            if (m == null) return false;
+            foreach (int c in m.Waiting)
+                if (PendingByChar.TryGetValue(c, out var mine) && ReferenceEquals(mine, m))
+                    PendingByChar.Remove(c);
+            m.Waiting.Clear();
+        }
         return true;
     }
 

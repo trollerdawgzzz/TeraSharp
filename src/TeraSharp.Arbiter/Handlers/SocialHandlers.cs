@@ -207,6 +207,7 @@ public sealed class SocialHandlers
         GuildWarManager.OnEnterWorld(session);
         // T172: the daily AS_RESET_PURCHASE_LIMIT check starts with the first player (idempotent).
         PurchaseLimitReset.EnsureStarted();
+        QaSocialCommands.RestoreChatBan(session, Program.Store);
     }
 
     internal static void UnregisterSession(string characterName)
@@ -221,6 +222,7 @@ public sealed class SocialHandlers
     /// </summary>
     internal static void UnregisterChat(GameSession? session)
     {
+        if (session != null) QaSocialCommands.Forget(session);
         var chr = session?.SelectedCharacter;
         if (chr == null) return;
         // T76: the other half of the ping, before the roster is torn down so the peers can
@@ -389,7 +391,7 @@ public sealed class SocialHandlers
                 // 582 then 585.
                 ["lastOnline"] = SecondsSince(f.LastLogin),
                 ["type"] = (uint)row.Type,
-                ["bonds"] = 0,
+                ["bonds"] = store.GetFriendshipGage(me, row.FriendId),
                 ["name"] = f.Name,
                 ["myNote"] = row.Memo,
                 ["theirNote"] = store.GetFriendRow(row.FriendId, me)?.Memo ?? "",
@@ -639,8 +641,8 @@ public sealed class SocialHandlers
         if (store.GetBlocks(me).Contains(targetId)) return AddFriendResult.IBlockedTarget;
         if (store.GetBlocks(targetId).Contains(me)) return AddFriendResult.TargetBlockedMe;
         if (store.GetFriendRow(me, targetId) != null) return AddFriendResult.AlreadyFriend;
-        if (store.GetFriendRows(me).Count >= MaxFriends) return AddFriendResult.MyListFull;
-        if (store.GetFriendRows(targetId).Count >= MaxFriends) return AddFriendResult.TargetListFull;
+        if (store.GetFriendRows(me).Count >= QaSocialCommands.FriendLimit(me)) return AddFriendResult.MyListFull;
+        if (store.GetFriendRows(targetId).Count >= QaSocialCommands.FriendLimit(targetId)) return AddFriendResult.TargetListFull;
         return AddFriendResult.Ok;
     }
 
@@ -655,7 +657,7 @@ public sealed class SocialHandlers
             return BlockResult.CannotBlock;
         var blocks = store.GetBlocks(me);
         if (blocks.Contains(targetId)) return BlockResult.AlreadyBlocked;
-        if (blocks.Count >= MaxBlocks) return BlockResult.ListFull;
+        if (blocks.Count >= QaSocialCommands.BlockLimit(me)) return BlockResult.ListFull;
         return BlockResult.Ok;
     }
 
@@ -760,6 +762,7 @@ public sealed class SocialHandlers
             return true;
         }
 
+        if (!QaSocialCommands.TakeFriendRequest(s, target.Id)) { SendSmt(s, 434); return true; }
         WriteFriendRequest(store, me, target.Id, memo);
         _log.LogInformation("C_ADD_FRIEND: {Name} -> {Target} (request)", chr.Name, target.Name);
 
@@ -851,10 +854,17 @@ public sealed class SocialHandlers
         var target = store.GetCharacterByName(targetName);
         if (target == null) return true;                 // silent, as the Arbiter
 
+        DeleteFriendResolved(s, store, chr, target, _log);
+        return true;
+    }
+
+    private static bool DeleteFriendResolved(GameSession s, CharacterStore store, Game.FakeCharacter chr, CharacterRecord target, ILogger log)
+    {
+
         int me = (int)chr.Id;
         int? wasType = DeleteFriendPair(store, me, target.Id);
-        if (wasType == null) return true;                // silent
-        _log.LogInformation("C_DELETE_FRIEND: {Name} x {Target} (was type {Type})",
+        if (wasType == null) return false;                // silent
+        log.LogInformation("C_DELETE_FRIEND: {Name} x {Target} (was type {Type})",
             chr.Name, target.Name, wasType);
 
         var peer = SessionForCharacter(target.Id);
@@ -875,6 +885,29 @@ public sealed class SocialHandlers
                 SendSmt(s, SmtFriendDeleted, "UserName", target.Name);
                 break;
         }
+        return true;
+    }
+
+    /// <summary>T201 QA AddFriendType0xAB creates a mutual pair, not the ordinary request. Arb030:7789.</summary>
+    internal static bool QaFriend(GameSession caller, GameSession targetSession, CharacterStore store, bool add, ILogger log)
+    {
+        var chr = caller.SelectedCharacter; var other = targetSession.SelectedCharacter;
+        if (chr == null || other == null || store.GetCharacter((int)other.Id) is not { } target) return false;
+        if (!add) return DeleteFriendResolved(caller, store, chr, target, log);
+        int me = (int)chr.Id, them = (int)other.Id;
+        if (GmCommandHandlers.LevelOf(targetSession, store) > 0) return false; // native CanAddFriend rejects GM targets.
+        var mine = store.GetFriendRow(me, them); var theirs = store.GetFriendRow(them, me);
+        var verdict = CanAddFriend(store, me, them);
+        if (verdict == AddFriendResult.AlreadyFriend && mine?.Type is 1 or 2
+            && store.GetFriendRows(me).Count <= QaSocialCommands.FriendLimit(me)
+            && store.GetFriendRows(them).Count <= QaSocialCommands.FriendLimit(them)) verdict = AddFriendResult.Ok;
+        if (verdict != AddFriendResult.Ok) return false;
+        store.UpsertFriend(me, them, FriendTypeMutual, "QACommand", mine?.GroupId ?? UngroupedGroupId);
+        store.UpsertFriend(them, me, FriendTypeMutual, "QACommand", theirs?.GroupId ?? UngroupedGroupId);
+        PushFriendCounts(store, me, them);
+        SendSmt(caller, 432, "UserName", other.Name); SendSmt(targetSession, 433, "UserName", chr.Name);
+        SendFriendList(caller); SendFriendList(targetSession);
+        SendUpdateFriendInfo(caller); SendUpdateFriendInfo(targetSession);
         return true;
     }
 
@@ -1077,12 +1110,13 @@ public sealed class SocialHandlers
     /// requester first, and sends them even when the count did not change (the first pair is
     /// two zeroes) - so this fires on the request as well as on the accept.
     /// </summary>
-    private void PushFriendCounts(CharacterStore store, int a, int b)
+    private static void PushFriendCounts(CharacterStore store, int a, int b)
     {
         var world = Program.World;
         if (world == null) return;
-        world.SendFrame(AS_ADD_TO_FRIEND_LIST, BuildAsUserPair(a, MutualFriendCount(store, a)));
-        world.SendFrame(AS_ADD_TO_FRIEND_LIST, BuildAsUserPair(b, MutualFriendCount(store, b)));
+        // Arb029:19831-19895 resolves each friend's own WorldServerSession.
+        ArbiterClientHandlers.SendToWorld(a, AS_ADD_TO_FRIEND_LIST, BuildAsUserPair(a, MutualFriendCount(store, a)));
+        ArbiterClientHandlers.SendToWorld(b, AS_ADD_TO_FRIEND_LIST, BuildAsUserPair(b, MutualFriendCount(store, b)));
     }
 
     // =====================================================================
@@ -1124,7 +1158,7 @@ public sealed class SocialHandlers
         }
 
         store.AddBlock(me, target.Id);
-        Program.World?.SendFrame(AS_ADD_BLOCKED_USER, BuildAsUserPair(me, target.Id));   // T64
+        ArbiterClientHandlers.SendToWorld(s, AS_ADD_BLOCKED_USER, BuildAsUserPair(me, target.Id)); // Arb030:7713-7769
 
         // Blocking breaks the friendship in both directions, and both sides are told.
         if (DeleteFriendPair(store, me, target.Id) != null)
@@ -1168,7 +1202,7 @@ public sealed class SocialHandlers
         int me = (int)chr.Id;
         if (!store.GetBlocks(me).Contains(target.Id)) return true;
         store.RemoveBlock(me, target.Id);
-        Program.World?.SendFrame(AS_REMOVE_BLOCKED_USER, BuildAsUserPair(me, target.Id));   // T64
+        ArbiterClientHandlers.SendToWorld(s, AS_REMOVE_BLOCKED_USER, BuildAsUserPair(me, target.Id)); // Arb030:8649-8699
         _log.LogInformation("C_REMOVE_BLOCKED_USER: {Name} x {Target}", chr.Name, target.Name);
         s.SendByDef("S_REMOVE_BLOCKED_USER", new Dictionary<string, object> { ["id"] = (uint)target.Id });
         return true;

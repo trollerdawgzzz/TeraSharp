@@ -1,0 +1,8 @@
+diff --git a/Datasheet/WorldData.xml b/Datasheet/WorldData.xml
+--- a/Datasheet/WorldData.xml
++++ b/Datasheet/WorldData.xml
+@@ -4081,3 +4081,3 @@
+     <GuildWareHouse enable="true" target="benefitOnly" />
+-    <Teleport enable="true" target="all">
++    <Teleport enable="true" target="benefitOnly">
+       <Condition continentId="5" enter="false" leave="true" exceptionCategory="9827, 9828, 9829, 3035" />

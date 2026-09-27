@@ -9,8 +9,8 @@
 
 | file | what |
 |---|---|
-| `<captures>\cap_newchar.log` | "Test" (playerId 2), FIRST login of a brand-new character |
-| `<captures>\arb_world_2026-09-13T11-33-30-680Z.log` | dob (playerId 1) and "Test" logging in WITH progress |
+| `D:\packetlogs\cap_newchar.log` | "Test" (playerId 2), FIRST login of a brand-new character |
+| `D:\packetlogs\arb_world_2026-09-13T11-33-30-680Z.log` | dob (playerId 1) and "Test" logging in WITH progress |
 | `data/cap_t22_newchar.bin` | the 15 frames of the first that the tests need (TSIS container) |
 | `data/cap_t22_relog.bin` | the 10 frames of the second |
 
@@ -49,11 +49,11 @@ DBS_LOAD_USER_ACHIEVEMENT (0x27F9), our reply to 0x27F8
   [309..]    bodies, in list order
 ```
 
-The writer confirms both: `FUN_1406eeae0` lays down 76 backpatch slots, then appends the DlmId as
-a u32 and Success as a u8, then backpatches the first list's offset with the running length and
-its count slot with the caller's byte count before appending the bytes themselves
-— list 0 written as raw bytes of that length, and `Handler_SDB_LOAD_USER_ACHIEVEMENT` passes
-`local_d08 = 0x4a0` = **1184** for it.
+The writer confirms both: `FUN_1406eeae0` lays down 76 backpatch slots (builder words 3 through
+0x4e), then writes DlmId (`FUN_14013d0b0`) and the Success byte (`FUN_1403513d0`), then stores the
+running frame length into the first slot and the blob's byte count into the second before
+`FUN_1403c98b0` appends list 0 as that many raw bytes — and `Handler_SDB_LOAD_USER_ACHIEVEMENT`
+passes `0x4a0` = **1184** as that count.
 
 **List 0 of both is `Data`**, a fixed 1184-byte blob. Every other list is a counter vector.
 
@@ -222,3 +222,86 @@ packet dumpers still have the answer.
 **playerId 1 (dob) keeps the captured statics** for all four, exactly as he keeps the captured
 quest list: his rows do not exist in our DB and a rebuilt reply would silently drop everything he
 has. `DbProxyHandlers.ServesCapturedStatics` is the one place that decides this.
+
+## 8. T203 — server-first achievements (research)
+
+The marker is **`serverUnique`**, a string attribute on `<Achievement>` in **`AchievementList.xml`**
+(`Executable/ServerConfig.xml:68` lists the sheet; both binaries decode it to an int —
+`WorldServer.exe.c:364358`, `Arb_part_006.c:7670`). 0 = normal, 1 = server-unique, 2 and 3 =
+server-unique **and** party-shared. The sheet itself is not on this machine, and **we do not need
+it**: World copies the decoded value into the **second u32 of each 24-byte `0x2802` record** — the
+field section 1 above calls `[u32 0]`.
+
+### What the real Arbiter does
+
+`Handler_SDB_ACCOMPLISH_USER_ACHIEVEMENT` = `FUN_1407375c0` (`Arb_part_062.c:18927`); the per-record
+gate is `User::AccomplishAchievement` = `FUN_140366070` (`Arb_part_027.c:16554`):
+
+1. per-character dedupe (`User+0x6010`) — already held, drop it;
+2. `serverUnique == 0` -> grant, **no shared check at all**;
+3. otherwise lock `GServerAchievementManager` and call `ServerAchievementManager::IsAccopmlishedNoLock`
+   (the binary's own spelling, `Arb_part_057.c:6374`);
+4. unclaimed -> `SetAccomplishedNoLock` (`Arb_part_057.c:16258`) -> `dbo.spInsertServerAchievement`;
+5. claimed and kind 2/3 -> `CanAccomplishPartyAchievementNoLock` (`Arb_part_056.c:16992`) grants it
+   to the **same party** that first claimed it;
+6. otherwise refuse.
+
+**There is no refusal reply.** `0x2803`'s `success` byte is a hard-coded 1 (`Arb_part_062.c:19023`,
+and all 50 replies in `cap_final2b` agree): the refusal *is* the record's absence from the returned
+list, which is the same 19-byte empty frame section 1 already documents. World's
+`AchievementManager::SetAccomplishedAchievementList` (`WorldServer.exe.c:2195421`) walks only the
+records it received — no else-branch — so nothing reaches the client either.
+
+The shared table is retail's `ServerAchievement` (`GameDatabaseDefinition.xml:1829`, desc
+"서버최초 업적리스트"), columns `achievementId`, `userDbId`, planet-wide with no world scoping;
+SPs `spLoadServerAchievement` / `spInsertServerAchievement` / `spClearServerAchievement`.
+
+### The pin, and one opcode we are missing
+
+`cap_final2b` **3622 -> 3623** (dlm 491, userDbId 1003): 12 ids requested, the 7 with
+`serverUnique == 0` granted and **exactly the 5 with `serverUnique == 1`** — 730, 731, 732, 737,
+2103 — refused, all five already held by userDbId 1 in the `0x2801` snapshot. `cap_newchar.log`
+pins the empty-table case.
+
+**`0x2801 DBS_UPDATE_SERVER_ACHIEVEMENT`** is a one-way A->W push of the whole table
+(`[u32 off][u32 bytes]` + N x `[u32 achievementId][u32 userDbId]`). The real Arbiter sends it once
+per World link on connect (`cap_final2b`: 75 links, 75 pushes, 54 bytes each) and again after a
+grant. We only silence it (`WorldBridge.cs:665`); World has a real handler
+(`WorldServer.exe.c:3026332`).
+
+### What T203 implements
+
+`OnAccomplishUserAchievement` deduped per character only and never read the record's second u32.
+Now:
+
+* **`server_achievements(achievement_id PRIMARY KEY, owner_id, party_id)`** - planet-wide, no
+  foreign key, because retail's table is keyed on the achievement and deleting a character does not
+  release a server first. `TryClaimServerAchievement` is `INSERT OR IGNORE` plus the row count,
+  which IS the race-free first-claimant-wins rule; `GetServerAchievementClaim`,
+  `GetServerAchievements` and `ClearServerAchievements` round it out.
+* **The gate**, in the real Arbiter's order: `serverUnique == 0` grants with no shared check;
+  otherwise claim it if nobody holds it, pass it through when the holder is this character (the
+  per-character table then refuses the repeat by itself), and for kinds 2/3 let the party that first
+  claimed it through. Everyone else is dropped from the offered list, which IS the refusal.
+* **Admin API**: `GET /api/server-achievements` lists every claim with its holder's name, and
+  `POST /api/clear-server-achievement` with an id or all releases one or all - retail's
+  `ClearServerAchievement` / `ClearAllServerAchievement`.
+
+Tests (`T203.cs`, fixture `data/cap_t203.bin`): the capture's split is exactly `serverUnique` in
+both directions and our reply to `cap_final2b` 3622 is **byte-identical to 3623** once the five ids
+are held elsewhere; the second claimant is refused while the ordinary achievement still lands; and a
+claim survives a store reopen, shows in the admin list, and is winnable again after a clear.
+
+**Left out on purpose.** `0x2801 DBS_UPDATE_SERVER_ACHIEVEMENT` is a one-way A->W push of the whole
+table (`[u32 off][u32 bytes]` + N x `[u32 achievementId][u32 userDbId]`) that the real Arbiter sends
+once per World link on connect (cap_final2b: 75 links, 75 pushes, 54 bytes each) and again after a
+grant; World has a real handler (`WorldServer.exe.c:3026332`) and we only silence it
+(`WorldBridge.cs:665`). Sending it is a DBS_* World never asked for, which CLAUDE.md forbids without
+a task that says so, and nothing in the refusal path needs it - the Arbiter is the only authority on
+the claim. It is the next step if World ever has to know the table.
+
+**Not verified:** the three literal `serverUnique` spellings (the sheet is absent from this machine;
+the decompile only gives lengths 5/6/5); kinds 2 and 3 appear in no capture, so the party branch is
+decompile-only; `Party+0x79`, the flag that makes kind 2 refuse outright, is unnamed. Retail's
+claimant list is multi-valued for party grants, so `achievement_id` as the sole key diverges if true
+party sharing is ever implemented.

@@ -1,0 +1,13 @@
+# T184f capture evidence
+
+`source-manifest.json` records original file hashes, frame counts and all eight formation windows (three per retail member, one per TeraSharp member), plus client1's Vanguard claim window 10209–10318. `frame-ledger.tsv` indexes every frame in those windows plus matching/party/dungeon/reset traffic elsewhere. `streams.json` supplies the complete original bytes for those entries and selected World control frames. `decoded-matching.json` decodes every C730/87AC/8BE4/8BC6/CCBC/6470/74C7 field in the selected client traffic, including the complete ordered event IDs and all 30 SYS slots. It does not pretend that movement/combat packets have been decoded.
+
+Regenerate from the original files with `python tools/t184f-evidence.py D:/packetlogs`, from the repository root. Login/ticket packets are excluded. A tap reference is the original TCP record containing the frame's **first** byte plus its byte offset, not the completing record or a reframe ordinal. `_ctl.txt` is only an index; tests use full HEX records.
+
+The new tap has 25 connections registered to **WorldId 0** (one control plus 24 bypass connections). DungeonServer and port 7803 MatchServer traffic are absent. Missing 13BF/13C0/13F5/AM/MA messages therefore cannot be treated as proof that retail omitted them. The dropout abnormality is visible in the client capture.
+
+`comparison.tsv` classifies concrete field differences. Character, party, game and character-name values are state, not replacement constants. Byte fixtures in `T184f*.cs` explicitly supply the captured state; local runtime IDs are normalized only where the test says so.
+
+The manifest also lists complete post-FIN windows through each member's next dungeon spawn, the reset vote/port-out and final withdrawal/port-out. Authentication packets are excluded even across client2's lobby relog. Client1 loads9781 at2113/4661/10824; client2 at2422/5556/8460. Client2's first C_ENTER1078 is followed by other zone changes before9781, and the second dungeon entry follows NPC/dialog traffic without another C_ENTER. These windows preserve that distinction rather than presenting the click as immediate proof of entry. The World claim window8450–8545 includes every persistence frame surrounding the Vanguard reward.
+
+Validation on the source copy with `status/T184f-PARTY-PATCH.diff` applied: solution build succeeds;1008 tests pass,0 fail,26 skip for absent older fixtures. The19 new T184f tests all pass. The actual worktree still requires that one-line human patch to remove the duplicate reset registration.34 whole-frame literals in the new tests were verified against the real two-player captures; no queue4 frame was accepted as a retail golden.

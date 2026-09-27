@@ -473,6 +473,11 @@ public static class SelfTest
         "TERASHARP_START_OVERRIDE",
         "TERASHARP_API_GATEWAY", "TERASHARP_DB_SERVER_NAME", "TERASHARP_API_JWT_SECRET",   // T124: Alt+A
         "TERASHARP_API_GATEWAY_SERVE", "TERASHARP_API_GATEWAY_BIND",                       // T132: the probe at that address
+        // T204: the rest, so this list and teras.json describe the same set and --check-config is
+        // the one place to look. Every one of these was readable and unreported before.
+        "TERASHARP_SERVERCONFIG", "TERASHARP_STANDALONE", "TERASHARP_RANKING_SEASON",
+        "TERASHARP_MATCH_ENTRY_SECONDS", "TERASHARP_MATCH_MIN_MEMBERS",
+        "TERASHARP_BG_MAX_HEALERS", "TERASHARP_BG_MAX_TANKS", "TERASHARP_BROKER_FEE_PERCENT",
     };
 
     /// <summary>Variables whose value must never reach a log or a console.</summary>
@@ -507,11 +512,18 @@ public static class SelfTest
         var sb = new System.Text.StringBuilder();
         sb.Append("TeraSharp configuration").Append(Environment.NewLine);
 
-        sb.Append(Environment.NewLine).Append("  environment").Append(Environment.NewLine);
+        // T204: which file the settings came from, before the settings themselves - reading the
+        // right values out of the wrong file is the mistake this block exists to catch.
+        sb.Append(Environment.NewLine).Append("  settings").Append(Environment.NewLine);
+        foreach (var line in TerasConfig.Describe())
+            sb.Append("    ").Append(line).Append(Environment.NewLine);
+
+        sb.Append(Environment.NewLine).Append("  values").Append(Environment.NewLine);
         foreach (var name in KnownVariables)
         {
-            string shown = Display(name, Environment.GetEnvironmentVariable(name));
-            sb.Append("    ").Append(name.PadRight(30)).Append(shown).Append(Environment.NewLine);
+            string shown = Display(name, TerasConfig.Get(name));
+            sb.Append("    ").Append(name.PadRight(30)).Append(shown.PadRight(34))
+              .Append('[').Append(TerasConfig.SourceOf(name)).Append(']').Append(Environment.NewLine);
         }
 
         sb.Append(Environment.NewLine).Append("  resolved").Append(Environment.NewLine);
@@ -535,7 +547,7 @@ public static class SelfTest
     /// </summary>
     public static IEnumerable<string> Notes()
     {
-        string? gm = Environment.GetEnvironmentVariable("TERASHARP_GM_ACCOUNTS");
+        string? gm = TerasConfig.Get("TERASHARP_GM_ACCOUNTS");
         if (!string.IsNullOrWhiteSpace(gm))
         {
             bool allNumeric = true;
@@ -547,22 +559,22 @@ public static class SelfTest
                            + "matches and that account silently gets a normal login.";
         }
 
-        if (!Auth.AuthProviders.EnabledFromEnvironment(Environment.GetEnvironmentVariable("TERASHARP_AUTH")))
+        if (!Auth.AuthProviders.EnabledFromEnvironment(TerasConfig.Get("TERASHARP_AUTH")))
             yield return "! auth is OPEN - every login is accepted. Do not expose this build.";
 
-        string? token = Environment.GetEnvironmentVariable("TERASHARP_ADMIN_TOKEN");
+        string? token = TerasConfig.Get("TERASHARP_ADMIN_TOKEN");
         if (string.IsNullOrWhiteSpace(token))
             yield return "- the admin web is OFF (TERASHARP_ADMIN_TOKEN is unset), which fails closed.";
         else if (token.Length < 24)
             yield return "! TERASHARP_ADMIN_TOKEN is short. It is the only thing in front of the "
                        + "write endpoints; use 48 characters of randomness.";
 
-        string? port = Environment.GetEnvironmentVariable("TERASHARP_ADMIN_PORT");
+        string? port = TerasConfig.Get("TERASHARP_ADMIN_PORT");
         if (string.IsNullOrWhiteSpace(port) || port.Trim() == "8050")
             yield return "! the admin web is on 8050, which !SECURITY_TODO lists as tera-api's own "
                        + "admin panel. Whichever starts second loses. Set TERASHARP_ADMIN_PORT=8051.";
 
-        string? bind = Environment.GetEnvironmentVariable("TERASHARP_BIND");
+        string? bind = TerasConfig.Get("TERASHARP_BIND");
         if (!string.IsNullOrWhiteSpace(bind) && bind.Trim() != "127.0.0.1")
             yield return "! TERASHARP_BIND is not 127.0.0.1. Port 7701 does not check GM privilege "
                        + "on C_ADMIN - the proxy on 7801 is the only gate. Keep it on loopback.";

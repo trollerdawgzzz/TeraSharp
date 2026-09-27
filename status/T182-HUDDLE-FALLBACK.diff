@@ -1,0 +1,17 @@
+diff --git a/Datasheet/AccountTrait.xml b/Datasheet/AccountTrait.xml
+--- a/Datasheet/AccountTrait.xml
++++ b/Datasheet/AccountTrait.xml
+@@ -719,10 +719,10 @@
+     <Package id="600" order="0" product="true">
+-      <Property name="HuddleAdding" enable="true" level="1" />
++      <Property name="HuddleAdding" enable="false" level="1" />
+     </Package>
+     <Package id="601" order="1" product="true">
+-      <Property name="HuddleAdding" enable="true" level="2" />
++      <Property name="HuddleAdding" enable="false" level="2" />
+     </Package>
+     <Package id="602" order="2" product="true">
+-      <Property name="HuddleAdding" enable="true" level="3" />
++      <Property name="HuddleAdding" enable="false" level="3" />
+     </Package>
+     <!-- for program -->

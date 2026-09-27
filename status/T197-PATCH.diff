@@ -1,0 +1,28 @@
+diff --git a/src/TeraSharp.Arbiter/Handlers/HandlerRegistry.cs b/src/TeraSharp.Arbiter/Handlers/HandlerRegistry.cs
+--- a/src/TeraSharp.Arbiter/Handlers/HandlerRegistry.cs
++++ b/src/TeraSharp.Arbiter/Handlers/HandlerRegistry.cs
+@@ -77,7 +77,7 @@
+                 // C_LOAD_TOPO_FIN (first spawn AND after a zone change). T45: built from the visited_sections
+                 // rows - the hard-coded empty list told World "nothing explored" on every relog.
+                 s.Send(ArbiterClientHandlers.BuildVisitedSectionListFor(s));   // T75/T79: FIRST in the burst, as frame 257 - S_VISITED_SECTION_LIST from visited_sections (stops the intro cutscene replaying)
+-                s.Send(ArbiterClientHandlers.BuildCrestInfoFor(s));            // T83: crest points + learned crests (frames 304/314)
++                // T197: World owns S_CREST_INFO; a synthetic zero-use packet resets glyphs on every topo-fin.
+                 s.Send(ArbiterClientHandlers.BuildChangeCardPreset());         // T83: card preset (frames 329/375)
+                 if (GmCommandHandlers.LevelOf(s, Program.Store) >= 1)   // T107: the real server sends these only to GMs
+                 {
+diff --git a/src/TeraSharp.Arbiter/World/WorldBridge.cs b/src/TeraSharp.Arbiter/World/WorldBridge.cs
+--- a/src/TeraSharp.Arbiter/World/WorldBridge.cs
++++ b/src/TeraSharp.Arbiter/World/WorldBridge.cs
+@@ -695,7 +695,11 @@
+             _log.LogWarning("0x{Op:X4}: world {W} has no links - frame dropped", op, worldId);
+             return;
+         }
+-        if (op == OpPlayerEnter) _crossWorld.RememberEnter(worldId, payload);
++        if (op == OpPlayerEnter)
++        {
++            DbProxy?.StampEnterWorldCrestPoints(payload); // T197: refresh earned extras before caching any entry/transfer/retry.
++            _crossWorld.RememberEnter(worldId, payload);
++        }
+         primary.SendFrame(op, payload);
+     }
+ 

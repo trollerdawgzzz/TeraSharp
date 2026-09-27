@@ -45,6 +45,22 @@ DEPLOY is complete, this one asks what the CONFIGURATION came out as.
 
 - [ ] `--check-config` run on the server itself, and no `!` line left
 
+### Production switches (T174)
+
+These exist for test sessions. Every one must be in this state before players arrive:
+
+| Switch | Production | Why |
+|---|---|---|
+| `TERASHARP_MATCH_MIN_MEMBERS` | **unset** | retired and ignored (T184h); configure dungeon capacity and roles in the sheets. The startup patch warns if the obsolete variable remains set |
+| the packet tap (`arbiter-world-tap.js`) | **not running**; DeploymentConfig's `<ArbiterServer port>` = **7802** | the tap listens on 7812 and writes every World frame to `arb_world_<stamp>.log`; point World straight at TeraSharp |
+| `TERASHARP_API_GATEWAY_SERVE` | **unset** | the T132 HTTP probe; it is not the Alt+A gate (T144b) and it opens a listener plus a urlacl |
+| `TERASHARP_START_OVERRIDE` | **unset** | forces every new character's start point |
+| `TERASHARP_LOG_LEVEL` | `Warning` | console only; the daily file keeps Debug |
+| `capture-tune.ps1` / `level70-start.ps1` edits | **reverted** (`-Revert`) unless you mean to keep them | temporary datasheet tweaks for capture sessions (T149, T160) |
+| `SpeedHack turnOn` in World's config | back to its shipped value | turned off for GM testing |
+
+- [ ] every row above in its production state
+
 ---
 
 ## 1. Turn auth on
@@ -88,10 +104,12 @@ survives without an environment variable.
 - [ ] log in and press **Alt+A** - the In-Game Operation Tool should open
 - [ ] a non-GM account logs in and Alt+A does nothing
 
-If Alt+A does nothing for an account you believe is a GM, check in this order:
-`S_LOGIN_ARBITER.status` should be 33 and not 31 (that is the client's switch), and
-`C_REQUEST_SERVER_ADMINTOOL_AWESOMIUM_URL` must be answered - see
-`status/GM-DESIGN.md`, T104 and T107.
+If Alt+A does nothing for an account you believe is a GM: the gate is **`S_SELECT_USER` body 1,
+the selected character's adminLevel** (T144b, `status/ALTA-DIFF.md`). It is non-zero only when the
+account is a GM by one of the two routes above at character select - relog after changing it.
+`S_LOGIN_ARBITER.status` 33 (vs 31) is the other half; the URL reply is identical for GMs and
+non-GMs and is not the gate. A GM spawns vaporized on World and is released from hold right after
+`S_SPAWN_ME` (T144b/T148): if the GM cannot move, that release is the first thing to check.
 
 ---
 
@@ -140,14 +158,15 @@ The In-Game Operation Tool is an embedded web view. It needs two fields in
 `S_LOGIN_ACCOUNT_INFO` - the second frame of every session - and a GM account:
 
 ```
-setx /M TERASHARP_API_GATEWAY      127.0.0.1:8040
+setx /M TERASHARP_API_GATEWAY      <address the client can reach>:8800
 setx /M TERASHARP_DB_SERVER_NAME   PlanetDB_2800
 setx /M TERASHARP_API_JWT_SECRET   <tera-api .env API_PORTAL_SECRET, verbatim>
 ```
 
-- [ ] the port is tera-api's `API_GATEWAY_LISTEN_PORT`, **not** the arbiter API on 8080 that
-      `TERASHARP_AUTH` uses - check your `.env` and mirror it here
-- [ ] tera-api's **gateway_api** component is actually running (`start_gateway_api.bat`)
+- [ ] the address is DeploymentConfig's `<APIServer port=8800>` as the CLIENT reaches it (T132 moved
+      the default from 8040, tera-api's billing gateway); it is what the panel shows, not what
+      opens it
+- [ ] `TERASHARP_API_GATEWAY_SERVE` stays unset (section 0.5)
 - [ ] the account is a GM (`TERASHARP_GM_ACCOUNTS`, or `accounts.admin_level >= 1`), which is
       what makes `S_LOGIN_ARBITER.status` 33 - both halves are needed
 - [ ] `--check-config` shows `TERASHARP_API_JWT_SECRET  (set, N chars)` and no `!` line
@@ -166,7 +185,7 @@ The box is a VPS. The defaults assume a workstation.
 
 ```
 setx /M TERASHARP_LOG_LEVEL Warning
-setx /M TERASHARP_LOGS <captures>
+setx /M TERASHARP_LOGS D:\packetlogs
 ```
 
 Item names in the admin web come from the client's own strsheet, loaded lazily on the
@@ -194,7 +213,7 @@ The memory is mostly not TeraSharp's:
       workload. 256 MB is plenty for `teraapi`, `box2db`, `steer3db`.
 - [ ] **tera-api (node)** - one process per service; do not run the four services you
       are not using.
-- [ ] **Rotate `<captures>`** - the tap logs are hundreds of MB each. Keep the
+- [ ] **Rotate `D:\packetlogs`** - the tap logs are hundreds of MB each. Keep the
       `arbiter-*.log` files, delete the `cap_*` captures once a pass is committed.
 - [ ] **Turn the packet tap off in production.** It writes every frame to disk.
 - [ ] Leave the Arbiter's own GC alone. It is the small one here.
@@ -221,6 +240,9 @@ Sanity check after an hour with players on: the Status tab's *working set* and
       have never restored is a hypothesis.
 - [ ] add `-MySqlDump` and `-SqlServer` if you are still running the leaked stack's
       databases - `!SECURITY_TODO` has had that item open since 2026-09-11
+- [ ] **before every deploy**, a snapshot of `terasharp.db` (`TERASHARP_DB`, default
+      `<TERASHARP_LOGS>\terasharp.db`): run `backup-db.ps1` once by hand, or stop the Arbiter and
+      copy the file. A schema migration runs on the next start and is not reversible without it.
 
 ---
 
@@ -232,6 +254,19 @@ Everything above should be done first.
 .\tools\harden-netcup.ps1 -AdminIp <your.ip> -WhatIf     # look first
 .\tools\harden-netcup.ps1 -AdminIp <your.ip>
 ```
+
+| Port | Who | Reachable from |
+|---|---|---|
+| 81 | tera-api launcher / account web | **internet** |
+| 7801 | tera-server-proxy (the GM gate) | **internet** |
+| 3389 | RDP | your address only |
+| 7701 | TeraSharp client listener | loopback - **never** public (section 0) |
+| 7802 | TeraSharp World link | loopback (World on the same box) |
+| 8051 | TeraSharp admin web | loopback; reach it through an RDP/SSH tunnel |
+| 8080, 8040, 8050 | tera-api auth API, gateway, imsadmin | loopback |
+| 8800 | Alt+A `apiServerAddress` probe | closed (the probe is off) |
+| 7812 | the capture tap | closed (the tap is off) |
+| 1433, 3306 | MSSQL, MySQL | loopback |
 
 This replaces `!Firewall_Lockdown.bat`'s denylist with a **default-deny** inbound
 policy: 81 and 7801 are allowed, RDP is allowed from your address, and anything else
@@ -282,7 +317,55 @@ Start-Process -FilePath (Join-Path $root 'Executable\WorldServer.exe') `
 
 ---
 
-## 9. First hour with players
+## 9. Maintenance: announce, kick, restart
+
+The Arbiter cannot be restarted under World: World dies when the link drops (section 8), so every
+deploy is both. Players get a warning first. The admin web calls take the token as `X-Admin-Token`.
+
+```powershell
+$h = @{ 'X-Admin-Token' = $env:TERASHARP_ADMIN_TOKEN }
+$api = 'http://127.0.0.1:8051/api'
+# 1. warn, 10 and 2 minutes ahead
+Invoke-RestMethod -Method Post "$api/announce" -Headers $h -ContentType 'application/json' `
+    -Body '{"text":"Server restart in 10 minutes.","reason":"deploy"}'
+# 2. at the time: kick whoever is still on (logs out cleanly, saves the character)
+(Invoke-RestMethod "$api/online" -Headers $h) | ForEach-Object {
+    Invoke-RestMethod -Method Post "$api/kick" -Headers $h -ContentType 'application/json' `
+        -Body (@{ id = $_.id; reason = 'restart' } | ConvertTo-Json) }
+```
+
+3. Stop the Arbiter; snapshot `terasharp.db` (section 6).
+4. Deploy (`deploy.ps1`: it runs `--selftest` first and aborts on a required failure).
+5. Start the Arbiter, then restart every World (`--id=1`, then `--id=13`) - the Status tab's
+   *world links* tile must come back.
+6. Log one character in before announcing that the server is up.
+
+- [ ] the whole loop rehearsed once on a quiet evening
+- [ ] `GET /api/online` field names checked against your build before scripting the kick
+
+---
+
+## 10. Editing a datasheet
+
+World's `Executable\Datasheet` is the source of truth for both processes (T159): World reads it
+at start, and TeraSharp reads the 14 values in `status/DATASHEETS.md` from the same folder.
+
+1. Copy the sheet aside first (or use `tools/capture-tune.ps1`, which backs up, hashes and edits
+   attribute values only; `-Revert` restores byte for byte).
+2. Edit values only; keep the file's encoding and BOM (`ServerConfig.xml` without its BOM makes
+   the real Arbiter exit silently - an editor that "fixes" it breaks it).
+3. Restart the Arbiter and World (section 9): World does not reload sheets, and TeraSharp reads
+   each once.
+4. Check the Arbiter's startup lines: `loaded <sheet>: N entries -> <consumer>`, or
+   `<sheet> not found, using built-in` when it did not parse. `--check-config` lists the same.
+5. Anything the client must also know (new items, strings) is in the client's data center, not
+   in these sheets (T160); a sheet edit alone does not change what the client shows.
+
+- [ ] the edit and its backup are recorded somewhere you will find in a month
+
+---
+
+## 11. First hour with players
 
 - [ ] watch `arbiter-<date>.log` for `WARN` and `ERROR`, not for traffic
 - [ ] `[spoof-guard] DROPPED` or repeated `[exploit-fix]` from one account: ban it
@@ -301,9 +384,9 @@ These are known and unfixed, not oversights:
   though: `S_GET_USER_LIST.18.def` has no play-time field.
 - ~~**Item names** show template ids~~ - **fixed (T113)**: read from the client's own
   `StrSheet_Item*.xml`. See `status/WEBADMIN-DESIGN.md` 11.1.1.
-- **`S_ADMIN_GM_SKILL` and `S_ADMIN_HOLD_CHARACTER` are pushed to every player**, not
-  just GMs (`HandlerRegistry.cs`, T89). The real server sends neither to a non-GM.
-  It is not what opens Alt+A, so it is not a privilege hole - but it should be gated.
+- ~~**`S_ADMIN_GM_SKILL` and `S_ADMIN_HOLD_CHARACTER` are pushed to every player**~~ -
+  **fixed**: the spawn-time `S_ADMIN_GM_SKILL` is World's alone (T152), and the hold release goes
+  to operators only (T144b).
 - **`S_CONFIRM_INVITE_CODE_BUTTON`** sends `UtcNow` where the real server sends a
   future expiry, so the countdown reads as expired. `status/CLIENT-REJECTS.md`, T106.
 - **The SQL Server `sa` and MySQL `root` passwords** are still the defaults from

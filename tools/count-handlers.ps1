@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 the TeraSharp contributors
+
 <#
 .SYNOPSIS
   Which client packets the real Arbiter handles, and which of them TeraSharp registers.

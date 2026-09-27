@@ -13,13 +13,13 @@ it to look up version info in two small static tables.
 The bounds check only guards the upper side:
 
 ```c
-iVar3 = *(int *)(packet + offset);       // module index — FROM PACKET, signed int
-if (1 < iVar3) { reject; }               // ONLY rejects index > 1
-// the index is then used twice unchecked: once to read a version out of a table of ints,
-// and once to index a table of pointers whose entry is printed with %s
+moduleIndex = *(int *)(packet + offset);   // module index — FROM PACKET, signed int
+if (1 < moduleIndex) { reject; }           // ONLY rejects index > 1
+versionTable[moduleIndex];                 // 4-byte stride — OOB read if negative
+ptrTable[moduleIndex];                     // pointer — OOB, dereferenced and printed as %s
 ```
 
-The index is a **signed int**. The check `if (1 < iVar3)` rejects values greater than
+The module index is a **signed int**. The check `if (1 < moduleIndex)` rejects values greater than
 1, but a **negative** value (e.g. `0xFFFFFFFF` = -1) passes the check. The negative
 index reads garbage from before the tables, then dereferences it as a wide-string
 pointer for logging → **crash**.

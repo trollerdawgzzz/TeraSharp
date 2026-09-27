@@ -317,7 +317,7 @@ public static class MatchComposition
 
     private static int EnvCount(string name, int fallback)
     {
-        var raw = Environment.GetEnvironmentVariable(name);
+        var raw = TerasConfig.Get(name);
         return !string.IsNullOrWhiteSpace(raw) && int.TryParse(raw.Trim(), out int v) && v >= 0
             ? v : fallback;
     }

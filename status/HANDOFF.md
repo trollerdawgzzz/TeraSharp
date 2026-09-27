@@ -127,7 +127,7 @@ D:\v100\TERA_SERVER.100\
   tera-api\                          Node auth/API server (for real account auth, not wired yet)
   arbiter-world-tap.js               the A<->W packet tap (see section 5)
 
-<captures>\
+D:\packetlogs\
   arb_world.log      A<->W tap: one login + one DISCONNECT logout. The replay table is built
                      from THIS file at startup. Captured 2026-09-12.
   lobby_tap.log      A<->W tap: login + working LOGOUT-BUTTON lobby return + relog + second
@@ -279,7 +279,7 @@ A raw TCP tap here only yields ciphertext after the key exchange. Two working op
 1. **`tera-server-proxy` / tera-toolbox** (present at
    `D:\v100\TERA_SERVER.100\tera-server-proxy\`, opcode map in `data\data.json` under `maps."376012"`).
    It terminates the client crypto and logs decrypted, opcode-named packets. This produced
-   `<captures>\lobby_proxy.log`:
+   `D:\packetlogs\lobby_proxy.log`:
 
    ```
    [1] [C->S] C_CHECK_VERSION (19900) len=32

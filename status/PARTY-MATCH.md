@@ -1,6 +1,6 @@
 # Party matching - the manual party board (LFG), T78
 
-Ground truth: `<captures>\cap_social4_client.log` frames **5194..5247** and
+Ground truth: `D:\packetlogs\cap_social4_client.log` frames **5194..5247** and
 `cap_social4_ctl.txt`, the World<->Arbiter tap of the same session. Implementation:
 `World/PartyMatchManager.cs`. Tests: `T78_party_match_frames_match_cap_social4`,
 `T78_party_match_client_bodies_parse_at_the_handler_offsets`,

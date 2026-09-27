@@ -5,7 +5,7 @@ T27, research only. Nothing in this document is implemented. `World/WorldBridge.
 diffs rather than editing them.
 
 Sources: the decompiled `ArbiterServer.exe` (`Arb_part_000.c` … `Arb_part_095.c`), the four
-Arbiter↔World taps in `<captures>\`, and `ServerConfig.xml`. Every claim carries a
+Arbiter↔World taps in `D:\packetlogs\`, and `ServerConfig.xml`. Every claim carries a
 `FUN_…` / `file:line`. `WorldServer.exe.c` is a single 125 MB file and could not be staged
 into the research container, so every "what World expects" answer below is derived from the
 Arbiter's side of the contract and is flagged where that matters.
@@ -31,9 +31,11 @@ is a decode bug that only ever fires with two logins.
 
 ### 1.1 Real layout
 
-From the PDL dumper `FUN_1402152d0` (`Arb_part_016.c:8636`): it labels the frame
-`SA_BYPASS_TO_CLIENT` and emits two ref fields - `UserList`, whose frame-relative offset it
-reads at +6, and `Packet`, whose offset it reads at +0x0E.
+From the PDL dumper `FUN_1402152d0` (`Arb_part_016.c:8636`):
+
+it writes the message name `SA_BYPASS_TO_CLIENT`, reads the u32 at frame+6 as the `UserList`
+offset and the u32 at frame+0x0E as the `Packet` offset, and emits each of the two as a named
+sub-record (`FUN_14016bd70`).
 
 | frame off | payload off | u32 | meaning |
 |---|---|---|---|
@@ -44,8 +46,9 @@ reads at +6, and `Packet`, whose offset it reads at +0x0E.
 | +0x16 | 16 | `UserList[]` | 16 bytes per recipient |
 
 `UserList` entry, from `Handler_SA_BYPASS_TO_CLIENT` = `FUN_140720f60` (`Arb_part_062.c:3755`):
-four fields per 16-byte entry - `PlanetId` at +0, an unread u32 at +4, `Ticket` at +8, and the
-sequence number pre-shifted as `Seq << 19` at +12.
+
+each entry is 16 bytes: `+0` PlanetId (int), `+4` an int the handler loads and never reads,
+`+8` Ticket (the low 32 bits of the u64 read there), `+12` `Seq << 19` (uint).
 
 So for **one** recipient the header is 32 bytes and the packet starts at payload+32 — which
 is exactly what `WorldBridge.HandleFrame` hardcodes, and why single-player works. For **two**
@@ -55,8 +58,17 @@ recipients the header is 48 bytes and the packet starts at payload+48.
 
 `Arb_part_062.c:3762`:
 
-`FUN_1405b3840` is `PacketBypassManager::GetSession(int)` (`Arb_part_048.c:11975`) - it indexes
-the flat array at `+0x60` by the Ticket and returns whatever is there, with no bounds check.
+the handler compares entry+0 against this Arbiter's PlanetId (`DAT_140e2d020`); on a match it
+takes `seq = entry+12 >> 19` and looks the target session up by the low 32 bits of the u64 at
+entry+8 — the Ticket — through `FUN_1405b3840` on the `PacketBypassManager` singleton
+(`DAT_141094508`).
+
+`FUN_1405b3840` is `PacketBypassManager::GetSession(int)` (`Arb_part_048.c:11975`) — a flat
+array indexed by Ticket, no bounds check:
+
+```c
+  session = *(ClientSession **)( *(void **)(manager + 0x60) + ticket * 8 );  // no range test
+```
 
 `DAT_140e2d020` is this Arbiter's **PlanetId**, from `ServerConfig.xml`'s `planetId`
 (`Arb_part_033.c:13299`, `:13511`). Every capture shows `0x0AF0` = 2800, and the same 2800
@@ -78,12 +90,14 @@ of all four captures, and the reorder slot array in `PacketBypassController` is 
 ### 1.4 One frame, several recipients
 
 The Arbiter allocates **one** `BypassPacketInfo` per 0x13F7 and refcounts it by recipient
-count (`Arb_part_062.c:3736`) - a 0x18-byte allocation carrying the packet buffer at +0 and its
-length at +8, with the recipient count added to the refcount at +0x0C;
+count (`Arb_part_062.c:3736`):
 
-then posts one job per live recipient onto that session's own queue and backs out the refcount
-for recipients with no live session (`Arb_part_062.c:3800`). Fan-out is the designed case, not
-an edge case.
+it allocates 0x18 bytes from the pool (`FUN_14002a7a0`), stamps the `BypassPacketInfo` RTTI
+type descriptor into the 8 bytes in front of the object, stores the packet buffer at +0 and its
+length at +8 (`FUN_140679590`), and adds `recipientCount` to the refcount at +0xc
+(`FUN_14063f4b0`). It then posts one job per live recipient onto that session's own queue and
+backs out the refcount for recipients with no live session (`Arb_part_062.c:3800`). Fan-out is
+the designed case, not an edge case.
 
 `param_1` — the `WorldServerSession` the frame arrived on — **is never referenced** in
 `FUN_140720f60`. The Arbiter does not care which of the 25 links a tunnel frame comes in on.
@@ -97,8 +111,8 @@ the 5810 0x13F7 frames across them has `UserListBytes == 16`, and every one has 
 ## 2. `AS_BYPASS_FROM_CLIENT` (0x13F6) — outbound
 
 Written by `Handler_CA_Default` = `FUN_1404d7fb0` (`Arb_part_040.c:16610`), which is the
-**default entry of the Arbiter's 65536-slot client-opcode table** (`Arb_part_000.c:5493` fills
-all 0x10000 slots with it). Anything the Arbiter has no handler for
+**default entry of the Arbiter's 65536-slot client-opcode table** (`Arb_part_000.c:5493`:
+the init loop fills all 0x10000 slots with `FUN_1404d7fb0`). Anything the Arbiter has no handler for
 is tunnelled — the same rule `PacketDispatcher` already implements.
 
 Dumper `FUN_14017d9c0` (`Arb_part_011.c:6532`): `Packet` offset @+6, `Packet` length @+0x0A,
@@ -109,7 +123,7 @@ Two corrections to the note in `CLAUDE.md` §3:
 
 - the u64 at payload+8 is `WorldClient`, sourced from `User+0x4038`, which is set from
   `SA_ENTER_WORLD`'s own `WorldClient` field (`User::EnterWorldEnd` = `FUN_140382180`,
-  `Arb_part_028.c:15031`, which stores that argument straight into `User+0x4038`). It is **not** the
+  `Arb_part_028.c:15031` stores that argument as the u64 at `User+0x4038`). It is **not** the
   `GameId` field at `User+0x5718`. They hold the same value in this build — `AS_ARBITER_USER_DELETE`
   sends both side by side and the captures show them equal — but they are different fields.
   Feeding `GameId` is correct today and would stay correct as long as World keeps echoing it.
@@ -118,9 +132,14 @@ Two corrections to the note in `CLAUDE.md` §3:
 
 ### Link selection — per-user affinity, not round-robin
 
-`User::GetBypassSession` = `FUN_140385c80` (`Arb_part_028.c:17295`) -> ... ->
-`WorldSessionManager::GetBypassSessionByServerId` = `FUN_14056d570` (`Arb_part_046.c:2413`),
-which indexes the session array at `+8` by the caller's id modulo the link count at `+0x20`.
+`User::GetBypassSession` = `FUN_140385c80` (`Arb_part_028.c:17295`) → … →
+`WorldSessionManager::GetBypassSessionByServerId` = `FUN_14056d570` (`Arb_part_046.c:2413`):
+
+```c
+  bypassLinks = *(Session **)(worldEntry + 0x08);        // vector<Session>, connect order
+  bypassCount = *(int *)(worldEntry + 0x20);             // TotalBypassCount
+  link        = bypassLinks[ userDbId % bypassCount ];   // 8 bytes per slot
+```
 
 → **`bypassLinks[ UserDbId % TotalBypassCount ]`**, `TotalBypassCount` = 24 from `SA_REGISTER`.
 Fixed for a user's whole session; there is no stored link index and no round-robin. (What *is*
@@ -143,10 +162,16 @@ the Arbiter binary.
 ### Allocation
 
 `PacketBypassManager::BypassStart(TPointer<ClientSession,5>,int)` = `FUN_1405afaf0`
-(`Arb_part_048.c:9296`) - a linear probe from a monotonic cursor. The cursor at `+0x58` modulo
-the table size at `+0x5c` (`maxUsers * 4`) picks the first slot, the cursor is bumped until a
-free one turns up, the `ClientSession` is stored there, and the slot index is returned as the
-Ticket.
+(`Arb_part_048.c:9296`) — linear probe from a monotonic cursor:
+
+```c
+  cursor    = *(uint *)(manager + 0x58);                    // monotonic
+  tableSize = *(uint *)(manager + 0x5c);                    // maxUsers * 4
+  ticket    = cursor % tableSize;
+  while (table[ticket] != 0) { cursor = cursor + 1; … }     // linear probe
+  table[ticket] = clientSession;
+  return ticket;
+```
 
 Called from the enter-world path (`Arb_part_028.c:15398`) and passed as parameter 14 of the
 `AS_ENTER_WORLD` writer — the dumper names it **`Ticket`** at frame+0x56 = **payload+80**,
@@ -161,8 +186,10 @@ out 0,1,2,… — the cursor is monotonic, so a freed slot is not reused immedia
 `GameId` u64 @+0x0E, `LeaveWorldType` @+0x16, `LogoutReason` @+0x1A, **`Ticket`** @+0x1E,
 **`LastIndex`** @+0x22. `Handler_SA_LEAVE_WORLD` = `FUN_140728c20` (`Arb_part_062.c:9038`):
 
-It fetches the session by the `Ticket` at +0x1E, then hands `ClientSession::BypassEnd(int,uint)`
-= `FUN_140883d90` that `Ticket` together with `LastIndex` at +0x22.
+it resolves the session with `FUN_1405b3840` on the manager singleton, passing the Ticket read
+as a u32 from frame+0x1E; it then builds a job whose callback is
+`ClientSession::BypassEnd(int,uint)` = `FUN_140883d90` and posts it with `FUN_1406d4490`,
+handing it Ticket (frame+0x1E) and LastIndex (frame+0x22).
 
 `LastIndex` is the final sequence World emitted on that Ticket; the controller drains up to it,
 then `PacketBypassManager::BypassEnd(int)` = `FUN_1405afa20` (`Arb_part_048.c:9262`) clears the
@@ -179,8 +206,10 @@ does.
 flipped by `PacketBypassController::ChangeQueueIndex`. `SetBypassPacket` = `FUN_1408dee30`
 (`Arb_part_077.c:8157`) matches the incoming Ticket against queue 0, then queue 1:
 
-On no match it logs `Bypass ticket error. [LtId : %d] [Seq : %d] [SessionId : %d]` and drops the
-frame.
+it reads queue 0's Ticket tag with `FUN_14049a5a0` and compares it to the incoming Ticket; on a
+mismatch it re-reads the tag at controller+0x10020 (queue 1) and compares again; if neither
+matches it falls through to the error log
+`Bypass ticket error. [LtId : %d] [Seq : %d] [SessionId : %d]`.
 
 That is how a user can have an old Ticket draining while a new one is already live — i.e. a
 world transfer. TeraSharp has no equivalent and does not need one until zone servers exist,
@@ -189,15 +218,17 @@ but it explains why a stale Ticket produces a log line rather than a crash.
 ### `ArbiterUser` / `ArbiterClient`
 
 `AS_ENTER_WORLD` carries `ArbiterClient` u64 @frame+0x16 and `ArbiterUser` u64 @frame+0x1E, and
-they are literally heap pointers - the `ClientSession*` and the `User*` as the writer's own arguments
+they are literally heap pointers — the live `ClientSession*` and the live `User*`, written
 at `Arb_part_028.c:15488`. The captures show `ArbiterClient=0x0000027057c028e0`,
 `ArbiterUser=0x0000026f4cfba020`.
 
 World echoes `ArbiterUser` back in every user-scoped `SA_*`, and the Arbiter validates it
 before dereferencing — `_Handler_SA_LEAVE_WORLD` = `FUN_140795980` (`Arb_part_066.c:3083`):
 
-It reads `ArbiterUser` from the frame at +6, checks the pointer is still live, and only then
-posts the handler onto that user's own job queue at `User+0x3F60`.
+it loads the `ArbiterUser` pointer from frame+6 and proceeds only if it is non-zero **and**
+`FUN_14083c170` on the `UserManager` singleton (`DAT_141214ff0`) says it is live; it then writes
+that `User*` into job slot 0xe and `Handler_SA_LEAVE_WORLD` = `FUN_140728c20` into job slot 0xf,
+and pushes the job onto the queue at `User+0x3F60` (`FUN_14003c4c0`).
 
 `FUN_14083c170` (`Arb_part_072.c:3618`) is a 16-shard hash set of live `User*` values — a
 pointer-liveness check. **Every user-scoped W→A message is serialised onto that user's own
@@ -218,8 +249,11 @@ Dumper `Arb_part_011.c:5856`: `GameId` u64 @+6, `WorldUser` u64 @+0x0E. Sent by
 link, from exactly one call site — `User::LeaveWorldEnd` (`Arb_part_029.c:3595`), *after* the
 leave is accepted:
 
-It clears `LoginState` at `User+0x3FC0` and `LeaveWorldType` at `User+0x3FC8`, then calls the
-notifier - which is what puts `AS_ARBITER_USER_DELETE` on the wire.
+```c
+  *(u32 *)(user + 0x3FC0) = 0;                  // LoginState = NONE
+  *(u32 *)(user + 0x3FC8) = 0;                  // LeaveWorldType = NONE
+  UserManager::NotiWorldToReleaseUser(user);    // -> AS_ARBITER_USER_DELETE
+```
 
 Order in every capture: `AS_LEAVE_WORLD` → World tears down → `SA_LEAVE_WORLD` (frees the
 Ticket) → `AS_ARBITER_USER_DELETE`. It carries no Ticket — it is purely "you may drop the
@@ -229,11 +263,12 @@ World-side User object now". TeraSharp already sends it from the 0x1393 handler.
 
 The user's brief named this as "the routing key". There are exactly six references to `0x3108`
 in the Arbiter (`Arb_part_028.c:15486/15538/15815/15843`, `Arb_part_030.c:6805/6833`), all of
-one shape: the u32 at offset `0x3108` of whatever `User+0x3f40` points at, which is the
-`Account*` (proved by `Account::GetClientSession` = `FUN_1407162c0`, `Arb_part_061.c:15686`).
-The value goes on the wire as `AS_ENTER_WORLD`'s
-**`SessionKey`** at frame+0x32 - dumper `Arb_part_011.c:10304`, which emits the field named
-`SessionKey` from the u32 at +0x32.
+the shape `*(u32 *)(Account + 0x3108)`, where the enclosing function takes a `User*` and
+`User+0x3f40` is the `Account*` (proved by `Account::GetClientSession` =
+`FUN_1407162c0`, `Arb_part_061.c:15686`). The value goes on the wire as `AS_ENTER_WORLD`'s
+**`SessionKey`** at frame+0x32 — dumper `Arb_part_011.c:10304`:
+
+it emits that u32 under the field name `SessionKey` via `FUN_14016bb70`.
 
 `lobby_tap.log` seq 127, bytes at frame+0x32: `45 16 04 00` = 267845, the same value the client
 got in `S_LOGIN_ACCOUNT_INFO`. It is the **login/auth session key**, echoed to World for
@@ -306,8 +341,14 @@ The dispatcher is `ChatManager::ChatMessageHandler(User*,ChatType,const wchar_t*
 The broadcast forms build **one** `S_CHAT` (client opcode 0x7D6B) and loop over sessions
 (`Arb_part_047.c:5694`):
 
-It asks `UserManager` for all users, builds one `S_CHAT` (client opcode `0x7D6B`), then walks
-the list, resolves each user's `ClientSession` and sends that same packet to each.
+```c
+  UserManager::GetAllUsers(&users, 1);          // FUN_14082f2f0 on the manager singleton
+  packet = MakePacket(0x7D6B);                  // FUN_140055430 — one S_CHAT for everyone
+  for (u = users.begin; u != users.end; u++) {
+      session = User::GetClientSession(u);      // FUN_140388310
+      session->Send(packet, len, 1);            // virtual send
+  }
+```
 
 **Whisper never touches World.** `Handler_C_WHISPER` = `FUN_1404f23a0` (`Arb_part_041.c:14662`)
 resolves the target **by name** against the Arbiter's own `UserManager`

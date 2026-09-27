@@ -1,0 +1,87 @@
+// TeraSharp settings. Copy to teras.json beside TeraSharp.Arbiter.exe (or run tools\setup.ps1,
+// which writes one for you) and edit. teras.json is gitignored because it holds two secrets.
+//
+// Every value here is also a TERASHARP_* environment variable, and THE ENVIRONMENT ALWAYS WINS -
+// so you can override one setting for one run without editing the file, and an existing
+// deployment that exports variables keeps working with no teras.json at all.
+// `TeraSharp.Arbiter.exe --check-config` prints each value and where it came from.
+//
+// "" and null both mean "unset - use the built-in default".
+// The full table, with the defaults, is docs/ARCHITECTURE.md section 5.
+{
+  "paths": {
+    // Root holding Executable\, tera_v100_MASTER_FINAL\ and tera-server-proxy\data\data.json.
+    // Its Executable\Datasheet is the source of truth for server policy: edit the sheets, not code.
+    "data": "C:\\TERA_SERVER.100",
+    // Capture input and the daily arbiter-<date>.log.
+    "logs": "C:\\TERA_SERVER.100\\logs",
+    // SQLite file. "" = <logs>\terasharp.db. Back it up: tools\backup-db.ps1.
+    "db": "",
+    "datasheet": "",
+    "serverConfig": "",
+    "starterBlob": "",
+    "starterInventory": "",
+    "itemStrSheet": "",
+    "itemNames": ""
+  },
+  "listener": {
+    // LEAVE THIS ON LOOPBACK. Port 7701 does not check GM privilege on C_ADMIN; the proxy is the gate.
+    "bind": "127.0.0.1"
+  },
+  "planet": {
+    // S_LOGIN_ACCOUNT_INFO.dbServerName. Must match what your tera-api / launcher expects.
+    "dbServerName": "PlanetDB_2800"
+  },
+  "auth": {
+    // false accepts every login. Set true before anyone but you can reach the box.
+    "enabled": false,
+    "url": "http://127.0.0.1:8080",
+    // Comma-separated tera-api accountDBIDs - numbers, not display names.
+    "gmAccounts": ""
+  },
+  "admin": {
+    // SECRET. Unset means the admin web never starts, which fails closed. 48 random characters.
+    "token": "",
+    // 8050 is tera-api's own panel; keep TeraSharp off it.
+    "port": 8051
+  },
+  "gateway": {
+    "address": "127.0.0.1:8800",
+    "serve": false,
+    "bind": "",
+    // SECRET. Must equal tera-api's API_PORTAL_SECRET, or Alt+A breaks on every restart.
+    "jwtSecret": ""
+  },
+  "knobs": {
+    // Console verbosity only; the daily file always takes Debug.
+    "logLevel": "Warning",
+    "rankingSeason": 15,
+    "startOverride": "",
+    "standalone": ""
+  },
+  "matchmaking": {
+    "entrySeconds": 300,
+    "bgMaxHealers": 2,
+    "bgMaxTanks": 3
+    // minMembers is retired and ignored (T184h). Two-player testing needs a two-player
+    // MatchingRoleTemplate row, not a setting.
+  },
+  "economy": {
+    // Price + price * rate / 100, truncated. A live Classic+ server runs 15.
+    "brokerFeePercent": 10
+  },
+  // Read by tools\setup.ps1, start.ps1 and stop.ps1 - NOT by the Arbiter. Changing a port here
+  // and re-running setup.ps1 -Check tells you whether DeploymentConfig.xml still agrees.
+  "deployment": {
+    "root": "C:\\TERA_SERVER.100",
+    "publicHost": "203.0.113.10",
+    "planetId": 2800,
+    "serverName": "My TERA Server",
+    "clientPort": 7701,
+    "worldPort": 7802,
+    "proxyPort": 7801,
+    "topologyFolder": ".\\Topology"
+  },
+  // Anything this file's table does not know about yet: exact TERASHARP_* names.
+  "env": {}
+}

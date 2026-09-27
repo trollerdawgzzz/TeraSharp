@@ -78,9 +78,9 @@ chat window processing `S_CHAT` and it is live-verified. The account one is simp
 
 **Save** — `Handler_C_SAVE_CLIENT_USER_SETTING` (`Arb_part_041.c:11024`) and
 `Handler_C_SAVE_CLIENT_ACCOUNT_SETTING` (`:10300`). Both require a packet of at least 8 bytes, treat
-their pointer as the **packet** start, and read the packet's third and fourth u16 as the offset and the count. If the
-offset is non-zero and inside the packet they pass `packetStart + offset` and the count to the
-store; otherwise they pass NULL.
+their pointer argument as the **packet** start (not the payload), and read the u32 at packet+8 as
+the blob offset and the u32 at packet+12 as the count. If the offset is non-zero and inside the
+packet they pass `packetStart + offset` and the count to the store; otherwise they pass NULL.
 
 `User::SaveClientSetting(const unsigned char *, int)` (`Arb_part_029.c:18757`) and
 `Account::SaveClientSetting` (`Arb_part_065.c:9779`) are the same function twice:
@@ -215,3 +215,74 @@ human-owned; it is not needed for settings to persist and is left out on purpose
   Arbiter falls back to the session's lobby user (`FUN_1408876c0`), which TeraSharp has no
   equivalent of. Not reachable in either capture.
 - Whether the empty default breaks chat rendering — see §5. One live test settles it.
+
+---
+
+## 9. T191b — the account blob is served empty at the lobby
+
+**Symptom.** A tutorial/interface option the player sets is back to its default at the next login,
+and the Arbiter log shows the save arriving (`Saved 606 bytes of account settings`).
+
+**Cause.** `LoginHandlers.OnGetUserList` sends the lobby `S_LOAD_CLIENT_ACCOUNT_SETTING` as a
+**hardcoded empty body** instead of the stored blob. The client reads that as "the server has
+nothing", initialises its own defaults, and pushes them straight back — overwriting what the player
+had saved.
+
+`cap_queue1_client.log`, one of ours, in order:
+
+| packet | direction | what | blob |
+| --- | --- | --- | --- |
+| 11 | S->C | `S_GET_USER_LIST` | |
+| 12 | S->C | `S_LOAD_CLIENT_ACCOUNT_SETTING` | **0** |
+| 31 | C->S | `C_SAVE_CLIENT_ACCOUNT_SETTING` — the client's own defaults | 592 |
+| 322 | S->C | `S_LOAD_CLIENT_ACCOUNT_SETTING` post-spawn — correct | 592 |
+| 1329 | C->S | `C_SAVE_CLIENT_ACCOUNT_SETTING` — the player's options | 606 |
+
+and the real Arbiter, `cap_final2b_client2.log`, same points, **one blob at all of them**:
+
+| packet | when | blob |
+| --- | --- | --- |
+| 12 | lobby | 659 |
+| 286 | post-spawn (account, then user) | 659 |
+| 846 | lobby again, after `C_RETURN_TO_LOBBY` | 659 |
+| 1119 | post-spawn of the second login | 659 |
+
+The real Arbiter sends the account blob at three points per login and the **user** blob only in the
+post-spawn pair. We send the user blob a fourth time, right before `S_LOGIN`, where the real one
+sends nothing. Pins: `data/cap_t191b.bin`, tests `T191b_*` (3).
+
+### The human-owned diff — `Handlers/LoginHandlers.cs`
+
+```diff
+-        s.SendByDef("S_LOAD_CLIENT_ACCOUNT_SETTING", new Dictionary<string, object> { ["data"] = Array.Empty<byte>() });
++        ClientSettingsHandlers.SendAccountSetting(s);     // T191b: the STORED blob, line 119
+```
+
+```diff
+-        ClientSettingsHandlers.SendUserSetting(s);        // T191b: line 207, delete it -
++                                                         // the real Arbiter sends nothing here
+```
+
+`SendAccountSetting` already keys on `s.Account.AccountId`, which is set before
+`S_GET_USER_LIST`, so no other change is needed. Line 207 is optional: it is an extra packet, not
+a wrong one. Line 119 is the fix.
+
+### It is not the tutorial tips
+
+World, not the Arbiter, decides a tutorial popup. `User::CheckTutorialSimpleTip(tipId)`
+(`WorldServer.exe.c:2685492`) looks the tip up in the per-user popup-count map it built from our
+`DBS_LOAD_TUTORIAL_SIMPLE_TIP`, compares the count against the sheet maximum, and answers
+`S_SIMPLE_TIP_REPEAT_CHECK` `[u32 tipId][u8 !show]` — **1 means "do not show"**. Our server answers
+1 for tips 1, 2, 35, 39 and 41 on every login, exactly like the real Arbiter's own runs:
+
+| capture | server | tips asked | answer |
+| --- | --- | --- | --- |
+| `cap_queue4_client1` 606-649 | ours | 1, 2, 35, 39, 41 | 1 each |
+| `cap_final2a_client1` 443-488 | real | 1, 2, 35, 39, 41 | 1 each |
+| `cap_social_client` 376-402, 600-641 | real | 1, 2, 35, 39, then 41 twice | 1, 1, 1, 1, then **0** then 1 |
+| `cap_bg1_client1` | real | none — the client had asked in an earlier process | — |
+
+`cap_social_client` 600/641 is the proof of the polarity: tip 41's first check answers **0** (show
+it), the check itself issues `SDB_ADD_TUTORIAL_SIMPLE_TIP`, and the second check answers 1.
+T191's counters are already right, and `C_SIMPLE_TIP_REPEAT_CHECK` is correctly forwarded to World
+(`RegNoop`'s in-world branch), so nothing on this path needs changing.

@@ -267,13 +267,15 @@ public sealed class BrokerHandlers
         // at the NPC.
         if (opcode == BrokerPackets.C_TRADE_BROKER_CLOSE)
         {
-            Program.World?.SendFrame(BrokerPackets.AS_TRADE_BROKER_CLOSE,
+            ArbiterClientHandlers.SendToWorld(s, BrokerPackets.AS_TRADE_BROKER_CLOSE,
                 BrokerPackets.BuildAsBrokerClose((int)s.PlayerId));
             _log.LogDebug("C_TRADE_BROKER_CLOSE from {Id} - told World", s.Id);
             return true;
         }
 
-        var reply = ReplyFor(opcode, global::TeraSharp.Arbiter.Program.Store, (int)s.PlayerId);
+        var reply = opcode == BrokerPackets.C_TRADE_BROKER_INPUT_PRICE && Program.Store is { } priceStore
+            ? QaMailBrokerCommands.InputPrice(priceStore, (int)s.PlayerId, body.Span)
+            : ReplyFor(opcode, global::TeraSharp.Arbiter.Program.Store, (int)s.PlayerId);
         if (reply == null)
         {
             _log.LogDebug("0x{Op:X4} from {Id} - Arbiter-owned, and the real Arbiter answers it "

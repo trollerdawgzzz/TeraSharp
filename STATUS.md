@@ -8,7 +8,7 @@ Tests: `dotnet run --project src/TeraSharp.Arbiter.Tests` → 15 passed, 0 faile
 (The test project is a self-contained console runner — xUnit/MSTest can't be restored here because
 nuget.org is unreachable from the build box and the frameworks aren't in the offline package cache.
 It exits non-zero on failure, so it works as a CI gate. One `[Test]` method per handler, asserting
-against bytes from `<captures>\arb_world.log`.)
+against bytes from `D:\packetlogs\arb_world.log`.)
 
 ---
 

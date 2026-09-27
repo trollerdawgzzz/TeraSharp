@@ -120,6 +120,7 @@ public static class ArbiterClientHandlers
     /// </summary>
     public static readonly IReadOnlySet<ushort> ArbiterOwned = new HashSet<ushort>
     {
+        CampTeleportHandlers.C_TEL_CAMP, // T183: record camp discovery in Arbiter; never forward.
         C_SHOW_ITEM_TOOLTIP_EX, C_VISIT_NEW_SECTION, C_CLIENT_LOG, C_SERVER_TIME,
         C_SAVE_CLIENT_UI_SETTING, C_TRADE_BROKER_HIGHEST_ITEM_LEVEL, C_UPDATE_CONTENTS_PLAYTIME,
         C_EVENT_GUIDE, C_REQUEST_PARTY_MATCH_INFO, C_REQUEST_MY_PARTY_MATCH_INFO,
@@ -836,8 +837,8 @@ public static class ArbiterClientHandlers
     /// <summary>
     /// The AS_ADD_TRADE_BAG (0x1637) payload the real Arbiter forwards. The leading u64 is not
     /// copied from the packet - the Arbiter builds it from its own planet id and the SENDER's
-    /// character db id (the sender's <c>User+0x120</c> concatenated with the planet id, so planet id in
-    /// the low half and db id in the high half).
+    /// character db id - the u32 at user+0x120 - with the planet id in the low half and the db id
+    /// in the high half.
     /// </summary>
     public static byte[] BuildAsAddTradeBag(int planetId, int senderDbId, AddTradeBagRequest r)
     {
@@ -884,7 +885,7 @@ public static class ArbiterClientHandlers
         if (chr == null) return true;
 
         var payload = BuildAsAddTradeBag(TeraSharp.Arbiter.World.ContractBroker.PlanetId, (int)chr.Id, req.Value);
-        Program.World?.SendFrame(AS_ADD_TRADE_BAG, payload);
+        SendToWorld(s, AS_ADD_TRADE_BAG, payload); // Arb040:17165-17207, user's World session
         log.LogInformation(
             "C_ADD_TRADE_BAG: {Name} -> AS_ADD_TRADE_BAG contract {Cid}, pocket {Tab} slot {Slot} x{N}{Money}",
             chr.Name, req.Value.ContractId, req.Value.TabIndex, req.Value.InvenPos, req.Value.MoveAmount,
@@ -1129,7 +1130,7 @@ public static class ArbiterClientHandlers
     /// NUL-terminated UTF-16LE, and the result is an empty string when nothing matched.
     ///
     /// <para>Pinned against the real Arbiter's own replies in
-    /// <c><captures>\cap_social_client_ctl.txt</c> frames 1093 / 1096 / 1098.</para>
+    /// <c>D:\packetlogs\cap_social_client_ctl.txt</c> frames 1093 / 1096 / 1098.</para>
     /// </summary>
     public static byte[] BuildFindName(int findType, string query, IReadOnlyList<string>? matches)
     {
@@ -1185,7 +1186,7 @@ public static class ArbiterClientHandlers
     /// re-entered within the session and S_VISIT_NEW_SECTION alone is enough.
     ///
     /// <para>The real Arbiter sends it immediately after C_LOAD_TOPO_FIN:
-    /// <c><captures>\cap_social_client_ctl.txt</c> frame 256 is the C_LOAD_TOPO_FIN and 257 is
+    /// <c>D:\packetlogs\cap_social_client_ctl.txt</c> frame 256 is the C_LOAD_TOPO_FIN and 257 is
     /// this packet - the same point where HandlerRegistry already pushes the World-side list.</para>
     ///
     /// <para>Standard TERA list encoding, the same shape as S_WATCHED_MOVIES: count at 0x04, the
@@ -1237,7 +1238,8 @@ public static class ArbiterClientHandlers
     /// <summary>
     /// Reads a NUL-terminated UTF-16LE string whose u16 PACKET offset sits at
     /// <paramref name="slotIndex"/> of the BODY. Empty for the 0 / out-of-range offsets the real
-    /// handlers fall back on - an offset of zero, or one not below the packet length, yields "").
+    /// handlers fall back on: when the offset is 0, or the packet length at packet+0 is less than
+    /// or equal to it, they substitute a static empty string.
     /// </summary>
     // =========================================================================================
     // 14. Guild crest and the skill-polishing window                                     (T82)
@@ -1604,16 +1606,10 @@ public static class ArbiterClientHandlers
     /// C_RQ_SKILL_POLISHING_LIST -&gt; S_RP_SKILL_POLISHING_LIST, and
     /// C_RQ_SKILL_POLISHING_EXP_INFO -&gt; S_RP_SKILL_POLISHING_EXP_INFO.
     ///
-    /// <para><b>Arbiter-built, and both were silently dropped.</b> Both C_ packets were on
-    /// HandlerRegistry s RegNoop list, which stops them reaching World but sends nothing back -
-    /// so the skill-polishing panel never populated. The real Arbiter answers both in the lobby
-    /// burst, before the world hand-off: cap_social4_client frame 145 is an
-    /// S_RP_SKILL_POLISHING_LIST of eight zero bytes (two empty arrays) and 146 is an
-    /// S_RP_SKILL_POLISHING_EXP_INFO of thirty-six (three int32 and three int64, all zero).</para>
-    ///
-    /// <para>Both shipped defs are right, and both frames are the empty form for a character
-    /// that has polished nothing - which is every character TeraSharp has, because nothing in
-    /// the tree grants polishing points. Serving the zeros is the whole fix.</para>
+    /// <para>T194: World owns both queries (World596825-596888), including current points,
+    /// unlocked effects and sheet-derived EXP bounds. cap_final2b raw371+0/+34 forwards the
+    /// requests; raw374/375 are World's replies. T82's zero replies are retained only for
+    /// standalone/lobby use; sending them in-world hides the persisted polishing state.</para>
     /// </summary>
     public static Dictionary<string, object> BuildSkillPolishingListFields()
         => new()
@@ -1637,6 +1633,7 @@ public static class ArbiterClientHandlers
     /// <summary>Handler for C_RQ_SKILL_POLISHING_LIST.</summary>
     public static bool OnRqSkillPolishingList(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
     {
+        if (ForwardPolishingQuery(s, C_RQ_SKILL_POLISHING_LIST, body)) return true;
         _ = body; _ = log;
         s.SendByDef("S_RP_SKILL_POLISHING_LIST", BuildSkillPolishingListFields());
         return true;
@@ -1645,8 +1642,20 @@ public static class ArbiterClientHandlers
     /// <summary>Handler for C_RQ_SKILL_POLISHING_EXP_INFO.</summary>
     public static bool OnRqSkillPolishingExpInfo(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
     {
+        if (ForwardPolishingQuery(s, C_RQ_SKILL_POLISHING_EXP_INFO, body)) return true;
         _ = body; _ = log;
         s.SendByDef("S_RP_SKILL_POLISHING_EXP_INFO", BuildSkillPolishingExpFields());
+        return true;
+    }
+
+    private static bool ForwardPolishingQuery(GameSession s, ushort opcode, ReadOnlyMemory<byte> body)
+    {
+        if (!s.InWorld || Program.World is not { IsConnected: true }) return false;
+        var frame = new byte[body.Length + 4];
+        BitConverter.GetBytes((ushort)frame.Length).CopyTo(frame, 0);
+        BitConverter.GetBytes(opcode).CopyTo(frame, 2);
+        body.Span.CopyTo(frame.AsSpan(4));
+        s.ForwardToWorld(frame);
         return true;
     }
 
@@ -2266,7 +2275,7 @@ public static class ArbiterClientHandlers
 
     // ---- T134: the two dungeon windows, from classic_live2 ----
     //
-    // Ground truth: <captures>\classic_live2.log, a live Classic+ reference. The client fires
+    // Ground truth: D:\packetlogs\classic_live2.log, a live Classic+ reference. The client fires
     // both requests back to back when the dungeon window opens and the replies come back in
     // request order, interleaved with each other (records 13160/13161 -> 13163/13164). 9 cool-time
     // pairs and 17 clear-count pairs in the capture.
@@ -2419,19 +2428,13 @@ public static class ArbiterClientHandlers
     }
 
     /// <summary>
-    /// The 14 dungeon ids every captured S_DUNGEON_CLEAR_COUNT_LIST answers with, in capture
-    /// order (classic_live2 records 13158, 13164, 15365, 15847, ...). The roster is the same for
-    /// every character - a character with 10 clears of 9830 and 34 of 9739 still gets all
-    /// fourteen rows, the other twelve at 0 - so it is client-side content, not a row set, and it
-    /// lives here beside the builder rather than in the store.
+    /// T184h: sheet-backed standalone roster. The legacy fourteen ids survive only as the
+    /// absent-sheet fallback. The live World selects its own rows for the named character.
     /// </summary>
-    public static readonly int[] DungeonClearCountRoster =
-    {
-        9068, 9056, 9168, 9156, 9507, 9043, 9768, 9756, 9868, 9856, 9830, 9810, 9739, 9075,
-    };
+    public static int[] DungeonClearCountRoster => DungeonClearCountSheet.Entry.Value.Rows.Select(r => r.Id).ToArray();
 
     /// <summary>
-    /// C_DUNGEON_CLEAR_COUNT_LIST (0x5C98) -> S_DUNGEON_CLEAR_COUNT_LIST (0x9D66). T134b.
+    /// C_DUNGEON_CLEAR_COUNT_LIST (0x5C98) -> World -> S_DUNGEON_CLEAR_COUNT_LIST (0x9D66).
     ///
     /// <para>The request names a CHARACTER, not the sender: classic_live2 record 13156 asks for
     /// "cat" (the player's own) and record 19419 asks for a party member, which is why the reply
@@ -2443,30 +2446,41 @@ public static class ArbiterClientHandlers
     /// <c>s.PlayerId = chr.Id</c> on select, so the same value works for the session's own
     /// character and for anyone else's row.</para>
     ///
-    /// <para>The merge is the whole job: every id in <see cref="DungeonClearCountRoster"/> gets a
-    /// row, <c>clears</c> from <c>dungeon_cooldowns.clear_count</c> or 0, and
-    /// <c>rookie = clears == 0</c> - exactly what the capture shows, rookie set on the twelve at
-    /// zero and clear on 9830 and 9739.</para>
+    /// <para>T184h: cap_2man client2:822/824 and tap1466 carry the World-built response.
+    /// World576445-576501 resolves the named user; 1024060-1024258 filters and sorts the
+    /// roster. The standalone fallback uses those sheets and persistent counts; newbie is
+    /// clears below DungeonNewbieBonusCheck.clearCount (World2346910-2346912).</para>
     /// </summary>
     public static bool OnDungeonClearCountList(GameSession s, ReadOnlyMemory<byte> body)
     {
+        if (s.InWorld && Program.World is { IsConnected: true })
+        {
+            var frame = new byte[body.Length + 4];
+            BitConverter.GetBytes((ushort)frame.Length).CopyTo(frame, 0);
+            BitConverter.GetBytes(C_DUNGEON_CLEAR_COUNT_LIST).CopyTo(frame, 2);
+            body.Span.CopyTo(frame.AsSpan(4));
+            s.ForwardToWorld(frame);
+            return true;
+        }
         var store = Program.Store;
         string name = ReadDungeonClearCountName(body.ToArray());
 
         var self = s.SelectedCharacter;
         int ownerId = self != null ? (int)self.Id : (int)s.PlayerId;
         uint pid = s.PlayerId;
+        int level = self?.Level ?? 0;
         if (store != null && name.Length > 0)
         {
             var who = store.GetCharacterByName(name);
-            if (who != null) { ownerId = who.Id; pid = (uint)who.Id; }
+            if (who != null) { ownerId = who.Id; pid = (uint)who.Id; level = who.Level; }
         }
 
         var counts = store?.GetDungeonClearCounts(ownerId);
-        var rows = new DungeonClears[DungeonClearCountRoster.Length];
+        var roster = DungeonClearCountSheet.ForLevel(level, store?.GetCompletedQuestIds(ownerId));
+        var rows = new DungeonClears[roster.Length];
         for (int i = 0; i < rows.Length; i++)
         {
-            int id = DungeonClearCountRoster[i];
+            int id = roster[i].Id;
             int clears = 0;
             if (counts != null)
             {
@@ -2477,7 +2491,7 @@ public static class ArbiterClientHandlers
                     break;
                 }
             }
-            rows[i] = new DungeonClears(id, clears, clears == 0);
+            rows[i] = new DungeonClears(id, clears, DungeonClearCountSheet.IsNewbie(clears));
         }
 
         s.Send(BuildDungeonClearCountList(pid, rows));
@@ -2825,6 +2839,19 @@ public static class ArbiterClientHandlers
         if (playerId > 0) { GmSkillPushed.TryRemove(playerId, out _); GmInvisible.TryRemove(playerId, out _); }
     }
 
+    /// <summary>
+    /// T188. The same reset, plus the last topo this player loaded, and it reports whether
+    /// anything was there - the admin reset lists what it cleared.
+    /// </summary>
+    public static bool ForgetPlayer(int playerId)
+    {
+        if (playerId <= 0) return false;
+        bool had = GmSkillPushed.TryRemove(playerId, out _);
+        had |= GmInvisible.TryRemove(playerId, out _);
+        had |= LastTopo.TryRemove(playerId, out _);
+        return had;
+    }
+
     // ------------------------------------------------------------------- T128: the toggle
     // The push above is one-way: a GM spawns invisible and the only way back was Alt+A, whose
     // C_ADMIN_GM_SKILL the tool sends. /@vaporize and /@invisible are World commands and do
@@ -3001,10 +3028,14 @@ public static class ArbiterClientHandlers
     public static bool SendToWorld(GameSession s, ushort op, byte[] payload)
     {
         var w = Program.World;
-        if (s == null || w == null || !w.IsConnected || !s.InWorld || s.SelectedCharacter == null) return false;
+        if (s == null || w == null || !s.InWorld || s.SelectedCharacter == null || !w.HasLinks(s.CurrentWorldId)) return false;
         w.SendFrame(s.CurrentWorldId, op, payload);
         return true;
     }
+
+    /// <summary>T195: the named character's current World, never a default-link fallback.</summary>
+    public static bool SendToWorld(int playerId, ushort op, byte[] payload)
+        => Program.World?.SessionForPlayerId(playerId) is { } session && SendToWorld(session, op, payload);
 
     // ------------------------------------------------------ T155: the rest of the GM tool
     // cap_multiworld.log (real Arbiter): client C_ADMIN_GM_TELEPORT 2497 (zone 5, 16920 / 1232 /
@@ -3074,10 +3105,10 @@ public static class ArbiterClientHandlers
         // 2026-09-20: a GM-flagged character (S_SELECT_USER.adminLevel > 0, T144b) spawns HELD and the real
         // Arbiter releases it with S_ADMIN_HOLD_CHARACTER 00 shortly after S_SPAWN_ME (cap frame 402, ~106
         // frames later). Sent before spawn (the old topo-fin slot) it did nothing; omitted, the GM cannot move
-        // or use items. So: release right behind the tunnelled S_SPAWN_ME, operators only.
+        // or use items. T180: preserve an explicit panel hold across a spawn; otherwise release.
         if (clientPacket.Length >= 4 && clientPacket[2] == 0x65 && clientPacket[3] == 0x83   // S_SPAWN_ME 0x8365
             && OperatorGetsGmSkillPush(GmCommandHandlers.LevelOf(s, Program.Store)))
-            s.Send(BuildAdminHoldCharacter());
+            s.Send(BuildAdminHoldCharacter(Program.World?.DbProxy?.UserControls.IsHeld(s.PlayerId, DateTimeOffset.UtcNow) ?? false));
         if (clientPacket.Length >= 4 && clientPacket[2] == 0x65 && clientPacket[3] == 0x83)
             WorldLevelSync.OnSpawn(s);   // T152b: a level set while offline reaches World here
     }
@@ -4900,31 +4931,20 @@ public static class GuildBoard
     // -------------------------------- the level ranking --------------------------------
 
     /// <summary>
-    /// Every guild by level, highest first. All four captured replies are EMPTY even though two
-    /// guilds existed by then, because the real Arbiter publishes this ranking from a scheduled
-    /// job rather than live; we have no such job, so we serve the live order and leave
-    /// PreRanking at 0 - we keep no previous ranking to compare against - and IsOccupation
-    /// false, since no floating castle is held in this build.
+    /// Native persisted ranking snapshot. Four T95 captures remain empty before calculation.
+    /// Arb070:11644 uses snapshot rank, previous rank, account count and level; guild metadata stays live.
     /// </summary>
     public static List<ArbiterClientHandlers.GuildRankingEntry> Ranking(CharacterStore? store)
     {
         var rows = new List<ArbiterClientHandlers.GuildRankingEntry>();
         if (store is null) return rows;
-        var guilds = store.GetAllGuilds();
-        guilds.Sort((a, b) =>
+        foreach (var rank in store.GetGuildLevelRanks())
         {
-            int byLevel = b.Level.CompareTo(a.Level);
-            if (byLevel != 0) return byLevel;
-            int byExp = b.Exp.CompareTo(a.Exp);
-            return byExp != 0 ? byExp : string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase);
-        });
-        for (int i = 0; i < guilds.Count; i++)
-        {
-            var g = guilds[i];
+            var g = store.GetGuild(rank.GuildId); if (g == null) continue;
             rows.Add(new ArbiterClientHandlers.GuildRankingEntry(
-                i + 1, 0, LogoIdOf(g.LogoId), g.Name,
+                rank.Rank, rank.PreviousRank, LogoIdOf(g.LogoId), g.Name,
                 store.GetCharacter(g.ChiefDbId)?.Name ?? "", g.Preference, g.CreateDate,
-                store.CountGuildMembers(g.GuildId), g.Level, false));
+                rank.AccountCount, rank.Level, false));
         }
         return rows;
     }
@@ -5490,8 +5510,8 @@ public static class ItemBoardPackets
 /// (Arb_part_003.c:3388) - a red-black-tree find that RETURNS 0 for an unknown key, and the
 /// caller checks it. Safe.</item>
 /// <item><c>class</c>: on the past-season path
-/// (Arb_part_050.c:10630) the cursor is advanced by <c>(class + 1) * 3</c> pointers - a raw
-/// index, 24-byte stride, <b>no bounds check at all</b>. On the current-season path it reaches
+/// (Arb_part_050.c:10630) it indexes a raw table pointer by <c>(class + 1) * 3</c> eight-byte
+/// elements - a 24-byte stride, <b>no bounds check at all</b>. On the current-season path it reaches
 /// <c>RankTree&lt;...&gt;::ClassRank(enum ClassType,int)</c> (Arb_part_049.c:11647) whose
 /// <c>if (0xe &lt; (ulonglong)(int)param_2)</c> calls a function Ghidra marks
 /// <c>Subroutine does not return</c> - a fatal abort, and the cast sign-extends, so a negative
@@ -5599,7 +5619,10 @@ public static class LeaderboardPackets
         var scores = season == RankingBoards.CurrentSeason && store != null
             ? (pve ? store.GetPveRankingScores() : store.GetPvpRankingScores())
             : new List<CharacterStore.RankingScore>();
-        var all = RankingBoards.Rank(scores, cls);
+        var all = pve && store != null && QaCompetitionCommands.IsCompetitionDungeon(id)
+            ? QaCompetitionCommands.Rank(season == RankingBoards.CurrentSeason ? store.GetCompetitionScores(id, season)
+                : new List<CharacterStore.RankingScore>(), cls)
+            : RankingBoards.Rank(scores, cls);
         var page = RankingBoards.Page(all, 0, me);
         var self = RankingBoards.Self(all, me);
         int myRank = self?.Rank ?? 0;
@@ -5612,8 +5635,9 @@ public static class LeaderboardPackets
         // only the first leaves the "my record" row under the board with nothing to fill it.
         //
         // T133: but the second frame is CONDITIONAL, and classic_live shows exactly when.
-        // SendNowSeasonRank guards it on the requested class equalling the requester's OWN
-        // class, or the aggregate 0x10 (Arb_part_050.c:9961).
+        // SendNowSeasonRank guards it with `requestedClass == myClass || requestedClass == 0x10`,
+        // where myClass is the int at +0x2f of the requester's record (Arb_part_050.c:9961) - so
+        // the class asked for is the requester's OWN class, or the aggregate.
         // Nine requests in that capture, all from a class-9 player: the eight
         // asking for class 9 or 16 each got S_USER_P*_RANKING, and frame 5846 - the one asking
         // for class 0 - got the list and nothing else. Your rank on somebody else's class
@@ -5678,11 +5702,13 @@ public static class LeaderboardPackets
     /// <summary>The same for battlegrounds: [battleground array][reward-guild array][two pools], 14 bytes.</summary>
     public static readonly byte[] EmptyBattlefieldList = { 0x0E, 0x00, 0x2C, 0x7A, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 
-    /// <summary>The frame the real Arbiter sends World for a list request - byte-exact against cap_social 1699 / 1723.</summary>
+    /// <summary>AS1644 carries current matching statistics (cap_2man tap 1289); an empty
+    /// cache keeps the cap_social 1699/1723 shape. World supplies the client dungeon rows.</summary>
     public static (ushort Op, byte[] Payload) WorldListRequest(bool dungeons, int characterId)
         => (dungeons ? PartyPackets.AS_VIEW_INTER_PARTY_MATCH_DUNGEON_LIST_EXTENDED
                      : PartyPackets.AS_VIEW_INTER_PARTY_MATCH_BATTLEFIELD_LIST_EXTENDED,
-            PartyPackets.BuildAsViewInterPartyMatchList(characterId));
+            dungeons ? MatchBrowsePackets.BuildExtendedList(characterId, MatchBrowseStatistics.Snapshot())
+                     : PartyPackets.BuildAsViewInterPartyMatchList(characterId));
 
     /// <summary>C_VIEW_INTER_PARTY_MATCH_DUNGEON_LIST (0xBA83): ask World (0x1644); it answers the client.</summary>
     public static bool OnViewInterPartyMatchDungeonList(GameSession s, ReadOnlyMemory<byte> body, ILogger log)

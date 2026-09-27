@@ -706,7 +706,14 @@ public static class GuildWarManager
         return new ActionDispatcher(
             _ => Sink(origin),
             p => Sink(world?.SessionForPlayerId(p) ?? (p == originId ? origin : null)),
-            (op, payload) => { if (world == null) return false; world.SendFrame(op, payload); return true; },
+            (op, payload) =>
+            {
+                if (world == null) return false;
+                if (op == AS_NOTIFY_GUILD_WAR_INFO || op == GuildPackets.AS_UPDATE_GUILD_DATA)
+                    return GuildWiring.SendWorldAction(world, op, payload);
+                world.SendFrame(op, payload);
+                return true;
+            },
             log)
         { RelayRejections = false };
     }

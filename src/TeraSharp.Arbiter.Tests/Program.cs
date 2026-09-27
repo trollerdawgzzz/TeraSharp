@@ -15,7 +15,7 @@ namespace TeraSharp.Arbiter.Tests;
 /// <summary>
 /// Minimal test harness: every public static method tagged [Test] is run; it throws on
 /// failure. Exit code = number of failures, so `dotnet run` is the CI gate.
-/// Ground-truth bytes are from <captures>\arb_world.log (the real ArbiterServer logout).
+/// Ground-truth bytes are from D:\packetlogs\arb_world.log (the real ArbiterServer logout).
 /// </summary>
 [AttributeUsage(AttributeTargets.Method)]
 public sealed class TestAttribute : Attribute { }
@@ -88,7 +88,7 @@ public static class Hex
     public static void True(bool cond, string what) { if (!cond) throw new Exception(what); }
 }
 
-public static class Tests
+public static partial class Tests
 {
     // Live gameId/playerId for the seeded character: gameId 0x80000AF00006 in the capture.
     const ulong GameId = 0x80000AF00006UL;
@@ -113,7 +113,7 @@ public static class Tests
 
     [Test] public static void LeaveWorld_Lobby_uses_type3_reason0()
     {
-        // Ground truth: <captures>\lobby_tap.log 02:51:52.830Z, real ArbiterServer, a WORKING
+        // Ground truth: D:\packetlogs\lobby_tap.log 02:51:52.830Z, real ArbiterServer, a WORKING
         // Logout-button lobby return followed by a clean relog:
         //   A->W 0x1392  01 00 f0 0a 00 80 00 00 | 03 00 00 00 | 00 00 00 00 | 01 00 00 00
         // and World echoes type=3 reason=0 straight back in SA_LEAVE_WORLD (0x1393).
@@ -1468,7 +1468,7 @@ array items
     // including UserLeaveWorld, which is what emits SA_LEAVE_WORLD (0x1393).
     //
     // Replaying a captured reply therefore MUST patch the live id in. These tests
-    // pin that contract. Bytes are from <captures>\arb_world.log.
+    // pin that contract. Bytes are from D:\packetlogs\arb_world.log.
     // ---------------------------------------------------------------------
 
     /// <summary>Writes a minimal Arbiter&lt;-&gt;World tap log in the format WorldReplayTable.Load parses.</summary>
@@ -1566,7 +1566,7 @@ array items
     }
 
     // ---------------------------------------------------------------------
-    // Daily-quest enter-world step.  Ground truth: <captures>\lobby_tap.log,
+    // Daily-quest enter-world step.  Ground truth: D:\packetlogs\lobby_tap.log,
     // real ArbiterServer, 2026-09-13T02:51:10.
     //
     // At enter-world World emits SDB_UPDATE_DAILY_QUEST_SEED (0x2899) once per daily
@@ -1662,7 +1662,7 @@ array items
     // T1 — byte-exact tests for the handlers that unblock the per-user DLM
     // queue (the ones made real for the logout/relog fix).
     //
-    // Ground truth: <captures>\lobby_tap.log, real ArbiterServer, login +
+    // Ground truth: D:\packetlogs\lobby_tap.log, real ArbiterServer, login +
     // logout-button lobby return + relog, 2026-09-13T02:51:10–02:52:07.
     // Frame = [u32 len][u16 op][payload]; the bytes below are PAYLOADS
     // (frame len - 6), reframed from the tap's TCP chunks.
@@ -1720,7 +1720,9 @@ array items
         var tmp = new byte[1 << 16];
         var frames = new List<(ushort op, byte[] body)>();
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        while (sw.ElapsedMilliseconds < 3000)
+        // T179 audit: a negative expectation records zero/multiple replies without asserting
+        // a guessed count. TryHandle sends synchronously; allow 25 ms for the loopback reader.
+        while (sw.ElapsedMilliseconds < (expectedFrames < 0 ? 25 : 3000))
         {
             while (peer.Available > 0)
             {
@@ -1738,10 +1740,10 @@ array items
                 frames.Add((fop, buf.GetRange(pos + 6, len - 6).ToArray()));
                 pos += len;
             }
-            if (frames.Count >= expectedFrames) break;
+            if (expectedFrames >= 0 && frames.Count >= expectedFrames) break;
             Thread.Sleep(5);
         }
-        Hex.True(frames.Count == expectedFrames,
+        Hex.True(expectedFrames < 0 || frames.Count == expectedFrames,
             $"0x{op:X4} should send {expectedFrames} frame(s), sent {frames.Count}");
         return frames;
     }
@@ -2048,7 +2050,7 @@ array items
     // ================================================================================
     // T3 - DBS_USER_RESTRICTION (0x2830), sent right after DBS_USER_ENTERWORLD
     //
-    // Ground truth: <captures>\lobby_tap.log packet 131, A->W, 02:51:10.552Z, 22-byte frame:
+    // Ground truth: D:\packetlogs\lobby_tap.log packet 131, A->W, 02:51:10.552Z, 22-byte frame:
     //   16 00 00 00  30 28 | 16 00 00 00  00 00 00 00  01 00 f0 0a 00 80 00 00
     //                        listOff=22    count=0      gameId 0x80000AF00001
     // listOff = 22 = the whole frame length, i.e. an empty list parked at the end. The handler
@@ -2080,7 +2082,7 @@ array items
     // ================================================================================
     // T4 - 0x2869 also pushes AS_REQUEST_DUNGEON_PHASE_USER_RESET (0x15E0)
     //
-    // Ground truth: <captures>\lobby_tap.log 02:51:10.705-.709, packets 172/173/174 -
+    // Ground truth: D:\packetlogs\lobby_tap.log 02:51:10.705-.709, packets 172/173/174 -
     // one W->A request answered by TWO A->W frames, the push first:
     //   172 W->A 0x2869  15 00 00 00  01 00 00 00
     //   173 A->W 0x15E0  01 00 00 00  00 00 00 00  9e 0f a6 6a 00 00 00 00
@@ -2165,7 +2167,7 @@ array items
             0x143F, 0x15B5, 0x13AA, 0x13F2, 0x13E5, 0x164D,
             // T158: SA_USER_ON_SPAWN_COMPLETE - its replayed 0x2737 went out with DLM 50 after every spawn.
             0x15AE,
-            // T15, from <captures>\cap_newchar.log: no A->W frame follows any occurrence.
+            // T15, from D:\packetlogs\cap_newchar.log: no A->W frame follows any occurrence.
             0x2927, 0x1491, 0x156F, 0x1499, 0x15FA,   // 0x13B6 became a handler in T25,
             //                                            0x13C5 and 0x13C6 in T108
             // T23: Handler_SA_REWARD_CITYWAR_KILL_DEATH_COUNT has no SendToSession.
@@ -2301,7 +2303,7 @@ array items
         Hex.True(DbProxyOpcodeNames.Count == 712,
             $"expected 712 entries extracted from WorldServer.exe.c, got {DbProxyOpcodeNames.Count}");
         // Nothing outside 0x2700-0x29FF may be in this table - AS_/SA_ opcodes below 0x2700 are
-        // named by <captures>\world_opcodes.txt instead.
+        // named by D:\packetlogs\world_opcodes.txt instead.
         Hex.True(DbProxyOpcodeNames.Name(0x1392) == null, "0x1392 AS_LEAVE_WORLD is out of range");
         Hex.True(DbProxyOpcodeNames.Name(0x26FF) == null, "0x26FF is below the range");
         Hex.True(DbProxyOpcodeNames.Name(0x2A00) == null, "0x2A00 is above the range");
@@ -2384,8 +2386,8 @@ array items
     // T8 — character creation
     //
     // Ground truth:
-    //   <captures>\cap_newchar_client.log packets 30-38  (client <-> real ArbiterServer)
-    //   <captures>\cap_newchar.log packet 133, 05:49:03  (the starter blob, DBS_USER_ENTERWORLD)
+    //   D:\packetlogs\cap_newchar_client.log packets 30-38  (client <-> real ArbiterServer)
+    //   D:\packetlogs\cap_newchar.log packet 133, 05:49:03  (the starter blob, DBS_USER_ENTERWORLD)
     //   data/starter_blob.bin                               (that blob, extracted)
     // ================================================================================
 
@@ -2896,7 +2898,7 @@ array items
     // (b) S_UPDATE_EXP_LEVEL (0x273B) -> D_UPDATE_EXP_LEVEL (0x273C) is a real
     //     handler that writes level/exp and echoes the LIVE DLM id.
     //
-    // Ground truth: <captures>\cap_newchar.log, real ArbiterServer, new
+    // Ground truth: D:\packetlogs\cap_newchar.log, real ArbiterServer, new
     // character "Test" playerId 2, reframed by u32 length. Layout cross-checked
     // against Handler_S_UPDATE_EXP_LEVEL (ArbiterServer.exe.c FUN_1408f44b0,
     // scope tracer line 1564123), which requires frame >= 0x2e and reads
@@ -3062,9 +3064,9 @@ array items
     // =====================================================================
     // T10 — tests for the zone-change handshake and the starter inventory.
     //
-    // Ground truth: <captures>\cap_newchar.log (real ArbiterServer, new
+    // Ground truth: D:\packetlogs\cap_newchar.log (real ArbiterServer, new
     // character "Test" playerId 2), reframed by u32 length; the four zone
-    // frames are also listed in <captures>\cap_newchar_zone.txt.
+    // frames are also listed in D:\packetlogs\cap_newchar_zone.txt.
     //   2457 W->A 0x13BE 215 B -> 2458 A->W 0x13BF 215 B
     //   2464 W->A 0x13C0 214 B -> 2465 A->W 0x13C1 214 B
     //    135 W->A 0x27A2  14 B ->  136 A->W 0x27A3 19 B + 137 A->W 0x27A4 3235 B
@@ -3364,7 +3366,7 @@ array items
     // item DB id 0 for the item it thinks it saved.
     //
     // Ground truth: data/cap_item_single.bin — the four frames from cap_newchar.log, extracted
-    // so the tests do not need <captures>. See data/cap_item_single.md and
+    // so the tests do not need D:\packetlogs. See data/cap_item_single.md and
     // status/INVENTORY-DESIGN.md.
     //   2072 -> 2073   one atom, op 7 (insert)      only change in 856 B: [16] 0 -> 15
     //   2211 -> 2213   five atoms, ops 6,11,6,11,7  atoms 0..3 identical, atom 4 [16] 0 -> 16
@@ -3385,7 +3387,7 @@ array items
     /// <summary>
     /// A TSIS container from data/ keyed by capture sequence number, or null (with a printed
     /// note) when the tests run somewhere the repo root is not above the binary. TSIS is the
-    /// little container T13 introduced so byte-exact tests do not need <captures> and do not
+    /// little container T13 introduced so byte-exact tests do not need D:\packetlogs and do not
     /// carry tens of kilobytes of hex literals: "TSIS", u32 recordCount, then per record
     /// u32 seq | u16 opcode | u32 payloadLength | payload.
     /// </summary>
@@ -4234,7 +4236,7 @@ array items
     // T15 - the per-user DB writes World sends during play.
     //
     // Ground truth: data/cap_t15.bin, the request/reply frames lifted out of
-    // <captures>\cap_newchar.log (real ArbiterServer, new character "Test", playerId 2,
+    // D:\packetlogs\cap_newchar.log (real ArbiterServer, new character "Test", playerId 2,
     // five minutes on the Island of Dawn). See data/cap_t15.md for the record list.
     //
     // Every handler gets two tests: the captured bytes reproduced exactly, and a live-reqId
@@ -4654,7 +4656,7 @@ array items
             $"only {opcodes.Count} opcodes parsed out of PERSISTENCE-MAP.md - the table format changed "
             + "and this guard is no longer guarding anything");
 
-        // The replay table is optional: it is built from <captures>\arb_world.log at runtime and
+        // The replay table is optional: it is built from D:\packetlogs\arb_world.log at runtime and
         // that file is not in the repo. Without it the other two arms have to carry the check, which
         // is the stricter answer anyway.
         var replay = LoadWorldReplayTableOrNull();
@@ -4733,11 +4735,11 @@ array items
 
     /// <summary>
     /// The replay table the running server would build, or null when the tap log is not on this
-    /// machine. Same env var as Program.cs (TERASHARP_LOGS, default <captures>).
+    /// machine. Same env var as Program.cs (TERASHARP_LOGS, default D:\packetlogs).
     /// </summary>
     static WorldReplayTable? LoadWorldReplayTableOrNull()
     {
-        var dir = Environment.GetEnvironmentVariable("TERASHARP_LOGS") ?? "logs";
+        var dir = Environment.GetEnvironmentVariable("TERASHARP_LOGS") ?? @"D:\packetlogs";
         var path = Path.Combine(dir, "arb_world.log");
         if (!File.Exists(path))
         {
@@ -4764,7 +4766,7 @@ array items
     //
     // Ground truth for the byte-exact tests:
     //   data/starter_blob.bin            blob 6880/7200 = 17 passive + 7 active ids
-    //   <captures>\cap_newchar_client.log packet 81 = the same 24 ids as S_SKILL_LIST
+    //   D:\packetlogs\cap_newchar_client.log packet 81 = the same 24 ids as S_SKILL_LIST
     //   Datasheet\DefaultSkillSet.xml    Popori/Female/Glaiver row = the same 24 ids
     // =====================================================================
 
@@ -5208,7 +5210,7 @@ array items
     // ================================================================================
     // T21 - relog into an instanced zone, and completed quests.
     //
-    // Ground truth: <captures>\arb_world_2026-09-13T11-33-30-680Z.log, the "Test"
+    // Ground truth: D:\packetlogs\arb_world_2026-09-13T11-33-30-680Z.log, the "Test"
     // (playerId 2) login at seq 835-2036. That character was saved inside instance 9827;
     // WorldServer refused the enter, and the real Arbiter fell back to Velika.
     //   seq 835  A->W 0x138E AS_ENTER_WORLD        continent 9827, ChannelInstanceId 0x0AF00001
@@ -5611,7 +5613,7 @@ array items
     // T22 - the per-character login loads, rebuilt from rows instead of replaying dob's
     // captured reply to every character.
     //
-    // Ground truth, both committed as TSIS containers so the tests need no <captures>:
+    // Ground truth, both committed as TSIS containers so the tests need no D:\packetlogs:
     //   data/cap_t22_newchar.bin  cap_newchar.log            - "Test" (playerId 2) FIRST login
     //   data/cap_t22_relog.bin    arb_world_2026-09-13...log - dob and "Test" WITH progress
     //
@@ -5870,8 +5872,6 @@ array items
             Hex.True(BitConverter.ToUInt32(ack, 0) == BitConverter.ToUInt32(newchar[seq], 0),
                 "the ack echoes the live DLM id");
         }
-        // A repeat must not duplicate the tip.
-        RunHandler1(DbProxyHandlers.SDB_ADD_TUTORIAL_SIMPLE_TIP, newchar[864], store, handlers);
         Hex.True(store.GetTutorialTips(2).SequenceEqual(new[] { 1, 2, 35, 39 }),
             "tips stay unique and in order: " + string.Join(",", store.GetTutorialTips(2)));
 
@@ -5881,6 +5881,11 @@ array items
         var (rop, body) = RunHandler1(DbProxyHandlers.SDB_TUTORIAL_SIMPLE_TIP, req, store, handlers);
         Hex.True(rop == DbProxyHandlers.DBS_TUTORIAL_SIMPLE_TIP, $"reply opcode, got 0x{rop:X4}");
         Hex.Eq(body, relog[859], "the rebuilt reply is the capture, byte for byte");
+        // T191: a repeated ADD increments the popup count, without duplicating the id.
+        RunHandler1(DbProxyHandlers.SDB_ADD_TUTORIAL_SIMPLE_TIP, newchar[864], store, handlers);
+        Hex.True(store.GetTutorialTips(2).SequenceEqual(new[] { 1, 2, 35, 39 }) &&
+            store.GetTutorialTipCounts(2).Single(t => t.TipId == 35).PopupCount == 2,
+            "a repeated ADD increments tip35 instead of silently discarding its count");
     }
 
     // ---- Seren guide: 0x2942 -> 0x2943, fed by 0x2944 ----
@@ -6976,7 +6981,8 @@ public bool TryHandle(WorldBridge bridge, WorldLink link, ushort op, byte[] payl
 
     [Test] public static void Party_capacities_are_5_and_30()
     {
-        // Party::Party sets 5, or 0x1e for a raid, and the member table is 30 slots.
+        // Party::Party sets the cap to 5, or to 0x1e when the raid flag is set, and the member
+        // table is 30 slots.
         Hex.True(PartyPackets.MaxPartyMembers == 5, "a party holds 5");
         Hex.True(PartyPackets.MaxRaidMembers == 30, "a raid holds 30, which is also the table size");
     }
@@ -7627,7 +7633,8 @@ public bool TryHandle(WorldBridge bridge, WorldLink link, ushort op, byte[] payl
         // T64: AS_DO_CREATE_PARTY, then one 0x15CD and one 0x13AD per member - the order
         // cap_social.log seq 748..753 has them in.
         Hex.True(WorldOps(a) == "0x139E,0x15CD,0x15CD,0x13AD,0x13AD", WorldOps(a));
-        Hex.True(a.ToClients.Count == 2 && a.ToClients.All(c => c.PacketName == "S_PARTY_MEMBER_LIST"), Names(a));
+        Hex.True(a.ToClients.Count == 4 && a.ToClients.Count(c => c.PacketName == "S_PARTY_MEMBER_LIST") == 2
+            && a.ToClients.Count(c => c.IsRaw && BitConverter.ToUInt16(c.RawPacket!, 2) == 0xCCBC) == 2, Names(a));
 
         // AS_DO_CREATE_PARTY: 0x32 fixed payload bytes then N x 0xA0 raw member records.
         var body = a.ToWorld[0].Payload;
@@ -7646,7 +7653,7 @@ public bool TryHandle(WorldBridge bridge, WorldLink link, ushort op, byte[] payl
         pm.Register(P(12, 3, "Testtwo"));
         var b = pm.OnWorldFrame(PartyPackets.SA_JOIN_PARTY, SaJoinPartyPayload(1, 3));
         Hex.True(b.ToWorld.Count == 1 && b.ToWorld[0].Opcode == PartyPackets.AS_DO_ADD_PARTY_MEMBER, WorldOps(b));
-        Hex.True(b.ToClients.Count == 3, $"all three get the refreshed list: {Names(b)}");
+        Hex.True(b.ToClients.Count == 6, $"all three get the refreshed list and names: {Names(b)}");
         Hex.True(pm.FindByMember(3)!.Id == party!.Id, "and they are in the same party");
     }
 
@@ -7750,8 +7757,8 @@ public bool TryHandle(WorldBridge bridge, WorldLink link, ushort op, byte[] payl
         var id = pm.FindByMember(1)!.Id;
         var pkt = Hex.B("08 00 6B 7D 01 02 03 04");     // an S_CHAT-shaped stand-in
 
-        // Party::BroadcastPacket skips the originator unless GroupType == 1:
-        //   the skip fires only when GroupType != 1 and the slot's planet and db id are the originator's.
+        // Party::BroadcastPacket skips the originator unless GroupType == 1: for any other
+        //   GroupType it passes over the slot whose PlanetId and UserDbId both match the sender's.
         var skip = pm.OnWorldFrame(PartyPackets.SA_BYPASS_TO_GROUP, SaBypassToGroupPayload(id, 0, 1, pkt));
         Hex.True(skip.ToWorld.Count == 0, "a fan-out never goes back to World");
         Hex.True(skip.ToClients.Count == 2 && skip.ToClients.All(c => c.IsRaw), Names(skip));
@@ -7802,11 +7809,11 @@ public bool TryHandle(WorldBridge bridge, WorldLink link, ushort op, byte[] payl
         var expected = new[]
         {
             "apply -> [10:S_OTHER_USER_APPLY_PARTY] []",
-            "accept -> [10:S_PARTY_MEMBER_LIST,11:S_PARTY_MEMBER_LIST] [0x139E,0x15CD,0x15CD,0x13AD,0x13AD]",
-            "accept2 -> [10:S_PARTY_MEMBER_LIST,11:S_PARTY_MEMBER_LIST,12:S_PARTY_MEMBER_LIST] [0x139F]",
+            "accept -> [10:S_PARTY_MEMBER_LIST,10:(raw),11:S_PARTY_MEMBER_LIST,11:(raw)] [0x139E,0x15CD,0x15CD,0x13AD,0x13AD]",
+            "accept2 -> [10:S_PARTY_MEMBER_LIST,10:(raw),11:S_PARTY_MEMBER_LIST,11:(raw),12:S_PARTY_MEMBER_LIST,12:(raw)] [0x139F]",
             "loot-request -> [] [0x13BB]",
             "loot-applied -> [10:S_PARTY_LOOTING_METHOD,11:S_PARTY_LOOTING_METHOD,12:S_PARTY_LOOTING_METHOD] [0x13A6]",
-            "leave -> [12:S_LEAVE_PARTY,10:S_LEAVE_PARTY_MEMBER,11:S_LEAVE_PARTY_MEMBER,10:S_PARTY_MEMBER_LIST,11:S_PARTY_MEMBER_LIST] [0x13A0]",
+            "leave -> [12:S_LEAVE_PARTY,10:S_LEAVE_PARTY_MEMBER,11:S_LEAVE_PARTY_MEMBER,10:S_PARTY_MEMBER_LIST,10:(raw),11:S_PARTY_MEMBER_LIST,11:(raw)] [0x13A0]",
             "dismiss-request -> [] [0x13BA]",
             "dismiss -> [10:S_LEAVE_PARTY,11:S_LEAVE_PARTY] [0x13A1]",
         };
@@ -11869,10 +11876,10 @@ bool   isGuildWarAcceptable
             Environment.SetEnvironmentVariable("TERASHARP_ADMIN_PORT", "8051");
             Environment.SetEnvironmentVariable("TERASHARP_BIND", "127.0.0.1");
 
-            string clean = SelfTest.BuildConfigReport(new[] { ("db", "logs\\terasharp.db") });
+            string clean = SelfTest.BuildConfigReport(new[] { ("db", "D:\\packetlogs\\terasharp.db") });
             Hex.True(clean.Contains("TERASHARP_GM_ACCOUNTS") && clean.Contains("2800,2801"),
                 "it prints every known variable and its value");
-            Hex.True(clean.Contains("logs\\terasharp.db"),
+            Hex.True(clean.Contains("D:\\packetlogs\\terasharp.db"),
                 "and the resolved paths Program computed, rather than re-deriving them here");
             Hex.True(!clean.Contains(new string('x', 48)) && clean.Contains("(set, 48 chars)"),
                 "the admin token is NEVER printed - a log line gets pasted into bug reports");
@@ -12571,10 +12578,10 @@ bool   isGuildWarAcceptable
         var request = Hex.B("20 00 92 CA 6A 02 00 00 35 26 00 00 01 00 00 00 00 00 00 00 00 00 00 00");
         Hex.True(ContinentHandoff.ContinentOf(request) == 9781,
             "the continent sits right after the 8-byte handle - it picks the destination link");
-        Hex.Eq(ContinentHandoff.EnterReply(request)!,
+        Hex.Eq(ContinentHandoff.EnterReply(request, 2800, 1)!,
             "F0 0A 00 00 01 00 00 00 35 26 00 00 01 00 00 00 00 00 00 00 00 00 00 00",
             "0x13BE -> 0x13BF: 8 bytes swapped, the rest copied (cap_multiworld3 17:35:38.020)");
-        Hex.True(ContinentHandoff.EnterReply(Hex.B("00 00")) == null,
+        Hex.True(ContinentHandoff.EnterReply(Hex.B("00 00"), 2800, 1) == null,
             "a payload too short for the prefix is refused");
 
         var ready = Hex.B("F0 0A 00 00 01 00 00 00 35 26 00 00 01 00 00 00");
@@ -13137,8 +13144,8 @@ bytes  ticket
         Hex.True(GmCommandHandlers.Classify(true, 1, mine) == GmDispatch.Local, "level 1 is enough");
         Hex.True(GmCommandHandlers.Classify(true, 5, worlds) == GmDispatch.ForwardToWorld,
             "a World command is forwarded");
-        Hex.True(GmCommandHandlers.Classify(true, 5, theirs) == GmDispatch.NotImplemented,
-            "an Arbiter command we do not implement says so rather than lying to World");
+        Hex.True(GmCommandHandlers.Classify(true, 5, theirs) == GmDispatch.Denied,
+            "T201 explicitly denies native process-crash commands before any forwarding");
         // T47 changed this: a name in neither catalogue is FORWARDED, not refused. The real
         // Arbiter can refuse because both tables are compiled into it; our catalogue comes off
         // disk and is empty whenever status/ is not beside the binary, so refusing locally meant
@@ -13193,7 +13200,7 @@ some prose with `backticks` that is not a table row
 
         var arbiter = GmCommandCatalog.ParseMarkdown(File.ReadAllText(arbiterFile));
         var world = GmCommandCatalog.ParseMarkdown(File.ReadAllText(worldFile));
-        Hex.True(arbiter.Count >= 150, $"the Arbiter catalogue has ~192 commands, parsed {arbiter.Count}");
+        Hex.True(arbiter.Count >= 318, $"the exhaustive Arbiter catalogue has318 native names plus local extensions, parsed {arbiter.Count}");
         Hex.True(world.Count >= 400, $"the World catalogue has 416 commands, parsed {world.Count}");
 
         Hex.True(arbiter.Contains("set_admin_level"), "set_admin_level is the Arbiter's");
@@ -15414,8 +15421,8 @@ some prose with `backticks` that is not a table row
 
         // And an Arbiter-owned name we have not implemented says so instead of lying to World.
         GmCommandCatalog.Set(arbiter: new[] { "crash_arbiter" }, world: Array.Empty<string>());
-        Hex.True(GmCommandHandlers.Classify(true, 5, GmCommandParser.Parse("crash_arbiter")) == GmDispatch.NotImplemented,
-                 "Arbiter-owned is checked BEFORE the forward");
+        Hex.True(GmCommandHandlers.Classify(true, 5, GmCommandParser.Parse("crash_arbiter")) == GmDispatch.Denied,
+                 "T201 deny policy is checked before the forward regardless of the catalogue");
 
         // The gate still comes first.
         Hex.True(GmCommandHandlers.Classify(true, 0, GmCommandParser.Parse("teleport")) == GmDispatch.NotAuthorised,
@@ -16251,7 +16258,7 @@ some prose with `backticks` that is not a table row
 
     [Test] public static void Parcel_list_offset_is_the_header_length_and_bytes_track_the_count()
     {
-        // The writer backpatches the OFFSET slot unconditionally, with the running frame length, and the
+        // The writer backpatches the OFFSET slot - always, to the running frame length - and the
         // BYTES slot only inside the non-empty branch - so an empty list has offset 35, not 0.
         var empty = ParcelDbHandlers.BuildDbsListParcel(1, true, 0, 0, 1, 0, null);
         Hex.True(BitConverter.ToUInt32(empty, ParcelDbHandlers.ListRspBinaryRef) == 6 + 29,
@@ -16717,10 +16724,11 @@ some prose with `backticks` that is not a table row
             ("C_PARTY_LOOTING_METHOD",     0x5D24, 0x17),   // FUN_1404e40a0 Arb_part_041.c:5086
             ("C_MERGE_PARTY_TO_RAID",      0xB8D0, 0x0D),   // FUN_1404e3870 Arb_part_041.c:4724
             ("C_REQUEST_PARTY_INFO",       0xFD35, 0x08),   // FUN_1404e9b50 Arb_part_041.c:8911
+            ("C_RESET_ALL_DUNGEON",        0x5867, 0x04),   // Arb_part_041.c:10049; cap_2man_client1:9822
         };
 
         Hex.True(PartyWiring.ClientOpcodes.Length == expected.Length,
-            $"seven Arbiter-side party opcodes, got {PartyWiring.ClientOpcodes.Length}");
+            $"eight Arbiter-side party opcodes, got {PartyWiring.ClientOpcodes.Length}");
 
         for (int i = 0; i < expected.Length; i++)
         {
@@ -16808,8 +16816,8 @@ some prose with `backticks` that is not a table row
         Hex.True(party!.IsManager(1), "the inviter is the manager");
         Hex.True(!pm.HasApplication(2, 1), "and the application edge is spent");
 
-        Hex.True(string.Join(",", leader.Log) == "def:S_PARTY_MEMBER_LIST", string.Join(",", leader.Log));
-        Hex.True(string.Join(",", joiner.Log) == "def:S_PARTY_MEMBER_LIST", string.Join(",", joiner.Log));
+        Hex.True(string.Join(",", leader.Log) == "def:S_PARTY_MEMBER_LIST,raw:80", string.Join(",", leader.Log));
+        Hex.True(string.Join(",", joiner.Log) == "def:S_PARTY_MEMBER_LIST,raw:80", string.Join(",", joiner.Log));
         Hex.True(r2.WorldSent == 5 && h.WorldLog.Count == 5 && h.WorldLog[0].Op == PartyPackets.AS_DO_CREATE_PARTY
                  && h.WorldLog[1].Op == PartyPackets.AS_CHANGE_EVENT_MATCHING_STATE
                  && h.WorldLog[3].Op == PartyPackets.AS_REQUEST_REFRESH_PARTY_INFO,
@@ -20207,8 +20215,8 @@ string message
         Hex.True(party!.IsManager(1), "the inviter is the manager");
         Hex.True(pm.FindByMember(2) != null && pm.FindByMember(2)!.Id == party.Id,
             "and the invitee is in the same party");
-        Hex.True(string.Join(",", inviter.Log) == "def:S_PARTY_MEMBER_LIST", string.Join(",", inviter.Log));
-        Hex.True(string.Join(",", invitee.Log) == "def:S_PARTY_MEMBER_LIST", string.Join(",", invitee.Log));
+        Hex.True(string.Join(",", inviter.Log) == "def:S_PARTY_MEMBER_LIST,raw:80", string.Join(",", inviter.Log));
+        Hex.True(string.Join(",", invitee.Log) == "def:S_PARTY_MEMBER_LIST,raw:80", string.Join(",", invitee.Log));
         Hex.True(r.WorldSent == 5 && h.WorldLog.Count == 5
                  && h.WorldLog[0].Op == PartyPackets.AS_DO_CREATE_PARTY,
             $"and World gets the member list back as AS_DO_CREATE_PARTY plus the T64 pushes: {r}");
@@ -20322,7 +20330,7 @@ string message
     // T64 - the party and social families, byte-exact against a real-Arbiter
     // capture at last.
     //
-    // <captures>\cap_social.log is a two-player tap of the REAL
+    // D:\packetlogs\cap_social.log is a two-player tap of the REAL
     // ArbiterServer: "Test" (playerId 2) invites "two" (playerId 1002) to a
     // party through the contract broker, they loot, swap manager, become
     // friends, block and unblock. Every literal below is the payload of a
@@ -21072,7 +21080,7 @@ string message
 
     /// <summary>
     /// C_FINDNAME -&gt; S_FINDNAME, pinned against the REAL Arbiter's replies in
-    /// <captures>\cap_social_client_ctl.txt frames 1093 / 1096 / 1098 - three keystrokes of
+    /// D:\packetlogs\cap_social_client_ctl.txt frames 1093 / 1096 / 1098 - three keystrokes of
     /// "two", each answered with the query echoed and an empty result.
     /// </summary>
     [Test] public static void T62_findname_matches_the_real_arbiters_replies()
@@ -21343,13 +21351,12 @@ string message
 
         var ep = store.GetCharacterEp(1);
         Hex.True(ep is not null && ep.EpExp == 1493660 && ep.EpLevel == 266 && ep.EpPoint == 300
-                 && ep.DailyEpExp == 1493660 && ep.DailyLimit == 8993,
-            "the six numbers seq 2929 carries are stored in the order its dumper names them");
+                 && ep.DailyEpExp == 0 && ep.DailyLimit == 8993,
+            "seq 2929 stores the six values; the daily reset then clears today's exp");
         Hex.True(ep!.ReserveBonus == 304230 && ep.ResetTime == 0x6AAA84C0,
             "and the daily write overwrites ReserveBonus and adds the reset stamp");
 
-        // The login reply, byte for byte. GoldConsumption (+41) and TotalEp (+49) stay zero:
-        // no W->A frame in any capture carries either, so there is nothing to fill them from.
+        // T193: TotalEp (+49) is NewEpPoint from 27B1; GoldConsumption (+41) stays zero.
         var req = new byte[8];
         BitConverter.GetBytes(0x77u).CopyTo(req, 0);
         BitConverter.GetBytes(1).CopyTo(req, 4);
@@ -21357,17 +21364,18 @@ string message
         Hex.True(op == 0x1555, $"0x{op:X4}");
         Hex.Eq(body,
             "77 00 00 00 01 01 00 00 00 0A 01 00 00 9C CA 16 "
-            + "00 00 00 00 00 9C CA 16 00 66 A4 04 00 21 23 00 "
+            + "00 00 00 00 00 00 00 00 00 66 A4 04 00 21 23 00 "
             + "00 C0 84 AA 6A 00 00 00 00 00 00 00 00 00 00 00 "
-            + "00 00 00 00 00",
+            + "00 2C 01 00 00",
             "AS_LOAD_EXTRAPOINT_DATA with the stored panel in it");
 
-        // A character with no EP is still the all-zero form both captured characters send.
+        // Both GuildStore characters belong to one account, so they share progress, not PRE/perks.
         BitConverter.GetBytes(2).CopyTo(req, 4);
         var (_, empty) = RunHandler1(DbProxyHandlers.SA_LOAD_EXTRAPOINT_DATA, req, store, handlers);
         Hex.True(empty.Length == DbProxyHandlers.ExtrapointReplySize
-                 && empty[4] == 1 && BitConverter.ToInt32(empty, 9) == 0,
-            "and an untouched character reads back zeros, not a refusal");
+                 && empty[4] == 1 && BitConverter.ToInt32(empty, 9) == 266
+                 && BitConverter.ToInt32(empty, 49) == 300,
+            "a sibling loads the account's progress (cap_social4 4974)");
     }
 
     /// <summary>
@@ -22643,13 +22651,8 @@ string message
         store.CreateGuild("low", 1, warAcceptable: true);
         store.CreateGuild("high", 2, warAcceptable: true);
         var rank = GuildBoard.Ranking(store);
-        Hex.True(rank.Count == 2 && rank[0].Ranking == 1 && rank[1].Ranking == 2,
-            "the ranking is numbered from one");
-        Hex.True(rank[0].GuildName == "high" && rank[0].GuildChiefName == "g2",
-            "level and exp tie at 0, so the tiebreak is the name - and the chief's name is read "
-            + "from his character row");
-        Hex.True(rank[0].PreRanking == 0 && !rank[0].IsOccupation,
-            "we keep no previous ranking and hold no castle, so both stay 0");
+        Hex.True(rank.Count == 0,
+            "T201: like all four cited captures, guilds remain unranked until the native calculation publishes a snapshot");
     }
 
     /// <summary>
@@ -22999,7 +23002,7 @@ string message
 
     // ===================== T103: SA_REGISTER answered for real =====================
     //
-    // <captures>\arb_world_2026-09-13T11-33-30-680Z.log opens with world 0's 25 registrations -
+    // D:\packetlogs\arb_world_2026-09-13T11-33-30-680Z.log opens with world 0's 25 registrations -
     // one control link (IsBypass 0, BypassIndex -1) and 24 bypass links (IsBypass 1, 0..23). The
     // builder below reproduces all 25 replies; the three pinned here are the first, the second and
     // the last, which are the three shapes.
@@ -25271,7 +25274,8 @@ string message
         var a = pm.OnWorldFrame(PartyPackets.SA_JOIN_PARTY_IN_ARBITER, p);
         Hex.True(a.Rejected == null, $"rejected: {a.Rejected}");
         Hex.True(WorldOps(a) == "0x139E,0x15CD,0x15CD,0x13AD,0x13AD", WorldOps(a));
-        Hex.True(a.ToClients.Count == 2 && a.ToClients.All(c => c.PacketName == "S_PARTY_MEMBER_LIST"), Names(a));
+        Hex.True(a.ToClients.Count == 4 && a.ToClients.Count(c => c.PacketName == "S_PARTY_MEMBER_LIST") == 2
+            && a.ToClients.Count(c => c.IsRaw && BitConverter.ToUInt16(c.RawPacket!, 2) == 0xCCBC) == 2, Names(a));
 
         // A name nobody is using is refused rather than half-applying the join.
         var other = NewPartyManager();
@@ -25452,7 +25456,7 @@ string message
     /// of SMT 433 was sent with NO parameter. Both sides get the other party's name, keyed
     /// <c>UserName</c> - capitalised exactly like this, because the client substitutes by key and a
     /// miss leaves the placeholder in the text. Pinned to the real Arbiter's own frame 1436 in
-    /// <captures>\cap_social_client.log.
+    /// D:\packetlogs\cap_social_client.log.
     /// </summary>
     [Test] public static void T75_friend_accept_smt_names_the_other_party()
     {
@@ -26281,8 +26285,8 @@ string message
     /// The second frame is conditional, and classic_live says exactly when. Nine requests, all
     /// from a class-9 player: the eight that asked for class 9 or class 16 were answered with
     /// S_USER_P*_RANKING after the list, and frame 5846 - the one that asked for class 0 - got
-    /// the list alone. That is SendNowSeasonRank's own guard,
-    /// the requested class equalling the user's own class or 0x10 (Arb_part_050.c:9961).
+    /// the list alone. That is SendNowSeasonRank's own guard: the class asked for must equal
+    /// <c>user.class</c> or be <c>0x10</c> (Arb_part_050.c:9961).
     /// </summary>
     [Test] public static void T133_the_self_rank_frame_only_follows_your_own_board()
     {
@@ -27134,10 +27138,10 @@ string message
             Hex.True(ReferenceEquals(pm.FindByMember(id), party), $"{id} is in that same party");
         Hex.True(party!.ManagerDbId == 101, "the first queued member leads it");
 
-        // The mirror JoinCore sends, per member, in the same order.
-        Hex.True(T138dCountWorld(a, PartyPackets.AS_CHANGE_EVENT_MATCHING_STATE) == 5
+        // T184f: queue-state cleanup and FIN each clear World matching state; refresh once.
+        Hex.True(T138dCountWorld(a, PartyPackets.AS_CHANGE_EVENT_MATCHING_STATE) == 10
                  && T138dCountWorld(a, PartyPackets.AS_REQUEST_REFRESH_PARTY_INFO) == 5,
-            "matching off and a party refresh for each of the five");
+            "two matching-off phases and a party refresh for each of the five");
 
         // S_SYS_PARTY_INFO to all five, the same frame, carrying the matched positions.
         var sys = T138dSysFrames(a);
@@ -27238,14 +27242,15 @@ string message
 
         var a = pm.OnWorldFrame(PartyPackets.SA_LEAVE_PARTY, SaLeavePartyPayload(sys.Id, 101));
         var leaver = a.ToClients.Where(c => c.Ticket == 1).ToList();
-        Hex.True(leaver.Count == 3 && leaver[0].PacketName == "S_LEAVE_PARTY"
+        Hex.True(leaver.Count == 4 && leaver[0].PacketName == "S_LEAVE_PARTY"
                  && leaver[1].IsRaw && BitConverter.ToString(leaver[1].RawPacket!) == BitConverter.ToString(Hex.B(T163CancelAny))
                  && leaver[2].PacketName == "S_PARTY_MEMBER_LIST"
-                 && (ulong)leaver[2].Fields!["id"] == (ulong)pair.Id,
+                 && (ulong)leaver[2].Fields!["id"] == (ulong)pair.Id
+                 && leaver[3].IsRaw && BitConverter.ToUInt16(leaver[3].RawPacket!, 2) == 0xCCBC,
             $"101: S_LEAVE_PARTY, the 53994 cancel, then the pair's party again - {string.Join(" ", T163Names(a, 1))}");
         Hex.True(ReferenceEquals(pm.FindByMember(101), pair), "101 is back in the pair");
         foreach (uint t in new uint[] { 2, 3, 4, 5 })
-            Hex.True(T163Names(a, t).SequenceEqual(new[] { "S_LEAVE_PARTY_MEMBER", "raw:D756", "S_PARTY_MEMBER_LIST" }),
+            Hex.True(T163Names(a, t).SequenceEqual(new[] { "S_LEAVE_PARTY_MEMBER", "raw:D756", "S_PARTY_MEMBER_LIST", "raw:CCBC" }),
                 $"ticket {t}: 53966 + 53967, then the list - {string.Join(" ", T163Names(a, t))}");
 
         // 102 still in the matched party does not see traffic of the pair it is away from.
@@ -27255,7 +27260,7 @@ string message
         var d = pm.OnWorldFrame(PartyPackets.SA_DISMISS_PARTY, SaPartyActorPayload(102));
         Hex.True(d.Rejected == null && T138dCountWorld(d, PartyPackets.AS_DO_DISMISS_PARTY) == 1, "the system party goes");
         var two = T163Names(d, 2);
-        Hex.True(two.SequenceEqual(new[] { "S_LEAVE_PARTY", "S_PARTY_MEMBER_LIST" }) && ReferenceEquals(pm.FindByMember(102), pair),
+        Hex.True(two.SequenceEqual(new[] { "S_LEAVE_PARTY", "S_PARTY_MEMBER_LIST", "raw:CCBC" }) && ReferenceEquals(pm.FindByMember(102), pair),
             $"102: out of the matched party and back in the pair - {string.Join(" ", two)}");
         Hex.True(T163Names(d, 3).SequenceEqual(new[] { "S_LEAVE_PARTY" }) && pm.FindByMember(103) == null,
             "103 queued alone and goes back to no party");
@@ -27264,7 +27269,7 @@ string message
 
     /// <summary>
     /// T163 (4). The dropout debuff is World's abnormality (DungeonMatching.xml
-    /// withdrawalAbnormalityId 999994, 180 s); what decides it is the Arbiter's
+    /// withdrawalAbnormalityId 999994, 900000 ms in cap_2man_client1:11071); what decides it is the Arbiter's
     /// AS_NOTIFY_ABOUT_SYS_PARTY_WITHDRAWAL. Leaving a matched DUNGEON party before World's
     /// DSA_NOTIFY_ABOUT_DUNGEON_CLEAR sends it; after it, nothing (classic_live3: 53190
     /// S_DUNGEON_CLEAR, 53990 /drop, no 999994 on the capturer). A normal party and a
@@ -27366,15 +27371,14 @@ string message
     }
 
     /// <summary>
-    /// T138d. TERASHARP_MATCH_MIN_MEMBERS: with it set, any N bodies are a group and the
-    /// composition is not consulted; with it unset the real rules are back.
+    /// T184h retires the T138d partial-group override, including its battleground bypass.
     /// </summary>
-    [Test] public static void T138d_the_min_members_knob_ignores_composition()
+    [Test] public static void T138d_retired_min_members_knob_preserves_composition()
     {
         const int Kelsaik = 9739, Skyring = 37;
         var now = DateTimeOffset.UnixEpoch.AddHours(5);
         T157TestSheet();   // T157: Skyring's size comes from the sheet
-        Hex.True(MatchQueueManager.MinMembersOverride() == 0, "unset by default");
+        var oldMinimum = Environment.GetEnvironmentVariable(MatchQueueManager.MinMembersVariable);
 
         // Two priests are not a party under the real rules.
         MatchQueueManager.Reset();
@@ -27386,34 +27390,28 @@ string message
         Environment.SetEnvironmentVariable(MatchQueueManager.MinMembersVariable, "2");
         try
         {
-            Hex.True(MatchQueueManager.MinMembersOverride() == 2, "the knob is read fresh");
+            Hex.True(MatchQueueManager.MinMembersOverride() == 2, "legacy setting remains visible for diagnostics");
             var g = MatchQueueManager.TryForm(Kelsaik, now);
-            Hex.True(g != null && g.Members.Count == 2 && g.Roles.Count == 2,
-                $"with the knob, two bodies are a group: {g?.Members.Count}");
-            foreach (var r in g!.Roles)
-                Hex.True(r == MatchRole.Healer,
-                    "and their DEFAULT position is still what the roster reports");
+            Hex.True(g == null, "legacy setting cannot form a partial dungeon group");
 
-            // Battlegrounds too: four queuers make two teams of two, and Skyring's one-healer
-            // and one-lancer rules are not consulted.
+            // Retiring the setting also preserves Skyring's team sizes and role limits.
             MatchQueueManager.Reset();
             Environment.SetEnvironmentVariable(MatchQueueManager.MinMembersVariable, "4");
             for (uint i = 1; i <= 4; i++) T138cQueue(i, Skyring, T138cQ(i, 6));
             var bg = MatchQueueManager.TryForm(Skyring, now, new T138cAlternating());
-            Hex.True(bg != null && bg.TeamA.Count == 2 && bg.TeamB.Count == 2,
-                $"two teams of two: {bg?.TeamA.Count}/{bg?.TeamB.Count}");
+            Hex.True(bg == null, "legacy setting cannot make two undersized battleground teams");
         }
         finally
         {
-            Environment.SetEnvironmentVariable(MatchQueueManager.MinMembersVariable, null);
+            Environment.SetEnvironmentVariable(MatchQueueManager.MinMembersVariable, oldMinimum);
             MatchQueueManager.Reset();
         }
 
-        // And with it unset the composition is back in force.
+        // Composition is equally enforced after the legacy setting is restored.
         MatchQueueManager.Reset();
         for (uint i = 1; i <= 4; i++) T138cQueue(i, Skyring, T138cQ(i, 6));
         Hex.True(MatchQueueManager.TryForm(Skyring, now, new T138cAlternating()) == null,
-            "four priests are not a Skyring match once the knob is gone");
+            "four priests are not a Skyring match");
         MatchQueueManager.Reset();
     }
 
@@ -28740,7 +28738,10 @@ string message
             var st = DatasheetLoader.LoadAll(null, dir);
             Hex.True(st.Count == DatasheetLoader.All.Count, "one line per sheet");
             Hex.True(st.Where(s => s.FromSheet).Count() == 8 && !st.Single(s => s.Sheet.StartsWith("DungeonData_")).FromSheet,
-                "eight read (CreateCharData twice: items, T162 levels; BattleFieldData twice: boards, T163 battlegrounds); the timeline needs four sheets and keeps its built-in");
+                "eight real consumers read the fixture; actual: " + string.Join(", ", st.Where(s => s.FromSheet).Select(s => s.Sheet)));
+            Hex.True(!st.Single(s => s.Sheet == "GuildConfig.xml <GuildRanking>").FromSheet
+                && QaGuildRankingCommands.Sheet.Value.MinimumAccounts == 0,
+                "a GuildConfig containing only GuildSize cannot claim to have loaded the absent GuildRanking row");
             Hex.True(GuildWarManager.DeclareCost == 2000 && GuildWarManager.DeclareLimit == 12 && GuildWarManager.GuildBlockUnk2 == 300,
                 "GuildSize rank 0, found behind a BOM and after rank 1");
             Hex.True(MatchComposition.RoleOf(0) == MatchRole.Tank && MatchComposition.RoleOf(6) == MatchRole.Healer,
@@ -29518,11 +29519,16 @@ string message
         Hex.True(bad.Count == 0, "twins not in exactly one group:\n    " + string.Join("\n    ", bad));
 
         // T165's classification is fixed data; the tables never overlap each other or group A.
+        // T191 moved2870 to popup-count persistence; T201 moved2983 to purchase-limit persistence.
         var unpinned = DbAckTable.All.Where(s => !s.Pinned).ToArray();
-        Hex.True(unpinned.Length == 51 && DbAckGroups.DenySpec.Count == 62 && DbAckGroups.RealHandlerSpec.Count == 75
+        Hex.True(unpinned.Length == 49 && DbAckGroups.DenySpec.Count == 62 && DbAckGroups.RealHandlerSpec.Count == 75
                 && DbAckGroups.ElsewhereSpec.Count == 16,
             $"A {unpinned.Length}, B {DbAckGroups.DenySpec.Count}, C {DbAckGroups.RealHandlerSpec.Count}, "
             + $"Elsewhere {DbAckGroups.ElsewhereSpec.Count}");
+        Hex.True(DbAckGroups.Of(0x2870) == DbAckGroups.Group.Handled && !DbAckTable.Covers(0x2870),
+            "T191 DONT_REPEAT persists the popup count; it is not a generic ACK");
+        Hex.True(DbAckGroups.Of(0x2983) == DbAckGroups.Group.Handled && !DbAckTable.Covers(0x2983),
+            "T201 UPDATE_PURCHASE_LIMIT persists counters and has its own reply; it is not a generic ACK");
         var specs = DbAckGroups.DenySpec.Keys.Concat(DbAckGroups.RealHandlerSpec.Keys).Concat(DbAckGroups.ElsewhereSpec.Keys).ToArray();
         Hex.True(specs.Distinct().Count() == specs.Length && !specs.Any(DbAckTable.Covers), "B / C / Elsewhere / A are disjoint");
         foreach (var s in DbAckTable.All)
@@ -30431,24 +30437,17 @@ string message
         MatchWiring.FormParty = (g, _) => g.Members.Select(m => m.CharacterId).ToArray();
         MatchWiring.SysPartyInfoFor = (id, roles) => PartyPackets.BuildSysPartyInfo(roles
             .Select(r => new PartyPackets.SysPartySlot(PartyPackets.PlanetId, r.Key, r.Value)).ToList());
-        var keep = Environment.GetEnvironmentVariable(MatchQueueManager.MinMembersVariable);
-        Environment.SetEnvironmentVariable(MatchQueueManager.MinMembersVariable, "2");
-        try
-        {
-            T138cQueue(9, 3036, T138cQ(9, 0));
-            T138cQueue(10, 3036, T138cQ(10, 6));
-            var g = MatchWiring.TryFormAndFinish(3036, now);
-            Hex.True(g != null && g.Members.Count == 2, "the knob's two-member match forms");
-        }
-        finally { Environment.SetEnvironmentVariable(MatchQueueManager.MinMembersVariable, keep); }
+        using var sheet = new T184hDungeonSheet(3036, total: 2, healers: 1);
+        T138cQueue(9, 3036, T138cQ(9, 0));
+        T138cQueue(10, 3036, T138cQ(10, 6));
+        var g = MatchWiring.TryFormAndFinish(3036, now);
+        Hex.True(g != null && g.Members.Count == 2, "the configured two-member match forms");
         return sent;
     }
 
     /// <summary>
     /// (4a/4b) A formed match is state: both members have it, it refuses a second queue, and a
-    /// relog gets the offer again - FIN then S_SYS_PARTY_INFO - once per world entry.
-    /// classic_live3's only formed match was entered at once, so there is no re-offer frame to
-    /// pin; the two frames are the capture's own FIN and party info, re-sent.
+    /// relog retains the entry without repeating FIN/SYS (cap_2man_client2 4356-5010).
     /// </summary>
     [Test] public static void T161_a_formed_match_stands_until_used()
     {
@@ -30469,13 +30468,13 @@ string message
             Hex.True(MatchWiring.Standing(new[] { T138cQ(11, 6) }, t0) == null, "someone else may queue");
 
             var offer = MatchWiring.TakeReoffer(0xABCDUL, 10, t0.AddSeconds(30));
-            Hex.True(offer.Count == 2, $"(a) the relog gets FIN + S_SYS_PARTY_INFO: {offer.Count}");
-            Hex.Eq(offer[0], MatchQueueManager.BuildFinInterPartyMatch(3036), "the same FIN");
-            Hex.True(BitConverter.ToUInt16(offer[1], 2) == PartyPackets.S_SYS_PARTY_INFO, "then the party info");
+            Hex.True(offer.Count == 0, "cap_2man_client2: relog does not repeat match completion");
             Hex.True(MatchWiring.TakeReoffer(0xABCDUL, 10, t0.AddSeconds(31)).Count == 0,
                 "a zone change in the same world entry does not throw the window up again");
-            Hex.True(MatchWiring.TakeReoffer(0xABCEUL, 10, t0.AddSeconds(40)).Count == 2,
-                "the next world entry does");
+            Hex.True(MatchWiring.TakeReoffer(0xABCEUL, 10, t0.AddSeconds(40)).Count == 0,
+                "another GameId is not another match completion");
+            Hex.True(MatchWiring.PendingFor(10, t0.AddSeconds(40)) != null,
+                "suppressing notification does not consume the waiting member's entry");
         }
         finally { MatchWiring.Reset(); }
     }
@@ -30502,8 +30501,8 @@ string message
     }
 
     /// <summary>
-    /// (4d) Declining (leaving the matched party, or C_MATCH_DEL) and running out both void the
-    /// match and tell everyone still waiting with the record-53967 cancel pair.
+    /// (4d) Party withdrawal clears pending state without duplicating PartyManager's packets.
+    /// The separately configured decline/expiry policy remains covered as local behavior.
     /// </summary>
     [Test] public static void T161_decline_and_expiry_void_the_match_and_tell_the_party()
     {
@@ -30516,14 +30515,8 @@ string message
             Hex.True(MatchWiring.OnLeftParty(9), "9 leaves the matched party");
             Hex.True(MatchWiring.PendingFor(9, t0) == null && MatchWiring.PendingFor(10, t0) == null,
                 "the match is off for both");
-            foreach (int c in new[] { 9, 10 })
-            {
-                var mine = sent.Where(s => s.Char == c).ToList();
-                Hex.True(mine.Count == 2 && mine[0].Op == MatchQueueManager.S_CANCEL_PARTY_MATCH_POOL
-                         && BitConverter.ToInt32(mine[0].Frame, 4) == 3036
-                         && mine[1].Op == MatchQueueManager.S_CHANGE_EVENT_MATCHING_STATE && mine[1].Frame[8] == 0,
-                    $"{c} is told: cancel(3036) + not queued");
-            }
+            Hex.True(sent.Count == 0,
+                "cap_2man_client1 11051-11055: PartyManager owns the single withdrawal sequence");
 
             sent = T161Form(t0);
             sent.Clear();
@@ -30701,8 +30694,11 @@ string message
                      && BitConverter.ToInt32(both[0], 14) == 5002 && BitConverter.ToInt32(both[1], 14) == 5001,
                 "dungeon events in the flag-1 frame, battleground events in the flag-0 frame (10580 / 10581)");
             var f = MatchWiring.MatchFoundFrames(9781);
-            Hex.True(f.Count == 2 && f[0][8] == 0 && f[0][9] == 1, "a 9781 match: state (0,1) [5002], then FIN");
-            Hex.Eq(f[1], MatchQueueManager.BuildFinInterPartyMatch(9781), "the FIN is unchanged");
+            Hex.True(f.Count == 3 && f[0][8] == 0 && f[0][9] == 1, "T184: a match clears all destinations, then FIN");
+            Hex.Eq(f[0], MatchQueueManager.BuildChangeEventMatchingState(new[] { 2154, 92151, 5002, 2154, 92151, 5002 }, false, 1),
+                "Arb079:3245/7274: all dungeon IDs in free=0 and free=1 order");
+            Hex.Eq(f[1], MatchQueueManager.BuildChangeEventMatchingState(new[] { 5001, 5001 }, false, 0), "all battlefield IDs in both free modes");
+            Hex.Eq(f[2], MatchQueueManager.BuildFinInterPartyMatch(9781), "the FIN is unchanged");
         }
         Hex.True(MatchQueueManager.EventMatchingFrames(new[] { 9739 }, queued: true).Count == 0, "built-in again");
     }
@@ -30784,7 +30780,7 @@ string message
             "no World / no requester: nothing sent");
     }
 
-    /// <summary>(3) A member who crashed takes the formed match with them; a lobby relog keeps T161's re-offer.</summary>
+    /// <summary>(3) A member who crashed takes the formed match with them; a lobby relog retains its entry.</summary>
     [Test] public static void T161b_a_crash_voids_the_members_match()
     {
         var t0 = DateTimeOffset.UnixEpoch.AddDays(103);
@@ -30793,7 +30789,7 @@ string message
             var sent = T161Form(t0);
             sent.Clear();
             Hex.True(!MatchWiring.OnLeftWorld(9, disconnected: false) && MatchWiring.PendingFor(9, t0) != null,
-                "a lobby leave: the match stands (re-offered at the next enter-world)");
+                "a lobby leave: the match stands without a repeated completion notification");
             Hex.True(MatchWiring.OnLeftWorld(9, disconnected: true), "arbiter-crash.log 01:11:42: 9's client crashed");
             Hex.True(MatchWiring.PendingFor(9, t0) == null && MatchWiring.PendingFor(10, t0) == null
                      && sent.Count(s => s.Char == 10 && s.Op == MatchQueueManager.S_CANCEL_PARTY_MATCH_POOL) == 1
@@ -31107,6 +31103,39 @@ string message
     {
         Hex.Eq(GmAdminTool.BuildCharLoc(0x80000AF00001UL, 0x80000AF00002UL | (1UL << 63)),
             "01 00 F0 0A 00 80 00 00 02 00 F0 0A 00 80 00 00", "7278");
+    }
+
+    [Test] public static void T179_servant_load_echoes_the_captured_user()
+    {
+        // cap_final2b.log 133 -> 134, complete payloads. The old replay returned user 1.
+        var (op, body) = RunHandler1(0x1539, Convert.FromHexString("20e066c77d01000009000000eb030000"));
+        Hex.True(op == 0x153A, "AS_LOAD_SERVANT_DATA");
+        Hex.Eq(body, Convert.FromHexString("00000000000000000900000001eb030000"), "cap_final2b 134");
+    }
+
+    [Test] public static void T179_servant_adventure_load_echoes_the_captured_user()
+    {
+        // cap_final2b.log 135 -> 136, complete payloads.
+        var (op, body) = RunHandler1(0x153B, Convert.FromHexString("20e066c77d0100000a000000eb030000"));
+        Hex.True(op == 0x153C, "AS_LOAD_SERVANT_ADVENTURE_DATA");
+        Hex.Eq(body, Convert.FromHexString("00000000000000000a00000001eb03000000000000"), "cap_final2b 136");
+    }
+
+    [Test] public static void T179_card_writes_match_all_five_real_pairs()
+    {
+        using var store = GuildStore(1);
+        // cap_social4.log: every observed real card write. Requests and replies are unmodified.
+        foreach (var (seq, op, request, response) in new[] {
+            (7032, 0x2988, "dc0400000100000000000000fabe040001000000", "dc04000001fabe040001000000"),
+            (7078, 0x2988, "df0400000100000000000000fabe040013000000", "df04000001fabe040013000000"),
+            (7107, 0x298A, "e004000001000000000000000100000000000000fabe0400", "e00400000100000000fabe0400"),
+            (7130, 0x298C, "e104000001000000000000000100000000000000fabe0400", "e10400000100000000fabe0400"),
+            (7140, 0x298A, "e204000001000000000000000100000000000000fabe0400", "e20400000100000000fabe0400") })
+        {
+            var (replyOp, body) = RunHandler1((ushort)op, Convert.FromHexString(request), store);
+            Hex.True(replyOp == op + 1, $"cap_social4 {seq + 1}: opcode");
+            Hex.Eq(body, Convert.FromHexString(response), $"cap_social4 {seq} -> {seq + 1}");
+        }
     }
 
 }

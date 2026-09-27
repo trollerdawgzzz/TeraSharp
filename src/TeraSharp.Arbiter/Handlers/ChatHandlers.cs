@@ -4,6 +4,7 @@
 using System.Collections.Concurrent;
 using Microsoft.Extensions.Logging;
 using TeraSharp.Arbiter.Network;
+using TeraSharp.Arbiter.World;
 
 namespace TeraSharp.Arbiter.Handlers;
 
@@ -56,6 +57,7 @@ public sealed class ChatHandlers
 
     public bool OnChat(GameSession s, ReadOnlyMemory<byte> body)
     {
+        if (QaSocialCommands.IsChatBanned(Program.Store, (int)s.PlayerId)) return true;
         var f = s.ReadByDef("C_CHAT", body);
         if (f == null) return true;
 
@@ -82,10 +84,15 @@ public sealed class ChatHandlers
         //   frame: [6]u32 msgOff=18 [10]u32 playerId [14]u32 channel [18] UTF-16LE message + 00 00
         if (s.InWorld)
         {
-            var w = Program.World;
             var chr = s.SelectedCharacter;
-            if (w != null && chr != null)
-                w.SendFrame(AS_REQUEST_NORMAL_CHAT, BuildRequestNormalChat((uint)chr.Id, channel, message));
+            // Arb047:7997-8003 -> Arb079:3639 -> Arb067:12789: party chat is
+            // an Arbiter fan-out. World does not handle channel1 as normal chat.
+            if (channel is 1 or 21 or 25 or 32)
+                PartyWiring.SendChat(s, channel, message);
+            else if (chr != null)
+                ArbiterClientHandlers.SendToWorld(s,
+                    channel is 5 or 22 ? AS_REQUEST_TEAM_CHAT : AS_REQUEST_NORMAL_CHAT,
+                    BuildRequestNormalChat((uint)chr.Id, channel, message));
             return true;
         }
 
@@ -98,6 +105,7 @@ public sealed class ChatHandlers
     }
 
     public const ushort AS_REQUEST_NORMAL_CHAT = 0x1449;
+    public const ushort AS_REQUEST_TEAM_CHAT = 0x144A;
 
     /// <summary>
     /// AS_REQUEST_NORMAL_CHAT (0x1449) payload: [u32 msgOff=18][u32 playerId][u32 channel][wstr msg].

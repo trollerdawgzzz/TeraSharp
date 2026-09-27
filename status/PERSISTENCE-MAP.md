@@ -1,9 +1,9 @@
 # Persistence map — what World writes during play, and which login load it feeds
 
-Source: `<captures>\cap_newchar.log` (real ArbiterServer, new character "Test" playerId 2,
+Source: `D:\packetlogs\cap_newchar.log` (real ArbiterServer, new character "Test" playerId 2,
 Island of Dawn, 05:49–05:53: create, enter, quests, gathering, potions, kills, level-ups, skill
 learning, item combine, tutorial dungeon enter/leave, logout). Condensed control listing in
-`<captures>\cap_newchar_ctl.txt` (seq, dir, time, opcode, len, first 64 payload bytes).
+`D:\packetlogs\cap_newchar_ctl.txt` (seq, dir, time, opcode, len, first 64 payload bytes).
 Names from `data/dbproxy_opcodes.txt`. All frame offsets below are payload-relative.
 
 Today TeraSharp persists the 15312-byte world blob (0x27CB), the item rows (T42/T44) and the rows the loads below are rebuilt from. Everything in the table below is
@@ -316,7 +316,7 @@ head-blocks that character's queue for the life of the World process.
 | 0x272C SDB_QUEST_LIST                             | 0x272D        | active quests in list 1, completed ids in list 2 | 1 per enter | **real (T17)**, from `quests` |
 | 0x27A2 SDB_USER_LOAD_INVENTORY                    | 0x27A3        | then 0x27A4, N x 536-B ItemData from the rows | 1 per enter | **real (T44)**, from `items` |
 | 0x27F8 SDB_USER_ACHIEVEMENT                       | 0x27F9        | the stored 0x27FA payload + the accomplished list, reqId@304 | 1 per enter | **real (T22)** |
-| 0x2872 SDB_TUTORIAL_SIMPLE_TIP                    | 0x2873        | 45 B, reqId@8, tips in first-seen order       | 1 per enter | **real (T22)** |
+| 0x2872 SDB_TUTORIAL_SIMPLE_TIP                    | 0x2873        | 19+8N B, reqId@8, (tipId, popupCount) ascending tipId | 1 per enter | **real (T22/T191)** |
 | 0x2942 SDB_SEREN_GUIDE                            | 0x2943        | 65 B, reqId@8, six fixed rows                 | 1 per enter | **real (T22)** |
 | 0x288F SDB_REPUTATION_LIST                        | 0x2890        | 65 B, reqId@9, the stored 52-B records        | 1 per enter | **real (T26)** |
 | 0x2908 SDB_FATIGABILITY_LIST                      | 0x2909        | 45 B, reqId@9 — keyed on the ACCOUNT, not the character | 1 per enter | **real (T26)** |
@@ -1166,10 +1166,103 @@ servant loads (still replayed), premium-slot cooltimes, purchase limits.
 | 0x282F SIMULATE_ITEM_TOOLTIP | T169's reference patch applied (World's answer to the 0x282E ask) | cap_final2a/2b |
 | EP writes 27C1 / 27BB x4 / 299A / 299C / 27BD + the loads after relog | **pinned**, replayed in order through the store | cap_final2b 682..6313, 29643 |
 | 0x2986 card loads (empty, 1 mounted card, 1 unmounted) | **pinned** with the card seeded (no card write in any capture) | cap_final2b 359 / 701 / 29661, cap_final 2931 |
-| 0x2988-0x2998 card writes | decompile-only - not in cap_final or cap_final2b | - |
+| 0x2988-0x2998 card writes | T190 pins captured pairs below; CREATE_CARD_INFO298E remains decompile-only | cap_2man_b |
 | Mail collect atom op 37 | modelled: DO_TS_RECV_PARCEL marker, parcel id @0x278, inert (the recv path marks the parcel) | cap_social 1555/1556 (every collect has one) |
 | Guild war accept / surrender | **pinned** - see GUILD-WAR.md section 8; `guild_wars` gains both sides' flags and money | cap_final2a + 2b |
 | Guild quest start / cancel | **pinned** - concurrent quests, SMT 3809 / 3909, S_FAIL_GUILD_QUEST, 0x1453 | cap_final2a 1549..4656, tap 7776 |
 | Guild quest timeout | not captured | - |
 
 Group C left: 0x275C ITEM_DECOMPOSE only (dead on both sides).
+
+### T190 — cards from the new two-player run
+
+[Evidence](../data/t190/README.md), including compact live-sheet attributes and exact frame fixtures under `data/t190/cards`, excludes the old cap_2man prefix. Client2 performs the writes; client1 only requests active-combine lists. Source refs below are original TCP chunk numbers, with offsets when nonzero; sizes include the6-byte World header.
+
+| Request/reply | Capture pair | Bytes | Result |
+|---|---|---|---|
+|2986/2987 load|13126→13127|22→91|Existing nonempty account/character layout matches.|
+|2988/2989 register|15072+18→15075|26→19|Reply already matches; added missing book-point/level update.|
+|298A/298B mount|13343→13344|30→19|Existing persistence and reply pinned.|
+|298C/298D unmount|13319→13320|30→19|Existing persistence and reply pinned.|
+|2990/2991 increase|13358→13359|886→879|Preset increment and full money-atom reply pinned.|
+|2998/2999 change|13372→13373|26→15|Per-character selection pinned.|
+|2992/2993 activate|16097→16098|26→19|Combine3/level1 persisted.|
+|2994/2995 deactivate|16128→16129|26→19|Combine removed.|
+|2996/2997 reward|15958→15959|894→883|Fixed BookType echo full-request+30→full-reply+19; RewardId remains+34→+23.|
+|2996/2997 refused reward7|16035→16036|894→883|Failure0 and original unallocated item atom pinned; actual rejection cause unknown.|
+|GM2985 refresh→2986→2987|15530→15533+93→15535|14→22→3547|Implemented `/@perfect_card_collection`, live-sheet fill and refresh to the issuer's World.|
+
+Register follows `Account::AddCardAmount` (Arb060:18935–19080): add `collectionBookPoint×delta`, then recalculate level. Card/level loaders are Arb085:5368–5422/4632–4692; threshold lookup is Arb084:14372–14450. Client2#2423 confirms60+5×3=75. GM source is Arb043:19442–19516, reset Arb065:8787–8842, refresh writer Arb039:11021–11062. The live218 templates produce10980 points/level3, matching all3547 bytes of15535. Production reads the sheets, retains the GM authorization gate and refuses a fill when sheets are missing.
+
+Reset SQL-body scope remains unknown. Capture proves the issuer's prior mount311034 disappears and account preset amount3 becomes1. Selected index was already0; the implementation preserves unproved selected indices and other characters' mounts. Account collection, points, level, preset amount, combines and claimed rewards follow the native account reset; no broader SQL parity is claimed.
+
+Rewards7/9 fail at16035→16036 and16058→16059, despite valid item templates341000/341001 and amount20≤maxStack100. Neither capture nor console gives the rejection reason. Native preflight can reject before execution (Arb063:18930–18949); the failure writer now preserves atoms and allocates no IDs. A missing-user handler refusal is covered from decompile, without claiming that absent-user state caused the real refusals. CREATE_CARD_INFO298E and ranked-result emission are not captured; the latter remains omitted by `OnUpdateDungeonRankRecord` (native client writer Arb064:11549–11647).
+
+### T191 — tutorial popup counts and relog
+
+| Evidence / field | Retail | Before T191 | Change |
+|---|---|---|---|
+| `cap_2man_b` 17468→17469; `cap_final2b` 34422→34423 | 67 B: tips 1,2,33,35,39,41; each count1 | Same element layout, insertion order | Load ascending tipId, exact replies pinned. |
+| `cap_2man_b` 17490→17491; `cap_final2b` 33787→33788 | 75 B: also tip31; each count1 | Constant second word1 | Load persisted popupCount. |
+| ADD 286E; DONT_REPEAT 2870 | ADD adds1; DONT_REPEAT adds request frame+18 | Duplicate ADD ignored; 2870 generic ack | Persist both increments; migrate existing rows to count1. |
+| Captured character id1 | Live stored rows | Always static tutorial reply | Stored rows take precedence; captured fallback only when empty. |
+
+There is **no separate don't-repeat flag**. Arbiter handlers `Arb_part_063.c:51/5317` both call `User::UpdateSimpleTip`; `Arb_part_030.c:15365–15374` inserts or increments the same counter. Native `GetSimpleTipNoLock` (`Arb_part_028.c:19197–19254`) traverses its ordered map. World compares the counter with its tip limit (`WorldServer.exe.c:2685546–2685577`); the client don't-repeat handler sends the remaining count, not a Boolean (`599415–599429`). The unobserved 2870 write/ack is **decompile-pinned**, not claimed as a captured pair.
+
+**The recurring WASD symptom is not conclusively explained.** Our `cap_handoff1` 297→298 already loads tip1/count1, identical to retail for that entry (only list order differs). Retail `cap_2man_b_client1` 524→525 and client2 486→490 answer tip1 with `090008660100000001` (`hide=true`). Neither `cap_handoff1_client` nor `cap_polish_client` contains that C_F9C6/S_6608 exchange. `HandlerRegistry.RegNoop` already forwards the check in-world. Capture a subsequent failing login including its C_SIMPLE_TIP_REPEAT_CHECK and S_SIMPLE_TIP_REPEAT_CHECK to establish the remaining UI cause; this change does not invent a suppression packet.
+
+Evidence: [14 selected frames and source hashes](../data/t191/frames.json), reproduced by `tools/t191-evidence.py`. Tests: `T191_tutorial_load_matches_retail_relogs_including_tip1`, `T191_tutorial_popup_counts_migrate_persist_and_reject_missing_owner`; the latter reopens SQLite and verifies ADD/DONT_REPEAT counts, migration and rejected missing-owner/truncated writes. No human-owned patch.
+
+### T193 — EP totals on level-70 login and account ownership
+
+The zero panel is proven: `cap_polish_client` 179 has EP level266, exp1493660, **totalPoints0**; `cap_handoff1` 361 sends the same zero total in AS1555. Retail `cap_final2b` 519 sends **300**, and `cap_2man` 257/771 sends 302/300. Character level70 and EP level266 are different counters.
+
+| Field / path | Retail evidence | Before T193 | Fix / classification |
+|---|---|---|---|
+| AS1555 full+15 level, +19 exp | final2b519: 266 / 1493660; 2man257: 268 / 1518005 | 266 / 1493660 | Valid state, unchanged layout. |
+| AS1555 full+55 TotalEp | final2b519: `2C010000`; handoff1:361 `00000000` | Stored300 never serialized | Emit stored EpPoint. Native Arb062:9490–9507, Arb061:16558–16562, Arb065:18377–18382. |
+| AS1555 full+27 daily exp | final2b519:0; handoff1:361:1493660 | Daily reset left earned exp intact | 27AF clears daily exp and updates reserve/stamp; Arb064:11069–11075. |
+| AS1555 full+31 reserve, +35 limit | final2b519:304230/0; subsequent1012 writes limit313223 | 27B3 only acknowledged | Persist the live limit; Arb064:11154–11156. The initial zero limit is valid state. |
+| AS1555 full+39 reset stamp, +47 gold | Captured stamp varies; gold0 in all audited loads | Stored stamp, gold0 | Preserve; no invented timezone conversion or gold value. |
+| 27B1 progress and 27B5 reset ownership | social4:2929 writes user1; 4974 loads same266/1493660/300 for sibling user2 | Per-character totals | Resolve character→account; shared `account_ep` for progress, daily fields, item gains and reset. |
+| 27C1 PRE versus 27B9/27BA perk load | final2b5716→5717 and682→683; 2man425→426 | PRE also overwrote current level/points | Update only character PRE. Used points, PRE, selected page and learned perks remain per-character (Arb030:13049–13112). |
+| Reset27B5→27B6 | None in social4/final2b/2man | Character-only reset | Account reset, daily limit retained; **decompile-only**, Arb064:1781–1820. |
+
+`EpData.xml` says `openLevel=65`, `startEp=300`, `maxEp=500`, `maxEpLevel=443`; `EpExp.xml` level265 ends at1493660 exp. The capture's266/300 is valid. **No evidence supports automatically granting500 at character level70.** World remains responsible for initial grants and progression (`WorldServer.exe.c:2755549–2755577`, `2770316–2770327`); Arbiter persists and returns what World writes. The projected XML under `data/t193` is test evidence, not deployment data.
+
+Migration runs atomically once, retaining all legacy `characters.ep_*` columns for recovery. For conflicting sibling rows, it selects the intact row with highest exp, then points, then EP level, then lowest character id. **There is no legacy EP write timestamp, so this cannot reconstruct the last-written history.** Balances are never summed. Subsequent opens never re-import legacy rows, including after account reset. Unknown character writes return failure and cannot create an account balance.
+
+The retail reset timestamp comes back 25,200 seconds below the raw27AF value in the audited relogs (e.g.2man1236→4038); server date conversion is not established by these packets, so T193 does not hardcode a seven-hour offset. Byte-exact load tests use the captured persisted stamp; the daily-write test checks clearing and persistence separately.
+
+Evidence: `data/t193/frames.json` (298 EP-family/client frames), `source-manifest.json`, minimal `EpData.xml`/`EpExp.xml` projections; regenerate with `tools/t193-evidence.py`. Tests: `T193_level70_loads_retail_points_and_keeps_perk_PRE_separate`, `T193_account_progress_migrates_once_and_survives_daily_reset_and_reopen`, `T193_EP_writes_refuse_unknown_character_without_creating_account_state`; T77's obsolete zero-total/daily assertions updated. No human-owned patch; live level70 relog remains to verify.
+
+### T192b / T191 / T193 / T194 — changed files and verification
+
+All paths below are relative to `D:\v100\TERA_SERVER.100\TeraSharp-cowork`.
+
+| Task | Files changed |
+|---|---|
+| T192b | `src/TeraSharp.Arbiter.Tests/T192Handoff.cs`; `status/MULTIWORLD-DESIGN.md` |
+| T191 + T193 shared | `src/TeraSharp.Arbiter/Persistence/CharacterStore.cs`; `src/TeraSharp.Arbiter/World/DbProxyHandlers.cs`; `src/TeraSharp.Arbiter.Tests/Program.cs`; this document |
+| T191 | `src/TeraSharp.Arbiter/World/DbAckTable.cs`; `src/TeraSharp.Arbiter.Tests/T191Tutorial.cs`; `tools/t191-evidence.py`; `data/t191/frames.json`; `data/t191/source-manifest.json` |
+| T193 | `src/TeraSharp.Arbiter.Tests/T193.cs`; `tools/t193-evidence.py`; `data/t193/frames.json`; `data/t193/source-manifest.json`; `data/t193/EpData.xml`; `data/t193/EpExp.xml` |
+| T194 | `src/TeraSharp.Arbiter/Handlers/ArbiterClientHandlers.cs`; `src/TeraSharp.Arbiter.Tests/T194.cs`; `tools/t194-evidence.py`; `data/t194/polishing-frames.json`; `status/CLIENT-REJECTS.md` |
+
+Validation on 2026-09-26: isolated master `c41b839` with these source changes and master's applied T192 WorldBridge patch builds successfully; **1031 passed / 0 failed / 26 skipped**. All edited C# files match the tested copy by SHA-256. Seven new regressions passed, including every polishing write/reply and the final load. The only integration correction was T165's generic-ack count, 51→50 after tutorial2870 became a real handler; its classification remains explicitly checked. T192b separately passed with both optional blobs present and skipped cleanly with them absent. No human-owned source file was edited.
+
+Live limits remain as stated above and in [T194's evidence and capture instructions](CLIENT-REJECTS.md#t194--skill-advancement-queries-belong-to-world-2026-09-26): WASD recurrence is unexplained by the supplied client traffic; polishing click/67–69/max-tome behavior needs the acting account's capture. The account migration preserves legacy rows but cannot reconstruct their missing write timestamps. These are tested protocol/persistence fixes, not a claimed live resolution of those symptoms.
+
+### T197 — glyph persistence and the false reset after topo-fin
+
+| Finding | Evidence / change |
+|---|---|
+| Live UI reset | `cap_instance1_client2`12494:42 learned,19 applied,60 total/60 used; topo-fin13037→13039 falsely clears use flags/used points. Same at9053→9055. Remove human-owned `HandlerRegistry`'s synthetic `S_CREST_INFO` via `T197-PATCH.diff`; World's packet remains authoritative. Native World `SendCrestInfo`:1578734–1578766; +12 is USED points, not extra points. |
+| Immediate persistence missing |1467/1469 previously acknowledged without saving. Native `Arb_part_031.c:938–1068` commits each active flag. Persist before ACK, then overlay learned ids/useNow in World blob+0x34C4 (192×8); preserve all padding/unrelated fields. Nullable legacy flags retain the saved blob's value until a real write. |
+| Point reload missing |1465 stored both SQL values but entry restored neither independently. Base `crestPoint` belongs at blob+0x3AEC (`Arb032:17859`, `Arb031:1186`); extra belongs at AS_ENTER_WORLD payload161/full0xA7 (`Arb028:15512–15545`, World:2985690). A write marker preserves unknown legacy zeroes; migrated nonzero values remain authoritative. Base follows the last write; extra only increases (`Arb031:1188–1213`). `T197-PATCH.diff` refreshes extra before caching/sending every entry, transfer or retry. |
+| What the run proves |42 unlocks/60 total points survive every entry. User9 apply1249→save3829→load10639 retains19; user10 apply17188→save19116→load20949 retains19. User9's later clear is client22699→1467record22700, not a lost save. Preset bytes also survive exactly:client2 saves8096/8802/12510→loads8724/9064/13048. No preset/default-points rewrite. |
+
+Tests: `T197_unlock_apply_reopen_load_matches_retail_without_waiting_for_world_save` (complete
+retail15331-B load; malformed/unknown-user refusal; native-only1469) and
+`T197_live_topo_fin_does_not_overwrite_world_crest_info` (requires the human patch).
+The load test starts with stale base0, then captured3379 restores60 across reopen. `T197_native_extra_points_restore_on_every_entry_and_never_decrease` covers unknown legacy points, positive extras7/11, a smaller write3, and explicit base0; these nonzero extras are decompile-only, not values claimed from the captures. Its owner-link send check requires the WorldBridge patch.
+Fixtures: `data/t197/frames.json`; direct packet evidence in `data/t197/README.md`.

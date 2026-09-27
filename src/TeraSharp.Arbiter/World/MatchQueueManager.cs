@@ -9,7 +9,7 @@ namespace TeraSharp.Arbiter.World;
 // =============================================================================================
 // MatchQueueManager - the instance-matching queue, T136. RAM only.
 //
-// Ground truth: <captures>\classic_live3.log, the LEADER side. T134 decoded classic_live2 and
+// Ground truth: D:\packetlogs\classic_live3.log, the LEADER side. T134 decoded classic_live2 and
 // T134b's note established that capture was a party MEMBER - it only ever showed the pushes.
 // classic_live3 is the human queueing Kelsaik (instance 9739) as party leader, matching, and
 // cancelling once, so it pins the REQUEST half for the first time.
@@ -95,7 +95,7 @@ public static class MatchQueueManager
     /// C_MATCH_ADD's trailing int32 carries it (0 tank, 1 DPS, 2 healer).
     /// <see cref="MatchComposition.NoChoice"/> when none was stated.</param>
     public readonly record struct Queuer(uint PlayerId, int CharacterId, int CharacterClass, int Level,
-                                         int Chosen = MatchComposition.NoChoice)
+                                         int Chosen = MatchComposition.NoChoice, float TrueItemLevel = 0)
     {
         /// <summary>The position this queuer is treated as when nothing is matching on it -
         /// their own choice when they can fill it, else the class default.</summary>
@@ -121,7 +121,7 @@ public static class MatchQueueManager
     public sealed class Entry
     {
         public uint LeaderPlayerId { get; init; }
-        public int[] InstanceIds { get; init; } = Array.Empty<int>();
+        public int[] InstanceIds { get; set; } = Array.Empty<int>();
         public uint[] MemberPlayerIds { get; init; } = Array.Empty<uint>();
         public DateTimeOffset QueuedAt { get; init; }
         public bool Matched { get; set; }
@@ -164,6 +164,14 @@ public static class MatchQueueManager
     public static Entry? Find(uint leaderPlayerId)
     {
         lock (Lock) return ByLeader.TryGetValue(leaderPlayerId, out var e) ? e : null;
+    }
+
+    /// <summary>T184: progress resolves a party application for any member (Arb077:9059-9116).</summary>
+    public static Entry? FindForPlayer(uint playerId)
+    {
+        lock (Lock)
+            return ByLeader.TryGetValue(playerId, out var e) ? e
+                : ByLeader.Values.FirstOrDefault(row => row.MemberPlayerIds.Contains(playerId));
     }
 
     /// <summary>Drops every entry. Tests only.</summary>
@@ -209,6 +217,52 @@ public static class MatchQueueManager
         if (e == null || e.InstanceIds.Length == 0) return (askedFor, 0, 0);
         int instance = askedFor == AnyInstance ? e.InstanceIds[0] : askedFor;
         return (instance, e.MemberPlayerIds.Length, e.MemberPlayerIds.Length);
+    }
+
+    /// <summary>T184: Arb_part_077:8929-8955 writes tanker/dealer/healer counts.
+    /// Find a compatible partial group containing the requesting entry; the capture's
+    /// single DPS is (0,1,0), and the same player queued as tank is (1,0,0).</summary>
+    public static byte[]? ProgressFrame(Entry? entry, int askedFor)
+    {
+        if (entry == null || entry.State != MatchState.Waiting) return null;
+        int id = askedFor == AnyInstance ? entry.InstanceIds.FirstOrDefault() : askedFor;
+        if (!entry.Wants(id)) return null;
+        if (QaMatchSimulation.Progress(id, IsBattleground(id)) is { } simulated) return simulated;
+        // The in-process battleground matcher has no MA_MATCH_PROGRESS cache. Report
+        // its own application's roles; do not seat a battleground into five dungeon slots.
+        if (IsBattleground(id))
+            return BuildMatchProgress(id, 1, 0, entry.Members.Count(q => q.Role == MatchRole.Tank),
+                entry.Members.Count(q => q.Role == MatchRole.Dps), entry.Members.Count(q => q.Role == MatchRole.Healer));
+        var candidates = Pool(id);
+        candidates.Remove(entry);
+        candidates.Insert(0, entry);
+        var rule = DungeonMatchRules.For(id);
+        var templates = rule?.Templates() ?? new[] { MatchComposition.DungeonTemplate(GroupSize(id)) };
+        var best = Array.Empty<MatchRole>();
+        foreach (var template in templates)
+        {
+            if (candidates.All(e => e.Members.All(q => q.ChosenRole != null)))
+            {
+                var selected = FixedRoleSubset(candidates, template, entry);
+                var assigned = selected.SelectMany(e => e.Members).Select(q => q.Role).ToArray();
+                if (assigned.Length > best.Length) best = assigned;
+                continue;
+            }
+            var members = new List<Queuer>(entry.Members);
+            if (!TryAssign(members, template)) continue;
+            foreach (var e in candidates.Skip(1))
+            {
+                int before = members.Count;
+                members.AddRange(e.Members);
+                if (!TryAssign(members, template)) members.RemoveRange(before, members.Count - before);
+            }
+            if (members.Count <= best.Length) continue;
+            var roles = new MatchRole[members.Count];
+            if (TryAssign(members, template, roles)) best = roles;
+        }
+        return BuildMatchProgress(id, IsBattleground(id) ? 1 : 0, 0,
+            best.Count(r => r == MatchRole.Tank), best.Count(r => r == MatchRole.Dps),
+            best.Count(r => r == MatchRole.Healer));
     }
 
     // ---- readers -------------------------------------------------------------------------
@@ -385,6 +439,26 @@ public static class MatchQueueManager
         return outp;
     }
 
+    /// <summary>T184: DoFinPartyMatch expands MatchingInfo(-9999,2,2), visiting every
+    /// destination in key order for free=0 and free=1. Do not deduplicate the two passes.
+    /// Arb_part_079:3245-3249,7274-7326; classic_live3 10580/10581.</summary>
+    public static List<byte[]> AllEventMatchingFrames()
+    {
+        var targets = DatasheetLoader.EventMatchingTargets.Value;
+        var dungeon = new List<int>();
+        var battle = new List<int>();
+        for (int free = 0; free < 2; free++)
+            foreach (int id in targets.Keys.OrderBy(id => id))
+            {
+                dungeon.AddRange(targets[id].Dungeon);
+                battle.AddRange(targets[id].BattleField);
+            }
+        var frames = new List<byte[]>(2);
+        if (dungeon.Count > 0) frames.Add(BuildChangeEventMatchingState(dungeon, false, 1));
+        if (battle.Count > 0) frames.Add(BuildChangeEventMatchingState(battle, false, 0));
+        return frames;
+    }
+
     public static byte[] BuildChangeEventMatchingState(IReadOnlyList<int> questIds, bool queued, byte unk = 1)
     {
         var q = questIds ?? Array.Empty<int>();
@@ -446,7 +520,7 @@ public static class MatchQueueManager
     /// <c>.1.def</c> GETS WRONG - T134 flagged it, and the leader-side capture settles it:
     /// <code>
     ///   body 0  u16 count instances / 2 u16 offset instances
-    ///        4  u16 count (second array, 0 in both captured frames) / 6 u16 offset
+    ///        4  i32 RemainSec (T184: Arb076:14950-15035)
     ///   instance element 20 B:
     ///        +0  u16 here / +2 u16 next
     ///        +4  u16 count players / +6 u16 offset players      &lt;-- a NESTED array
@@ -461,40 +535,50 @@ public static class MatchQueueManager
     /// </summary>
     public static byte[] BuildAddInterPartyMatchPool(int instanceId, IReadOnlyList<PoolPlayer> players,
         int unk1 = 0, int unk2 = 0)
+        => BuildAddInterPartyMatchPool(new[] { instanceId }, players, unk1, unk2);
+
+    /// <summary>T184: full+8 is i32 RemainSec; each matching row owns a PDId-ordered
+    /// member list. Arb_part_076:14950-15035; classic_live2 9335 and classic_live3 8662.</summary>
+    public static byte[] BuildAddInterPartyMatchPool(IReadOnlyList<int> instances,
+        IReadOnlyList<PoolPlayer> players, int matchingType = 0, int freeMatching = 0, int remainSec = 0)
     {
-        var ps = players ?? Array.Empty<PoolPlayer>();
+        var ps = (players ?? Array.Empty<PoolPlayer>()).OrderBy(p => p.PlanetId).ThenBy(p => p.PlayerId).ToArray();
         const int Header = 4, InstanceStride = 20, PlayerStride = 17;
-        int len = Header + 8 + InstanceStride + ps.Count * PlayerStride;
+        int stride = InstanceStride + ps.Length * PlayerStride;
+        int len = Header + 8 + instances.Count * stride;
+        if (len > ushort.MaxValue) throw new ArgumentOutOfRangeException(nameof(instances));
         var p = new byte[len];
         BitConverter.GetBytes((ushort)len).CopyTo(p, 0);
         BitConverter.GetBytes(S_ADD_INTER_PARTY_MATCH_POOL).CopyTo(p, 2);
 
         int inst = Header + 8;
-        BitConverter.GetBytes((ushort)1).CopyTo(p, 4);
-        BitConverter.GetBytes((ushort)inst).CopyTo(p, 6);
-        BitConverter.GetBytes((ushort)0).CopyTo(p, 8);
-        BitConverter.GetBytes((ushort)0).CopyTo(p, 10);
+        BitConverter.GetBytes((ushort)instances.Count).CopyTo(p, 4);
+        BitConverter.GetBytes((ushort)(instances.Count == 0 ? 0 : inst)).CopyTo(p, 6);
+        BitConverter.GetBytes(remainSec).CopyTo(p, 8);
 
-        int pfirst = inst + InstanceStride;
-        BitConverter.GetBytes((ushort)inst).CopyTo(p, inst);
-        BitConverter.GetBytes((ushort)0).CopyTo(p, inst + 2);
-        BitConverter.GetBytes((ushort)ps.Count).CopyTo(p, inst + 4);
-        BitConverter.GetBytes((ushort)(ps.Count == 0 ? 0 : pfirst)).CopyTo(p, inst + 6);
-        BitConverter.GetBytes(instanceId).CopyTo(p, inst + 8);
-        BitConverter.GetBytes(unk1).CopyTo(p, inst + 12);
-        BitConverter.GetBytes(unk2).CopyTo(p, inst + 16);
-
-        int off = pfirst;
-        for (int i = 0; i < ps.Count; i++)
+        for (int row = 0; row < instances.Count; row++, inst += stride)
         {
-            int next = i + 1 < ps.Count ? off + PlayerStride : 0;
-            BitConverter.GetBytes((ushort)off).CopyTo(p, off);
-            BitConverter.GetBytes((ushort)next).CopyTo(p, off + 2);
-            BitConverter.GetBytes(ps[i].PlanetId).CopyTo(p, off + 4);
-            BitConverter.GetBytes(ps[i].PlayerId).CopyTo(p, off + 8);
-            p[off + 12] = ps[i].Flag;
-            BitConverter.GetBytes(ps[i].Tail).CopyTo(p, off + 13);
-            off = next;
+            int pfirst = inst + InstanceStride;
+            BitConverter.GetBytes((ushort)inst).CopyTo(p, inst);
+            BitConverter.GetBytes((ushort)(row + 1 < instances.Count ? inst + stride : 0)).CopyTo(p, inst + 2);
+            BitConverter.GetBytes((ushort)ps.Length).CopyTo(p, inst + 4);
+            BitConverter.GetBytes((ushort)(ps.Length == 0 ? 0 : pfirst)).CopyTo(p, inst + 6);
+            BitConverter.GetBytes(instances[row]).CopyTo(p, inst + 8);
+            BitConverter.GetBytes(matchingType).CopyTo(p, inst + 12);
+            BitConverter.GetBytes(freeMatching).CopyTo(p, inst + 16);
+
+            int off = pfirst;
+            for (int i = 0; i < ps.Length; i++)
+            {
+                int next = i + 1 < ps.Length ? off + PlayerStride : 0;
+                BitConverter.GetBytes((ushort)off).CopyTo(p, off);
+                BitConverter.GetBytes((ushort)next).CopyTo(p, off + 2);
+                BitConverter.GetBytes(ps[i].PlanetId).CopyTo(p, off + 4);
+                BitConverter.GetBytes(ps[i].PlayerId).CopyTo(p, off + 8);
+                p[off + 12] = ps[i].Flag;
+                BitConverter.GetBytes(ps[i].Tail).CopyTo(p, off + 13);
+                off = next;
+            }
         }
         return p;
     }
@@ -544,35 +628,27 @@ public static class MatchQueueManager
     public static bool IsBattleground(int instanceId) => instanceId > 0 && instanceId < 1000;
 
     /// <summary>
-    /// Members a formed group wants, per instance. Dungeons are a party unless an entry here
-    /// says otherwise: <c>DungeonMatching.xml</c>'s <c>&lt;Dungeon&gt;</c> rows carry id, name,
-    /// levels, minItemLevel and matchingRoleId and NO member count, and the table
-    /// <c>matchingRoleId</c> indexes lives in the MatchServer binary this stack does not have.
-    /// So a raid size is configured rather than decoded, and
-    /// <see cref="MatchComposition.DungeonTemplate"/> turns whatever is put here into counts -
-    /// 10 becomes 2 tanks / 2 healers / 6 DPS, 20 becomes 4 / 4 / 12.
+    /// Legacy per-instance size overrides, used only without a loaded DungeonMatchRules row.
+    /// T184 loads production sizes and role bounds from MatchingRoleTemplate.xml.
     /// </summary>
     public static readonly Dictionary<int, int> RaidSizes = new();
 
-    /// <summary>The group size for an instance - <see cref="RaidSizes"/>, else a party.</summary>
+    /// <summary>The production RoleData.totalUser; legacy overrides are used only without a sheet row.</summary>
     public static int GroupSize(int instanceId)
-        => RaidSizes.TryGetValue(instanceId, out int n) && n > 0 ? n : MatchComposition.PartySize;
+        => DungeonMatchRules.For(instanceId)?.Total
+            ?? (RaidSizes.TryGetValue(instanceId, out int n) && n > 0 ? n : MatchComposition.PartySize);
 
     /// <summary>
-    /// T138d, A TEST KNOB AND NOTHING ELSE. When set to a whole number above zero, a pool forms
-    /// at that many queued players and the composition is not consulted at all - no roles, no
-    /// per-team caps, no healer floors. It exists so two people can queue and actually get into
-    /// a dungeon on a server with two accounts on it; it makes the matcher wrong on purpose, so
-    /// <c>Program</c> logs a warning at startup whenever it is set.
-    ///
-    /// <para>Read fresh on every call, not cached, so it can be turned off without a restart.</para>
+    /// Retired T138d setting. Kept only to report stale configuration at startup. T184h:
+    /// completion and advertised capacity both follow DungeonMatchRules.Total; an environment
+    /// value cannot form a partial group or bypass role constraints (cap_2man versus queue5).
     /// </summary>
     public const string MinMembersVariable = "TERASHARP_MATCH_MIN_MEMBERS";
 
-    /// <summary><see cref="MinMembersVariable"/>'s value, or 0 when unset or not a number.</summary>
+    /// <summary>Legacy configured value for diagnostics only; matchmaking ignores it.</summary>
     public static int MinMembersOverride()
     {
-        var raw = Environment.GetEnvironmentVariable(MinMembersVariable);
+        var raw = TerasConfig.Get(MinMembersVariable);
         return !string.IsNullOrWhiteSpace(raw) && int.TryParse(raw.Trim(), out int v) && v > 0
             ? v : 0;
     }
@@ -743,14 +819,40 @@ public static class MatchQueueManager
             ? TryFormBattleground(instanceId, now, rng)
             : TryFormDungeon(instanceId, GroupSize(instanceId), now);
 
-    /// <summary>1 tank / 1 healer / 3 DPS, or the raid counts for a larger group.</summary>
+    /// <summary>Complete a template permitted by the destination's MatchingRoleTemplate row.</summary>
     public static FormedGroup? TryFormDungeon(int instanceId, int size, DateTimeOffset now)
     {
-        int over = MinMembersOverride();
-        var template = over > 0 ? new RoleTemplate(0, 0, over) : MatchComposition.DungeonTemplate(size);
+        var rule = DungeonMatchRules.For(instanceId);
+        if (rule == null)
+            return TryFormDungeonTemplate(instanceId, MatchComposition.DungeonTemplate(size), now);
+        foreach (var template in rule.Templates())
+        {
+            var group = TryFormDungeonTemplate(instanceId, template, now);
+            if (group != null) return group;
+        }
+        return null;
+    }
+
+    private static FormedGroup? TryFormDungeonTemplate(int instanceId, RoleTemplate configured,
+        DateTimeOffset now)
+    {
+        var template = configured;
         if (template.Size <= 0) return null;
         var pool = Pool(instanceId);
         if (pool.Count == 0) return null;
+
+        // MatchServer FUN_14010c5d0 considers combinations of WHOLE applications.
+        // A compatible early solo must not hide a later complete premade. Live requests
+        // carry fixed choices; retain the legacy flexible-class path for callers without them.
+        if (pool.All(e => e.Members.All(q => q.ChosenRole != null)))
+        {
+            var selected = FixedRoleSubset(pool, template);
+            var selectedMembers = selected.SelectMany(e => e.Members).ToArray();
+            if (selectedMembers.Length != template.Size) return null;
+            Mark(selected, instanceId);
+            return new FormedGroup(instanceId, selected, selectedMembers, selectedMembers,
+                Array.Empty<Queuer>(), selectedMembers.Select(q => q.Role).ToArray());
+        }
 
         // Entries stay ATOMIC - a queued party is taken whole or skipped - but the seating is
         // checked over the WHOLE candidate set each time one is added, so an entry that would
@@ -764,7 +866,7 @@ public static class MatchQueueManager
             if (members.Count + e.Members.Length > template.Size) continue;
             int before = members.Count;
             members.AddRange(e.Members);
-            if (over <= 0 && !TryAssign(members, template))
+            if (!TryAssign(members, template))
             {
                 members.RemoveRange(before, members.Count - before);
                 continue;
@@ -775,17 +877,40 @@ public static class MatchQueueManager
         if (members.Count != template.Size) return null;
 
         var roles = new MatchRole[members.Count];
-        if (over > 0)
-        {
-            // The knob: everybody is a body. Their DEFAULT position is still reported, so
-            // S_SYS_PARTY_INFO says something true about the class even though nothing was
-            // matched on it.
-            for (int i = 0; i < roles.Length; i++) roles[i] = members[i].Role;
-        }
-        else if (!TryAssign(members, template, roles)) return null;
+        if (!TryAssign(members, template, roles)) return null;
 
         Mark(taken, instanceId);
         return new FormedGroup(instanceId, taken, members, members, Array.Empty<Queuer>(), roles);
+    }
+
+    // T184: bounded role-count dynamic programming, derived from MatchServer:217054-217975.
+    // Equal-count alternatives keep the first encountered application order. MatchServer's
+    // random/tie priority is not reproduced; no capture pins that selection policy.
+    private static List<Entry> FixedRoleSubset(IReadOnlyList<Entry> pool, RoleTemplate template,
+        Entry? required = null)
+    {
+        static (int T, int H, int D) Counts(Entry e) =>
+            (e.Members.Count(q => q.Role == MatchRole.Tank),
+             e.Members.Count(q => q.Role == MatchRole.Healer),
+             e.Members.Count(q => q.Role == MatchRole.Dps));
+        bool Fits((int T, int H, int D) c) => c.T <= template.Tanks && c.H <= template.Healers && c.D <= template.Dps;
+        var states = new Dictionary<(int T, int H, int D), List<Entry>>();
+        var start = required == null ? (0, 0, 0) : Counts(required);
+        if (!Fits(start)) return new List<Entry>();
+        states[start] = required == null ? new List<Entry>() : new List<Entry> { required };
+        foreach (var e in pool)
+        {
+            if (ReferenceEquals(e, required) || e.Members.Length == 0) continue;
+            var n = Counts(e);
+            foreach (var s in states.ToArray())
+            {
+                var next = (T: s.Key.T + n.T, H: s.Key.H + n.H, D: s.Key.D + n.D);
+                if (!Fits(next) || states.ContainsKey(next)) continue;
+                var chosen = new List<Entry>(s.Value) { e };
+                states.Add(next, chosen);
+            }
+        }
+        return states.OrderByDescending(s => s.Key.T + s.Key.H + s.Key.D).First().Value;
     }
 
     /// <summary>
@@ -796,9 +921,8 @@ public static class MatchQueueManager
     public static FormedGroup? TryFormBattleground(int battleFieldId, DateTimeOffset now,
         Random? rng = null)
     {
-        int over = MinMembersOverride();
         var rule = MatchComposition.RuleFor(battleFieldId);
-        int teamSize = over > 0 ? Math.Max(1, over / 2) : rule.TeamSize;
+        int teamSize = rule.TeamSize;
         if (teamSize <= 0) return null;
         var pool = Pool(battleFieldId);
         if (pool.Count == 0) return null;
@@ -813,11 +937,7 @@ public static class MatchQueueManager
             for (int t = 0; t < 2; t++)
             {
                 var team = teams[(first + t) & 1];
-                if (over > 0)
-                {
-                    if (team.Count + e.Members.Length > teamSize) continue;
-                }
-                else if (!TeamTakes(rule, team, e.Members)) continue;
+                if (!TeamTakes(rule, team, e.Members)) continue;
                 team.AddRange(e.Members);
                 taken.Add(e);
                 break;
@@ -825,8 +945,7 @@ public static class MatchQueueManager
             if (teams[0].Count == teamSize && teams[1].Count == teamSize) break;
         }
         if (teams[0].Count != teamSize || teams[1].Count != teamSize) return null;
-        // The floors are a composition rule, so the knob skips them with everything else.
-        if (over <= 0 && (!Satisfies(rule, teams[0]) || !Satisfies(rule, teams[1]))) return null;
+        if (!Satisfies(rule, teams[0]) || !Satisfies(rule, teams[1])) return null;
 
         var all = new List<Queuer>(teams[0]);
         all.AddRange(teams[1]);

@@ -6,7 +6,7 @@
     frameworks aren't in the offline package cache), so this project depends only
     on the Arbiter project and the BCL. It exits non-zero if any check fails, so
     `dotnet run` doubles as the CI gate. Each [Test] method targets one handler
-    and compares against bytes captured from a real server.
+    and compares against bytes captured in D:\packetlogs\arb_world.log.
   -->
   <PropertyGroup>
     <OutputType>Exe</OutputType>

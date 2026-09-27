@@ -1,8 +1,8 @@
 # status/ALTA-DIFF.md - T129, the full-payload Alt+A diff
 
-Real: `<captures>\cap_final_gm_client2.log` - the original ArbiterServer.exe, panel OPENS
+Real: `D:\packetlogs\cap_final_gm_client2.log` - the original ArbiterServer.exe, panel OPENS
 (`C_ADMIN_REQUEST_CUSTOM_BOOKMARK` at record 524).
-Ours: `<captures>\cap_t124.log` - TeraSharp after T124, same D:\Tera 100-class client,
+Ours: `D:\packetlogs\cap_t124.log` - TeraSharp after T124, same D:\Tera 100-class client,
 panel does NOT open (zero `C_ADMIN_*` in the whole capture; 25 `C_REQUEST_PVE_RANKING` instead).
 
 Window: every `S->C` frame from `S_LOGIN_ARBITER` (record 7 in both) to the first
@@ -253,7 +253,7 @@ were checked and none of them carries the path:
 
 | Source | What is actually there |
 |---|---|
-| `ArbiterServer.exe.c` (59 MB, grepped) | No admin-tool path. Its ONLY URL is `L"http://%s/Default.aspx?v=%s"` at line 1440066, filled with the hardcoded a hardcoded retail address and `"Live-100.02 TW #9 (Gold)"` and fired through `InternetOpenUrlW` as `ArbiterServer` - a retail phone-home at startup, unrelated to Alt+A. (Worth blocking before going public.) |
+| `ArbiterServer.exe.c` (59 MB, grepped) | No admin-tool path. Its ONLY URL is `L"http://%s/Default.aspx?v=%s"` at line 1440066, filled with the hardcoded `"<retail-phone-home-address>:80"` and `"Live-100.02 TW #9 (Gold)"` and fired through `InternetOpenUrlW` as `ArbiterServer` - a retail phone-home at startup, unrelated to Alt+A. (Worth blocking before going public.) |
 | `WebApp\ContentsControl\Awesomium\*` | A DIFFERENT feature. `AwesomiumUrlControl.aspx` is a GM page managing a per-server (Title, Url) list - the in-game web panel. All logic is compiled into `WebApp\bin\*.dll`; the .aspx files are markup only. |
 | `S_RESPONSE_SERVER_ADMINTOOL_AWESOMIUM_URL` | Serves that same list. Body in the working capture is `08 00 0A 00 00 00 00 00` = TWO string refs at packet 8 and 10, BOTH EMPTY. The panel opened with an empty admin-tool URL, which is the proof the URL does not come from this packet. (The shipped def declares only `string title` - it under-declares the second string.) |
 | `tera-api` | `API_GATEWAY_LISTEN_PORT=8040`, and its own `.env.example` calls it the API "for receiving connections from the external website (like billing)". Not an admin tool. |
@@ -452,7 +452,7 @@ helper and pass `GmCommandHandlers.LevelOf`.
 | S_LOGIN_ARBITER | status | 33 | 33 | identical (ordinary account: 31) |
 | S_LOGIN_ACCOUNT_INFO | accountId, dbServerName | 1, PlanetDB_2800 | same | - |
 | S_LOGIN_ACCOUNT_INFO | antiCheatChecksumSeed, apiServerAuthToken | 619351, JWT | 941901, JWT | session nonce |
-| S_LOGIN_ACCOUNT_INFO | apiServerAddress | 127.0.0.1:8800 | 203.0.113.10:8800 | deploy config, not a gate - see below |
+| S_LOGIN_ACCOUNT_INFO | apiServerAddress | 127.0.0.1:8800 | 192.0.2.10:8800 | deploy config, not a gate - see below |
 | S_GET_USER_LIST | veteran, maxCharacters | 1, 3 | 0, 8 | account state |
 | S_GET_USER_LIST | adminLevel (elem+142) | 1 | 5 | both > 0; T144 works |
 | S_GET_USER_LIST | level, hp, guildName, achievementPoints, guildLogoId | - | - | character state |

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 the TeraSharp contributors
+
 <#
 .SYNOPSIS
     T160/T162 - data-only level-70 start: lift the ClassException teleport gate and the

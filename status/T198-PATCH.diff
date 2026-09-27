@@ -1,0 +1,174 @@
+diff --git a/src/TeraSharp.Arbiter/World/WorldBridge.cs b/src/TeraSharp.Arbiter/World/WorldBridge.cs
+--- a/src/TeraSharp.Arbiter/World/WorldBridge.cs
++++ b/src/TeraSharp.Arbiter/World/WorldBridge.cs
+@@ -30,6 +30,7 @@
+ internal sealed class TunnelReorderBuffer
+ {
+     public readonly SortedDictionary<uint, byte[]> Pending = new();
++    public readonly OrderedTunnelDelivery Ready = new();
+     public uint NextSeq;
+     public DateTime LastDelivery = DateTime.UtcNow;
+     /// <summary>Callback to deliver a reordered client packet to the owning session.</summary>
+@@ -133,6 +134,7 @@
+         }
+         lock (_reorderLock)
+         {
++            if (_tunnels.TryGetValue((s.CurrentWorldId, s.TunnelKey), out var previous)) previous.Ready.Retire();
+             _tunnels[(s.CurrentWorldId, s.TunnelKey)] = new TunnelReorderBuffer { Deliver = p => Handlers.ArbiterClientHandlers.DeliverTunnelled(s, p) };   // T121: inject S_ADMIN_GM_SKILL before the tunnelled S_LOAD_TOPO
+             _departed.ForgetEverywhere(s.TunnelKey);   // T161 (+ 2026-09-22: a reissued ticket is live on every world)
+         }
+@@ -153,7 +155,7 @@
+         _crossWorld.Forget(gameId);   // T192: a disconnected session must not finish an old transfer
+         lock (_reorderLock)
+         {
+-            _tunnels.Remove((worldId, tunnelKey));
++            if (_tunnels.Remove((worldId, tunnelKey), out var old)) old.Ready.Retire();
+             _departed.Add(worldId, tunnelKey);   // T161: World keeps addressing it until SA_LEAVE_WORLD
+         }
+         _tickets.For(worldId).Free(tunnelKey);
+@@ -205,6 +207,7 @@
+     {
+         lock (_reorderLock)
+         {
++            if (_tunnels.TryGetValue((worldId, key), out var previous)) previous.Ready.Retire();
+             _tunnels[(worldId, key)] = new TunnelReorderBuffer { Deliver = callback };
+             _departed.ForgetEverywhere(key);   // T161 (+ 2026-09-22)
+         }
+@@ -219,7 +222,7 @@
+     {
+         lock (_reorderLock)
+         {
+-            _tunnels.Remove((worldId, key));
++            if (_tunnels.Remove((worldId, key), out var old)) old.Ready.Retire();
+             _departed.Add(worldId, key);   // T161
+         }
+     }
+@@ -273,6 +276,7 @@
+             foreach (var buf in _tunnels.Values)
+             {
+                 buf.Pending.Clear();
++                buf.Ready.Clear();
+                 buf.NextSeq = 0;
+                 buf.LastDelivery = DateTime.UtcNow;
+             }
+@@ -290,6 +294,7 @@
+             foreach (var pair in _tunnels.Where(pair => pair.Key.World == worldId))
+             {
+                 pair.Value.Pending.Clear();
++                pair.Value.Ready.Clear();
+                 pair.Value.NextSeq = 0;
+                 pair.Value.LastDelivery = DateTime.UtcNow;
+             }
+@@ -311,6 +316,7 @@
+         {
+             if (!_tunnels.TryGetValue((worldId, tunnelKey), out var buf)) return;
+             buf.Pending.Clear();
++            buf.Ready.Clear();
+             buf.NextSeq = 0;
+             buf.LastDelivery = DateTime.UtcNow;
+         }
+@@ -426,40 +432,44 @@
+             await Task.Delay(50, ct);
+             DbProxy?.UserControls.Tick(DateTimeOffset.UtcNow, ResolveControlUser, HasLinks,
+                 send => SendFrame(send.WorldId, send.Opcode, send.Payload));
+-            List<((int World, uint Ticket) key, byte[] pkt)>? flush = null;
+-            lock (_reorderLock)
+-            {
+-                foreach (var (key, buf) in _tunnels)
+-                {
+-                    if (buf.Pending.Count > 0 &&
+-                        (DateTime.UtcNow - buf.LastDelivery).TotalMilliseconds > StallMs)
+-                    {
+-                        var first = buf.Pending.Keys.First();
+-                        _log.LogWarning("Tunnel world={W} key={Key} seq stall: expected {Exp}, "
+-                            + "have {Have} - skipping", key.World, key.Ticket, buf.NextSeq, first);
+-                        buf.NextSeq = first;
+-                        flush ??= new();
+-                        flush.AddRange(DrainInOrder(key, buf));
+-                    }
+-                }
+-            }
+-            if (flush != null)
+-                foreach (var (k, p) in flush) RouteToClient(k.World, k.Ticket, p);
+-        }
+-    }
+-
+-    private static List<((int World, uint Ticket) key, byte[] pkt)> DrainInOrder(
+-        (int World, uint Ticket) key, TunnelReorderBuffer buf)
+-    {
+-        var outp = new List<((int, uint), byte[])>();
++            FlushStalledTunnels(DateTime.UtcNow);
++        }
++    }
++
++    // T198: watchdog and normal arrivals enqueue under the SAME sequence lock, then use
++    // the SAME per-ticket drainer outside it. No callback runs while _reorderLock is held.
++    internal void FlushStalledTunnels(DateTime utcNow)
++    {
++        List<OrderedTunnelDelivery>? flush = null;
++        lock (_reorderLock)
++        {
++            foreach (var (key, buf) in _tunnels)
++            {
++                if (buf.Pending.Count > 0 && (utcNow - buf.LastDelivery).TotalMilliseconds > StallMs)
++                {
++                    var first = buf.Pending.Keys.First();
++                    _log.LogWarning("Tunnel world={W} key={Key} seq stall: expected {Exp}, "
++                        + "have {Have} - skipping", key.World, key.Ticket, buf.NextSeq, first);
++                    buf.NextSeq = first;
++                    QueueInOrder(buf);
++                    flush ??= new();
++                    flush.Add(buf.Ready);
++                }
++            }
++        }
++        if (flush != null)
++            foreach (var ready in flush) ready.Drain();
++    }
++
++    private static void QueueInOrder(TunnelReorderBuffer buf)
++    {
+         while (buf.Pending.TryGetValue(buf.NextSeq, out var pkt))
+         {
+             buf.Pending.Remove(buf.NextSeq);
+-            outp.Add((key, pkt));
++            if (buf.Deliver != null) buf.Ready.Enqueue(buf.Deliver, pkt);
+             buf.NextSeq++;
+             buf.LastDelivery = DateTime.UtcNow;
+         }
+-        return outp;
+     }
+ 
+     // T180: AS_ENTER_WORLD uses our gameId as its opaque Arbiter User handle. Real captures
+@@ -706,12 +716,10 @@
+     /// </summary>
+     private void DeliverTunnelPacket(int worldId, uint ticket, uint seq, byte[] clientPkt)
+     {
+-        List<((int World, uint Ticket) k, byte[] p)>? deliver = null;
+-        lock (_reorderLock)
+-        {
+-            // T161: a departed Ticket's frames never enter the survivor's buffer - their sequence
+-            // numbers are not the survivor's (cap_queue1: "expected 1362, have 2730").
+-            TunnelReorderBuffer? buf = null;
++        TunnelReorderBuffer? buf = null;
++        lock (_reorderLock)
++        {
++            // T161: a departed ticket must never borrow the remaining player's sequence.
+             _tunnels.TryGetValue((worldId, ticket), out var own);
+             switch (TunnelRouting.Decide(own != null, _departed.Contains(worldId, ticket), _tunnels.Count))
+             {
+@@ -721,10 +729,10 @@
+             if (buf != null)
+             {
+                 buf.Pending[seq] = clientPkt;
+-                deliver = DrainInOrder((worldId, ticket), buf);
+-            }
+-        }
+-        if (deliver != null) { foreach (var (k, p) in deliver) RouteToClient(k.World, k.Ticket, p); return; }
++                QueueInOrder(buf);
++            }
++        }
++        if (buf != null) { buf.Ready.Drain(); return; }
+         RouteToClient(worldId, ticket, clientPkt);   // logs + drops with 2+ sessions
+     }
+ 

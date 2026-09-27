@@ -146,8 +146,8 @@ public static class ItemNames
     private static IEnumerable<string> Candidates(string? dataRoot)
     {
         // The explicit ones win, then the client's own strsheet, then a hand-made TSV.
-        yield return Environment.GetEnvironmentVariable(StrSheetVariable) ?? string.Empty;
-        yield return Environment.GetEnvironmentVariable(PathVariable) ?? string.Empty;
+        yield return TerasConfig.Get(StrSheetVariable) ?? string.Empty;
+        yield return TerasConfig.Get(PathVariable) ?? string.Empty;
         if (!string.IsNullOrWhiteSpace(dataRoot))
         {
             // Both sheets: they cover different id ranges and neither is a superset.

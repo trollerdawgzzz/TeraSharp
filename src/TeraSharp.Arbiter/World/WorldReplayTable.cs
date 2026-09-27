@@ -46,13 +46,13 @@ public sealed class WorldReplayTable
     /// thing that emits SA_LEAVE_WORLD - waits forever (status/HANDOFF.md section 1).
     /// That is exactly what 0x143F -> 0x290D did.
     ///
-    /// Measured against <captures>\arb_world.log (the file the table is loaded from): this set
+    /// Measured against D:\packetlogs\arb_world.log (the file the table is loaded from): this set
     /// removes 8 request entries that had ZERO responses - 0x13AA 0x13CC 0x13FA 0x1436 0x15A8
     /// 0x15B5 0x1626 0x164D, pure "no replay for" noise - and strips three frames that the
     /// heartbeats had let 0x27B3 inherit (0x15FB, 0x1449 and, worst, 0x14FF AS_USER_REQUEST_EXIT).
     /// No legitimate request -> response mapping is lost.
     ///
-    /// Names from <captures>\world_opcodes.txt and the opcode switch in WorldServer.exe.c.
+    /// Names from D:\packetlogs\world_opcodes.txt and the opcode switch in WorldServer.exe.c.
     /// SA_BYPASS_TO_CLIENT (0x13F7) is deliberately NOT here: it is the tunnel, it interleaves
     /// constantly, and sealing on it would break every attribution.
     /// </summary>
@@ -114,6 +114,7 @@ public sealed class WorldReplayTable
         0x13AA, // SA_DEL_FROM_INTER_PARTY_MATCH_POOL
         0x13F2, // DSA_DUNGEON_TIMELINE_OPEN_INFO      (periodic heartbeat)
         0x13E5, // BSA_REQUEST_BOUNTY_HUNT_SEASON_INFO (periodic heartbeat)
+        // T201 0x13E8 is explicitly consumed by DbProxyHandlers, like the reply-less handlers below; never seal it too.
         0x164D, // SA_WORLD_SERVER_STATUS              (periodic)
 
         // --- T74: the two audit-log writes. Both are fire-and-forget: Handler_SDB_ITEM_TRADE_LOG
@@ -139,7 +140,7 @@ public sealed class WorldReplayTable
         0x28B8, // SDB_PUBLISH_INVITE_CODE  - `UserDbId@06`, nothing else
         0x14CE, // SA_DARK_RIFT_EVENT_OPEN  - five i32s of event config
 
-        // --- T15: proven one-way in <captures>\cap_newchar.log (a real ArbiterServer
+        // --- T15: proven one-way in D:\packetlogs\cap_newchar.log (a real ArbiterServer
         // playing for five minutes). Each was checked frame by frame: no A->W frame follows
         // any occurrence, and the Arbiter's handler has no SendToSession at all. ---
         0x2927, // SDB_CANCEL_NPC_ARENA_BET  - 5 occurrences (the logout-countdown ticks),

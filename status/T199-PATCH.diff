@@ -1,0 +1,78 @@
+--- a/src/TeraSharp.Arbiter/World/WorldBridge.cs
++++ b/src/TeraSharp.Arbiter/World/WorldBridge.cs
+@@ -117,6 +117,8 @@
+     /// </summary>
+     private readonly Dictionary<ulong, GameSession> _players = new();
+     private readonly object _playersLock = new();
++    private readonly BattlefieldCreation _battlefieldCreation = new(); // T199: BF protocol creation/log state
++    private readonly BattlefieldHandoff _battlefield = new(); // T199: pending BG offers and native return path
+     private readonly CrossWorldHandoff _crossWorld = new();   // T192: live enter data + type-2 continuation
+ 
+     /// <summary>Allocate a unique tunnel Ticket for a new player session.</summary>
+@@ -144,7 +146,7 @@
+         => UnregisterPlayer(gameId, WorldRegistration.DefaultWorldId, tunnelKey);
+ 
+     /// <summary>T111: the Ticket is freed in its own World's space and unkeyed with it.</summary>
+-    public void UnregisterPlayer(ulong gameId, int worldId, uint tunnelKey)
++    public void UnregisterPlayer(ulong gameId, int worldId, uint tunnelKey, bool transferring = false)
+     {
+         lock (_playersLock)
+         {
+@@ -153,6 +155,7 @@
+         }
+         DbProxy?.UserControls.Forget(gameId);   // T180: User-owned hold/departure lifetime
+         _crossWorld.Forget(gameId);   // T192: a disconnected session must not finish an old transfer
++        if (!transferring) _battlefield.ForgetUser(gameId); // T199: preserve BG state only across type2
+         lock (_reorderLock)
+         {
+             if (_tunnels.Remove((worldId, tunnelKey), out var old)) old.Ready.Retire();
+@@ -283,6 +286,7 @@
+             _departed.Clear();   // T161: World restarted - its ticket table went with it
+         }
+         _crossWorld.Clear();
++        _battlefield.Clear();
+         CharacterTransientState.ResetWorldSessions(this);   // T192: same lifetime as the World process
+     }
+ 
+@@ -301,6 +305,7 @@
+             _departed.ClearWorld(worldId);
+         }
+         _crossWorld.ForgetWorld(worldId);
++        _battlefield.ForgetWorld(worldId);
+         int reset = CharacterTransientState.ResetWorldSessions(this, worldId);
+         if (reset != 0) _log.LogWarning("World {W} disconnected - reset transient state for {N} character(s)", worldId, reset);
+     }
+@@ -430,6 +435,7 @@
+         while (!ct.IsCancellationRequested)
+         {
+             await Task.Delay(50, ct);
++            _battlefield.Tick(this, DateTimeOffset.UtcNow);
+             DbProxy?.UserControls.Tick(DateTimeOffset.UtcNow, ResolveControlUser, HasLinks,
+                 send => SendFrame(send.WorldId, send.Opcode, send.Payload));
+             FlushStalledTunnels(DateTime.UtcNow);
+@@ -493,6 +499,8 @@
+ 
+     public void HandleFrame(WorldLink link, ushort op, byte[] payload)
+     {
++        if (_battlefieldCreation.TryHandle(link, Program.Store, op, payload)) return;
++        if (_battlefield.TryHandle(this, link, _crossWorld, Program.Store, op, payload, DateTimeOffset.UtcNow)) return;
+         // T180: consume these before DbProxy/replay. Replies go to the owning/target World,
+         // including same-World cases; no same-link fallback for an unknown handle or owner.
+         if (DbProxy?.UserControls.TryHandle(op, payload, ResolveControlUser, DungeonRouting.Channels,
+@@ -903,7 +911,7 @@
+                 // LeaveWorldEnd commits the destination before owner138E/2711; preserve login
+                 // account/session fields and update only the captured transfer fields.
+                 DbProxy?.CommitTeleportLocation((int)session.PlayerId, transfer.Move, transfer.DestinationWorld);
+-                UnregisterPlayer(session.GameId, session.CurrentWorldId, session.TunnelKey);
++                UnregisterPlayer(session.GameId, session.CurrentWorldId, session.TunnelKey, transferring: true);
+                 session.CurrentWorldId = transfer.DestinationWorld;
+                 session.TunnelKey = AllocateTunnelKey(session.CurrentWorldId);
+                 RegisterPlayer(session);
+@@ -916,6 +924,7 @@
+                 BitConverter.GetBytes((ulong)(party?.Id ?? 0)).CopyTo(enter, 94);
+                 enter[102] = party?.IsSys == true ? (byte)1 : (byte)0;
+                 SendFrame(session.CurrentWorldId, OpPlayerEnter, enter);
++                _battlefield.CompleteTransfer(session.PlayerId, session.CurrentWorldId);
+                 _log.LogInformation("Transferred player {Pid} from World {From} to {To} ({Continent}/{Channel})",
+                     session.PlayerId, link.WorldId, session.CurrentWorldId, transfer.Move.Continent, transfer.Move.Channel);
+                 return;

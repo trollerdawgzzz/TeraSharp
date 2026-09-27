@@ -92,7 +92,7 @@ public static class AuthProviders
     public static IAuthProvider FromEnvironment(ILogger log)
     {
         ArgumentNullException.ThrowIfNull(log);
-        bool enabled = EnabledFromEnvironment(Environment.GetEnvironmentVariable(EnableVariable));
+        bool enabled = EnabledFromEnvironment(TerasConfig.Get(EnableVariable));
         if (!enabled)
         {
             // T113: say it loudly, and say it here rather than in Program, so it is true
@@ -104,7 +104,7 @@ public static class AuthProviders
                 EnableVariable);
             return new AcceptAllAuthProvider();
         }
-        string url = Environment.GetEnvironmentVariable(UrlVariable) ?? DefaultUrl;
+        string url = TerasConfig.Get(UrlVariable) ?? DefaultUrl;
         log.LogInformation(
             "auth: tera-api at {Url}{Endpoint} - fail closed (a timeout, a non-200 or an "
             + "unparseable body all reject the login)",
@@ -118,9 +118,9 @@ public static class AuthProviders
     /// </summary>
     public static string DescribeMode()
     {
-        bool enabled = EnabledFromEnvironment(Environment.GetEnvironmentVariable(EnableVariable));
+        bool enabled = EnabledFromEnvironment(TerasConfig.Get(EnableVariable));
         if (!enabled) return "OPEN - every login accepted (" + EnableVariable + " is not true)";
-        string url = (Environment.GetEnvironmentVariable(UrlVariable) ?? DefaultUrl).TrimEnd('/');
+        string url = (TerasConfig.Get(UrlVariable) ?? DefaultUrl).TrimEnd('/');
         return "tera-api " + url + TeraApiAuthProvider.Endpoint + " (fail closed)";
     }
 

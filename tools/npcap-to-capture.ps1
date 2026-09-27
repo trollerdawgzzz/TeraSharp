@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 the TeraSharp contributors
+
 <#
 .SYNOPSIS
     Convert a Noctenium .npcap client capture into the text format
@@ -53,8 +54,8 @@
     Protocol map key. Default 376012 (this build).
 
 .EXAMPLE
-    .\npcap-to-capture.ps1 -Npcap <captures>\classic_live.npcap
-    .\reframe-client.ps1   -Log   <captures>\classic_live.log
+    .\npcap-to-capture.ps1 -Npcap D:\packetlogs\classic_live.npcap
+    .\reframe-client.ps1   -Log   D:\packetlogs\classic_live.log
 
 .NOTES
     Runs on Windows PowerShell 5.1 as well as pwsh 7: no ternary, no ?? and no calculated

@@ -407,7 +407,7 @@ public static class DungeonRouting
 /// <see cref="WorldServerList.SeedDefault"/> seeds from config. Live data wins because it arrives
 /// later; config is the fallback for a World that never sends one.
 ///
-/// <para>Layout, pinned against <captures>\cap_multiworld3.log (T137c). Payload-relative:</para>
+/// <para>Layout, pinned against D:\packetlogs\cap_multiworld3.log (T137c). Payload-relative:</para>
 /// <code>
 ///   0   i32 count / 4 i32 unk (22 in every captured frame) / 8 i32 planetId / 12 i32 worldId
 ///   16  count x 16 B:  i32 minLevel / i32 maxLevel / i32 continentId / i32 unk
@@ -490,11 +490,25 @@ public static class WorldContinentList
 ///   W->A 0x2711  on the MAIN link       re-entry, channel 0
 /// </code>
 /// <para>Both replies are near-copies, which is what makes this implementable without knowing
-/// what the 200-odd bytes mean: 0x13BF is 8 fixed bytes plus the whole of 0x13BE from offset 8
+/// what the 200-odd bytes mean: 0x13BF is the resolved user's PDId plus 0x13BE from offset 8
 /// on (verified on all three captured entries), and 0x13C1 is 0x13C0 byte for byte, 208 B.</para>
 /// </summary>
 public static class ContinentHandoff
 {
+    public const ushort SA_REQUEST_LEAVE_DUNGEON = 0x13C2;
+    public const ushort AS_REQUEST_LEAVE_DUNGEON = 0x13C3;
+
+    /// <summary>T180: [PDId][continent], Arb_part_062.c:13016-13099; multiworld 12834,
+    /// multiworld3 8165/8321. PDId comes from the resolved User, not the request pointer.</summary>
+    public static byte[] LeaveReply(uint planetId, uint userDbId, int continent)
+    {
+        var payload = new byte[12];
+        BitConverter.TryWriteBytes(payload.AsSpan(0, 4), planetId);
+        BitConverter.TryWriteBytes(payload.AsSpan(4, 4), userDbId);
+        BitConverter.TryWriteBytes(payload.AsSpan(8, 4), continent);
+        return payload;
+    }
+
     /// <summary>Main World -> Arbiter: a player wants a continent somebody else may own.</summary>
     public const ushort SA_REQUEST_ENTER_CONTINENT = 0x13BE;
 
@@ -514,12 +528,12 @@ public static class ContinentHandoff
     public const int MinPayload = 12;
 
     /// <summary>
-    /// What 0x13BF carries where the request carried a session handle: planet 2800, then 1.
-    /// Identical in all three captured entries. The 1 is NOT the destination world id (that is 13
-    /// in the same capture), so it is copied as the observed constant rather than computed from
-    /// something we would be guessing at.
+    /// T192: the prefix is [planetId][UserDbId], resolved from the opaque request handle.
+    /// Arb_part_062.c:12947 writes User+0x120, not a constant or the destination World id.
+    /// cap_multiworld3 used user 1; cap_2man also captures user 1003. Replaying user 1 for
+    /// handoff1's user 10 makes World echo a 0x13C0/0x13C1 for the wrong character.
     /// </summary>
-    public static readonly byte[] EnterReplyPrefix = { 0xF0, 0x0A, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00 };
+    public const int UserDbIdOffset = 4;
 
     /// <summary>The continent a 0x13BE names - it decides which link gets the reply.</summary>
     public static int? ContinentOf(byte[]? request)
@@ -529,11 +543,12 @@ public static class ContinentHandoff
     /// 0x13BE -> 0x13BF. Swap the handle, copy everything else verbatim - destination continent,
     /// spawn coordinates and all. Null for a payload too short to hold the prefix.
     /// </summary>
-    public static byte[]? EnterReply(byte[]? request)
+    public static byte[]? EnterReply(byte[]? request, uint planetId, uint userDbId)
     {
-        if (request == null || request.Length < HandleSize) return null;
+        if (request == null || request.Length < HandleSize || userDbId == 0) return null;
         var reply = new byte[request.Length];
-        EnterReplyPrefix.CopyTo(reply, 0);
+        BitConverter.TryWriteBytes(reply.AsSpan(0, 4), planetId);
+        BitConverter.TryWriteBytes(reply.AsSpan(UserDbIdOffset, 4), userDbId);
         Array.Copy(request, HandleSize, reply, HandleSize, request.Length - HandleSize);
         return reply;
     }

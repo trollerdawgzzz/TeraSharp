@@ -55,7 +55,7 @@ public readonly record struct ClientAction(
 
     public bool IsRaw => RawPacket != null;
 
-    /// <summary>Parties address clients by tunnel ticket - GameSession.TunnelKey.</summary>
+    /// <summary>Internal recipient token; live PartyWiring uses the stable character id.</summary>
     public Recipient To => Recipient.Ticket(Ticket);
 
     /// <summary>Always null: a party's raw packets come from World already framed.</summary>
@@ -143,8 +143,11 @@ public sealed class Party
     public PartyPackets.LootSettings Loot { get; set; } = DefaultLoot;
     public PartyPackets.PartyMember?[] Slots { get; } = new PartyPackets.PartyMember?[SlotCount];
 
-    /// <summary>Party::Party sets this to 5, or 0x1e when the party is a raid.</summary>
-    public int MaxMembers => Raid ? PartyPackets.MaxRaidMembers : PartyPackets.MaxPartyMembers;
+    /// <summary>System party capacity comes from MA_FIN's RoleData.totalUser:
+    /// MatchServer:218076,233269-233341; Arb067:2210-2216 overrides ordinary 5/30.</summary>
+    public int? MatchedMemberLimit { get; init; }
+    public int MaxMembers => MatchedMemberLimit ?? (Raid ? PartyPackets.MaxRaidMembers : PartyPackets.MaxPartyMembers);
+    public string[] RaidPartyNames { get; } = DatasheetLoader.RaidPartyNames.Value.ToArray();
     public int Count { get { int n = 0; foreach (var s in Slots) if (s != null) n++; return n; } }
 
     /// <summary>
@@ -202,9 +205,10 @@ public sealed class PartyManager
 
     /// <summary>
     /// PartyId = ((PlanetId &lt;&lt; 16 | PlanetInnerId) &lt;&lt; 32) | ++counter
-    /// (PartyManager::New_CreateParty, Arb_part_079.c:15283): the high dword is the PlanetId
-    /// shifted left 16 and ORed with the u16 at PartyManager+0x70; the low dword is a
-    /// lock-protected counter, read and incremented under LOCK and used as counter + 1.
+    /// (PartyManager::New_CreateParty, Arb_part_079.c:15283):
+    /// the high dword is PlanetId shifted left 0x10, ORed with the u16 PlanetInnerId at
+    /// manager+0x70; the low dword is the manager's counter, fetched and incremented under
+    /// LOCK/UNLOCK and used as old + 1.
     /// With PlanetId 2800 the high dword is 0x0AF00001, so the first id is 0x0AF0000100000001.
     /// The counter is process-lifetime on the real server and nothing detects a duplicate, so if
     /// party ids ever need to survive a restart, persist or randomise the seed
@@ -220,15 +224,31 @@ public sealed class PartyManager
     // ---- who is online ----
 
     /// <summary>
-    /// What the routing layer knows about a logged-in character. Ticket is the tunnel Ticket
-    /// (MULTIPLAYER-DESIGN.md section 1) - the manager never sees a GameSession.
+    /// What the routing layer knows about a logged-in character. Ticket is an internal
+    /// recipient token (the live character id), never a per-World wire bypass ticket.
     /// </summary>
     public readonly record struct PartyPlayer(
         uint Ticket, int UserDbId, string Name, int Level, int Class, int Race, int Gender,
-        ulong GameId, int Laurel = 0, int AwakenGrade = 0);
+        ulong GameId, int Laurel = 0, int AwakenGrade = 0, int WorldId = 0,
+        bool Online = true, bool QaDummy = false);
 
     private readonly Dictionary<uint, PartyPlayer> _byTicket = new();
     private readonly Dictionary<int, uint> _ticketByDbId = new();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<int, float> _itemLevels = new();
+
+    /// <summary>Latest authoritative SA_EQUIP_ITEM_LEVEL; zero until World reports one.</summary>
+    public float TrueItemLevelFor(int userDbId) => _itemLevels.GetValueOrDefault(userDbId);
+
+    /// <summary>Arb066:2810-2817 resolves the opaque handle; Arb062:6733 reads full+0x0E.
+    /// cap_2man raw184/695 pin the two players' actual item levels; there is no reply.</summary>
+    internal bool ObserveEquipItemLevel(byte[] payload, Func<ulong, int?> resolveUser)
+    {
+        if (payload.Length < 12) return false;
+        int? id = resolveUser(BitConverter.ToUInt64(payload, 0));
+        if (id is not > 0) return false;
+        _itemLevels[id.Value] = BitConverter.ToSingle(payload, 8);
+        return true;
+    }
 
     public void Register(PartyPlayer p)
     {
@@ -257,6 +277,7 @@ public sealed class PartyManager
         var a = new PartyActions();
         if (!_byTicket.Remove(ticket, out var p)) return a;
         _ticketByDbId.Remove(p.UserDbId);
+        _itemLevels.TryRemove(p.UserDbId, out _);
         _applications.RemoveWhere(x => x.applicant == p.UserDbId || x.target == p.UserDbId);
 
         if (_normalByMember.TryGetValue(p.UserDbId, out var normal)) SetOnline(normal, p.UserDbId, false);   // T163
@@ -329,11 +350,15 @@ public sealed class PartyManager
     /// <summary>Pending "I applied to join your party" edges, applicant -> target.</summary>
     private readonly HashSet<(int applicant, int target)> _applications = new();
     public bool HasApplication(int applicant, int target) => _applications.Contains((applicant, target));
+    internal IReadOnlyList<PartyPlayer> CandidatesFor(int target) => _applications.Where(a => a.target == target)
+        .OrderBy(a => a.applicant).Select(a => _ticketByDbId.TryGetValue(a.applicant, out uint ticket)
+            && _byTicket.TryGetValue(ticket, out var player) ? (PartyPlayer?)player : null)
+        .Where(p => p.HasValue).Take(200).Select(p => p!.Value).ToArray();
 
     private PartyPackets.PartyMember MemberOf(in PartyPlayer p, bool canInvite) => new(
         PlanetId: PlanetId, UserDbId: p.UserDbId, GameId: p.GameId, Level: p.Level, Class: p.Class,
         Race: p.Race, Gender: p.Gender, Role: -1, Name: p.Name, CanInvite: canInvite,
-        Alive: true, Online: true, AchievementGrade: p.Laurel, AwakenGrade: p.AwakenGrade);
+        Alive: true, Online: p.Online, AchievementGrade: p.Laurel, AwakenGrade: p.AwakenGrade);
 
     // =========================================================================================
     // Client -> Arbiter
@@ -350,6 +375,7 @@ public sealed class PartyManager
             case PartyPackets.C_APPLY_PARTY: return ApplyParty(a, me, body);
             case C_PARTY_APPLICATION_DENIED: return DenyApplication(a, me, body);
             case PartyPackets.C_DISMISS_PARTY: return DismissParty(a, me);
+            case PartyPackets.C_RESET_ALL_DUNGEON: return ResetAllDungeon(a, me);
             case PartyPackets.C_PARTY_LOOTING_METHOD: return RequestLootingMethod(a, me, body);
             case PartyPackets.C_BAN_PARTY_MEMBER: return RequestBan(a, me, body);
             case PartyPackets.C_MERGE_PARTY_TO_RAID: return MergeToRaid(a, me, body);
@@ -360,6 +386,38 @@ public sealed class PartyManager
     /// <summary>C_PARTY_APPLICATION_DENIED (0x4F00): [u32 pid]. Not in PartyPackets because T28
     /// only covered the seven the task named.</summary>
     public const ushort C_PARTY_APPLICATION_DENIED = 0x4F00;
+
+    /// <summary>T184f. Arb_part_041.c:10049-10118: leader-only, with a strict majority
+    /// of online members in the caller's World. World owns the vote and port-out.</summary>
+    private PartyActions ResetAllDungeon(PartyActions a, in PartyPlayer me)
+    {
+        var party = FindByMember(me.UserDbId);
+        int online = 0;
+        if (party != null)
+        {
+            if (!party.IsManager(me.UserDbId))
+            {
+                a.Client(ClientAction.Raw(me.Ticket, DbProxyHandlers.BuildSystemMessage("@4393")));
+                return a;
+            }
+            online = OnlineCount(party);
+            int sameWorld = 0;
+            foreach (var (ticket, member) in OnlineMembersOf(party))
+                if (_byTicket.TryGetValue(ticket, out var p)
+                    && (me.WorldId == 0 ? member.PlanetId == PlanetId : p.WorldId == me.WorldId))
+                    sameWorld++;
+            // Party::IsSameWorldPartyMember (Arb_part_067.c:7706 onward) uses the
+            // member's planet when WorldId is zero, otherwise the concrete WorldId.
+            if (online - sameWorld >= sameWorld)
+            {
+                a.Client(ClientAction.Raw(me.Ticket, DbProxyHandlers.BuildSystemMessage("@2660")));
+                return a;
+            }
+        }
+        a.World(PartyPackets.AS_RESET_ALL_DUNGEON, PartyPackets.BuildAsResetAllDungeon(
+            PlanetId, me.UserDbId, party?.Id ?? 0, party?.IsSys ?? false, online));
+        return a;
+    }
 
     /// <summary>
     /// C_APPLY_PARTY (0xA889) - "let me into the party you have listed". Handler FUN_1404db920
@@ -563,8 +621,20 @@ public sealed class PartyManager
     /// <summary>
     /// The half both join paths share: create-or-extend, then the AS_ mirror World needs.
     /// </summary>
+    /// <summary>T201: Arb040:12533-12876 calls the same party transaction directly.
+    /// cap_bg1:11887/11971 pins QA party type-1 and zero invitation authority.</summary>
+    internal PartyActions JoinForQa(PartyPlayer inviter, PartyPlayer invitee, bool raid)
+    {
+        var a = new PartyActions();
+        if (inviter.UserDbId == invitee.UserDbId || FindByMember(invitee.UserDbId) != null)
+            return a.Reject("invitee is already in a party or is the inviter");
+        if (FindByMember(inviter.UserDbId) is { } party && (party.IsSys || party.Count >= party.MaxMembers))
+            return a.Reject("inviter's party is full or is a system party");
+        return JoinCore(a, inviter, invitee, raid, false, -1, qa: true);
+    }
+
     private PartyActions JoinCore(PartyActions a, PartyPlayer inviter, PartyPlayer invitee,
-        bool raid, bool isAnonymous, int partyType)
+        bool raid, bool isAnonymous, int partyType, bool qa = false)
     {
         var party = FindByMember(inviter.UserDbId);
         if (party == null)
@@ -576,11 +646,14 @@ public sealed class PartyManager
             _byId[party.Id] = party;
             AddMember(a, party, inviter);
             if (!AddMember(a, party, invitee)) return a.Reject("SA_JOIN_PARTY: new party is full");
+            if (qa)
+                for (int i = 0; i < party.Slots.Length; i++)
+                    if (party.Slots[i] is { } member) party.Slots[i] = member with { CanInvite = false };
 
             // The mirror World needs for loot/exp/instances: the whole member list at once.
             a.World(PartyPackets.AS_DO_CREATE_PARTY, PartyPackets.BuildDoCreateParty(
                 party.Id, party.OwnerPlanetId, party.ManagerPlanetId, party.ManagerDbId,
-                party.MaxMembers, party.PartyType, dungeonClearCompensation: false, dungeonId: 0,
+                party.MaxMembers, party.PartyType, dungeonClearCompensation: false, dungeonId: qa ? -1 : 0,
                 raid: party.Raid, teamIndex: 0, battleFieldId: 0,
                 members: party.Members().ToList()));
 
@@ -620,7 +693,10 @@ public sealed class PartyManager
     /// One member of a formed match: who, and which POSITION they were matched into.
     /// <paramref name="Role"/> is what S_SYS_PARTY_INFO carries per slot.
     /// </summary>
-    public readonly record struct MatchedMember(int UserDbId, MatchRole Role);
+    public readonly record struct MatchedMember(int UserDbId, MatchRole Role,
+        float TrueItemLevel = 0, int CountOfDungeonClear = 0, int WinRate = 0,
+        int WinCount = 0, int BattleFieldScore = 0, bool SupplementCompensation = false,
+        bool IsSoloMatching = false);
 
     /// <summary>
     /// T138d. The matcher put these characters together - make them a party.
@@ -686,12 +762,18 @@ public sealed class PartyManager
             // `party+0x94 == 0`; cap_queue1 3312 carries 0), never the normal party's -1.
             PartyType = 0,
             IsSys = true,
+            Loot = DatasheetLoader.PartyLootDefaults.Value[0],
             DungeonId = dungeonId,
+            MatchedMemberLimit = DungeonMatchRules.For(dungeonId)?.Total,
             // Handler_MA_FIN_PARTY_MATCH: SetWithdrawalPenalty(true) only on the dungeon branch.
             WithdrawalPenalty = dungeonId > 0 && battleFieldId == 0,
         };
         party.ManagerDbId = known[0].M.UserDbId;
         _byId[party.Id] = party;
+
+        // New_CreateParty seats members in order. Each addition broadcasts its new list:
+        // cap_2man first pop gives New a one-member list, then both get the two-member list.
+        var rosterActions = new PartyActions();
 
         foreach (var (m, p) in known)
         {
@@ -704,6 +786,15 @@ public sealed class PartyManager
                 a.Client(ClientAction.Def(p.Ticket, "S_LEAVE_PARTY", new Dictionary<string, object>()));
             }
             AddMember(a, party, p);
+            int slot = party.IndexOf(m.UserDbId);
+            party.Slots[slot] = party.Slots[slot]!.Value with
+            {
+                Role = (int)m.Role, TrueItemLevel = m.TrueItemLevel,
+                CountOfDungeonClear = m.CountOfDungeonClear, WinRate = m.WinRate,
+                WinCount = m.WinCount, BattleFieldScore = m.BattleFieldScore,
+                SupplementCompensation = m.SupplementCompensation, IsSoloMatching = m.IsSoloMatching,
+            };
+            BroadcastMemberList(rosterActions, party);
         }
 
         if (party.Count < 2)
@@ -715,19 +806,18 @@ public sealed class PartyManager
 
         a.World(PartyPackets.AS_DO_CREATE_PARTY, PartyPackets.BuildDoCreateParty(
             party.Id, party.OwnerPlanetId, party.ManagerPlanetId, party.ManagerDbId,
-            party.MaxMembers, party.PartyType, dungeonClearCompensation: false,
+            // MatchServer's MA_FIN writer always sets this byte to one (257253),
+            // including its battlefield caller. Arb069:9743 -> Party+0x98 -> AS_CREATE.
+            party.MaxMembers, party.PartyType, dungeonClearCompensation: true,
             dungeonId: dungeonId, raid: party.Raid, teamIndex: teamIndex,
             battleFieldId: battleFieldId, members: party.Members().ToList()));
-        // The same two-per-member mirror JoinCore sends: matching is over, and World will not
-        // refresh its party UI without the second one (T64, cap_social.log seq 748 -> 751..753).
-        foreach (var m in party.Members())
-            a.World(PartyPackets.AS_CHANGE_EVENT_MATCHING_STATE,
-                PartyPackets.BuildAsChangeEventMatchingState(m.UserDbId, isMatching: false));
+        // cap_2man 1921 create, 1922 refreshes, then client rosters and both matching
+        // clear phases below. Normal-party JoinCore has its own separate mirror sequence.
         foreach (var m in party.Members())
             a.World(PartyPackets.AS_REQUEST_REFRESH_PARTY_INFO,
                 PartyPackets.BuildAsRequestRefreshPartyInfo(m.UserDbId));
 
-        BroadcastMemberList(a, party);
+        foreach (var packet in rosterActions.ToClients) a.Client(packet);
         BroadcastSysPartyInfo(a, party, known, matchFrames);
 
         _log.LogInformation(
@@ -750,13 +840,31 @@ public sealed class PartyManager
         foreach (var (m, _) in known) roles[m.UserDbId] = (int)m.Role;
 
         var frame = SysPartyInfoFrame(party, roles);
+        int finIndex = 0;
+        if (matchFrames != null)
+        {
+            finIndex = matchFrames.Count;
+            for (int i = 0; i < matchFrames.Count; i++)
+                if (matchFrames[i].Length >= 4 && BitConverter.ToUInt16(matchFrames[i], 2)
+                    == MatchQueueManager.S_FIN_INTER_PARTY_MATCH) { finIndex = i; break; }
+        }
+        // First phase clears every member's full event lists and updates World:
+        // Arb079:3245-3249 -> Arb077:6149-6152. cap_2man 1924/1928 first two 15CDs.
         foreach (var (t, m) in OnlineMembersOf(party))
         {
-            // T161: the matched members' state pair + FIN go here, per member and ahead of
-            // that member's S_SYS_PARTY_INFO. A seed-party member who was not in this match
-            // gets no FIN - there is no window for them to answer.
             if (matchFrames != null && roles.ContainsKey(m.UserDbId))
-                foreach (var f in matchFrames) a.Client(ClientAction.Raw(t, f));
+                for (int i = 0; i < finIndex; i++) a.Client(ClientAction.Raw(t, matchFrames[i]));
+            a.World(PartyPackets.AS_CHANGE_EVENT_MATCHING_STATE,
+                PartyPackets.BuildAsChangeEventMatchingState(m.UserDbId, isMatching: false));
+        }
+        foreach (var (t, m) in OnlineMembersOf(party))
+        {
+            // Second phase explicitly clears World's state again before FIN/SYS:
+            // Arb079:3257-3334; cap_2man record1928 ends with these two 15CDs.
+            a.World(PartyPackets.AS_CHANGE_EVENT_MATCHING_STATE,
+                PartyPackets.BuildAsChangeEventMatchingState(m.UserDbId, isMatching: false));
+            if (matchFrames != null && roles.ContainsKey(m.UserDbId))
+                for (int i = finIndex; i < matchFrames.Count; i++) a.Client(ClientAction.Raw(t, matchFrames[i]));
             a.Client(ClientAction.Raw(t, frame));
         }
     }
@@ -765,10 +873,14 @@ public sealed class PartyManager
     /// matched position from <paramref name="roles"/>, -1 for anyone without one.</summary>
     private static byte[] SysPartyInfoFrame(Party party, IReadOnlyDictionary<int, int> roles)
     {
-        var slots = new List<PartyPackets.SysPartySlot>(party.Count);
-        foreach (var m in party.Members())
-            slots.Add(new PartyPackets.SysPartySlot(
-                m.PlanetId, m.UserDbId, roles.TryGetValue(m.UserDbId, out int r) ? r : -1));
+        // Arb_part_079:3223-3243 walks all 30 physical slots, including holes. Every
+        // recipient receives this same order; neither the recipient nor the role sorts it.
+        var slots = new List<PartyPackets.SysPartySlot>(Party.SlotCount);
+        foreach (var slot in party.Slots)
+            slots.Add(slot is { } m
+                ? new PartyPackets.SysPartySlot(m.PlanetId, m.UserDbId,
+                    roles.TryGetValue(m.UserDbId, out int r) ? r : -1)
+                : PartyPackets.EmptySysPartySlot);
         return PartyPackets.BuildSysPartyInfo(slots);
     }
 
@@ -803,17 +915,20 @@ public sealed class PartyManager
         RemoveMember(a, party, l.Value.MemberDbId, tellLeaver: true);
         a.World(PartyPackets.AS_DO_REMOVE_PARTY_MEMBER,
             PartyPackets.BuildDoRemovePartyMember(party.Id, PlanetId, l.Value.MemberDbId));
+        RestoreNormalParty(a, l.Value.MemberDbId);
+        FinishAfterRemoval(a, party);
         if (penalty)
         {
             // The dropout debuff is World's (abnormality DungeonMatching.xml withdrawalAbnormalityId,
-            // 999994 / 180 s here) - applied on this frame, FUN_1409752e0 -> FUN_140982610.
+            // 999994 / 900000 ms in cap_2man_b_client2:4672) - applied on this frame,
+            // FUN_1409752e0 -> FUN_140982610. Its duration is World data, not Arbiter policy.
+            // The leave job follows party teardown: cap_2man_b:19038/39 remove,
+            // 19048/49 dismiss, then19061 withdrawal to the departing user's World13.
             a.World(PartyPackets.AS_NOTIFY_ABOUT_SYS_PARTY_WITHDRAWAL,
                 PartyPackets.BuildAsNotifyAboutSysPartyWithdrawal(PlanetId, l.Value.MemberDbId));
             _log.LogInformation("Party 0x{Id:X}: {M} left dungeon {D} before the clear - dropout penalty",
                 party.Id, l.Value.MemberDbId, party.DungeonId);
         }
-        RestoreNormalParty(a, l.Value.MemberDbId);
-        FinishAfterRemoval(a, party);
         return a;
     }
 
@@ -853,7 +968,10 @@ public sealed class PartyManager
         if (!_byId.ContainsKey(normal.Id) || normal.IndexOf(userDbId) < 0) return;   // it went while they were away
         _byMember[userDbId] = normal;
         if (_ticketByDbId.TryGetValue(userDbId, out uint t))
+        {
             a.Client(ClientAction.Def(t, "S_PARTY_MEMBER_LIST", MemberListFields(normal)));
+            a.Client(ClientAction.Raw(t, PartyPackets.BuildPartyNameList(normal.RaidPartyNames)));
+        }
         _log.LogInformation("Party 0x{Id:X}: {M} is back from the matched party", normal.Id, userDbId);
     }
 
@@ -966,8 +1084,10 @@ public sealed class PartyManager
     /// fan it out to a party, because the Arbiter owns the member list.
     /// Handler FUN_140721360 (Arb_part_062.c:3820) -> PartyManager::BroadcastPacketToParty
     /// (FUN_14090ed50) -> Party::BroadcastPacket (FUN_1407b71e0, Arb_part_067.c:4370), which
-    /// walks the 30 slots and unicasts to every member whose UserDbId is non-zero and whose
-    /// PlanetId is this Arbiter's, skipping the originator unless GroupType == 1.
+    /// walks the 30 slots and unicasts to each member's ClientSession: it sends only where the
+    /// slot's UserDbId is non-zero and the slot's PlanetId equals this process's PlanetId,
+    /// with the originator skipped unless GroupType == 1 - for any other GroupType the slot whose
+    /// PlanetId and UserDbId both equal the originator's is passed over.
     /// The PlanetId guard means members on another planet are not unicast here - with one planet
     /// it is always true, but the check is kept so the behaviour is the real one.
     /// </summary>
@@ -1010,7 +1130,7 @@ public sealed class PartyManager
         if (party.IndexOf(p.UserDbId) >= 0) return true;
         int slot = party.FindEmptySlot();
         if (slot < 0) return false;
-        party.Slots[slot] = MemberOf(p, canInvite: party.IsManager(p.UserDbId));
+        party.Slots[slot] = MemberOf(p, canInvite: !party.IsSys && party.IsManager(p.UserDbId));
         _byMember[p.UserDbId] = party;
         return true;
     }
@@ -1019,6 +1139,18 @@ public sealed class PartyManager
     {
         int slot = party.IndexOf(userDbId);
         if (slot < 0) return;
+        // cap_2man clients 1:9987/9988 and 2:7821/7822, repeated at 1:11052/11053
+        // and 2:8664/8665: both full event lists are cleared before the leave and cancel.
+        if (party.IsSys)
+            foreach (var (ticket, member) in OnlineMembersOf(party))
+            {
+                foreach (var frame in MatchQueueManager.AllEventMatchingFrames())
+                    a.Client(ClientAction.Raw(ticket, frame));
+                // The PDId helper also clears World's matching flag before removal:
+                // Arb067:10911-10929 -> Arb077:6149-6152; cap_2man_b:19036/19037.
+                a.World(PartyPackets.AS_CHANGE_EVENT_MATCHING_STATE,
+                    PartyPackets.BuildAsChangeEventMatchingState(member.UserDbId, isMatching: false));
+            }
         var gone = party.Slots[slot]!.Value;
         party.Slots[slot] = null;
         Unmap(userDbId, party);
@@ -1052,6 +1184,15 @@ public sealed class PartyManager
     {
         if (_byMember.TryGetValue(userDbId, out var cur) && ReferenceEquals(cur, party)) _byMember.Remove(userDbId);
         if (_normalByMember.TryGetValue(userDbId, out var n) && ReferenceEquals(n, party)) _normalByMember.Remove(userDbId);
+        // T201: QA dummies have no persistent character or session. Retire their
+        // registry entry when their final party association goes away.
+        if (!_byMember.ContainsKey(userDbId) && !_normalByMember.ContainsKey(userDbId)
+            && _ticketByDbId.TryGetValue(userDbId, out uint ticket)
+            && _byTicket.TryGetValue(ticket, out var player) && player.QaDummy)
+        {
+            _ticketByDbId.Remove(userDbId); _byTicket.Remove(ticket);
+            _applications.RemoveWhere(x => x.applicant == userDbId || x.target == userDbId);
+        }
     }
 
     /// <summary>
@@ -1104,7 +1245,38 @@ public sealed class PartyManager
     {
         var fields = MemberListFields(party);
         foreach (var (t, _) in OnlineMembersOf(party))
+        {
             a.Client(ClientAction.Def(t, "S_PARTY_MEMBER_LIST", fields));
+            // New_SendPartyMemberList always follows its roster with the raid names,
+            // even for an ordinary two-member system party (Arb_part_067.c:11593).
+            a.Client(ClientAction.Raw(t, PartyPackets.BuildPartyNameList(party.RaidPartyNames)));
+        }
+    }
+
+    /// <summary>T195: Arb067:12789-12946. Same-party recipients, including the sender;
+    /// ordinary party chat in a raid reaches the sender's five-member subgroup.</summary>
+    internal PartyActions Chat(uint ticket, uint channel, string message,
+        Func<int, int, bool>? blocked = null)
+    {
+        var actions = new PartyActions { Origin = Recipient.Ticket(ticket) };
+        if (!_byTicket.TryGetValue(ticket, out var sender)
+            || FindByMember(sender.UserDbId) is not { } party
+            || channel is not (1 or 21 or 25 or 32)
+            || (channel == 32 && !party.Raid)) return actions;
+        int group = party.IndexOf(sender.UserDbId) / 5;
+        foreach (var (recipientTicket, member) in OnlineMembersOf(party))
+        {
+            if (member.PlanetId != PlanetId
+                || (party.Raid && channel == 1 && party.IndexOf(member.UserDbId) / 5 != group)
+                || blocked?.Invoke(member.UserDbId, sender.UserDbId) == true) continue;
+            actions.Client(ClientAction.Def(recipientTicket, "S_CHAT", new Dictionary<string, object>
+            {
+                ["channel"] = channel, ["gameId"] = sender.GameId & 0x7FFFFFFFFFFFFFFFUL,
+                ["isWorldEventTarget"] = false, ["gm"] = false, ["founder"] = false,
+                ["name"] = sender.Name, ["message"] = message,
+            }));
+        }
+        return actions;
     }
 
     // =========================================================================================
@@ -1127,9 +1299,9 @@ public sealed class PartyManager
     /// .def to use is version 8, NOT 7. Sources: ims &lt;- Party+0x78, raid &lt;- +0x79,
     /// memberLimit &lt;- +0xD0, id &lt;- +0x80, leader &lt;- +0xC0/+0xC4,
     /// loot &lt;- +0xA8,+0xAC,+0xB4,+0xB5,+0xB0,+0xB8,+0xBC, anonymized &lt;- +0xD4.
-    /// `slot` is the loop index for a party and Party::GetIndex(PDId) for a raid, chosen on the
-    /// raid flag at Party+0x79 - which for us is the same number either way, because we never
-    /// compact the slot array.
+    /// `slot` is the loop index for a party and Party::GetIndex(PDId) for a raid - when the raid
+    /// byte at Party+0x79 is non-zero the encoder takes it from FUN_1407b9e80 instead -
+    /// which for us is the same number either way, because we never compact the slot array.
     /// </summary>
     public Dictionary<string, object> MemberListFields(Party party)
     {

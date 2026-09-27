@@ -55,8 +55,8 @@ the whole point.
 
    ```powershell
    cd D:\v100\TERA_SERVER.100\TeraSharp\tools
-   .\reframe-tap.ps1    -Log <captures>\arb_world_<stamp>.log -Opcodes 0x139E,0x139F,0x13F8
-   .\reframe-client.ps1 -Log <captures>\capture_<stamp>.log   -Packets S_GUILD_INFO
+   .\reframe-tap.ps1    -Log D:\packetlogs\arb_world_<stamp>.log -Opcodes 0x139E,0x139F,0x13F8
+   .\reframe-client.ps1 -Log D:\packetlogs\capture_<stamp>.log   -Packets S_GUILD_INFO
    ```
 
    Each writes `<log>_ctl.txt` (one line per frame, noise removed — read this first) and

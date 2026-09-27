@@ -1,505 +1,190 @@
-# Chat handoff — for the Claude that pairs with the human (NOT Cowork)
+# Chat handoff - for the Claude that pairs with the human (NOT Cowork)
 
-Last updated: 2026-09-14 ~01:40 local. If you are reading this, the previous chat session died.
-Read this file, then `CLAUDE.md`, then `status/HANDOFF.md` §1 (DLMItems), then
-`status/PERSISTENCE-MAP.md`, then `status/STATUS.md`.
+Last rewritten: 2026-09-22, T174, against master @ T172. The checkpoint log this file used to be
+(2026-09-14 .. 09-21) is in git history; everything still true from it is folded in below.
+Read order: this file -> `CLAUDE.md` -> `status/HANDOFF.md` section 1 (DLM items) ->
+`status/PERSISTENCE-MAP.md` -> `status/STATUS.md` (area table, then the per-task log).
 
-## Roles
+## 1. Roles
 
-- **This chat (you):** the human's live pair. You have the `filesystem` tool on the human's D:.
-  You edit Cowork-editable files directly on `master` (World/DbProxyHandlers.cs, Handlers/Chat*,
-  Character*, Social*, Persistence/*, Tests, status/*, data/*). Human-owned files (WorldBridge,
-  WorldEntry, GameSession, LoginHandlers, HandlerRegistry, Program.cs): give the human a PowerShell
-  patch (`[IO.File]::ReadAllText` with FULL paths — `.\x` resolves against system32). You can't run
-  commands; the human runs `.\ship.ps1 "msg"` (build+tests+commit+publish+7z) and pastes output.
-- **Cowork:** separate autonomous session. It CANNOT run git. The human creates a git worktree
-  `D:\v100\TERA_SERVER.100\TeraSharp-cowork` on a `cowork/Tn` branch; Cowork writes only there; the
-  human commits/rebases/merges. Rules are in `CLAUDE.md`. Cowork can't build either (no dotnet in
-  its container) — it verifies bytes with Python; the human builds before merging. Its work today
-  has been good (it found a real bug in my 0x13BF builder).
-- **Human:** runs WorldServer + client on a netcup VM (`C:\deploy.ps1` = kill arbiter, curl the 7z
-  from the build host over http, extract, set env vars incl. `TERASHARP_STARTER_BLOB`, run with
-  Tee to `C:\TeraSharp-deploy\arbiter.log`). Terse; wants commands, not prose. World takes ~3 min
-  to restart; a fresh World process is needed for many tests (see below).
+| Who | Does | Cannot |
+|---|---|---|
+| Human | runs netcup (WorldServer, tera-api, proxy, TeraSharp), builds/ships (`ship.ps1`), commits, merges, rebases the worktrees, applies human-owned patches | - |
+| This chat | live pair: reads D: via the filesystem tool, edits Cowork-editable files on master, hands PowerShell patches for human-owned files (full paths: `[IO.File]` resolves against system32) | run commands |
+| Cowork session 1 | worktree `TeraSharp-cowork`, branch `cowork/T8` | run git; edit human-owned files |
+| Cowork session 2 | worktree `TeraSharp-cowork2`, branch `cowork/T27` | same |
 
-## State of the server (what works live)
+Both Cowork sessions build and run the full test suite in their own Linux sandbox since T150b (the
+reports say "Built and run in a Linux sandbox (N passed)"); the human's `dotnet build` is still the
+merge gate. Human-owned files (CLAUDE.md section 0): `Program.cs`, `Network/*`,
+`World/WorldBridge.cs`, `World/TunnelFrames.cs`, `Handlers/WorldEntry.cs`,
+`Handlers/HandlerRegistry.cs`, `Handlers/LoginHandlers.cs`. Cowork ships changes to them as
+`status/Tnnn-PATCH.diff`: T161, T161b, T172 are applied on master; `MULTIWORLD-PATCH.diff` is the
+multi-World step, applied as T138b.
 
-- Login → play → Logout button → lobby → relog: works, position restored (blob offset 220).
-- Chat: works (AS_REQUEST_NORMAL_CHAT 0x1449 to World; S_LOAD_CLIENT_USER_SETTING + block/friend
-  lists must be sent after C_LOAD_TOPO_FIN, not at select).
-- Character creation (T8, Cowork): works. `data/starter_blob.bin` = the real Arbiter's 15312-byte
-  blob for a never-entered character; `StarterBlob.Build` patches playerId@112, name@116,
-  x/y/z@220/224/228, zone@236. Field map in `data/starter_blob.md` (ZONE IS 236, NOT 208; 208=HP).
-  Still missing: race/gender/class@192/196/200 and appearance 288 / appearance2 296 / details 312 /
-  shape 344 (Cowork T12 in flight) — a human warrior currently looks like an Elin valkyrie.
-- New characters get the real starter inventory: `0x27A2` → `0x27A3` + `0x27A4` built from
-  `data/starter_inventory.bin` (6 × 536 B items, owner playerId at item+16, reqId at [8]).
-  playerId 1 (dob) still gets the replay-table capture. `EnterWorld Failed [..] [name] [1]` in the
-  World console = World rejected the inventory (owner mismatch).
-- gameId is a per-login counter reset per World process (`WorldBridge.AllocateGameId`), NOT
-  `0xAF00000|playerId`. `DbProxyHandlers.GameIdByPlayer` carries it to 0x2830.
-- Zone change / quest teleport: `0x13BE→0x13BF`, `0x13C0→0x13C1` echoes (Cowork T10 fixed the
-  padding rule: only struct-padding bytes are zeroed; 44..47 is a coordinate). `0x1439` (empty
-  visited-section list) sent on every C_LOAD_TOPO_FIN. Live test of a teleport still pending.
-- Post-handshake: 98 × `0x1581 [dungeonId][1][0]` pushes (`OnWorldReady`), and `0x147D` is answered
-  with the 23 captured `0x147E` promotion records re-stamped with the current UTC time
-  (`data/promotions_147E.bin`). See "the crash" below.
-- T6 (Cowork): characters row now gets zone/x/y/z from every blob save and level/exp from
-  `0x273B S_UPDATE_EXP_LEVEL` (level 0 = exp-only update; ok = row-updated).
+## 2. Architecture in one screen (details: `docs/ARCHITECTURE.md`)
 
-## The crash we were fixing when this was written — SOLVED 02:02
+```
+client -> tera-server-proxy :7801 (public, the GM gate) -> TeraSharp :7701 (loopback)
+WorldServer.exe --id=1 [--id=13] -> TeraSharp :7802 (25 links per World: 1 control + 24 bypass)
+TeraSharp admin web :8051 (loopback, X-Admin-Token)   tera-api :81 public, :8080 auth API (loopback)
+```
 
-Root cause: `WorldEntry.EnterWorld` step 5 sent a pre-emptive `0x2738` right after `AS_ENTER_WORLD`
-with `[8] = playerId` where World expects a DLM id. On a fresh World the low ids belong to the
-load contexts World creates right after the real enter-world completes, so the stray frame
-"completed" e.g. `DBLoadPromotionContext` with an enter-world payload -> crash in its
-`ExecuteCommit`. Removed; `DbProxyHandlers.OnUserEnterWorld` answers `0x2711` with the live id.
-Minidump analysis recipe (PowerShell, no WinDbg) is in this chat's history: parse streams 4
-(modules), 6 (exception), 3 (threads); scan the faulting thread's stack for addresses inside
-WorldServer.exe; map `WorldServer+0xNNN` to `FUN_1400NNN` in the decompile.
+- TeraSharp replaces `ArbiterServer.exe` only; World is the retail binary. World dies when the
+  Arbiter link drops and never reconnects, so every Arbiter restart is a World restart (~3 min).
+- Client packets the Arbiter does not own go to World inside `AS_BYPASS_FROM_CLIENT` 0x13F6;
+  World's client packets come back in `SA_BYPASS_TO_CLIENT` 0x13F7 (N-recipient, Ticket-routed,
+  T38; departed tickets never borrowed, T161).
+- DB traffic: every `SDB_*` World sends is answered by `DbProxyHandlers` (+ `DbProxyT167/168/170/172`
+  partials), a `DbAckTable` row, or the `WorldReplayTable` (captured pair, id patched). Persistence
+  is one SQLite file (`TERASHARP_DB`, default `<logs>\terasharp.db`), schema in `CharacterStore.cs`.
+- Multi-World: `WorldRegistration` / `WorldInstances` / `ContinentRouting` (T103-T112, T138/T138b);
+  a continent is owned by the World whose 0x164D roster lists it.
+- Datasheets: `World/DatasheetLoader.cs` (T159) - section 5.
 
-Old notes from the hunt (kept for context):
+## 3. What is verified, and how
 
-Symptom: a **level-1 character entering a FRESH World process** → World silent after our
-`DBS_USER_ENTERWORLD`, minidump written the same second, process dies ~45 s later (writing a 30 GB
-full dump — delete `*_full.dmp` in `C:\TERA_SERVER.100\Executable\`, they eat the disk).
-After dob (level 58) has entered once, the same character enters fine ("warm" path). Not the
-zone, not the blob bytes (sha256-verified byte-identical to the real one), not gameId.
-Minidump (parsed with the PowerShell snippet in this chat's history — MINIDUMP streams 4 and 6):
-access violation at `WorldServer+0x128F4B0` = `FUN_14128f410` = vector<PromotionConditionDataHead>
-copy ctor, called from `PromotionController::NewPromotion` (WorldServer.exe.c ~3531130). Newbie
-promotions are evaluated for level-1 characters only, and the promotion datasheet World uses comes
-from the Arbiter at handshake (`0x147D → 0x1484 + N×0x147E + 0x1480`); we were replaying the
-2026-09-12 records with stale timestamps. Fix shipped (commit 51d635e + merge): live timestamps.
-**Not yet live-verified** — next step is: deploy, restart World, select `testtwo` (zone 5) as the
-first login. Expect `0x147D: sent 23 x 0x147E promotion records stamped …` in the handshake and
-`EnterWorld [1] testtwo(3)` in World. If it still crashes, get the new minidump address the same way
-and look for the next caller.
+| Level | Meaning |
+|---|---|
+| live | seen working against a real client on netcup |
+| pinned | byte-exact against a real-Arbiter capture, in a test (`data/*.bin` TSIS fixtures) |
+| decompile-only | layout from the Arbiter writer + World reader; no capture has the frame |
 
-## How to get facts
+| System | State | Tasks |
+|---|---|---|
+| Login, lobby, create/delete, enter world, relog, logout, chat, keybinds | live | T1-T21, T30 |
+| Two+ players in one World, whisper, party, trade (items + money), friends/blocks | live (09-15/09-16 passes) | T38, T47, T49, T60, T64 |
+| Inventory rows, money, loot, starter kit item ids | live | T44, T59, T105 |
+| Broker, mail, bank | live 09-16 for buy/collect and deposit; the T74 / T141 fixes (tabs, attachments, withdraw, TotalPaid) not re-verified live | T71-T81, T141 |
+| Guild create/ranks/leave, LFG, guild war declare/withdraw | wired, pinned to cap_social2-4 | T39-T57, T80 |
+| Guild war declare back / withdraw one side / surrender, guild quests start/cancel | pinned (cap_final2a/2b), not live | T170 |
+| GM `/@`, Alt+A panel, GM tool buttons | live (Alt+A after T144b) | T32, T46, T89, T144b, T148, T155 |
+| Leaderboards, dungeon cool times, matching window | live (Classic+ client) | T118-T136 |
+| Dungeon / BG queue -> matched system party -> enter | two live queue sessions (cap_queue1/2) drove T161/T163; the fixes are not re-verified live | T138b-T138d, T161, T163 |
+| Multi-World hand-off (Velika 9781 -> World 13) | wired, pinned to cap_multiworld3; live test pending | T138b |
+| Crafting / gathering | pinned client-side (classic_craft); A<->W writes decompile-only | T147, T147b |
+| Enchanting family, cards, EP pages, polishing, dungeon rank | enchant: decompile-only; polishing + EP writes + card loads pinned | T166, T167, T169, T170 |
+| Item tooltip + compare (0x282E ask / 0x282F answer) | pinned: 59 material tooltips byte-exact; equipment differs in 3 item-level floats | T169, T170 |
+| Group C remainder (VIP, servants, money GM, gold, attendance, ...) | decompile-only, store-backed | T168, T168b |
+| Clear all skill, event-system progress | clear: pinned (cap_clearallskill); progress: decompile-only | T171 (= T170 parts 5-6) |
+| Visited sections (cinematics), guild-quest points, purchase-limit reset, whole-world broadcasts | pinned | T172 |
 
-- Captures in `<captures>\`: `lobby_tap.log` (login/logout/relog, real Arbiter), `cap_newchar.log`
-  + `cap_newchar_client.log` (create char → Island of Dawn → quests/gathering/kills/level-up/teleport
-  → logout). `cap_newchar_ctl.txt` = condensed control-channel listing (seq, dir, time, op, len,
-  first 64 B) — read this first, it's small. `cap_newchar_zone.txt` = full 0x13BE/0x13C0 frames.
-- Files >1 MB: `read_text_file` with `head=`/`tail=` (≤1 MB each) → results land in
-  `/mnt/user-data/tool_results/*.json` → parse with the bash tool (`parse_tap.py` pattern: reframe
-  by u32 length per direction). The middle of a big file is unreachable that way; have the human
-  produce a condensed listing with the PowerShell reframer instead.
-- Decompiles: `Arb_part_*.c` (Arbiter, readable), `world_decompiled\WorldServer.exe.c` (125 MB —
-  NEVER read whole; human runs `Select-String` for a line number, then
-  `Get-Content $W | Select-Object -Skip N -First 200 | Set-Content status\x.txt`; each pass ~30 s).
-  Ghidra base 0x140000000 → `WorldServer+0xNNN` = `FUN_1400NNN`.
-- World console log: `C:\TERA_SERVER.100\Executable\Logs\Console\WorldServerConsole_<date>_2800.log`
-  (rolls at midnight). Minidumps next to WorldServer.exe.
+The per-opcode truth is `status/PERSISTENCE-MAP.md` (a test parses it); the census of every
+opcode in the two newest taps is `status/T169-CENSUS.md` (T172 resolved every row).
 
-## Rules that bit us
+## 4. The wedge story, and DbAckGroups
 
-- **Session A (real Arbiter + tap) is NOT feasible on the 32 GB netcup box while World runs**: World
-  27 GB + real Arbiter 3.3 GB + MSSQL leaves ~400 MB, SQL pages and stored procs take 15-48 s, World
-  keeps the character in loading state (can move, cannot use skills). Options: Session B (client-side
-  capture on a populated 100.02 server), or a temporarily larger VM for one Session A. The T56 tap is
-  installed on netcup at C:\TERA_SERVER.100\arbiter-world-tap.js and PlanetDB Users.adminLevel = 5
-  for dob/Test/two.
-- **Every `C:\deploy.ps1` requires a WorldServer restart afterwards** - World cannot survive the
-  Arbiter link dropping; it will not reconnect. Budget ~3 min per deploy for that.
-- **`deploy.ps1` now runs `--selftest` first** and aborts on a required failure; it sets
-  TERASHARP_DATA / TERASHARP_LOGS / TERASHARP_STARTER_BLOB and has a commented
-  `TERASHARP_GM_ACCOUNTS` line.
-- **Never send a `DBS_*` reply World didn't ask for.** Every DBS_ carries a DLM id that World looks up
-  in DLMExistManager; an unsolicited one (the pre-emptive 0x2738 WorldEntry used to send with
-  playerId in the id slot) completes whichever item currently holds that id. It only "worked" for
-  playerId 1 by coincidence and crashed a fresh World for every other character (found via minidump
-  stack walk, 2026-09-14 01:55). Pushes (AS_*, no id) are fine; replies are not.
+- **The failure mode.** Every `SDB_*` with a DlmId is a DLM item in World's per-user DB queue. One
+  unanswered request freezes that character's DB writes for the session: skills, equips, loot,
+  mail all stop, silently (`status/HANDOFF.md` section 1). One unsolicited `DBS_*` is worse: it
+  completes whichever item holds that id - the 2026-09-14 fresh-World crash.
+- **How they were found.** Tap in front of TeraSharp, then the first request with no reply:
+  cap_bag 0x2732 quest-list batch (T145), cap_play1 `SA_CREST_USE` + `PEGASUS_FEE` (T158), cap_scroll
+  0x28AE / 0x2790 (T164), 0x283D bag grow (T150b), twelve crafting writes (T147), 0x2734 (T142).
+- **Generic acks.** T150 answered ~180 opcodes with a `[DlmId][ok]` table and was reverted after a live
+  regression (a level-70 loaded as level 1). T150b made `DbAckTable` opt-in: only rows proven by a
+  live pair.
+- **The groups (T165, `World/DbAckGroups.cs`).** All 300 request/reply twins sorted, each checked
+  against World's `Handler_DBS_*` reader: A = unpinned table rows (log "capture a real pair to
+  pin" once), B = denied on purpose, C = needs a real handler, Elsewhere = answered elsewhere.
+  `DbAckTable` refuses to load a B/C row. Since T165b the pending lists are computed from
+  `IsHandledRequest`, so a new real handler needs no table edit.
+- **Now.** Group C landed in T166 (enchant), T167, T168, T170. Pending C = **0x275C ITEM_DECOMPOSE
+  only** (dead on both sides: World's reader returns false). The walk test pins that.
+- **Guards.** `Fuzz_dbproxy_dispatch_survives_hostile_frames` throws every allow-listed opcode
+  76k hostile payloads: a handler exception closes the World link, so it must stay green (T168b
+  found a FK throw that way). Store writes check owner/guild/account first (`NoSuch*`).
 
-- `[IO.File]` in PowerShell uses the process CWD (system32) — always full paths.
-- Two `git worktree add` with the same folder: the second fails silently and Cowork writes into
-  the old branch. Check `git worktree list` + `git branch -v` before assuming where a commit went.
-- Cowork's worktree can be stale vs master: rebase it (`git rebase master` in the worktree) and
-  resolve `DbProxyHandlers.cs` conflicts (usually both `case` lines are wanted).
-- Replay-table accidents: T5 sealing `0x15A8` removed the `0x1581` burst that used to be replayed
-  by luck. Anything the real Arbiter pushes unprompted must be sent explicitly, not hoped for.
-- `LoginHandlers` `maxCharacters` now follows `CharacterHandlers.MaxCharactersPerAccount` (8).
-- `TERASHARP_START_OVERRIDE="zone,x,y,z"` env var forces new-character start (experiment knob).
+## 5. Datasheets
 
-## Next steps (in order)
+| Rule | Detail |
+|---|---|
+| Source of truth | World's `Executable\Datasheet` (`TERASHARP_DATASHEET` overrides). Every value copied into code is a `SheetValue` in `DatasheetLoader`; the copy is only the fallback (T159) |
+| Loaded today | GuildConfig sizes + reparation rates, DungeonMatching ClassPosition, DefaultSkillSet, CreateCharData kits + createdLevel, BattleFieldData, DungeonRankRecorder ids, dungeon timeline ids, EventMatching targets, GuardData, BuyMenuData, ItemTemplate equip slots (T159-T172; table in `status/DATASHEETS.md`) |
+| Startup | `DatasheetLoader.LoadAll` (Program.cs, applied) logs one line per sheet; `--check-config` lists them |
+| New constant | not without a loader (CLAUDE.md) |
+| Editing a sheet | `docs/GO-LIVE.md` section 10 |
 
-**Checkpoint 2026-09-21 - 878 tests. ALT+A FIXED (T144b).** The gate was one int32: S_SELECT_USER =
-`accepted(u8) | adminLevel(i32) | errorCode(i32) | firstLoginToday(u8) | firstLoginByAccount(u8)` (11 B; the
-shipped .def is mis-typed). The real Arbiter sends the GM's admin level there; T124 had the layout but only
-fixed the standalone path - WorldEntry (every live login) kept the old literal. Proven by a CONTROL
-(cap_final_gm_client: same account, status 33, adminLevel 0 -> no panel). Lessons: (1) when two sessions
-behave differently, find a control and diff EVERY field on the LIVE path - never accept "byte-identical"
-from truncated _ctl lines or the standalone path; (2) T129's "S_SELECT_USER differs, cosmetic" was the
-miss. Also T144: S_GET_USER_LIST adminLevel(+142) = the [GM] select tag. GM state consequences: a
-GM-flagged character spawns HELD - S_ADMIN_HOLD_CHARACTER 00 must go right AFTER S_SPAWN_ME (now injected
-in DeliverTunnelled; the old topo-fin send did nothing and its removal froze GMs) - verify live: move +
-potion after deploy. Wedges fixed: 0x2734 SDB_SET_TASK_SHOW_TOGGLE (after /@level - T142), 12 crafting
-writes (T147). T142b: character 1 is live (replay fixture retired), empty-bag guard, DBS_ITEM_SINGLE ack
-pinned. AdminLevel in World (User+0xA474) is NOT settable from the Arbiter (console/script only) - World
-logs AdminLevel[0] for GMs and that's cosmetic. Admin web: /api/set-level, set-money, give-item, teleport
-(DB-side, wired 2026-09-20; body field is "id"), no delete route. Characters leveled by /@level or
-perfect_level before T142 may have broken bags - reroll them. OPEN: T145 (bags after /@level - needs the
-tap-in-front-of-TeraSharp capture cap_levelbag on a fresh char), crafting live validation (learn/craft/
-gather once - decompile-derived layouts, no capture), GM panel buttons never exercised (BG/Dungeon/Event
-tabs, Summon, Resurrect, Restrict, Punishment, Delete monster -> click through, capture proxy log, task),
-multi-World live test (Velik's walk-in + MIN_MEMBERS=2 queue), go-live, public repo push (D:\TeraSharp-
-public, audit -Strict then push).
+## 6. GM and Alt+A - what was learned
 
-**OPS NOTE 2026-09-20 (post-reboot recovery - read before touching netcup configs).** After a VPS
-reboot Topography failed every start with `open failed [2]` / `Load Topo Fail, continent=N` /
-`LoadZone Error (x,y)`. ROOT CAUSE: `DeploymentConfig.xml` had `<Topography folderName="..\..\Topology"
-/>` (vendor-relative -> resolves to C:\Topology); it must be `.\Topology` (the folder lives in
-Executable\). ProcMon showed `C:\Topology\x46y52.geo PATH NOT FOUND`. Everything else was a red
-herring: all 1773 tiles were on the box the whole time (Executable\Topology, .geo/.idx global grid,
-703 geo), pagefile/disk fine, ServerConfig fine. Other lessons: (1) TopographyServer MUST run with
-`--sharedmemoryproducer=true` (the bat does; bare exe dies attaching to a map nobody made); (2) it logs
-into WorldServerConsole_*.log, not only TopoServerConsole_*; (3) LoadWorld/LoadZone lines only print
-on failure and loading is parallel, so the first failing continent is random - do NOT chase it per
-continent; (4) ServerConfig.xml needs its UTF-8 BOM; (5) active data set = the 102 KB ContinentData
-(D:\ContinentData.lowmem.xml == full list) + low-mem CAPACITIES ServerConfig (D:\ServerConfig.lowmem.xml,
-same as ServerConfig.pc-copy) - NOT the 16 KB aggressive trim (6 continents; fails PostProcess: 1 needs
-7001-7004); World 1 = ~13 GB, --id=13 loads only its roster so both should fit in 32 GB; (6) MySQL is
-Laragon (no service) - start Laragon or mysqld from laragon\bin\mysql; tera-api needs it (3306);
-(7) `_capture_aside\` holds AreaData/DungeonData set-asides (empty) + DungeonConstraint/EventMatching
-.full copies; (8) Topography/World need an elevated shell; (9) after any World reconnect the tap link
-numbers climb - grep by link, not by "#3". Netcup boot order for TeraSharp: SQL(auto) -> Laragon ->
-tera-api -> proxy -> TopographyServer(bat) -> deploy.ps1 -> WorldServer --id=1 -> --id=13.
+| Finding | Task |
+|---|---|
+| `S_LOGIN_ARBITER.status` 33 = GM client switch (31 = normal) | T32, T104 |
+| `TERASHARP_GM_ACCOUNTS` takes numeric accountDBIDs; `accounts.admin_level` is the durable route | T46, T101 |
+| **The Alt+A gate is `S_SELECT_USER` body 1 = int32 adminLevel** (the shipped def is mis-typed); the control capture (same GM account, a 0-level character) proved it. WorldEntry still sent the old literal | T144b |
+| `apiServerAddress` / the 8800 probe / S_VERSION_INFO are NOT the gate; the replay bisection could not find it | T129, T131, T132, T143 |
+| World vaporizes a GM at spawn when adminLevel > 0; the panel's Invisible toggle is World's (0x2827 action 0x65); our spawn-time S_ADMIN_GM_SKILL contradicted World and froze learns | T148, T152 |
+| A GM spawns held: `S_ADMIN_HOLD_CHARACTER 00` right after `S_SPAWN_ME`, operators only | T144b |
+| World's `User+0xA474` admin level is not settable from the Arbiter; "AdminLevel[0]" in the World log is cosmetic | T142b |
+| Tool buttons: teleport / map teleport / go to / summon / resurrect / delete monster wired via 0x2825-0x2827; kick is logged only | T155 |
+| Real-Arbiter GM needs `qaServer=true`; tera-api privilege 33 puts the character in GM-invisible mode (use 0 for players) | 09-15/09-16 capture notes |
 
-**Checkpoint 2026-09-21 - ~860 tests, T138b/T138c/T139 merged.** Multi-World hand-off is WIRED
-(WorldBridge.HandleFrame: 0x164D roster -> DungeonChannels.MapContinent; 0x13BE on main -> 0x13BF on
-owner link; 0x13C0 on owner -> 0x13C1 to main; 0x13C5/0x13C6 channel add/remove; packed channel =
-channel|planet<<16, client shows channel+1). Matchmaker built (T138c): roles from characters.class via
-DungeonMatching.xml ClassPosition (C_MATCH_ADD carries NO class - the two i32s are the queuer's own
-pid + a first-queue flag), 1/1/3 pools, party slots kept, BG random fill with per-BG table from
-BattleFieldData.xml (Skyring 37-40, Corsairs 26-29, Fraywind 10/11), rating +/-5..12 pinned to a live
-S_BATTLE_FIELD_RESULT (delta -8), stored characters.bg_rating. FIN does not teleport: client shows
-enter-now/later, C_ENTER_DUNGEON (World-owned) triggers the hand-off. LEFT: T138d - PartyManager.
-FormMatchedParty (S_SYS_PARTY_INFO after FIN so strangers share one instance), PvP board ordered by
-rating, env TERASHARP_MATCH_MIN_MEMBERS test knob. LIVE TEST PENDING: TeraSharp + WorldServer --id=1
-and --id=13 (all three DeploymentConfig ports 7802), walk into Velik's Sanctuary 9781, two accounts
-queue a dungeon with MIN_MEMBERS=2, enter now -> same instance. OPEN SOURCE: T139 landed (LICENSE MIT,
-README, docs/SETUP.md, .env.example, deploy.example.ps1, tools/audit-release.ps1); D:\TeraSharp-public
-(branch public) is the stripped clone - 36 retail/capture files removed; T140 (session 2) is replacing
-200 verbatim-decompile quotes with descriptions+citations; audit -Strict exit 0 = push. Master keeps
-all fixtures. Handlers: 211/273 registered by name (~90% of the 235 reachable; the rest are lord/TBA/
-petition/city-war skip set + 8 guild-war accept/surrender needing a two-guild capture).
+## 7. Capture files (`D:\packetlogs`)
 
-**Checkpoint 2026-09-20 (late) - 854 tests, T125-T138a merged, ticket patch APPLIED.** Captures:
-classic_live/2/3 (Noctenium .npcap from the live Classic+ server via tools/npcap-to-capture.ps1 -
-leaderboard populated, BG+dungeon queue as member and leader, guild quests), cap_multiworld/2/3 (tap
-with DungeonServer --id=13; #3 is the definitive cross-World hand-off: 0x13BE on main -> 0x13BF on
-owner link, 0x13C5/0x13C0 on owner -> 0x13C1 back, SDB_USER_ENTERWORLD on the owner link, client channel
-= internal+1, client sees a plain zone change). DONE: leaderboard validated + my-record (T126/T133),
-guild quests (T135), matchmaking window (T134/T136/T136b - queue refused until hand-off), dungeon
-cool-time/clear-count windows, /@vis /@invis GM visibility (T128), ContinentRouting from 0x294E/0x164D
-(T138), per-World ticket patch on master (T138a - apply with --ignore-whitespace: master is CRLF,
-patch LF). IN FLIGHT: T138b = wire the crossing pairs at WorldBridge.HandleFrame + matchmaker (1/1/3
-roles, party slots kept, BG random fill with per-BG composition table, rating +/-5..12 cosmetic, no MMR).
-OPS LESSONS: ServerConfig.xml MUST keep its UTF-8 BOM (WriteAllText with UTF8Encoding($true)) or the
-real Arbiter exits 1 silently; SpeedHack turnOn=false for GM testing; two Worlds fit in 32 GB only
-with the low-mem config; start order for the real Arbiter = hub -> hub_gw -> arb_gw -> tap ->
-Arbiter -> World --id=1 -> --id=13 (AccountId:0 logins = gateway started after the Arbiter); tap link
-numbers climb on every World reconnect. Alt+A: S_LOGIN_ACCOUNT_INFO's apiServerAddress is
-DeploymentConfig <APIServer port=8800 ttl=120> = the retail admin-tool HTTP endpoint; the probe
-(TERASHARP_API_GATEWAY_SERVE=1 on 8800, urlacl + firewall done) has NOT been pressed yet - one press
-settles it. After T138b: deploy with WorldServer --id=1 and --id=13 against TeraSharp, walk into
-Velik's Sanctuary (9781), queue a dungeon and a BG, then docs/GO-LIVE.md.
+`*.log` = raw frames; `*_ctl.txt` = reframed one-line-per-frame listing (payload cut at 64 B -
+never diff from it); `*_client*.log` = the client side of the same session. Tap = World<->Arbiter.
 
-**Checkpoint 2026-09-20 - 832 tests, T113-T124b merged.** Live session with the Classic+ client (the
-`D:\Tera 100` client doesn't exercise leaderboard/Alt+A; Classic+ does - run it via the rust launcher
-at D:\tera-rust-launcher-local which auths to tera-api, path=D:\Tera 100). FIXED LIVE THIS ROUND:
-leaderboard now opens and lists (T118 exploit-fix mod forwards C_REQUEST_P*_RANKING - the mod's
-season>0/id>0 guard drops tabs sending 0, watch its console; T119 builds S_PVE/PVP_RANKING_LIST from
-dungeon_cooldowns clears + game_log pvp.kill, 0 rows until progress exists), character-select level
-(T122 refreshes the live row), play time (T113), admin web game-log search (T116), api-gateway fields
-in S_LOGIN_ACCOUNT_INFO (T124). PARKED: Alt+A GM panel. Full byte parity reached vs the working
-cap_final_gm_client2 session (status 33, S_ADMIN_GM_SKILL before S_LOAD_TOPO via the tunnel T121,
-S_LOGIN_ACCOUNT_INFO 544B identical layout, apiServerAddress reachable) AND Fiddler shows the client
-fires NO http on Alt+A against TeraSharp while the same client opens it on the real Arbiter - trigger
-is client-internal, not in any packet we send; deferred, /@ + admin web cover its function. Note:
-apiServerAddress must be the SERVER's reachable IP:port (client/server are separate machines here);
-tera-api gateway API_GATEWAY_LISTEN_HOST reverted to 127.0.0.1 and the 8040 firewall rule removed
-after testing. T126 (leaderboard class dropdown 'undefined') on HOLD - class names are client-side;
-identify the exact undefined control before building. Open polish: leaderboard class dropdown, EP
-maxRestBonusXp (needs RestBonusDataSheet), exp offset in blob (needs an earned-level capture).
-Still to do: multi-World (patch ready, needs dungeon-server capture), go-live per docs/GO-LIVE.md.
+| File | Server | What it holds | Consumers |
+|---|---|---|---|
+| `lobby_tap.log`, `lobby_proxy.log` | real | login / logout / relog | T1-T5 |
+| `arb_world.log` | real | the World conversation `WorldReplayTable` is built from (required at runtime) | replay |
+| `cap_newchar*` | real | create -> Island of Dawn -> quests, loot, level, teleport, logout | T8-T22 |
+| `cap_social*` (1-4, + client/client2) | real | party + contracts, mail with attachment, whisper, friends/blocks, guild window (1); guild ranks/announce, warehouse, mail (2); broker with listings, LFG, guild war window, wanted board (3); broker seller, guild war declare/withdraw, EP, card pushes (4) | T61-T82 |
+| `cap_final*` (+ client1-4, gm_client, gm_client2) | real | the GM session: Alt+A opening (gm_client2) and its control (gm_client), makeitem (op 8), card/EP loads | T89, T124-T153, T170 |
+| `cap_final2a*`, `cap_final2b*`, `cap_final2_clients\` | real | census taps: tooltip compare, guild war declare/accept/withdraw/surrender, guild quests, EP writes, visited sections | T169, T170, T172 |
+| `cap_clearallskill*` | real | `/@clear...` skills: 0x27E6 -> 0x27E7 (902/903) | T171 |
+| `cap_multiworld`, `2`, `3` (+ client) | real | DungeonServer `--id=13`; #3 is the definitive cross-World hand-off | T138, T138b |
+| `classic_live`, `2`, `3`, `4`, `classic_craft` (+ `.npcap`) | live Classic+ (client-side) | leaderboards, BG/dungeon queue, guild quests (1-3); broker, mail, trade (4); crafts + gathers | T118-T141, T147b |
+| `cap_t124`, `cap_altA_gm`, `cap_altA_probe`, `cap_ts_gm2` (+ client) | TeraSharp | our side of the Alt+A hunt | T129-T144b |
+| `cap_bag`, `cap_invensize`, `cap_skills2/3`, `cap_play1`, `cap_scroll`, `cap_makeitem` | TeraSharp (tap in front) | the wedge hunts: login batch, bag size, learns after relog, crest/pegasus, level scroll, makeitem | T145-T164 |
+| `cap_queue1`, `cap_queue2` (+ clients) | TeraSharp | first live dungeon queues | T161, T163 |
+| `cap_crash`, `arbiter-crash.log` | TeraSharp | the leave-during-load crash (LeaveGate) and /@goto | T161b |
+| `terasharp.db` | - | the local instance's SQLite file (the default `TERASHARP_DB`) | - |
 
-**Checkpoint 2026-09-19 - 797 tests, T83-T110 merged.** Client-facing handler set essentially complete
-(~250/273; remaining are skip-list or capture-gated: guild war accept/raise/give-up, guild quest
-start/finish, Civil Unrest). New since last checkpoint: cards (account-wide + per-character mounts),
-perks/crest, account lists, GM tool complete incl. Alt+A URL reply (T107), guild board/wanted/lists/
-ranking/flag/quests, private channels wired, telemetry acks, item strings/boards/dungeon rank, misc
-acks, character rename/cancel-delete, admin web (T101a-d: lookups, restore, soft delete, restrictions,
-money/items/kick/announce, status tab + log tail at http://127.0.0.1:8051/ with TERASHARP_ADMIN_TOKEN),
-log provider (console Warning+, daily file), go-live kit (tools/harden-netcup.ps1 default-deny -
-needs -AdminIp; tools/backup-db.ps1; docs/GO-LIVE.md), multi-World steps 1-2 dormant behind null hooks
-+ status/MULTIWORLD-PATCH.diff (apply after a dungeon-server capture; T109: no allocator exists - one
-World per continent from ServerConfig). LIVE FINDINGS FIXED THIS ROUND: bag loss (starter rows shared
-item ids 7..12 across characters - T105), blob level stamped at 204, watched movies account-scoped
-(intro cutscene), broker register push, status 33 for GM accounts. STILL TO VERIFY LIVE: items intact
-after relog, level in-world, cutscene once, listing push, Alt+A, admin web, flag-8 mode-screen
-experiment (LoginHandlers.SendContentFlags id 8 enabled - revert if no effect). Mode-select screen:
-client-native (S1UI_GameModeSelectScene.gpk, no data/packet gate found - CLIENT-GAMEMODE-SCREEN.md).
-GM notes: TERASHARP_GM_ACCOUNTS takes the numeric accountDBID; real Arbiter GM needs qaServer=true.
-Next: live pass -> fix -> T111 (WorldServerList into DungeonChannels + apply patch) -> dungeon-server
-capture -> go-live per docs/GO-LIVE.md.
+Tools: `tools/reframe-tap.ps1` / `reframe-client.ps1` (the `_ctl.txt`), `tools/make-tsis.ps1`
+(fixture), `tools/npcap-to-capture.ps1` (Classic+), `tools/arbiter-world-tap.js` (listens 7812,
+forwards to 7802; point DeploymentConfig's `ArbiterServer port` at 7812 for a tapped session).
+`data/classic-live/*.hex` stays local, never committed.
 
-**Checkpoint 2026-09-17 - 696 tests, T74-T82 merged.** Captures cap_social3_client2 (seller) and
-cap_social4 (+client2) consumed: broker complete end to end (T71/T72/T74/T81), EP stored/served (T77),
-party-matching board (T78), guild war persisted (T80), guild crest + skill polishing (T82), 0x2792
-forget-skill answered (was the guild-create wedge), bank withdraw by template (was the dup), parcel send
-date, S_VISITED_SECTION_LIST first in the topo-fin burst (T79), enter-world prefers the stored return
-point whenever the saved zone is an instance (WorldEntry, untested). In flight: T83 cards/perks/crest,
-T84 mail UI / S_VIEW_WARE_EX / account lists. Then LIVE PASS #3 (10 points, see chat) - first with the
-full social layer. Real-Arbiter GM: qaServer=true works (m1 patch not needed); both proxy clients log
-to separate capture_*.log files - always take both. Remaining after: multi-World servers, web admin
-decision (SharedDB), go-live (auth on, ports, backups).
+## 8. How to get facts
 
-**Checkpoint 2026-09-16 17:15 - 663 tests, T70-T73 merged.** Captures: cap_social3 (broker with
-listings, windows, guild ranks/leave/relog-in-guild, LFG create, guild war window, wanted board) - all
-reframed under <captures>. Real-Arbiter GM: gate is bit 5 of Account+0x2adc from the hub's
-UserLoginAns.ext_flag, which arb_gw_tw2 never delivers - fix is ArbiterServer_m1.exe (100.02 TW patch,
-the intended setup per the proxy's README) or qaServer=true; SQL Users.money works for gold;
-level lives in the blob. Low-mem config in tools/ (World 13.6 GB). LIVE PASS ON TERASHARP (first with
-the whole social layer): WORKS - party, trade incl. items+money, whisper, friends add/accept/menu/delete/
-block, GM forward (money, level), broker list/buy/collect server-side, bank deposit, money persists.
-BROKEN -> T74 (session 2): broker active/sold tabs empty, mail item attachment (step 2 never sent),
-bank withdraw multiplies amounts, 0x27DD/0x288C unanswered. -> T75 (session 1): friend-added SMT
-param key, friend list location/last-login, character-select location/last-login/rested xp, intro
-cutscene replays on zone 5 (visited_sections), guild founder gets no create popup (member does).
-Guild rank/announce/leave/relog and LFG are captured (cap_social2/3) and coded, pending the founder
-fix to exercise live. Web Admin Tool: WEBADMIN-DESIGN.md - it reads game data via ODBC SharedDB (not
-in shipped config); decision deferred. Both worktrees rebased on master after each merge.
+- Decompiles: `Arb_part_*.c` / `ArbiterServer.exe.c` (Arbiter), `world_decompiled\WorldServer.exe.c`
+  (125 MB - never read whole; Select-String for the line, then a 200-line window). Ghidra base
+  0x140000000: `WorldServer+0xNNN` = `FUN_1400NNN`.
+- World console: `Executable\Logs\Console\WorldServerConsole_<date>_2800.log`; minidumps next to
+  WorldServer.exe (delete `*_full.dmp`, they are ~30 GB). Stack-walk recipe: parse MINIDUMP streams
+  3/4/6 in PowerShell, map addresses to `FUN_`.
+- Tests: `TERASHARP_TEST_FILTER=T170_` runs a subset (T170).
 
-**CAPTURE 2026-09-15 13:52-13:56 (real Arbiter + T56 tap, two clients): <captures>\cap_social.log +
-cap_social_client.log (+ _ctl.txt/_frames.txt via tools/reframe-*.ps1).** Contains: party lifecycle
-through contracts (0x2809/0x280B/0x280C/0x280A/0x280D invite, 0x280F/0x2810 accept, 0x13AB -> 0x139E party
-list, 0x13F8 SA_BYPASS_TO_GROUP fan-outs, 0x13BB leave, 0x139D/0x13A6, 0x139B/0x13A4), loot method change,
-mail with an attachment (0x2779 5282 B make -> 0x277A, 0x2777/0x2778 list with a parcel, 0x277B/0x277C
-receive, 0x2811 delete), whisper both ways, friend add/accept/delete, block/unblock (0x1644/0x1645, 0x2862,
-0x1475/0x1476, 0x28C1), guild window opened (no guild created), the six silent windows. Enabler: the
-low-memory config from the community guide (ContinentData initChannelCount=1 everywhere,
-ServerConfig worldSessions=4 clientSessions=8 arbiterClient=1 World threadNum=2) brought World to 13.6 GB
-and the real Arbiter to 1.7 GB - no datasheet trimming needed. Both files live as
-D:\ServerConfig.lowmem.xml / D:\ContinentData.lowmem.xml. Gotchas: tera-api privilege 33 puts the
-character in GM-invisible mode (skills disabled) - use 0 for players; the real Arbiter still refused /@
-(Abuse Command) with Users.adminLevel=5 - not traced. Consumers: T61 (mail), T64 (party/contracts/social
-byte-exact), T63 no longer blocking captures (still useful for a smaller World).
-Cowork assignments at 2026-09-15 14:30: session 1 = T63 on TeraSharp-cowork (cowork/T8); session 2 = T64
-on TeraSharp-cowork2 (cowork/T27); queued T61 (mail, session 2 next), T62 (friend menu / cutscene flag /
-name completion, session 1 next), T58 (selftest completeness + scratch cleanup). Open blockers for the
-next capture: real-Arbiter GM refusal (Abuse Command despite Users.adminLevel=5) - needed for guild
-create (gold), Phargo/warehouse, broker listings.
+## 9. Rules that bit us
 
-**2026-09-15 06:20 - 624 tests; T57/T59/T60 merged (character money, guild SA_ handlers, contract broker
-for party invites + C_ADD_TRADE_BAG), all wired, none live-tested yet.** Capture-box work: World
-partial loading is a DATASHEET trim, not a ServerConfig list; six families cleared by hand
-(ContinentData/AreaList to {5,9827,9828,9829}, ShieldTerritory stub, AreaData_/DungeonData_ moved out of
-the Datasheet tree, DungeonConstraint rows, EventMatching events) - next was Leaderboards.xml; T63 finishes
-the list + writes tools/trim-datasheets.ps1. Netcup fully restored (254 continents, 26 ShieldTerritory,
-294 AreaData, 224 DungeonData, line 46 = 7802, TeraSharp deployed). _capture_aside on netcup holds the
-.full backups. In flight: T63 (session 2, TeraSharp-cowork), T61 mail contents (session 1,
-TeraSharp-cowork2); T62 (friend menu 22073, cutscene flag 0x27FE, name completion 31605) queued.
+- Never send a `DBS_*` World did not ask for; pushes (AS_*) are fine.
+- Every deploy = World restart. Keep the order: SQL -> Laragon (MySQL) -> tera-api -> proxy ->
+  TopographyServer (`--sharedmemoryproducer=true`, via its .bat) -> TeraSharp -> World `--id=1`
+  -> `--id=13`. World and Topography need an elevated shell.
+- `DeploymentConfig.xml`: `<Topography folderName=".\Topology">`, not `..\..\Topology`. It also holds
+  the SQL passwords - never quote it, nor the capture-tune backup copy.
+- `ServerConfig.xml` must keep its UTF-8 BOM, or the real Arbiter exits 1 silently.
+- Two Worlds fit in 32 GB only with the low-mem config (`D:\ServerConfig.lowmem.xml`,
+  `D:\ContinentData.lowmem.xml`). Session A (real Arbiter + World) needs it too.
+- Diff full payloads, never `_ctl.txt`; when two sessions differ, find a control session and diff
+  every field on the LIVE path (T144b's lesson).
+- Tap link numbers climb on every World reconnect: grep by link, not by `#3`.
+- `git worktree add` into an existing folder fails silently; check `git worktree list`.
+- Master is CRLF; apply LF patches with `--ignore-whitespace`.
 
-**Checkpoint 2026-09-15 late - 605 tests, T52-T56 merged.** Since the last checkpoint: guild SA_
-direction (leave/banish) + C_INVITE_USER_TO_GUILD/C_CHANGE_GUILDNAME real, GuildWiring gate in
-HandleFrame; broker research (BROKER-DESIGN.md) + the five SDB_TRADE_BROKER_* DLM answers (opening the
-broker no longer wedges) + 15 C_TRADE_BROKER_* accept/empty replies; TunnelFrames length-overflow fix;
-SelfTest requires the guild + visited_sections tables; docs refreshed from git (LIVE-CHECKLIST,
-STATUS, CLAUDE section 0, PERSISTENCE-MAP now covers all 59 allow-listed opcodes, CAPTURE-PLAN);
-capture tooling under tools/ (arbiter-world-tap.js labels World links - copy it to netcup before the
-next capture; reframe-tap.ps1 / reframe-client.ps1 / packet-logger.js). In flight: T57 (eight guild
-SA_ handlers, session 2), T58 (selftest completeness + scratch cleanup, session 1). Live session in
-progress: GM /@makemoney reported not working - first check `C_ADMIN ... -> ForwardToWorld` in
-arbiter.log and `AdminLevel[5]` in the World console; TERASHARP_GM_ACCOUNTS (not the tera-api
-privilege) is what TeraSharp reads. Live script: LIVE-CHECKLIST.md sections 0-11 with
-accountonetest + warriortwo for the two-client steps and warrior for the quest-after-relog check
-(fallback puts it in its own 9827 instance, so it cannot see the others). GM money/items:
-/@makemoney <amount>, /@makeitem <templateId> <amount>.
+## 10. Open items
 
-**Checkpoint 2026-09-15 - 583 tests, T45-T51 merged.** New on master since the multiplayer milestone:
-whisper via ChatManager (roster registered in WorldEntry/GameSession), World GM commands forwarded
-(anything not Arbiter-owned -> AS_ADMIN_COMMAND 0x2829), AdminLevel in AS_ENTER_WORLD[111] +
-TERASHARP_GM_ACCOUNTS honoured at enter, the 18 Arbiter-owned client packets answered (tooltip reply,
-visited sections, parcel DB, C_CLIENT_LOG printed) and dropped-not-forwarded via
-ArbiterClientHandlers.ArbiterOwned, PartyWiring (7 C_ + 12 SA_ party opcodes) and GuildWiring (17 C_ +
-0x27CF boot load from rows) wired, security audit + fuzz suite (T48/T50: DefinitionReader bounds, DefField
-narrowing, FK owner guards, crest offset wrap, WorldLink per-frame try/catch), language-aware social
-seed. Live-untested: all of it. In flight: T52 guild SA_ direction + C_INVITE_USER_TO_GUILD, T53 broker
-research (session 2). Next live session: LIVE-CHECKLIST + whisper, /@teleport, party invite, guild
-create, potions, mailbox, GM AdminLevel[5] in World's console; then the real-Arbiter capture session
-(party/guild/warehouse/mail/broker) with both accounts GM in tera-api, or a client-side capture on a
-populated 100.02 server with mods/packet-logger.
-
-**MILESTONE 2026-09-15 00:25 - MULTIPLAYER.** Two accounts, two clients, both in world at once, see each
-other, /say and global chat cross, one logs out without disturbing the other. Routing = MULTIPLAYER-DESIGN
-section 6 applied to WorldBridge (TicketAllocator 5,6,...; N-recipient SA_BYPASS_TO_CLIENT via
-TunnelFrames; per-ticket reorder; unknown ticket dropped when 2+ sessions, delivered when 1). World echoes
-the ticket we put in AS_ENTER_WORLD[80] - the two-client capture on the real Arbiter is no longer needed
-for routing. Still broken with two players: whisper ("offline" - SocialHandlers has no session lookup;
-ChatManager wiring = T47), party (PartyManager not wired), World GM commands (`teleport -> Unknown`,
-T47), World logs AdminLevel[0] for the GM account (LevelOf ignores the env list at enter - T47). New
-pushes with two players in view: 0x2809, 0x280E (T47 names them). AS_ENTER_WORLD[111] now carries the
-admin level (T46). Session lookups available on WorldBridge: SessionForTicket, SessionForPlayerId,
-InWorldSessions, PlayerForGameId.
-
-**Live session 2026-09-14 22:45-23:55 - results.** Passed: fresh warrior on a fresh World with own
-hotbar/tooltips (fixed: empty S_LOAD_CLIENT_USER_SETTING default), quests through the 9827 teleport,
-loot persisted (T44 items table), level/exp/achievements/reputation/cooldowns/tips persisted, keybinds
-persisted, Exit + relog -> 0x138D -> retry at return point -> Island of Dawn -> World re-teleports into
-a fresh instance (twice), friends groups + same-account refusal, chat, GM /@ recognised (status=31
-confirmed). Fixed during the session: C_DELETE_USER FK cascade; AS_ENTER_WORLD [48] zone from the blob
-(stale lobby record sent zone 5 with 9827 coords -> void spawn). Broken/pending: potions do not
-decrement on screen (client packet 30152 forwarded to World and rejected - T45), mailbox shows 12
-phantom rows (replayed list - T45), quest not advancing after relog (T45), forwarded World GM
-commands (`perfect_level -> Unknown`) and World's AdminLevel[0] (T46), warehouse untested, T20's
-inventory work had been LOST (never committed) and was redone as T44. deploy.ps1 now runs --selftest
-and needs TERASHARP_GM_ACCOUNTS uncommented for /@.
-
-**2026-09-15 checkpoint: 448 tests, T36-T38 merged.** Since the last checkpoint: TunnelFrames
-(multi-recipient 0x13F7 parser, 0x13F6 builder with WorldClient addressing, TicketAllocator -
-call-site swap for WorldBridge in the T38 report / MULTIPLAYER-DESIGN section 6, NOT applied yet),
-GUILD-DESIGN.md + GuildPackets codec (17 Arbiter-handled guild packets vs 10 World-handled; the
-replayed 0x27ED leaks two Arbiter stack bytes - BuildEmptyDbsInitGuildData is the clean form),
-SelfTest (`TeraSharp.Arbiter.exe --selftest`), LIVE-CHECKLIST.md (12 steps). Cowork queue: T39
-guild persistence (Arbiter half), T40 mail/warehouse research. Human-owned, waiting for a live
-session: the WorldBridge tunnel call-site swap (T38) + TicketAllocator wiring, then the two-client
-capture; PartyManager wiring (PARTY-DESIGN section 10) after that.
-
-**State at 2026-09-14 end (411 tests, everything through T35 merged; T36 guilds and T37 live checklist in flight).**
-
-What works (live-verified): login -> lobby -> create character (any class, own kit, own skills, own
-look) -> Island of Dawn on a fresh World -> quests, loot, level -> logout/exit (5 s) -> relog with
-quests/level/position intact; chat; character delete.
-
-What is implemented and unit-tested but NOT live-verified (all since T19): client settings
-persistence (keybinds); inventory rows (loot survives relog); achievements, tutorial tips, seren
-guide, reputation, per-account fatigability, dungeon cool-times served from rows; completed quests
-in 0x272D list 2; the 63-push handshake burst with live timestamps + city-war replies; 0x13F2 ->
-0x1581 echo (fallback burst still on); relog into a dead instance (0x138D -> retry at stored return
-point; needs a character that entered the instance AFTER T21); friends/groups/memos/blocks (v100
-defs - the shipped S_FRIEND_LIST def was patch-101); GM commands via C_ADMIN/C_OP_COMMAND with
-`TERASHARP_GM_ACCOUNTS=<account>` (S_LOGIN_ARBITER.status=31 unlocks /@ in the client - untested);
-auth provider (`TERASHARP_AUTH=true` -> tera-api /authApi/GameAuthenticationLogin, default
-accept-all).
-
-Designed, codec written, NOT wired: multiplayer routing (MULTIPLAYER-DESIGN.md section 6 diffs to
-WorldBridge/GameSession; six Routing_* tests PENDING), PartyManager (PARTY-DESIGN.md section 10
-wiring; needs routing first). Not started: guilds (T36 research), mail, broker, warehouse, admin
-beyond the six GM commands, multi-World.
-
-First live session: deploy -> restart World -> new character -> play 10 min incl. the 9827 teleport
--> change a keybind -> Exit -> relog: check position/quests/inventory/keybind, then `0x13F2:
-echoed` in the log (then flip SendPostHandshakeDungeonBurst=false), then /@ commands with
-TERASHARP_GM_ACCOUNTS set. Then the routing diffs + two-client capture.
-
-**Update 2026-09-14 late.** Merged T24-T34 (361 tests). Master now also has: dungeon cool-times,
-reputation + per-account fatigability, MULTIPLAYER-DESIGN.md (routing = Ticket index into a session
-table; SA_BYPASS_TO_CLIENT is N x 16-byte recipients, packet at payload[8]-6 - our parser is wrong
-for 2+ players; six Routing_* tests report PENDING until section 6's WorldBridge/GameSession diffs
-are applied), PARTY-DESIGN.md + the party packet codec (no PartyManager yet), HANDSHAKE-DATA.md
-(0x1581 burst = echo of World's non-empty 0x13F2; HandleFrame now dispatches it; fallback burst
-still on via DbProxyHandlers.SendPostHandshakeDungeonBurst - flip to false once the log shows
-`0x13F2: echoed 98 ...`). Cowork session 1 has T30 friends / T31 auth / T32 GM commands queued.
-EVERYTHING since T19 is live-untested - the first live session is a fresh World + new character
-+ 9827 relog + keybind check, then the routing diffs and the two-client capture (checklist in
-MULTIPLAYER-DESIGN.md section 8: the tap must label frames by client socket).
-
-**Scope reference (2026-09-14 ~06:20).** `status/arbiter_c_handlers.txt` (~270 `C_` handlers the real
-Arbiter serves) and `status/arbiter_s_packets.txt` (~200 `S_` it builds via the PDL template writer -
-a lower bound). HandlerRegistry registers 44. By area: login/lobby/characters/settings/exit (done),
-chat+block (done; whisper/private channels not), friends (lists only), party + matching (30, none),
-guild (60, none), trade broker (20, none), lord/election/city war (15, none), petition/reports (12),
-admin (25), events/attendance/shop/VIP (20), TBA battlepass (10), appearance/name change/rankings (25).
-Priority for a populated server: multiplayer routing -> party -> guild -> broker -> friends/whisper.
-
-**Update 2026-09-14 ~05:40.** T21 merged + wired (WorldBridge.PlayerForGameId, WorldEntry.ResendEnterWorld,
-Program.cs hooks; AS_ENTER_WORLD [68] is EnterWorldType=1 not level, [52] = stored instance PDId when the
-saved zone is that instance). 278 tests, shipped 71437b1. **Live test pending**: new character -> teleport
-into 9827 -> Exit -> relog; expect `EnterWorld retry for '...': continent 9827 refused, falling back to zone 5`,
-spawn on Island of Dawn, World re-teleports into the instance. (letustry has no stored return point - delete it.)
-Cowork in flight: **T22** (`TeraSharp-cowork`, cowork/T8): per-character loads from rows - achievements,
-reputation, tutorial tips, seren, fatigability, EP, dungeon history; **T23** (`TeraSharp-cowork2`,
-cowork/T23): post-handshake config burst + 0x15ED/0x295D. Prompts are in this chat's history; CLAUDE.md
-section 0 has the queue. Merge order irrelevant; both touch DbProxyHandlers.cs so expect one conflict.
-
-**Update 2026-09-14 ~05:00.** Merged since the milestone: T19 (client settings persist -
-`client_settings`/`account_settings`, `C_SAVE_CLIENT_*` registered, `S_LOAD_CLIENT_ACCOUNT_SETTING`
-sent before the user setting after C_LOAD_TOPO_FIN), T20 (inventory persistence - `items` table
-keyed (owner_id, id), atoms applied for ops 7/2/6/11/9, 0x27A4 rebuilt from rows, starter kit
-inserted on first login). 272 tests. **Capture taken**: `<captures>\arb_world_2026-09-13T11-33-30-680Z.log`
-(+ `capture_2026-09-13T11-42-27-513Z.log` client side), condensed `cap_relog9827_ctl.txt`, full
-enter-world frames `cap_relog9827_frames.txt`. It shows the real relog-into-instance behaviour:
-AS_ENTER_WORLD into 9827 with [52]=PDId -> World 0x138D (fail) -> Arbiter pushes 0x148D x2 and
-re-sends AS_ENTER_WORLD at the return position saved from the earlier 0x13BE context, with
-[52]=-1 -> spawn on Island of Dawn -> World re-runs the teleport quest itself. Also: 0x272D list 2
-= completed quest ids; the post-handshake config burst is sent right after the handshake.
-**Cowork T21** (worktree `TeraSharp-cowork`, cowork/T8, rebased on master) implements both.
-Netcup is back on TeraSharp (DeploymentConfig `<WorldServerConfig><ArbiterServer port>` must be
-7802; 7812 = the tap). Real-Arbiter capture recipe is in item 1 below - and it needs MS SQL
-(`MSSQL$SQL2022` listens on 1433 when started).
-
-**MILESTONE 2026-09-14 ~03:30: a brand-new character works end-to-end on a fresh World — creation,
-per-class kit, default skills, quests — "everything works like it did on Arbiter" (human).**
-Merged: T14/T15/T16/T17/T18 (248 tests). Merge notes: T15's 0x272E handler was dropped for
-T17's; three tests needed fixture rows because playerId 1 is reserved for dob's captures and
-`quests` has an FK on `characters`.
-
-0. **Where things stand at end of 2026-09-14 (~02:30):** live-verified today: fresh-World first login of a
-   new character (testtwo, zone 5), elinwarrior spawned after the 0x1463 crest handler. Shipped but
-   NOT live-verified: 0x297B/0x297C ack, T13 (0x2769 echo + item id counter), T11/T12 (starter blob
-   identity block). Two Cowork sessions in flight: **T14** (per-class starter inventory from
-   `Executable\Datasheet\CreateCharData.xml` + `ItemTemplate*.xml`, worktree `TeraSharp-cowork`,
-   branch cowork/T8) and **T15** (answer every per-user DB write from PERSISTENCE-MAP.md + a test
-   that every request opcode is handled/one-way/replayed, worktree `TeraSharp-cowork2`, branch
-   cowork/T15). Merge order: T15 first (smaller blast radius), then T14; expect a DbProxyHandlers.cs
-   conflict between them (both add allow-list cases - keep both). Known open: warrior skills locked
-   (valkyrie starter gear + maybe `learnAllSkills` on the CreateCharData row); characters created
-   with TERASHARP_START_OVERRIDE set sit in Velika (testthree, elinwarrior) - delete them.
-   **Overnight results (all in worktrees, unmerged):** T14 per-class starter kit from
-   `CreateCharData.xml` + `ItemTemplate.xml` (glaiver output byte-identical to the capture, ids
-   allocated in datasheet order, records emitted sorted by pocket/slot); T16 start position from the
-   datasheet (only soulless differs); T17 quest persistence (`quests` table, rowid = questDbId at
-   0x272F payload[25]; 0x272D rebuilt from rows, empty case == 73-byte capture; completed quests
-   stored but not served until a capture of "Test" relogging on the real Arbiter shows list 1/2);
-   T15 every per-user DB write answered + coverage test (`IsHandledRequest` refactor); T18 SKILLS.md:
-   **level-1 skills live in the blob** - 40 passive slots @6880, 500 active @7200, 8 B each
-   `[u32 skillId][u8 0][pad]`, written by `AccountManager::ExecCreateDefaultSkills` from
-   `DefaultSkillSet.xml` (race,gender,class), read back by `User::SendMySkillList`; learned skills
-   persist through the blob save. `StarterBlob.ApplyDefaultSkills` now patches them. Characters
-   created before that keep valkyrie skills - delete and recreate. Live-bug fixed by T17: every
-   character was being handed dob's quest 59901 + 18 stale seeds via `QuestListEmpty`.
-   Merge: cowork/T15 (T15+T18) first, then cowork/T8 (T14+T16+T17); conflicts expected in
-   `DbProxyHandlers.cs` (`IsHandledRequest` case list: keep 0x297B inside it, drop the
-   `HandledOnMasterNotOnThisBranch` exemption; `0x272E`: take T17's handler) and in `PatchedWindows()`
-   in the tests (T12/T18 both extend it - union).
-
-1. **Relog into an instanced zone fails** (04:03, character 'letustry' saved in zone 9827 = the
-   instanced intro area): World sends 0x138C, the client never finishes loading, World times the
-   user out ~60 s later (0x2927 ticks, then 0x13AA..0x1393 with "no session for gameId"). The
-   real Arbiter must set up the dungeon channel for a login into an instance (0x13BE/0x13C0 and/or
-   the 16-byte world-session state at AS_ENTER_WORLD [167] that we zero) - never captured. Options:
-   (a) capture a real-Arbiter relog from inside 9827 (same capture as the "Test" quest one!).
-   HOW: on netcup stop TeraSharp; `DeploymentConfig.xml` `<ArbiterServer port="7812">`; `node
-   C:\TERA_SERVER.100\arbiter-world-tap.js` (listens 7812 -> 7802, logs to
-   C:\TERA_SERVER.100\arb_world_<stamp>.log); start the real ArbiterServer from
-   C:\TERA_SERVER.100\Executable (it needs MS SQL Server listening on 1433 - on 2026-09-14 04:30
-   both instances `MSSQLSERVER` and `MSSQL$SQL2022` were STOPPED and the Arbiter died instantly
-   with no console log; check `Get-NetTCPConnection -LocalPort 1433 -State Listen` first); restart
-   World; client proxy; log in "Test" (the real Arbiter's playerId 2, saved in 9827); spawn, walk,
-   Logout, Exit. Copy tap log + proxy log to <captures>\cap_relog9827[_client].log. Revert the
-   port to 7802 and `C:\deploy.ps1`.
-   (b) short-term: on login, if the saved zone is an instance, spawn at the continent's return
-   position instead (the real Arbiter has AS_SAVE_ETC_DATA_FOR_MOVE_WORLD 0x1499 data for that).
-2. **Exit Game button**: timing is 5 s already (C_EXIT -> leave -> S_EXIT); only the countdown
-   display is missing because `S_PREPARE_EXIT` is sent via `defs.Has(..)` and is not in the
-   registry - send it raw (`[u32 time]`, same shape as S_PREPARE_RETURN_TO_LOBBY).
-3. `no replay for 0x156F` still logged after the T15 merge - check `WorldReplayTable.OneWayFromWorld`
-   kept T15's additions (0x156F, 0x1491, 0x13B6, 0x13C5, 0x13C6, 0x1499, 0x15FA, 0x2927).
-4. Live-verify the promotion-timestamp fix on a fresh World (see above). Delete old `*_full.dmp`.
-2. Merge Cowork T11 (INVENTORY-DESIGN.md) and T12 (identity block in StarterBlob.Build), then
-   create a human warrior and confirm it looks right.
-3. Live-test a quest teleport / dungeon enter (zone-change echoes).
-4. Persistence: quests first (`status/PERSISTENCE-MAP.md` order), then inventory per T11's design.
-5. Two-login capture for multi-player; account auth last.
+| Item | State | Next step |
+|---|---|---|
+| Card-preset writes 0x2990 / 0x2998 (and all of 0x2988-0x2998) | decompile-only, store-backed (T167); no capture has one (T170 checked cap_final, cap_final2b) | tap session: change preset, add preset, mount/unmount a card |
+| Civil Unrest (CU) | city owners 0x2954 (T154), state 0x2958/0x295A (T172), capture tuning ready (T149 `capture-tune.ps1`); the rest is in the not-started lord / city-war set (`status/MISSING-HANDLERS.txt`) | a CU capture with `capture-tune.ps1`, then a design task |
+| Menu pop | a two-account queue via the Instance Matching menu never formed on the real Arbiter (MatchingRoleTemplate edits didn't take), so the real pop sequence for both members is unpinned; classic_live3 (leader only) is the reference (T174b) | get a two-member queue to form on the real Arbiter and tap both clients |
+| Guild war / guild quests live | T170 pinned; live pass pending | two guilds, declare -> declare back -> surrender |
+| Multi-World live | T138b wired | World `--id=1` + `--id=13`, walk into Velika 9781, queue with `TERASHARP_MATCH_MIN_MEMBERS=2` (unset after) |
+| Equip tap | `SDB_EQUIP_ITEM` answered in the ITEM_SINGLE shape, no tap holds one (T145/T151) | one equip on a tapped session |
+| Equipment tooltip item level | 3 floats need EquipmentItemLevel data (T169) | export from the datacenter |
+| Event-system progress | stored (T171) but not served back at World connect (`AS_LOAD_EVENTSYSTEM_PROGRESS_INFO`) | a task when an event is actually run |
+| Go-live | `docs/GO-LIVE.md` | work down it; section 9 is the maintenance loop |
+| Publish | `D:\TeraSharp-public` (branch `public`), audit gate `tools/audit-release.ps1` (T139); T140 is replacing verbatim decompile quotes | `audit-release.ps1 -Strict` exit 0, then push |
+| T146 | paused | - |

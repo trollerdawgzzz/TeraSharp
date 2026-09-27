@@ -1,0 +1,13 @@
+diff --git a/src/TeraSharp.Arbiter/Handlers/HandlerRegistry.cs b/src/TeraSharp.Arbiter/Handlers/HandlerRegistry.cs
+--- a/src/TeraSharp.Arbiter/Handlers/HandlerRegistry.cs
++++ b/src/TeraSharp.Arbiter/Handlers/HandlerRegistry.cs
+@@ -159,6 +159,9 @@ public static class HandlerRegistry
+             Reg(guildName, GuildWiring.MinBodyLength(guildOp),
+                 (s, body) => GuildWiring.OnClientPacket(s, guildOp, body));
+ 
++        // T183: camp discovery is Arbiter-owned (16-byte client frame).
++        Reg("C_TEL_CAMP", CampTeleportHandlers.BodySize, CampTeleportHandlers.OnTelCamp);
++
+         // --- Trade broker (T55, status/BROKER-DESIGN.md section 8.2): 15 C_ packets
+         //     (C_TRADE_BROKER_HIGHEST_ITEM_LEVEL is T45's, registered below) ---
+         var broker = new BrokerHandlers(loggerFactory.CreateLogger<BrokerHandlers>());

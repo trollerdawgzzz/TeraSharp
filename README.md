@@ -47,7 +47,7 @@ If you do not already have a working 100.02 server, TeraSharp will not give you 
 | You provide | Why | Where it goes |
 |---|---|---|
 | `WorldServer.exe` and its `Executable\` tree, from your own 100.02 files | the other half of the server | wherever you already run it |
-| The server datasheets from the same build | server policy: guild war, starter kits, battlegrounds, … | `<TERASHARP_DATA>\Executable\Datasheet` |
+| The client datasheets from the same build | item names, create-character data | `<TERASHARP_DATA>\Executable\Datasheet` |
 | The client packet definitions (`.def`, ~4550 of them) | the client codec | `<TERASHARP_DATA>\tera_v100_MASTER_FINAL\` |
 | An opcode map for protocol `376012` | client opcode ↔ name | `<TERASHARP_DATA>\tera-server-proxy\data\data.json` |
 | [`tera-api`](https://github.com/justkeepquiet/tera-api) | accounts, the launcher portal, the Alt+A panel | its own service, reached over HTTP |
@@ -60,8 +60,8 @@ not mirrored here, and not requested from anyone here.
 ### Captured traffic and the fixtures
 
 This repository contains **no captured packet bytes**. The byte-exact tests are still in the
-suite; they load their fixtures from `data/` and report `SKIP` (never a failure) when the
-folder is empty, which is what a fresh clone looks like. `data/README.md` explains how to
+suite; they load their fixtures from `data/` and print `(skipped: … not found)` and pass when
+the folder is empty, which is what a fresh clone looks like. `data/README.md` explains how to
 regenerate every fixture from a capture of your own server with `tools/npcap-to-capture.ps1`,
 `tools/reframe-tap.ps1` and `tools/reframe-client.ps1`.
 
@@ -90,22 +90,6 @@ dotnet run --project src\TeraSharp.Arbiter
 folder and schema dependency and exits non-zero if a required one is missing. Run both before
 you let anyone log in.
 
-### Running it day to day
-
-`docs/SETUP.md` sections 8-14, one short section each:
-
-- **Datasheets are the source of truth.** The Arbiter reads the same `Executable\Datasheet` as
-  World (`TERASHARP_DATA`). Change a rule in the sheet, never in code.
-- **Admin API.** `set-level`, `give-item`, `delete-character`, `teleport`, `kick`, `announce` and
-  more, on loopback behind `TERASHARP_ADMIN_TOKEN`.
-- **GM panel.** The client's Alt+A tool, for GM accounts.
-- **Level-70 start.** `tools/level70-start.ps1` edits `CreateCharData.xml`; both servers read it.
-- **Matchmaking knobs.** Entry window and role caps. `TERASHARP_MATCH_MIN_MEMBERS` is test-only.
-- **Restart rule: announce -> kick -> restart.** World does not survive the Arbiter link
-  dropping, and characters save on leave. `deploy.example.ps1` does it for you.
-- **Capturing.** `tools/arbiter-world-tap.js` in front of TeraSharp records your own traffic
-  for the fixtures.
-
 `docs/GO-LIVE.md` covers the things that matter once it is public: turning auth on, GM
 accounts, the admin panel, logging, backups and the firewall.
 
@@ -116,8 +100,7 @@ dotnet run --project src\TeraSharp.Arbiter.Tests
 ```
 
 A self-contained console runner — no xUnit, no NuGet. It exits non-zero on any failure, so it
-doubles as the CI gate. Tests whose fixtures are absent print `SKIP  <test>: <reason>`, and the
-last line is `N passed, F failed, S skipped`. `TERASHARP_TEST_FILTER=T172_` runs a subset.
+doubles as the CI gate. Tests whose fixtures are absent skip and say so.
 
 ## Layout
 
@@ -127,7 +110,6 @@ src/TeraSharp.Arbiter.Tests/  the test runner
 src/TeraSharp.TestClient/     a minimal protocol client for poking at it
 docs/                         ARCHITECTURE, SETUP, GO-LIVE
 status/                       design notes, one per subsystem
-CHANGELOG.md                  T1-T172 by area
 tools/                        capture conversion, backups, firewall, release audit
 data/                         fixture + runtime blobs you generate yourself (empty on clone)
 ```
@@ -137,8 +119,7 @@ what, and what is deliberately still unimplemented. It is verbose on purpose.
 
 ## Contributing
 
-`CONTRIBUTING.md` has the workflow: branches and worktrees, the budget rules, capture-first,
-adding a datasheet loader, and the tap. Two rules carry most of the weight:
+Two rules carry most of the weight:
 
 1. **Evidence order.** When notes and the binary disagree, the binary wins. When the binary and
    a capture disagree, the capture wins. An assertion with no evidence behind it is a guess and

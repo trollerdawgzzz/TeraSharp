@@ -1,0 +1,52 @@
+--- a/src/TeraSharp.Arbiter/World/WorldBridge.cs
++++ b/src/TeraSharp.Arbiter/World/WorldBridge.cs
+@@ -140,6 +140,7 @@
+     public void UnregisterPlayer(ulong gameId, int worldId, uint tunnelKey)
+     {
+         lock (_playersLock) _players.Remove(gameId);
++        DbProxy?.UserControls.Forget(gameId);   // T180: User-owned hold/departure lifetime
+         lock (_reorderLock)
+         {
+             _tunnels.Remove((worldId, tunnelKey));
+@@ -390,6 +391,8 @@
+         while (!ct.IsCancellationRequested)
+         {
+             await Task.Delay(50, ct);
++            DbProxy?.UserControls.Tick(DateTimeOffset.UtcNow, ResolveControlUser, HasLinks,
++                send => SendFrame(send.WorldId, send.Opcode, send.Payload));
+             List<((int World, uint Ticket) key, byte[] pkt)>? flush = null;
+             lock (_reorderLock)
+             {
+@@ -426,8 +429,32 @@
+         return outp;
+     }
+ 
++    // T180: AS_ENTER_WORLD uses our gameId as its opaque Arbiter User handle. Real captures
++    // contain pointers instead; never decode either handle as a UserDbId.
++    private WorldControlUser? ResolveControlUser(ulong handle)
++    {
++        var session = PlayerForGameId(handle);
++        if (session == null || session.PlayerId == 0) return null;
++        return new WorldControlUser((uint)PartyPackets.PlanetId, session.PlayerId, session.CurrentWorldId, () =>
++        {
++            // Arb_part_062.c:13016 queues User::OnRequestCancelReturnToLobby before leave.
++            // TeraSharp has no pending prepare-appearance object (1498 is currently a no-op).
++            var pending = session.PendingLobbyReturn;
++            if (pending == null) return;
++            pending.Cancel();
++            session.PendingLobbyReturn = null;
++            SendFrame(session.CurrentWorldId, OpUserCancelRequestExit, BitConverter.GetBytes(session.PlayerId));
++            session.SendByDef("S_CANCEL_RETURN_TO_LOBBY", new Dictionary<string, object> { ["byInterrupt"] = (byte)0 });
++        });
++    }
++
+     public void HandleFrame(WorldLink link, ushort op, byte[] payload)
+     {
++        // T180: consume these before DbProxy/replay. Replies go to the owning/target World,
++        // including same-World cases; no same-link fallback for an unknown handle or owner.
++        if (DbProxy?.UserControls.TryHandle(op, payload, ResolveControlUser, DungeonRouting.Channels,
++                HasLinks, send => SendFrame(send.WorldId, send.Opcode, send.Payload), DateTimeOffset.UtcNow) == true)
++            return;
+         // ---- T138b: the cross-World hand-off (status/MULTIWORLD-DESIGN.md T137c) ----
+         // ONLY the cross-link case is taken here; everything else (including a same-World zone
+         // change, which also travels 0x13BE/0x13C0 and is completed by the T108 DbProxy handlers)

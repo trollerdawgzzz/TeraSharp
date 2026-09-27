@@ -55,9 +55,9 @@ public static class WorldServerList
     {
         get
         {
-            var explicitPath = Environment.GetEnvironmentVariable("TERASHARP_SERVERCONFIG");
+            var explicitPath = TerasConfig.Get("TERASHARP_SERVERCONFIG");
             if (!string.IsNullOrWhiteSpace(explicitPath)) return explicitPath;
-            var root = Environment.GetEnvironmentVariable("TERASHARP_DATA");
+            var root = TerasConfig.Get("TERASHARP_DATA");
             if (string.IsNullOrWhiteSpace(root)) root = @"D:\v100\TERA_SERVER.100";
             return Path.Combine(root, "Executable", FileName);
         }

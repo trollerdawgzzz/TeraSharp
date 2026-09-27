@@ -3,6 +3,7 @@
 
 using Microsoft.Extensions.Logging;
 using TeraSharp.Arbiter.Network;
+using TeraSharp.Arbiter.Handlers;
 
 namespace TeraSharp.Arbiter.World;
 
@@ -654,7 +655,7 @@ public static class ContractBroker
             Log.LogInformation(
                 "SDB_FETCH_THROUGH_ARBITER_CONTRACT: type {Type} ({What}) is not brokered yet - refusing contract {Id}",
                 r.ContractType, DescribeType(r.ContractType), r.ContractId);
-            bridge.SendFrame(DBS_FETCH_THROUGH_ARBITER_CONTRACT,
+            ArbiterClientHandlers.SendToWorld(r.ContractorDbId, DBS_FETCH_THROUGH_ARBITER_CONTRACT,
                 BuildDbsFetch(r.ContractorDbId, r.ContractType, r.ContractId, 0, ErrorTargetNotInWorld));
             return;
         }
@@ -668,7 +669,7 @@ public static class ContractBroker
             Log.LogInformation(
                 "SDB_FETCH_THROUGH_ARBITER_CONTRACT: contract {Id} type {Type} from {From} - target not in world ({How}), refusing with ErrorNo {E}",
                 r.ContractId, r.ContractType, r.ContractorDbId, how, ErrorTargetNotInWorld);
-            bridge.SendFrame(DBS_FETCH_THROUGH_ARBITER_CONTRACT,
+            ArbiterClientHandlers.SendToWorld(r.ContractorDbId, DBS_FETCH_THROUGH_ARBITER_CONTRACT,
                 BuildDbsFetch(r.ContractorDbId, r.ContractType, r.ContractId, 0, ErrorTargetNotInWorld));
             return;
         }
@@ -693,7 +694,7 @@ public static class ContractBroker
         // T76: one 0x280B per opponent, each naming THAT opponent - tap 1182 for the guild
         // create carries New + Test, the founder and the single other party member.
         foreach (var opp in opponents)
-            bridge.SendFrame(DBS_ASK_THROUGH_ARBITER_CONTRACT,
+            ArbiterClientHandlers.SendToWorld(opp, DBS_ASK_THROUGH_ARBITER_CONTRACT,
                 BuildDbsAsk(contract.Index, r.ContractorDbId, r.ContractType, r.ContractId,
                             (int)opp.SelectedCharacter!.Id,
                             contract.ContractorName, opp.SelectedCharacter!.Name));
@@ -745,13 +746,13 @@ public static class ContractBroker
                     a.ContractIndex, c.Opponents.Count);
                 return;
             }
-            bridge.SendFrame(DBS_FETCH_THROUGH_ARBITER_CONTRACT,
+            ArbiterClientHandlers.SendToWorld(c.ContractorDbId, DBS_FETCH_THROUGH_ARBITER_CONTRACT,
                 BuildDbsFetch(c.ContractorDbId, c.ContractType, c.ContractId, c.Index,
                               ErrorNone, c.Opponents));
         }
         else
         {
-            bridge.SendFrame(DBS_FETCH_THROUGH_ARBITER_CONTRACT,
+            ArbiterClientHandlers.SendToWorld(c.ContractorDbId, DBS_FETCH_THROUGH_ARBITER_CONTRACT,
                 BuildDbsFetch(c.ContractorDbId, c.ContractType, c.ContractId, 0, ErrorTargetNotInWorld));
             Forget(c.Index);
         }
@@ -811,9 +812,8 @@ public static class ContractBroker
         {
             var s = bridge.SessionForPlayerId(who);
             if (s != null) { s.Send(clients == 0 ? packet : (byte[])packet.Clone()); clients++; }
-            bridge.SendFrame(DBS_SEND_END_THROUGH_ARBITER_CONTRACT,
-                BuildDbsSendEnd(r.ContractorDbId, r.ContractType, r.ContractId, who));
-            frames++;
+            if (ArbiterClientHandlers.SendToWorld(who, DBS_SEND_END_THROUGH_ARBITER_CONTRACT,
+                BuildDbsSendEnd(r.ContractorDbId, r.ContractType, r.ContractId, who))) frames++;
         }
         Log.LogInformation("Contract for {Cid} ended: S_END to {C} client(s), {F} x 0x280F",
             r.ContractId, clients, frames);
@@ -872,9 +872,9 @@ public static class ContractBroker
             return true;
         }
 
-        bridge.SendFrame(DBS_SEND_END_THROUGH_ARBITER_CONTRACT,
+        ArbiterClientHandlers.SendToWorld(s, DBS_SEND_END_THROUGH_ARBITER_CONTRACT,
             BuildDbsSendEnd(requestorDbId, r.ContractType, r.ContractId, replierDbId));
-        bridge.SendFrame(DBS_REPLY_THROUGH_ARBITER_CONTRACT,
+        ArbiterClientHandlers.SendToWorld(requestorDbId, DBS_REPLY_THROUGH_ARBITER_CONTRACT,
             BuildDbsReply(requestorDbId, replierDbId, r.ContractType, r.ContractId, r.Reply));
 
         Forget(r.ContractIndex);

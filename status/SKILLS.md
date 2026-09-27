@@ -50,7 +50,7 @@ arrays, actives first, and that is `S_SKILL_LIST`.
 
 ## 2. The proof, end to end
 
-From `<captures>\cap_newchar.log` + `cap_newchar_client.log` (the same session — a character
+From `D:\packetlogs\cap_newchar.log` + `cap_newchar_client.log` (the same session — a character
 created and played from scratch by the *real* ArbiterServer):
 
 - `data/starter_blob.bin` holds **7 active** ids at 7200 and **17 passive** at 6880:

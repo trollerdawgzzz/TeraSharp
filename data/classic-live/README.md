@@ -31,7 +31,7 @@ starting with `#` are ignored, so a header comment saying where the frame came f
 
 `<n>` is the frame number in your own listing; `LoadLiveFrame` takes the exact file name, so if
 you regenerate these, the test's file names have to match what you wrote. Absent, the tests
-report `SKIP <test>: data/classic-live/<name> not found` and are not failures.
+print `(skipped: data/classic-live/<name> not found)` and pass.
 
 ## Generating them
 
@@ -57,7 +57,7 @@ than decode into nonsense. Ranks are competition ranks (1, 1, 3), not dense.
 
 A page with only your own characters on it is enough to exercise all of that.
 
-## T147b - crafting (`<captures>\classic_craft.log`)
+## T147b - crafting (`D:\packetlogs\classic_craft.log`)
 
 A second live character, one that crafts and gathers. These are World-built packets, so the
 tests pin their layout by decode and re-encode and check the fields the Arbiter feeds.
@@ -67,7 +67,7 @@ tests pin their layout by decode and re-encode and check the fields the Arbiter 
 | `S_ARTISAN_SKILL_LIST-95.hex` | 95, 169 B | five skills, the 32-byte element, proficiency values 500 / 555 / 590 / 1 / 9 |
 | `S_ARTISAN_RECIPE_LIST-96.hex` | 96, 3451 B | 36 learned recipes, the 46-byte element and its 17-byte materials |
 
-## T156 - the Vanguard Initiative window (`<captures>\classic_live3.log`)
+## T156 - the Vanguard Initiative window (`D:\packetlogs\classic_live3.log`)
 
 World-built too: the tests decode them and check every byte is accounted for.
 

@@ -1,6 +1,6 @@
 # T169 - real-Arbiter census and pins (cap_final2a/2b, 2026-09-22)
 
-Sources: `<captures>\cap_final2a.log` + `cap_final2b.log` (A<->W taps), `cap_final2_clients\*.log`
+Sources: `D:\packetlogs\cap_final2a.log` + `cap_final2b.log` (A<->W taps), `cap_final2_clients\*.log`
 (9 client connections). Status is cowork/T8 at T169: DbProxy/DbAck/Party/Guild/Contract probe plus a
 source scan (a const with no use counts as "never sent"). Frame counts are both taps together.
 

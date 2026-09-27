@@ -51,8 +51,10 @@ list as the fallback for the case where World asks for nothing.**
 
 ### The payload shape was also slightly wrong
 
-Writer `FUN_1407ace90` (`Arb_part_066.c:17289`): it opens the packet with opcode `0x1581`, then
-appends its three arguments as a u32, a u8 and a u64, in that order.
+Writer `FUN_1407ace90` (`Arb_part_066.c:17289`) writes opcode `0x1581` and then appends its three
+arguments in argument order through the stream's 4-byte, 1-byte and 8-byte primitives
+(`FUN_14013d0b0`, `FUN_1403513d0`, `FUN_140351270`) — a u32, then a u8, then a u64, packed with no
+padding between them.
 
 Dumper field names (`Arb_part_011.c:10058`): `DungeonId` @frame+6, `IsOn` @frame+10,
 `NextChange` @frame+0x0B. So the 13-byte payload is
@@ -69,10 +71,10 @@ the fix.
 `DungeonManager::SetDungeonTimelineOpen(int,bool,__int64,bool)` = `FUN_140786fd0`
 (`Arb_part_065.c:13433`) is what the `0x13F2` handler calls, once per record, and it broadcasts
 to all 0x20 world-session slots (`Arb_part_065.c:13600`). The handler itself
-(`Handler_DSA_DUNGEON_TIMELINE_OPEN_INFO`, `Arb_part_062.c:332`) is a pure fan-out:
-
-It reads the record's fields straight out of the frame and hands them to the broadcaster
-unchanged; the layout is below.
+(`Handler_DSA_DUNGEON_TIMELINE_OPEN_INFO`, `Arb_part_062.c:332`) is a pure fan-out: per node it
+calls `FUN_140786fd0` on the global `DungeonManager` with four fields lifted straight off the node
+and nothing else — `DungeonId` (node+8) as an int, `CurrOpen` (node+0x0C) as a byte, `NextChange`
+(node+0x0D) as 8 bytes, and `SendSystemMessage` (node+0x15) as 1 byte.
 
 `DSA_DUNGEON_TIMELINE_OPEN_INFO` (0x13F2) layout, from the dumper at `Arb_part_016.c:2781`
 (`L"OpenInfo"`, `L"DungeonId"`, `L"CurrOpen"`, `L"NextChange"`, `L"SendSystemMessage"`):
@@ -82,14 +84,15 @@ unchanged; the layout is below.
   [u32 self][u32 next][u32 DungeonId][u8 CurrOpen][i64 NextChange][u8 SendSystemMessage]
 ```
 
-Node size confirmed by the handler's own guard `(longlong)iVar2 + 0x16U <= …`.
+Node size confirmed by the handler's own guard: it keeps reading only while the current node's
+start offset plus `0x16` stays `<=` the list limit.
 
 ---
 
 ## 1. Where the Arbiter reads datasheets from
 
-`ServerConfig.xml` carries a **name → filename-glob table** read at boot
-(`Arb_part_077.c:3434`, which asks the config object for its `Datasheet` section):
+`ServerConfig.xml` carries a **name → filename-glob table** read at boot — `Arb_part_077.c:3434`
+calls vtable slot `+0x108` on the config object with the section name `L"Datasheet"`:
 
 ```xml
 <Datasheet rootFolder=".\Datasheet\" …>
@@ -105,7 +108,8 @@ Node size confirmed by the handler's own guard `(longlong)iVar2 + 0x16U <= …`.
 Only **8** `.xml` filenames are hardcoded in the whole binary (`ServerConfig.xml`,
 `DeploymentConfig.xml`, `DefineDefine.xml`, `Version.xml`, `NetModeratorConfig.xml` and three
 DB-definition files); everything else resolves through that table by logical name, e.g.
-`Arb_part_085.c:989`, which resolves the logical name `PoliticsTemplate` through it.
+`Arb_part_085.c:989`, where `FUN_140033940` is handed a 0x10-byte result buffer and the logical
+name `L"PoliticsTemplate"`.
 
 **They are plain XML in `Executable\Datasheet\`. There is no packed or compiled form.**
 
@@ -150,13 +154,10 @@ constant — it is independently observable: `SA_WORLD_SERVER_STATUS` (0x164D, 2
 matches `(DungeonData ∩ ContinentData) − DungeonMatching` exactly, in order.
 
 `isActive` is parsed World-side in `DungeonBaseTemplate::ParseConstraint`
-(`WorldServer.exe.c:266453`):
-
-It reads the `isActive` attribute off the parsed node and stores it as the byte at
-`DungeonBaseTemplate+0x95`.
-
-and consumed by `DungeonOffManager::IsDisabled(int)` (`:3151768`) as
-`(*(char *)(puVar3[5] + 0x95) != '\0')`.
+(`WorldServer.exe.c:266453`): it reads the `isActive` attribute off the XML node through that
+node's vtable slot `+0x10` with `0` as the default, and stores the result as a single byte at
+`template+0x95`. `DungeonOffManager::IsDisabled(int)` (`:3151768`) reads that same byte back —
+through the template pointer at index 5 of its own object — and returns whether it is non-zero.
 
 The `DungeonMatching` exclusion is consistent with `ServerConfig.xml`:
 
@@ -187,9 +188,14 @@ captures at the same position (`arb_world.log` chunks 6→7, 76-byte frame).
 Writer `World::SendPoliticsUnit(class Session *)` (`Arb_part_074.c:4349`) emits an
 offset/length pair then a raw `int[]`:
 
-It opens the packet with opcode `0x1559`, reserves the `dataOffset` and `byteLength` u32 slots
-by writing zero into each, backpatches the offset once the data begins, appends the ints one at
-a time, and finally backpatches the length as the element count times four.
+```
+write u16 opcode 0x1559
+slotOffset = reserve u32, written as 0         // u32 dataOffset, backpatched
+slotLength = reserve u32, written as 0         // u32 byteLength, backpatched
+*slotOffset = cursor                           // the int[] starts here
+for each id in the list: write u32 id; cursor += 4
+*slotLength = ((listEnd - listBegin) >> 2) * 4 // = idCount * 4
+```
 
 ⇒ `[u32 dataOffset=14][u32 byteLength=68][int[17]]`. Decoded from `lobby_tap.log` seq 7:
 

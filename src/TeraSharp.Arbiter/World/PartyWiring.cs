@@ -109,6 +109,7 @@ public static class PartyWiring
         ("C_PARTY_LOOTING_METHOD",     PartyPackets.C_PARTY_LOOTING_METHOD),        // 0x5D24
         ("C_MERGE_PARTY_TO_RAID",      PartyPackets.C_MERGE_PARTY_TO_RAID),         // 0xB8D0
         ("C_REQUEST_PARTY_INFO",       PartyPackets.C_REQUEST_PARTY_INFO),          // 0xFD35
+        ("C_RESET_ALL_DUNGEON",        PartyPackets.C_RESET_ALL_DUNGEON),           // 0x5867
     };
 
     /// <summary>
@@ -155,6 +156,7 @@ public static class PartyWiring
         PartyPackets.C_PARTY_LOOTING_METHOD => 0x17,
         PartyPackets.C_MERGE_PARTY_TO_RAID => 0x0D,
         PartyPackets.C_REQUEST_PARTY_INFO => 0x08,
+        PartyPackets.C_RESET_ALL_DUNGEON => ClientHeaderSize,
         _ => 0,
     };
 
@@ -204,7 +206,7 @@ public static class PartyWiring
 
     /// <summary>
     /// An <see cref="ActionDispatcher"/> bound to live sessions. Parties address clients by tunnel
-    /// Ticket only (<see cref="PartyManager.PartyPlayer.Ticket"/> is <c>GameSession.TunnelKey</c>),
+    /// a stable local recipient key (the character id), not a per-World tunnel ticket,
     /// so the player-id lookup exists purely so a rejection can still reach
     /// <paramref name="origin"/> when World is not up - standalone mode, and every unit test.
     /// <c>ResolveDef</c> is null on purpose; see the header.
@@ -212,16 +214,87 @@ public static class PartyWiring
     internal static ActionDispatcher Dispatcher(GameSession? origin, ILogger log)
     {
         var world = Bridge;
-        uint originTicket = origin?.TunnelKey ?? 0;
+        uint originTicket = origin == null ? 0 : RecipientKey(origin);
         bool haveOrigin = origin != null;
         return new ActionDispatcher(
-            t => Sink(world?.SessionForTicket(t) ?? (haveOrigin && t == originTicket ? origin : null)),
+            t => Sink((Manager.TryGetPlayer(t, out var player) ? world?.SessionForPlayerId(player.UserDbId) : null)
+                ?? (haveOrigin && t == originTicket ? origin : null)),
             p => Sink(world?.SessionForPlayerId(p)),
-            (op, payload) => { if (world == null) return false; world.SendFrame(op, payload); return true; },
+            (op, payload) => SendWorldAction(world, op, payload),
             log);
     }
 
+    private static bool SendWorldAction(WorldBridge? world, ushort op, byte[] payload)
+    {
+        if (world == null) return false;
+        return RouteWorldAction(op, payload, world.HasLinks,
+            playerId => world.SessionForPlayerId(playerId)?.CurrentWorldId, world.SendFrame);
+    }
+
+    internal static bool RouteWorldAction(ushort op, byte[] payload, Func<int, bool> hasLinks,
+        Func<int, int?> worldForPlayer, Action<int, ushort, byte[]> send)
+    {
+        if (op == PartyPackets.AS_RESET_ALL_DUNGEON
+            || op == PartyPackets.AS_DO_CREATE_PARTY
+            || op == PartyPackets.AS_DO_ADD_PARTY_MEMBER
+            || op == PartyPackets.AS_DO_REMOVE_PARTY_MEMBER
+            || op == PartyPackets.AS_DO_DISMISS_PARTY
+            || op == PartyPackets.AS_DO_EXTEND_PARTY
+            || op == PartyPackets.AS_DO_SWAP_PARTY
+            || op == PartyPackets.AS_DO_SET_PARTY_MANAGER
+            || op == PartyPackets.AS_DO_CHANGE_PARTY_MEMBER_AUTHORITY
+            || op == PartyPackets.AS_DO_SET_LOOTING_METHOD
+            || op == PartyPackets.AS_DO_SET_PARTY_OWNER
+            || op == PartyPackets.AS_DISMISS_PARTY
+            || op == PartyPackets.AS_PARTY_LOOTING_METHOD
+            || op == PartyPackets.AS_BAN_PARTY_MEMBER)
+        {
+            // Broadcast once per registered World, not per bypass socket. Reset:
+            // Arb041:10100-10114; remove: Arb067:8245-8260; dismiss: Arb066:18102-18124.
+            // Creation: Arb079:15465-15491; cap_2man_b:12571/12572,18232/18234.
+            // cap_2man_b:19038/19039 and19048/19049 reach World0 and World13.
+            // T195: vote requests also broadcast (Arb041:1489-1535,5113-5137;
+            // Arb040:19290-19314). Mirrors update every World (Arb067:5364-5389).
+            bool sent = false;
+            for (int id = 0; id < WorldRegistration.MaxWorldId; id++)
+                if (hasLinks(id)) { send(id, op, payload); sent = true; }
+            return sent;
+        }
+        if (op == PartyPackets.AS_CHANGE_EVENT_MATCHING_STATE)
+        {
+            // This is deliberately World0, even for users inside a dungeon World:
+            // cap_2man_b:17291/17292 and19036/19037. FUN_14056dbe0 is
+            // GetDataSessionByServerId(int) (Arb046:2704-2729); admission, formation,
+            // and leave call it with literal0 (Arb076:15129,8270; Arb079:3261; Arb077:6151).
+            if (payload.Length < 5 || !hasLinks(WorldRegistration.DefaultWorldId)) return false;
+            send(WorldRegistration.DefaultWorldId, op, payload);
+            return true;
+        }
+        if (op == PartyPackets.AS_NOTIFY_ABOUT_SYS_PARTY_WITHDRAWAL
+            || op == PartyPackets.AS_REQUEST_REFRESH_PARTY_INFO)
+        {
+            // Leave job resolves the departing user's current World session:
+            // Arb_part_082.c:15914-15925; cap_2man_b:19061 goes only to World13,
+            // registered on link#54 at11532 (World0 is link#26 at10299).
+            // Refresh also resolves the user's World (Arb067:13616-13639), with just
+            // UserDbId at payload0 instead of the withdrawal packet's PDId.
+            int userOffset = op == PartyPackets.AS_REQUEST_REFRESH_PARTY_INFO ? 0 : 4;
+            if (payload.Length < userOffset + 4
+                || worldForPlayer(BitConverter.ToInt32(payload, userOffset)) is not { } id)
+                return false;
+            send(id, op, payload);
+            return true;
+        }
+        send(WorldRegistration.DefaultWorldId, op, payload);
+        return true;
+    }
+
     private static IClientSink? Sink(GameSession? s) => s == null ? null : new SessionSinkAdapter(s);
+
+    // T195: native party membership uses PDId, not bypass slot. cap_instance1
+    // 136991/137332 ->146976/147327 swaps tickets5/6 between users10/9.
+    // This key is internal to PartyManager/ActionDispatcher and never goes on the wire.
+    private static uint RecipientKey(GameSession session) => session.SelectedCharacter?.Id ?? session.PlayerId;
 
     /// <summary>ActionDispatcher's sink over a real session: the same three methods, same
     /// signatures. The twin of SocialHandlers' adapter; both are private to their file because
@@ -243,26 +316,23 @@ public static class PartyWiring
     /// Tell the party manager this character is online, so a Ticket resolves to a character and a
     /// member who logged back in goes Online again in whatever party still holds them. Idempotent.
     ///
-    /// <para>Gated on <c>InWorld</c> because the Ticket is what the manager keys on and it is only
-    /// allocated in <c>WorldEntry</c>, one line before the roster call. A session that has picked
-    /// a character but not entered world still has whatever TunnelKey it was left with, and
-    /// TicketAllocator wraps at 4096, so ticket 0 is a real ticket rather than a sentinel - hence
-    /// the state test rather than a <c>!= 0</c> test.</para>
+    /// <para>Gated on <c>InWorld</c>. The local recipient token is stable across transfers;
+    /// World's bypass tickets are a separate namespace and can collide across Worlds.</para>
     /// </summary>
     public static void Register(GameSession? session)
     {
         var chr = session?.SelectedCharacter;
         if (chr == null || !session!.InWorld) return;
-        Register(session!.TunnelKey, (int)chr.Id, chr.Name, chr.Level, chr.Class, chr.Race,
-                 chr.Gender, session!.GameId);
+        Register(RecipientKey(session!), (int)chr.Id, chr.Name, chr.Level, chr.Class, chr.Race,
+                 chr.Gender, session!.GameId, session.CurrentWorldId);
     }
 
     /// <summary>The session-free half, so the tests can build a roster without a socket.</summary>
     internal static void Register(uint ticket, int userDbId, string name, int level, int cls,
-                                  int race, int gender, ulong gameId)
+                                  int race, int gender, ulong gameId, int worldId = 0)
         => Manager.Register(new PartyManager.PartyPlayer(
             Ticket: ticket, UserDbId: userDbId, Name: name, Level: level, Class: cls, Race: race,
-            Gender: gender, GameId: gameId));
+            Gender: gender, GameId: gameId, WorldId: worldId));
 
     /// <summary>
     /// Leave world or drop the connection. The party SURVIVES - PartyMemberInfo+0x70 is an Online
@@ -273,9 +343,25 @@ public static class PartyWiring
     public static void Unregister(GameSession? session)
     {
         if (session == null) return;
-        var actions = Manager.Unregister(session.TunnelKey);
+        var actions = Manager.Unregister(RecipientKey(session));
         if (actions.IsEmpty && actions.Rejected == null) return;
         Dispatcher(session, PartyLog).Dispatch(actions, "party-leave");
+    }
+
+    /// <summary>World has finished loading a party member. Retail asks that user's World
+    /// to refresh party data, after SA_ENTER_WORLD rather than during registration:
+    /// cap_2man_b raw13913+15 ->14041; Arb029:12364 ->Arb079:14553-14570
+    /// ->Arb067:9181/13616-13639. Ordinary and system parties both take this path.</summary>
+    internal static bool OnWorldEntryComplete(WorldBridge? world, ulong arbiterUser)
+    {
+        var session = world?.PlayerForGameId(arbiterUser);
+        var character = session?.SelectedCharacter;
+        if (session == null || !session.InWorld || character == null
+            || Manager.FindByMember((int)character.Id) == null
+            || !world!.HasLinks(session.CurrentWorldId)) return false;
+        return RouteWorldAction(PartyPackets.AS_REQUEST_REFRESH_PARTY_INFO,
+            PartyPackets.BuildAsRequestRefreshPartyInfo((int)character.Id), world.HasLinks,
+            id => id == character.Id ? session.CurrentWorldId : null, world.SendFrame);
     }
 
     /// <summary>
@@ -309,6 +395,16 @@ public static class PartyWiring
         foreach (var s in world.InWorldSessions()) Register(s);
     }
 
+    internal static void SendChat(GameSession sender, uint channel, string message)
+    {
+        SyncRoster();
+        Register(sender);
+        var store = global::TeraSharp.Arbiter.Program.Store;
+        var actions = Manager.Chat(RecipientKey(sender), channel, message,
+            (recipient, from) => store?.GetBlocks(recipient).Contains(from) == true);
+        Dispatcher(sender, PartyLog).Dispatch(actions, "party-chat");
+    }
+
     // =========================================================================================
     // 5. The two entry points the human's two lines call
     // =========================================================================================
@@ -330,7 +426,7 @@ public static class PartyWiring
 
         SyncRoster();
         Register(session);
-        DispatchClientPacket(Manager, Dispatcher(session, PartyLog), session.TunnelKey, opcode, body.ToArray());
+        DispatchClientPacket(Manager, Dispatcher(session, PartyLog), RecipientKey(session), opcode, body.ToArray());
         return true;
     }
 
@@ -342,6 +438,14 @@ public static class PartyWiring
     /// </summary>
     public static bool TryHandleWorldFrame(ushort opcode, byte[] payload)
     {
+        if (opcode == PartyPackets.SA_EQUIP_ITEM_LEVEL)
+        {
+            // T180's handle convention: our AS_ENTER_WORLD carries GameId as the opaque
+            // Arbiter handle. Native captures carry pointers; neither is a database id.
+            Manager.ObserveEquipItemLevel(payload,
+                handle => Bridge?.PlayerForGameId(handle)?.SelectedCharacter is { } c ? (int)c.Id : null);
+            return true;
+        }
         if (!HandlesWorldFrame(opcode)) return false;
         DispatchWorldFrame(Manager, Dispatcher(null, PartyLog), opcode, payload);
         // T161: leaving (or being voted out of) the party a match formed is how a member turns

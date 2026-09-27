@@ -675,7 +675,7 @@ list is a UI refresh, not state, and he gets it from the tab on the way back in.
 
 ## T141 - checked against a live Classic+ server
 
-`<captures>\classic_live4.log` is a client capture of a third-party 100.02 server driven
+`D:\packetlogs\classic_live4.log` is a client capture of a third-party 100.02 server driven
 through one whole broker episode: register, the waiting list new/page/sort, buy-it-now,
 calc-bought, and the bought / sold / registered tabs. Every S_ the Arbiter builds was rebuilt
 from the frame's own decoded values and diffed byte-for-byte.

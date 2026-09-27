@@ -190,17 +190,36 @@ public static class GuildWiring
     /// <c>Dispatcher_encodes_with_the_corrected_def_when_one_resolves</c> is the test that fails
     /// if this is dropped.</para>
     /// </summary>
-    internal static ActionDispatcher Dispatcher(GameSession? origin, ILogger log)
+    internal static ActionDispatcher Dispatcher(GameSession? origin, ILogger log,
+        Func<ushort, byte[], bool>? worldReply = null)
     {
         var world = Bridge;
         int originId = origin != null ? (int)origin.PlayerId : -1;
         return new ActionDispatcher(
             t => Sink(world?.SessionForTicket(t)),
             p => Sink(world?.SessionForPlayerId(p) ?? (p == originId ? origin : null)),
-            (op, payload) => { if (world == null) return false; world.SendFrame(op, payload); return true; },
+            worldReply ?? ((op, payload) => SendWorldAction(world, op, payload)),
             log)
         { ResolveDef = n => GuildHandlers.ResolveDef(null, n) };
     }
+
+    internal static bool SendWorldAction(WorldBridge? world, ushort op, byte[] payload)
+    {
+        if (world == null) return false;
+        // Native UserJoinToGuild sends this one push to the joining user only:
+        // Arb069:4373-4380 -> Arb067:17036. Other unsolicited guild actions are mirrors
+        // broadcast to every World (Arb045:4885-5067; Arb027:1219-1265).
+        // SA_LOAD_GUILD uses its requesting-link dispatcher instead (Arb072:14286).
+        if (op == GuildPackets.AS_GUILD_JOINED || op == GuildWarManager.AS_NOTIFY_GUILD_WAR_INFO)
+            return payload.Length >= 4 && GuildPlayerWorldSend(BitConverter.ToInt32(payload, 0), op, payload);
+        bool sent = false;
+        for (int id = 0; id < WorldRegistration.MaxWorldId; id++)
+            if (world.HasLinks(id)) { world.SendFrame(id, op, payload); sent = true; }
+        return sent;
+    }
+
+    private static bool GuildPlayerWorldSend(int playerId, ushort op, byte[] payload)
+        => global::TeraSharp.Arbiter.Handlers.ArbiterClientHandlers.SendToWorld(playerId, op, payload);
 
     private static IClientSink? Sink(GameSession? s) => s == null ? null : new SessionSinkAdapter(s);
 
@@ -496,11 +515,18 @@ public static class GuildWiring
     /// the caller can <c>return</c>; false leaves it to DbProxy and the replay table exactly as
     /// before.
     /// </summary>
-    public static bool TryHandleWorldFrame(ushort opcode, byte[] payload)
+    public static bool TryHandleWorldFrame(ushort opcode, byte[] payload,
+        Action<ushort, byte[]>? reply = null)
     {
         if (!HandlesWorldFrame(opcode)) return false;
         var actions = OnWorldFrame(Store, opcode, payload);
-        Dispatcher(null, GuildLog).Dispatch(actions, "guild-world");
+        // Native Handler_SA_LOAD_GUILD sends 144D/27D0/27D1/27D2 through
+        // param2, the requesting WorldServerSession (Arb072:14163,14244,
+        // 14286-14300,14490-14560). Mutations below remain global mirrors.
+        Func<ushort, byte[], bool>? requestReply = opcode == GuildPackets.SA_LOAD_GUILD
+            ? (op, body) => { if (reply == null) return false; reply(op, body); return true; }
+            : null;
+        Dispatcher(null, GuildLog, requestReply).Dispatch(actions, "guild-world");
         return true;
     }
 
@@ -627,13 +653,13 @@ public static class GuildWiring
     // that are easy to get wrong:
     //   * NONE of them sends a client packet except the chief change. The guild window is
     //     refreshed by the S_ packets the C_ handlers already answer, not by these.
-    //   * The AS_ fan-out in the decompile is a loop over all 32 WorldServerSession slots, i.e.
-    //     "tell every World". ArbiterActions.World is exactly that, so a.World is the twin.
+    //   * Mutation AS_ fan-out loops over all 32 WorldServerSession slots. SA_LOAD_GUILD
+    //     is a request/reply exception: TryHandleWorldFrame sends it to its incoming link.
     // =========================================================================================
 
     /// <summary>
     /// SA_LOAD_GUILD (0x13FB) - Handler_SA_LOAD_GUILD, Arb_part_072.c:14046. Re-push one guild's
-    /// mirror to World. The writer calls in that function are, in order,
+    /// mirror to the requesting WorldServerSession. The writer calls in that function are, in order,
     /// <c>0x144D</c>, <c>0x27D0</c>, <c>0x27D1</c>, <c>0x27D2</c> - so this is NOT the boot load:
     /// the guild blob goes out as <c>AS_LOAD_GUILD_DATA</c> (0x144D) rather than
     /// <c>DBS_INIT_GUILD_DATA</c> (0x27ED), and there is no <c>DBS_LOAD_GUILD_COMPLETE</c>
@@ -985,8 +1011,8 @@ public static class GuildWiring
         return frames;
     }
 
-    /// <summary>DBS_INIT_GUILD_PERK_LIST's element stride, from the 0xc its writer's loop adds
-    /// per record (Arb_part_072.c:14554). The contents are two
+    /// <summary>DBS_INIT_GUILD_PERK_LIST's element stride, from its writer's loop, which advances
+    /// the running frame length by 0xc per element (Arb_part_072.c:14554). The contents are two
     /// u32s and never non-empty here, so only the stride matters.</summary>
     public const int GuildPerkRecordSize = 0x0C;
 

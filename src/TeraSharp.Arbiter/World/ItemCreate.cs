@@ -46,6 +46,7 @@ public static class ItemCreate
         (0x264, 0x03C, 4), (0x268, 0x040, 4), (0x26C, 0x044, 4), (0x270, 0x048, 4), (0x274, 0x04C, 4),
         (0x104, 0x134, 4),
         (0x128, 0x138, 1), (0x129, 0x139, 1),
+        (0x0E0, 0x13C, 8), // masterwork stat-rate indices; same ItemData fields as op86 (T166).
         (0x108, 0x148, 8), (0x110, 0x150, 1), (0x120, 0x158, 8),
         (0x16C, 0x160, 4), (0x170, 0x164, 4), (0x178, 0x168, 4), (0x174, 0x16C, 4),
         (0x1D0, 0x170, 8),
@@ -106,6 +107,10 @@ public static class ItemCreate
             if (BitConverter.ToUInt32(atom.Slice(WarehouseHandlers.AtomOp, 4)) != WarehouseHandlers.TsInsertNonStackItem) continue;
             int id = BitConverter.ToInt32(atom.Slice(WarehouseHandlers.AtomItemDbId, 4));
             var row = id != 0 ? store.GetItem(id) : null;
+            // T201 native ForceOpenIdentify clears unidentified-grade in the returned atom and
+            // persisted record. This affects op8 only; an unset QA flag preserves every capture.
+            if (row != null && Handlers.QaInventoryCommands.OpenIdentify) atom.Slice(0x104, 4).Clear();
+            if (row != null) Handlers.QaInventoryCommands.ApplyMasterworkRate(atom);
             var rec = BuildRecord(atom);
             if (row is null || rec is null) continue;
             store.UpsertItem(row.ItemDbId, row.OwnerDbId, row.InvenType, row.Slot, row.TemplateId, row.Amount, rec);

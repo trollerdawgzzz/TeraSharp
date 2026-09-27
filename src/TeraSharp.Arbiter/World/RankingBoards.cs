@@ -30,16 +30,14 @@ public readonly record struct RankingRow(
 /// straight off the writer, <c>PVERankingSystemManager::SendRankList</c> (Arb_part_050.c:9747,
 /// which stamps 0xBEDC at :9758). Every offset below is that function's own store:
 /// <code>
-///   +0    u16  here
-///   +2    u16  next
-///   +4    u16  nameOffset
-///   +6    u8   IsRookie(..)
-///   +7    u32  rankInfo+0x1C
-///   +11   u32  rankInfo+0x18
-///   +15   u32  rankInfo+0x08
-///   +19   u64  rankInfo+0x10
-///   +27   u32  node+0x18
-///   then the cursor advances 0x1f and nameOffset is backpatched to it; the name follows
+///   el+0  u16 here;  el+2  u16 next;  el+4  u16 nameOffset
+///   el+6  u8  IsRookie(..)
+///   el+7  u32 rankInfo+0x1C
+///   el+11 u32 rankInfo+0x18
+///   el+15 u32 rankInfo+0x08
+///   el+19 u64 rankInfo+0x10
+///   el+27 u32 node+0x18
+///   frameLength += 0x1f;  el+4 = frameLength;                        // then the name
 /// </code>
 /// so the element is 31 fixed bytes and a NUL-terminated UTF-16 name.</item>
 /// </list>
@@ -81,7 +79,7 @@ public static class RankingBoards
 {
     /// <summary>
     /// The season number the live Classic+ server was on when
-    /// <c><captures>\classic_live.npcap</c> was taken (T130): both
+    /// <c>D:\packetlogs\classic_live.npcap</c> was taken (T130): both
     /// <c>S_P*_LEADER_BOARD_INFO</c> frames carry <c>season = 15</c>, and every
     /// <c>C_REQUEST_P*_RANKING</c> in that capture asks for 15. T119 assumed 1, which was
     /// T91's own capture from 2022 and is four years of seasons out of date.
@@ -109,7 +107,7 @@ public static class RankingBoards
         {
             if (_season is int s) return s;
             int v = DefaultSeason;
-            var raw = Environment.GetEnvironmentVariable(SeasonEnvVariable);
+            var raw = TerasConfig.Get(SeasonEnvVariable);
             if (!string.IsNullOrWhiteSpace(raw) && int.TryParse(raw.Trim(), out int parsed)
                 && parsed > 0) v = parsed;
             _season = v;
@@ -145,8 +143,8 @@ public static class RankingBoards
 
     // ---- the PvP element ----
     // The .def and the writer disagree on the first two scalars: the def declares
-    // `int32 unk; byte unk2`, which encodes as i32@6 + u8@10, while the writer stores
-    // a u8 at +6 and a u32 at +7
+    // `int32 unk; byte unk2`, which encodes as i32@6 + u8@10, while the writer stores a u8 at
+    // element+6 and a u32 at element+7
     // (Arb_part_050.c:10266-10267) - byte FIRST. The decompile wins, so the byte sits at +6.
     // Both fields are 0 in every frame we send, so the bytes are the same either way and the
     // def cross-check in the tests still holds; only the shape is corrected.
@@ -398,8 +396,8 @@ public static class RankingBoards
     /// <summary>
     /// T133. Whether the requester's own line (<c>S_USER_P*_RANKING</c>) follows the list.
     /// <c>SendNowSeasonRank</c> guards it with
-    /// the requested class matching either the requester's own class or the aggregate 0x10
-    /// (Arb_part_050.c:9961):
+    /// <c>requestedClass == myClass || requestedClass == 0x10</c>, where myClass is the int at
+    /// +0x2f of the requester's record (Arb_part_050.c:9961):
     /// the class asked for is the requester's own, or the aggregate. classic_live agrees on
     /// all nine of its requests - the one that asked for a class the viewer is not (frame
     /// 5846, class 0 from a class-9 player) got the list alone.

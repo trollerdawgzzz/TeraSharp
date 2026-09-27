@@ -80,7 +80,7 @@ public static class HandlerRegistry
                 // C_LOAD_TOPO_FIN (first spawn AND after a zone change). T45: built from the visited_sections
                 // rows - the hard-coded empty list told World "nothing explored" on every relog.
                 s.Send(ArbiterClientHandlers.BuildVisitedSectionListFor(s));   // T75/T79: FIRST in the burst, as frame 257 - S_VISITED_SECTION_LIST from visited_sections (stops the intro cutscene replaying)
-                s.Send(ArbiterClientHandlers.BuildCrestInfoFor(s));            // T83: crest points + learned crests (frames 304/314)
+                // T197: World owns S_CREST_INFO; a synthetic zero-use packet resets glyphs on every topo-fin.
                 s.Send(ArbiterClientHandlers.BuildChangeCardPreset());         // T83: card preset (frames 329/375)
                 if (GmCommandHandlers.LevelOf(s, Program.Store) >= 1)   // T107: the real server sends these only to GMs
                 {
@@ -161,6 +161,9 @@ public static class HandlerRegistry
         foreach (var (guildName, guildOp) in GuildWiring.ClientOpcodes)
             Reg(guildName, GuildWiring.MinBodyLength(guildOp),
                 (s, body) => GuildWiring.OnClientPacket(s, guildOp, body));
+
+        // T183: camp discovery is Arbiter-owned (16-byte client frame).
+        Reg("C_TEL_CAMP", CampTeleportHandlers.BodySize, CampTeleportHandlers.OnTelCamp);
 
         // --- Trade broker (T55, status/BROKER-DESIGN.md section 8.2): 15 C_ packets
         //     (C_TRADE_BROKER_HIGHEST_ITEM_LEVEL is T45's, registered below) ---
@@ -278,7 +281,7 @@ public static class HandlerRegistry
         foreach (var name in new[]
         {
             "C_VIEW_BATTLE_FIELD_RESULT",
-            "C_REQUEST_CANDIDATE_LIST", "C_SHOW_AWESOMIUMWEB_SHOP", "C_RESET_ALL_DUNGEON",
+            "C_REQUEST_CANDIDATE_LIST", "C_SHOW_AWESOMIUMWEB_SHOP",
             "C_UPDATE_CONTENTS_PLAYTIME", "C_EVENT_GUIDE",
             // T97: real handlers that parse nothing / store nothing / reply nothing
             "C_GET_ATTENDANCE_REWARD", "C_REQUEST_STACK_ATTENDANCE_EVENT_REWARD", "C_EVENT_MATCHING_DUNGEON_DETAIL_INFO",
@@ -377,13 +380,13 @@ public static class HandlerRegistry
         //      client sent S_RETURN_TO_LOBBY (handled in GameSession).
         void StartLeaveCountdown(GameSession s, LeaveMode mode, string preparePacket)
         {
-            const int countdown = 5;
+            int countdown = QaDiagnosticCommands.LeaveCountdownSeconds;
             s.BeginLeaveToWorld(mode);
             if (defs.Has(preparePacket))
                 s.SendByDef(preparePacket, new Dictionary<string, object> { ["time"] = countdown });
             var cts = new CancellationTokenSource();
             s.PendingLobbyReturn = cts;
-            _ = Task.Delay(TimeSpan.FromSeconds(countdown), cts.Token).ContinueWith(t =>
+            _ = QaDiagnosticCommands.WaitForLeaveCountdown(countdown, cts.Token).ContinueWith(t =>
             {
                 if (t.IsCanceled) return;
                 s.CompleteLeaveToWorld();

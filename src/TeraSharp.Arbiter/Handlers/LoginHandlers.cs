@@ -47,7 +47,7 @@ public sealed class LoginHandlers
         _log.LogInformation("C_LOGIN_ARBITER: account '{Name}' (id {Id}) language {Lang}, {N} character(s)",
             s.Account.Name, s.Account.AccountId, language, s.Account.Characters.Count);
 
-        s.SendByDef("S_LOADING_SCREEN_CONTROL_INFO", new Dictionary<string, object> { ["enableCustom"] = false });
+        s.SendByDef("S_LOADING_SCREEN_CONTROL_INFO", new Dictionary<string, object> { ["enableCustom"] = QaUtilityCommands.LoadingScreenEnabled(Program.Store) });
         s.SendByDef("S_SERVER_BUILD_INFO", new Dictionary<string, object> { ["langType"] = 6, ["revision"] = 376056 });
         s.SendByDef("S_REMAIN_PLAY_TIME", new Dictionary<string, object> { ["accountType"] = 6, ["minutesLeft"] = 0 });
         s.SendByDef("S_LOGIN_ARBITER", new Dictionary<string, object>
@@ -114,14 +114,14 @@ public sealed class LoginHandlers
 
         s.SendByDef("S_GET_USER_LIST", new Dictionary<string, object>
         {
-            ["characters"] = characters, ["veteran"] = false, ["bonusBufSec"] = 0, ["maxCharacters"] = CharacterHandlers.MaxCharactersPerAccount,
+            ["characters"] = characters, ["veteran"] = false, ["bonusBufSec"] = 0, ["maxCharacters"] = QaUtilityCommands.CharacterSlots(Program.Store, (long)s.Account.AccountId),
             ["first"] = true, ["more"] = false, ["leftDelTimeAccountOver"] = 0,
             ["deletionSectionClassifyLevel"] = 5, ["deleteCharacterExpireHour1"] = 0, ["deleteCharacterExpireHour2"] = 72,
         });
 
-        s.SendByDef("S_LOAD_CLIENT_ACCOUNT_SETTING", new Dictionary<string, object> { ["data"] = Array.Empty<byte>() });
+        ClientSettingsHandlers.SendAccountSetting(s);   // T191b: the STORED account-settings blob (an empty body made the client reset its options - the WASD prompt every login)
         // T89b: two lobby packets the real Arbiter sends here (cap_final_client frames 13 and 15).
-        s.Send(new byte[] { 0x08, 0x00, 0xB3, 0x57, 0x00, 0x00, 0x00, 0x00 });                      // S_DECO_UI_INFO, body all zero
+        s.Send(QaUiCommands.BuildDecoUi(Program.Store)); // T201: native persisted contents(type33) selection.
         {
             var inv = new byte[17];
             inv[0] = 0x11; inv[1] = 0x00; inv[2] = 0x1D; inv[3] = 0xD4;                                 // S_CONFIRM_INVITE_CODE_BUTTON
@@ -157,6 +157,10 @@ public sealed class LoginHandlers
         var chr = s.Account.Characters.Find(c => c.Id == (uint)id) ?? s.Account.Characters.FirstOrDefault();
         if (chr == null) { _log.LogWarning("C_SELECT_USER: no character {Id}", id); return true; }
 
+        // T185: reject before allocating an identity or sending any spawn/replay frames.
+        if (!WorldAvailability.Ready(Program.World) && !WorldAvailability.StandaloneEnabled)
+            return WorldAvailability.RefuseSelection(s, _log);
+
         s.SelectedCharacter = chr;
         // gameId from capture S_LOGIN/S_SPAWN_ME: 140737671856129 = 0x80000AF00001
         // Per-login counter from the World bridge (restarts at 1 per World process), like the real Arbiter.
@@ -166,17 +170,9 @@ public sealed class LoginHandlers
 
         _log.LogInformation("C_SELECT_USER: entering world as '{Name}' (gameId {GameId})", chr.Name, s.GameId);
 
-        // If the real WorldServer is connected, hand the player to it and let it drive.
-        var world = Program.World;
-        if (world != null && world.IsConnected && !world.IsReady)
-        {
-            // World still loading: reject like the real Arbiter does (client shows "You can't enter right now").
-            _log.LogWarning("C_SELECT_USER while World not ready - rejecting");
-            s.SendByDef("S_SYSTEM_MESSAGE", new Dictionary<string, object> { ["message"] = "@769" });
-            s.SendByDef("S_SELECT_USER", ArbiterClientHandlers.BuildSelectUserFields(accepted: false));   // T124
-            return true;
-        }
+        // The ready World owns entry. Only the explicit harness option permits fallback.
         if (WorldEntry.EnterWorld(s, _log)) return true;
+        if (!WorldAvailability.StandaloneEnabled) return WorldAvailability.RefuseSelection(s, _log);
 
         if (PureReplay) { SpawnReplay.ReplayPhase1(s, _log); return true; }
 
@@ -211,7 +207,7 @@ public sealed class LoginHandlers
             ["servants"] = new List<object>(),
         });
 
-        ClientSettingsHandlers.SendUserSetting(s);
+        // T191b: the real Arbiter sends no user-setting load here (cap_final2b) - ClientSettingsHandlers.SendUserSetting removed
         s.SendRawBody("S_USER_BLOCK_LIST", new byte[] { 0, 0, 0, 0 });
         s.SendRawBody("S_FRIEND_GROUP_LIST", new byte[] { 0x01,0x00,0x08,0x00,0x08,0x00,0x00,0x00,0x12,0x00,0x02,0x00,0x00,0x00,0x7D,0x59,0xCB,0x53,0x00,0x00 });
         s.SendRawBody("S_FRIEND_LIST", new byte[] { 0x00,0x00,0x00,0x00,0x0A,0x00,0xCA,0x4E,0x29,0x59,0x5F,0x4E,0x2F,0x66,0x09,0x61,0xEB,0x5F,0x84,0x76,0x00,0x4E,0x29,0x59,0x21,0x00,0x00,0x00 });
@@ -249,6 +245,13 @@ public sealed class LoginHandlers
     /// </summary>
     public bool OnLoadTopoFin(GameSession s, ReadOnlyMemory<byte> body)
     {
+        // In-world C_LOAD_TOPO_FIN is routed by HandlerRegistry. This is standalone only.
+        if (!WorldAvailability.StandaloneEnabled)
+        {
+            _log.LogWarning("C_LOAD_TOPO_FIN ignored outside World: standalone spawn is disabled");
+            return true;
+        }
+
         var chr = s.SelectedCharacter;
         if (chr == null) { _log.LogWarning("C_LOAD_TOPO_FIN without a selected character"); return true; }
 

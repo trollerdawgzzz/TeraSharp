@@ -2,7 +2,7 @@
 
 Research and implementation for **T45**. Sources: the ArbiterServer 100.02 decompile
 (`D:\v100\TERA_SERVER.100\Arb_part_0*.c`), `tera-server-proxy/data/data.json` map `376012`,
-the `.def` files in `tera_v100_MASTER_FINAL`, and `<captures>\{arb_world,cap_newchar,
+the `.def` files in `tera_v100_MASTER_FINAL`, and `D:\packetlogs\{arb_world,cap_newchar,
 cap_newchar_client}.log`.
 
 A live WorldServer prints
@@ -233,24 +233,24 @@ Frame-relative request: `[6] DlmId [10] UserDbId [14] ViewType [18] CurPage [22]
 Its reply writer, read line by line at `:15376`:
 
 ```
-FUN_140350eb0(&pkt, 0x2778)              opcode
-slotA = cursor; *slotA = 0; u32 0        DataList offset
-slotB = cursor; *slotB = 0; u32 0        DataList bytes
-u32 uVar3  = *(u32*)(request + 6)        DlmId, echoed
-u8  uVar11                               Success
-u32 uVar4  = *(u32*)(request + 0xe)      ViewType, echoed
-u32 uVar10 = *(u32*)(request + 0x12)     CurPage, echoed
-u32        = MaxPage, from the handler's own count
-u32        = ParcelCount, likewise
-*slotA = *local_d8;                      offset := the running FRAME LENGTH - unconditionally
+FUN_140350eb0(&pkt, 0x2778)               opcode
+slotA = cursor; *slotA = 0; u32 0         DataList offset
+slotB = cursor; *slotB = 0; u32 0         DataList bytes
+u32 dlmId       = *(u32*)(request + 6)    DlmId, echoed
+u8  success                               Success
+u32 viewType    = *(u32*)(request + 0xe)  ViewType, echoed
+u32 curPage     = *(u32*)(request + 0x12) CurPage, echoed
+u32 maxPage                               MaxPage, from :15334
+u32 parcelCount                           ParcelCount, from :15334
+*slotA = frameLength;                     offset := the running FRAME LENGTH - unconditionally
 if (list non-empty) { append N x 0x9e8; *slotB = N * 0x9e8; }
 ```
 
 and at `:15334`, before it consults the parcel manager at all:
 
 ```
-local_ec = 1;      // MaxPage
-local_f0 = 0;      // ParcelCount
+maxPage     = 1;      // MaxPage
+parcelCount = 0;      // ParcelCount
 ```
 
 So every field of the empty reply is either echoed from the request or a compiled-in default, and
@@ -279,13 +279,13 @@ the same atom `SDB_ITEM_SINGLE` carries — so `WarehouseHandlers.CloneAtomsWith
 are reused unchanged, and the insert-id rule is the same one T44 established: **atoms are applied
 from the reply, never the request**.
 
-`ParcelDataNoMsg` is 0x9e8 = 2536 bytes, read off the writer's own bounds check, which demands
-0x9e8 more bytes of room per record. **Its interior is not pinned by anything we have.** Only
-two fields are: the parcel id at +0 and the receiver db id at +0x50 (the latter from
-`Handler_C_SHOW_PARCEL_MESSAGE`'s ownership test, MAIL-WAREHOUSE §2.1). So T45 does what T44 did
-for item records — `SDB_MAKE_PARCEL` hands us the real `ParcelData` and we keep it verbatim in
-`parcels.record`, and `DBS_LIST_PARCEL` lists it back byte-for-byte. A parcel with no stored
-record gets the synthesised two-field form.
+`ParcelDataNoMsg` is 0x9e8 = 2536 bytes, read off the writer's own bounds check, which tests the
+buffer limit against the running frame length plus `0x9e8`. **Its interior is not pinned by
+anything we have.** Only two fields are: the parcel id at +0 and the receiver db id at +0x50 (the
+latter from `Handler_C_SHOW_PARCEL_MESSAGE`'s ownership test, MAIL-WAREHOUSE §2.1). So T45 does
+what T44 did for item records — `SDB_MAKE_PARCEL` hands us the real `ParcelData` and we keep it
+verbatim in `parcels.record`, and `DBS_LIST_PARCEL` lists it back byte-for-byte. A parcel with no
+stored record gets the synthesised two-field form.
 
 ---
 
@@ -317,7 +317,7 @@ potion with the tooltip open and read what the client says.
 | `C_REQUEST_GUILD_LIST` | accepted silently | the guild browser; `S_REPLY_GUILD_LIST` (0x5F75) is a paged list we have no shape for |
 | `C_REQUEST_CANDIDATE_LIST` | accepted silently | lord election |
 | `C_VIEW_BATTLE_FIELD_RESULT` | accepted silently | no battleground records |
-| `C_SHOW_AWESOMIUMWEB_SHOP` | accepted silently | the real handler sends a configured URL held at data symbol `DAT_14121924a`, and skips the packet entirely when the shop-enabled flag beside it is 0, which is our case |
+| `C_SHOW_AWESOMIUMWEB_SHOP` | accepted silently | the real handler sends a URL taken from the configured string at `0x14121924a` and skips the packet entirely when the shop-enabled flag at `0x141219248` is 0, which is our case |
 | `C_RESET_ALL_DUNGEON` | accepted silently | a party vote; needs a party |
 | `C_EVENT_GUIDE`, `C_UPDATE_CONTENTS_PLAYTIME` | accepted silently | already `RegNoop`; the change is that they stop being forwarded |
 
@@ -502,6 +502,9 @@ would produce anyway, so serving the zeros is the whole fix.
 The crest answer has one byte worth naming: a `bytes` ref is `[u16 offset][u16 count]`, and an
 **empty** blob still gets a real offset — 16, the packet length — because the writer patches the
 slot to the current end whether or not data follows. Frame 2911 is `10 00 00 00 …`, not `00 00 00 00`.
+
+T194 supersedes the polishing ownership claim above: both requests belong to World, as proven
+by `cap_final2b` raw371+0/+34 -> raw374/375 and World's native handlers. See the T194 section below.
 
 ### 10.2 Already correct — verified against the capture, not changed
 
@@ -877,3 +880,43 @@ The other two were already correct:
   invite-code deadline that is recomputed now and then. Sending `now` makes the button's countdown
   read as already expired. Not fixed here: `LoginHandlers.cs` is human-owned, and one more capture
   would settle whether the offset is per-account or per-server-config before anyone hard-codes it.
+
+## T194 — skill advancement queries belong to World (2026-09-26)
+
+**Fixed:** the two registered polishing queries now forward unchanged to the character's current
+World. T82 intercepted them and returned empty lists/zero EXP, hiding the persistent state.
+Standalone/lobby fallback is unchanged. `DBS_LOAD_SKILL_POLISHING` and its stored record already
+match retail; no data layout, unlock grants, sheet values or World tome behavior was changed.
+
+| Evidence | Retail | TeraSharp before T194 | Verdict |
+|---|---|---|---|
+| `cap_final2b` raw371+0/+34 -> raw374/375 | C7983/CAD37 in 13F6, DA7E/EA50 in World's 13F7 | Local handlers answer both | Forward both queries |
+| First EXP_INFO, retail `cap_final2_clients/capture_2026-09-22T09-25-01-045Z`:190 vs `cap_polish_client`:196/2031 | Point/total/level/EXP/previous bound 0; current bound **1** at full+32 | All six fields 0 | World's sheet-derived bound was lost |
+| Retail same client:15377, after max-level tome | Point161, total180, level180, EXP24362201, previous24206204, current24362201 | No equivalent acting-user frame in supplied log | All six values come from World; no separate max flag |
+| Retail same client:13296 ->13299 | C5435 **24B** -> SC7BB12B, group1301/effect16130901 | No upgrade C in supplied log | World native guard is24B; no Arbiter upgrade handler needed |
+| Retail same client:14511 ->14513 | CC18716B -> SBD0312B, group1302/effect17131101 | No unlock C in supplied log | World owns unlock validation |
+| `cap_final2b` 37023–48244 ->50067/50068 | 11 EXP writes,180 upgrades,6 unlocks,2 option changes; final2976 **197B** | Same DB layouts already implemented | New test replays all199 writes including complete transaction atoms, then compares every reply and final load |
+
+Native ownership: `WorldServer.exe.c:596825–596888`; EXP fields and sheet bounds
+`:3356447–3356485`; list serialization `:3356493–3356601`;2976 reader
+`:3018537–3018582` (17B option nodes,16B level nodes; level/point/total/EXP at full27/31/35/39).
+The67/69 option gates are `SkillPolishing.xml` `requiredLevel`, `requiredSkillId` and effect costs;
+World checks these at`:3322027–3322047`. `SkillPolishingExp.xml` ends at level180/EXP24362201;
+World clamps at`:3357177–3357204`. Those are World-owned rules, not missing DB flags.
+
+**Capture limit:** `cap_polish_client` has13505 frames and no `C_USE_ITEM`, `C_REQUEST_CONTRACT`,
+polishing upgrade/unlock/change request, or matching error response. Its own S_LOGIN gameId ends
+in0001 then0003 (records61/1885); all122 polishing-level-up broadcasts target0002, another user.
+It is an observer capture. Click refusal,67/69 selection and tome-at-max refusal remain live
+unverified. Retest/capture the acting account from login through query -> tome -> upgrade/unlock
+-> max -> another tome, with the matching World tap and Arbiter log. Do not infer a new DB error
+from the observer's broadcasts. Native item-context validation`:3362934–3362962` alone does not
+check max; global item validation/client gating cannot be established from this supplied run.
+
+Files: `src/TeraSharp.Arbiter/Handlers/ArbiterClientHandlers.cs`,
+`src/TeraSharp.Arbiter.Tests/T194.cs`, `data/t194/polishing-frames.json`,
+`tools/t194-evidence.py`, this section. Fixtures are tracked JSON with source hashes; no ignored
+binary is required. Exporter reads original logs via the existing T190 reassembler.
+Tests: `T194_polishing_queries_forward_to_current_world_without_zero_replies` (World0 and13;
+only the outer monotonic tick is normalized),
+`T194_full_retail_polishing_writes_reload_byte_exact_without_seeded_end_state` (all200 pairs).

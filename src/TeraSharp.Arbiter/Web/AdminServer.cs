@@ -56,7 +56,7 @@ public sealed class AdminServer : IDisposable
     public static AdminServer? TryStart(CharacterStore store,
         Func<IReadOnlyList<AdminOnlineRow>>? online, ILogger log)
     {
-        string? token = Environment.GetEnvironmentVariable(TokenVariable);
+        string? token = TerasConfig.Get(TokenVariable);
         if (string.IsNullOrWhiteSpace(token))
         {
             log.LogInformation("admin web: {Var} is not set - not starting", TokenVariable);
@@ -64,7 +64,7 @@ public sealed class AdminServer : IDisposable
         }
 
         int port = DefaultPort;
-        string? p = Environment.GetEnvironmentVariable(PortVariable);
+        string? p = TerasConfig.Get(PortVariable);
         if (!string.IsNullOrWhiteSpace(p) && int.TryParse(p, out int parsed) && parsed is > 0 and < 65536)
             port = parsed;
 

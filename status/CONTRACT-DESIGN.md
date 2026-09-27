@@ -398,7 +398,7 @@ what the real Arbiter does for an unrestricted item.
 
 ## 10. T64 — the capture, and the two things it changed
 
-`<captures>\cap_social.log` is a two-player tap of the **real** ArbiterServer. It contains one
+`D:\packetlogs\cap_social.log` is a two-player tap of the **real** ArbiterServer. It contains one
 complete party contract: "Test" (playerId **2**, the contractor) invites "two" (playerId **1002**,
 the opponent). Sequence numbers below are that log's, as `cap_social_ctl.txt` numbers them.
 

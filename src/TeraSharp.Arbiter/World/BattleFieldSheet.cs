@@ -23,7 +23,7 @@ namespace TeraSharp.Arbiter.World;
 // =============================================================================================
 
 /// <summary>One <c>&lt;BattleField&gt;</c> row: the parts the matcher uses.</summary>
-public sealed record BattleFieldEntry(int Id, string Type, int TeamSize, int MinLevel, int MaxLevel);
+public sealed record BattleFieldEntry(int Id, string Type, int TeamSize, int MinLevel, int MaxLevel, int ContinentId = 0);
 
 /// <summary>BattleFieldData.xml, parsed and cached for the process.</summary>
 public static class BattleFieldSheet
@@ -56,7 +56,7 @@ public static class BattleFieldSheet
             if (!int.TryParse((string?)bf.Attribute("id"), out int id)) continue;
             var cd = bf.Element("CommonData");
             list.Add(new BattleFieldEntry(id, ((string?)bf.Attribute("type") ?? "").Trim(),
-                Int(cd, "maxTeamMember"), Int(cd, "minLevel"), Int(cd, "maxLevel")));
+                Int(cd, "maxTeamMember"), Int(cd, "minLevel"), Int(cd, "maxLevel"), Int(cd, "continentId")));
         }
         return list;
     }

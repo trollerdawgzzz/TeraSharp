@@ -98,7 +98,7 @@ public sealed partial class DbProxyHandlers
         [SDB_ITEM_CUSTOMIZING] = new[] { (0x16, 0x12) },                                     // UpdateType
         [SDB_REQUEST_GUILD_QUEST_WEEKLY_REWARD_ITEM_TRANSACTION] = new[] { (0x0E, 0x0E), (0x16, 0x16), (0x1A, 0x1A) },
         [SDB_SHARED_ACCOUNT_DATA] = new[] { (0x16, 0x0A) },                                  // SharedTaskType
-        [SDB_RECEIVE_COLLECTION_BOOK_REWARD] = new[] { (0x22, 0x17) },                       // RewardId
+        [SDB_RECEIVE_COLLECTION_BOOK_REWARD] = new[] { (0x1E, 0x13), (0x22, 0x17) },         // T190: BookType, RewardId (cap_2man_b15959)
         [SDB_USE_RIGHT_ITEM] = new[] { (0x12, 0x12), (0x16, 0x16), (0x1A, 0x1A) },           // owner, index, template
     };
 
@@ -115,9 +115,30 @@ public sealed partial class DbProxyHandlers
         return ack;
     }
 
+    /// <summary>T190. Arb063:18930-18949 and19059-19077: failed user/transaction validation
+    /// preserves the offered atoms, does not allocate IDs, and writes Success0. Captured
+    /// reward7/9 failures are cap_2man_b16035-16036 /16058-16059; their cause is not known.</summary>
+    public static DbAckTable.Ack BuildCollectionBookReward(byte[] payload, bool success, Func<int>? allocateItemId = null)
+    {
+        var ack = success ? BuildT168Echo(SDB_RECEIVE_COLLECTION_BOOK_REWARD, payload, allocateItemId)
+            : DbAckTable.Build(T168Specs[SDB_RECEIVE_COLLECTION_BOOK_REWARD], payload);
+        if (!success)
+            foreach (var (req, rep) in T168Copies[SDB_RECEIVE_COLLECTION_BOOK_REWARD])
+                Put(ack.Reply, rep - 6, Ep32(payload, req - 6));
+        ack.Reply[12] = success ? (byte)1 : (byte)0;
+        return ack;
+    }
+
     private bool OnT168Echo(WorldLink link, ushort op, byte[] payload)
     {
         var spec = T168Specs[op];
+        if (op == SDB_RECEIVE_COLLECTION_BOOK_REWARD && _store != null
+            && _store.GetCharacter(Ep32i(payload, 0x1A - 6)) == null)
+        {
+            var refused = BuildCollectionBookReward(payload, false);
+            link.SendFrame(spec.ReplyOp, refused.Reply);
+            return true;
+        }
         var ack = BuildT168Echo(op, payload, _store is null ? null : new Func<int>(_store.NextItemId));
         int rows = 0;
         if (_store is not null)

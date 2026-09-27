@@ -199,6 +199,17 @@ public static class DatasheetLoader
         "EventMatching.xml <Event><TargetList>", "S_CHANGE_EVENT_MATCHING_STATE id lists (MatchQueueManager)",
         new Dictionary<int, (int[] Dungeon, int[] BattleField)>(), ReadEventMatchingTargets, r => r.Count);
 
+    /// <summary>T184f. Default raid-group names, slots 1..6; native missing lookup returns an empty string.</summary>
+    public static readonly SheetValue<string[]> RaidPartyNames = new(
+        "StrSheet_BattleField.xml <String id=10000001..10000006>", "S_SEND_PARTY_NAME_LIST raid names (PartyManager)",
+        Enumerable.Repeat(string.Empty, 6).ToArray(), ReadRaidPartyNames, r => r.Count(s => s.Length != 0));
+
+    /// <summary>T184f. One party-loot row; the array keeps the value in SheetValue's reference-type cache.</summary>
+    public static readonly SheetValue<PartyPackets.LootSettings[]> PartyLootDefaults = new(
+        "WorldData.xml <PartyLootingOption>", "new party looting settings (PartyManager)",
+        // Compatibility fallback for standalone/old capture fixtures; not the native WorldParameter constructor default.
+        new[] { Party.DefaultLoot }, ReadPartyLootDefaults, r => r.Length);
+
     /// <summary>T172. GuardData.xml: guard id -> its &lt;Continent id&gt; (VisitedSectionInfo's 4th field).</summary>
     public static readonly SheetValue<IReadOnlyDictionary<int, int>> GuardContinents = new(
         "GuardData.xml <Continent><Guard>", "AS_UPDATE_VISITED_SECTION_LIST continent (ArbiterClientHandlers)",
@@ -244,9 +255,32 @@ public static class DatasheetLoader
     public static IReadOnlyList<ISheetValue> All => new ISheetValue[]
     {
         GuildSizes, ClassPositions, DefaultSkills, StarterKits, CreatedLevels, PvpBoardIds, PveBoardIds, DungeonTimelineIds,
-        EventMatchingTargets, GuardContinents, DailyBuyMenus,
+        EventMatchingTargets, GuardContinents, DailyBuyMenus, RaidPartyNames, PartyLootDefaults,
         EventMatchingTargets, EquipSlots, ReparationRates,
         BattleFieldSheet.Entry,   // T163: T157's reader, on master since T161
+        BattlegroundRatingSheet.Entry, // T199: custom rating bounds; not native MMR
+        DungeonMatchRules.Entry,
+        DungeonClearCountSheet.Entry,
+        MatchBrowseStatistics.Entry,
+        CardCollectionSheet.Entry,
+        GuildLevelSheet.Entry, // T201: QA guild progression follows the deployed curve.
+        GuildLevelSheet.QuestEntry,
+        QaAccountSheet.Entry,
+        VipSystemSheet.Entry,
+        QaCommerceSheet.Entry,
+        QaItemSheet.Entry,
+        QaGuildSheet.Entry,
+        QaGuildSheet.Emblems,
+        QaGuildSheet.Mode,
+        GuildIncentiveSheet.Entry,
+        QaSocialSheet.Entry,
+        Handlers.QaInventoryCommands.CommissionSheet,
+        Handlers.QaPurchaseCommands.Menus,
+        Handlers.QaNpcShopCommands.Menus,
+        TeraSharp.Arbiter.Handlers.QaAchievementCommands.Sheet,
+        TeraSharp.Arbiter.Handlers.QaFestivalCommands.Sheet,
+        TeraSharp.Arbiter.Handlers.QaUtilityCommands.Sheet,
+        TeraSharp.Arbiter.Handlers.QaGuildRankingCommands.Sheet,
     };
 
     /// <summary>
@@ -417,19 +451,28 @@ public static class DatasheetLoader
     }
 
     /// <summary>
-    /// T161b. EventMatching.xml: every active <c>&lt;Event type="Dungeon|BattleField"&gt;</c> with an
+    /// T161b/T184f. EventMatching.xml: every active <c>&lt;Event type="Dungeon|TimeLine|BattleField"&gt;</c> with an
     /// <c>&lt;Action type="matching"&gt;</c>, filed under each <c>&lt;Target id&gt;</c> it lists.
     /// </summary>
     public static IReadOnlyDictionary<int, (int[] Dungeon, int[] BattleField)>? ReadEventMatchingTargets(string dir)
     {
         var doc = ReadXml(dir, "EventMatching.xml");
         if (doc == null) return null;
+        // T184: the wildcard reset expands the destination sheets, not arbitrary event
+        // targets (Arb079:7274-7326). With no destination sheet, retain the old fallback.
+        var dungeonIds = ReadXml(dir, "DungeonMatching.xml")?.Descendants("Dungeon")
+            .Select(e => Int(e, "id", -1)).ToHashSet();
+        var battleIds = ReadXml(dir, "BattleFieldData.xml")?.Descendants("BattleField")
+            .Select(e => Int(e, "id", -1)).ToHashSet();
         var d = new Dictionary<int, (List<int> D, List<int> B)>();
         foreach (var ev in doc.Descendants("Event"))
         {
             int id = Int(ev, "id", -1);
             string type = ((string?)ev.Attribute("type"))?.Trim() ?? "";
-            bool dungeon = type.Equals("Dungeon", StringComparison.OrdinalIgnoreCase);
+            // Arb008:17688-17693,18111-18168: TimeLine=4 shares the dungeon event index.
+            // Arb076:18485-18543 accepts types 0/4; cap_2man_client1 #1283 includes 2176/92176.
+            bool dungeon = type.Equals("Dungeon", StringComparison.OrdinalIgnoreCase)
+                || type.Equals("TimeLine", StringComparison.OrdinalIgnoreCase);
             if (id <= 0 || !(dungeon || type.Equals("BattleField", StringComparison.OrdinalIgnoreCase))) continue;
             if (string.Equals(((string?)ev.Attribute("active"))?.Trim(), "false", StringComparison.OrdinalIgnoreCase)) continue;
             if (!ev.Elements("Action").Any(a => string.Equals(((string?)a.Attribute("type"))?.Trim(), "matching", StringComparison.OrdinalIgnoreCase))) continue;
@@ -437,11 +480,43 @@ public static class DatasheetLoader
             {
                 int target = Int(t, "id", -1);
                 if (target <= 0) continue;
+                var offered = dungeon ? dungeonIds : battleIds;
+                if (offered != null && !offered.Contains(target)) continue;
                 if (!d.TryGetValue(target, out var lists)) d[target] = lists = (new List<int>(), new List<int>());
                 (dungeon ? lists.D : lists.B).Add(id);
             }
         }
         return d.Count == 0 ? null : d.ToDictionary(kv => kv.Key, kv => (kv.Value.D.ToArray(), kv.Value.B.ToArray()));
+    }
+
+    /// <summary>Arb067:14533-14574 / Arb082:4830-4878,9850-9872. Strings remain in the sheet's locale.</summary>
+    public static string[]? ReadRaidPartyNames(string dir)
+    {
+        var doc = ReadXml(dir, "StrSheet_BattleField.xml");
+        if (doc == null) return null;
+        var names = Enumerable.Repeat(string.Empty, 6).ToArray();
+        foreach (var row in doc.Descendants().Where(e => e.Name.LocalName.Equals("String", StringComparison.OrdinalIgnoreCase)))
+        {
+            int slot = Int(row, "id", -1) - 10000001;
+            if ((uint)slot < names.Length) names[slot] = (string?)row.Attribute("string") ?? string.Empty;
+        }
+        return names;
+    }
+
+    /// <summary>Arb058:13553-13568 supplies defaults for missing attributes when the row exists.</summary>
+    public static PartyPackets.LootSettings[]? ReadPartyLootDefaults(string dir)
+    {
+        var row = ReadXml(dir, "WorldData.xml")?.Descendants("PartyLootingOption").FirstOrDefault();
+        if (row == null) return null;
+        bool Flag(string name, bool fallback) => bool.TryParse((string?)row.Attribute(name), out bool value) ? value : fallback;
+        return new[] { new PartyPackets.LootSettings(
+            Method: Int(row, "lootingType", 1),
+            RareGradeForDicing: Int(row, "exceptionGradeForDistribution", 1),
+            EquipmentForDicing: Flag("appliedToGearOnly", false),
+            FindClassForDicing: Flag("onlyAppropriateClassCanLoot", true),
+            RareItemDistributionMethod: Int(row, "exceptionItemDistributionType", 0),
+            BoundOnLootItemDistributionMethod: Int(row, "nonSoulboundItems", 1),
+            ForbidLootingInBattle: Flag("lootingNotAllowedDuringCombat", false)) };
     }
 
     /// <summary>GuardData.xml as shipped (6 continents, 27 guards) - the built-in.</summary>

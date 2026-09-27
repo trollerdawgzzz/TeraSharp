@@ -140,6 +140,9 @@ public sealed class AdminApi
         if (method == "POST" && path == "/api/ban") return Ban(body, sourceIp, true);
         if (method == "POST" && path == "/api/unban") return Ban(body, sourceIp, false);
         if (method == "POST" && path == "/api/kick") return Kick(body, sourceIp);
+        if (method == "POST" && path == "/api/reset-character") return ResetCharacter(body, sourceIp);
+        if (method == "GET" && path == "/api/server-achievements") return ServerAchievements();
+        if (method == "POST" && path == "/api/clear-server-achievement") return ClearServerAchievement(body, sourceIp);
         if (method == "POST" && path == "/api/announce") return Announcement(body, sourceIp);
         if (method == "POST" && path == "/api/gm-level") return GmLevel(body, sourceIp);
         // ---- phase 2b (T101c) ----
@@ -663,6 +666,76 @@ public sealed class AdminApi
         Log(ip, "kick", id.ToString(CultureInfo.InvariantCulture), reason, ok ? ResultOk : ResultNotFound);
         return ok ? Json(200, ResultOk, "disconnected")
                   : Json(404, ResultNotFound, "that player is not online");
+    }
+
+    /// <summary>
+    /// T203. GET /api/server-achievements - who holds each server first, oldest claim first.
+    /// One row per achievement, because that is the whole rule: the planet-wide table is keyed on
+    /// the achievement id and only the first claimant is ever in it.
+    /// </summary>
+    private AdminResponse ServerAchievements()
+    {
+        var sb = new StringBuilder("{\"result\":" + ResultOk + ",\"claims\":[");
+        bool first = true;
+        foreach (var claim in _store.GetServerAchievements())
+        {
+            if (!first) sb.Append(',');
+            first = false;
+            var chr = _store.GetCharacter(claim.OwnerId);
+            sb.Append("{\"achievementId\":").Append(claim.AchievementId.ToString(CultureInfo.InvariantCulture))
+              .Append(",\"ownerId\":").Append(claim.OwnerId.ToString(CultureInfo.InvariantCulture))
+              .Append(",\"name\":").Append(Str(chr?.Name))
+              .Append(",\"partyId\":").Append(claim.PartyId.ToString(CultureInfo.InvariantCulture))
+              .Append(",\"claimedAt\":").Append(Str(claim.ClaimedAt)).Append('}');
+        }
+        sb.Append("]}");
+        return new AdminResponse(200, "application/json; charset=utf-8", sb.ToString());
+    }
+
+    /// <summary>
+    /// T203. POST /api/clear-server-achievement {"id":N} or {"all":true} - release a server first
+    /// so it can be won again. Retail has the same pair as operator commands
+    /// (ArbiterQACommandHandler::ClearServerAchievement / ClearAllServerAchievement).
+    /// </summary>
+    private AdminResponse ClearServerAchievement(string body, string ip)
+    {
+        int id = (int)(JsonNumber(body, "id") ?? 0);
+        // A flat body, like every other route here: {"all":true} or {"all":1}.
+        bool all = (JsonString(body, "all") ?? string.Empty) == "true"
+                   || body?.Contains("\"all\":true", StringComparison.OrdinalIgnoreCase) == true
+                   || (JsonNumber(body, "all") ?? 0) != 0;
+        if (id <= 0 && !all) return Json(400, ResultInvalid, "id or all is required");
+        int cleared = _store.ClearServerAchievements(all ? 0 : id);
+        Log(ip, "clear-server-achievement", all ? "all" : id.ToString(CultureInfo.InvariantCulture),
+            string.Empty, ResultOk);
+        return new AdminResponse(200, "application/json; charset=utf-8",
+            "{\"result\":" + ResultOk + ",\"cleared\":" + cleared.ToString(CultureInfo.InvariantCulture) + "}");
+    }
+
+    /// <summary>
+    /// T188. POST /api/reset-character {"id":N,"reason":"..."} - throw away the per-character
+    /// state the Arbiter holds between World sessions: the enter-world stamp and game id, the
+    /// one-shot Alt+A push and the GM invisibility World last reported, a queued match, a
+    /// party-match listing, and a T180 hold or leave-dungeon departure. Nothing durable is
+    /// touched - no items, skills, quests or money - so this is the repair for a character that
+    /// came up wedged after a World restart, and it is safe on one that did not.
+    /// </summary>
+    private AdminResponse ResetCharacter(string? body, string? ip)
+    {
+        int id = (int)(JsonNumber(body, "id") ?? 0);
+        string reason = JsonString(body, "reason") ?? string.Empty;
+        if (id <= 0) return Json(400, ResultInvalid, "id is required");
+        var chr = _store.GetCharacter(id);
+        if (chr == null)
+        {
+            Log(ip, "reset-character", id.ToString(CultureInfo.InvariantCulture), reason, ResultNotFound);
+            return Json(404, ResultNotFound, "no such character");
+        }
+        var cleared = World.CharacterTransientState.Reset(id);
+        Log(ip, "reset-character", chr.Name, reason, ResultOk);
+        var list = string.Join(",", cleared.Select(c => "\"" + c + "\""));
+        return new AdminResponse(200, "application/json; charset=utf-8",
+            "{\"result\":" + ResultOk + ",\"cleared\":[" + list + "]}");
     }
 
     /// <summary>POST /api/announce {"text":"...","reason":"..."} - WA_INSTANT_INGAME_ANNOUNCE.</summary>

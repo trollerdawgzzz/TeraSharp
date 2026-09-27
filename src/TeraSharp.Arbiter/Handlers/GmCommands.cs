@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT
 // Copyright (c) 2026 the TeraSharp contributors
 
 using System.Text;
@@ -92,7 +92,7 @@ public static class GmCommandParser
 /// ArbiterCommandDistributor::RegisterWorldCommands registers every name into a bypass bucket
 /// whose handler is a null stub (Arb_part_085.c:16540-16578). We have no such handshake, so the
 /// two catalogues the human extracted from the binaries are the list:
-/// <c>status/GM-COMMANDS-ARBITER.md</c> (192 the Arbiter owns) and
+/// <c>status/GM-COMMANDS-ARBITER.md</c> (318 distinct native Arbiter registrations) and
 /// <c>status/GM-COMMANDS-FULL.md</c> (416 the World owns).
 /// </summary>
 public static class GmCommandCatalog
@@ -198,7 +198,7 @@ public static class GmAccounts
 
     /// <summary>As above, against the live environment.</summary>
     public static bool IsListed(string? accountName)
-        => IsListed(accountName, Environment.GetEnvironmentVariable(EnvVariable));
+        => IsListed(accountName, TerasConfig.Get(EnvVariable));
 
     /// <summary>
     /// The level for this login: the allow-list wins (it is the bootstrap - without it nobody
@@ -262,12 +262,15 @@ public enum GmDispatch
     NoUser,
     /// <summary>Admin level below 1: the real Arbiter writes an abuse log and sends NOTHING.</summary>
     NotAuthorised,
+    /// <summary>Explicit server policy denies this command even to operators.</summary>
+    Denied,
     /// <summary>We implement it here.</summary>
     Local,
     /// <summary>The World owns it - forward with AS opcode 0x2829.</summary>
     ForwardToWorld,
     /// <summary>An Arbiter command we have not implemented yet.</summary>
     NotImplemented,
+    NotApplicable,
     /// <summary>In neither catalogue: S_SYSTEM_MESSAGE_CUSTOM "Invalid QA Command".</summary>
     Unknown,
 }
@@ -307,8 +310,8 @@ public sealed class GmCommandHandlers
     /// <summary>
     /// What goes in the forward's third field. The Arbiter's dumper calls that field
     /// <c>CommandType</c> (FUN_14017bdf0, Arb_part_011.c:5334), and the writer fills it from the
-    /// HANDLER's own constant - a field on the ArbiterBypassCommandHandler object
-    /// (Arb_part_067.c:6898). The handler is
+    /// HANDLER's own constant, not from the client packet: it loads the field at index 0x24 of
+    /// the ArbiterBypassCommandHandler instance it was given (Arb_part_067.c:6898). The handler is
     /// constructed twice, with 1 and 0 (Arb_part_033.c:13685/13691), and World commands live in
     /// the bucket that carries 1.
     ///
@@ -373,12 +376,20 @@ public sealed class GmCommandHandlers
                 ForwardToWorld(s, line, commandType);
                 return true;
 
+            case GmDispatch.Denied:
+                SendCustom(s, "QA command is disabled on this server\n");
+                return true;
+
             case GmDispatch.Local:
                 Execute(s, store!, chr!, line, commandType);
                 return true;
 
             case GmDispatch.NotImplemented:
                 SendCustom(s, $"{line.Name}: an Arbiter command TeraSharp does not implement yet\n");
+                return true;
+
+            case GmDispatch.NotApplicable:
+                SendCustom(s, $"{line.Name}: {NotApplicableReasons[line.Name]}\n");
                 return true;
 
             default:
@@ -395,39 +406,171 @@ public sealed class GmCommandHandlers
         if (line == null || line.Name.Length == 0) return GmDispatch.Empty;
         if (!hasUser) return GmDispatch.NoUser;
         if (adminLevel < GmAccounts.MinimumAdminLevel) return GmDispatch.NotAuthorised;
+        if (IsDenied(line.Name)) return GmDispatch.Denied;
+        if (NotApplicableReasons.ContainsKey(line.Name)) return GmDispatch.NotApplicable;
+        // T181: World registers allow_teleport with on/off arguments (WorldServer.exe.c:2186574).
+        // Keep this explicit even if a deployed catalogue is missing or misclassifies it.
+        if (line.Name.Equals("allow_teleport", StringComparison.OrdinalIgnoreCase)) return GmDispatch.ForwardToWorld;
         if (Implemented.Contains(line.Name)) return GmDispatch.Local;
-        // The Arbiter's own table is checked BEFORE the forward, and the forward is the default.
-        // Two reasons, both learned the hard way in T47:
-        //   1. GM-COMMANDS-FULL.md lists all 608 names, the Arbiter's included, so asking
-        //      IsWorldCommand first sent Arbiter-owned commands to World.
-        //   2. GmCommandCatalog loads those markdown files from disk and leaves both sets EMPTY
-        //      when it cannot find them - which is the normal case for a deployed binary with no
-        //      status/ folder beside it. Every command then fell through to Unknown, which is
-        //      exactly what the live test saw: "/@teleport warriortwo" -> Unknown, with teleport
-        //      sitting in GM-COMMANDS-FULL.md line 384 all along.
-        // Forwarding by default makes the catalogue an optimisation rather than a dependency.
-        if (GmCommandCatalog.IsArbiterCommand(line.Name)) return GmDispatch.NotImplemented;
+        // T201: native ownership is compiled from this build's complete registration function.
+        // A missing or stale documentation file cannot change the command's destination.
+        if (NativeQaCommands.Names.Contains(line.Name)) return GmDispatch.NotImplemented;
         return GmDispatch.ForwardToWorld;
     }
 
     /// <summary>
-    /// <b>Divergence from the original, on purpose.</b> The real Arbiter knows all 608 names
-    /// because both tables are compiled into it, so a name in neither is a typo and
+    /// The real Arbiter knows its own names and the World's announced names, so a name in
+    /// neither is a typo and
     /// <c>ArbiterCommandDistributor::OnUnregisteredCommand</c> (Arb_part_085.c:12895) answers
-    /// "Invalid QA Command" plus S_COMMAND_HELP with near matches. We only know the names when
-    /// the catalogue files are on disk, so a typo would be indistinguishable from a real command
-    /// and would be refused locally instead of reaching World. We forward instead and let World
-    /// reject: a typo costs one wasted frame, a real command that we failed to recognise costs a
-    /// feature. <see cref="GmDispatch.Unknown"/> is therefore no longer produced by
-    /// <see cref="Classify"/>; it is kept so the enum and its tests stay meaningful.
+    /// "Invalid QA Command" plus S_COMMAND_HELP. T201 compiles complete Arbiter ownership;
+    /// unknown names still reach World because its runtime registry is not yet imported.
     /// </summary>
     public const string ForwardByDefaultNote =
-        "T47: a command that is not in Implemented and not Arbiter-owned is forwarded to World.";
+        "T201: only names outside the compiled Arbiter registry and explicit deny policy default to World.";
+
+    /// <summary>T201 operator policy, independent of the optional command catalogues.</summary>
+    public static bool IsDenied(string name)
+        => name.StartsWith("BOT_", StringComparison.OrdinalIgnoreCase)
+        || name.StartsWith("shutdown", StringComparison.OrdinalIgnoreCase)
+        || name.StartsWith("crash", StringComparison.OrdinalIgnoreCase)
+        || DeniedNames.Contains(name);
+
+    public static readonly IReadOnlySet<string> DeniedNames = new HashSet<string>(new[] {
+        "ps_im_king", "ps_vote_count", "dbg_break", "server_shutdown", "shutdown_server",
+        "reset_bf_result", // Global season/ranking wipe; explicitly denied by operator policy (T201).
+        "set_dg_result_resettime", // Changes the realm season clock and triggers InitSeasonData/PVE reset (Arb061:2841 -> 065:5612).
+        "set_bf_result_resettime", // Native timer mutation triggers realm-wide PVP InitSeasonResult (Arb071:18683–18732).
+        "reset_admin_reward", "clear_achievement_season", "clear_serverachievement", "clear_all_serverachievement", // Native global reward/season/server-first record deletion, not the caller's progress.
+        "change_date", "change_time", // Realm-wide virtual-clock changes immediately process item/event expiry (Arb040:7245/7866).
+        "add_namepreempt_event", // Deletes all existing name-preemption events before inserting (Arb040:5010 -> Arb034:1373).
+        "ps_clear_election", // Realm-wide Lord election/candidacy reset (Arb073:15818).
+        "delete_all_event_system", // Deletes every event definition and persisted progress (Arb080:12056/12395).
+        "clear_all_item_period", // Global period-event definition wipe (Arb082:948 -> DeleteItemPeriodInfoFromDb).
+        "reset_premium_slot", // Global character/account premium-slot SQL wipe and1633 (Arb078:9779/9860).
+        "delete_all_parcels", // Native deletes every mailbox/escrow row, not the calling account's mail.
+        "clear_wanted_writing", // Realm-wide persistent guild recruitment deletion (Arb040:8696 -> Arb058:8484).
+        "reset_weekly_contribution_point", // Realm-wide weekly guild contribution wipe and reset-time advance (Arb070:10740; SQL17358).
+        "clear_saevent", // Stops active stack-attendance event and deletes all participant/pending progress (Arb050:8038; Arb049:15007).
+        "reset_all_phaselevel", // Realm-wide persisted progress wipe; explicitly denied by operator policy (T201).
+        "testautomation_clear_allusers_completely", "import_characters", // Native permanent account deletion / bulk database import.
+        "test_on", // Native fault-injection thread randomly suspends Arbiter worker threads (Arb002:996).
+        "add_many_friends", // Persistent synthetic account/user generator; unlike the authorized ephemeral party dummies.
+        "create_many_guilds", "create_many_guilds_and_users", "create_many_guilds_for_invite_user_to_guild",
+        "create_many_guilds_random_condition", "create_many_users_and_apply_guild", "create_many_users_for_guild_wanted_writing",
+        "create_many_users_to_my_guild", "create_many_users_to_my_account", "change_guild_member_count", // Persistent synthetic accounts/characters; last command also removes real online members on shrink.
+        "clear_all_pverank", "clear_all_pvprank", "clear_pverank", "init_battlefield_season", "init_dungeon_season",
+        "makeuser_pverank", "makeuser_pvprank", "rank_next_season", // Native global persisted wipes / mass synthetic users.
+        "restart_server", "server_restart", "terminate_server", "kill_server", "stop_server", "quit_server",
+    }, StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Only proven absent native dependencies. Pending ordinary commands remain NotImplemented.</summary>
+    public static readonly IReadOnlyDictionary<string, string> NotApplicableReasons = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) {
+        ["create_bill_account"] = "Billing account service/request-response transport absent in TeraSharp (Arb040:10239-10280; FUN1408173D0)",
+        ["fund_coin"] = "Billing funding service/transaction replies absent; Tcat or character gold are different ledgers (Arb040:14754-14803; FUN1408173D0)",
+        ["purchase_prod"] = "Both local F2P catalog/purchase manager and external ArbiterGateway purchase transport are absent; not ordinary item generation (Arb040:14050; Arb065:6510,6682-6743; Arb048:617; Arb071:14445)",
+        ["publisher"] = "Native publisher-specific account/payment/content policy consumers are absent; broadcasting a World-only enum would leave Arbiter behavior inconsistent (Arb044:1-77; Arb006:18545; Arb007:2634)",
+        ["gara_pub_exp"] = "Native F2P money-product purchase engine is absent; manual add_vip_pub_exp is a separate implemented command, not this consumer (obj/t201/gara-pub-exp.asm14053E900-9DB; Arb058:7230; FUN140700C90)",
+        ["reset_invitecode"] = "InviteCode generation/use-limit/reset lifecycle absent; changing an unused timestamp would be inert (Arb044:1414; Arb046:10324,11053 FUN140579530)",
+        ["set_referer"] = "Referral benefit/reward/expiry consumers are absent; SDB referral load is currently empty. Do not invent a persistent referrer dictionary (Arb044:4764-4806; Arb065:13915-13957)",
+        ["set_returnuser"] = "ReturnUser eligibility, reward-claim and account attendance lifecycle absent; T168 character attendance bitmap is a different feature (Arb044:4961; Arb033:6191-6300; Arb045:4042 writer; FUN14078C010)",
+        ["reset_returnuser"] = "ReturnUser eligibility/reward/attendance manager absent; cannot clear unrelated character attendance state as a substitute (Arb044:1594; Arb031:18683; Arb045:4042 writer; FUN14078C010)",
+        ["add_city_war_guild_ban"] = "CityWar league/season admission manager and boot-loaded ban map absent; existing result-city-war DB acknowledgements do not implement this consumer (Arb040:3282; Arb053:19842)",
+        ["del_city_war_guild_ban"] = "CityWar league/season admission and ban-map lifecycle absent (Arb040:13533; Arb054:414)",
+        ["chnage_city_war_interestOnly"] = "CityWar manager's boot-loaded league admission configuration absent; sending a transient push alone would lose native persisted admission state (Arb040:7213; Arb054:1029-1190)",
+        ["del_city_war_rank"] = "CityWar season, winner and rank manager absent; generic DB blob save/load is not this aggregate ranking consumer (Arb040:13563; Arb054:604-790)",
+        ["set_city_war_open_time"] = "CityWar active-season state and opening scheduler absent; unused configuration would not open a battle (Arb044:7327; Arb054:1196-1387)",
+        ["add_citywar_taxpot"] = "CityWarTaxManager tax-pot accrual/distribution and boot-load lifecycle absent (Arb040:5493; Arb054:794-1025)",
+        ["set_tax_config"] = "CityWarTaxManager tax collection/payout consumers absent; broker registration fee is not this tax policy (Arb044:7822; Arb054:1391-1570)",
+        ["assign_floating_castle"] = "FloatingCastle ownership, parts inventory and boot-load manager absent; guild general coin is independently implemented (Arb040:5930; Arb084:7470; FUN1409CD620,FUN1409A2080)",
+        ["collect_floating_castle"] = "FloatingCastle ownership/parts manager absent; cannot substitute setting guild coin or emblem (Arb040:8951; Arb084:11803-11950)",
+        ["insert_floating_castle_parts"] = "Owned-castle resolution and parts inventory manager absent (Arb043:15126-15163; Arb084:12193 FUN1409A67C0)",
+        ["reset_floating_castle_parts_cooltime"] = "FloatingCastle ownership/parts replacement cooldown consumer absent; standalone zero flag would be inert (Arb044:1444; Arb084:8205-8247)",
+        ["add_guild_quest"] = "Daily guild-quest selection/QA queue manager absent; current board always exposes static sheet catalogue (Arb040:4026; Arb027:19184 FUN140369DB0)",
+        ["guild_quest_start"] = "Native selected-quest/resource-cost/pending acceptance engine absent; existing C# ordinary StartGuildQuest writes active row immediately and does not reproduce these gates (Arb044:6290; Arb029:17489 FUN1403A27C0,17552 FUN1403A29B0; FUN140404980)",
+        ["guild_quest_complete"] = "Full quest-objective/reward/weekly-point engine absent; existing client finish's fixed20XP/1guild-money reward is not the native QA completion pipeline (Arb040:9060; Arb029:17778 FUN1403A2F90/3A30B0 -> FUN14037A860)",
+        ["increase_guild_reward_point"] = "Weekly guild quest reward points/history manager absent; ordinary guild currency g.Point is a distinct ledger and must not be reused (Arb043:14937; Arb029:789,732; FUN14037A4B0; GameDatabaseDefinition.xml:17295)",
+        ["reset_guild_reward"] = "Weekly quest point/reward-step claim ledger absent; ordinary guild points and quest status rows are different state (Arb044:1310; Arb029:18348 FUN1403A3D40/3A3EC0/3A39B0; GameDatabaseDefinition.xml:17316,17329)",
+        ["guildwar_immediate"] = "Existing GuildWarManager starts declarations directly in state6; pending-state1 scheduler/start-end timestamps absent. It cannot meaningfully start a pending pool it never represents (Arb044:6323; Arb058:17680-18090)",
+        ["guildwar_cooltime"] = "Native multi-phase timers and surrender-side history absent from existing immediate-state6 model; an unused override plus packet would not implement all consumers (Arb040:16541; Arb058:17617,11312,11606,11777)",
+        ["reload_ir"] = "requires the absent local native InputRestriction rule interpreter and gameplay consumers (Arb080:16639); XML assets exist and fixed character-name validation is different",
+        ["turn_ir"] = "requires that absent native InputRestriction engine (Arb081:5878); an unconsumed on/off flag would not enable its rules",
+        ["toggle_onoff"] = "requires the general ContentsOnOff lifecycle manager and per-type consumers (Arb070:15259), including billing, ranking and city-war; narrow deco/abnormality helpers are not that engine",
+        ["qatest"] = "requires coherent native QA profiles across WorldParameter/GuildWar/BattleChip/FloatingCastle and MatchServer command transport (Arb044:114–268), absent here",
+        ["connection"] = "requires native AuthManager admission/connection counters and waiting-queue lifecycle, absent in TeraSharp; online character count is not the same counter",
+        ["huntingevent_remove"] = "requires the absent HuntingEvent active/pending/reward manager (Arb079:17855); native removal has real effects although this build's add QA handler is empty",
+        ["reload_shop_data"] = "requires the absent local F2PInGameShop catalog/purchase manager and shop_info*.shop catalogs (Arb058:18109; Arb072:2864), not an external publisher transport",
+        ["change_shop_status"] = "requires that absent local F2PInGameShop catalog/purchase manager (Arb072:2864/2959); a disconnected enabled flag would not operate a shop",
+        ["check_premium_slot_reset_time"] = "requires the absent global PremiumSlot reset-version/cross-realm manager (Arb078:9779), distinct from character cooldown records",
+        ["init_limited_gacha"] = "requires the absent LimitedGacha bucket/acquisition/stock manager (Arb048:14435); its real sheet exists but no pool consumer runs here",
+        ["limited_gacha_go_next_bucket"] = "requires that absent LimitedGacha bucket/stock manager (Arb048:17421); writing a bucket without its acquisition lifecycle is not supported",
+        ["clear_board"] = "requires the absent general Board post/per-writer-quota manager (Arb034:2934); native clears RAM writing quotas, not posts",
+        ["set_board_clear_time"] = "requires that absent general Board quota-reset timer (Arb034:12447), distinct from guild recruitment or party boards",
+        ["write_board"] = "requires that absent general Board validation/post store and client handlers (Arb035:1210), distinct from guild recruitment or party boards",
+        ["load_gmevent"] = "requires the absent native GM event DB definitions/participant lifecycle (Arb050:2560), not the simple notice sender",
+        ["gmevent_change_maxjoincount"] = "requires that absent native GM event participant/capacity manager (Arb049:10621), not a detached capacity variable",
+        ["char_record"] = "requires the native C++ client-session recorder (Arb040:8056), which TeraSharp does not host",
+        ["char_record_end"] = "requires that same native client-session recorder (Arb040:8076), which TeraSharp does not host",
+        ["test_off"] = "stops the native worker-thread fault injector (Arb002:977); that engine is absent and test_on is denied",
+        ["match"] = "requires the external MatchServer AM_COMMAND transport (Arb043:19317), which the local matching runtime does not expose",
+        ["set_play_limit"] = "requires AuthManager admission waiting-list capacity and S_WAITING_LIST lifecycle (Arb044:4639; Arb058:10645); it is not a character playtime limit",
+        ["tutorial"] = "requires the absent Account tutorial-character creation/lifecycle (Arb061:14378; Arb046:4885; Arb030:5492), distinct from the implemented tip ledger",
+        ["tutorialPlayer"] = "requires that same Account tutorial-user lifecycle (Arb030:5492), not a tutorial-tip or AS_ENTER_WORLD flag",
+        ["clear_level_reward"] = "requires the absent Account LevelEventRewardInfo claim/grant manager (Arb061:13747; GameDatabaseDefinition:12049)",
+        ["reset_attendance_event_reward"] = "requires the absent AccountAttendanceEventCompensation event mask (Arb065:7291), distinct from the character attendance bitmap",
+        ["setplaytime"] = "requires active PlayTimeEventManager DB/web event definitions and reward ledger (Arb055:17347; SQL5965–6095), absent in this runtime",
+        ["getplaytime"] = "requires that same active PlayTimeEventManager definition/ledger (Arb055:17380), not total character playtime",
+        ["resetplaytimereward"] = "requires that same active PlayTimeEventManager reward ledger (Arb054:11647/12328; Arb056:148/217)",
+        ["nexus_broadcast"] = "requires the absent NexusSessionManager inter-Arbiter transport (Arb043:17217; Arb039:1758; Arb085:19507)",
+        ["nexus_bypass"] = "requires the absent NexusSessionManager inter-Arbiter transport (Arb043:17235; Arb039:1758; Arb085:19507)",
+        ["turn_netm"] = "requires external NetModerator middleware, absent in TeraSharp and disabled in DeploymentConfig (Arb044:7053; Arb080:18649)",
+        ["reload_netm"] = "requires that external NetModerator configuration loader (Arb081:1690), not a local chat toggle",
+        ["sysconfig"] = "controls native C++ allocator/profiler/latency instrumentation bits (Arb001:15766; Arb044:6688), not hosted by TeraSharp",
+        ["chrono_debug"] = "controls fault injection in the absent Chronoscroll billing request/redeem/restore engine (Arb044:3334; Arb037:16099)",
+        ["skill_cheater_arbiter"] = "configures the absent native rolling-window skill-cheat detector and KickUserJob (Arb077:8223; Arb028:8483), not the World detector",
+        ["ps_guard_info"] = "requires the absent native Guard ownership/policy/tax runtime and continent/guard mapping (Arb074:2999; Arb081:4898)",
+        ["ps_period_minute"] = "requires the absent native election state machine consuming the period override (Arb040:7529; Arb074:5067)",
+        ["ps_go_next"] = "requires the absent native election state machine consuming force-next (Arb040:16269; Arb074:5067)",
+        ["ps_activate_election"] = "requires native election conditions, candidates and voting stores, absent here (Arb073:15559; Arb074:5067)",
+        ["ps_add_point"] = "requires absent Lord election competition/candidacy records (Arb073:15585); ordinary guild contribution points differ",
+        ["ps_policy_point"] = "requires absent Guard Lord ownership and policy ledger (Arb080:10158); no disconnected policy value is written",
+        ["ps_calc_tax"] = "requires the absent Guard tax accrual/settlement subsystem (Arb080:9455)",
+        ["ps_world_tick"] = "controls the absent Arbiter political World manager timer (Arb074:5012), not WorldBridge or WorldServer ticks",
+        ["ps_maketax"] = "requires absent Guard tax ownership/settlement (Arb080:8144), not guild-bank money",
+        ["ps_planet_vote"] = "requires absent account-wide election vote validation/records (Arb077:18102); a display-bit change would not enforce voting",
+        ["ps_candidacy_membercount"] = "requires absent election candidacy registration/validation (Arb044:3198)",
+        ["lord_behavior"] = "requires absent LordAchievementManager and Lord election ownership (Arb085:12346), not character achievements",
+        ["ps_gw_reset"] = "requires absent Lord election guild-war competition limits (Arb074:3826), not ordinary guild-war cooldowns",
+        ["ps_gw_time"] = "requires absent political World election/guild-war timer (Arb073:16060; Arb074:5195)",
+        ["ps_gw_point"] = "requires absent Lord election guild-war competition records (Arb073:16045), not ordinary guild points",
+        ["load_saevent"] = "requires absent StackAttendanceEventManager participant/reward lifecycle (Arb043:16859); the real XML exists, but an empty74EA reply is not that manager",
+        ["resettime_saevent"] = "requires that absent active stack-attendance event/reset-boundary manager (Arb049:18215; Arb050:11621), not the character attendance bitmap",
+        ["perfect_hero"] = "requires the absent TBA arena account hero/skin lifecycle (Arb043:19518); this is not a native no-op",
+        ["reset_hero"] = "requires the absent TBA arena account hero/skin lifecycle (Arb044:1367)",
+        ["perfect_rune"] = "requires the absent TBA arena account rune lifecycle (Arb043:19581)",
+        ["reset_rune"] = "requires the absent TBA arena account rune lifecycle (Arb044:1650)",
+        ["delete_tbauser"] = "requires the absent TBA account-user lifecycle (Arb040:13927)",
+        ["force_start_battlepass_season"] = "requires the absent TBA BattlePass season manager (Arb040:14641)",
+        ["force_end_battlepass_season"] = "requires the absent TBA BattlePass season manager (Arb040:14421)",
+        ["check_battlepass_season"] = "requires the absent TBA BattlePass season manager (Arb040:8103)",
+        ["reset_battlepass_data"] = "requires the absent TBA account BattlePass lifecycle (Arb044:933)",
+        ["change_hero_rotation"] = "requires the absent TBA hero rotation manager (Arb040:7728)",
+        ["get_hero_rotation_time"] = "requires the absent TBA hero rotation manager (Arb040:14961)",
+        ["add_tba_currency"] = "requires absent TCat/TBAFragment account currencies (Arb040:5352); Classic money is not a substitute",
+        ["tba_change_point"] = "requires the absent TBA ranking manager (Arb044:6720); Classic BG rating is not a substitute",
+        ["add_tba_season"] = "requires the absent TBA ranking season manager (Arb040:5473)",
+    };
 
     /// <summary>The Arbiter-side commands TeraSharp actually runs.</summary>
     public static readonly IReadOnlySet<string> Implemented = new HashSet<string>(
         new[] { "set_admin_level", "create_user", "testitem", "clear_inven", "warehousegold_max", "query_point",
-                "vis", "invis", "vaporize", "invisible" },
+                "vis", "invis", "vaporize", "invisible", "perfect_card_collection", "battlefield" }
+            .Concat(QaPartyCommands.Names).Concat(QaGuildCardCommands.Names).Concat(QaGeneralCommands.Names)
+            .Concat(QaDungeonCommands.Names).Concat(QaUiCommands.Names)
+            .Concat(QaAccountCommands.Names).Concat(QaDiagnosticCommands.Names).Concat(QaSocialCommands.Names)
+            .Concat(QaTimelineCommands.Names).Concat(QaCompetitionCommands.Names).Concat(QaMailBrokerCommands.Names)
+            .Concat(QaDungeonEvents.Names).Concat(QaInventoryCommands.Names).Concat(QaAchievementCommands.Names)
+            .Concat(QaFestivalCommands.Names).Concat(QaGuildCommands.Names).Concat(QaItemPeriodCommands.Names).Concat(QaUtilityCommands.Names)
+            .Concat(QaGuildRankingCommands.Names).Concat(QaPurchaseCommands.Names).Concat(QaAwakenCommands.Names).Concat(QaNpcShopCommands.Names).Concat(QaStyleShopCommands.Names),
         StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
@@ -465,9 +608,11 @@ public sealed class GmCommandHandlers
         {
             var acct = store.GetAccount(s.Account.Name);
             stored = acct?.AdminLevel ?? 0;
+            if (s.SelectedCharacter is { } character)
+                stored = store.GetCharacterAdminLevel(character.Id) ?? stored;
         }
         return LevelOf(s.Account.Name, s.SelectedCharacter?.Name, stored,
-                       Environment.GetEnvironmentVariable(GmAccounts.EnvVariable));
+                       TerasConfig.Get(GmAccounts.EnvVariable));
     }
 
     /// <summary>The pure half of <see cref="LevelOf(GameSession, CharacterStore?)"/>, for tests.</summary>
@@ -485,7 +630,8 @@ public sealed class GmCommandHandlers
         var chr = s.SelectedCharacter;
         int playerId = chr == null ? (int)s.PlayerId : (int)chr.Id;
         var payload = BuildWorldForward(playerId, BypassModeWorld, line.Rebuilt());
-        Program.World?.SendFrame(AS_BYPASS_COMMAND, payload);
+        // T195: native uses User::GetBypassSession (Arb_part_067:6893, Arb_part_028:17295).
+        ArbiterClientHandlers.SendToWorld(s, AS_BYPASS_COMMAND, payload);
     }
 
     /// <summary>
@@ -536,14 +682,44 @@ public sealed class GmCommandHandlers
     private void Execute(GameSession s, CharacterStore store, FakeCharacter chr, GmCommandLine line,
                          int commandType)
     {
+        if (QaGeneralCommands.TryExecute(s, store, line, _log)
+            || QaAccountCommands.TryExecute(s, store, line, _log)
+            || QaDiagnosticCommands.TryExecute(s, store, line, _log)
+            || QaSocialCommands.TryExecute(s, store, line, _log)
+            || QaTimelineCommands.TryExecute(s, store, line, _log)
+            || QaCompetitionCommands.TryExecute(s, store, line, _log)
+            || QaMailBrokerCommands.TryExecute(s, store, line, _log)
+            || QaDungeonEvents.TryExecute(s, store, line, _log)
+            || QaInventoryCommands.TryExecute(s, store, line, _log)
+            || QaItemPeriodCommands.TryExecute(s, store, line, _log)
+            || QaUtilityCommands.TryExecute(s, store, line, _log, commandType)
+            || QaGuildRankingCommands.TryExecute(s, store, line, _log)
+            || QaPurchaseCommands.TryExecute(s, store, line, _log)
+            || QaAwakenCommands.TryExecute(s, store, line, _log)
+            || QaNpcShopCommands.TryExecute(s, store, line, _log)
+            || QaStyleShopCommands.TryExecute(s, store, line, _log)
+            || QaAchievementCommands.TryExecute(s, store, line, _log)
+            || QaFestivalCommands.TryExecute(s, store, line, _log)
+            || QaGuildCommands.TryExecute(s, store, line, _log)
+            || QaUiCommands.TryExecute(s, store, line, _log)
+            || QaDungeonCommands.TryExecute(s, store, line, _log)
+            || QaPartyCommands.TryExecute(s, store, line, _log)
+            || QaGuildCardCommands.TryExecute(s, store, line, _log)) return;
         switch (line.Name.ToLowerInvariant())
         {
             case "set_admin_level": SetAdminLevel(s, store, line); break;
             case "create_user":     CreateUser(s, store, line); break;
             case "testitem":        TestItem(s, line); break;
-            case "clear_inven":     ClearInven(s, chr); break;
             case "warehousegold_max": WarehouseGoldMaxCommand(s, line); break;
             case "query_point":     QueryPoint(s); break;
+            case "battlefield":
+                if (Program.World is { } bfWorld) BattlefieldCreation.CreateForGm(bfWorld, s, line.Args);
+                break;
+            case "perfect_card_collection":
+                var refresh = PerfectCardCollection(store, store.AccountOf((int)chr.Id), (int)chr.Id);
+                if (refresh != null) Program.World?.SendFrame(s.CurrentWorldId, 0x2985, refresh);
+                else _log.LogWarning("perfect_card_collection: CardTemplate/CollectionBook sheets unavailable");
+                break;
 
             // T128 - the visibility toggle. /@vis and /@invis set it; /@vaporize and
             // /@invisible flip it, which is what the client's own Alt+A does, and are
@@ -555,6 +731,20 @@ public sealed class GmCommandHandlers
         }
 
         if (AlsoForwarded.Contains(line.Name)) ForwardToWorld(s, line, commandType);
+    }
+
+    /// <summary>T190. Native Arb043:19442-19516 fills every template to its activation
+    /// quantity after resetting the account collection; Arb039:11021-11062 refreshes World
+    /// with DBS_REFRESH_CARD_DATA (2985), payload [i64 AccountDbId]. World requests2986.</summary>
+    public static byte[]? PerfectCardCollection(CharacterStore store, long accountId, int characterId)
+    {
+        var sheet = CardCollectionSheet.Entry.Value;
+        if (accountId <= 0 || !sheet.Available) return null;
+        var cards = sheet.Templates.Values.OrderBy(t => t.Id)
+            .Select(t => new CharacterStore.CardRow(t.Id, t.ActivationAmount)).ToArray();
+        int points = sheet.Templates.Values.Sum(t => checked(t.ActivationAmount * t.BookPoints));
+        store.ReplaceCardCollection(accountId, characterId, cards, new(1, sheet.LevelFor(points), points));
+        return BitConverter.GetBytes(accountId);
     }
 
 
@@ -652,19 +842,6 @@ public sealed class GmCommandHandlers
     private void TestItem(GameSession s, GmCommandLine line)
     {
         _log.LogInformation("GM testitem (stub in the real Arbiter too): {Args}", line.Rebuilt());
-        SendCustom(s, "testitem is an empty stub in ArbiterServer.exe - nothing to do\n");
-    }
-
-    /// <summary>
-    /// <c>clear_inven</c> - Arb_part_040.c:8714. It ignores its arguments entirely and queues an
-    /// async job on the CALLING user (the neighbouring clear_parcel does take a username, so the
-    /// omission looks deliberate). TeraSharp does not persist inventory - it lives in the world
-    /// blob World owns - so there is nothing here to delete; this says so instead of pretending.
-    /// </summary>
-    private void ClearInven(GameSession s, FakeCharacter chr)
-    {
-        _log.LogInformation("GM clear_inven for '{Name}': no Arbiter-side inventory to clear", chr.Name);
-        SendCustom(s, "clear_inven: the Arbiter does not store inventory (World owns it)\n");
     }
 
     /// <summary>
@@ -677,7 +854,6 @@ public sealed class GmCommandHandlers
         if (!TryParseWarehouseGoldMax(line, out long amount)) return;   // silent, as the Arbiter
         WarehouseGoldMax = amount;
         _log.LogInformation("GM warehousegold_max = {Amount}", WarehouseGoldMax);
-        SendCustom(s, $"warehousegold_max = {WarehouseGoldMax}\n");
     }
 
     /// <summary>
@@ -1259,15 +1435,12 @@ public static class GmAdminTool
 
     /// <summary>
     /// C_ADMIN_GMEVENT_NOTICE (0xD622): <c>[u16 noticeOffset]</c> then the line. It goes to the
-    /// GM-event manager, which runs the OX quiz and the summon events this build has none of -
-    /// there is no event to notice about - so the line is logged rather than broadcast to every
-    /// player as a GM event that is not running.
+    /// caller's current World as1611; native does not require a running GM event.
     /// </summary>
     public static bool OnGmEventNotice(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
     {
         if (!Allowed(s, log, "C_ADMIN_GMEVENT_NOTICE")) return true;
-        log.LogInformation("C_ADMIN_GMEVENT_NOTICE: '{Notice}' - no GM event is running",
-            ArbiterClientHandlers.ReadWString(body.Span, 0));
+        QaUtilityCommands.SendGmEventNotice(s, ArbiterClientHandlers.ReadWString(body.Span, 0));
         return true;
     }
 
@@ -1394,4 +1567,3 @@ public static class WorldLevelSync
             CommandLine(level), s.PlayerId);
     }
 }
-

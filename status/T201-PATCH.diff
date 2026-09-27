@@ -1,0 +1,121 @@
+diff --git a/src/TeraSharp.Arbiter/World/WorldBridge.cs b/src/TeraSharp.Arbiter/World/WorldBridge.cs
+--- a/src/TeraSharp.Arbiter/World/WorldBridge.cs
++++ b/src/TeraSharp.Arbiter/World/WorldBridge.cs
+@@ -271,6 +271,22 @@
+         WorldServerList.SeedDefault(DungeonRouting.Channels, log);
+     }
+ 
++    /// <summary>T201 QA StickTogether: native User::TeleportStart, Arb044:6400 and030:6925.</summary>
++    public bool TryQaTeleport(GameSession user, int continent, uint channel, float x, float y, float z, short direction)
++    {
++        if (!user.InWorld || !HasLinks(user.CurrentWorldId)) return false;
++        var previous = _crossWorld.EnterFor(user.GameId, user.CurrentWorldId);
++        var move = previous == null ? null : CrossWorldHandoff.QaTeleport(previous, user.GameId, continent, channel, x, y, z, direction);
++        if (move == null) return false;
++        int? owner = CrossWorldHandoff.ResolveDestination(move,
++            c => DungeonRouting.Channels.WorldForChannel(move.Continent, unchecked((int)c)),
++            DungeonRouting.Channels.WorldForContinent, DungeonRouting.Channels.CatchAllWorldId);
++        if (owner is not int destination || !HasLinks(destination)
++            || !_crossWorld.Begin(user.CurrentWorldId, destination, move, user.PlayerId)) return false;
++        SendFrame(user.CurrentWorldId, OpLeaveWorld, CrossWorldHandoff.BuildLeave(move, user.PlayerId));
++        return true;
++    }
++
+     /// <summary>Reset every reorder buffer (World restarted).</summary>
+     public void ResetTunnelSequence()
+     {
+@@ -435,6 +451,13 @@
+         while (!ct.IsCancellationRequested)
+         {
+             await Task.Delay(50, ct);
++            TeraSharp.Arbiter.Handlers.QaDungeonEvents.Tick(Program.Store, this, DateTimeOffset.UtcNow);
++            TeraSharp.Arbiter.Handlers.QaSocialCommands.Tick(Program.Store, this, DateTimeOffset.UtcNow);
++            TeraSharp.Arbiter.Handlers.QaAchievementCommands.Tick(Program.Store, this, DateTimeOffset.UtcNow);
++            TeraSharp.Arbiter.Handlers.QaFestivalCommands.Tick(Program.Store, this, DateTimeOffset.UtcNow);
++            TeraSharp.Arbiter.Handlers.QaItemPeriodCommands.Tick(Program.Store, this, DateTimeOffset.UtcNow);
++            TeraSharp.Arbiter.Handlers.QaAwakenCommands.Tick(Program.Store, this, DateTimeOffset.UtcNow);
++            TeraSharp.Arbiter.Handlers.QaStyleShopCommands.Tick(Program.Store, this, DateTimeOffset.UtcNow);
+             _battlefield.Tick(this, DateTimeOffset.UtcNow);
+             DbProxy?.UserControls.Tick(DateTimeOffset.UtcNow, ResolveControlUser, HasLinks,
+                 send => SendFrame(send.WorldId, send.Opcode, send.Payload));
+@@ -619,6 +642,7 @@
+ 
+             case OpTunnelToClient:
+             {
++                if (!TeraSharp.Arbiter.Handlers.QaDiagnosticCommands.BypassEnabled) return; // Native Arb062:3672; group bypass is separate.
+                 // SA_BYPASS_TO_CLIENT addresses N recipients (16 B each) and the client packet
+                 // follows the list - TunnelFrames owns the layout (T38 / MULTIPLAYER-DESIGN.md
+                 // section 6). Each recipient has its own Ticket and sequence, so each gets the
+@@ -715,6 +739,7 @@
+         }
+         if (op == OpPlayerEnter)
+         {
++            TeraSharp.Arbiter.Handlers.QaGeneralCommands.StampEnterWorldFlags(payload, Program.Store);
+             DbProxy?.StampEnterWorldCrestPoints(payload); // T197: refresh earned extras before caching any entry/transfer/retry.
+             _crossWorld.RememberEnter(worldId, payload);
+         }
+diff --git a/src/TeraSharp.Arbiter/Handlers/HandlerRegistry.cs b/src/TeraSharp.Arbiter/Handlers/HandlerRegistry.cs
+--- a/src/TeraSharp.Arbiter/Handlers/HandlerRegistry.cs
++++ b/src/TeraSharp.Arbiter/Handlers/HandlerRegistry.cs
+@@ -377,13 +377,13 @@
+         //      client sent S_RETURN_TO_LOBBY (handled in GameSession).
+         void StartLeaveCountdown(GameSession s, LeaveMode mode, string preparePacket)
+         {
+-            const int countdown = 5;
++            int countdown = QaDiagnosticCommands.LeaveCountdownSeconds;
+             s.BeginLeaveToWorld(mode);
+             if (defs.Has(preparePacket))
+                 s.SendByDef(preparePacket, new Dictionary<string, object> { ["time"] = countdown });
+             var cts = new CancellationTokenSource();
+             s.PendingLobbyReturn = cts;
+-            _ = Task.Delay(TimeSpan.FromSeconds(countdown), cts.Token).ContinueWith(t =>
++            _ = QaDiagnosticCommands.WaitForLeaveCountdown(countdown, cts.Token).ContinueWith(t =>
+             {
+                 if (t.IsCanceled) return;
+                 s.CompleteLeaveToWorld();
+diff --git a/src/TeraSharp.Arbiter/Handlers/LoginHandlers.cs b/src/TeraSharp.Arbiter/Handlers/LoginHandlers.cs
+--- a/src/TeraSharp.Arbiter/Handlers/LoginHandlers.cs
++++ b/src/TeraSharp.Arbiter/Handlers/LoginHandlers.cs
+@@ -44,7 +44,7 @@
+         _log.LogInformation("C_LOGIN_ARBITER: account '{Name}' (id {Id}) language {Lang}, {N} character(s)",
+             s.Account.Name, s.Account.AccountId, language, s.Account.Characters.Count);
+ 
+-        s.SendByDef("S_LOADING_SCREEN_CONTROL_INFO", new Dictionary<string, object> { ["enableCustom"] = false });
++        s.SendByDef("S_LOADING_SCREEN_CONTROL_INFO", new Dictionary<string, object> { ["enableCustom"] = QaUtilityCommands.LoadingScreenEnabled(Program.Store) });
+         s.SendByDef("S_SERVER_BUILD_INFO", new Dictionary<string, object> { ["langType"] = 6, ["revision"] = 376056 });
+         s.SendByDef("S_REMAIN_PLAY_TIME", new Dictionary<string, object> { ["accountType"] = 6, ["minutesLeft"] = 0 });
+         s.SendByDef("S_LOGIN_ARBITER", new Dictionary<string, object>
+@@ -111,14 +111,14 @@
+ 
+         s.SendByDef("S_GET_USER_LIST", new Dictionary<string, object>
+         {
+-            ["characters"] = characters, ["veteran"] = false, ["bonusBufSec"] = 0, ["maxCharacters"] = CharacterHandlers.MaxCharactersPerAccount,
++            ["characters"] = characters, ["veteran"] = false, ["bonusBufSec"] = 0, ["maxCharacters"] = QaUtilityCommands.CharacterSlots(Program.Store, (long)s.Account.AccountId),
+             ["first"] = true, ["more"] = false, ["leftDelTimeAccountOver"] = 0,
+             ["deletionSectionClassifyLevel"] = 5, ["deleteCharacterExpireHour1"] = 0, ["deleteCharacterExpireHour2"] = 72,
+         });
+ 
+         s.SendByDef("S_LOAD_CLIENT_ACCOUNT_SETTING", new Dictionary<string, object> { ["data"] = Array.Empty<byte>() });
+         // T89b: two lobby packets the real Arbiter sends here (cap_final_client frames 13 and 15).
+-        s.Send(new byte[] { 0x08, 0x00, 0xB3, 0x57, 0x00, 0x00, 0x00, 0x00 });                      // S_DECO_UI_INFO, body all zero
++        s.Send(QaUiCommands.BuildDecoUi(Program.Store)); // T201: native persisted contents(type33) selection.
+         {
+             var inv = new byte[17];
+             inv[0] = 0x11; inv[1] = 0x00; inv[2] = 0x1D; inv[3] = 0xD4;                                 // S_CONFIRM_INVITE_CODE_BUTTON
+diff --git a/src/TeraSharp.Arbiter/Network/GameSession.cs b/src/TeraSharp.Arbiter/Network/GameSession.cs
+--- a/src/TeraSharp.Arbiter/Network/GameSession.cs
++++ b/src/TeraSharp.Arbiter/Network/GameSession.cs
+@@ -85,6 +85,13 @@
+         PendingLeaveMode = mode;
+         var w = Program.World;
+         if (w != null && InWorld) w.SendUserRequestExit(PlayerId);
++    }
++
++    /// <summary>T201 native QA logout starts the leave immediately, without a client countdown request.</summary>
++    public void ForceLeaveToWorld(LeaveMode mode)
++    {
++        PendingLeaveMode = mode;
++        CompleteLeaveToWorld();
+     }
+ 
+     /// <summary>

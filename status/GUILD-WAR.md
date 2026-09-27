@@ -1,6 +1,6 @@
 # Guild war - declare, view, withdraw (T80)
 
-Ground truth: `<captures>\cap_social4_client.log` frames **1621..4453** and
+Ground truth: `D:\packetlogs\cap_social4_client.log` frames **1621..4453** and
 `cap_social4_ctl.txt` taps **6023** and **7468**. Implementation: `World/GuildWarManager.cs`,
 `Persistence/CharacterStore.cs` (tables `guild_wars`, `guild_war_history`),
 `Protocol/V100Definitions.cs` (two corrected defs). Tests:
@@ -73,8 +73,8 @@ def names the enum: `0 = declare, 1 = Withdrew, 2 = Surrendered`.
 ### `S_OPEN_GUILD_WAR_WINDOW.1` has no war list at all
 
 It declares two `int32` and stops - eight bytes. Frame 1623 is twelve and frame 3389 is 104. The
-writer (`Arb_part_059.c:2659`) settles it: it advances the element cursor by 0x48 - **72 bytes
-per element** - and it writes, in order,
+writer (`Arb_part_059.c:2659`) settles it: after each element it advances the running write offset
+by `0x48` - **72 bytes per element** - and it writes, in order,
 
 ```
 +0  u16 here      +2  u16 next
@@ -215,5 +215,5 @@ cap_final2a_client1 (sdg, guild 2) / client2 (fdh, guild 3) + the cap_final2b ta
   declaration), second = the opponent. T80's attacker-first rows were the attacker's view.
 - T80 missed the payment: cap_social4_client 3385 and tap 6022 are the same money + guild-data pair.
 - S_START_GUILD_WAR (client1 4616) and the SMT 3891/3892/3893 notices are World's (GuildWar
-  ticks; SA_BROADCAST_SYSTEM_MESSAGE 0x1436, which WorldBridge still drops).
+  ticks; SA_BROADCAST_SYSTEM_MESSAGE 0x1436, relayed since T172).
 - The capture's costs (100 / 10) are an admin override (spLoadGuildWarAdmin*); TeraSharp uses the sheet.

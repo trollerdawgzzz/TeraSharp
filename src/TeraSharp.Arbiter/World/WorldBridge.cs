@@ -33,6 +33,7 @@ public enum LeaveMode
 internal sealed class TunnelReorderBuffer
 {
     public readonly SortedDictionary<uint, byte[]> Pending = new();
+    public readonly OrderedTunnelDelivery Ready = new();
     public uint NextSeq;
     public DateTime LastDelivery = DateTime.UtcNow;
     /// <summary>Callback to deliver a reordered client packet to the owning session.</summary>
@@ -119,6 +120,9 @@ public sealed class WorldBridge
     /// </summary>
     private readonly Dictionary<ulong, GameSession> _players = new();
     private readonly object _playersLock = new();
+    private readonly BattlefieldCreation _battlefieldCreation = new(); // T199: BF protocol creation/log state
+    private readonly BattlefieldHandoff _battlefield = new(); // T199: pending BG offers and native return path
+    private readonly CrossWorldHandoff _crossWorld = new();   // T192: live enter data + type-2 continuation
 
     /// <summary>Allocate a unique tunnel Ticket for a new player session.</summary>
     internal uint AllocateTunnelKey() => AllocateTunnelKey(WorldRegistration.DefaultWorldId);
@@ -128,9 +132,14 @@ public sealed class WorldBridge
 
     public void RegisterPlayer(GameSession s)
     {
-        lock (_playersLock) _players[s.GameId] = s;
+        lock (_playersLock)
+        {
+            _players[s.GameId] = s;
+            CharacterTransientState.PlayerRegistered(this, s.PlayerId);   // T192: supersede a departed owner
+        }
         lock (_reorderLock)
         {
+            if (_tunnels.TryGetValue((s.CurrentWorldId, s.TunnelKey), out var previous)) previous.Ready.Retire();
             _tunnels[(s.CurrentWorldId, s.TunnelKey)] = new TunnelReorderBuffer { Deliver = p => Handlers.ArbiterClientHandlers.DeliverTunnelled(s, p) };   // T121: inject S_ADMIN_GM_SKILL before the tunnelled S_LOAD_TOPO
             _departed.ForgetEverywhere(s.TunnelKey);   // T161 (+ 2026-09-22: a reissued ticket is live on every world)
         }
@@ -140,12 +149,19 @@ public sealed class WorldBridge
         => UnregisterPlayer(gameId, WorldRegistration.DefaultWorldId, tunnelKey);
 
     /// <summary>T111: the Ticket is freed in its own World's space and unkeyed with it.</summary>
-    public void UnregisterPlayer(ulong gameId, int worldId, uint tunnelKey)
+    public void UnregisterPlayer(ulong gameId, int worldId, uint tunnelKey, bool transferring = false)
     {
-        lock (_playersLock) _players.Remove(gameId);
+        lock (_playersLock)
+        {
+            if (_players.Remove(gameId, out var removed))
+                CharacterTransientState.PlayerUnregistered(this, worldId, removed.PlayerId);
+        }
+        DbProxy?.UserControls.Forget(gameId);   // T180: User-owned hold/departure lifetime
+        _crossWorld.Forget(gameId);   // T192: a disconnected session must not finish an old transfer
+        if (!transferring) _battlefield.ForgetUser(gameId); // T199: preserve BG state only across type2
         lock (_reorderLock)
         {
-            _tunnels.Remove((worldId, tunnelKey));
+            if (_tunnels.Remove((worldId, tunnelKey), out var old)) old.Ready.Retire();
             _departed.Add(worldId, tunnelKey);   // T161: World keeps addressing it until SA_LEAVE_WORLD
         }
         _tickets.For(worldId).Free(tunnelKey);
@@ -197,6 +213,7 @@ public sealed class WorldBridge
     {
         lock (_reorderLock)
         {
+            if (_tunnels.TryGetValue((worldId, key), out var previous)) previous.Ready.Retire();
             _tunnels[(worldId, key)] = new TunnelReorderBuffer { Deliver = callback };
             _departed.ForgetEverywhere(key);   // T161 (+ 2026-09-22)
         }
@@ -211,7 +228,7 @@ public sealed class WorldBridge
     {
         lock (_reorderLock)
         {
-            _tunnels.Remove((worldId, key));
+            if (_tunnels.Remove((worldId, key), out var old)) old.Ready.Retire();
             _departed.Add(worldId, key);   // T161
         }
     }
@@ -257,6 +274,22 @@ public sealed class WorldBridge
         WorldServerList.SeedDefault(DungeonRouting.Channels, log);
     }
 
+    /// <summary>T201 QA StickTogether: native User::TeleportStart, Arb044:6400 and030:6925.</summary>
+    public bool TryQaTeleport(GameSession user, int continent, uint channel, float x, float y, float z, short direction)
+    {
+        if (!user.InWorld || !HasLinks(user.CurrentWorldId)) return false;
+        var previous = _crossWorld.EnterFor(user.GameId, user.CurrentWorldId);
+        var move = previous == null ? null : CrossWorldHandoff.QaTeleport(previous, user.GameId, continent, channel, x, y, z, direction);
+        if (move == null) return false;
+        int? owner = CrossWorldHandoff.ResolveDestination(move,
+            c => DungeonRouting.Channels.WorldForChannel(move.Continent, unchecked((int)c)),
+            DungeonRouting.Channels.WorldForContinent, DungeonRouting.Channels.CatchAllWorldId);
+        if (owner is not int destination || !HasLinks(destination)
+            || !_crossWorld.Begin(user.CurrentWorldId, destination, move, user.PlayerId)) return false;
+        SendFrame(user.CurrentWorldId, OpLeaveWorld, CrossWorldHandoff.BuildLeave(move, user.PlayerId));
+        return true;
+    }
+
     /// <summary>Reset every reorder buffer (World restarted).</summary>
     public void ResetTunnelSequence()
     {
@@ -265,11 +298,35 @@ public sealed class WorldBridge
             foreach (var buf in _tunnels.Values)
             {
                 buf.Pending.Clear();
+                buf.Ready.Clear();
                 buf.NextSeq = 0;
                 buf.LastDelivery = DateTime.UtcNow;
             }
             _departed.Clear();   // T161: World restarted - its ticket table went with it
         }
+        _crossWorld.Clear();
+        _battlefield.Clear();
+        CharacterTransientState.ResetWorldSessions(this);   // T192: same lifetime as the World process
+    }
+
+    /// <summary>T192. Reset only the World whose final link disconnected.</summary>
+    internal void ResetTunnelSequenceForWorld(int worldId)
+    {
+        lock (_reorderLock)
+        {
+            foreach (var pair in _tunnels.Where(pair => pair.Key.World == worldId))
+            {
+                pair.Value.Pending.Clear();
+                pair.Value.Ready.Clear();
+                pair.Value.NextSeq = 0;
+                pair.Value.LastDelivery = DateTime.UtcNow;
+            }
+            _departed.ClearWorld(worldId);
+        }
+        _crossWorld.ForgetWorld(worldId);
+        _battlefield.ForgetWorld(worldId);
+        int reset = CharacterTransientState.ResetWorldSessions(this, worldId);
+        if (reset != 0) _log.LogWarning("World {W} disconnected - reset transient state for {N} character(s)", worldId, reset);
     }
 
     /// <summary>Reset ONE player's reorder buffer (their re-enter), leaving the others' queues alone.</summary>
@@ -283,6 +340,7 @@ public sealed class WorldBridge
         {
             if (!_tunnels.TryGetValue((worldId, tunnelKey), out var buf)) return;
             buf.Pending.Clear();
+            buf.Ready.Clear();
             buf.NextSeq = 0;
             buf.LastDelivery = DateTime.UtcNow;
         }
@@ -365,27 +423,30 @@ public sealed class WorldBridge
             var link = new WorldLink(Interlocked.Increment(ref _nextLinkId), sock, this, _log);
             lock (_lock) _links.Add(link);
             _log.LogInformation("WorldServer link #{Id} connected ({N} active)", link.Id, _links.Count);
-            _ = link.RunAsync(ct).ContinueWith(_ =>
-            {
-                int remaining, mine;
-                lock (_lock)
-                {
-                    _links.Remove(link);
-                    remaining = _links.Count;
-                    mine = _links.Count(l => l.WorldId == link.WorldId);
-                }
-                if (mine == 0)
-                {
-                    // T108: only THIS World stops taking players, and its instances go with it.
-                    _worlds.For(link.WorldId).MarkDisconnected();
-                    DungeonRouting.Channels.ForgetWorld(link.WorldId);
-                    DungeonRouting.Transfers.ForgetWorld(link.WorldId);
-                    _log.LogWarning("World {W} fully disconnected - not ready", link.WorldId);
-                }
-                _log.LogInformation("WorldServer link #{Id} closed ({N} active)", link.Id, remaining);
-            }, ct);
+            _ = link.RunAsync(ct).ContinueWith(_ => OnWorldLinkClosed(link), CancellationToken.None);
         }
         listener.Stop();
+    }
+
+    // Also used by the disconnect regression: closing a worker must not reset the whole World.
+    internal void OnWorldLinkClosed(WorldLink link)
+    {
+        int remaining, mine;
+        lock (_lock)
+        {
+            if (!_links.Remove(link)) return;   // one cleanup per actual link
+            remaining = _links.Count;
+            mine = _links.Count(l => l.WorldId == link.WorldId);
+            if (mine == 0) _worlds.For(link.WorldId).MarkDisconnected();
+        }
+        if (mine == 0)
+        {
+            ResetTunnelSequenceForWorld(link.WorldId);
+            DungeonRouting.Channels.ForgetWorld(link.WorldId);
+            DungeonRouting.Transfers.ForgetWorld(link.WorldId);
+            _log.LogWarning("World {W} fully disconnected - not ready", link.WorldId);
+        }
+        _log.LogInformation("WorldServer link #{Id} closed ({N} active)", link.Id, remaining);
     }
 
     private async Task StallWatchdog(CancellationToken ct)
@@ -393,44 +454,84 @@ public sealed class WorldBridge
         while (!ct.IsCancellationRequested)
         {
             await Task.Delay(50, ct);
-            List<((int World, uint Ticket) key, byte[] pkt)>? flush = null;
-            lock (_reorderLock)
-            {
-                foreach (var (key, buf) in _tunnels)
-                {
-                    if (buf.Pending.Count > 0 &&
-                        (DateTime.UtcNow - buf.LastDelivery).TotalMilliseconds > StallMs)
-                    {
-                        var first = buf.Pending.Keys.First();
-                        _log.LogWarning("Tunnel world={W} key={Key} seq stall: expected {Exp}, "
-                            + "have {Have} - skipping", key.World, key.Ticket, buf.NextSeq, first);
-                        buf.NextSeq = first;
-                        flush ??= new();
-                        flush.AddRange(DrainInOrder(key, buf));
-                    }
-                }
-            }
-            if (flush != null)
-                foreach (var (k, p) in flush) RouteToClient(k.World, k.Ticket, p);
+            TeraSharp.Arbiter.Handlers.QaDungeonEvents.Tick(Program.Store, this, DateTimeOffset.UtcNow);
+            TeraSharp.Arbiter.Handlers.QaSocialCommands.Tick(Program.Store, this, DateTimeOffset.UtcNow);
+            TeraSharp.Arbiter.Handlers.QaAchievementCommands.Tick(Program.Store, this, DateTimeOffset.UtcNow);
+            TeraSharp.Arbiter.Handlers.QaFestivalCommands.Tick(Program.Store, this, DateTimeOffset.UtcNow);
+            TeraSharp.Arbiter.Handlers.QaItemPeriodCommands.Tick(Program.Store, this, DateTimeOffset.UtcNow);
+            TeraSharp.Arbiter.Handlers.QaAwakenCommands.Tick(Program.Store, this, DateTimeOffset.UtcNow);
+            TeraSharp.Arbiter.Handlers.QaStyleShopCommands.Tick(Program.Store, this, DateTimeOffset.UtcNow);
+            _battlefield.Tick(this, DateTimeOffset.UtcNow);
+            DbProxy?.UserControls.Tick(DateTimeOffset.UtcNow, ResolveControlUser, HasLinks,
+                send => SendFrame(send.WorldId, send.Opcode, send.Payload));
+            FlushStalledTunnels(DateTime.UtcNow);
         }
     }
 
-    private static List<((int World, uint Ticket) key, byte[] pkt)> DrainInOrder(
-        (int World, uint Ticket) key, TunnelReorderBuffer buf)
+    // T198: watchdog and normal arrivals enqueue under the SAME sequence lock, then use
+    // the SAME per-ticket drainer outside it. No callback runs while _reorderLock is held.
+    internal void FlushStalledTunnels(DateTime utcNow)
     {
-        var outp = new List<((int, uint), byte[])>();
+        List<OrderedTunnelDelivery>? flush = null;
+        lock (_reorderLock)
+        {
+            foreach (var (key, buf) in _tunnels)
+            {
+                if (buf.Pending.Count > 0 && (utcNow - buf.LastDelivery).TotalMilliseconds > StallMs)
+                {
+                    var first = buf.Pending.Keys.First();
+                    _log.LogWarning("Tunnel world={W} key={Key} seq stall: expected {Exp}, "
+                        + "have {Have} - skipping", key.World, key.Ticket, buf.NextSeq, first);
+                    buf.NextSeq = first;
+                    QueueInOrder(buf);
+                    flush ??= new();
+                    flush.Add(buf.Ready);
+                }
+            }
+        }
+        if (flush != null)
+            foreach (var ready in flush) ready.Drain();
+    }
+
+    private static void QueueInOrder(TunnelReorderBuffer buf)
+    {
         while (buf.Pending.TryGetValue(buf.NextSeq, out var pkt))
         {
             buf.Pending.Remove(buf.NextSeq);
-            outp.Add((key, pkt));
+            if (buf.Deliver != null) buf.Ready.Enqueue(buf.Deliver, pkt);
             buf.NextSeq++;
             buf.LastDelivery = DateTime.UtcNow;
         }
-        return outp;
+    }
+
+    // T180: AS_ENTER_WORLD uses our gameId as its opaque Arbiter User handle. Real captures
+    // contain pointers instead; never decode either handle as a UserDbId.
+    private WorldControlUser? ResolveControlUser(ulong handle)
+    {
+        var session = PlayerForGameId(handle);
+        if (session == null || session.PlayerId == 0) return null;
+        return new WorldControlUser((uint)PartyPackets.PlanetId, session.PlayerId, session.CurrentWorldId, () =>
+        {
+            // Arb_part_062.c:13016 queues User::OnRequestCancelReturnToLobby before leave.
+            // TeraSharp has no pending prepare-appearance object (1498 is currently a no-op).
+            var pending = session.PendingLobbyReturn;
+            if (pending == null) return;
+            pending.Cancel();
+            session.PendingLobbyReturn = null;
+            SendFrame(session.CurrentWorldId, OpUserCancelRequestExit, BitConverter.GetBytes(session.PlayerId));
+            session.SendByDef("S_CANCEL_RETURN_TO_LOBBY", new Dictionary<string, object> { ["byInterrupt"] = (byte)0 });
+        });
     }
 
     public void HandleFrame(WorldLink link, ushort op, byte[] payload)
     {
+        if (_battlefieldCreation.TryHandle(link, Program.Store, op, payload)) return;
+        if (_battlefield.TryHandle(this, link, _crossWorld, Program.Store, op, payload, DateTimeOffset.UtcNow)) return;
+        // T180: consume these before DbProxy/replay. Replies go to the owning/target World,
+        // including same-World cases; no same-link fallback for an unknown handle or owner.
+        if (DbProxy?.UserControls.TryHandle(op, payload, ResolveControlUser, DungeonRouting.Channels,
+                HasLinks, send => SendFrame(send.WorldId, send.Opcode, send.Payload), DateTimeOffset.UtcNow) == true)
+            return;
         // ---- T138b: the cross-World hand-off (status/MULTIWORLD-DESIGN.md T137c) ----
         // ONLY the cross-link case is taken here; everything else (including a same-World zone
         // change, which also travels 0x13BE/0x13C0 and is completed by the T108 DbProxy handlers)
@@ -446,19 +547,47 @@ public sealed class WorldBridge
             int owner = continent is int c ? (DungeonRouting.Channels.WorldForContinent(c) ?? link.WorldId) : link.WorldId;
             if (owner != link.WorldId && LinksOf(owner).Count > 0)
             {
-                var reply = ContinentHandoff.EnterReply(payload);
+                // T192: full+6 is an opaque User handle, not UserDbId. The old captured
+                // prefix addressed every request to player 1 (handoff1's requester was 10).
+                var user = payload.Length >= DbProxyHandlers.RequestEnterDungeonMinPayload
+                    ? ResolveControlUser(BitConverter.ToUInt64(payload, 0)) : null;
+                if (user == null)
+                {
+                    _log.LogWarning("0x13BE continent {C}: unknown user handle or short request - dropped", continent);
+                    return;
+                }
+                var reply = ContinentHandoff.EnterReply(payload, user.PlanetId, user.UserDbId);
                 if (reply != null)
                 {
-                    _log.LogInformation("0x13BE continent {C} from world {From} -> 0x13BF to world {To}", continent, link.WorldId, owner);
+                    DbProxy?.RecordDungeonEntry(payload, response: false, resolvedPlayerId: (int)user.UserDbId);
+                    _log.LogInformation("0x13BE player {Pid} continent {C} from world {From} -> 0x13BF to world {To}", user.UserDbId, continent, link.WorldId, owner);
                     SendFrame(owner, ContinentHandoff.AS_ENTER_CONTINENT, reply);
                     return;
                 }
             }
         }
-        else if (op == ContinentHandoff.SA_CONTINENT_READY && link.WorldId != 0 && LinksOf(0).Count > 0)   // 0x13C0 on an owner link
+        else if (op == ContinentHandoff.SA_CONTINENT_READY)
         {
-            var reply = ContinentHandoff.ReadyReply(payload);
-            if (reply != null) { SendFrame(0, ContinentHandoff.AS_CONTINENT_READY, reply); return; }
+            // Arb_part_062.c:13719-13741 resolves the returned PDId, then sends to that
+            // user's current World. The source can itself be a DungeonServer, not only 0.
+            var user = payload.Length >= DbProxyHandlers.ResponseEnterDungeonMinPayload
+                ? SessionForPlayerId(BitConverter.ToInt32(payload, ContinentHandoff.UserDbIdOffset)) : null;
+            if (user == null)
+            {
+                _log.LogWarning("0x13C0: unknown user PDId or short response - dropped");
+                return;
+            }
+            if (user.CurrentWorldId != link.WorldId)
+            {
+                if (HasLinks(user.CurrentWorldId))
+                {
+                    DbProxy?.RecordDungeonEntry(payload, response: true, resolvedPlayerId: (int)user.PlayerId);
+                    SendFrame(user.CurrentWorldId, ContinentHandoff.AS_CONTINENT_READY,
+                        ContinentHandoff.ReadyReply(payload)!);
+                }
+                return;
+            }
+            // Same-World requests retain the existing DbProxy path and its state updates.
         }
 
         switch (op)
@@ -516,6 +645,7 @@ public sealed class WorldBridge
 
             case OpTunnelToClient:
             {
+                if (!TeraSharp.Arbiter.Handlers.QaDiagnosticCommands.BypassEnabled) return; // Native Arb062:3672; group bypass is separate.
                 // SA_BYPASS_TO_CLIENT addresses N recipients (16 B each) and the client packet
                 // follows the list - TunnelFrames owns the layout (T38 / MULTIPLAYER-DESIGN.md
                 // section 6). Each recipient has its own Ticket and sequence, so each gets the
@@ -534,13 +664,32 @@ public sealed class WorldBridge
                 return;
             }
 
+            case CrossWorldHandoff.SA_TELEPORT:
+            {
+                var move = CrossWorldHandoff.Parse(payload);
+                var user = move == null ? null : PlayerForGameId(move.UserHandle);
+                if (move == null || user == null || user.CurrentWorldId != link.WorldId) return;
+                int? owner = CrossWorldHandoff.ResolveDestination(move,
+                    channel => DungeonRouting.Channels.WorldForChannel(move.Continent, unchecked((int)channel)),
+                    DungeonRouting.Channels.WorldForContinent, DungeonRouting.Channels.CatchAllWorldId);
+                if (owner is not int target || !HasLinks(target)
+                    || !_crossWorld.Begin(link.WorldId, target, move, user.PlayerId))
+                {
+                    _log.LogWarning("SA_TELEPORT player {Pid}: missing target World, live enter data, or duplicate transfer", user.PlayerId);
+                    return;
+                }
+                // Native TeleportStart calls LeaveWorldStart(type2); no lobby response.
+                link.SendFrame(OpLeaveWorld, CrossWorldHandoff.BuildLeave(move, user.PlayerId));
+                return;
+            }
+
             case OpSaLeaveWorld:
                 HandleSaLeaveWorld(link, payload);
                 return;
 
             default:
                 if (PartyWiring.TryHandleWorldFrame(op, payload)) return;   // T49: the twelve party SA_ opcodes incl. SA_BYPASS_TO_GROUP
-                if (GuildWiring.TryHandleWorldFrame(op, payload)) return;   // T52: guild SA_ opcodes (membership test, not a length gate)
+                if (GuildWiring.TryHandleWorldFrame(op, payload, link.SendFrame)) return;   // T52: guild SA_ opcodes (membership test, not a length gate)
                 if (ContractBroker.TryHandleWorldFrame(op, payload)) return;   // T60: 0x2809/0x280C/0x280D/0x280E - party invites travel as contracts
                 if (WorldReplayTable.LogsAtDebug(op))
                     _log.LogDebug("W->A #{Id} 0x{Op:X4} len={Len}", link.Id, op, payload.Length + 6);   // T106: quiet set
@@ -591,6 +740,12 @@ public sealed class WorldBridge
             _log.LogWarning("0x{Op:X4}: world {W} has no links - frame dropped", op, worldId);
             return;
         }
+        if (op == OpPlayerEnter)
+        {
+            TeraSharp.Arbiter.Handlers.QaGeneralCommands.StampEnterWorldFlags(payload, Program.Store);
+            DbProxy?.StampEnterWorldCrestPoints(payload); // T197: refresh earned extras before caching any entry/transfer/retry.
+            _crossWorld.RememberEnter(worldId, payload);
+        }
         primary.SendFrame(op, payload);
     }
 
@@ -601,12 +756,10 @@ public sealed class WorldBridge
     /// </summary>
     private void DeliverTunnelPacket(int worldId, uint ticket, uint seq, byte[] clientPkt)
     {
-        List<((int World, uint Ticket) k, byte[] p)>? deliver = null;
+        TunnelReorderBuffer? buf = null;
         lock (_reorderLock)
         {
-            // T161: a departed Ticket's frames never enter the survivor's buffer - their sequence
-            // numbers are not the survivor's (cap_queue1: "expected 1362, have 2730").
-            TunnelReorderBuffer? buf = null;
+            // T161: a departed ticket must never borrow the remaining player's sequence.
             _tunnels.TryGetValue((worldId, ticket), out var own);
             switch (TunnelRouting.Decide(own != null, _departed.Contains(worldId, ticket), _tunnels.Count))
             {
@@ -616,10 +769,10 @@ public sealed class WorldBridge
             if (buf != null)
             {
                 buf.Pending[seq] = clientPkt;
-                deliver = DrainInOrder((worldId, ticket), buf);
+                QueueInOrder(buf);
             }
         }
-        if (deliver != null) { foreach (var (k, p) in deliver) RouteToClient(k.World, k.Ticket, p); return; }
+        if (buf != null) { buf.Ready.Drain(); return; }
         RouteToClient(worldId, ticket, clientPkt);   // logs + drops with 2+ sessions
     }
 
@@ -662,14 +815,18 @@ public sealed class WorldBridge
     /// </summary>
     public void SendUserRequestExit(uint playerId)
     {
-        SendFrame(OpUserRequestExit, BitConverter.GetBytes(playerId));
+        var user = SessionForPlayerId(unchecked((int)playerId));
+        if (user == null || !user.InWorld || !HasLinks(user.CurrentWorldId)) return;
+        SendFrame(user.CurrentWorldId, OpUserRequestExit, BitConverter.GetBytes(playerId));
         _log.LogInformation("Sent AS_USER_REQUEST_EXIT (0x14FF) for player {Id}", playerId);
     }
 
     /// <summary>Countdown cancelled. Writer FUN_140353530: AS_USER_CANCEL_REQUEST_EXIT [u32 playerId].</summary>
     public void SendUserCancelRequestExit(uint playerId)
     {
-        SendFrame(OpUserCancelRequestExit, BitConverter.GetBytes(playerId));
+        var user = SessionForPlayerId(unchecked((int)playerId));
+        if (user == null || !user.InWorld || !HasLinks(user.CurrentWorldId)) return;
+        SendFrame(user.CurrentWorldId, OpUserCancelRequestExit, BitConverter.GetBytes(playerId));
         _log.LogInformation("Sent AS_USER_CANCEL_REQUEST_EXIT (0x1500) for player {Id}", playerId);
     }
 
@@ -770,6 +927,36 @@ public sealed class WorldBridge
         var session = FindPlayer(gameId) ?? FindPlayer(gameId | 0x80000AF00000UL);
         if (session != null)
         {
+            if (payload.Length >= 24 && BitConverter.ToUInt32(payload, 16) == 2)
+            {
+                var transfer = _crossWorld.Take(gameId, link.WorldId);
+                if (transfer == null || !session.InWorld || !HasLinks(transfer.DestinationWorld))
+                {
+                    _log.LogWarning("Type-2 SA_LEAVE_WORLD for {G:X}: no live transfer destination", gameId);
+                    return;
+                }
+                // All source saves precede this confirmation (retail7903 -> 7906). Native
+                // LeaveWorldEnd commits the destination before owner138E/2711; preserve login
+                // account/session fields and update only the captured transfer fields.
+                DbProxy?.CommitTeleportLocation((int)session.PlayerId, transfer.Move, transfer.DestinationWorld);
+                UnregisterPlayer(session.GameId, session.CurrentWorldId, session.TunnelKey, transferring: true);
+                session.CurrentWorldId = transfer.DestinationWorld;
+                session.TunnelKey = AllocateTunnelKey(session.CurrentWorldId);
+                RegisterPlayer(session);
+                PartyWiring.Register(session);
+                LeaveGate.Shared.StartTransfer(session.GameId);
+                var enter = CrossWorldHandoff.BuildEnter(transfer.PreviousEnter, transfer.Move, session.TunnelKey);
+                // Matching can form a party after login. Native EnterWorldStart reads the
+                // current Party each time (Arb028:15773-15781/15847-15850), not the login snapshot.
+                var party = PartyWiring.Manager.FindByMember((int)session.PlayerId);
+                BitConverter.GetBytes((ulong)(party?.Id ?? 0)).CopyTo(enter, 94);
+                enter[102] = party?.IsSys == true ? (byte)1 : (byte)0;
+                SendFrame(session.CurrentWorldId, OpPlayerEnter, enter);
+                _battlefield.CompleteTransfer(session.PlayerId, session.CurrentWorldId);
+                _log.LogInformation("Transferred player {Pid} from World {From} to {To} ({Continent}/{Channel})",
+                    session.PlayerId, link.WorldId, session.CurrentWorldId, transfer.Move.Continent, transfer.Move.Channel);
+                return;
+            }
             DbProxy?.CommitPlayTime((int)(session.SelectedCharacter?.Id ?? 0), DateTimeOffset.UtcNow.ToUnixTimeSeconds());   // T113
             session.OnWorldLeaveConfirmed();
         }

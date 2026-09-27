@@ -17,8 +17,8 @@ namespace TeraSharp.Arbiter.Web;
 // not read it:
 //
 //   * ArbiterServer.exe.c has no admin-tool path at all. Its only URL is a hardcoded retail
-//     phone-home, FUN_14016dad0(.., L"http://%s/Default.aspx?v=%s", a hardcoded retail address,
-//     "Live-100.02 TW #9 (Gold)"), fired through InternetOpenUrlW at startup. Unrelated.
+//     phone-home (FUN_14016dad0, L"http://%s/Default.aspx?v=%s" against a hardcoded retail
+//     address with the build string), fired through InternetOpenUrlW at startup. Unrelated.
 //   * WebApp\ContentsControl\Awesomium\* is a DIFFERENT feature - the GM pages that manage the
 //     per-server (Title, Url) list behind C_/S_REQUEST_SERVER_ADMINTOOL_AWESOMIUM_URL. In the
 //     working capture both of those strings are EMPTY and the panel opened anyway.
@@ -82,7 +82,7 @@ public sealed class ApiGatewayServer : IDisposable
         string port = colon >= 0 ? address[(colon + 1)..] : string.Empty;
         if (port.Length == 0) port = ApiGatewayToken.DefaultAddress[(ApiGatewayToken.DefaultAddress.IndexOf(':') + 1)..];
 
-        string b = bind ?? Environment.GetEnvironmentVariable(BindVariable) ?? string.Empty;
+        string b = bind ?? TerasConfig.Get(BindVariable) ?? string.Empty;
         if (!string.IsNullOrWhiteSpace(b)) host = b.Trim();
         if (host is "0.0.0.0" or "*" or "+") host = "+";
         return "http://" + host + ":" + port + "/";
@@ -144,7 +144,7 @@ public sealed class ApiGatewayServer : IDisposable
     /// <summary>Starts the probe, or returns null and says why. Never throws.</summary>
     public static ApiGatewayServer? TryStart(ILogger log)
     {
-        string serve = Environment.GetEnvironmentVariable(EnableVariable) ?? string.Empty;
+        string serve = TerasConfig.Get(EnableVariable) ?? string.Empty;
         if (!(serve.Trim() == "1" || serve.Trim().Equals("true", StringComparison.OrdinalIgnoreCase)))
         {
             log.LogInformation(

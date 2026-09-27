@@ -22,7 +22,7 @@ neighbour among the leftovers is `C_REQUEST_PARTY_MATCH_INFO_PAGE` (`int16 page`
 
 `class` reaches two places unchecked:
 
-- **Past season**, Arb_part_050.c:10630 - the cursor is advanced by `(class + 1) * 3` pointers.
+- **Past season**, Arb_part_050.c:10630 - `row = base + (class + 1) * 24 bytes`, with `class` taken raw from the packet.
   A raw pointer index, 24-byte stride, no bound of any kind. `0x7fffffff` is a ~51 GB offset; a
   negative value walks backwards. A wild read, i.e. a real fault.
 - **Current season** - `RankTree<LevelTime,...>::ClassRank(enum ClassType,int)`
@@ -271,7 +271,7 @@ is what the server does when `Rank()` misses its tree.
 
 ## 8. Against the live Classic+ server (T133)
 
-`<captures>\classic_live_ctl.txt` (T130) is the first capture of a leaderboard that
+`D:\packetlogs\classic_live_ctl.txt` (T130) is the first capture of a leaderboard that
 **answers**. The real Arbiter on 100.02 never did, so everything in sections 6 and 7 came from
 the decompile alone. Five frames are kept in `data/classic-live/` and the tests round-trip
 them.
@@ -328,8 +328,8 @@ carries 1 - row 97 of frame 5818, rank 96, "BFG", up seven places.
 
 ### 8.3 The self-rank frame is conditional
 
-`SendNowSeasonRank` guards the second frame on the requested class matching either the
-requester's own class or the aggregate value 0x10 (Arb_part_050.c:9961): the class
+`SendNowSeasonRank` guards the second frame with
+`requestedClass == viewerClass || requestedClass == 0x10` (viewerClass read at `+0x2f`; Arb_part_050.c:9961): the class
 asked for is the requester's own, or the aggregate. T126 sent it unconditionally. All nine
 requests in classic_live come from a class-9 player and agree:
 

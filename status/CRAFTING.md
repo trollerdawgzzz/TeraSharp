@@ -119,3 +119,63 @@ Added `ArtisanDb.ProfHerb..ProfEnergy` and `ArtisanDb.GatheringOpFor(type)`.
 four or five SkillProf rows), LEARN, DELETE_LIST, SET_BOOKMARK, STEP1, STEP2 and its atoms,
 UPDATE_SKILL_PROF and the four S_UPDATE_PROF_*. RecipeInfo's Extract, Bookmark and learn time
 have no client-visible trace here: nothing was learned, extracted or bookmarked.
+
+## T198 — operator crafting window: login packets delivered out of order
+
+`cap_instance1_client2` is the failing operator (S_LOGIN_ARBITER status 33); client1
+is the working normal account (31). World sent the operator's S_LOGIN first, but
+TeraSharp delivered both artisan lists before it. This is a demonstrated tunnel
+ordering defect. Whether fixing this alone restores the J window still needs a live
+check; there is no client decompile proving when the UI clears its artisan state.
+
+Record references below use the original raw log record; `+0` is the frame offset
+within that record. Fixtures contain the original frame bytes, not dump row numbers.
+
+| Client packet | World-to-Arbiter evidence for the failing GM | Failing client2 record | Working client1 record | Real GM control record |
+|---|---|---:|---:|---:|
+| S_LOGIN | cap_instance1:137078+0, link #82, ticket 5, sequence **0**, 14:50:37.465Z | **72** | 51 | 48 |
+| S_ARTISAN_SKILL_LIST, 169 B | cap_instance1:137095, link #98, ticket 5, sequence **16**, 14:50:37.467Z | **52** | 66 | 64 |
+| S_ARTISAN_RECIPE_LIST, 10 B | cap_instance1:137096, link #99, ticket 5, sequence **17**, 14:50:37.467Z | **67** | 67 | 65 |
+| S_FATIGABILITY_POINT, 16 B, 4000 points | cap_instance1:137253, ticket 5, sequence 131 | 181 | 181 | 158 |
+
+The real GM control above is
+`cap_final2_clients/capture_2026-09-22T08-06-24-583Z.log`, status 33.
+A second status-33 control, `capture_2026-09-22T09-50-23-561Z.log`, also sends
+S_LOGIN (51) before the artisan lists (115/116). Its S_LOGIN corresponds to
+cap_final2b:50073. The similarly named top-level cap_final2b_client1/2 files both
+have status 31 and cannot establish the operator comparison.
+
+| Suspected input | Captured comparison | Verdict |
+|---|---|---|
+| Learned recipes, 0x2760/0x2761 | ours GM 137003/137004; player 137343/137344; real GM cap_final2b 49996/49997 | Successful empty 19-B reply for all; only DlmId differs. |
+| Production proficiency, 0x2764/0x2765 | ours GM 137005/137006; player 137345/137346; real GM cap_final2b 49998/49999 | Successful empty 19-B reply for all; only DlmId differs. |
+| Artisan, recipe and fatigue client payloads | Client records in the first table | Byte-identical across working player, failing GM and real GM. |
+| Operator login/selection | ours client2 7/33; early real GM 7/31 | S_LOGIN_ARBITER status 33 and S_SELECT_USER are byte-identical. |
+| Benefits 533/534/1000 | Existing T181 capture pins; AccountTrait package definitions | No proven crafting-specific mismatch; unchanged. |
+| Craft request | No C_START_PRODUCE in either instance1 client or the 17 cap_final2_clients files | Those files prove initial state, not a successful GM craft transaction. Classic_craft remains the successful client exchange control. |
+
+`WorldBridge.DeliverTunnelPacket` previously advanced the sequence counter while
+holding `_reorderLock`, released that lock, then invoked client delivery. Another
+World-link thread could advance and deliver later frames before the first thread
+sent its already-drained batch. The stall watchdog had the same gap. The observed
+World 0/16/17 to client 16/17/0 inversion is consistent with this race.
+
+`OrderedTunnelDelivery` queues each ready packet under the existing sequence lock.
+Normal arrivals and the watchdog share one drainer per ticket; callbacks run outside
+both locks. A callback retains its original owner. Ticket replacement retires queued
+old packets; reset clears them without allowing two simultaneous drainers.
+The human-owned wiring is in **status/T198-PATCH.diff**; WorldBridge.cs was not
+edited by this task.
+
+Tests in `T198.cs` use `data/t198/frames.json`: the actual 18-frame World login prefix,
+the artisan client packets and the empty load pairs. They block sequence 0 before
+delivery, concurrently submit later frames, and assert no overtaking; exercise the
+same condition through the stall watchdog; and verify reset/ticket reuse cannot
+deliver queued packets from the old sequence. Both operator and normal-account
+handler replies are checked against the retail GM's load replies with DlmId normalized.
+The fixtures contain no S_LOGIN_ACCOUNT_INFO authentication token.
+
+Live confirmation: log in as the operator, press J before and after transferring to
+9781, and record both client and World taps. Confirm S_LOGIN precedes both artisan
+lists and that the crafting window populates. If the window still fails with ordered
+delivery, that UI cause remains unresolved; do not remove benefits on this evidence.

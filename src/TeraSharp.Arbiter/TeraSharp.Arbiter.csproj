@@ -19,6 +19,15 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- T199: editable custom policy plus the identical XML as the missing-file fallback. -->
+    <Content Include="..\..\data\custom-datasheets\TeraSharpBattlegroundRating.xml"
+             Link="custom-datasheets\TeraSharpBattlegroundRating.xml"
+             CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <EmbeddedResource Include="..\..\data\custom-datasheets\TeraSharpBattlegroundRating.xml"
+                      LogicalName="TeraSharpBattlegroundRating.xml" />
+  </ItemGroup>
+
+  <ItemGroup>
     <!-- Structured logging. Add DB packages (Microsoft.Data.SqlClient / MySqlConnector)
          when we wire persistence. -->
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.12" />

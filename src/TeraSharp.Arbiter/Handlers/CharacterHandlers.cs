@@ -49,10 +49,10 @@ public sealed class CreateUserRequest
 ///   C_CREATE_USER      -> S_CREATE_USER      { bool success }  (opcode 0x7160)
 ///   C_DELETE_USER      -> S_DELETE_USER      { bool success }
 ///
-/// <para>Ground truth for the whole flow: <captures>\cap_newchar_client.log packets 30-38
+/// <para>Ground truth for the whole flow: D:\packetlogs\cap_newchar_client.log packets 30-38
 /// (C_CAN_CREATE_USER -> S_CAN_CREATE_USER 01, C_CHECK_USERNAME "Test" -> S_CHECK_USERNAME 01,
 /// C_CREATE_USER 146 B -> S_CREATE_USER 01, then C_GET_USER_LIST returns two characters), and
-/// <captures>\cap_newchar.log 05:49:03 for that character's first enter-world.</para>
+/// D:\packetlogs\cap_newchar.log 05:49:03 for that character's first enter-world.</para>
 ///
 /// <para>Decompile: <c>Handler_C_CREATE_USER</c> Arb_part_079.c:9510,
 /// <c>Handler_C_CHECK_USERNAME</c> Arb_part_079.c:9369, <c>Handler_C_CAN_CREATE_USER</c>
@@ -120,7 +120,7 @@ public sealed class CharacterHandlers
             return true;
         }
 
-        if (s.Account.Characters.Count >= MaxCharactersPerAccount)
+        if (s.Account.Characters.Count >= QaUtilityCommands.CharacterSlots(Program.Store, (long)s.Account.AccountId))
         {
             // The real handler's else branch: answer false FIRST, then raise the message.
             _log.LogInformation("C_CANCEL_DELETE_USER from {Id}: no free slot, refusing", s.Id);
@@ -402,9 +402,10 @@ public sealed class CharacterHandlers
     /// </summary>
     public bool OnCanCreateUser(GameSession s, ReadOnlyMemory<byte> body)
     {
-        bool ok = s.Account.Characters.Count < MaxCharactersPerAccount;
+        int capacity = QaUtilityCommands.CharacterSlots(Program.Store, (long)s.Account.AccountId);
+        bool ok = s.Account.Characters.Count < capacity;
         _log.LogInformation("C_CAN_CREATE_USER from {Id} -> ok={Ok} ({N}/{Max})",
-            s.Id, ok, s.Account.Characters.Count, MaxCharactersPerAccount);
+            s.Id, ok, s.Account.Characters.Count, capacity);
         s.SendByDef("S_CAN_CREATE_USER", new Dictionary<string, object> { ["ok"] = ok });
         return true;
     }
@@ -463,7 +464,7 @@ public sealed class CharacterHandlers
             return true;
         }
 
-        if (s.Account.Characters.Count >= MaxCharactersPerAccount)
+        if (s.Account.Characters.Count >= QaUtilityCommands.CharacterSlots(Program.Store, (long)s.Account.AccountId))
         {
             _log.LogInformation("C_CREATE_USER from {Id}: character limit reached", s.Id);
             SendCreateResult(s, false);

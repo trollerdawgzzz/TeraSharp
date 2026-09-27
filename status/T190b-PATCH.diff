@@ -1,0 +1,21 @@
+--- a/src/TeraSharp.Arbiter/Handlers/WorldEntry.cs
++++ b/src/TeraSharp.Arbiter/Handlers/WorldEntry.cs
+@@ -206,11 +206,13 @@
+         w.U8(0);
+         w.U8(0);
+ 
+-        // [94..101] Unknown u64 (param_18). Capture=0.
+-        w.U64(0);
+-
+-        // [102] Unknown u8 (param_19). Capture=0.
+-        w.U8(0);
++        // [94..101] Existing PartyId. Arb028:15773-15781 / 15847-15850;
++        // cap_2man_b raw13799: a matched character's lobby return retains its party.
++        var party = PartyWiring.Manager.FindByMember((int)chr.Id);
++        w.U64((ulong)(party?.Id ?? 0));
++
++        // [102] IsSysParty from the same party; normal/no party sends zero.
++        w.U8(party?.IsSys == true ? (byte)1 : (byte)0);
+ 
+         // [103..106] From WorldSession+0x758 (param_20). Capture=6.
+         w.U32(6);

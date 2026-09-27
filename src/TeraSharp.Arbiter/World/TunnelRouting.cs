@@ -88,6 +88,15 @@ public sealed class DepartedTickets
 
     public int Count => _set.Count;
 
+    /// <summary>T192. One World restarted; the other Worlds still own their departed Tickets.</summary>
+    public void ClearWorld(int worldId)
+    {
+        foreach (var key in _set.Keys.Where(key => key.World == worldId).ToArray()) _set.Remove(key);
+        var keep = _order.Where(item => item.Key.World != worldId).ToArray();
+        _order.Clear();
+        foreach (var item in keep) _order.Enqueue(item);
+    }
+
     /// <summary>Every Ticket of every World - World restarted (ResetTunnelSequence).</summary>
     public void Clear() { _set.Clear(); _order.Clear(); }
 }
@@ -130,6 +139,19 @@ public sealed class LeaveGate
         lock (_lock)
         {
             if (_entered.Contains(gameId) || _entering.ContainsKey(gameId)) return;
+            _entering[gameId] = null;
+            Remember(gameId);
+        }
+    }
+
+    /// <summary>T192. A type-2 cross-World entry keeps its GameId but needs a new destination
+    /// SA_ENTER_WORLD before a client leave may be sent (Arb_part_028.c:15685-15755).</summary>
+    public void StartTransfer(ulong gameId)
+    {
+        if (gameId == 0) return;
+        lock (_lock)
+        {
+            _entered.Remove(gameId);
             _entering[gameId] = null;
             Remember(gameId);
         }

@@ -165,6 +165,7 @@ public static class BagItems
         // give/take records have a different tail.
         if (recordSize <= 0 || recordSize == DbProxyHandlers.ItemAtomSize)
         {
+            Handlers.QaItemPeriodCommands.ApplyCreatedAtoms(store, reply, refOffset);
             int kept = ItemCreate.StoreRecords(store, reply, refOffset);
             if (kept > 0) log?.LogInformation("items: {N} created item record(s) stored (op 8)", kept);
             ItemEdits.Apply(store, reply, refOffset, log);   // T166: enchant / awaken / option edits

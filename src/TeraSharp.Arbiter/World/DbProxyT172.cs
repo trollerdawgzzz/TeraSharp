@@ -73,7 +73,7 @@ public sealed partial class DbProxyHandlers
     /// SA_CREST_USE_LIST (0x1467, User::CrestApplyList): the applied crests, DlmId @24. The reply
     /// (0x1468) is <c>[u32 ref 0x13][u32 0][DlmId][u8 ok 1]</c> - an empty refusal list. Both real
     /// pairs (cap_final2b 4746/4747 DlmId 0x294, 4807/4808 0x295). Without it the user's DB queue
-    /// waits on the DlmId. Which crests are applied is not stored (the crests table has no flag).
+    /// waits on the DlmId. T197 persists the active set before this acknowledgement.
     /// </summary>
     public static byte[] BuildCrestUseListReply(byte[] payload)
     {

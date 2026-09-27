@@ -210,6 +210,8 @@ public sealed class ChatManager
     public ArbiterActions OnClientPacket(int characterId, ushort opcode, byte[] body)
     {
         var a = new ArbiterActions { Origin = Recipient.Player(characterId) };
+        if ((opcode == ChatPackets.C_CHAT || opcode == ChatPackets.C_WHISPER)
+            && Handlers.QaSocialCommands.IsChatBanned(_store, characterId)) return a.Reject("Account chat restriction is active");
         switch (opcode)
         {
             case ChatPackets.C_WHISPER: return Whisper(a, characterId, body);

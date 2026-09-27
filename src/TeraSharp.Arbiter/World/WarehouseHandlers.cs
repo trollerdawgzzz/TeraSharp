@@ -642,12 +642,35 @@ public static class WarehouseHandlers
                 // ---- swap two occupied slots ----
                 case TsSwapItemPos:
                 {
-                    // Both halves are identified by position: the atom names one pair of slots
-                    // and the two rows sitting in them trade places.
-                    var first = store.FindItemAt(a.SrcOwner, (int)a.SrcInven, (int)a.SrcSlot);
-                    var second = store.FindItemAt(dstOwner, (int)dstInven, (int)dstSlot);
-                    if (first != null && second != null && store.SwapItemPositions(first.ItemDbId, second.ItemDbId))
-                        moved += 2;
+                    // T187. The atom is anchored on the item it NAMES: that row ends up at the
+                    // destination triple, and whatever sits there goes to the row's own current
+                    // position. Reading it as "swap whatever is at src with whatever is at dst"
+                    // was what lost every equip: an equip arrives as a PAIR of op-36 atoms, one
+                    // per direction (cap_final2b 4162, cap_queue4 5034 - worn 14:1 <-> bag 0:9),
+                    // and swapping by position twice put the rows straight back, so the worn set
+                    // reverted to the starter kit on the next SDB_USER_LOAD_INVENTORY.
+                    //
+                    // Anchoring on the id makes the second atom of the pair a no-op instead
+                    // (the item it names is already at its destination), so one atom or two
+                    // reach the same end state, which is what World's own view shows.
+                    var named = a.ItemDbId != 0
+                        ? store.GetItem((int)a.ItemDbId)
+                        : store.FindItemAt(a.SrcOwner, (int)a.SrcInven, (int)a.SrcSlot);
+                    var atDst = store.FindItemAt(dstOwner, (int)dstInven, (int)dstSlot);
+                    if (named is null) { ignored++; break; }
+                    if (atDst is not null && atDst.ItemDbId == named.ItemDbId)
+                    {
+                        // The other half of the pair, already applied.
+                        log?.LogDebug("items: item {Id} is already at {Inven}:{Slot}", named.ItemDbId, dstInven, dstSlot);
+                        ignored++;
+                        break;
+                    }
+                    if (atDst is not null)
+                    {
+                        if (store.SwapItemPositions(named.ItemDbId, atDst.ItemDbId)) moved += 2;
+                        else ignored++;
+                    }
+                    else if (store.MoveItem(named.ItemDbId, dstOwner, (int)dstInven, (int)dstSlot)) moved++;
                     else ignored++;
                     break;
                 }

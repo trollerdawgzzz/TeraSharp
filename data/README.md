@@ -9,7 +9,7 @@ What that costs you, and what it does not:
 
 | | |
 |---|---|
-| Tests | the byte-exact tests report `SKIP <test>: data/<name> not found` and are not failures. The suite exits 0 on a fresh clone (`N passed, 0 failed, S skipped`). |
+| Tests | the byte-exact tests print `(skipped: data/<name> not found)` and pass. The suite is green on a fresh clone. |
 | Runtime | **four files are required to start.** Without them a new character cannot be created. See "Runtime blobs" below. |
 
 `TeraSharp.Arbiter.exe --selftest` names every missing required file and exits non-zero, so you

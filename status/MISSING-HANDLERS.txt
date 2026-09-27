@@ -1,13 +1,12 @@
-273 client handlers in the Arbiter decompile, 62 not registered
+273 client handlers in the Arbiter decompile, 58 not registered
 # regenerate: .\tools\count-handlers.ps1   (the script explains both numbers)
 # denominator: Handler_C_* / making_Handler_C_* trace guards in Arb_part_*.c
 # registered: the name appears as a string literal in HandlerRegistry.cs or a wiring table
 # unregistered: PacketDispatcher forwards it to World -> 'handler has not been implemented yet!!!'
-# generated 2026-09-20
+# generated 2026-09-22
 C_ACCEPT_GUILD_WAR
 C_BOT_CANDIDATE_INFO
 C_CHANGE_GROUP_DUEL_SETTING
-C_CHECK_TO_OPPOSITE_DECLARE_GUILD_WAR
 C_CHECK_TO_RAISE_GUILD_WAR
 C_CITY_WAR_INFO_HISTROY
 C_CITY_WAR_SEASON_HISTROY
@@ -15,7 +14,6 @@ C_COMMIT_CHANGE_USER_APPEARANCE
 C_CONFIRM_INVITE_CODE
 C_CREATE_GROUP_DUEL
 C_GET_GUILD_QUEST_WEEKLY_REWARD
-C_GIVE_UP_GUILD_WAR
 C_INVITE_FRIEND_CODE
 C_LORD_CALC_TAX
 C_LORD_CANDIDATE_LIST
@@ -32,7 +30,6 @@ C_LORD_VOTE_CANDIDATE_LIST
 C_MATCH_PROGRESS
 C_MATCH_ROOM_JOIN
 C_MATCH_ROOM_LIST
-C_OPPOSITE_DECLARE_GUILD_WAR
 C_PETITION_CANCEL
 C_PETITION_CHAT_USER_MESSAGE
 C_PETITION_CHECK_CREATABLE
@@ -46,7 +43,6 @@ C_REIGN_INFO
 C_REPLY_INTER_PARTY_MAKE
 C_REQUEST_DICE_THROW
 C_REQUEST_FLOATING_CASTLE_PARTS_COOL_TIME
-C_REQUEST_GUILD_WAR_PENALTY_INFO
 C_REQUEST_GUILD_WAR_TRACKING_INFO
 C_REQUEST_MY_HEROLIST
 C_REQUEST_MY_HEROSKINLIST

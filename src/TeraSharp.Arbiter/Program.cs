@@ -19,17 +19,17 @@ public static class Program
     private const string ProtocolVersionKey = "376012";
 
     private static string DataRoot =>
-        Environment.GetEnvironmentVariable("TERASHARP_DATA") ?? @"D:\v100\TERA_SERVER.100";
+        TerasConfig.Get("TERASHARP_DATA") ?? @"D:\v100\TERA_SERVER.100";
     private static string DataJsonPath => Path.Combine(DataRoot, "tera-server-proxy", "data", "data.json");
     private static string DefinitionsPath => Path.Combine(DataRoot, "tera_v100_MASTER_FINAL");
     private static string PacketLogsPath =>
-        Environment.GetEnvironmentVariable("TERASHARP_LOGS") ?? "logs";
+        TerasConfig.Get("TERASHARP_LOGS") ?? "logs";
     private static string WorldReplayPath => Path.Combine(PacketLogsPath, "arb_world.log");
     private static string SpawnReplayPath => Path.Combine(PacketLogsPath, "full_replay.txt");
     private static string DbPath =>
-        Environment.GetEnvironmentVariable("TERASHARP_DB") ?? Path.Combine(PacketLogsPath, "terasharp.db");
+        TerasConfig.Get("TERASHARP_DB") ?? Path.Combine(PacketLogsPath, "terasharp.db");
 
-    private static string BindAddress => Environment.GetEnvironmentVariable("TERASHARP_BIND") ?? "127.0.0.1";
+    private static string BindAddress => TerasConfig.Get("TERASHARP_BIND") ?? "127.0.0.1";
     private const int BindPort = 7701;
 
     /// <summary>Login authority (status/AUTH-DESIGN.md). AcceptAll by default; TERASHARP_AUTH=true selects tera-api.</summary>
@@ -52,9 +52,13 @@ public static class Program
         });
 
         var log = loggerFactory.CreateLogger("Arbiter");
+        // T204: teras.json, if there is one. The environment still overrides it, so this changes
+        // nothing for a deployment that already exports variables.
+        TerasConfig.UseWarningSink(m => log.LogWarning("{Message}", m));
         bool selfTest = args.Any(a => a is "--selftest" or "/selftest");
         Auth = AuthProviders.FromEnvironment(log);
         log.LogInformation("TeraSharp Arbiter starting (protocol {Proto}, patch {Patch})", ProtocolVersion, MajorPatchVersion);
+        log.LogInformation("Settings: {File}", TerasConfig.LoadedPath ?? "(environment only)");
         log.LogInformation("Data root: {Root}, logs: {Logs}, db: {Db}", DataRoot, PacketLogsPath, DbPath);
         ItemNames.DataRoot = DataRoot;      // T113: item strsheets resolve under the data root
         if (args.Any(a => a is "--check-config" or "/check-config"))
@@ -63,20 +67,17 @@ public static class Program
                 ("data root", DataRoot), ("opcodes", DataJsonPath), ("definitions", DefinitionsPath),
                 ("logs", PacketLogsPath), ("db", DbPath),
                 ("game port", BindAddress + ":" + BindPort),
-                ("admin web", "127.0.0.1:" + (Environment.GetEnvironmentVariable("TERASHARP_ADMIN_PORT") ?? "8050")) }));
+                ("admin web", "127.0.0.1:" + (TerasConfig.Get("TERASHARP_ADMIN_PORT") ?? "8050")) }));
             return;
         }
         log.LogInformation("Auth provider: {Name}", Auth.Name);
         TeraSharp.Arbiter.World.DatasheetLoader.LoadAll(loggerFactory.CreateLogger("Datasheets"));   // T159: one line per sheet at startup
 
-        // T138d: the matcher's test knob. It makes matchmaking WRONG on purpose - any N bodies
-        // form a group, with no tank, no healer and no battleground composition - so it is never
-        // silent. World/MatchQueueManager.cs.
+        // T184h: report the retired partial-group setting so deployed configurations are corrected.
         int matchMin = MatchQueueManager.MinMembersOverride();
         if (matchMin > 0)
-            log.LogWarning("{Var}={N}: instance matching will form a group as soon as that "
-                + "many players are queued and will IGNORE roles and battleground composition. "
-                + "Unset it for real matchmaking.",
+            log.LogWarning("{Var}={N} is retired and ignored. Dungeon matching requires the "
+                + "configured MatchingRoleTemplate totalUser and roles; remove this setting.",
                 MatchQueueManager.MinMembersVariable, matchMin);
 
         OpcodeTable opcodes;
