@@ -1,0 +1,21 @@
+--- a/src/TeraSharp.Arbiter/Handlers/WorldEntry.cs
++++ b/src/TeraSharp.Arbiter/Handlers/WorldEntry.cs
+@@ -71,9 +71,17 @@
+         // Chat/UI settings are Arbiter-owned and World never sends them. Without the chat-option
+         // setting the client's chat window has no channel tabs configured, so S_CHAT arrives but
+         // never renders (system messages use a separate UI path, which is why !test showed but
+         // chat didn't). Send them here so the chat window initializes in World mode too.
+-        ClientSettingsHandlers.SendUserSetting(s);
++        // T191c: NOT the user-setting load. The real Arbiter sends S_LOAD_CLIENT_USER_SETTING once
++        // per world entry, after C_LOAD_TOPO_FIN (cap_2man_b_client1: 312 fin -> 322 account, 323
++        // user, and nowhere else). TeraSharp sent it here as well, so the client received the same
++        // blob twice per entry (cap_bg2_client1 packets 51 and 342, byte-identical) and merged the
++        // incoming shortcut list into its live one instead of replacing it. S1ShortCutController
++        // then doubled every world entry - 1024 records in cap_polish_client, 131072 in
++        // cap_bg2_client1 - until the blob passed the 9000-byte cap and every save was refused, so
++        // nothing the client stored persisted any more and the WASD prompt came back each relog.
++        // What is left is HandlerRegistry's pair on C_LOAD_TOPO_FIN, which is the retail one.
+         ClientSettingsHandlers.SendUiSetting(s);
+         ClientSettingsHandlers.SendChatOption(s);
+ 
+         log.LogInformation("Handed session {Id} to WorldServer (gameId {G}, char '{Name}')",

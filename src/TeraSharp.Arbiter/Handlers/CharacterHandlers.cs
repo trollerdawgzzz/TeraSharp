@@ -486,17 +486,29 @@ public sealed class CharacterHandlers
             return true;
         }
 
+        long accountId = (long)s.Account.AccountId;
+        int position = store.NextPosition(accountId);
+
+        // T209: the record is generated from CreateCharData.xml unless an operator dropped a
+        // capture in, so it is seeded with THIS character's account and slot. The captured
+        // template carried the capture's own account 1 slot 2 on every character we ever made.
         byte[] template;
-        try { template = StarterBlob.LoadTemplate(); }
+        try
+        {
+            template = StarterBlob.LoadTemplate(new StarterBlob.Seed(
+                AccountDbId: accountId,
+                AccountName: s.Account.Name ?? string.Empty,
+                SlotOrdinal: position,
+                Level: World.StarterInventory.CreatedLevelFor(req.Class),
+                CreatedUtc: DateTime.UtcNow));
+        }
         catch (Exception ex)
         {
-            _log.LogError(ex, "C_CREATE_USER from {Id}: starter blob unavailable, refusing to create", s.Id);
+            // Only a malformed override reaches this now: a missing file generates the record.
+            _log.LogError(ex, "C_CREATE_USER from {Id}: starter blob unusable, refusing to create", s.Id);
             SendCreateResult(s, false);
             return true;
         }
-
-        long accountId = (long)s.Account.AccountId;
-        int position = store.NextPosition(accountId);
 
         // The blob carries the playerId, which SQLite only assigns on INSERT: insert first with
         // a placeholder blob, then rewrite the blob with the real row id.
@@ -517,6 +529,10 @@ public sealed class CharacterHandlers
 
         var (zone, x, y, z) = StartPositionFor(req.Race, req.Class);
         record.WorldBlob = StarterBlob.Build(template, id, req.Name, IdentityOf(req), zone, x, y, z);
+        // Build() copies the template, so re-stamp the three fields that say who owns the record.
+        // They are outside its patch list, and on an operator-supplied override they would still
+        // be the capture's account.
+        StarterBlob.WriteAccount(record.WorldBlob, accountId, s.Account.Name, position);
         store.SaveWorldBlob(id, record.WorldBlob);
 
         s.Account.Characters.Add(FakeCharacter.FromRecord(record));

@@ -190,6 +190,47 @@ public static class StarterInventory
     }
 
     /// <summary>
+    /// T209: the same payload with every 536-byte record BUILT rather than copied out of the
+    /// capture. <see cref="WarehouseHandlers.BuildItemRecord"/> writes the named fields and
+    /// leaves the rest zero, which is what <c>BagItems</c> already serves for any row whose
+    /// stored record was lost - so this path is not new code, only newly reachable at creation.
+    ///
+    /// <para>It is behind <c>economy.synthItemRecords</c> because the copied record is the one
+    /// live-verified to get past <c>SA_ENTER_WORLD_FAILED</c>: about 400 of the 536 bytes are
+    /// zero either way, but the remainder is uninitialised Arbiter heap and no capture proves
+    /// World ignores all of it on the CREATION path. Default off; turn it on to run with no
+    /// <c>starter_inventory.bin</c> at all.</para>
+    /// </summary>
+    public static byte[]? BuildSynthetic(int classId, int playerId, uint reqId)
+    {
+        var kit = ForClass(classId);
+        if (kit == null) return null;
+
+        var order = new int[kit.Count];
+        for (int i = 0; i < order.Length; i++) order[i] = i;
+        Array.Sort(order, (a, b) => kit[a].Pocket != kit[b].Pocket
+            ? kit[a].Pocket.CompareTo(kit[b].Pocket)
+            : kit[a].Slot.CompareTo(kit[b].Slot));
+
+        int size = DbProxyHandlers.StarterInventoryItemSize;
+        int header = DbProxyHandlers.StarterInventoryItemStart;
+        var payload = new byte[header + kit.Count * size];
+        BitConverter.GetBytes(19u).CopyTo(payload, 0);
+        BitConverter.GetBytes((uint)(kit.Count * size)).CopyTo(payload, 4);
+        BitConverter.GetBytes(reqId).CopyTo(payload, 8);
+        payload[12] = 0;
+
+        for (int n = 0; n < order.Length; n++)
+        {
+            var item = kit[order[n]];
+            int at = header + n * size;
+            WarehouseHandlers.BuildItemRecord(FirstStarterItemId + order[n], item.TemplateId,
+                playerId, item.Amount, item.Pocket, item.Slot).CopyTo(payload.AsSpan(at));
+        }
+        return payload;
+    }
+
+    /// <summary>
     /// The 536-byte record to start from for a given position.
     ///
     /// <para>We cannot synthesise one: about 40 of the 536 bytes are named, ~400 are zero, and

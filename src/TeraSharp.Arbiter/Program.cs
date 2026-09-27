@@ -18,6 +18,15 @@ public static class Program
     private const int MajorPatchVersion = 100;
     private const string ProtocolVersionKey = "376012";
 
+    /// <summary>T207: every in-world session of one account, for the hub's hooks.</summary>
+    private static List<GameSession> SessionsForAccount(long accountId)
+    {
+        var mine = new List<GameSession>();
+        foreach (var s in World?.InWorldSessions() ?? new List<GameSession>())
+            if ((long)s.Account.AccountId == accountId) mine.Add(s);
+        return mine;
+    }
+
     private static string DataRoot =>
         TerasConfig.Get("TERASHARP_DATA") ?? @"D:\v100\TERA_SERVER.100";
     private static string DataJsonPath => Path.Combine(DataRoot, "tera-server-proxy", "data", "data.json");
@@ -144,6 +153,30 @@ public static class Program
                 s.SelectedCharacter?.Name ?? "", s.SelectedCharacter?.Level ?? 0,
                 s.SelectedCharacter?.Zone ?? 0, s.Account.Name)).ToList(), log);
         var apiGateway = TeraSharp.Arbiter.Web.ApiGatewayServer.TryStart(log);   // T132: probe listener at apiServerAddress (TERASHARP_API_GATEWAY_SERVE)
+        // T207: the platform hub. tera-api's HUB_HOST/HUB_PORT point here, so a shop purchase
+        // becomes a system parcel and arb_gw is not needed (status/T207-HUB.md).
+        using var hub = TeraSharp.Arbiter.Web.HubServer.TryStart(Store,
+            new TeraSharp.Arbiter.Web.HubServer.Hooks
+            {
+                IsOnline = account => SessionsForAccount(account).Count > 0,
+                Notify = (account, text) =>
+                {
+                    foreach (var s in SessionsForAccount(account))
+                        s.SendByDef("S_SYSTEM_MESSAGE", new Dictionary<string, object> { ["message"] = text });
+                },
+                Kick = account =>
+                {
+                    var sessions = SessionsForAccount(account);
+                    foreach (var s in sessions) s.Close();
+                    return sessions.Count;
+                },
+                BenefitsChanged = account =>
+                {
+                    foreach (var s in SessionsForAccount(account))
+                        s.SendByDef("S_ACCOUNT_BENEFIT_LIST",
+                            ArbiterClientHandlers.BuildAccountBenefitFields(Store?.GetAccountBenefits(account)));
+                },
+            }, log);
         if (admin != null)
         {
             admin.Api.StartedAt = DateTimeOffset.UtcNow;

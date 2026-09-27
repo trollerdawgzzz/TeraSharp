@@ -49,6 +49,7 @@ public static class TerasConfig
         ["paths.serverConfig"] = "TERASHARP_SERVERCONFIG",
         ["paths.starterBlob"] = "TERASHARP_STARTER_BLOB",
         ["paths.starterInventory"] = "TERASHARP_STARTER_INVENTORY",
+        ["economy.synthItemRecords"] = "TERASHARP_SYNTH_ITEM_RECORDS",
         ["paths.itemStrSheet"] = "TERASHARP_ITEM_STRSHEET",
         ["paths.itemNames"] = "TERASHARP_ITEM_NAMES",
         ["listener.bind"] = "TERASHARP_BIND",
@@ -62,6 +63,10 @@ public static class TerasConfig
         ["gateway.serve"] = "TERASHARP_API_GATEWAY_SERVE",
         ["gateway.bind"] = "TERASHARP_API_GATEWAY_BIND",
         ["gateway.jwtSecret"] = "TERASHARP_API_JWT_SECRET",
+        ["shop.url"] = "TERASHARP_SHOP_URL",
+        ["shop.hubListen"] = "TERASHARP_HUB_LISTEN",
+        ["shop.hubEnabled"] = "TERASHARP_HUB_ENABLED",
+        ["shop.serverId"] = "TERASHARP_HUB_SERVER_ID",
         ["knobs.logLevel"] = "TERASHARP_LOG_LEVEL",
         ["knobs.rankingSeason"] = "TERASHARP_RANKING_SEASON",
         ["knobs.startOverride"] = "TERASHARP_START_OVERRIDE",
@@ -70,6 +75,7 @@ public static class TerasConfig
         ["matchmaking.minMembers"] = "TERASHARP_MATCH_MIN_MEMBERS",
         ["matchmaking.bgMaxHealers"] = "TERASHARP_BG_MAX_HEALERS",
         ["matchmaking.bgMaxTanks"] = "TERASHARP_BG_MAX_TANKS",
+        ["matchmaking.bfEnterDelay"] = "TERASHARP_BF_ENTER_DELAY",
         ["economy.brokerFeePercent"] = "TERASHARP_BROKER_FEE_PERCENT",
     };
 

@@ -86,6 +86,54 @@ public static class ItemNames
         lock (Gate) return _names.TryGetValue(templateId, out var n) ? n : string.Empty;
     }
 
+    /// <summary>T206: one search hit - a template and the name that matched.</summary>
+    public readonly record struct Hit(int TemplateId, string Name);
+
+    /// <summary>
+    /// T206: find templates by name or by id, for the admin tool's item picker. A term that
+    /// parses as a number is looked up as a template id FIRST and then still matched as text, so
+    /// typing 88888 finds that item and also anything whose name contains those digits.
+    /// Matching is case-insensitive substring; results are ordered by where the match starts
+    /// (a prefix hit beats a mid-word one) and then by name, so the obvious answer is first.
+    /// </summary>
+    public static IReadOnlyList<Hit> Search(string? term, int limit = 50)
+    {
+        if (limit < 1) limit = 1;
+        term = term?.Trim();
+        if (string.IsNullOrEmpty(term)) return Array.Empty<Hit>();
+        EnsureLoaded();
+
+        var hits = new List<(int Rank, string Name, int Id)>();
+        lock (Gate)
+        {
+            if (int.TryParse(term, NumberStyles.Integer, CultureInfo.InvariantCulture, out int id)
+                && _names.TryGetValue(id, out var exact))
+                hits.Add((-1, exact, id));
+
+            foreach (var pair in _names)
+            {
+                int at = pair.Value.IndexOf(term, StringComparison.OrdinalIgnoreCase);
+                if (at < 0 || (hits.Count > 0 && hits[0].Id == pair.Key && hits[0].Rank == -1)) continue;
+                hits.Add((at, pair.Value, pair.Key));
+            }
+        }
+        hits.Sort((a, b) =>
+        {
+            int c = a.Rank.CompareTo(b.Rank);
+            if (c != 0) return c;
+            c = string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase);
+            return c != 0 ? c : a.Id.CompareTo(b.Id);
+        });
+
+        var result = new List<Hit>(Math.Min(limit, hits.Count));
+        foreach (var h in hits)
+        {
+            if (result.Count >= limit) break;
+            result.Add(new Hit(h.Id, h.Name));
+        }
+        return result;
+    }
+
     private static bool _tried;
 
     /// <summary>The lazy half. Tries once, whether or not it finds anything.</summary>

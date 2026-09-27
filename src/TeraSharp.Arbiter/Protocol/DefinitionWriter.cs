@@ -5,15 +5,43 @@ using System.Buffers.Binary;
 
 namespace TeraSharp.Arbiter.Protocol;
 
+/// <summary>How wide a frame header and its ref offsets are. T209b.</summary>
+public enum PacketFraming
+{
+    /// <summary>Client packets: [u16 length][u16 opcode], u16 offsets, packet-relative base 4.</summary>
+    Client,
+
+    /// <summary>
+    /// Arbiter&lt;-&gt;World frames: [u32 length][u16 opcode], u32 offsets, base 6. The record model
+    /// is the same - ref-header block, fixed fields, variable data - which is why the handshake
+    /// burst's two empty-list forms fall out of this writer byte for byte: an empty array is
+    /// <c>count=0, offset=0</c>, and an empty bytes field is <c>offset=&lt;end of the fixed
+    /// part&gt;, length=0</c> - `0e 00 00 00 00 00 00 00` for a frame whose fixed part is the
+    /// header alone, `16 00 00 00 00 00 00 00` for 0x14D1, which has a u64 after it.
+    /// </summary>
+    InterServer,
+}
+
 /// <summary>
 /// Writes a field dictionary to a packet body. Mirrors the tera-data compiler:
 /// per record, emit the ref-header block, then fixed fields, then variable data,
-/// backpatching offsets. Offsets are packet-relative (base 4).
+/// backpatching offsets. Offsets are packet-relative - base 4 and two bytes wide for client
+/// framing, base 6 and four bytes wide for inter-server framing.
 /// </summary>
 public sealed class DefinitionWriter
 {
-    private const int Header = 4;
+    private readonly int _header;
+    private readonly int _offsetWidth;
     private readonly List<byte> _buf = new(256);
+
+    public DefinitionWriter(PacketFraming framing = PacketFraming.Client)
+    {
+        _header = framing == PacketFraming.InterServer ? 6 : 4;
+        _offsetWidth = framing == PacketFraming.InterServer ? 4 : 2;
+    }
+
+    /// <summary>Which framing this writer was built for.</summary>
+    public PacketFraming Framing => _offsetWidth == 4 ? PacketFraming.InterServer : PacketFraming.Client;
 
     /// <summary>If set, records "field@packetOffset" for each emitted field.</summary>
     public List<string>? Trace;
@@ -24,7 +52,7 @@ public sealed class DefinitionWriter
         return _buf.ToArray();
     }
 
-    private int PacketOffset => _buf.Count + Header;
+    private int PacketOffset => _buf.Count + _header;
 
     private void T(string name) => Trace?.Add($"{name}@{PacketOffset}");
 
@@ -41,18 +69,18 @@ public sealed class DefinitionWriter
                 case FieldKind.String:
                     T($"HDR.str.{f.Name}");
                     offsetSlot[f.RefId] = _buf.Count;
-                    WriteU16(0);
+                    WriteOffset(0);
                     break;
                 case FieldKind.Bytes:
                     T($"HDR.bytes.{f.Name}");
                     offsetSlot[f.RefId] = _buf.Count;
-                    WriteU16(0); WriteU16(0);
+                    WriteOffset(0); WriteOffset(0);
                     break;
                 case FieldKind.Array:
                     T($"HDR.arr.{f.Name}");
-                    WriteU16(0);
+                    WriteOffset(0);
                     offsetSlot[f.RefId] = _buf.Count;
-                    WriteU16(0);
+                    WriteOffset(0);
                     break;
             }
         }
@@ -86,7 +114,7 @@ public sealed class DefinitionWriter
             switch (f.Kind)
             {
                 case FieldKind.String:
-                    PatchU16(offsetSlot[f.RefId], (ushort)PacketOffset);
+                    PatchOffset(offsetSlot[f.RefId], PacketOffset);
                     T($"DATA.str.{f.Name}");
                     WriteStringData(Get(data, f.Name) as string ?? string.Empty);
                     break;
@@ -94,8 +122,8 @@ public sealed class DefinitionWriter
                 {
                     var bytes = Get(data, f.Name) as byte[] ?? Array.Empty<byte>();
                     int slot = offsetSlot[f.RefId];
-                    PatchU16(slot, (ushort)PacketOffset);
-                    PatchU16(slot + 2, (ushort)bytes.Length);
+                    PatchOffset(slot, PacketOffset);
+                    PatchOffset(slot + _offsetWidth, bytes.Length);
                     T($"DATA.bytes.{f.Name}");
                     _buf.AddRange(bytes);
                     break;
@@ -114,24 +142,24 @@ public sealed class DefinitionWriter
         if (Get(parent, arrayField.Name) is System.Collections.IEnumerable e)
             foreach (var it in e) items.Add(it);
 
-        PatchU16(offsetSlotPos - 2, (ushort)items.Count);
-        if (items.Count == 0) { PatchU16(offsetSlotPos, 0); return; }
+        PatchOffset(offsetSlotPos - _offsetWidth, items.Count);
+        if (items.Count == 0) { PatchOffset(offsetSlotPos, 0); return; }
 
-        PatchU16(offsetSlotPos, (ushort)PacketOffset);
+        PatchOffset(offsetSlotPos, PacketOffset);
 
         for (int i = 0; i < items.Count; i++)
         {
             T($"ELEM[{i}].here");
-            WriteU16((ushort)PacketOffset);
+            WriteOffset(PacketOffset);
             int nextSlot = _buf.Count;
-            WriteU16(0);
+            WriteOffset(0);
 
             if (arrayField.ElementKind is FieldKind ek)
                 WritePrimitive(ek, items[i]);
             else
                 WriteRecord(arrayField.Children, items[i] as IReadOnlyDictionary<string, object> ?? new Dictionary<string, object>());
 
-            PatchU16(nextSlot, i < items.Count - 1 ? (ushort)PacketOffset : (ushort)0);
+            PatchOffset(nextSlot, i < items.Count - 1 ? PacketOffset : 0);
         }
     }
 
@@ -209,4 +237,17 @@ public sealed class DefinitionWriter
         _buf.Add(0); _buf.Add(0);
     }
     private void PatchU16(int at, ushort v) { _buf[at] = (byte)v; _buf[at + 1] = (byte)(v >> 8); }
+
+    /// <summary>A ref offset/length/count slot: two bytes for client framing, four for inter-server.</summary>
+    private void WriteOffset(int v)
+    {
+        if (_offsetWidth == 2) WriteU16((ushort)v); else WriteI32(v);
+    }
+
+    private void PatchOffset(int at, int v)
+    {
+        if (_offsetWidth == 2) { PatchU16(at, (ushort)v); return; }
+        _buf[at] = (byte)v; _buf[at + 1] = (byte)(v >> 8);
+        _buf[at + 2] = (byte)(v >> 16); _buf[at + 3] = (byte)(v >> 24);
+    }
 }

@@ -10,7 +10,7 @@ What that costs you, and what it does not:
 | | |
 |---|---|
 | Tests | the byte-exact tests print `(skipped: data/<name> not found)` and pass. The suite is green on a fresh clone. |
-| Runtime | **four files are required to start.** Without them a new character cannot be created. See "Runtime blobs" below. |
+| Runtime | **no file is required to start** - T209, T209b and T209c retired all four. Each is still an override. See "Runtime blobs" below. |
 
 `TeraSharp.Arbiter.exe --selftest` names every missing required file and exits non-zero, so you
 find this out before a player does, not after.
@@ -92,23 +92,24 @@ only mean something against a listing.
 
 ## Runtime blobs
 
-These four are **not** test fixtures. `DbProxyHandlers` and `CharacterStore` read them while the
-server is running, and character creation fails without them.
+These four **were** the runtime blobs `DbProxyHandlers` and `CharacterStore` read while the server
+is running. T209, T209b and T209c retired all of them: the server starts and runs with an empty
+`data\` folder. Every one is still an override - drop a capture in and it wins.
 
-| File | Shape | What it is |
-|---|---|---|
-| `starter_blob.bin` | raw, 15312 B | the world blob `DBS_USER_ENTERWORLD` (`0x2738`) carries for a never-entered character. Used as the template for every new character, then patched per character: playerId at 112, UTF-16LE name after it, HP at 208, x/y/z at 220/224/228, zone at 236. |
-| `starter_inventory.bin` | raw | the starter kit, as a `0x27A4` payload |
-| `promotions_147E.bin` | raw | `AS_PROMOTION_RECORD` (`0x147E`) records of 1368 bytes each, concatenated. The loader rejects a file whose length is not a multiple of 1368 and falls back to the replay table. |
-| `handshake_burst.bin` | TSIS | the 63 config pushes the Arbiter sends World right after the startup handshake. Two `u64`s in it are timestamps the Arbiter restamps at send time, so a stale capture is still usable. |
+| File | Shape | Needed? | What it is |
+|---|---|---|---|
+| `starter_blob.bin` | raw, 15312 B | **no** (T209) | the world blob `DBS_USER_ENTERWORLD` (`0x2738`) carries for a never-entered character. Only 232 of its 15312 bytes are non-zero, and `StarterBlob.Generate` now builds all of them from `CreateCharData.xml`, `DefaultSkillSet.xml` and the create request - byte-identical to this capture except eleven bytes of padding above a bool or u8 field, which the real Arbiter never initialises. A file here still wins if you drop one in. |
+| `starter_inventory.bin` | raw payload | **no** (T209c part 2) | the starter kit, as a `0x27A4` payload. The item LIST comes from `CreateCharData.xml`; what this file supplied is the 536-byte record skeleton each item is cut from, and `StarterInventory.BuildSynthetic` now builds those instead. Live-verified: a character created with the file absent entered world with its six starter items and still had them after a relog. Set `economy.synthItemRecords` to `false` to go back to copying a file you still have. |
+| `promotions_147E.bin` | **no** (T209c) | 23 records of 1368 bytes - and never promotions. The Arbiter's own opcode table names `0x147D`/`0x147E`/`0x1480`/`0x1484` `SA_LOAD_GUARD`, `AS_LOAD_GUARD`, `AS_LOAD_GUARD_FINISH` and `AS_ELECTION_STATE` (`Arb_part_003.c:4978-4993`): the castle-and-lord Guard system. Retail's own walk emits no `AS_LOAD_GUARD` frame when the guard tree is empty, and this server has no castles, so it now sends the election state and the finish marker and nothing between them. Each record was a `memcpy` of another process's live Guard struct - heap pointers included - so replaying it pushed 23 foreign castles into a world that has none. Delete the file; nothing reads it. |
+| `handshake_burst.bin` | TSIS, 63 records | **no** (T209b) | the 63 config pushes the Arbiter sends World right after the startup handshake. `World/HandshakeBurst` builds all 63 from `Protocol/InterServerDefinitions` - 50 defs whose every field name comes from the retail Arbiter's own dump helpers - and the result is byte-identical to this capture, two clock-driven `u64`s aside. Nothing reads it at runtime; it is the evidence `Tests/T209b.cs` compares against, and that test skips when it is absent. |
 
 Each has an environment-variable override — `TERASHARP_STARTER_BLOB`,
 `TERASHARP_STARTER_INVENTORY` — so they can live outside the repo. See `.env.example`.
 
-To produce them: capture your own server's startup and one character creation, reframe, and cut
-the payloads out. `handshake_burst.bin` is a TSIS container like the fixtures above
-(`make-tsis.ps1` with the burst's frame numbers). The three raw ones are a single payload each,
-written straight to a file.
+To produce the one that is still needed: capture your own server's startup and one character
+creation, reframe, and cut the payload out - it is a single payload written straight to a file.
+`handshake_burst.bin`, if you want the T209b comparison to run rather than skip, is a TSIS
+container like the fixtures above (`make-tsis.ps1` with the burst's frame numbers).
 
 ## `classic-live/`
 

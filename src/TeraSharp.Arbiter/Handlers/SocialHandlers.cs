@@ -577,7 +577,16 @@ public sealed class SocialHandlers
         var chr = s.SelectedCharacter;
         var store = Program.Store;
         if (chr == null || store == null) return;
-        if (state == FriendStateOnline) store.StampLogin((int)chr.Id);
+        if (state == FriendStateOnline)
+        {
+            store.StampLogin((int)chr.Id);
+            // T206: and record it, so the admin tool's Accounts screen has a login HISTORY and
+            // not just one overwritten stamp. This is the only place that knows a character came
+            // online, and game_log is where the log search already looks.
+            store.AddGameLog(World.GameLogPackets.CategoryUser, Web.AdminApi.LoginAction,
+                store.AccountOf((int)chr.Id), chr.Id, 0, 0, 0, 0, 0,
+                "world " + s.CurrentWorldId + ", zone " + chr.Zone);
+        }
         foreach (var row in store.GetFriendRows((int)chr.Id))
         {
             if (row.Type != FriendTypeMutual) continue;

@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TeraSharp admin</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<!--
+  T206. The shell only. Every screen is an ES module under /view-*.js, imported by app.js; there
+  is no framework and no build step, so what ships in the assembly is what you read here.
+-->
+<div id="login" hidden>
+  <form id="login-form">
+    <h1>TeraSharp admin</h1>
+    <p class="muted">The tool is bound to 127.0.0.1. Paste the value of
+      <code>TERASHARP_ADMIN_TOKEN</code> (setup.ps1 wrote it into <code>teras.json</code>).</p>
+    <label>Admin token<input id="login-token" type="password" autocomplete="off" spellcheck="false" autofocus></label>
+    <label class="row"><input id="login-remember" type="checkbox"> Keep for this browser tab only</label>
+    <button type="submit">Sign in</button>
+    <p id="login-error" class="error" hidden></p>
+  </form>
+</div>
+
+<div id="app" hidden>
+  <header>
+    <span class="brand">TeraSharp</span>
+    <nav id="tabs"></nav>
+    <span class="spacer"></span>
+    <span id="health" class="pill" title="World links / online"></span>
+    <button id="sign-out" class="link">Sign out</button>
+  </header>
+  <main id="screen" aria-live="polite"></main>
+  <div id="toasts"></div>
+</div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

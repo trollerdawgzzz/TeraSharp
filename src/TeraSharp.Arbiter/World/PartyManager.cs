@@ -347,6 +347,50 @@ public sealed class PartyManager
     public Party? FindById(long id) => _byId.TryGetValue(id, out var p) ? p : null;
     public int PartyCount => _byId.Count;
 
+    /// <summary>
+    /// T208d. Every live party's mirror, for a World that has just connected.
+    ///
+    /// <para><b>The native path.</b> <c>PartyManager::OnConnectWorldServer(int)</c>
+    /// (Arb_part_079.c:16418, <c>FUN_140920480</c>) takes the party-table lock, walks the whole
+    /// party list and calls <c>Party::UnicastPartyInfoToSpecialWorldServer(int)</c>
+    /// (Arb_part_067.c:15448, <c>FUN_1407c7580</c>) on each one. That function collects the party's
+    /// live member slots - all 30, skipping the empty ones - into a
+    /// <c>vector&lt;PartyMemberBasicInfo&gt;</c> and sends
+    /// <b>ONE AS_DO_CREATE_PARTY carrying the whole roster</b> (<c>FUN_1407ae9d0</c>, the
+    /// <c>PKT_AS_DO_CREATE_PARTY_WRITE&lt;vector&lt;PartyMemberBasicInfo&gt;&gt;</c> instantiation
+    /// at Arb_part_066.c:18282), then <b>AS_DO_SET_LOOTING_METHOD</b> for the same party
+    /// (<c>FUN_1407af2b0</c>, Arb_part_066.c). There is no per-member AS_DO_ADD_PARTY_MEMBER on
+    /// this path: the roster in the create frame IS the member list.</para>
+    ///
+    /// <para>Its guard is <c>worldServerId == 0 || party.OwnerPlanetId == thisPlanet</c>
+    /// (Arb_part_067.c:15452 against <c>DAT_140e2d020</c>), so a party belonging to this planet
+    /// goes to every World. One planet here, so every party qualifies.</para>
+    ///
+    /// <para>Because this runs once, at the moment a World connects, it can only ever describe
+    /// parties that already existed - a party formed later is mirrored by the live path instead.
+    /// That is what makes it safe to send unconditionally: no World can be told about the same
+    /// party twice.</para>
+    /// </summary>
+    public List<(ushort Opcode, byte[] Payload)> BuildWorldConnectReplay()
+    {
+        var frames = new List<(ushort, byte[])>();
+        var parties = new List<Party>(_byId.Values);
+        parties.Sort((a, b) => a.Id.CompareTo(b.Id));
+        foreach (var party in parties)
+        {
+            var members = party.Members().ToList();
+            if (members.Count == 0) continue;            // a party mid-dissolve describes nothing
+            frames.Add((PartyPackets.AS_DO_CREATE_PARTY, PartyPackets.BuildDoCreateParty(
+                party.Id, party.OwnerPlanetId, party.ManagerPlanetId, party.ManagerDbId,
+                party.MaxMembers, party.PartyType,
+                dungeonClearCompensation: party.IsSys, dungeonId: party.DungeonId,
+                raid: party.Raid, teamIndex: 0, battleFieldId: 0, members: members)));
+            frames.Add((PartyPackets.AS_DO_SET_LOOTING_METHOD,
+                PartyPackets.BuildDoSetLootingMethod(party.Id, party.Loot)));
+        }
+        return frames;
+    }
+
     /// <summary>Pending "I applied to join your party" edges, applicant -> target.</summary>
     private readonly HashSet<(int applicant, int target)> _applications = new();
     public bool HasApplication(int applicant, int target) => _applications.Contains((applicant, target));

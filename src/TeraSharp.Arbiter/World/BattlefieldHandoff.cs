@@ -14,6 +14,26 @@ public sealed class BattlefieldHandoff
 {
     public const ushort BSA_NOTIFY_USER_ENTERABLE = 0x1513, SA_ENTER_BATTLE_FIELD = 0x13CB,
         BSA_EXIT_BATTLE_FIELD = 0x13CD, AS_REQUEST_ENTER_BATTLEFIELD = 0x1597;
+
+    /// <summary>
+    /// T208b. Seconds between an entrance offer and the AS_REQUEST_ENTER_BATTLEFIELD that enters
+    /// the player. 15 is the native interval, measured twice in cap_bg1 to the millisecond:
+    /// offer 12390 15:36:15.135 -> request 12545 15:36:30.123, and offer 12535 15:36:29.939 ->
+    /// request 13168 15:36:44.938. It is the window the entrance popup gives a player on the
+    /// normal MatchServer path; a forced /@battlefield has no popup, so waiting it out is just a
+    /// wait (cap_bg3: C_ADMIN 03:55:47.936 -> entry 03:56:03.1). 0 enters at once.
+    /// <para>Read fresh on every offer so a test server can change it without a restart.</para>
+    /// </summary>
+    public const string EnterDelayVariable = "TERASHARP_BF_ENTER_DELAY";
+    public const int DefaultEnterDelaySeconds = 15;
+
+    /// <summary><see cref="EnterDelayVariable"/>, clamped to 0..600; the default when unset or not a number.</summary>
+    public static int EnterDelaySeconds()
+    {
+        var raw = Environment.GetEnvironmentVariable(EnterDelayVariable);
+        return !string.IsNullOrWhiteSpace(raw) && int.TryParse(raw.Trim(), out int v) && v >= 0 && v <= 600
+            ? v : DefaultEnterDelaySeconds;
+    }
     public sealed record Offer(int UserId, int OwnerWorld, int Battlefield, int Continent, uint Channel,
         long PartyId, float X, float Y, float Z, short Direction, long[] Parties);
     public sealed record EnterRequest(ulong Handle, CharacterStore.SystemReturnPoint Return);
@@ -23,6 +43,10 @@ public sealed class BattlefieldHandoff
     private readonly Dictionary<int, PendingOffer> offers = new();
     private readonly Dictionary<int, Entered> entered = new();
     private readonly List<(DateTimeOffset Due, int UserId, GameSession Session, ulong GameId, int OwnerWorld, int SourceWorld)> timers = new();
+    // T208: what ReleaseEntered needs. Both are process singletons and TryHandle sees them on
+    // every BF frame, so they are set long before any user can be entered.
+    private WorldBridge? bridgeRef;
+    private CharacterStore? storeRef;
 
     public static Offer? ParseOffer(int ownerWorld, byte[] p)
     {
@@ -70,11 +94,14 @@ public sealed class BattlefieldHandoff
     public bool TryHandle(WorldBridge bridge, WorldLink link, CrossWorldHandoff transfers,
         CharacterStore? store, ushort opcode, byte[] payload, DateTimeOffset now)
     {
+        bridgeRef = bridge;
+        if (store != null) storeRef = store;
         if (opcode == BSA_NOTIFY_USER_ENTERABLE)
         {
             var offer = ParseOffer(link.WorldId, payload);
             var user = offer == null ? null : bridge.SessionForPlayerId(offer.UserId);
             if (offer == null || user == null || !user.InWorld) return true;
+            int delay = EnterDelaySeconds();   // T208b
             bool accept;
             lock (gate)
             {
@@ -85,7 +112,9 @@ public sealed class BattlefieldHandoff
                     offers[offer.UserId] = new(offer, user, user.GameId, user.CurrentWorldId);
                     // Every offer schedules its own callback. In cap_bg1, the old
                     //38 timer enters the newer37; the37 timer fires while already inside.
-                    timers.Add((now.AddSeconds(15), offer.UserId, user, user.GameId, offer.OwnerWorld, user.CurrentWorldId));
+                    // T208b: at delay 0 the request goes out below instead of waiting for Tick.
+                    if (delay > 0)
+                        timers.Add((now.AddSeconds(delay), offer.UserId, user, user.GameId, offer.OwnerWorld, user.CurrentWorldId));
                 }
                 else accept = false;
             }
@@ -103,6 +132,10 @@ public sealed class BattlefieldHandoff
             }
             // SetEnterableBattleFieldInfoCache emits FIN after its cache branch.
             user.Send(MatchQueueManager.BuildFinInterPartyMatch(offer.Battlefield, 1, 0));
+            // T208b: the same frame Tick would have sent, without the native 15-second wait.
+            if (accept && delay <= 0 && bridge.HasLinks(user.CurrentWorldId))
+                bridge.SendFrame(user.CurrentWorldId, AS_REQUEST_ENTER_BATTLEFIELD,
+                    BitConverter.GetBytes(offer!.UserId));
             return true;
         }
         if (opcode != SA_ENTER_BATTLE_FIELD && opcode != BSA_EXIT_BATTLE_FIELD) return false;
@@ -127,7 +160,9 @@ public sealed class BattlefieldHandoff
                 if (party == null || !offer.Parties.Contains(party.Id) || !bridge.HasLinks(offer.OwnerWorld)) return true;
                 var move = Destination(offer, handle, session.GameId, previous);
                 if (!transfers.Begin(link.WorldId, offer.OwnerWorld, move, session.PlayerId)) return true;
-                if (!store.SaveSystemReturn(userId, request.Return))
+                // T208b: dungeon_id = the battlefield continent, so a relog whose blob still points
+                // inside the battleground takes WorldEntry's return-from-instance path.
+                if (!store.SaveBattlefieldReturn(userId, offer.Continent, request.Return))
                 { transfers.Take(session.GameId, link.WorldId); return true; }
                 // Native UpdateSysReturnLoc sends27C6 to the source before LeaveWorldStart.
                 link.SendFrame(0x27C6, BuildSystemReturn(session.PlayerId, request.Return));
@@ -171,25 +206,39 @@ public sealed class BattlefieldHandoff
 
     public void CompleteTransfer(uint userId, int destination)
     {
-        lock (gate) if (entered.TryGetValue((int)userId, out var active) && active.ReturnWorld == destination)
-            entered.Remove((int)userId);
+        bool returned;
+        lock (gate)
+        {
+            returned = entered.TryGetValue((int)userId, out var active) && active.ReturnWorld == destination;
+            if (returned) entered.Remove((int)userId);
+        }
+        // T208b: the character is out of the battlefield, so the return point goes with it -
+        // native User::CleanSysReturnLoc on a normal zone change (see ClearDungeonReturn).
+        if (returned) (storeRef ?? TeraSharp.Arbiter.Program.Store)?.ClearDungeonReturn((int)userId);
     }
     public void ForgetUser(ulong gameId)
     {
+        int[] abandoned;
         lock (gate)
         {
             foreach (int id in offers.Where(x => x.Value.GameId == gameId).Select(x => x.Key).ToArray()) offers.Remove(id);
+            abandoned = entered.Where(x => x.Value.GameId == gameId && x.Value.ReturnWorld == null)
+                .Select(x => x.Key).ToArray();
             foreach (int id in entered.Where(x => x.Value.GameId == gameId).Select(x => x.Key).ToArray()) entered.Remove(id);
             timers.RemoveAll(t => t.GameId == gameId);
         }
+        // T208: the session ended inside the battlefield, so the13CD return will never run.
+        foreach (int id in abandoned) ReleaseEntered(id);
     }
     public void Clear() { lock (gate) { offers.Clear(); entered.Clear(); timers.Clear(); } }
     public void ForgetWorld(int world)
     {
+        int[] abandoned;
         lock (gate)
         {
             foreach (int id in offers.Where(x => x.Value.Offer.OwnerWorld == world || x.Value.SourceWorld == world)
                 .Select(x => x.Key).ToArray()) offers.Remove(id);
+            abandoned = entered.Where(x => x.Value.OwnerWorld == world).Select(x => x.Key).ToArray();
             foreach (int id in entered.Where(x => x.Value.OwnerWorld == world).Select(x => x.Key).ToArray()) entered.Remove(id);
             // CrossWorldHandoff cancels transfers to a disconnected destination.
             // Permit the still-live source BF to request return again after it recovers.
@@ -197,5 +246,36 @@ public sealed class BattlefieldHandoff
                 entered[id] = entered[id] with { ReturnWorld = null };
             timers.RemoveAll(t => t.OwnerWorld == world || t.SourceWorld == world);
         }
+        // T208: the battlefield World itself is gone - those users have no way back from it.
+        foreach (int id in abandoned) ReleaseEntered(id);
+    }
+
+    /// <summary>
+    /// T208. A battleground session that ends without the13CD return leaves the character's stored
+    /// position inside the battlefield continent - the transfer stamps it there on the way in
+    /// (arbiter-bg2.log 20:01:31 "Saved world blob ... zone115"). The next C_SELECT_USER routes
+    /// AS_ENTER_WORLD by that continent, so it goes to the BF World, which refuses it
+    /// (arbiter-bg2.log 20:04:50 SA_ENTER_WORLD_FAIL reason3) and the client sits on the loading
+    /// screen. Stamp the blob back to the saved system return point - the same place a completed
+    /// return would have put it - and drop T192's owner record with the rest of the session state.
+    /// Nothing durable other than the position is touched; the battleground result rows stay.
+    /// </summary>
+    internal void ReleaseEntered(int userId, CharacterStore? store = null, WorldBridge? bridge = null)
+    {
+        store ??= storeRef ?? TeraSharp.Arbiter.Program.Store;
+        bridge ??= bridgeRef ?? TeraSharp.Arbiter.Program.World;
+        var point = store?.GetSystemReturn(userId);
+        var blob = store?.GetCharacter(userId)?.WorldBlob;
+        if (store == null || point == null || blob == null || blob.Length < 308) return;
+        short direction = unchecked((short)BitConverter.ToInt32(blob, 304));
+        var move = new CrossWorldHandoff.Teleport(0, 0, -1, point.Continent, point.Channel,
+            point.X, point.Y, point.Z, direction, Array.Empty<byte>());
+        int destination = CrossWorldHandoff.ResolveDestination(move,
+            channel => DungeonRouting.Channels.WorldForChannel(move.Continent, unchecked((int)channel)),
+            DungeonRouting.Channels.WorldForContinent, DungeonRouting.Channels.CatchAllWorldId)
+            ?? WorldRegistration.DefaultWorldId;
+        store.SaveWorldBlob(userId, CrossWorldHandoff.StampLocation(blob, move, destination));
+        store.ClearDungeonReturn(userId);   // T208b: the battlefield is behind it now
+        if (bridge != null) CharacterTransientState.Reset(userId, bridge);
     }
 }

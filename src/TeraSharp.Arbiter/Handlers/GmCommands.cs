@@ -713,7 +713,8 @@ public sealed class GmCommandHandlers
             case "warehousegold_max": WarehouseGoldMaxCommand(s, line); break;
             case "query_point":     QueryPoint(s); break;
             case "battlefield":
-                if (Program.World is { } bfWorld) BattlefieldCreation.CreateForGm(bfWorld, s, line.Args);
+                if (Program.World is { } bfWorld) BattlefieldCreation.CreateForGm(bfWorld, s, line.Args, _log);
+                else _log.LogInformation("battlefield: no World bridge - refused ({Cmd})", string.Join(' ', line.Args));
                 break;
             case "perfect_card_collection":
                 var refresh = PerfectCardCollection(store, store.AccountOf((int)chr.Id), (int)chr.Id);
@@ -744,6 +745,9 @@ public sealed class GmCommandHandlers
             .Select(t => new CharacterStore.CardRow(t.Id, t.ActivationAmount)).ToArray();
         int points = sheet.Templates.Values.Sum(t => checked(t.ActivationAmount * t.BookPoints));
         store.ReplaceCardCollection(accountId, characterId, cards, new(1, sheet.LevelFor(points), points));
+        // T210: the refresh World asks for next describes the reset in-memory Account, not the
+        // stored presets/rewards - which is why they are still there on the next login.
+        TeraSharp.Arbiter.World.DbProxyHandlers.MarkPerfectCardRefresh(accountId);
         return BitConverter.GetBytes(accountId);
     }
 

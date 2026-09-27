@@ -1,0 +1,25 @@
+--- a/src/TeraSharp.Arbiter/Handlers/HandlerRegistry.cs
++++ b/src/TeraSharp.Arbiter/Handlers/HandlerRegistry.cs
+@@ -277,9 +277,8 @@
+         Reg("C_DUNGEON_RANK_SEASON_LIST", ItemBoardPackets.RankSeasonBodySize,      (s,b) => ItemBoardPackets.OnDungeonRankSeasonList(s,b,misc));
+         GmAdminTool.OnlineSessions = () => Program.World?.InWorldSessions() ?? new List<GameSession>();
+         foreach (var name in new[]
+         {
+-            "C_VIEW_BATTLE_FIELD_RESULT",
+             "C_REQUEST_CANDIDATE_LIST",
+             // T207b: C_SHOW_AWESOMIUMWEB_SHOP has a real handler now (ShopUrl.OnShowShop, above),
+             // so it must NOT also be accepted silently here - PacketDispatcher refuses a second
+             // registration of the same opcode and the server would not start.
+@@ -295,8 +294,12 @@
+ 
+         // T134: dungeon cool-time window (all 9 live replies are empty). Clear-count needs the 14-id roster merge - T134b.
+         Reg("C_DUNGEON_COOL_TIME_LIST", 0, (s, body) => { s.Send(ArbiterClientHandlers.BuildDungeonCoolTimeList()); return true; });
+         Reg("C_DUNGEON_CLEAR_COUNT_LIST", 0, (s, b) => ArbiterClientHandlers.OnDungeonClearCountList(s, b));   // T134b: roster + store merge
++        // T211: the profile's PvP Record tab. Was in the OnAcceptSilently list above, which is
++        // why it opened onto nothing; the reply layout is pinned to the dumper - see
++        // ArbiterClientHandlers.BuildViewBattleFieldResult and status/T211-PROFILE.md.
++        Reg("C_VIEW_BATTLE_FIELD_RESULT", 0, (s, b) => ArbiterClientHandlers.OnViewBattleFieldResult(s, b));
+         // --- T97: party extras, event/VIP windows, reports, profile ---
+         Reg("C_REQUEST_PARTY_NAME",                     MiscClientPackets.RequestPartyNameBodySize,      (s,b) => MiscClientPackets.OnRequestPartyName(s,b,misc));
+         Reg("C_VIEW_PARTY_INVITE",                      0,                                              (s,b) => MiscClientPackets.OnViewPartyInvite(s,b,misc));
+         Reg("C_GET_EVENT_DETAIL",                       0,                                              (s,b) => MiscClientPackets.OnGetEventDetail(s,b,misc));

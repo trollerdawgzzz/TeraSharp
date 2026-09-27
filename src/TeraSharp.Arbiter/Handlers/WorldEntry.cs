@@ -75,7 +75,15 @@ public static class WorldEntry
         // setting the client's chat window has no channel tabs configured, so S_CHAT arrives but
         // never renders (system messages use a separate UI path, which is why !test showed but
         // chat didn't). Send them here so the chat window initializes in World mode too.
-        ClientSettingsHandlers.SendUserSetting(s);
+        // T191c: NOT the user-setting load. The real Arbiter sends S_LOAD_CLIENT_USER_SETTING once
+        // per world entry, after C_LOAD_TOPO_FIN (cap_2man_b_client1: 312 fin -> 322 account, 323
+        // user, and nowhere else). TeraSharp sent it here as well, so the client received the same
+        // blob twice per entry (cap_bg2_client1 packets 51 and 342, byte-identical) and merged the
+        // incoming shortcut list into its live one instead of replacing it. S1ShortCutController
+        // then doubled every world entry - 1024 records in cap_polish_client, 131072 in
+        // cap_bg2_client1 - until the blob passed the 9000-byte cap and every save was refused, so
+        // nothing the client stored persisted any more and the WASD prompt came back each relog.
+        // What is left is HandlerRegistry's pair on C_LOAD_TOPO_FIN, which is the retail one.
         ClientSettingsHandlers.SendUiSetting(s);
         ClientSettingsHandlers.SendChatOption(s);
 
@@ -279,6 +287,26 @@ public static class WorldEntry
                 + "the character is stuck. Give it one in the DB (characters.return_zone/x/y/z).",
                 chr.Name, f.ContinuousDungeonId);
             return;
+        }
+
+        // T208: the refused continent and the fallback zone can belong to different Worlds. In
+        // cap_bg2 the relog was routed at the battleground World by the leftover continent 115
+        // (60743), World 10 refused it, and the retry for zone 7005 went to that same World
+        // (60746) - which does not own 7005, so nothing answered and the client sat on the
+        // loading screen. Re-point the session first: the Ticket indexes THAT World's bypass
+        // slots and the tunnel map is keyed (WorldId, Ticket), so it has to be reallocated (T111).
+        int refused = s.CurrentWorldId;
+        int owner = DungeonRouting.Channels.WorldForContinent(back.Zone)
+            ?? DungeonRouting.Channels.CatchAllWorldId;
+        if (owner < 0) owner = WorldRegistration.DefaultWorldId;   // T208: CatchAllWorldId is a plain int; negative = none
+        if (owner != refused && w.HasLinks(owner))
+        {
+            w.UnregisterPlayer(s.GameId, refused, s.TunnelKey, transferring: true);
+            s.CurrentWorldId = owner;
+            s.TunnelKey = w.AllocateTunnelKey(owner);
+            w.RegisterPlayer(s);
+            log.LogWarning("EnterWorld retry for '{Name}': zone {Z} belongs to World {Owner}, not "
+                + "{Refused} - re-pointed the session", chr.Name, back.Zone, owner, refused);
         }
 
         var record = Program.Store?.GetCharacter((int)chr.Id);

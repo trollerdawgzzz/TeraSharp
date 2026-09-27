@@ -48,9 +48,25 @@
   "gateway": {
     "address": "127.0.0.1:8800",
     "serve": false,
+    // Which address that listener binds. "" = the host half of "address"; 0.0.0.0 when the
+    // client is on another machine (a + prefix needs an urlacl - see ARCHITECTURE.md).
     "bind": "",
     // SECRET. Must equal tera-api's API_PORTAL_SECRET, or Alt+A breaks on every restart.
     "jwtSecret": ""
+  },
+  // T207 - the tera-api shop and item delivery.
+  "shop": {
+    // The page the in-game shop button opens (S_SHOW_AWESOMIUMWEB_SHOP). "" derives it from
+    // auth.url's host on tera-api's portal port 81.
+    "url": "",
+    // TeraSharp answers tera-api's hub itself, so a purchase becomes a system parcel and no
+    // arb_gw is needed. Point tera-api's HUB_HOST / HUB_PORT at this. LEAVE IT ON LOOPBACK:
+    // the hub is an unauthenticated control channel, exactly as retail built it.
+    "hubListen": "127.0.0.1:11001",
+    "hubEnabled": true,
+    // The server number tera-api addresses (its own server id). "" = the number in
+    // planet.dbServerName, so PlanetDB_2800 needs nothing here.
+    "serverId": ""
   },
   "knobs": {
     // Console verbosity only; the daily file always takes Debug.
@@ -62,13 +78,23 @@
   "matchmaking": {
     "entrySeconds": 300,
     "bgMaxHealers": 2,
-    "bgMaxTanks": 3
+    "bgMaxTanks": 3,
+    // T208b. Seconds between a battlefield entrance offer (BSA_NOTIFY_USER_ENTERABLE) and the
+    // AS_REQUEST_ENTER_BATTLEFIELD that enters the player. 15 is retail (cap_bg1 measures it
+    // twice: 15:36:15.135 -> 15:36:30.123 and 15:36:29.939 -> 15:36:44.938). Set 0 to enter at
+    // once, which makes /@battlefield instant on a test server.
+    "bfEnterDelay": 15
     // minMembers is retired and ignored (T184h). Two-player testing needs a two-player
     // MatchingRoleTemplate row, not a setting.
   },
   "economy": {
     // Price + price * rate / 100, truncated. A live Classic+ server runs 15.
-    "brokerFeePercent": 10
+    "brokerFeePercent": 10,
+    // T209. Build the starter kit's 536-byte item records instead of copying them out of
+    // data\starter_inventory.bin, so that file is not needed at all. Default TRUE since T209c
+    // part 2 was live-verified (created with the file absent, entered world, kit survived a
+    // relog). Set it to false only to go back to copying a captured record you still have.
+    "synthItemRecords": true
   },
   // Read by tools\setup.ps1, start.ps1 and stop.ps1 - NOT by the Arbiter. Changing a port here
   // and re-running setup.ps1 -Check tells you whether DeploymentConfig.xml still agrees.

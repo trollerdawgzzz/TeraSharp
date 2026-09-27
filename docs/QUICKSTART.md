@@ -34,15 +34,20 @@ and the Alt+A signing key, makes `DeploymentConfig.xml` agree with it (ports, `E
 behind. Run it again any time; it keeps your answers and your secrets, and `-Check` shows what it
 would change without touching anything.
 
-### 3. Supply the four runtime blobs
+### 3. Nothing to supply
 
-```
-data\starter_blob.bin   data\starter_inventory.bin   data\promotions_147E.bin   data\handshake_burst.bin
-```
+There is no runtime blob left. All four files this step used to ask for are generated:
 
-They are bytes off a running server's wire, so this repository ships none of them.
-`data\README.md` has the format of each and how to cut it out of your own capture. Until they
-exist the server runs and existing characters work, but **creating a character fails**.
+| File | Retired by | Built from |
+|---|---|---|
+| `starter_blob.bin` | T209 | `CreateCharData.xml`, `DefaultSkillSet.xml` and the create request |
+| `promotions_147E.bin` | T209c | nothing - a server with no castles is supposed to send none |
+| `handshake_burst.bin` | T209b | `Protocol/InterServerDefinitions`, every field named from the retail dump helpers |
+| `starter_inventory.bin` | T209c part 2 | `CreateCharData.xml` plus built 536-byte item records |
+
+Each is still an override: drop a capture of your own into `data\` and it wins, byte for byte.
+`data\README.md` has the formats. Set `economy.synthItemRecords` to `false` in `teras.json` to go
+back to copying item records out of a `starter_inventory.bin` you still have.
 
 ### 4. Check what the process actually resolved
 
@@ -66,6 +71,39 @@ Topography (`--sharedmemoryproducer=true`) -> TeraSharp -> World -> the proxy, e
 before the next. Players connect to the host and port it prints. `.\stop.ps1` announces, kicks so
 rows are written, and stops in reverse.
 
+Once it is up and someone else is playing on it, [OPERATIONS.md](OPERATIONS.md) is the runbook:
+backups and the restore drill, how to restart without losing a character, what the Dashboard tiles
+and `worldReady false` mean, what needs a World restart and what does not, and the settings to clear
+before anyone logs in. [GO-LIVE.md](GO-LIVE.md) is the one-time hardening that comes first.
+
+---
+
+## Enable the shop (optional)
+
+The in-game shop button and the items a purchase delivers both go through
+[tera-api](https://github.com/justkeepquiet/tera-api). TeraSharp answers tera-api's hub socket
+itself, so there is no `arb_gw` to run:
+
+1. In tera-api's `.env`, point the hub at TeraSharp and turn the shop on:
+
+   ```
+   HUB_HOST=127.0.0.1
+   HUB_PORT=11001
+   API_PORTAL_SHOP_ENABLE=true
+   ```
+
+   Nothing else in tera-api changes. If `arb_gw_tw2_log.exe` is running, stop it - it holds 11001.
+
+2. In `teras.json`, leave `shop.hubListen` at `127.0.0.1:11001` and set `shop.url` only if your
+   shop page is not tera-api's default (`http://<auth host>:81/tera/ShopMain`).
+
+3. Restart TeraSharp. The log says `hub listening on 127.0.0.1:11001 as server 2800`.
+
+A purchase then arrives as a system parcel in the buyer's mailbox, and elite (benefit 533) is
+granted on the account while the player is online. Boxes bought before the account has a character
+wait in `hub_boxes` and are delivered within a minute of the first character existing.
+`status/T207-HUB.md` is the whole path, including why it is a parcel and not an Item Claim window.
+
 ---
 
 ## Settings
@@ -76,6 +114,10 @@ always wins**, so you can override one setting for one run without editing anyth
 table with defaults is [ARCHITECTURE.md](ARCHITECTURE.md) section 5.
 
 `teras.json` holds the admin token and the Alt+A key. It is gitignored. Never commit it.
+
+The admin web tool is at `http://127.0.0.1:8051/` - paste `admin.token` from `teras.json` to sign
+in. Seven screens: Dashboard, Accounts, Characters, Mail, Guilds, Server, Settings. `docs/ADMIN.md`
+says what each one does and what it replaces in the retail GM tool.
 
 ## When it does not work
 

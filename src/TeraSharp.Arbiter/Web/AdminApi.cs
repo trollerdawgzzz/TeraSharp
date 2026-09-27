@@ -26,8 +26,14 @@ namespace TeraSharp.Arbiter.Web;
 // 3 invalid argument, 0x16 refused. The JSON mirrors those rather than inventing a scheme.
 // =============================================================================================
 
-/// <summary>One HTTP answer: a status, a content type and a body.</summary>
-public sealed record AdminResponse(int Status, string ContentType, string Body);
+/// <summary>
+/// One HTTP answer: a status, a content type and a body. T206 added the two optional headers the
+/// embedded UI needs - <paramref name="CacheControl"/> so a browser does not keep yesterday's
+/// script, and <paramref name="ETag"/> so an operator can tell which UI build is being served.
+/// Both are null on every JSON answer, which is why they are at the end with defaults.
+/// </summary>
+public sealed record AdminResponse(int Status, string ContentType, string Body,
+    string? CacheControl = null, string? ETag = null);
 
 /// <summary>A live session as the online list shows it. Supplied by a delegate so this file
 /// never depends on WorldBridge and the tests need no server.</summary>
@@ -37,6 +43,10 @@ public sealed class AdminApi
 {
     /// <summary>Retail result codes, from WEBADMIN-DESIGN.md section 2.</summary>
     public const int ResultOk = 0, ResultNotFound = 2, ResultInvalid = 3, ResultRefused = 0x16;
+
+    /// <summary>The content type every JSON answer carries. T206 named the literal that was
+    /// repeated at forty call sites so a new endpoint cannot get it subtly wrong.</summary>
+    public const string JsonType = "application/json; charset=utf-8";
 
     private readonly CharacterStore _store;
     private readonly Func<IReadOnlyList<AdminOnlineRow>> _online;
@@ -109,8 +119,18 @@ public sealed class AdminApi
         // for the token, keeps it in this browser, and sends it as X-Admin-Token on every API
         // call below, each of which is still gated. The listener is bound to 127.0.0.1 and
         // Serve() re-checks the peer is loopback, so serving it costs nothing.
-        if (method == "GET" && (path == "/" || path == "/index.html"))
-            return new AdminResponse(200, "text/html; charset=utf-8", AdminPage.Html);
+        // T206: the same reasoning, now for a multi-file app. index.html, app.css, app.js and one
+        // module per screen are embedded resources (AdminAssets), so an ES module can import its
+        // siblings by URL. Nothing under /api/ can be reached this way, and a path with a slash or
+        // a dot-dot in it is refused outright, so no URL walks out of the resource list.
+        if (method == "GET" && !path.StartsWith("/api/", StringComparison.Ordinal))
+        {
+            var asset = AdminAssets.Find(path);
+            if (asset != null)
+                return new AdminResponse(200, asset.ContentType, asset.Body, "no-store", asset.ETag);
+            if (path == "/" || path == "/index.html")
+                return new AdminResponse(200, "text/html; charset=utf-8", AdminAssets.MissingPage);
+        }
 
         if (!TokenOk(token))
         {
@@ -153,6 +173,29 @@ public sealed class AdminApi
         if (method == "POST" && path == "/api/rename") return Rename(body, sourceIp);
         if (method == "POST" && path == "/api/announce-schedule") return ScheduleAnnounce(body, sourceIp);
         if (method == "POST" && path == "/api/announce-delete") return DeleteAnnounce(body, sourceIp);
+
+        // ---- T206: the single-page admin UI ----
+        if (method == "GET" && path == "/api/db") return Db();
+        if (method == "GET" && path == "/api/queue") return Queue();
+        if (method == "GET" && path == "/api/settings") return Settings();
+        if (method == "GET" && path == "/api/account-logins") return AccountLogins(query);
+        if (method == "GET" && path == "/api/item-search") return ItemSearch(query);
+        if (method == "GET" && path == "/api/achievements") return Achievements(query);
+        if (method == "GET" && path == "/api/parcels") return Parcels(query);
+        if (method == "GET" && path == "/api/guilds") return Guilds(query);
+        if (method == "GET" && path == "/api/guild") return Guild(query);
+        if (method == "POST" && path == "/api/set-position") return SetPosition(body, sourceIp);
+        if (method == "POST" && path == "/api/remove-item") return RemoveItem(body, sourceIp);
+        if (method == "POST" && path == "/api/reset-skills") return ResetSkills(body, sourceIp);
+        if (method == "POST" && path == "/api/reset-client-settings") return ResetClientSettings(body, sourceIp);   // T191c
+        if (method == "POST" && path == "/api/set-ep") return SetEp(body, sourceIp);
+        if (method == "POST" && path == "/api/send-mail") return SendMail(body, sourceIp);
+        if (method == "POST" && path == "/api/delete-parcel") return DeleteParcelNow(body, sourceIp);
+        if (method == "POST" && path == "/api/guild-money") return GuildMoney(body, sourceIp);
+        if (method == "POST" && path == "/api/guild-level") return GuildLevel(body, sourceIp);
+        if (method == "POST" && path == "/api/guild-disband") return GuildDisband(body, sourceIp);
+        if (method == "POST" && path == "/api/restart-notice") return RestartNotice(body, sourceIp);
+        if (method == "POST" && path == "/api/reload-datasheets") return ReloadDatasheets(body, sourceIp);
 
         foreach (var p in PhaseThreePaths)
             if (path == p)
@@ -697,7 +740,7 @@ public sealed class AdminApi
     /// so it can be won again. Retail has the same pair as operator commands
     /// (ArbiterQACommandHandler::ClearServerAchievement / ClearAllServerAchievement).
     /// </summary>
-    private AdminResponse ClearServerAchievement(string body, string ip)
+    private AdminResponse ClearServerAchievement(string? body, string? ip)
     {
         int id = (int)(JsonNumber(body, "id") ?? 0);
         // A flat body, like every other route here: {"all":true} or {"all":1}.
@@ -1174,10 +1217,884 @@ public sealed class AdminApi
                   : Json(404, ResultNotFound, "no such announce");
     }
 
-    private void Log(string? ip, string action, string target, string reason, int result)
+    // =========================================================== T206: the single-page admin UI
+    //
+    // Everything below exists because a screen needs it. The seven screens are Dashboard,
+    // Accounts, Characters, Mail, Guilds, Server and Settings (docs/ADMIN.md); T101-T106 already
+    // covered most of Accounts and Characters, so what is new here is the state the Dashboard
+    // and Settings screens read, the whole of Mail and Guilds, and the handful of per-character
+    // writes the retail right-hand action menu offers that this tool did not.
+
+    /// <summary>GET /api/db - the database report the Settings and Dashboard screens show.</summary>
+    private AdminResponse Db()
     {
-        _store.AddAdminLog(DateTimeOffset.UtcNow.ToUnixTimeSeconds(), ip ?? string.Empty,
-            action, target, reason, result);
+        var s = _store.GetDatabaseStats();
+        var sb = new StringBuilder("{\"result\":").Append(ResultOk)
+            .Append(",\"path\":").Append(Str(s.Path))
+            .Append(",\"bytes\":").Append(s.Bytes)
+            .Append(",\"walBytes\":").Append(s.WalBytes)
+            .Append(",\"pageCount\":").Append(s.PageCount)
+            .Append(",\"pageSize\":").Append(s.PageSize)
+            .Append(",\"userVersion\":").Append(s.UserVersion)
+            .Append(",\"tables\":[");
+        for (int i = 0; i < s.Tables.Count; i++)
+        {
+            if (i > 0) sb.Append(',');
+            sb.Append("{\"name\":").Append(Str(s.Tables[i].Name))
+              .Append(",\"rows\":").Append(s.Tables[i].Rows).Append('}');
+        }
+        sb.Append("]}");
+        return new AdminResponse(200, JsonType, sb.ToString());
+    }
+
+    /// <summary>
+    /// GET /api/queue - the matchmaking pool and the party count, which is the one piece of
+    /// Dashboard state that lives in memory rather than in the database. Reads
+    /// <see cref="World.MatchQueueManager.All"/>, so an empty array means nobody is queued, not
+    /// that the read failed.
+    /// </summary>
+    private AdminResponse Queue()
+    {
+        var entries = World.MatchQueueManager.All();
+        long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var sb = new StringBuilder("{\"result\":").Append(ResultOk)
+            .Append(",\"parties\":").Append(World.PartyWiring.Manager.PartyCount)
+            .Append(",\"queued\":").Append(entries.Count)
+            .Append(",\"queues\":[");
+        for (int i = 0; i < entries.Count; i++)
+        {
+            var e = entries[i];
+            if (i > 0) sb.Append(',');
+            sb.Append("{\"leader\":").Append(e.LeaderPlayerId)
+              .Append(",\"size\":").Append(e.Size)
+              .Append(",\"isParty\":").Append(e.IsParty ? "true" : "false")
+              .Append(",\"state\":").Append(Str(e.State.ToString()))
+              .Append(",\"matched\":").Append(e.Matched ? "true" : "false")
+              .Append(",\"matchedInstanceId\":").Append(e.MatchedInstanceId)
+              .Append(",\"queuedAt\":").Append(e.QueuedAt.ToUnixTimeSeconds())
+              .Append(",\"waitSeconds\":").Append(Math.Max(0, now - e.QueuedAt.ToUnixTimeSeconds()))
+              .Append(",\"instances\":[");
+            for (int j = 0; j < e.InstanceIds.Length; j++)
+            {
+                if (j > 0) sb.Append(',');
+                sb.Append(e.InstanceIds[j]);
+            }
+            sb.Append("]}");
+        }
+        sb.Append("]}");
+        return new AdminResponse(200, JsonType, sb.ToString());
+    }
+
+    /// <summary>
+    /// Names whose value is never sent to the browser. Substring match, case-insensitive, so a
+    /// setting added later that is called anything like a credential is masked by default rather
+    /// than by someone remembering to add it here.
+    /// </summary>
+    private static readonly string[] SecretMarkers = { "TOKEN", "SECRET", "PASSWORD", "PASSWD", "_KEY", "APIKEY" };
+
+    /// <summary>True when this setting's value must not leave the process.</summary>
+    internal static bool IsSecret(string name)
+    {
+        foreach (string marker in SecretMarkers)
+            if (name.Contains(marker, StringComparison.OrdinalIgnoreCase)) return true;
+        return false;
+    }
+
+    /// <summary>
+    /// GET /api/settings - the effective configuration, teras.json and environment together,
+    /// with every secret replaced by its length rather than its value. The masked form still
+    /// answers the question the screen is for ("is the token set, and where did it come from?")
+    /// without putting the token in a browser tab, a screenshot or a support ticket.
+    /// </summary>
+    private AdminResponse Settings()
+    {
+        var sb = new StringBuilder("{\"result\":").Append(ResultOk)
+            .Append(",\"configFile\":").Append(Str(TerasConfig.LoadedPath))
+            .Append(",\"configProblem\":").Append(Str(TerasConfig.Problem))
+            .Append(",\"itemNames\":{\"count\":").Append(Protocol.ItemNames.Count)
+            .Append(",\"source\":").Append(Str(Protocol.ItemNames.Source)).Append('}')
+            .Append(",\"datasheetDir\":").Append(Str(SafeDatasheetDir()))
+            .Append(",\"ui\":{\"files\":").Append(AdminAssets.All.Count)
+            .Append(",\"build\":").Append(Str(UiBuild())).Append('}')
+            .Append(",\"describe\":[");
+        bool firstLine = true;
+        foreach (string line in TerasConfig.Describe())
+        {
+            if (!firstLine) sb.Append(',');
+            firstLine = false;
+            sb.Append(Str(line));
+        }
+        sb.Append("],\"values\":[");
+
+        var seen = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var pair in TerasConfig.Map) seen.Add(pair.Value);
+        bool first = true;
+        foreach (string name in seen)
+        {
+            string? value = TerasConfig.Get(name);
+            bool secret = IsSecret(name);
+            if (!first) sb.Append(',');
+            first = false;
+            sb.Append("{\"name\":").Append(Str(name))
+              .Append(",\"source\":").Append(Str(TerasConfig.SourceOf(name)))
+              .Append(",\"set\":").Append(string.IsNullOrEmpty(value) ? "false" : "true")
+              .Append(",\"secret\":").Append(secret ? "true" : "false")
+              .Append(",\"value\":").Append(Str(secret
+                  ? (string.IsNullOrEmpty(value) ? string.Empty : "set, " + value.Length + " characters")
+                  : value))
+              .Append('}');
+        }
+        sb.Append("]}");
+        return new AdminResponse(200, JsonType, sb.ToString());
+    }
+
+    /// <summary>The datasheet directory, or a note - resolving it touches the filesystem.</summary>
+    private static string SafeDatasheetDir()
+    {
+        try { return World.DatasheetLoader.Directory(); }
+        catch (Exception e) { return "unresolved: " + e.Message; }
+    }
+
+    /// <summary>A fingerprint of the embedded UI, so the screen can prove which build it is.</summary>
+    private static string UiBuild()
+    {
+        var index = AdminAssets.Find(AdminAssets.IndexPath);
+        return index?.ETag.Trim('"') ?? string.Empty;
+    }
+
+    /// <summary>
+    /// GET /api/account-logins?id=N|name=X - the Accounts screen's login history.
+    ///
+    /// There is no login table: the server stamps <c>characters.last_login</c> and (T206) writes
+    /// one <c>game_log</c> row per character that comes online, so the history is that log
+    /// filtered to this account, with each character's stamped pair alongside. An account that
+    /// has not logged in since this build shipped shows the stamps and an empty log, which is the
+    /// truth rather than a gap dressed up as zero activity.
+    /// </summary>
+    private AdminResponse AccountLogins(IReadOnlyDictionary<string, string> q)
+    {
+        var account = AccountFromQuery(q);
+        if (account == null) return Json(404, ResultNotFound, "no such account");
+        int limit = (int)Num(q, "limit");
+        if (limit <= 0 || limit > 200) limit = 50;
+
+        var rows = _store.QueryGameLog(accountId: account.Id,
+            category: World.GameLogPackets.CategoryUser, action: LoginAction, page: 0, pageSize: limit);
+        var sb = new StringBuilder("{\"result\":").Append(ResultOk)
+            .Append(",\"account\":{\"id\":").Append(account.Id)
+            .Append(",\"name\":").Append(Str(account.Name)).Append('}')
+            .Append(",\"characters\":[");
+        var characters = _store.GetCharacters(account.Id);
+        for (int i = 0; i < characters.Count; i++)
+        {
+            var c = characters[i];
+            if (i > 0) sb.Append(',');
+            sb.Append("{\"id\":").Append(c.Id)
+              .Append(",\"name\":").Append(Str(c.Name))
+              .Append(",\"level\":").Append(c.Level)
+              .Append(",\"lastLogin\":").Append(Str(Iso(c.LastLogin)))
+              .Append(",\"lastLogout\":").Append(Str(Iso(c.LastLogout))).Append('}');
+        }
+        sb.Append("],\"logins\":[");
+        for (int i = 0; i < rows.Count; i++)
+        {
+            if (i > 0) sb.Append(',');
+            sb.Append("{\"at\":").Append(rows[i].LoggedAt)
+              .Append(",\"characterId\":").Append(rows[i].CharacterId)
+              .Append(",\"character\":").Append(Str(_store.GetCharacterName((int)rows[i].CharacterId)))
+              .Append(",\"extra\":").Append(Str(rows[i].Extra)).Append('}');
+        }
+        sb.Append("]}");
+        return new AdminResponse(200, JsonType, sb.ToString());
+    }
+
+    /// <summary>The <c>game_log</c> action a character coming online writes. Shared with
+    /// <c>SocialHandlers</c>, which is the one place that knows a login happened.</summary>
+    public const string LoginAction = "login";
+
+    /// <summary>An account from ?id= or ?name=.</summary>
+    private AccountRecord? AccountFromQuery(IReadOnlyDictionary<string, string> q)
+    {
+        long id = Num(q, "id");
+        if (id > 0) return _store.GetAccountById(id);
+        string? name = Blank(Get(q, "name"));
+        return name == null ? null : _store.GetAccount(name);
+    }
+
+    /// <summary>A round-trip timestamp, or empty for the default value.</summary>
+    private static string Iso(DateTime when)
+        => when == default ? string.Empty : when.ToString("o", CultureInfo.InvariantCulture);
+
+    /// <summary>
+    /// POST /api/set-position {"id":N,"zone":Z,"x":..,"y":..,"z":..} - the retail right-menu
+    /// teleport, which moves a character to a place. <c>/api/teleport</c> is the other retail
+    /// verb (move a character to another PLAYER) and needs a live session; this one writes the
+    /// spawn point, so it works on an offline character, which is when an operator needs it.
+    /// </summary>
+    private AdminResponse SetPosition(string? body, string? ip)
+    {
+        var c = Target(body);
+        string reason = JsonString(body, "reason") ?? string.Empty;
+        if (c == null) { Log(ip, "set-position", "?", reason, ResultNotFound); return Json(404, ResultNotFound, "no such character"); }
+        double? zone = JsonNumber(body, "zone");
+        if (zone == null || zone < 0) { Log(ip, "set-position", c.Name, reason, ResultInvalid); return Json(400, ResultInvalid, "zone is required"); }
+        float x = (float)(JsonNumber(body, "x") ?? c.X);
+        float y = (float)(JsonNumber(body, "y") ?? c.Y);
+        float z = (float)(JsonNumber(body, "z") ?? c.Z);
+
+        _store.UpdateLevelAndPosition(c.Id, c.Level, (int)zone.Value, x, y, z);
+        Log(ip, "set-position", c.Name, reason, ResultOk, c.Id, c.AccountId,
+            "zone " + (int)zone.Value);
+        return Json(200, ResultOk, $"{c.Name} moved to zone {(int)zone.Value}");
+    }
+
+    /// <summary>POST /api/remove-item {"itemDbId":N,"reason":"..."} - retail WA_DEL_ITEM.</summary>
+    private AdminResponse RemoveItem(string? body, string? ip)
+    {
+        int itemDbId = (int)(JsonNumber(body, "itemDbId") ?? 0);
+        string reason = JsonString(body, "reason") ?? string.Empty;
+        if (itemDbId <= 0) return Json(400, ResultInvalid, "itemDbId is required");
+        var row = _store.GetItem(itemDbId);
+        if (row == null) { Log(ip, "remove-item", itemDbId.ToString(CultureInfo.InvariantCulture), reason, ResultNotFound); return Json(404, ResultNotFound, "no such item"); }
+
+        bool ok = _store.DeleteItem(itemDbId);
+        string owner = _store.GetCharacterName((int)row.OwnerDbId) ?? row.OwnerDbId.ToString(CultureInfo.InvariantCulture);
+        Log(ip, "remove-item", owner, reason, ok ? ResultOk : ResultRefused, row.OwnerDbId, 0,
+            "item " + itemDbId + " template " + row.TemplateId + " amount " + row.Amount);
+        return ok ? Json(200, ResultOk, $"item {itemDbId} removed from {owner}")
+                  : Json(500, ResultRefused, "the store refused the delete");
+    }
+
+    /// <summary>
+    /// GET /api/item-search?q=name-or-id&amp;limit=N - the item picker behind give-item and mail
+    /// attachments. Retail made the operator know the template id; the StrSheet is loaded
+    /// anyway for inventory names, so searching it costs nothing.
+    /// </summary>
+    private AdminResponse ItemSearch(IReadOnlyDictionary<string, string> q)
+    {
+        int limit = (int)Num(q, "limit");
+        if (limit <= 0 || limit > ItemSearchMaxResults) limit = 25;
+        var hits = Protocol.ItemNames.Search(Get(q, "q"), limit);
+        var sb = new StringBuilder("{\"result\":").Append(ResultOk)
+            .Append(",\"loaded\":").Append(Protocol.ItemNames.Count)
+            .Append(",\"items\":[");
+        for (int i = 0; i < hits.Count; i++)
+        {
+            if (i > 0) sb.Append(',');
+            sb.Append("{\"templateId\":").Append(hits[i].TemplateId)
+              .Append(",\"name\":").Append(Str(hits[i].Name)).Append('}');
+        }
+        sb.Append("]}");
+        return new AdminResponse(200, JsonType, sb.ToString());
+    }
+
+    /// <summary>The most item hits one search will return.</summary>
+    public const int ItemSearchMaxResults = 200;
+
+    /// <summary>
+    /// POST /api/reset-skills {"id":N} - retail ResetSkill. Zeroes both skill regions of the
+    /// world blob; World re-learns the level's skills on the next level commit, which is what
+    /// <c>/api/set-level</c> already queues.
+    /// </summary>
+    private AdminResponse ResetSkills(string? body, string? ip)
+    {
+        var c = Target(body);
+        string reason = JsonString(body, "reason") ?? string.Empty;
+        if (c == null) { Log(ip, "reset-skills", "?", reason, ResultNotFound); return Json(404, ResultNotFound, "no such character"); }
+        bool ok = _store.ClearAllSkills(c.Id);
+        Log(ip, "reset-skills", c.Name, reason, ok ? ResultOk : ResultRefused, c.Id, c.AccountId);
+        return ok ? Json(200, ResultOk, $"{c.Name} skills cleared - relog to re-learn")
+                  : Json(500, ResultRefused, "the store refused the reset");
+    }
+
+    /// <summary>
+    /// POST /api/reset-client-settings {"id":N} - T191c. Drops the character's stored client
+    /// settings blob. Use it when the blob has run away past 9000 bytes: every C_SAVE_CLIENT_USER_SETTING
+    /// is refused from then on (retail refuses the same way) and nothing the client stores persists,
+    /// which is what brings the WASD prompt back on every relog. The client rebuilds a small blob on
+    /// the next login; hotkeys and UI layout for that character go back to their defaults.
+    /// </summary>
+    private AdminResponse ResetClientSettings(string? body, string? ip)
+    {
+        var c = Target(body);
+        string reason = JsonString(body, "reason") ?? string.Empty;
+        if (c == null) { Log(ip, "reset-client-settings", "?", reason, ResultNotFound); return Json(404, ResultNotFound, "no such character"); }
+        bool ok = _store.ClearClientSetting(c.Id);
+        Log(ip, "reset-client-settings", c.Name, reason, ok ? ResultOk : ResultRefused, c.Id, c.AccountId);
+        return ok ? Json(200, ResultOk, $"{c.Name} client settings cleared - relog to rebuild them")
+                  : Json(404, ResultNotFound, "that character had no stored client settings");
+    }
+
+    /// <summary>POST /api/set-ep {"id":N,"level":L,"point":P} - the EP tab's two numbers.</summary>
+    private AdminResponse SetEp(string? body, string? ip)
+    {
+        var c = Target(body);
+        string reason = JsonString(body, "reason") ?? string.Empty;
+        if (c == null) { Log(ip, "set-ep", "?", reason, ResultNotFound); return Json(404, ResultNotFound, "no such character"); }
+        double? level = JsonNumber(body, "level");
+        double? point = JsonNumber(body, "point");
+        if (level == null || level < 0 || point == null || point < 0)
+        { Log(ip, "set-ep", c.Name, reason, ResultInvalid); return Json(400, ResultInvalid, "level and point must be >= 0"); }
+
+        bool ok = _store.SetCharacterEpLevel(c.Id, (int)level.Value, (int)point.Value);
+        Log(ip, "set-ep", c.Name, reason, ok ? ResultOk : ResultRefused, c.Id, c.AccountId,
+            "ep level " + (int)level.Value + " point " + (int)point.Value);
+        return ok ? Json(200, ResultOk, $"{c.Name} EP level {(int)level.Value}, {(int)point.Value} points")
+                  : Json(500, ResultRefused, "the store refused the update");
+    }
+
+    /// <summary>The accomplished-achievement record World stores: id, serverUnique, six date
+    /// words, pad. T203 read the same 24 bytes to gate server firsts.</summary>
+    private const int AchievementRecordSize = 24;
+
+    /// <summary>
+    /// GET /api/achievements?id=N - the Achievement tab. The stored records are World's own 24
+    /// bytes, so this decodes the two fields whose meaning T203 established (the id and the
+    /// server-unique flag) and the completion date, and leaves the rest alone.
+    /// </summary>
+    private AdminResponse Achievements(IReadOnlyDictionary<string, string> q)
+    {
+        var c = CharacterFromQuery(q);
+        if (c == null) return Json(404, ResultNotFound, "no such character");
+        var records = _store.GetAccomplishedAchievements(c.Id);
+        var sb = new StringBuilder("{\"result\":").Append(ResultOk)
+            .Append(",\"characterId\":").Append(c.Id)
+            .Append(",\"character\":").Append(Str(c.Name))
+            .Append(",\"count\":").Append(records.Count)
+            .Append(",\"done\":[");
+        bool first = true;
+        foreach (byte[] record in records)
+        {
+            if (record.Length < AchievementRecordSize) continue;
+            if (!first) sb.Append(',');
+            first = false;
+            int id = BitConverter.ToInt32(record, 0);
+            int unique = BitConverter.ToInt32(record, 4);
+            sb.Append("{\"id\":").Append(id)
+              .Append(",\"serverUnique\":").Append(unique)
+              .Append(",\"date\":").Append(Str(AchievementDate(record))).Append('}');
+        }
+        sb.Append("],\"serverFirsts\":[");
+        first = true;
+        foreach (var claim in _store.GetServerAchievements())
+        {
+            if (claim.OwnerId != c.Id) continue;
+            if (!first) sb.Append(',');
+            first = false;
+            sb.Append("{\"id\":").Append(claim.AchievementId)
+              .Append(",\"partyId\":").Append(claim.PartyId)
+              .Append(",\"claimedAt\":").Append(Str(claim.ClaimedAt)).Append('}');
+        }
+        sb.Append("]}");
+        return new AdminResponse(200, JsonType, sb.ToString());
+    }
+
+    /// <summary>The six little-endian date words at +8, as yyyy-MM-dd HH:mm:ss.</summary>
+    private static string AchievementDate(byte[] record)
+    {
+        int year = BitConverter.ToUInt16(record, 8), month = BitConverter.ToUInt16(record, 10);
+        int day = BitConverter.ToUInt16(record, 12), hour = BitConverter.ToUInt16(record, 14);
+        int minute = BitConverter.ToUInt16(record, 16), second = BitConverter.ToUInt16(record, 18);
+        if (year < 1 || month is < 1 or > 12 || day is < 1 or > 31) return string.Empty;
+        return string.Format(CultureInfo.InvariantCulture, "{0:0000}-{1:00}-{2:00} {3:00}:{4:00}:{5:00}",
+            year, month, day, hour, minute, second);
+    }
+
+    /// <summary>A character from ?id= or ?name=, the read-side twin of <see cref="Target"/>.</summary>
+    private CharacterRecord? CharacterFromQuery(IReadOnlyDictionary<string, string> q)
+    {
+        long id = Num(q, "id");
+        if (id > 0) return _store.GetCharacter((int)id);
+        string? name = Blank(Get(q, "name"));
+        return name == null ? null : _store.GetCharacterByName(name);
+    }
+
+    /// <summary>
+    /// GET /api/parcels?id=N|name=X - the ParcelInfo tab: the inbox and the sent box, each
+    /// parcel with its attachments spelled out. Retail's grid showed one item name per parcel;
+    /// <c>GetParcelItems</c> (T206) makes all five slots visible.
+    /// </summary>
+    private AdminResponse Parcels(IReadOnlyDictionary<string, string> q)
+    {
+        var c = CharacterFromQuery(q);
+        if (c == null) return Json(404, ResultNotFound, "no such character");
+        var (unread, readUnclaimed) = _store.GetParcelCounts(c.Id);
+        var sb = new StringBuilder("{\"result\":").Append(ResultOk)
+            .Append(",\"characterId\":").Append(c.Id)
+            .Append(",\"character\":").Append(Str(c.Name))
+            .Append(",\"unread\":").Append(unread)
+            .Append(",\"readUnclaimed\":").Append(readUnclaimed)
+            .Append(",\"inbox\":[");
+        AppendParcels(sb, _store.GetParcelsFor(c.Id));
+        sb.Append("],\"sent\":[");
+        AppendParcels(sb, _store.GetParcelsSentBy(c.Id));
+        sb.Append("]}");
+        return new AdminResponse(200, JsonType, sb.ToString());
+    }
+
+    private void AppendParcels(StringBuilder sb, IReadOnlyList<CharacterStore.ParcelRow> rows)
+    {
+        for (int i = 0; i < rows.Count; i++)
+        {
+            var p = rows[i];
+            if (i > 0) sb.Append(',');
+            sb.Append("{\"parcelId\":").Append(p.ParcelId)
+              .Append(",\"type\":").Append(p.ParcelType)
+              .Append(",\"status\":").Append(p.Status)
+              .Append(",\"isRead\":").Append(p.IsRead ? "true" : "false")
+              .Append(",\"isRecved\":").Append(p.IsRecved ? "true" : "false")
+              .Append(",\"senderDbId\":").Append(p.SenderDbId)
+              .Append(",\"sender\":").Append(Str(p.SenderName))
+              .Append(",\"receiverDbId\":").Append(p.ReceiverDbId)
+              .Append(",\"receiver\":").Append(Str(_store.GetCharacterName(p.ReceiverDbId)))
+              .Append(",\"title\":").Append(Str(p.Title))
+              .Append(",\"message\":").Append(Str(p.Message))
+              .Append(",\"money\":").Append(p.Money)
+              .Append(",\"createdAt\":").Append(Str(Iso(_store.GetParcelCreatedUtc(p.ParcelId))))
+              .Append(",\"items\":[");
+            var items = _store.GetParcelItems(p.ParcelId);
+            for (int j = 0; j < items.Count; j++)
+            {
+                if (j > 0) sb.Append(',');
+                sb.Append("{\"slot\":").Append(items[j].Slot)
+                  .Append(",\"itemDbId\":").Append(items[j].ItemDbId)
+                  .Append(",\"templateId\":").Append(items[j].TemplateId)
+                  .Append(",\"amount\":").Append(items[j].Amount)
+                  .Append(",\"name\":").Append(Str(Protocol.ItemNames.Lookup(items[j].TemplateId)))
+                  .Append('}');
+            }
+            sb.Append("]}");
+        }
+    }
+
+    /// <summary>The system sender name and parcel type, as T202 read them off the capture.</summary>
+    public const string SystemSender = "GM";
+    /// <summary>Parcel type 102 is the system parcel: no sent-box entry, no reply.</summary>
+    public const int SystemParcelType = 102;
+
+    /// <summary>
+    /// POST /api/send-mail - retail WA_SEND_NORMAL_PARCEL plus its TeraTime broadcast.
+    ///
+    /// <code>{"id":N | "name":"X" | "all":"online" | "all":"everyone",
+    ///  "sender":"GM","title":"...","message":"...","money":0,
+    ///  "items":"88888:1,99999:2","reason":"..."}</code>
+    ///
+    /// <c>items</c> is a flat string on purpose: the body scanner this file has always used
+    /// reads one key at a time and does not understand arrays, and a real parser is a bigger
+    /// change than this screen justifies. Up to
+    /// <see cref="CharacterStore.MaxParcelAttachments"/> pairs; retail's form stopped at four.
+    /// </summary>
+    private AdminResponse SendMail(string? body, string? ip)
+    {
+        string reason = JsonString(body, "reason") ?? string.Empty;
+        string title = (JsonString(body, "title") ?? string.Empty).Trim();
+        string message = JsonString(body, "message") ?? string.Empty;
+        string sender = Blank(JsonString(body, "sender")) ?? SystemSender;
+        long money = (long)(JsonNumber(body, "money") ?? 0);
+        if (title.Length == 0) return Json(400, ResultInvalid, "title is required");
+        if (money < 0) return Json(400, ResultInvalid, "money must be >= 0");
+
+        if (!TryParseAttachments(JsonString(body, "items"), out var attachments, out string problem))
+            return Json(400, ResultInvalid, problem);
+
+        var receivers = new List<CharacterRecord>();
+        string scope = (JsonString(body, "all") ?? string.Empty).Trim();
+        bool allFlag = (JsonNumber(body, "all") ?? 0) != 0
+            || scope.Equals("true", StringComparison.OrdinalIgnoreCase);
+        if (allFlag && scope.Length == 0) scope = "online";
+
+        if (scope.Length > 0 && !scope.Equals("false", StringComparison.OrdinalIgnoreCase))
+        {
+            if (scope.Equals("online", StringComparison.OrdinalIgnoreCase)
+                || scope.Equals("true", StringComparison.OrdinalIgnoreCase))
+            {
+                foreach (var row in _online())
+                {
+                    var c = _store.GetCharacter(row.PlayerId);
+                    if (c != null) receivers.Add(c);
+                }
+            }
+            else if (scope.Equals("everyone", StringComparison.OrdinalIgnoreCase))
+            {
+                receivers.AddRange(_store.GetAllCharacters(BulkMailMaxReceivers));
+            }
+            else return Json(400, ResultInvalid, "all must be online or everyone");
+        }
+        else
+        {
+            var one = Target(body);
+            if (one == null) { Log(ip, "send-mail", "?", reason, ResultNotFound); return Json(404, ResultNotFound, "no such character"); }
+            receivers.Add(one);
+        }
+
+        if (receivers.Count == 0)
+        { Log(ip, "send-mail", scope, reason, ResultNotFound); return Json(404, ResultNotFound, "nobody to send to"); }
+
+        int sent = 0;
+        foreach (var c in receivers)
+        {
+            int parcelId = _store.CreateParcel(0, sender, c.Id, title, message, money, SystemParcelType);
+            if (parcelId <= 0) continue;
+            for (int slot = 0; slot < attachments.Count; slot++)
+            {
+                // A fresh item id per receiver: two players cannot share one item row.
+                _store.AddParcelItem(parcelId, slot, _store.NextItemId(),
+                    attachments[slot].Template, attachments[slot].Amount);
+            }
+            sent++;
+        }
+
+        string target = receivers.Count == 1 ? receivers[0].Name : scope + " (" + sent + ")";
+        Log(ip, "send-mail", target, reason, sent > 0 ? ResultOk : ResultRefused,
+            receivers.Count == 1 ? receivers[0].Id : 0, 0,
+            "title " + title + ", " + attachments.Count + " attachment(s), money " + money);
+        return new AdminResponse(200, JsonType,
+            "{\"result\":" + (sent > 0 ? ResultOk : ResultRefused) + ",\"sent\":" + sent
+            + ",\"receivers\":" + receivers.Count + "}");
+    }
+
+    /// <summary>The ceiling on an "everyone" mail run, so one click cannot write forever.</summary>
+    public const int BulkMailMaxReceivers = 5000;
+
+    /// <summary>Parse <c>"template:amount,template:amount"</c>. An empty string is no attachments,
+    /// which is valid; anything malformed is refused with the reason, never silently dropped.</summary>
+    internal static bool TryParseAttachments(string? text,
+        out List<(int Template, long Amount)> items, out string problem)
+    {
+        items = new List<(int Template, long Amount)>();
+        problem = string.Empty;
+        if (string.IsNullOrWhiteSpace(text)) return true;
+        foreach (string piece in text.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries))
+        {
+            string[] parts = piece.Split(new[] { ':' }, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length is < 1 or > 2)
+            { problem = "attachment '" + piece.Trim() + "' is not template:amount"; return false; }
+            if (!int.TryParse(parts[0].Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out int template)
+                || template <= 0)
+            { problem = "attachment '" + piece.Trim() + "' has no template id"; return false; }
+            long amount = 1;
+            if (parts.Length == 2 && (!long.TryParse(parts[1].Trim(), NumberStyles.Integer,
+                    CultureInfo.InvariantCulture, out amount) || amount <= 0))
+            { problem = "attachment '" + piece.Trim() + "' has a bad amount"; return false; }
+            items.Add((template, amount));
+            if (items.Count > CharacterStore.MaxParcelAttachments)
+            { problem = "at most " + CharacterStore.MaxParcelAttachments + " attachments"; return false; }
+        }
+        return true;
+    }
+
+    /// <summary>POST /api/delete-parcel {"parcelId":N} - drop a parcel and its attachments.</summary>
+    private AdminResponse DeleteParcelNow(string? body, string? ip)
+    {
+        int parcelId = (int)(JsonNumber(body, "parcelId") ?? 0);
+        string reason = JsonString(body, "reason") ?? string.Empty;
+        if (parcelId <= 0) return Json(400, ResultInvalid, "parcelId is required");
+        var parcel = _store.GetParcel(parcelId);
+        if (parcel == null) { Log(ip, "delete-parcel", parcelId.ToString(CultureInfo.InvariantCulture), reason, ResultNotFound); return Json(404, ResultNotFound, "no such parcel"); }
+
+        bool ok = _store.DeleteParcel(parcelId);
+        Log(ip, "delete-parcel", _store.GetCharacterName(parcel.ReceiverDbId) ?? parcelId.ToString(CultureInfo.InvariantCulture),
+            reason, ok ? ResultOk : ResultRefused, parcel.ReceiverDbId, 0, "parcel " + parcelId);
+        return ok ? Json(200, ResultOk, $"parcel {parcelId} deleted")
+                  : Json(500, ResultRefused, "the store refused the delete");
+    }
+
+    /// <summary>The most guilds one list will return.</summary>
+    public const int GuildListLimit = 200;
+
+    /// <summary>
+    /// GET /api/guilds?q=&amp;limit=N - the guild list. Retail looked a guild up by exact id or
+    /// name; the substring match here is what an operator given half a name actually needs.
+    /// </summary>
+    private AdminResponse Guilds(IReadOnlyDictionary<string, string> q)
+    {
+        string? term = Blank(Get(q, "q"));
+        int limit = (int)Num(q, "limit");
+        if (limit <= 0 || limit > GuildListLimit) limit = 50;
+
+        var all = _store.GetAllGuilds();
+        var sb = new StringBuilder("{\"result\":").Append(ResultOk)
+            .Append(",\"total\":").Append(all.Count)
+            .Append(",\"guilds\":[");
+        int shown = 0;
+        foreach (var g in all)
+        {
+            if (shown >= limit) break;
+            if (term != null && g.Name.IndexOf(term, StringComparison.OrdinalIgnoreCase) < 0
+                && g.GuildId.ToString(CultureInfo.InvariantCulture) != term) continue;
+            if (shown > 0) sb.Append(',');
+            shown++;
+            sb.Append("{\"id\":").Append(g.GuildId)
+              .Append(",\"name\":").Append(Str(g.Name))
+              .Append(",\"level\":").Append(g.Level)
+              .Append(",\"money\":").Append(g.Money)
+              .Append(",\"chiefDbId\":").Append(g.ChiefDbId)
+              .Append(",\"chief\":").Append(Str(_store.GetCharacterName(g.ChiefDbId)))
+              .Append(",\"members\":").Append(_store.CountGuildMembers(g.GuildId))
+              .Append(",\"warAcceptable\":").Append(g.WarAcceptable ? "true" : "false")
+              .Append('}');
+        }
+        sb.Append("],\"shown\":").Append(shown).Append('}');
+        return new AdminResponse(200, JsonType, sb.ToString());
+    }
+
+    /// <summary>GET /api/guild?id=N|name=X - one guild, its roster and its wars.</summary>
+    private AdminResponse Guild(IReadOnlyDictionary<string, string> q)
+    {
+        long id = Num(q, "id");
+        var g = id > 0 ? _store.GetGuild((int)id) : null;
+        if (g == null)
+        {
+            string? name = Blank(Get(q, "name"));
+            if (name != null) g = _store.GetGuildByName(name);
+        }
+        if (g == null) return Json(404, ResultNotFound, "no such guild");
+
+        var sb = new StringBuilder("{\"result\":").Append(ResultOk)
+            .Append(",\"guild\":{\"id\":").Append(g.GuildId)
+            .Append(",\"name\":").Append(Str(g.Name))
+            .Append(",\"level\":").Append(g.Level)
+            .Append(",\"exp\":").Append(g.Exp)
+            .Append(",\"point\":").Append(g.Point)
+            .Append(",\"money\":").Append(g.Money)
+            .Append(",\"chiefDbId\":").Append(g.ChiefDbId)
+            .Append(",\"chief\":").Append(Str(_store.GetCharacterName(g.ChiefDbId)))
+            .Append(",\"announce\":").Append(Str(g.Announce))
+            .Append(",\"title\":").Append(Str(g.Title))
+            .Append(",\"promotion\":").Append(Str(g.Promotion))
+            .Append(",\"warAcceptable\":").Append(g.WarAcceptable ? "true" : "false")
+            .Append(",\"createDate\":").Append(g.CreateDate)
+            .Append(",\"joinMinLevel\":").Append(g.JoinMinLevel)
+            .Append(",\"joinMaxLevel\":").Append(g.JoinMaxLevel)
+            .Append('}')
+            .Append(",\"members\":[");
+        var members = _store.GetGuildMembers(g.GuildId);
+        for (int i = 0; i < members.Count; i++)
+        {
+            var m = members[i];
+            if (i > 0) sb.Append(',');
+            sb.Append("{\"userDbId\":").Append(m.UserDbId)
+              .Append(",\"name\":").Append(Str(m.Name))
+              .Append(",\"level\":").Append(m.UserLevel)
+              .Append(",\"class\":").Append(m.UserClass)
+              .Append(",\"race\":").Append(m.Race)
+              .Append(",\"groupId\":").Append(m.GuildGroupId)
+              .Append(",\"joinDate\":").Append(m.GuildJoinDate)
+              .Append(",\"lastLogout\":").Append(m.LastLogoutTime)
+              .Append(",\"weekly\":").Append(m.WeeklyContribution)
+              .Append(",\"total\":").Append(m.TotalContribution)
+              .Append(",\"isChief\":").Append(m.UserDbId == g.ChiefDbId ? "true" : "false")
+              .Append('}');
+        }
+        sb.Append("],\"wars\":[");
+        var wars = _store.GetGuildWars(g.GuildId);
+        for (int i = 0; i < wars.Count; i++)
+        {
+            var w = wars[i];
+            if (i > 0) sb.Append(',');
+            int other = w.AttackGuildId == g.GuildId ? w.DefendGuildId : w.AttackGuildId;
+            sb.Append("{\"warId\":").Append(w.WarId)
+              .Append(",\"attackGuildId\":").Append(w.AttackGuildId)
+              .Append(",\"defendGuildId\":").Append(w.DefendGuildId)
+              .Append(",\"opponent\":").Append(Str(_store.GetGuild(other)?.Name))
+              .Append(",\"attacking\":").Append(w.AttackGuildId == g.GuildId ? "true" : "false")
+              .Append(",\"declaredAt\":").Append(w.DeclaredAt)
+              .Append(",\"money\":").Append(w.Money)
+              .Append(",\"defendMoney\":").Append(w.DefendMoney)
+              .Append(",\"state\":").Append(w.State)
+              .Append(",\"defendDeclared\":").Append(w.DefendDeclared ? "true" : "false")
+              .Append('}');
+        }
+        sb.Append("],\"history\":[");
+        var history = _store.GetGuildWarHistory(g.GuildId);
+        for (int i = 0; i < history.Count; i++)
+        {
+            if (i > 0) sb.Append(',');
+            var h = history[i];
+            sb.Append("{\"attackGuildId\":").Append(h.AttackGuildId)
+              .Append(",\"defendGuildId\":").Append(h.DefendGuildId)
+              .Append(",\"result\":").Append(h.Result)
+              .Append(",\"endedAt\":").Append(h.EndedAt).Append('}');
+        }
+        sb.Append("]}");
+        return new AdminResponse(200, JsonType, sb.ToString());
+    }
+
+    /// <summary>POST /api/guild-money {"id":N,"money":M} - retail CHANGE_GUILD_MONEY, which
+    /// also demanded a reason; this one logs whatever reason it is given.</summary>
+    private AdminResponse GuildMoney(string? body, string? ip)
+    {
+        var g = GuildTarget(body, out string reason);
+        if (g == null) { Log(ip, "guild-money", "?", reason, ResultNotFound); return Json(404, ResultNotFound, "no such guild"); }
+        double? money = JsonNumber(body, "money");
+        if (money == null || money < 0) { Log(ip, "guild-money", g.Name, reason, ResultInvalid); return Json(400, ResultInvalid, "money must be >= 0"); }
+
+        bool ok = _store.SetGuildMoney(g.GuildId, (long)money.Value);
+        Log(ip, "guild-money", g.Name, reason, ok ? ResultOk : ResultRefused, 0, 0,
+            "was " + g.Money + ", now " + (long)money.Value);
+        return ok ? new AdminResponse(200, JsonType,
+                        "{\"result\":" + ResultOk + ",\"oldMoney\":" + g.Money
+                        + ",\"newMoney\":" + (long)money.Value + "}")
+                  : Json(500, ResultRefused, "the store refused the update");
+    }
+
+    /// <summary>POST /api/guild-level {"id":N,"level":L} - retail CHANGE_GUILD_LEVEL.</summary>
+    private AdminResponse GuildLevel(string? body, string? ip)
+    {
+        var g = GuildTarget(body, out string reason);
+        if (g == null) { Log(ip, "guild-level", "?", reason, ResultNotFound); return Json(404, ResultNotFound, "no such guild"); }
+        double? level = JsonNumber(body, "level");
+        if (level == null || level < 0 || level > MaxGuildLevel)
+        { Log(ip, "guild-level", g.Name, reason, ResultInvalid); return Json(400, ResultInvalid, $"level must be 0..{MaxGuildLevel}"); }
+
+        bool ok = _store.SetGuildLevel(g.GuildId, (int)level.Value);
+        Log(ip, "guild-level", g.Name, reason, ok ? ResultOk : ResultRefused, 0, 0,
+            "was " + g.Level + ", now " + (int)level.Value);
+        return ok ? Json(200, ResultOk, $"{g.Name} is guild level {(int)level.Value}")
+                  : Json(500, ResultRefused, "the store refused the update");
+    }
+
+    /// <summary>The guild-level ceiling the tool will set.</summary>
+    public const int MaxGuildLevel = 20;
+
+    /// <summary>POST /api/guild-disband {"id":N} - retail DELETE_GUILD. No undo.</summary>
+    private AdminResponse GuildDisband(string? body, string? ip)
+    {
+        var g = GuildTarget(body, out string reason);
+        if (g == null) { Log(ip, "guild-disband", "?", reason, ResultNotFound); return Json(404, ResultNotFound, "no such guild"); }
+        int members = _store.CountGuildMembers(g.GuildId);
+        bool ok = _store.DeleteGuild(g.GuildId);
+        Log(ip, "guild-disband", g.Name, reason, ok ? ResultOk : ResultRefused, 0, 0,
+            members + " member(s), " + g.Money + " money");
+        return ok ? Json(200, ResultOk, $"{g.Name} disbanded ({members} members)")
+                  : Json(500, ResultRefused, "the store refused the delete");
+    }
+
+    /// <summary>A guild from {"id":N} or {"name":"X"}, plus the reason out of the same body.</summary>
+    private CharacterStore.GuildRow? GuildTarget(string? body, out string reason)
+    {
+        reason = JsonString(body, "reason") ?? string.Empty;
+        int id = (int)(JsonNumber(body, "id") ?? 0);
+        if (id > 0) return _store.GetGuild(id);
+        string? name = Blank(JsonString(body, "name"));
+        return name == null ? null : _store.GetGuildByName(name);
+    }
+
+    /// <summary>How long before a restart the notices go out, longest first.</summary>
+    public static readonly int[] RestartNoticeMinutes = { 30, 15, 10, 5, 3, 1 };
+
+    /// <summary>
+    /// POST /api/restart-notice {"minutes":M,"text":"..."} - the countdown retail did from a
+    /// console. One announcement now and one at each step of
+    /// <see cref="RestartNoticeMinutes"/> that still falls inside the window, scheduled through
+    /// the same announce table <c>/api/announce-schedule</c> writes. This SCHEDULES NOTICES; it
+    /// does not stop the server, because an admin page should not be able to.
+    /// </summary>
+    private AdminResponse RestartNotice(string? body, string? ip)
+    {
+        string reason = JsonString(body, "reason") ?? string.Empty;
+        int minutes = (int)(JsonNumber(body, "minutes") ?? 0);
+        if (minutes <= 0 || minutes > MaxRestartMinutes)
+            return Json(400, ResultInvalid, $"minutes must be 1..{MaxRestartMinutes}");
+        string text = Blank(JsonString(body, "text")) ?? "The server restarts in {0} minute(s).";
+        if (!text.Contains("{0}", StringComparison.Ordinal)) text += " ({0} minute(s))";
+
+        long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        int sent = Announce?.Invoke(string.Format(CultureInfo.InvariantCulture, text, minutes)) ?? 0;
+        var scheduled = new List<(long Id, long At, int Minutes)>();
+        foreach (int step in RestartNoticeMinutes)
+        {
+            if (step >= minutes) continue;
+            long at = now + (minutes - step) * 60L;
+            long id = _store.AddAnnounce(string.Format(CultureInfo.InvariantCulture, text, step),
+                at, at + RestartNoticeWindowSeconds, 0, ip ?? string.Empty, now);
+            scheduled.Add((id, at, step));
+        }
+
+        Log(ip, "restart-notice", minutes + " minutes", reason, ResultOk, 0, 0,
+            scheduled.Count + " scheduled, " + sent + " reached now");
+        var sb = new StringBuilder("{\"result\":").Append(ResultOk)
+            .Append(",\"sent\":").Append(sent)
+            .Append(",\"scheduled\":[");
+        for (int i = 0; i < scheduled.Count; i++)
+        {
+            if (i > 0) sb.Append(',');
+            sb.Append("{\"id\":").Append(scheduled[i].Id)
+              .Append(",\"at\":").Append(scheduled[i].At)
+              .Append(",\"minutes\":").Append(scheduled[i].Minutes).Append('}');
+        }
+        sb.Append("]}");
+        return new AdminResponse(200, JsonType, sb.ToString());
+    }
+
+    /// <summary>The longest countdown the tool will schedule.</summary>
+    public const int MaxRestartMinutes = 720;
+    /// <summary>How long a scheduled notice stays due, so a paused server still sends it once.</summary>
+    public const int RestartNoticeWindowSeconds = 120;
+
+    /// <summary>
+    /// POST /api/reload-datasheets - re-run <see cref="World.DatasheetLoader.LoadAll"/> and
+    /// report what each sheet did. Every reader is a static that reloads in place, so an edited
+    /// sheet takes effect without a restart; a sheet that will not parse keeps its built-in and
+    /// says <c>fromSheet:false</c> rather than leaving the server with nothing.
+    /// </summary>
+    private AdminResponse ReloadDatasheets(string? body, string? ip)
+    {
+        string reason = JsonString(body, "reason") ?? string.Empty;
+        IReadOnlyList<World.SheetStatus> sheets;
+        try { sheets = World.DatasheetLoader.LoadAll(_log); }
+        catch (Exception e)
+        {
+            Log(ip, "reload-datasheets", "?", reason, ResultRefused);
+            return Json(500, ResultRefused, "reload failed: " + e.Message);
+        }
+
+        int fromSheet = 0;
+        foreach (var s in sheets) if (s.FromSheet) fromSheet++;
+        Log(ip, "reload-datasheets", fromSheet + "/" + sheets.Count, reason, ResultOk, 0, 0,
+            "directory " + SafeDatasheetDir());
+
+        var sb = new StringBuilder("{\"result\":").Append(ResultOk)
+            .Append(",\"directory\":").Append(Str(SafeDatasheetDir()))
+            .Append(",\"fromSheet\":").Append(fromSheet)
+            .Append(",\"sheets\":[");
+        for (int i = 0; i < sheets.Count; i++)
+        {
+            if (i > 0) sb.Append(',');
+            sb.Append("{\"sheet\":").Append(Str(sheets[i].Sheet))
+              .Append(",\"fromSheet\":").Append(sheets[i].FromSheet ? "true" : "false")
+              .Append(",\"entries\":").Append(sheets[i].Entries)
+              .Append(",\"consumer\":").Append(Str(sheets[i].Consumer)).Append('}');
+        }
+        sb.Append("]}");
+        return new AdminResponse(200, JsonType, sb.ToString());
+    }
+
+    /// <summary>The <c>game_log</c> category every admin write lands under, so T115's log
+    /// search can answer "what did an operator do to this account" with the same filters it
+    /// uses for everything else.</summary>
+    public const string AdminLogCategory = "admin";
+
+    /// <summary>
+    /// Audit one write. Two rows, on purpose: <c>admin_log</c> stays the tool's own chronological
+    /// feed (what the Server screen tails), and <c>game_log</c> gets the same event keyed on the
+    /// account and character it touched, so it shows up when an operator searches that player's
+    /// history rather than only in a separate admin list. T206 added the second row; before it,
+    /// nothing an operator did was visible from the player's side.
+    /// </summary>
+    private void Log(string? ip, string action, string target, string reason, int result,
+        long characterId = 0, long accountId = 0, string extra = "")
+    {
+        long at = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        _store.AddAdminLog(at, ip ?? string.Empty, action, target, reason, result);
+
+        var detail = new StringBuilder(target);
+        if (reason.Length > 0) detail.Append(" - ").Append(reason);
+        if (extra.Length > 0) detail.Append(" [").Append(extra).Append(']');
+        detail.Append(" from ").Append(ip ?? "?").Append(" -> ").Append(result);
+        _store.AddGameLog(AdminLogCategory, action, accountId, characterId, 0, 0, 0, 0, 0,
+            detail.ToString(), at);
+
         _log.LogInformation("admin {Action} {Target} from {Ip} -> {Result} ({Reason})",
             action, target, ip ?? "?", result, reason);
     }

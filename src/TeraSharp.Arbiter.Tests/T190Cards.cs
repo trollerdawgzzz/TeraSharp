@@ -91,6 +91,7 @@ public static partial class Tests
             long other = store.GetOrCreateAccount("t190-other").Id;
             store.AddCard(other, 311034, 7);
 
+            DbProxyHandlers.ResetPerfectCardRefreshForTests();   // T210b: isolate the one-shot view
             var command = GmCommandParser.Parse("perfect_card_collection");
             Hex.True(GmCommandHandlers.Classify(true, 5, command) == GmDispatch.Local
                 && GmCommandHandlers.Classify(true, 0, command) == GmDispatch.NotAuthorised,
@@ -99,9 +100,25 @@ public static partial class Tests
             Hex.Eq(refresh!, frames[15530][6..], "cap_2man_b15530 DBS_REFRESH_CARD_DATA AccountDbId1");
             var reply = RunHandler1(DbProxyHandlers.SDB_LOAD_2986, frames[15533][6..], store);
             Hex.Eq(reply.body, frames[15535][6..], "all3541 payload bytes:218 cards,10980 points,level3,one empty preset");
-            Hex.True(store.GetCardCombines(1).Count == 0 && store.GetCardBookRewards(1).Count == 0
-                && store.GetCardMounts(1).Count == 0 && store.GetCardPresetIndex(1) == 0,
-                "native reset clears the old collection arrangement and rewards");
+            // T210b. The captured refresh above IS the reset view - one empty preset, no
+            // combines, no rewards - but it is a view, not a delete: the very next load on this
+            // same retail account carries the arrangement again (cap_2man_b_client2 3634 and
+            // cap_bg1_client1 182, a later session: 218 cards, preset amount 3, 3 presets, 8
+            // claimed rewards). Native Account::ResetCardCollectionBook resets the in-memory
+            // Account; the rows survive. T190 asserted the delete and that was the wrong half.
+            Hex.True(store.GetCardCombines(1).Single() == new CharacterStore.CardCombineRow(3, 1)
+                && store.GetCardBookRewards(1).SequenceEqual(new[] { 1 })
+                && store.GetCardMounts(1).Single().CardTemplateId == 311034
+                && store.GetCardInfo(1).PresetAmount == 3 && store.GetCardPresetIndex(1) == 0,
+                "the stored arrangement, claimed rewards and preset amount all survive the command");
+            var again = RunHandler1(DbProxyHandlers.SDB_LOAD_2986, frames[15533][6..], store);
+            Hex.True(BitConverter.ToUInt32(again.body, 8) == 1 && BitConverter.ToUInt32(again.body, 16) == 1
+                && BitConverter.ToUInt32(again.body, 24) == 1
+                && BitConverter.ToInt32(again.body, 37) == 3 && BitConverter.ToInt32(again.body, 41) == 0
+                && BitConverter.ToUInt32(again.body, 0) == BitConverter.ToUInt32(reply.body, 0)
+                && again.body.Length == reply.body.Length + 16 + 16 + 12,
+                "the next load reports one preset, one combine, one claimed reward and preset amount3 "
+                + "on the same perfect collection - the two-phase behaviour retail shows");
             Hex.True(store.GetAccountCards(other).Single().Amount == 7, "another account is unchanged");
             var curve = CardCollectionSheet.Entry.Value;
             Hex.True(curve.LevelFor(2499) == 1 && curve.LevelFor(2500) == 2

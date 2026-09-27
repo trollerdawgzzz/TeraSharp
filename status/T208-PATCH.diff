@@ -1,0 +1,37 @@
+--- a/src/TeraSharp.Arbiter/Handlers/WorldEntry.cs
++++ b/src/TeraSharp.Arbiter/Handlers/WorldEntry.cs
+@@ -279,15 +279,34 @@
+         }
+ 
++        // T208: the refused continent and the fallback zone can belong to different Worlds. In
++        // cap_bg2 the relog was routed at the battleground World by the leftover continent 115
++        // (60743), World 10 refused it, and the retry for zone 7005 went to that same World
++        // (60746) - which does not own 7005, so nothing answered and the client sat on the
++        // loading screen. Re-point the session first: the Ticket indexes THAT World's bypass
++        // slots and the tunnel map is keyed (WorldId, Ticket), so it has to be reallocated (T111).
++        int refused = s.CurrentWorldId;
++        int owner = DungeonRouting.Channels.WorldForContinent(back.Zone)
++            ?? DungeonRouting.Channels.CatchAllWorldId ?? WorldRegistration.DefaultWorldId;
++        if (owner != refused && w.HasLinks(owner))
++        {
++            w.UnregisterPlayer(s.GameId, refused, s.TunnelKey, transferring: true);
++            s.CurrentWorldId = owner;
++            s.TunnelKey = w.AllocateTunnelKey(owner);
++            w.RegisterPlayer(s);
++            log.LogWarning("EnterWorld retry for '{Name}': zone {Z} belongs to World {Owner}, not "
++                + "{Refused} - re-pointed the session", chr.Name, back.Zone, owner, refused);
++        }
++
+         var record = Program.Store?.GetCharacter((int)chr.Id);
+         var first = BuildEnterWorldPayload(s.GameId, chr, record?.WorldBlob, s.TunnelKey);
+         var retry = DbProxyHandlers.BuildEnterWorldRetryPayload(
+             first, back.Zone, back.X, back.Y, back.Z,
+             channelInstanceId: 0xFFFFFFFF,
+             ticket: s.TunnelKey,
+             continuousDungeonId: f.ContinuousDungeonId);
+         if (retry == null) return;
+ 
+         log.LogWarning("EnterWorld retry for '{Name}': continent {C} refused, falling back to "
+             + "zone {Z} ({X:F0}, {Y:F0}, {Zz:F0})", chr.Name, f.ContinuousDungeonId,
+             back.Zone, back.X, back.Y, back.Z);
+         w.SendFrame(s.CurrentWorldId, WorldBridge.OpPlayerEnter, retry);

@@ -2498,6 +2498,128 @@ public static class ArbiterClientHandlers
         return true;
     }
 
+    // ------------------------- T211: the profile's PvP Record tab -------------------------
+    //
+    // C_VIEW_BATTLE_FIELD_RESULT was registered to OnAcceptSilently, so the tab opened onto
+    // nothing. Both halves are pinned to the decompile, not guessed:
+    //
+    //   Handler_C_VIEW_BATTLE_FIELD_RESULT (Arb_part_041.c:14181-14232) guards param_3 < 6, reads
+    //   param_2[2] as a string ref and resolves that NAME to a user - the same
+    //   [u16 offset][wstring] body C_DUNGEON_CLEAR_COUNT_LIST carries - then queues
+    //   BattleFieldResultManager::DoAsyncJob.
+    //
+    //   The reply's dumper is FUN_140307ba0 (Arb_part_024.c:10014-10479), which names every field
+    //   and reads each from a fixed offset:
+    //     packet +4  u16 count / +6 u16 firstOffset   (the ResultList array head)
+    //     packet +8  i32 UserDbId        (puVar11 + 4)
+    //     packet +12 i32 SeasonPeriod    (puVar11 + 6)     -> body 12, and the guard is 0xf < len
+    //     element, 64 B: u16 here / u16 next then fifteen i32, in this order:
+    //       +4  BfId          +8  BfType        +12 CountOfWin      +16 CountOfLoss
+    //       +20 CountOfDraw   +24 CountOfKill   +28 CountOfDeath    +32 CountOfGiveHelp
+    //       +36 CurrRankScore +40 CurrRank      +44 BestRank        +48 CountOfDestroy
+    //       +52 GradeScore    +56 Grade         +60 CountOfCapture
+    //
+    // The numbers come from what the server already keeps: T199 files one game_log row per
+    // participant per finished match (World/BattlefieldRecords.cs folds them), and T138c's
+    // characters.bg_rating is the rating the PvP board already ranks by.
+
+    /// <summary>S_VIEW_BATTLE_FIELD_RESULT (0xE459). T211.</summary>
+    public const ushort S_VIEW_BATTLE_FIELD_RESULT = 0xE459;
+
+    /// <summary>Fifteen i32 plus the 4-byte element header - the dumper's 64-byte stride.</summary>
+    public const int ViewBattleFieldResultStride = 64;
+
+    /// <summary>One <c>ResultList</c> element, field names and order straight from the dumper.</summary>
+    public readonly record struct BattleFieldResultRow(
+        int BfId, int BfType, int CountOfWin, int CountOfLoss, int CountOfDraw,
+        int CountOfKill, int CountOfDeath, int CountOfGiveHelp, int CurrRankScore, int CurrRank,
+        int BestRank, int CountOfDestroy, int GradeScore, int Grade, int CountOfCapture);
+
+    /// <summary>
+    /// S_VIEW_BATTLE_FIELD_RESULT. Empty is the 16-byte head with <c>count = 0, offset = 0</c>,
+    /// which is what the guard <c>0xf &lt; param_2</c> in the dumper accepts as the smallest frame.
+    /// </summary>
+    public static byte[] BuildViewBattleFieldResult(int userDbId, int seasonPeriod,
+        IReadOnlyList<BattleFieldResultRow>? rows = null)
+    {
+        var r = rows ?? Array.Empty<BattleFieldResultRow>();
+        const int Head = 16;
+        int len = Head + r.Count * ViewBattleFieldResultStride;
+        var p = new byte[len];
+        BitConverter.GetBytes((ushort)len).CopyTo(p, 0);
+        BitConverter.GetBytes(S_VIEW_BATTLE_FIELD_RESULT).CopyTo(p, 2);
+        BitConverter.GetBytes((ushort)r.Count).CopyTo(p, 4);
+        BitConverter.GetBytes((ushort)(r.Count == 0 ? 0 : Head)).CopyTo(p, 6);
+        BitConverter.GetBytes(userDbId).CopyTo(p, 8);
+        BitConverter.GetBytes(seasonPeriod).CopyTo(p, 12);
+
+        int at = Head;
+        for (int i = 0; i < r.Count; i++)
+        {
+            int next = i + 1 < r.Count ? at + ViewBattleFieldResultStride : 0;
+            BitConverter.GetBytes((ushort)at).CopyTo(p, at);
+            BitConverter.GetBytes((ushort)next).CopyTo(p, at + 2);
+            int[] fields =
+            {
+                r[i].BfId, r[i].BfType, r[i].CountOfWin, r[i].CountOfLoss, r[i].CountOfDraw,
+                r[i].CountOfKill, r[i].CountOfDeath, r[i].CountOfGiveHelp, r[i].CurrRankScore,
+                r[i].CurrRank, r[i].BestRank, r[i].CountOfDestroy, r[i].GradeScore, r[i].Grade,
+                r[i].CountOfCapture,
+            };
+            for (int f = 0; f < fields.Length; f++) BitConverter.GetBytes(fields[f]).CopyTo(p, at + 4 + f * 4);
+            at = next;
+        }
+        return p;
+    }
+
+    /// <summary>
+    /// OURS: the season the tab is told it is showing. The server runs no battleground season, and
+    /// nothing in the captures or the decompile says what a "no season" value looks like, so it
+    /// stays 0 until a capture settles it.
+    /// </summary>
+    public const int BattleFieldSeasonPeriod = 0;
+
+    /// <summary>
+    /// C_VIEW_BATTLE_FIELD_RESULT (0xEC3D) -> S_VIEW_BATTLE_FIELD_RESULT (0xE459). T211.
+    ///
+    /// <para>The request names a CHARACTER, exactly like C_DUNGEON_CLEAR_COUNT_LIST - the window
+    /// can be opened on somebody else - so an unknown or empty name falls back to the caller's own
+    /// character rather than answering about nobody.</para>
+    ///
+    /// <para>OURS: <c>CurrRankScore</c> is <c>characters.bg_rating</c> and <c>CurrRank</c> its
+    /// position on that board, the same number S_PVP_RANKING_LIST renders. <c>BestRank</c> repeats
+    /// <c>CurrRank</c> because no rank history is kept, and <c>Grade</c> stays 0 - the native
+    /// end-of-match record carries one grade value (<c>NativeGradePoint</c>), which goes to
+    /// <c>GradeScore</c>. Every other field is a real total.</para>
+    /// </summary>
+    public static bool OnViewBattleFieldResult(GameSession s, ReadOnlyMemory<byte> body)
+    {
+        var store = Program.Store;
+        string name = ReadDungeonClearCountName(body.ToArray());
+
+        var self = s.SelectedCharacter;
+        int ownerId = self != null ? (int)self.Id : (int)s.PlayerId;
+        if (store != null && name.Length > 0)
+        {
+            var who = store.GetCharacterByName(name);
+            if (who != null) ownerId = who.Id;
+        }
+
+        int rating = store?.GetBgRating(ownerId) ?? 0;
+        int rank = store?.GetBgRatingRank(ownerId) ?? 0;
+        var records = TeraSharp.Arbiter.World.BattlefieldRecords.For(store, ownerId);
+        var rows = new BattleFieldResultRow[records.Count];
+        for (int i = 0; i < records.Count; i++)
+        {
+            var r = records[i];
+            rows[i] = new BattleFieldResultRow(r.BfId, r.BfType, r.Wins, r.Losses, r.Draws,
+                r.Kills, r.Deaths, r.Assists, rating, rank, rank, r.Destroys, r.GradeScore, 0, r.Captures);
+        }
+
+        s.Send(BuildViewBattleFieldResult(ownerId, BattleFieldSeasonPeriod, rows));
+        return true;
+    }
+
     /// <summary>S_VERSION_INFO (0xB767). T131. Opcode only - the frame is built below.</summary>
     public const ushort S_VERSION_INFO = 0xB767;
 
@@ -3101,6 +3223,27 @@ public static class ArbiterClientHandlers
         // match, the un-vaporize never completed (no 0x282D 00), and the character stayed
         // vaporized on World for the session - where every learn came back @3534. The tracker
         // now starts visible at SDB_USER_ENTERWORLD and follows SDB_USER_VAPORIZED (T148).
+        //
+        // T191d: the frame itself is NOT optional, only its value was. The real Arbiter sends one
+        // S_ADMIN_GM_SKILL per world entry in this exact slot - cap_final_gm_client2 98/99/100 and
+        // 2444/2445/2446 are S_FESTIVAL_LIST, S_ADMIN_GM_SKILL, S_LOAD_TOPO - and its 542 -> 546
+        // exchange is the panel's own toggle, not a second push. An operator who never gets it has
+        // a client whose GM-skill switch was never initialised, and the movement guide ("use W A S D
+        // to move") stays on screen on every login: cap_wasd_client has three world entries as an
+        // operator (S_LOGIN_ARBITER.status 0x21 = 33, against 0x1F = 31 for the ordinary characters
+        // in cap_2man_b_client1/2, which show no prompt) and not one S_ADMIN_GM_SKILL in 4304
+        // frames. The panel toggle is the first one that client ever receives, which is why pressing
+        // Invisible clears the prompt at once.
+        //
+        // What T152 must keep is the VALUE, and it does: the enabled byte is IsGmInvisible, which
+        // starts visible at SDB_USER_ENTERWORLD and only ever moves on World's own
+        // SDB_USER_VAPORIZED (0x282D). So the switch cannot claim "invisible" while World has the GM
+        // visible - the desync that let the panel's OFF vaporize them - and when World does vaporize
+        // (cap_final 495 -> 496) this frame carries 01, exactly as retail's 99 does.
+        if (IsLoadTopo(clientPacket)
+            && OperatorGetsGmSkillPush(GmCommandHandlers.LevelOf(s, Program.Store))
+            && TryTakeGmSkillPush((int)s.PlayerId))
+            s.Send(BuildAdminGmSkill(GmSkillInvisible, IsGmInvisible((int)s.PlayerId)));
         s.Send(clientPacket);
         // 2026-09-20: a GM-flagged character (S_SELECT_USER.adminLevel > 0, T144b) spawns HELD and the real
         // Arbiter releases it with S_ADMIN_HOLD_CHARACTER 00 shortly after S_SPAWN_ME (cap frame 402, ~106
@@ -4526,9 +4669,9 @@ public static class ArbiterClientHandlers
     /// </code>
     /// 65 bytes, which is the head guard's 0x40 exactly. Elements are the same nine fields
     /// without the dungeon ids: 36 bytes, the element guard's 0x24.
-    /// <para>No dungeon run is recorded anywhere in this build, so the board goes out empty with
-    /// HasMyRecord false and the four ids echoed from the request - the window then says "no
-    /// record" instead of waiting.</para>
+    /// <para>T211: the rows come from T167's <c>dungeon_rank_records</c>. With none filed the
+    /// board still goes out empty, HasMyRecord false and the four ids echoed from the request -
+    /// the window then says "no record" instead of waiting.</para>
     /// </summary>
     public sealed record DungeonRankRow(int Rank, string Name, string GuildName, int Classe,
                                         int Race, int Gender, int Record, long Date);
@@ -5459,8 +5602,14 @@ public static class ItemBoardPackets
 
     /// <summary>
     /// C_DUNGEON_RANK_RECORD_LIST (0xF679): <c>[i32 DungeonId][i32 Season][i32 DrtType]</c>.
-    /// Nothing in this build records a dungeon run, so the board is empty, HasMyRecord is false
-    /// and the ids are echoed - the window then says "no record" instead of waiting.
+    ///
+    /// <para>T211: the board is now T167's <c>dungeon_rank_records</c> - the rows
+    /// <c>SDB_UPDATE_DUNGEON_RANK_RECORD</c> files, one per character per dungeon per season,
+    /// already holding World's own TopPoint and TopTime bests. They are ordered the way the window
+    /// ranks them (highest point, then fastest time), <c>Rank</c> is the 1-based position in that
+    /// order, and the caller's own row becomes <c>myRecord</c> so <c>HasMyRecord</c> is true and
+    /// the header line fills in. An empty table still answers the echo-only frame, so the window
+    /// says "no record" instead of waiting.</para>
     /// </summary>
     public static bool OnDungeonRankRecordList(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
     {
@@ -5468,7 +5617,26 @@ public static class ItemBoardPackets
         int dungeonId = b.Length >= 4 ? BitConverter.ToInt32(b) : 0;
         int season = b.Length >= 8 ? BitConverter.ToInt32(b[4..]) : 0;
         int drtType = b.Length >= 12 ? BitConverter.ToInt32(b[8..]) : 0;
-        s.Send(ArbiterClientHandlers.BuildDungeonRankRecordList(dungeonId, season, drtType));
+
+        var store = Program.Store;
+        var board = store?.GetDungeonRankBoard(dungeonId, season);
+        var rows = new List<ArbiterClientHandlers.DungeonRankRow>(board?.Count ?? 0);
+        ArbiterClientHandlers.DungeonRankRow? mine = null;
+        long lastSort = 0;
+        int ownerId = s.SelectedCharacter is { } chr ? (int)chr.Id : (int)s.PlayerId;
+
+        for (int i = 0; i < (board?.Count ?? 0); i++)
+        {
+            var r = board![i];
+            var row = new ArbiterClientHandlers.DungeonRankRow(i + 1, r.Name, r.GuildName,
+                r.Class, r.Race, r.Gender, r.TopPoint, r.PlayDate);
+            rows.Add(row);
+            if (r.PlayDate > lastSort) lastSort = r.PlayDate;
+            if (r.CharacterId == ownerId) mine = row;
+        }
+
+        s.Send(ArbiterClientHandlers.BuildDungeonRankRecordList(dungeonId, season, drtType,
+            dctType: 0, myRecord: mine, lastSortTime: lastSort, rows: rows));
         return true;
     }
 

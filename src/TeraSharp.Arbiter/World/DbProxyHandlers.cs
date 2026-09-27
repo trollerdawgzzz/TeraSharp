@@ -267,6 +267,18 @@ public sealed partial class DbProxyHandlers
     //   rsp: [u8 ok][u32 reqId]   (ok = user valid & clear succeeded)
     public const ushort SA_CLEAR_BATTLE_FIELD_ENTER_COUNT = 0x1562; public const ushort AS_CLEAR_BATTLE_FIELD_ENTER_COUNT = 0x1563;
 
+    // SA_UPDATE_BATTLE_FIELD_COOL_TIME (0x1523) -> AS_UPDATE_BATTLE_FIELD_COOL_TIME (0x1524).
+    // T208. World sends one per user a second after a battleground entry completes, and it is
+    // a per-user DLMItem exactly like 0x1562 above: unanswered it head-blocks UserLeaveWorld, so
+    // "Leave battleground" never produces SA_LEAVE_WORLD and the player stays in the BF World.
+    //   cap_bg1 12933 -> 12940 (01 5D 00 00 00) and 12944 -> 12945 (01 64 00 00 00): reply is
+    //   [u8 ok][u32 reqId], reqId at payload[16] (after u32 vectorOffset, u32 vectorBytes, u64 gameId).
+    //   cap_bg2 56491/56497 are the same frames unanswered; arbiter-bg2.log 20:04:04/20:04:07 then
+    //   shows 0x13CD -> 0x1392 with no 0x1393 back, and the 20:04:50 relog is refused (reason 3).
+    // The 24-byte record at payload[20] is (battleFieldId, OURS: unpinned u32, endTime, 0, 0, 0);
+    // nothing is stored from it - SA_LOAD_BATTLE_FIELD_COOL_TIME still answers with an empty list.
+    public const ushort SA_UPDATE_BATTLE_FIELD_COOL_TIME = 0x1523; public const ushort AS_UPDATE_BATTLE_FIELD_COOL_TIME = 0x1524;
+
     // SA_LEARN_ALL_CREST_ACQUIRABLE (0x1463) -> AS_LEARN_ALL_CREST_ACQUIRABLE (0x1464).
     // World sends it at first enter-world for classes that have level-1 crests (a warrior does, the
     // captured valkyrie did not - hence never seen in a capture). Per-user DLM item: unanswered = no
@@ -1475,6 +1487,7 @@ public sealed partial class DbProxyHandlers
             case SDB_USER_VAPORIZED:       // 0x282D, T148: one-way, tracked not stored
             case SDB_LOAD_WORLD_EVENT:     // 0x27B4 = [reqId][01]       (capture: 83 00 00 00 01)
             case SA_CLEAR_BATTLE_FIELD_ENTER_COUNT: // 0x1563 = [01][reqId@8]  (decompile Arb_part_062.c:4769)
+            case SA_UPDATE_BATTLE_FIELD_COOL_TIME:  // 0x1524 = [01][reqId@16] (cap_bg1 12940/12945)
             case SA_LEARN_ALL_CREST_ACQUIRABLE:     // 0x1464 = learned-crest list (all of them)
             case SDB_UPDATE_USER_ACTPOINT:          // 0x297C = [reqId][01]
             case SA_REQUEST_ENTER_DUNGEON:          // 0x13BF (zone change step 1)
@@ -1490,7 +1503,7 @@ public sealed partial class DbProxyHandlers
             case Handlers.ArbiterClientHandlers.SDB_SIMULATE_ITEM_TOOLTIP: // 0x282F, T169: World's simulated item -> the compare tooltip
             case SDB_LOAD_2869:          // 0x15E0 push + 0x286A, both carrying the live reset time
             case SDB_LOAD_BATTLE_FIELD_LIST: // T201: persisted native BG results (not custom rating)
-            case AS_PROMOTION_LIST_REQ:  // 0x147D -> 0x1484 + 24 x 0x147E (timestamps = now) + 0x1480
+            case SA_LOAD_GUARD:          // 0x147D -> 0x1484 election state + 0x1480 finish (no guards)
             // --- T15: the per-user writes World sends during play. Each one is a DLM item; a
             // missing reply head-blocks the user's queue for the life of the World process. ---
             case SDB_USER_LEARN_SKILL:            // 0x278F = echo of the fee atoms + empty skill-period list
@@ -1701,7 +1714,7 @@ public sealed partial class DbProxyHandlers
             case SDB_USER_ENTERWORLD: return OnUserEnterWorld(link, payload);
             case SDB_UPDATE_USER_DATA: return OnUpdateUserData(link, payload);
             case SDB_USER_LOAD_INVENTORY: return OnLoadInventory(link, payload);
-            case AS_PROMOTION_LIST_REQ: return OnPromotionListRequest(link);
+            case SA_LOAD_GUARD: return OnLoadGuardRequest(link);
             case SDB_UPDATE_EXP_LEVEL: return OnUpdateExpLevel(link, payload);
             case SDB_SET_QUEST_INFO: return OnSetQuestInfo(link, payload);
 
@@ -1943,6 +1956,7 @@ public sealed partial class DbProxyHandlers
                 return true;
             case SDB_USER_VAPORIZED:       OnUserVaporized(payload, _log); return true;
             case SA_CLEAR_BATTLE_FIELD_ENTER_COUNT: link.SendFrame(AS_CLEAR_BATTLE_FIELD_ENTER_COUNT, BuildOkReqId(payload, 8)); return true;
+            case SA_UPDATE_BATTLE_FIELD_COOL_TIME: link.SendFrame(AS_UPDATE_BATTLE_FIELD_COOL_TIME, BuildOkReqId(payload, 16)); return true;
             case SDB_UPDATE_USER_ACTPOINT: link.SendFrame(DBS_UPDATE_USER_ACTPOINT, BuildReqIdAck(payload, 0)); return true;
             case SA_LEARN_ALL_CREST_ACQUIRABLE:
             {
@@ -5759,46 +5773,51 @@ public sealed partial class DbProxyHandlers
 
     public const ushort DBS_USER_RESTRICTION = 0x2830;
 
-    // ---- Handshake: 0x147D -> 0x1484 + 24 x 0x147E + 0x1480 (promotion definitions) ----
-    // World's PromotionController keeps the promotion datasheet it receives here. Each 0x147E record
-    // (1368-byte payload) carries two 16-byte timestamps at [16] and [32]: u16 year, month, day, hour,
-    // minute, second + u32 nanoseconds, stamped "now" by the real Arbiter (arb_world.log: 2026-09-12
-    // 04:47:51; cap_newchar.log: 2026-09-13 05:47:09). Replaying yesterday's records left World with
-    // stale promotion entries, and the first level-1 character to qualify for a newbie promotion
-    // crashed World in PromotionController::NewPromotion -> vector<PromotionConditionDataHead> copy
-    // (WorldServer+0x128F4B0, minidump 2026-09-14 01:03:25). Level-58 dob never triggers it, which
-    // is why the crash only hit new characters on a fresh World.
-    // Bytes 568..700 of each record are raw Arbiter heap pointers memcpy'd into the struct; harmless.
-    // data/promotions_147E.bin = the 24 records from cap_newchar.log concatenated.
-    public const ushort AS_PROMOTION_LIST_REQ = 0x147D;
-    public const ushort AS_PROMOTION_LIST_BEGIN = 0x1484;
-    public const ushort AS_PROMOTION_RECORD = 0x147E;
-    public const ushort AS_PROMOTION_LIST_END = 0x1480;
-    public const int PromotionRecordSize = 1368;
-    private static byte[]? _promotions;
+    // ---- Handshake: SA_LOAD_GUARD 0x147D -> AS_ELECTION_STATE + AS_LOAD_GUARD* + FINISH ----
+    //
+    // T209c RENAMED THIS FAMILY. It was AS_PROMOTION_* here, and it is not promotions: the
+    // Arbiter's own opcode-name table (Arb_part_003.c:4978-4993) gives 0x147D SA_LOAD_GUARD,
+    // 0x147E AS_LOAD_GUARD, 0x1480 AS_LOAD_GUARD_FINISH and 0x1484 AS_ELECTION_STATE, and World
+    // consumes them in GuardManager::OnLoadGuard / OnLoadFinish. This is the castle-and-lord
+    // Guard system. Promotions are the separate 0x291x family (SDB_LOAD_PROMOTION_LIST 0x2912,
+    // handled above), which is why the old comment's PromotionController crash note was attached
+    // to the wrong opcodes entirely.
+    //
+    // WHAT RETAIL SENDS. World::SendLoadGuard (Arb_part_074.c:4035) sends AS_ELECTION_STATE
+    // carrying ONE u32 - the lord-election state, not a list header - then walks ten continent
+    // slots and calls Guard::SendLoadGuard (Arb_part_081.c:3130) once per Guard object, then
+    // sends AS_LOAD_GUARD_FINISH with an empty payload. The per-guard writer takes its length as
+    // the compile-time constant 0x550 (1360), so an AS_LOAD_GUARD frame is never empty; and the
+    // walk begins with a begin-not-equal-end test, so WITH NO GUARDS IT EMITS NO FRAME AT ALL.
+    // Zero 0x147E frames is the correct wire for a server with no castles, which is what this
+    // one is: nothing here models Guards, continents' guard trees or the lord election.
+    //
+    // WHY THE FILE IS GONE. data/promotions_147E.bin held 23 records of 1368 bytes (the old
+    // comment said 24 - both 23x1368 and 24x1311 come to 31464, which is how that slipped past),
+    // replayed from a capture of a server that DID have castles. Each 1360-byte payload is a
+    // memcpy of a live C++ Guard struct - bytes 568..700 are that process's heap pointers - so it
+    // can neither be generated nor meaningfully edited, and replaying it pushed 23 foreign
+    // castles into a world that has none. Sending nothing is both retail-correct and truthful.
+    public const ushort SA_LOAD_GUARD = 0x147D;
+    public const ushort AS_ELECTION_STATE = 0x1484;
+    public const ushort AS_LOAD_GUARD = 0x147E;
+    public const ushort AS_LOAD_GUARD_FINISH = 0x1480;
 
-    private bool OnPromotionListRequest(WorldLink link)
+    /// <summary>The lord-election state AS_ELECTION_STATE carries. 0 is "no election running",
+    /// which is this server's permanent answer until the election system is modelled.</summary>
+    public const uint ElectionStateNone = 0;
+
+    /// <summary>
+    /// SA_LOAD_GUARD (0x147D): the election state, then one AS_LOAD_GUARD per Guard, then FINISH.
+    /// This server has no Guards, so the middle is empty - exactly what retail emits for a world
+    /// with no castles. The two frames it does send are byte-identical to what it sent before
+    /// T209c; all that changed is that the 23 replayed guard records are gone.
+    /// </summary>
+    private bool OnLoadGuardRequest(WorldLink link)
     {
-        var data = LoadDataFile("promotions_147E.bin", ref _promotions, 0);
-        if (data == null || data.Length % PromotionRecordSize != 0)
-        {
-            _log.LogWarning("0x147D: promotions_147E.bin missing or malformed - falling back to replay (stale timestamps)");
-            return false;
-        }
-        link.SendFrame(AS_PROMOTION_LIST_BEGIN, new byte[4]);
-        var now = DateTime.UtcNow;
-        int n = 0;
-        for (int off = 0; off + PromotionRecordSize <= data.Length; off += PromotionRecordSize)
-        {
-            var rec = new byte[PromotionRecordSize];
-            Array.Copy(data, off, rec, 0, PromotionRecordSize);
-            WriteArbTimestamp(rec, 16, now);
-            WriteArbTimestamp(rec, 32, now);
-            link.SendFrame(AS_PROMOTION_RECORD, rec);
-            n++;
-        }
-        link.SendFrame(AS_PROMOTION_LIST_END, Array.Empty<byte>());
-        _log.LogInformation("0x147D: sent {N} x 0x147E promotion records stamped {Now:u}", n, now);
+        link.SendFrame(AS_ELECTION_STATE, BitConverter.GetBytes(ElectionStateNone));
+        link.SendFrame(AS_LOAD_GUARD_FINISH, Array.Empty<byte>());
+        _log.LogInformation("0x147D: no guards on this planet - election state {State}, 0 x 0x147E, finish", ElectionStateNone);
         return true;
     }
 
@@ -6008,8 +6027,11 @@ public sealed partial class DbProxyHandlers
     // catalogue and the continent channel counts. status/RELOG-CAPTURE-NOTES.md section 4 has the
     // full opcode table; data/handshake_burst.md is the per-frame index.
     //
-    // The bytes live in data/handshake_burst.bin (TSIS container, same shape as cap_t15.bin)
-    // rather than in a literal here: 63 frames, 1082 frame bytes, 50 distinct opcodes.
+    // T209b: the frames are BUILT from Protocol/InterServerDefinitions - 63 frames, 1082 frame
+    // bytes, 50 distinct opcodes, every field named from the retail dumpers - see HandshakeBurst.
+    // data/handshake_burst.bin (TSIS container, same shape as cap_t15.bin) is kept only as the
+    // test's evidence; LoadHandshakeBurst/ParseBurst/BuildHandshakeBurst below still read it so
+    // Tests/T209b.cs can compare against it, and nothing at runtime touches it any more.
     //
     // Four captures were diffed frame by frame - arb_world.log (2026-09-12 06:36), lobby_tap.log
     // (09-13 02:51), cap_newchar.log (09-13 05:49) and the 09-13 11:42 relog. The burst is
@@ -6029,6 +6051,25 @@ public sealed partial class DbProxyHandlers
     public const int DarkRiftResetTimeOffset = 8;   // 0x14D1 payload+8, u64 unix seconds
     public const int HandshakeBurstFrameCount = 63;
     public const string HandshakeBurstFile = "handshake_burst.bin";
+
+    /// <summary>T209: <c>economy.synthItemRecords</c>. True builds the starter kit's item records
+    /// instead of copying them out of <c>starter_inventory.bin</c>, so the file is not needed at
+    /// all. Read per call rather than cached, so it can be flipped without a restart.
+    ///
+    /// <para>T209c part 2: DEFAULT TRUE, live-verified - character 'newnew' was created with the
+    /// setting on and <c>data/starter_inventory.bin</c> absent, entered world with its six starter
+    /// items and still had them after a relog. Set the key to 0 / false to go back to copying the
+    /// captured record.</para></summary>
+    public static bool SynthItemRecords
+    {
+        get
+        {
+            string? v = TerasConfig.Get("TERASHARP_SYNTH_ITEM_RECORDS");
+            // Unset (and empty, which is how an unset variable reads on Linux) means ON.
+            if (string.IsNullOrWhiteSpace(v)) return true;
+            return v == "1" || v.Equals("true", StringComparison.OrdinalIgnoreCase);
+        }
+    }
 
     /// <summary>
     /// The daily-reset instant the real Arbiter stamps into 0x14D1 - and into the SECOND u64 of
@@ -6130,7 +6171,7 @@ public sealed partial class DbProxyHandlers
 
     /// <summary>
     /// Called by WorldBridge once the handshake completes (on the link that carried 0x294F,
-    /// exactly once per World process). Sends the captured config burst first, then the 0x1581
+    /// exactly once per World process). Sends the config burst first, then the 0x1581
     /// dungeon-open pushes - the order in lobby_tap.log, the capture the live-verified login came
     /// from, and the order that puts AS_INITIALIZE_DUNGEON_ID / AS_DUNGEON_DISABLED_LIST before
     /// the per-dungeon opens. (cap_newchar.log has them the other way round only because that
@@ -6139,24 +6180,22 @@ public sealed partial class DbProxyHandlers
     /// </summary>
     public void OnWorldReady(WorldLink link)
     {
-        var burst = LoadHandshakeBurst();
-        if (burst == null)
-        {
-            _log.LogWarning("Post-handshake: data/{File} missing or malformed - the {N}-push config burst was NOT sent",
-                HandshakeBurstFile, HandshakeBurstFrameCount);
-        }
-        else
+        // T209b: the burst is BUILT from Protocol/InterServerDefinitions now (see HandshakeBurst),
+        // not replayed out of data/handshake_burst.bin. Every frame reproduces the capture byte for
+        // byte from named fields, so there is no file to miss and nothing to warn about; the
+        // capture is the test's evidence (Tests/T209b.cs), not a runtime dependency - T139.
         {
             var now = DateTimeOffset.UtcNow;
             ulong reset = DailyResetUnixSeconds(now);
-            foreach (var (op, payload) in BuildHandshakeBurst(burst, now))
+            var burst = HandshakeBurst.Build(now, reset);
+            foreach (var (op, payload) in burst)
                 link.SendFrame(op, op == 0x157E && _store != null
                     ? Handlers.QaDungeonCommands.BuildDisabledDungeons(_store.GetDisabledDungeons())
                     : op == 0x14E9 ? Handlers.QaDungeonEvents.BuildRookieSnapshot(_store, now, rememberReplay: true)
                     : op == 0x156B ? Handlers.QaFestivalCommands.DailySnapshot(_store, now)
                     : op == 0x13B5 && Handlers.QaInventoryCommands.StyleWarehouseOverride is bool style ? new[] { style ? (byte)1 : (byte)0 }
                     : Handlers.QaAchievementCommands.BootFrame(_store, op, now) ?? payload);
-            _log.LogInformation("Post-handshake: sent {N} config pushes (0x15BD = {Now:u}, 0x14D1 daily reset = {Reset:u})",
+            _log.LogInformation("Post-handshake: sent {N} config pushes built from defs (0x15BD = {Now:u}, 0x14D1 daily reset = {Reset:u})",
                 burst.Count, now.UtcDateTime, DateTimeOffset.FromUnixTimeSeconds((long)reset).UtcDateTime);
         }
 
@@ -6169,6 +6208,12 @@ public sealed partial class DbProxyHandlers
         Handlers.QaStyleShopCommands.ReplayWorld(_store, link, DateTimeOffset.UtcNow);
         Handlers.QaItemPeriodCommands.Replay(_store, link, DateTimeOffset.UtcNow);
         Handlers.QaPurchaseCommands.Replay(_store, link);
+        // T208d: the party table, for a World that came up after parties already existed. The real
+        // Arbiter does this from its own registration path - PartyManager::OnConnectWorldServer
+        // (Arb_part_079.c:16418) walks every party and unicasts its roster to the new World - and
+        // without it a battleground or dungeon World resolves a party handle we hand it to zero and
+        // builds nothing (cap_bg4 17:07:44; status/T208c-BG.md, status/T208d-PARTY-REPLAY.md).
+        PartyWiring.ReplayToWorld(WorldRouting.WorldIdOf(link));
         Handlers.QaNpcShopCommands.Replay(_store, link);
 
         // The FALLBACK, not the mechanism - the real Arbiter only ever echoes World's 0x13F2.
@@ -6675,10 +6720,15 @@ public sealed partial class DbProxyHandlers
             return true;
         }
 
+        // T209: the class kit comes from CreateCharData.xml either way; the file only supplies
+        // the 536-byte record skeleton. With economy.synthItemRecords on - the default since
+        // T209c part 2 was live-verified - the records are built instead
+        // (StarterInventory.BuildSynthetic) and no file is needed. The file still wins when it is
+        // there, so a deployment that keeps it is byte-for-byte unchanged.
         var template = LoadStarterInventory();
-        if (template == null)
+        if (template == null && !SynthItemRecords)
         {
-            _log.LogWarning("SDB_USER_LOAD_INVENTORY: starter_inventory.bin not found - falling back to replay (World will reject it for player {Pid})", playerId);
+            _log.LogWarning("SDB_USER_LOAD_INVENTORY: starter_inventory.bin not found and economy.synthItemRecords is off - falling back to replay (World will reject it for player {Pid}). Remove the setting to build the records instead.", playerId);
             return false;
         }
         // T14: the kit the real Arbiter would have created for this character's class
@@ -6688,7 +6738,9 @@ public sealed partial class DbProxyHandlers
         // _store is null in the pure-protocol unit tests; a class kit needs the row.
         var chr = _store is null ? null : _store.GetCharacter(playerId);
         int classId = chr?.Class ?? -1;
-        var kit = StarterInventory.Build(template, classId, playerId, reqId);
+        var kit = template != null
+            ? StarterInventory.Build(template, classId, playerId, reqId)
+            : StarterInventory.BuildSynthetic(classId, playerId, reqId);
 
         // The kit is only the STARTING point now. T44: the inventory is rows in `items`, the
         // same table the warehouse uses, so a character who has picked anything up gets what
@@ -6702,11 +6754,19 @@ public sealed partial class DbProxyHandlers
                 playerId, StarterInventory.ForClass(classId)!.Count, classId,
                 classId >= 0 && classId < StarterInventory.ClassNames.Length ? StarterInventory.ClassNames[classId] : "?");
         }
-        else
+        else if (template != null)
         {
             inventory = BuildStarterInventory(template, reqId, (uint)playerId);
             _log.LogWarning("SDB_USER_LOAD_INVENTORY: player {Pid} has no class kit (class {Cls}) - serving the captured glaiver list",
                 playerId, classId);
+        }
+        else
+        {
+            // T209: no class kit AND no file. The captured glaiver list was the last resort and
+            // it needs the file, so there is nothing left to serve but the truth.
+            _log.LogWarning("SDB_USER_LOAD_INVENTORY: player {Pid} has no class kit (class {Cls}) and no starter_inventory.bin to fall back on",
+                playerId, classId);
+            return false;
         }
 
         if (_store is not null)

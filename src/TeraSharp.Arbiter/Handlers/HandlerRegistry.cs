@@ -246,6 +246,7 @@ public static class HandlerRegistry
         Reg("C_ADMIN_REQUEST_USERINFO",   22, (s, b) => GmAdminTool.OnRequestUserInfo(s, b, misc));     // T91
         Reg("C_ADMIN_REQUEST_USERACTION", 18, (s, b) => GmAdminTool.OnRequestUserAction(s, b, misc));   // T91
         Reg("C_REQUEST_SERVER_ADMINTOOL_AWESOMIUM_URL", 0, (s,b) => ArbiterClientHandlers.OnRequestAdminToolUrl(s,b,misc));   // T107: Alt+A waits for this reply
+        Reg("C_SHOW_AWESOMIUMWEB_SHOP", 0, (s,b) => ShopUrl.OnShowShop(s, log));   // T207: the shop / item-claim web view
         // T118: the leaderboard and the leftovers (status/LEADERBOARD.md). C_REQUEST_MY_PARTY_MATCH_INFO stays with PartyMatchManager.
         Reg("C_REQUEST_PVE_RANKING",       LeaderboardPackets.RankingBodySize,        (s,b) => LeaderboardPackets.OnRequestPveRanking(s, b, log));
         Reg("C_REQUEST_PVP_RANKING",       LeaderboardPackets.RankingBodySize,        (s,b) => LeaderboardPackets.OnRequestPvpRanking(s, b, log));
@@ -280,8 +281,10 @@ public static class HandlerRegistry
         GmAdminTool.OnlineSessions = () => Program.World?.InWorldSessions() ?? new List<GameSession>();
         foreach (var name in new[]
         {
-            "C_VIEW_BATTLE_FIELD_RESULT",
-            "C_REQUEST_CANDIDATE_LIST", "C_SHOW_AWESOMIUMWEB_SHOP",
+            "C_REQUEST_CANDIDATE_LIST",
+            // T207b: C_SHOW_AWESOMIUMWEB_SHOP has a real handler now (ShopUrl.OnShowShop, above),
+            // so it must NOT also be accepted silently here - PacketDispatcher refuses a second
+            // registration of the same opcode and the server would not start.
             "C_UPDATE_CONTENTS_PLAYTIME", "C_EVENT_GUIDE",
             // T97: real handlers that parse nothing / store nothing / reply nothing
             "C_GET_ATTENDANCE_REWARD", "C_REQUEST_STACK_ATTENDANCE_EVENT_REWARD", "C_EVENT_MATCHING_DUNGEON_DETAIL_INFO",
@@ -295,6 +298,10 @@ public static class HandlerRegistry
         // T134: dungeon cool-time window (all 9 live replies are empty). Clear-count needs the 14-id roster merge - T134b.
         Reg("C_DUNGEON_COOL_TIME_LIST", 0, (s, body) => { s.Send(ArbiterClientHandlers.BuildDungeonCoolTimeList()); return true; });
         Reg("C_DUNGEON_CLEAR_COUNT_LIST", 0, (s, b) => ArbiterClientHandlers.OnDungeonClearCountList(s, b));   // T134b: roster + store merge
+        // T211: the profile's PvP Record tab. Was in the OnAcceptSilently list above, which is
+        // why it opened onto nothing; the reply layout is pinned to the dumper - see
+        // ArbiterClientHandlers.BuildViewBattleFieldResult and status/T211-PROFILE.md.
+        Reg("C_VIEW_BATTLE_FIELD_RESULT", 0, (s, b) => ArbiterClientHandlers.OnViewBattleFieldResult(s, b));
         // --- T97: party extras, event/VIP windows, reports, profile ---
         Reg("C_REQUEST_PARTY_NAME",                     MiscClientPackets.RequestPartyNameBodySize,      (s,b) => MiscClientPackets.OnRequestPartyName(s,b,misc));
         Reg("C_VIEW_PARTY_INVITE",                      0,                                              (s,b) => MiscClientPackets.OnViewPartyInvite(s,b,misc));

@@ -375,7 +375,7 @@ public static class DefaultSkillSet
 /// Everything else in the blob is identical between a level-1 and a level-58 character and
 /// must be copied verbatim. Never parse or synthesise the rest of it.
 /// </summary>
-public static class StarterBlob
+public static partial class StarterBlob
 {
     public const int Size = 15312;
 
@@ -566,7 +566,20 @@ public static class StarterBlob
     /// from the running assembly (so it works from bin/Debug and from a publish folder), then
     /// <c>&lt;TERASHARP_DATA&gt;/TeraSharp/data/starter_blob.bin</c>. Cached after the first hit.
     /// </summary>
-    public static byte[] LoadTemplate()
+    /// <summary>
+    /// T209: the file is now an OVERRIDE, not a requirement. When one of the candidate paths has
+    /// it, those bytes win - an operator with a capture of their own build can still drop it in.
+    /// Otherwise the record is generated (<see cref="Generate"/>), which is what a stock install
+    /// does. Either way the caller gets 15312 bytes and <see cref="Build"/> patches the same
+    /// fields on top, so nothing downstream can tell the difference.
+    /// </summary>
+    public static byte[] LoadTemplate(Seed? seed = null)
+        => LoadTemplateFile() ?? Generate(seed ?? new Seed());
+
+    /// <summary>The override, or null when no candidate path has a well-formed file. A file of
+    /// the wrong length is a bad deploy and still throws - silently generating over it would hide
+    /// a truncated copy.</summary>
+    public static byte[]? LoadTemplateFile()
     {
         if (_cached != null) return _cached;
         foreach (var candidate in CandidatePaths())
@@ -578,9 +591,11 @@ public static class StarterBlob
             _cached = bytes;
             return bytes;
         }
-        throw new FileNotFoundException(
-            "starter_blob.bin not found. Set TERASHARP_STARTER_BLOB or put it in the repo's data/ folder.");
+        return null;
     }
+
+    /// <summary>For tests: forget a cached override so the next load re-resolves.</summary>
+    internal static void ResetTemplateCacheForTests() => _cached = null;
 
     /// <summary>Test seam: inject a template instead of reading it from disk.</summary>
     internal static void SetTemplateForTest(byte[]? template) => _cached = template;
@@ -738,10 +753,70 @@ public sealed partial class CharacterStore : IDisposable
     public CharacterStore(string path, ILogger log)
     {
         _log = log;
+        DbPath = path;
         _db = new SqliteConnection($"Data Source={path}");
         _db.Open();
         Migrate();
         _log.LogInformation("CharacterStore open: {Path}", path);
+    }
+
+    /// <summary>T206: the file this store was opened on, so the admin tool can report where the
+    /// database lives and how big it has grown without guessing from configuration.</summary>
+    public string DbPath { get; } = string.Empty;
+
+    /// <summary>T206: one table and its row count, for the admin Settings screen.</summary>
+    public sealed record TableRow(string Name, long Rows);
+
+    /// <summary>T206: the whole database report - byte size from the page geometry (which is
+    /// correct even while a WAL is open, unlike a bare FileInfo on the main file), the schema
+    /// version and every table with its row count.</summary>
+    public sealed record DatabaseStats(string Path, long Bytes, long PageCount, long PageSize,
+        long UserVersion, long WalBytes, IReadOnlyList<TableRow> Tables);
+
+    /// <summary>T206: read the database report. Never throws - a refused pragma or a table that
+    /// vanished mid-walk yields a zero rather than failing the whole screen.</summary>
+    public DatabaseStats GetDatabaseStats()
+    {
+        lock (_lock)
+        {
+            long pages = Scalar("PRAGMA page_count"), size = Scalar("PRAGMA page_size");
+            long version = Scalar("PRAGMA user_version");
+            var names = new List<string>();
+            using (var cmd = _db.CreateCommand())
+            {
+                cmd.CommandText =
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name";
+                using var r = cmd.ExecuteReader();
+                while (r.Read()) names.Add(r.GetString(0));
+            }
+            var tables = new List<TableRow>(names.Count);
+            foreach (string name in names)
+            {
+                // The name came from sqlite_master, so it cannot be hostile, but quote it anyway.
+                tables.Add(new TableRow(name, Scalar("SELECT COUNT(*) FROM \"" + name.Replace("\"", "\"\"") + "\"")));
+            }
+            long wal = 0;
+            try
+            {
+                var info = new FileInfo(DbPath + "-wal");
+                if (info.Exists) wal = info.Length;
+            }
+            catch { }
+            return new DatabaseStats(DbPath, pages * size, pages, size, version, wal, tables);
+        }
+    }
+
+    /// <summary>One number from a statement, or 0. Caller holds <c>_lock</c>.</summary>
+    private long Scalar(string sql)
+    {
+        try
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = sql;
+            object? value = cmd.ExecuteScalar();
+            return value == null || value is DBNull ? 0 : Convert.ToInt64(value);
+        }
+        catch { return 0; }
     }
 
     private void Migrate()
@@ -1954,6 +2029,27 @@ ON CONFLICT(character_id) DO UPDATE SET blob = excluded.blob, updated_at = exclu
         }
     }
 
+    /// <summary>
+    /// T191c. Throw away one character's stored client settings so the next login serves an
+    /// empty body and the client re-seeds a small blob. The recovery for a character whose blob
+    /// has run away past <see cref="MaxClientSettingBytes"/>: every save is refused from then on
+    /// (the real Arbiter refuses the same way, see that constant), so nothing the client stores -
+    /// including the tutorial/first-run state behind the WASD prompt - can ever persist again.
+    /// Returns false when the character had nothing stored.
+    /// </summary>
+    public bool ClearClientSetting(long characterId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "DELETE FROM client_settings WHERE character_id = $c";
+            cmd.Parameters.AddWithValue("$c", characterId);
+            int n = cmd.ExecuteNonQuery();
+            if (n > 0) _log.LogInformation("Cleared the stored client settings for character {Id}", characterId);
+            return n > 0;
+        }
+    }
+
     /// <summary>Account-scope equivalent of <see cref="SaveClientSetting"/>.</summary>
     public bool SaveAccountSetting(long accountId, byte[] blob)
     {
@@ -2113,6 +2209,26 @@ ON CONFLICT(account_id) DO UPDATE SET blob = excluded.blob, updated_at = exclude
             using var r = cmd.ExecuteReader();
             return r.Read() ? Read(r) : null;
         }
+    }
+
+    /// <summary>
+    /// T206: every character, id order, capped. There was no server-wide character list - the
+    /// only ways in were by account or by exact name - so a mail run to everyone had nothing to
+    /// iterate. The cap is the caller's, not a page: this is for one bulk write, not browsing.
+    /// </summary>
+    public List<CharacterRecord> GetAllCharacters(int limit = 1000)
+    {
+        if (limit < 1) limit = 1;
+        var rows = new List<CharacterRecord>();
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT * FROM characters ORDER BY id LIMIT $n";
+            cmd.Parameters.AddWithValue("$n", limit);
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) rows.Add(Read(r));
+        }
+        return rows;
     }
 
     public CharacterRecord? GetCharacterByName(string name)
@@ -2663,6 +2779,39 @@ FROM (SELECT account_id, ep_exp, ep_level, ep_point, ep_daily_exp, ep_reserve_bo
             using var r = cmd.ExecuteReader();
             return r.Read() && r.GetInt32(0) > 0 ? new(r.GetInt32(0), unchecked((uint)r.GetInt64(1)),
                 (int)r.GetDouble(2), (int)r.GetDouble(3), (int)r.GetDouble(4)) : null;
+        }
+    }
+
+    /// <summary>
+    /// T208b. The battleground entry point: 13CB's system return point, plus <c>dungeon_id</c> set to
+    /// the battlefield continent. That last column is what makes a relog work: the blob World saves
+    /// inside a battleground carries continent 115, and
+    /// <c>WorldEntry.BuildEnterWorldPayload</c> only replaces it with the return point when
+    /// <c>GetDungeonReturn().DungeonId</c> equals that continent. T199 stored the return point but
+    /// never the continent, so a battleground relog still carried 115 - and when the battlefield
+    /// World has no links yet the frame goes to a World that does not own the continent and is never
+    /// answered at all (arbiter-bg3.log 20:53:19: no SA_ENTER_WORLD, no 0x138D, the client sits on
+    /// the loading screen, and the abandoned session leaves a held leave only
+    /// /api/reset-character clears).
+    /// </summary>
+    public bool SaveBattlefieldReturn(int characterId, int battlefieldContinent, SystemReturnPoint point)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE characters SET dungeon_id=$d, return_zone=$zone, return_channel=$channel, "
+                + "return_x=$x, return_y=$y, return_z=$z WHERE id=$id";
+            cmd.Parameters.AddWithValue("$d", battlefieldContinent);
+            cmd.Parameters.AddWithValue("$zone", point.Continent);
+            cmd.Parameters.AddWithValue("$channel", (long)point.Channel);
+            cmd.Parameters.AddWithValue("$x", point.X); cmd.Parameters.AddWithValue("$y", point.Y);
+            cmd.Parameters.AddWithValue("$z", point.Z); cmd.Parameters.AddWithValue("$id", characterId);
+            bool ok = cmd.ExecuteNonQuery() == 1;
+            if (ok) _log.LogInformation(
+                "Character {Id} entered battlefield continent {C}; return point zone {Z} ({X}, {Y}, {Zz})",
+                characterId, battlefieldContinent, point.Continent, point.X, point.Y, point.Z);
+            else _log.LogWarning("SaveBattlefieldReturn: character {Id} not found", characterId);
+            return ok;
         }
     }
 
@@ -4730,6 +4879,37 @@ DELETE FROM restrictions      WHERE character_id = $id;";
 
     /// <summary>T170. Guild money moves (a war declaration, a surrender's reparation). Clamped at 0;
     /// returns the new total, -1 when the guild does not exist.</summary>
+    /// <summary>
+    /// T206: set a guild's level outright. <c>AddGuildMoney</c>-style deltas are what the game
+    /// uses; an operator correcting a wrong value needs to say what the value IS.
+    /// </summary>
+    public bool SetGuildLevel(int guildId, int level)
+    {
+        if (level < 0) return false;
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE guilds SET level=$l WHERE guild_id=$g";
+            cmd.Parameters.AddWithValue("$l", level);
+            cmd.Parameters.AddWithValue("$g", guildId);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    /// <summary>T206: set a guild's money outright. Negative is refused, not clamped.</summary>
+    public bool SetGuildMoney(int guildId, long money)
+    {
+        if (money < 0) return false;
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE guilds SET money=$m WHERE guild_id=$g";
+            cmd.Parameters.AddWithValue("$m", money);
+            cmd.Parameters.AddWithValue("$g", guildId);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
     public long AddGuildMoney(int guildId, long delta)
     {
         if (!AddGuildQuestReward(guildId, 0, delta)) return -1;
@@ -5874,16 +6054,32 @@ DELETE FROM restrictions      WHERE character_id = $id;";
         }
     }
 
-    /// <summary>T190/T201. Account::ResetCardCollectionBook followed by PerfectCardCollection.
+    /// <summary>
+    /// T190/T201. Account::ResetCardCollectionBook followed by PerfectCardCollection.
     /// GameDatabaseDefinition.xml:21055-21075 deletes all account presets, while leaving the
-    /// separate CardPresetIndex table intact; Arb065:8787-8840 restores info defaults.</summary>
+    /// separate CardPresetIndex table intact; Arb065:8787-8840 restores info defaults.
+    ///
+    /// <para>T210: it replaces the COLLECTION, and nothing else durable. Retail's refresh right
+    /// after the command reports preset amount 1 with no presets and no claimed book rewards
+    /// (cap_2man_b_client2 2705), and the very NEXT login reports 3 presets and 8 claimed rewards
+    /// again (cap_2man_b_client2 3634, cap_bg1_client1 182) - so those rows were never deleted;
+    /// only the in-memory Account was reset, which is what that refresh reply describes
+    /// (DbProxyHandlers.MarkPerfectCardRefresh). T190 deleted the rows, so after one
+    /// /@perfect_card_collection the card panel was empty for good.</para>
+    /// </summary>
     public void ReplaceCardCollection(long accountId, int characterId, IReadOnlyList<CardRow> cards, CardInfoRow info)
     {
         lock (_lock)
         {
-            ResetCardCollection(accountId);
+            using (var wipe = _db.CreateCommand())
+            {
+                wipe.CommandText = "DELETE FROM cards WHERE account_id=$a";
+                wipe.Parameters.AddWithValue("$a", accountId);
+                wipe.ExecuteNonQuery();
+            }
             foreach (var card in cards) AddCard(accountId, card.CardTemplateId, card.Amount);
-            SetCardInfo(accountId, info);
+            // preset_amount IS the CardPresetIndex value the native reset leaves intact.
+            SetCardInfo(accountId, info with { PresetAmount = GetCardInfo(accountId).PresetAmount });
         }
     }
 
@@ -6350,6 +6546,66 @@ DELETE FROM restrictions      WHERE character_id = $id;";
                 rows.Add(new DungeonRankRow(r.GetInt32(0), r.GetInt32(1), r.GetInt32(2), r.GetInt32(3), r.GetInt32(4),
                     r.GetInt64(5), r.GetInt32(6) != 0, r.GetInt32(7), r.GetInt32(8), r.GetInt32(9), r.GetString(10)));
             return rows;
+        }
+    }
+
+    /// <summary>
+    /// T211. One row of the dungeon record board: a character's best for one dungeon in one
+    /// season, with the identity columns <c>S_DUNGEON_RANK_RECORD_LIST</c> renders beside it.
+    /// </summary>
+    public readonly record struct DungeonRankBoardRow(int CharacterId, string Name, string GuildName,
+        int Class, int Race, int Gender, int TopPoint, int TopTime, long PlayDate);
+
+    /// <summary>
+    /// T211. The board for one dungeon and season, best first - highest point, then fastest time.
+    /// The guild name is a LEFT JOIN, so a guildless character is an empty string rather than a
+    /// missing row.
+    /// </summary>
+    public IReadOnlyList<DungeonRankBoardRow> GetDungeonRankBoard(int dungeonId, int season, int limit = 100)
+    {
+        if (limit <= 0) limit = 1;
+        if (limit > 200) limit = 200;
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "SELECT r.character_id, c.name, COALESCE(g.name, ''), c.class, c.race, c.gender, " +
+                "r.top_point, r.top_time, r.play_date " +
+                "FROM dungeon_rank_records r " +
+                "JOIN characters c ON c.id = r.character_id AND c.deleted_at = 0 " +
+                "LEFT JOIN guild_members m ON m.user_db_id = r.character_id " +
+                "LEFT JOIN guilds g ON g.guild_id = m.guild_id " +
+                "WHERE r.dungeon_id = $d AND r.season = $s " +
+                "ORDER BY r.top_point DESC, r.top_time ASC, r.character_id ASC LIMIT $n";
+            cmd.Parameters.AddWithValue("$d", dungeonId);
+            cmd.Parameters.AddWithValue("$s", season);
+            cmd.Parameters.AddWithValue("$n", limit);
+            var rows = new List<DungeonRankBoardRow>();
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                rows.Add(new DungeonRankBoardRow(r.GetInt32(0), r.GetString(1), r.GetString(2),
+                    r.GetInt32(3), r.GetInt32(4), r.GetInt32(5), r.GetInt32(6), r.GetInt32(7), r.GetInt64(8)));
+            return rows;
+        }
+    }
+
+    /// <summary>
+    /// T211. Where a character sits on the <c>bg_rating</c> board: 1 for the highest, 0 when the
+    /// character has never finished a battleground. Ties share the better rank, as
+    /// <see cref="GetPvpBoard"/> renders them.
+    /// </summary>
+    public int GetBgRatingRank(int characterId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "SELECT CASE WHEN c.bg_rating <= 0 THEN 0 ELSE " +
+                "(SELECT COUNT(*) + 1 FROM characters o WHERE o.deleted_at = 0 AND o.bg_rating > c.bg_rating) " +
+                "END FROM characters c WHERE c.id = $id AND c.deleted_at = 0";
+            cmd.Parameters.AddWithValue("$id", characterId);
+            var v = cmd.ExecuteScalar();
+            return v == null || v is DBNull ? 0 : Convert.ToInt32(v);
         }
     }
 
@@ -8413,6 +8669,30 @@ DELETE FROM restrictions      WHERE character_id = $id;";
             cmd.Parameters.AddWithValue("$a", amount);
             return cmd.ExecuteNonQuery() > 0;
         }
+    }
+
+    /// <summary>T206: one attachment row, as the admin Mail screen lists them.</summary>
+    public sealed record ParcelItemRow(int ParcelId, int Slot, int ItemDbId, int TemplateId, long Amount);
+
+    /// <summary>
+    /// T206: every attachment on one parcel, slot order. <see cref="CountParcelItems"/> could
+    /// only say how many there were, so the admin tool had no way to show WHAT was attached.
+    /// </summary>
+    public IReadOnlyList<ParcelItemRow> GetParcelItems(int parcelId)
+    {
+        var rows = new List<ParcelItemRow>();
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText =
+                "SELECT slot, item_db_id, template_id, amount FROM parcel_items " +
+                "WHERE parcel_id=$p ORDER BY slot";
+            cmd.Parameters.AddWithValue("$p", parcelId);
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                rows.Add(new ParcelItemRow(parcelId, r.GetInt32(0), r.GetInt32(1), r.GetInt32(2), r.GetInt64(3)));
+        }
+        return rows;
     }
 
     public int CountParcelItems(int parcelId)

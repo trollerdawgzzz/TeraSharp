@@ -1301,3 +1301,39 @@ Tests: `T195_instance_say_party_chat_and_party_menu_reach_their_native_destinati
 | 14FF request exit /1500 cancel | Resolve player → current World, no default fallback. Arb029:13257–13278,13349–13374 and13131/13209; writers Arb027:2554/2512. cap_2man_b:12875 pins14FF's4-byte UserDbId;1500 remains native-marked in this capture set. |
 
 `ChatManager`/`PartyMatchManager`/`SocialHandlers.ChatDispatcher` World callbacks have no producing World actions; their dormant callbacks are unchanged. Request/reply DB frames continue back to the requesting link with the live DLM id. Tests `T195_contract_participants_follow_their_own_worlds_and_refuse_missing_owners` and `T195_social_trade_guild_and_exit_countdown_use_current_character_world` exercise the live handlers on separate World0/13 sockets, per-participant fan-out, guild broadcast exceptions, unsupported-contract refusal and unavailable-owner refusal.
+
+## T209d - a roster claim is not continent ownership
+
+A newly created character hung on the loading screen while existing characters entered
+(`D:\packetlogs\cap_t209.log`, `arbiter-t209.log`). The generated blob was not at fault: World
+never asked for it.
+
+| Evidence | Reading |
+|---|---|
+| `0x138E` at 04:22:33.836 / 04:22:36.441, **link #39**, continent **5**, instance -1 | both creations handed over |
+| no `0x2711` on that link afterwards, ever | World never requested the blob, so no blob field was rejected |
+| `0x164D` link #40 = world **10**, 18 rows, first row `levels 22-38 -> continent 5` | the battleground World claims continent 5 |
+| `0x164D` link #42 = world 0, 173 rows, none of them 5 / 115 / 7005 | the catch-all World's roster lists only instanced content |
+| `arbiter-mail1.log` 12:37:49 `created 'tard' ... start=zone 5 (16260,1253,-4410)`, entered 12:37:55 on link #1 | the identical start position works when world 10 is not started |
+| `arbiter-t209.log` 21:22:27 `start=zone 5 (16260,1253,-4410)` | pre-T209 and post-T209 creation records carry the same continent |
+
+Continent 5 is where every created character starts (`CreateCharData.xml` `InitLoc default`), and it
+is also row 1 of the battleground World's match roster. `WorldContinentList.Apply` folded that
+roster into the same table `ServerConfig.xml` seeds, so world 10 became the owner of continent 5 and
+`WorldForEnterWorld` sent the creation to a World that had not asked for a player. Whether it broke
+depended on **start order**: in the broken run world 13 and world 10 rostered at 21:20:27 and world 0
+only at 21:21:20; in the working runs world 0 came up alone or first.
+
+The fix keeps the roster but stops it owning anything:
+
+| Table | Written by | Answers |
+|---|---|---|
+| `_continents` | `MapContinent` - `ServerConfig.xml` only | everything |
+| `_channels` | `Add` / `Remove` - `0x13C5` / `0x13C6` | everything |
+| `_rostered` | `ClaimContinent` - `0x164D` | `WorldForContinent` (the dungeon hand-off) only |
+
+`WorldForOpenWorld` is the new lookup: configured owner, then announced channel, then nothing - so a
+plain `AS_ENTER_WORLD` (instance -1) falls through to the catch-all World. `WorldForContinent` is
+unchanged for callers, ending in `_rostered`, which is what T138b's 9781 hand-off needs.
+`ForgetWorld` now drops a disconnected World's claims as well as its channels. Test:
+`T209d_a_battleground_roster_does_not_own_the_creation_continent`.

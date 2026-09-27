@@ -202,11 +202,17 @@ public static class SelfTest
         }
     }
 
-    /// <summary>handshake_burst.bin: parsed, not just present - a truncated file parses to fewer frames.</summary>
-    public static SelfTestResult CheckHandshakeBurst(string? path)
+    /// <summary>
+    /// handshake_burst.bin: parsed, not just present - a truncated file parses to fewer frames.
+    /// <para>T209b: no longer part of <see cref="Report"/> - the burst is built from defs, so the
+    /// file is evidence for the tests and may be absent. Pass <c>required: false</c> for that.</para>
+    /// </summary>
+    public static SelfTestResult CheckHandshakeBurst(string? path, bool required = true)
     {
         if (string.IsNullOrEmpty(path) || !File.Exists(path))
-            return new SelfTestResult("handshake burst", false, $"not found (looked at {Show(path)})");
+            return new SelfTestResult("handshake burst", !required,
+                required ? $"not found (looked at {Show(path)})"
+                         : "not present - the burst is built from defs (T209b)");
         try
         {
             var frames = DbProxyHandlers.ParseBurst(File.ReadAllBytes(path));
@@ -220,6 +226,29 @@ public static class SelfTest
         catch (Exception ex)
         {
             return new SelfTestResult("handshake burst", false, $"{ex.GetType().Name}: {ex.Message}  {path}");
+        }
+    }
+
+    /// <summary>
+    /// T209b: what a deploy must satisfy now is that the burst BUILDS - 63 frames out of
+    /// Protocol/InterServerDefinitions - not that a capture file sits next to the binary. A def
+    /// text that stops parsing, or a field renamed on one side only, fails here.
+    /// </summary>
+    public static SelfTestResult CheckHandshakeBurstBuild()
+    {
+        try
+        {
+            var frames = HandshakeBurst.Build(DateTimeOffset.UtcNow);
+            int bytes = 0;
+            foreach (var (_, payload) in frames) bytes += payload.Length + 6;
+            return frames.Count == HandshakeBurst.FrameCount
+                ? new SelfTestResult("handshake burst", true, $"{frames.Count} frames / {bytes} B built from defs")
+                : new SelfTestResult("handshake burst", false,
+                    $"built {frames.Count} frames, expected {HandshakeBurst.FrameCount}");
+        }
+        catch (Exception ex)
+        {
+            return new SelfTestResult("handshake burst", false, $"{ex.GetType().Name}: {ex.Message}");
         }
     }
 
@@ -428,10 +457,17 @@ public static class SelfTest
         {
             CheckOpcodes(Path.Combine(dataRoot, "tera-server-proxy", "data", "data.json"), versionKey),
             CheckDefinitions(Path.Combine(dataRoot, "tera_v100_MASTER_FINAL"), log),
-            CheckFixedSize("starter blob", Data("starter_blob.bin"), DbProxyHandlers.WorldBlobSize),
-            CheckFixedSize("starter inventory", Data("starter_inventory.bin"), DbProxyHandlers.StarterInventorySize),
-            CheckRecordFile("promotion records", Data("promotions_147E.bin"), DbProxyHandlers.PromotionRecordSize),
-            CheckHandshakeBurst(Data(DbProxyHandlers.HandshakeBurstFile)),
+            // T209: starter_blob.bin is an OVERRIDE now - StarterBlob.Generate builds the record
+            // when no file is there - so its absence is a WARN, not a bad deploy. A file of the
+            // wrong SIZE is still reported, because that is a truncated copy rather than none.
+            CheckFixedSize("starter blob", Data("starter_blob.bin"), DbProxyHandlers.WorldBlobSize,
+                required: false),
+            // T209c part 2: starter_inventory.bin is retired. economy.synthItemRecords defaults
+            // to true and StarterInventory.BuildSynthetic builds the records, so there is no file
+            // left to check for. A deployment that still has one keeps using it.
+            // T209b: the burst is built from defs, so the check is that it builds - the capture
+            // file is the tests' evidence now and no longer has to ship.
+            CheckHandshakeBurstBuild(),
             CheckExists("world replay log", Path.Combine(packetLogs, "arb_world.log")),
             CheckExists("spawn replay", Path.Combine(packetLogs, "full_replay.txt"), required: false),
             CheckFolder("Datasheet folder", Path.Combine(dataRoot, "Executable", "Datasheet"),
@@ -470,6 +506,7 @@ public static class SelfTest
         "TERASHARP_LOG_LEVEL",
         "TERASHARP_ITEM_STRSHEET", "TERASHARP_ITEM_NAMES",
         "TERASHARP_DATASHEET", "TERASHARP_STARTER_BLOB", "TERASHARP_STARTER_INVENTORY",
+        "TERASHARP_SYNTH_ITEM_RECORDS",                                                    // T209
         "TERASHARP_START_OVERRIDE",
         "TERASHARP_API_GATEWAY", "TERASHARP_DB_SERVER_NAME", "TERASHARP_API_JWT_SECRET",   // T124: Alt+A
         "TERASHARP_API_GATEWAY_SERVE", "TERASHARP_API_GATEWAY_BIND",                       // T132: the probe at that address
@@ -477,7 +514,10 @@ public static class SelfTest
         // the one place to look. Every one of these was readable and unreported before.
         "TERASHARP_SERVERCONFIG", "TERASHARP_STANDALONE", "TERASHARP_RANKING_SEASON",
         "TERASHARP_MATCH_ENTRY_SECONDS", "TERASHARP_MATCH_MIN_MEMBERS",
+        "TERASHARP_BF_ENTER_DELAY",                                                        // T208b
         "TERASHARP_BG_MAX_HEALERS", "TERASHARP_BG_MAX_TANKS", "TERASHARP_BROKER_FEE_PERCENT",
+        // T207: the shop page and the hub tera-api delivers purchases through.
+        "TERASHARP_SHOP_URL", "TERASHARP_HUB_LISTEN", "TERASHARP_HUB_ENABLED", "TERASHARP_HUB_SERVER_ID",
     };
 
     /// <summary>Variables whose value must never reach a log or a console.</summary>

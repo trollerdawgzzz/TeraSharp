@@ -492,3 +492,23 @@ Two things it deliberately does NOT do. It does not scrub developer paths in gen
 tree already contains `D:\...` in comments, and a blanket rewrite would touch a hundred files
 nobody asked about. And it does not pass `-AllowAddress` to the audit - if a routable public
 address survives, the run names the **master** file to fix and exits non-zero.
+
+## admin-ui-probe.mjs - drive the admin UI's sign-in path
+
+`node tools/admin-ui-probe.mjs --token <TERASHARP_ADMIN_TOKEN> [--url http://127.0.0.1:8051]
+[--root src/TeraSharp.Arbiter/Web/wwwroot]`
+
+Loads the shipped `wwwroot` into node behind a minimal DOM and drives the real sign-in path
+against a running Arbiter: the fetch wrapper, the 401 handling, the header-poll lifecycle and the
+router are all app.js's own code. Twelve checks; exit 0 is a pass, and each failure names the step.
+
+It exists because T206b was a class of bug the C# suite cannot see. The API accepted the token and
+every endpoint answered - `Invoke-RestMethod` proved it - but the sign-in form said the token was
+refused, because `app.js` armed the header poll at page load and read the resulting
+empty-token 401 as a refusal. Nothing on the server was wrong, so nothing on the server could
+fail. Run this after changing `app.js`, `index.html` or anything about the token flow.
+
+Needs node 18 or newer (for global `fetch`) and the server up. It is deliberately NOT part of
+`dotnet run --project src/TeraSharp.Arbiter.Tests`: the suite must not require node. The two
+`T206b_*` tests cover what C# can - that the listener accepts the header the UI sends, and that
+the three guards are still in the shipped module.

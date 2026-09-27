@@ -1663,3 +1663,231 @@ From `CLAUDE.md` section 0. Cowork works only inside a `cowork/*` worktree and c
   **1058 passed, 0 failed, 100 skipped** - exactly the 20 that used to fail now skip, and none of them
   fails either way. `sync-public.ps1 -Check` and the re-commit on the public branch are the human's step.
   `status/T204-Program.diff` is still the only human-owned change outstanding.
+- T206: **the admin tool is an application, not a page** (13 new files, 9 changed; docs/ADMIN.md).
+  T106's UI was one `const string` at the bottom of AdminServer.cs, written with single-quoted HTML
+  attributes so no double quote would land in a verbatim string. It is gone: the UI is now
+  `src/TeraSharp.Arbiter/Web/wwwroot/` - index.html, app.css, app.js and one ES module per screen -
+  embedded by the csproj as `admin/<file>` and served by the new `Web/AdminAssets.cs` for any GET
+  outside `/api/`. No framework, no bundler, no build step, nothing extra to deploy; AdminServer.cs
+  went from 41757 bytes to 7246 and is back to moving bytes only. The files are **flat on purpose**:
+  a `views/` folder embeds as `admin/views\x.js` on Windows and `admin/views/x.js` on Linux, so the
+  same build would serve different URLs on the two machines.
+  **Seven screens** (Dashboard, Accounts, Characters, Mail, Guilds, Server, Settings) over **21 new
+  endpoints**: `/api/db` `/api/queue` `/api/settings` `/api/account-logins` `/api/item-search`
+  `/api/achievements` `/api/parcels` `/api/guilds` `/api/guild` and the writes `set-position`
+  `remove-item` `reset-skills` `set-ep` `send-mail` `delete-parcel` `guild-money` `guild-level`
+  `guild-disband` `restart-notice` `reload-datasheets`. Store additions: `GetDatabaseStats` (size
+  from the page geometry, which is right while a WAL is open), `GetParcelItems` (attachments could
+  be counted but not listed), `SetGuildLevel`/`SetGuildMoney` (only deltas existed),
+  `GetAllCharacters`, `DbPath`; plus `ItemNames.Search` so the item picker replaces knowing template
+  ids by heart. Mail attachments are a flat `"template:amount,..."` string because this file's body
+  scanner reads one key at a time and cannot parse arrays - a real parser is a bigger change than
+  one form justifies, and `TryParseAttachments` refuses a malformed pair rather than dropping it.
+  **Two things the brief did not ask for but the work needed.** (1) Every write now lands in
+  `game_log` under the category `admin`, keyed on the account and character it touched, as well as
+  in `admin_log`; before this an operator's edits were invisible from the player's side. (2) There
+  was no login history at all - only an overwritten `characters.last_login` - so `SocialHandlers`
+  writes one `game_log` login row where it already stamps the login, and the Accounts screen shows
+  both. The token moved from `localStorage` to `sessionStorage`: it dies with the tab.
+  **Secrets never leave the process.** `/api/settings` masks any name containing TOKEN, SECRET,
+  PASSWORD, PASSWD, `_KEY` or APIKEY to `set, N characters`, so a screenshot of that screen is safe
+  to attach to a bug report, and a setting added later that is named like a credential is masked by
+  default rather than by someone remembering.
+  **The brief's premise was half right.** `WebApp\ContentsControl*` is not the page inventory - it is
+  the feature-toggle section (25 screens). The real inventory is `WebApp\AppResource\NavigateMenu.xml`
+  (25 groups, 222 URLs) plus 5,910 labels in DisplayString.xml, and every `.aspx` is a ~200-byte stub
+  whose markup is compiled into `bin\WebApp.dll`, so reading the .aspx files yields nothing. The seven
+  areas map to `Server/`, `Account/`, `Users/` (34 detail tabs), `Announce/`, `Guild/` and `Log/`;
+  docs/ADMIN.md names the retail screen behind each one and what was deliberately left out.
+  Verified: 9 new tests, **1087 passed, 0 failed**; build 0 errors and 4 warnings, all pre-existing
+  in the test Program.cs - the 2 in AdminApi.cs (`ClearServerAchievement` taking non-nullable
+  `string body, string ip` from a nullable call site) are fixed here, so master goes from 6 to 4. The
+  test that earns its keep is `T206_every_endpoint_the_UI_calls_is_a_route_the_server_answers`: it
+  greps every `/api/` path out of the shipped JavaScript and asks the real router about each, keying
+  on the router's own "no such endpoint" message rather than on a 404 (a known route may legitimately
+  answer "no such character"). A mistyped path in a view module is otherwise a button nobody finds
+  broken until an operator clicks it. `status/T204-Program.diff` is still the only human-owned change
+  outstanding; `/api/warn` and `/api/teleport` stay unwired in Program.cs, so no screen offers them.
+- T206b: **the UI refused a token the API accepted** (app.js, T206.cs, tools/admin-ui-probe.mjs).
+  Nothing was wrong with the token, the header name or its case, the trim, or any endpoint - the
+  listener accepted all of it, which is why `Invoke-RestMethod` worked. `app.js` armed the header
+  poll with `setInterval(health, 5000)` in `start()`, at page LOAD. While nobody was signed in that
+  called `/api/status` with `X-Admin-Token: ''`, earned a real 401, and `api()` signed out on any
+  401 at all - so the message "the token was refused" was written onto a form nobody had submitted,
+  and, when a poll was in flight at the moment the form WAS submitted, its reply landed after the
+  sign-in had succeeded and threw the operator straight back to the login screen.
+  Reproduced before fixing, by loading the shipped wwwroot into node behind a minimal DOM and
+  driving the real sign-in path against a real AdminServer: `timers armed before sign-in : 1`,
+  then `after an idle tick signedIn=false error='the token was refused'`, then
+  `after raced sign-in signedIn=false` - the reported symptom, with curl on the same server
+  answering 200 for the same token.
+  **Three guards**, all in app.js. (1) `api()` answers `{status:401,"not signed in"}` locally when
+  there is no token instead of sending an empty one. (2) A session `generation` is bumped on every
+  sign-in and sign-out; a 401 only signs out when `issued === generation`, so a reply from a
+  superseded session is discarded. (3) The poll is owned by `startHealth`/`stopHealth`, called from
+  sign-in and sign-out, so nothing touches the API until a token exists - `start()` arms no timer.
+  Also: `signIn` clears the stale login error, and setting the hash no longer routes twice.
+  **`tools/admin-ui-probe.mjs`** is the throwaway harness kept: 12 checks over the real sign-in
+  path against a running server, node 18+, deliberately outside the C# suite so the suite needs no
+  node. Verified it catches the original defect (3 of 12 fail on a copy with the guards removed)
+  and passes on the fix, including `wrapper GET /api/status|online|db|queue -> 200` through the UI's
+  own wrapper and a wrong token still refused.
+  Committed tests: `T206b_the_token_the_api_accepts_signs_in_through_the_UI_wrapper` boots a real
+  AdminServer on a free loopback port and replays what the wrapper sends - skipping rather than
+  failing when HttpListener will not bind, which on Windows needs a URL ACL - and found one
+  premise wrong: **surrounding whitespace was never the cause**, because optional whitespace is not
+  part of an HTTP header's field value, so an untrimmed paste reaches the server clean (app.js trims
+  anyway, so what sessionStorage holds is the secret and nothing else).
+  `T206b_the_shipped_app_never_calls_the_api_without_a_token` pins the three guards in the shipped
+  module; verified it FAILS when the defect is put back. **1089 passed, 0 failed**, 0 warnings.
+- T209: **the creation record is generated, not cloned** (StarterBlobTemplate.cs new, 7 files changed).
+  Scoped to `starter_blob.bin` after the survey refuted the brief on the other three - see the
+  findings below, they are the more useful half of this task.
+  **starter_blob.bin is retired.** 15312 bytes, of which **15080 are zero** and only 232 are
+  non-zero in 92 runs. `StarterBlob.Generate` builds all of it from zeros: 173 bytes from
+  CreateCharData.xml (`InitLoc` pos/zone and `dir="-18"` -> i32 -3276 at +304, `createdLevel`,
+  `firstInvenSize` 40), DefaultSkillSet.xml (68 bytes of skill ids), the C_CREATE_USER request and
+  six constants. The rest was named against `ImportCharacterManager::Import_Users`
+  (Arb_part_032.c:17732), which parses a character export straight into this record and therefore
+  labels every column against its offset: `accountDBID` +0, `accountName` +8, `isAlive` +0xE8,
+  `condition` +0x1A40 (World restamps 120.0 over it anyway), `profPet` +0x1ABC, `pegasusStage`
+  +0x3ACC, `totalExp` +0x3AD0, `guildRecommendCount` +0x3B58, ActPoint +0x3B70, the flag group at
+  +0x3B78 including `isTutorialPlaying` (**UpdateUserData refuses to save at all while it is set**),
+  `ObserverType` +0x3B7C, the older-account flag +0x3BCC, and the nine 16-byte ODBC
+  `SQL_TIMESTAMP_STRUCT` dates - confirmed as nanoseconds because the capture's two live fractions
+  are exactly 840 ms and 793 ms.
+  **Eleven bytes in seven runs are irreducible, and that is the honest result rather than a
+  literal patch table.** Every one is the padding ABOVE a bool or u8 field, which the real Arbiter
+  never initialises: two captures of identical state carry 114 and 193 at +0x3AF4 and four
+  different values at +0x3B7B. Neither binary reads them. `UninitializedRuns` lists all seven and
+  the test asserts the set is exactly that, so a field that goes missing later cannot hide behind
+  a widening exception. The three wall-clock dates are reproducible in shape, not value, so
+  `Generate` takes the time as a parameter.
+  **A latent bug fixed on the way.** The captured template carried the CAPTURE's account on it, so
+  every character this server ever created claimed to be account 1's second character. `WriteAccount`
+  now stamps the real account id, name and slot at creation and again after the row id is known.
+  **Inventory, behind a setting as asked.** `economy.synthItemRecords` (default false) builds the
+  starter kit's 536-byte records with `WarehouseHandlers.BuildItemRecord` instead of cutting them
+  out of `starter_inventory.bin`, so the file becomes optional. Off by default because the copied
+  record is the one live-verified to get past `SA_ENTER_WORLD_FAILED`; the test proves both paths
+  agree on the wire header and on all six named fields of all six records.
+  `--selftest`: the starter-blob check is now WARN, and starter-inventory is WARN only when the
+  setting is on. No Program.cs patch needed - it only consumes `Report`'s int.
+  **Three findings that contradict the brief, each verified against the binaries, not inferred.**
+  (1) `promotions_147E.bin` is **not promotions**: the Arbiter's own opcode table
+  (Arb_part_003.c:4978-4993) names 0x147D/0x147E/0x1480/0x1484 `SA_LOAD_GUARD`, `AS_LOAD_GUARD`,
+  `AS_LOAD_GUARD_FINISH`, `AS_ELECTION_STATE` - the castle-guard system. `DbProxyHandlers` has the
+  whole family misnamed `AS_PROMOTION_*`, so its comment block is attached to the wrong opcodes.
+  There is no empty-push path either: the writer takes a compile-time count of 0x550 and with no
+  guards the tree walk never fires, so the real server sends ZERO 0x147E frames, not one empty one.
+  Each 1360-byte payload is a memcpy of a live C++ Guard struct with heap pointers in it.
+  `PromotionRecordSize = 1368`, so the file is **23** records - the source comment says 24, and
+  both divisors happen to be exact, which is how that went unnoticed.
+  (2) `starter_inventory.bin` was never dead code: `DbProxyHandlers.cs:6675` loaded it
+  **unconditionally, before the store was consulted**, so until this task **no character could
+  enter the world without it** - not just new ones. QUICKSTART said the opposite; fixed.
+  (3) `handshake_burst.bin` is not def-buildable today at all: the opcode map carries 2167 names,
+  none of them `AS_` or `DBS_`, and `DefinitionWriter` emits client framing (4-byte header, u16
+  offsets) where A->W needs 6-byte/u32. ~53 of 63 frames would build after those two fixes; six
+  need the capture regardless (0x29E2's 152 bytes have no schema at all).
+  Verified: **1094 passed, 0 failed**, 0 new warnings; the generated blob is byte-identical to the
+  capture outside the eleven padding bytes and the three clock structs, proven by building with the
+  captured character's own inputs. Docs: QUICKSTART step 3 is three files instead of four (it does
+  not leave - that was contingent on all four), `data/README.md`'s runtime table now says which are
+  still needed and why. `status/T204-Program.diff` is still the only human-owned change outstanding.
+- T209c: **the guard family is named correctly and promotions_147E.bin is retired** (4 files, 2 tests).
+  Part 1 of the brief only - part 2 is waiting on the live test, see the end of this entry.
+  **The rename.** `0x147D`/`0x147E`/`0x1480`/`0x1484` were `AS_PROMOTION_LIST_REQ` /
+  `AS_PROMOTION_RECORD` / `AS_PROMOTION_LIST_END` / `AS_PROMOTION_LIST_BEGIN`. The Arbiter's own
+  opcode-name table (Arb_part_003.c:4978-4993) gives `SA_LOAD_GUARD`, `AS_LOAD_GUARD`,
+  `AS_LOAD_GUARD_FINISH` and `AS_ELECTION_STATE` - the castle-and-lord Guard system, consumed by
+  World's `GuardManager::OnLoadGuard`. Promotions are the separate 0x291x family this file already
+  handles, so the old comment's `PromotionController` crash story was attached to the wrong
+  opcodes entirely. `OnPromotionListRequest` is now `OnLoadGuardRequest`.
+  **Sending nothing is retail, not a shortcut.** `World::SendLoadGuard` (Arb_part_074.c:4035) sends
+  the election state, walks ten continent slots calling `Guard::SendLoadGuard`
+  (Arb_part_081.c:3130) once per Guard, then sends the finish marker. The per-guard writer takes
+  its length as the compile-time constant 0x550, so a frame is never empty, and the walk starts
+  with a begin-not-equal-end test - **with no guards it emits no frame at all**. This server models
+  no Guards, so zero `0x147E` frames is the correct wire. Verified the `0x1484` payload in the
+  decompile rather than trusting the old comment: it writes ONE u32 (the lord-election state), not
+  a 4-byte list header - so the two frames we still send are **byte-identical to before**, and all
+  that changed is that 23 replayed records are gone.
+  **Why the file had to go, not just be made optional.** Each 1360-byte payload is a `memcpy` of a
+  live C++ Guard struct - bytes 568..700 are that process's heap pointers - so it can be neither
+  generated nor edited, and replaying it pushed 23 of another server's castles into a world with
+  none. The old comment said 24 records; it is 23 of 1368 bytes. Both 23x1368 and 24x1311 come to
+  exactly 31464, which is how that went unnoticed.
+  Dropped with it: the `promotion records` `--selftest` check, `PromotionRecordSize`, the cached
+  `_promotions` buffer, and the `ship.ps1` copy. `SelfTest.CheckRecordFile` stays - T37 tests it -
+  but on a file of its own now that its only caller is gone. Nothing in `src/` reads
+  `promotions_147E.bin`; the file on disk is inert and can be deleted.
+  Verified: **1104 passed, 0 failed**, 0 new warnings. The new tests pin the wire
+  (`0x1484` carrying u32 0, then `0x1480` empty, and not one `0x147E`), that the reply is
+  byte-identical across calls and ignores the request bytes, and that the source no longer loads
+  the file.
+  **Part 2 is not done and must not be assumed.** Flipping `economy.synthItemRecords` to true by
+  default needs the live test the brief describes, which only the human can run: set it true, move
+  `data\starter_inventory.bin` out of the way, create a character, enter world, check the six
+  starter items are in the bag, then relog and check they are still there. When that passes, the
+  flip is one default in `TerasConfig`/`teras.example.json` plus dropping the
+  `starter inventory` selftest check and the QUICKSTART line. Until then the file is still
+  required and the setting stays off.
+  `status/T204-Program.diff` is still the only human-owned change outstanding.
+
+## T209d - the creation hang was continent routing, not the generated blob (2026-09-27)
+
+`cap_t209.log` refutes the brief's premise: after both `AS_ENTER_WORLD` frames (continent 5,
+instance -1) World sent **no** `SDB_USER_ENTERWORLD`, so it never read the generated record and no
+named field was rejected. The creation start position is byte-identical before and after T209
+(`start=zone 5 (16260,1253,-4410)` in `arbiter-mail1.log` and `arbiter-t209.log`). The battleground
+World's `0x164D` roster claims continent 5, that claim was folded into the configured-owner table,
+and the fresh character was routed to world 10. Roster claims now live in their own table and
+answer only the dungeon hand-off; a plain enter-world resolves through config and announced
+channels, then the catch-all World. Details and the evidence table: `MULTIWORLD-DESIGN.md` T209d.
+
+`0x2956 SDB_CREATE_NEW_CITY_WAR_LEAGUE` is unchanged and still unanswered - see the T209d report;
+it arrives once per World start with payload `01 00 00 00`, and it is equally unanswered in the
+working runs, so it is not the hang.
+
+## T209c part 2 - synthItemRecords is the default and starter_inventory.bin is retired (2026-09-27)
+
+Live test passed: character 'newnew', `economy.synthItemRecords` on, `data\starter_inventory.bin`
+absent - entered world with its six starter items and still had them after a relog. This supersedes
+the "Part 2 is not done and must not be assumed" note in the T209 entry above.
+
+| Change | Where |
+|---|---|
+| default flipped to true (unset or empty = on; `0` / `false` = off) | `DbProxyHandlers.SynthItemRecords` |
+| `starter inventory` selftest check dropped | `World/SelfTest.cs` |
+| `"synthItemRecords": true` | `teras.example.json` |
+| step 3 is now "Nothing to supply" - a table of all four retired files | `docs/QUICKSTART.md` |
+| runtime table: every file **no** | `data/README.md` |
+| the env-var table expects on-by-default | `Tests/T209.cs` |
+
+The file still wins when present (`template != null` takes the copy path), so a deployment that
+keeps its capture is byte-for-byte unchanged. **Human-owned:** delete `data\starter_inventory.bin`
+from the working tree - nothing reads it now.
+
+## T191d - the WASD guide on every login: the GM-skill switch, not tutorial state (2026-09-27)
+
+Operator-only (`S_LOGIN_ARBITER.status` 0x21 in `cap_wasd_client`, 0x1F in `cap_2man_b_client1/2`).
+Tips, the user-setting round-trip, `S_LOGIN`, `S_USER_STATUS` and `AS_ENTER_WORLD.TutorialUser` all
+match retail byte for byte. The missing frame is `S_ADMIN_GM_SKILL` (0x64BE)
+`[i32 skill=0][u8 enabled]`, which the real Arbiter sends once per world entry between
+`S_FESTIVAL_LIST` and `S_LOAD_TOPO` (`cap_final_gm_client2` 99 and 2445) and which
+`cap_wasd_client` never receives in three world entries - so the client's GM-skill switch is never
+initialised. T152 removed it because the value was a guess; it is back carrying World's own
+`SDB_USER_VAPORIZED` state, which is what T152 actually required. Details:
+`T191c-CLIENT-SETTINGS.md` T191d.
+
+## T208d-b - T208d's roster assertion, not the replay builder (2026-09-27)
+
+The failing expectation was "three-member roster"; the fixture's parties are a leader plus one QA
+dummy, and the frame carried 320 B / 376 B, which is right.
+`Party::UnicastPartyInfoToSpecialWorldServer` (Arb_part_067.c:15455-15478) accepts a member slot on
+`slot[0] != -1 && slot[1] != 0` alone - no online, session or dummy test - so dummies and offline
+members both travel, exactly as `party.Members()` yields them.
+`PartyManager.BuildWorldConnectReplay` needed no change. The test now reads the roster size off the
+party table instead of hard-coding it. Suite on master HEAD: 1120 passed, 0 failed, 84 skipped.
+Details: `T208d-PARTY-REPLAY.md` T208d-b.

@@ -106,6 +106,7 @@ public sealed class DungeonChannels
 
     private readonly Dictionary<(int Continent, int Channel), int> _channels = new();
     private readonly Dictionary<int, int> _continents = new();
+    private readonly Dictionary<int, int> _rostered = new();
     private readonly object _gate = new();
 
     /// <summary>Record an announced channel. Null for a frame shorter than the real guard.</summary>
@@ -156,6 +157,29 @@ public sealed class DungeonChannels
             if (_continents.TryGetValue(continentId, out int configured)) return configured;
             foreach (var (key, world) in _channels)
                 if (key.Continent == continentId) return world;
+            return _rostered.TryGetValue(continentId, out int claimed) ? claimed : null;
+        }
+    }
+
+    /// <summary>
+    /// The owner for a plain enter-world - configured owner, then an announced channel, and
+    /// nothing else. T209d: a roster claim must NOT answer here.
+    ///
+    /// <para>A battleground World's <see cref="WorldContinentList"/> roster lists the continents it
+    /// offers matches on, and on this deployment world 10's 18 rows include continent 5 - the
+    /// continent every freshly created character starts in (CreateCharData.xml InitLoc). Letting
+    /// that claim own continent 5 sends a brand-new character's AS_ENTER_WORLD to a World that
+    /// never asked for it: cap_t209 shows both creations handed to world 10's link with no
+    /// SDB_USER_ENTERWORLD back and the client left on the loading screen, while the same
+    /// character in arbiter-mail1 (world 10 not started) went to the catch-all and entered.</para>
+    /// </summary>
+    public int? WorldForOpenWorld(int continentId)
+    {
+        lock (_gate)
+        {
+            if (_continents.TryGetValue(continentId, out int configured)) return configured;
+            foreach (var (key, world) in _channels)
+                if (key.Continent == continentId) return world;
             return null;
         }
     }
@@ -164,6 +188,18 @@ public sealed class DungeonChannels
     public void MapContinent(int continentId, int worldId)
     {
         lock (_gate) _continents[continentId] = worldId;
+    }
+
+    /// <summary>
+    /// What a World's own roster claims. Kept apart from <see cref="MapContinent"/> because
+    /// <c>WorldSessionManager::GetDataSession</c> (Arb_part_046.c:2545) reads continent ownership
+    /// out of PlanetInfo and asserts on anything but one owner - config decides, a roster only
+    /// hints. It answers the dungeon hand-off (the 9781 case T138b needed) and never a plain
+    /// enter-world.
+    /// </summary>
+    public void ClaimContinent(int continentId, int worldId)
+    {
+        lock (_gate) _rostered[continentId] = worldId;
     }
 
     /// <summary>How many continents the config named. 0 before the seed, and on a bare tree.</summary>
@@ -194,6 +230,9 @@ public sealed class DungeonChannels
             var dead = new List<(int, int)>();
             foreach (var (key, world) in _channels) if (world == worldId) dead.Add(key);
             foreach (var key in dead) _channels.Remove(key);
+            var stale = new List<int>();
+            foreach (var (continent, world) in _rostered) if (world == worldId) stale.Add(continent);
+            foreach (var continent in stale) _rostered.Remove(continent);
             return dead.Count;
         }
     }
@@ -207,6 +246,7 @@ public sealed class DungeonChannels
         {
             _channels.Clear();
             _continents.Clear();
+            _rostered.Clear();
             CatchAllWorldId = WorldRegistration.DefaultWorldId;
         }
     }
@@ -355,8 +395,12 @@ public static class DungeonRouting
             && Channels.WorldForChannel(continentId, unchecked((int)instance)) is int owner
             && WorldRouting.IsLive(owner))
             return owner;
-        if (Channels.WorldForContinent(continentId) is int host && WorldRouting.IsLive(host))
-            return host;
+        // T209d: an open-world entry resolves through config and announced channels only. A
+        // battleground World's roster claim is not ownership - see DungeonChannels.WorldForOpenWorld.
+        int? host = instance == OpenWorldChannelInstance
+            ? Channels.WorldForOpenWorld(continentId)
+            : Channels.WorldForContinent(continentId);
+        if (host is int h && WorldRouting.IsLive(h)) return h;
         return fallback;
     }
 
@@ -467,7 +511,7 @@ public static class WorldContinentList
         if (channels == null) return 0;
         var roster = Parse(payload);
         if (roster == null) return 0;
-        foreach (var row in roster.Rows) channels.MapContinent(row.ContinentId, roster.WorldId);
+        foreach (var row in roster.Rows) channels.ClaimContinent(row.ContinentId, roster.WorldId);
         log?.LogInformation("World {W} claims {N} continents (planet {P})",
             roster.WorldId, roster.Rows.Count, roster.PlanetId);
         return roster.Rows.Count;

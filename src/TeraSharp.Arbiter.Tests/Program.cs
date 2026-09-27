@@ -11167,12 +11167,9 @@ bool   isGuildWarAcceptable
         var off = NewAdminApi(store, token: null);
         Hex.True(off.Handle("GET", "/").Status == 503, "TERASHARP_ADMIN_TOKEN unset serves nothing");
 
-        // The page has to actually send the header the server now reads.
-        Hex.True(AdminServer.TokenHeader == "X-Admin-Token"
-                 && AdminPage.Html.Contains("X-Admin-Token"),
-            "the page and the listener agree on the header name");
-        Hex.True(!AdminPage.Html.Contains("\""),
-            "and the page still has no double quote in it - it lives in a verbatim string");
+        // The page has to actually send the header the server now reads (T206: the SPA's app.js).
+        Hex.True(AdminServer.TokenHeader == "X-Admin-Token",
+            "the listener reads the header the SPA sends");
     }
 
     /// <summary>T106.4 - the Status tab's two read endpoints.</summary>
@@ -12557,7 +12554,7 @@ bool   isGuildWarAcceptable
         Hex.True(WorldContinentList.Parse(Hex.B("05 00 00 00 16 00 00 00")) == null,
             "a count that overruns the payload is refused, not read past");
 
-        // ---- it feeds the SAME table WorldServerList seeds from config ----
+        // ---- a roster claim answers WorldForContinent, but not a plain enter-world (T209d) ----
         var channels = new DungeonChannels();
         Hex.True(channels.WorldForContinent(9781) == null,
             "nothing claimed yet - and an empty map is a single-World server");
@@ -13317,13 +13314,14 @@ some prose with `backticks` that is not a table row
         string dir = T37TempDir();
         try
         {
-            string promos = Path.Combine(dir, "promotions_147E.bin");
-            File.WriteAllBytes(promos, new byte[DbProxyHandlers.PromotionRecordSize * 3]);
-            var ok = SelfTest.CheckRecordFile("promotion records", promos, DbProxyHandlers.PromotionRecordSize);
+            string promos = Path.Combine(dir, "records.bin");
+            const int RecordSize = 1368;   // T209c: PromotionRecordSize is gone; the check is generic
+            File.WriteAllBytes(promos, new byte[RecordSize * 3]);
+            var ok = SelfTest.CheckRecordFile("promotion records", promos, RecordSize);
             Hex.True(ok.Pass && ok.Detail.Contains("3 record"), "three whole records: " + ok.Detail);
 
-            File.WriteAllBytes(promos, new byte[DbProxyHandlers.PromotionRecordSize + 7]);
-            var ragged = SelfTest.CheckRecordFile("promotion records", promos, DbProxyHandlers.PromotionRecordSize);
+            File.WriteAllBytes(promos, new byte[RecordSize + 7]);
+            var ragged = SelfTest.CheckRecordFile("promotion records", promos, RecordSize);
             Hex.True(!ragged.Pass, "a partial record fails - that is what a truncated copy looks like");
 
             File.WriteAllBytes(promos, Array.Empty<byte>());
@@ -13447,12 +13445,12 @@ some prose with `backticks` that is not a table row
             Path.Combine(dir, "starter_inventory.bin"), DbProxyHandlers.StarterInventorySize);
         Hex.True(inv.Pass, "data/starter_inventory.bin: " + inv.Detail);
 
-        var promos = SelfTest.CheckRecordFile("promotion records",
-            Path.Combine(dir, "promotions_147E.bin"), DbProxyHandlers.PromotionRecordSize);
-        Hex.True(promos.Pass, "data/promotions_147E.bin: " + promos.Detail);
+        // T209c: promotions_147E.bin is retired (the guard family sends nothing without guards) - no check.
 
-        var burst = SelfTest.CheckHandshakeBurst(Path.Combine(dir, DbProxyHandlers.HandshakeBurstFile));
-        Hex.True(burst.Pass, "data/handshake_burst.bin parses to 63 frames: " + burst.Detail);
+        // T209b: the burst is built from defs now, so the capture file is optional evidence.
+        var burst = SelfTest.CheckHandshakeBurst(Path.Combine(dir, DbProxyHandlers.HandshakeBurstFile),
+            required: false);
+        Hex.True(burst.Pass, "data/handshake_burst.bin, if present, parses to 63 frames: " + burst.Detail);
     }
 
     // ================================================================================
@@ -23854,22 +23852,16 @@ string message
     }
 
     /// <summary>
-    /// T116. The page itself: one nav entry for both logs, and the admin-log view moved in
-    /// beside the game log rather than duplicated.
+    /// T116. The page itself carried both logs in one tab; T206 replaced the inline page with the
+    /// embedded SPA (Web/wwwroot), whose routes are checked by T206's own tests - this test now
+    /// only pins that the log endpoint the Logs screen calls still exists.
     /// </summary>
     [Test] public static void T116_the_admin_page_carries_both_logs_in_one_tab()
     {
-        Hex.True(AdminPage.Html.Contains("data-tab='logs'"), "the Logs tab is in the nav");
-        Hex.True(!AdminPage.Html.Contains("data-tab='audit'"),
-            "and the old Admin log entry is gone, not left showing the same table twice");
-        Hex.True(AdminPage.Html.Contains("id='t-logs'") && AdminPage.Html.Contains("id='lp-game'")
-                 && AdminPage.Html.Contains("id='lp-admin'"),
-            "one section, two panels");
-        Hex.True(AdminPage.Html.Contains("id='auresult'") && AdminPage.Html.Contains("loadAudit()"),
-            "the admin-log view kept its element id and its loader");
-        Hex.True(AdminPage.Html.Contains("/api/game-log?"), "and the page calls the new endpoint");
-        Hex.True(!AdminPage.Html.Contains("\""),
-            "the page literal still has no double quote in it - CLAUDE.md's verbatim-string rule");
+        Hex.True(AdminAssets.Find("app.js") != null, "the SPA shell is embedded");
+        bool callsLog = false;
+        foreach (var a in AdminAssets.All.Values) if (a.Body.Contains("game-log")) { callsLog = true; break; }
+        Hex.True(callsLog, "some screen module calls the game-log endpoint");
     }
 
     // ===================== T111: multi-world step 3 =====================

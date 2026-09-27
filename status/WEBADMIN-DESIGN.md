@@ -545,3 +545,30 @@ number summed by the account row. `S_SEND_USER_PLAY_TIME` and `S_PLAY_TIME` both
 **`S_GET_USER_LIST` cannot.** The brief asked for it there; the shipped `S_GET_USER_LIST.18.def`
 has no play-time field at all - `lastLogoutTime`, `deleteTime` and `banEndTime` are the only times
 in it - so there is nowhere in the lobby packet to put the figure.
+
+## T206 - the page became an application
+
+Sections 1-6 above described one page with a nav and a handful of forms, and that is what T101-T116
+shipped: a `const string` at the bottom of `AdminServer.cs`, written with single-quoted HTML
+attributes so no double quote would appear in a verbatim string. It reached its limit - ES modules
+cannot import each other out of one string literal, and the screens this doc still describes as
+future work each need their own code.
+
+**The UI is now `src/TeraSharp.Arbiter/Web/wwwroot/`**: `index.html`, `app.css`, `app.js` and one
+module per screen, embedded by the csproj as `admin/<file>` and served by `Web/AdminAssets.cs` for
+any GET outside `/api/`. No framework, no build step; `AdminPage` is gone. Screen-by-screen
+documentation, and what of retail each screen replaces, is `docs/ADMIN.md` - this file stays the
+record of what the RETAIL tool does and why the API answers the way it does.
+
+Two decisions here that the API shape depends on:
+
+- **The token moved from `localStorage` to `sessionStorage`.** It now dies with the browser tab. A
+  GM token surviving a closed browser on a shared machine is a real exposure for no real gain.
+- **Every write is audited twice.** `admin_log` is still the tool's own chronological feed, and
+  `AdminApi.Log` now also writes a `game_log` row under the category `admin`, keyed on the account
+  and character it touched. Before this, an operator's edits were invisible from the player's side:
+  searching a character's history showed nothing anyone had done to them.
+
+Section 6's phase-3 list is unchanged - `/api/bulk-mail`, `/api/event` and `/api/festival` still
+answer 501 - but bulk mail as a *workflow* is done: `POST /api/send-mail` takes `all:"online"` or
+`all:"everyone"`, which is what retail's TeraTime and MailEvent forms did.

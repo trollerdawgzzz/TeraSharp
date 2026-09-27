@@ -93,6 +93,10 @@ you let anyone log in.
 `docs/GO-LIVE.md` covers the things that matter once it is public: turning auth on, GM
 accounts, the admin panel, logging, backups and the firewall.
 
+`docs/OPERATIONS.md` is the runbook for after that - the 30-minute backup task and the restore
+drill, announce/kick/stop and the boot order, log rotation and what the Dashboard tiles mean,
+ship-then-deploy, and which changes need a World restart rather than an Arbiter one.
+
 ## Tests
 
 ```
@@ -108,7 +112,7 @@ doubles as the CI gate. Tests whose fixtures are absent skip and say so.
 src/TeraSharp.Arbiter/        the server
 src/TeraSharp.Arbiter.Tests/  the test runner
 src/TeraSharp.TestClient/     a minimal protocol client for poking at it
-docs/                         ARCHITECTURE, SETUP, GO-LIVE
+docs/                         ARCHITECTURE, SETUP, GO-LIVE, OPERATIONS
 status/                       design notes, one per subsystem
 tools/                        capture conversion, backups, firewall, release audit
 data/                         fixture + runtime blobs you generate yourself (empty on clone)

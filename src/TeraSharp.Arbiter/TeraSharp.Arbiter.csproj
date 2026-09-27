@@ -19,6 +19,15 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- T206: the admin UI, compiled in. Flat on purpose - a subdirectory would embed as
+         "admin/views\x.js" on Windows and "admin/views/x.js" on Linux, and the same build would
+         serve different URLs on the two machines. See Web/AdminAssets.cs. -->
+    <EmbeddedResource Include="Web\wwwroot\*.*">
+      <LogicalName>admin/%(Filename)%(Extension)</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
+
+  <ItemGroup>
     <!-- T199: editable custom policy plus the identical XML as the missing-file fallback. -->
     <Content Include="..\..\data\custom-datasheets\TeraSharpBattlegroundRating.xml"
              Link="custom-datasheets\TeraSharpBattlegroundRating.xml"

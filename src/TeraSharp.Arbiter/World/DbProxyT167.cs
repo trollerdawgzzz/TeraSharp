@@ -41,18 +41,42 @@ public sealed partial class DbProxyHandlers
 
     // ------------------------------------------------------------------ cards
 
+    /// <summary>
+    /// T210. Accounts whose collection was just perfected. Native
+    /// Account::ResetCardCollectionBook resets the in-memory Account, so the refresh the command
+    /// asks for describes THAT: preset amount 1, no presets, no combines, no claimed book rewards
+    /// (cap_2man_b_client2 2705). The stored rows are untouched and the next login reports them
+    /// again (cap_2man_b_client2 3634). One shot, so only that refresh sees it.
+    /// </summary>
+    private static readonly HashSet<long> PerfectCardRefresh = new();
+
+    public static void MarkPerfectCardRefresh(long accountId)
+    { if (accountId > 0) lock (PerfectCardRefresh) PerfectCardRefresh.Add(accountId); }
+
+    internal static bool TakePerfectCardRefresh(long accountId)
+    { lock (PerfectCardRefresh) return PerfectCardRefresh.Remove(accountId); }
+
+    internal static void ResetPerfectCardRefreshForTests()
+    { lock (PerfectCardRefresh) PerfectCardRefresh.Clear(); }
+
     /// <summary>SDB_REQUEST_CARD_DATA (0x2986, guard 0x16): DlmId@0, AccountDbId i64@4, UserDbId@12.</summary>
     private bool OnRequestCardData(WorldLink link, byte[] payload)
     {
         long account = Ep64(payload, 4);
         int character = Ep32i(payload, 12);
-        var info = _store?.GetCardInfo(account) ?? CharacterStore.DefaultCardInfo;
+        bool perfected = TakePerfectCardRefresh(account);   // T210
+        var stored = _store?.GetCardInfo(account) ?? CharacterStore.DefaultCardInfo;
+        var info = perfected
+            ? (stored with { PresetAmount = CharacterStore.DefaultCardInfo.PresetAmount })
+            : stored;
         var reply = BuildDbsResponseCardData(Ep32(payload, 0), ok: true, info,
-            _store?.GetCardPresetIndex(character) ?? 0,
+            perfected ? 0 : _store?.GetCardPresetIndex(character) ?? 0,
             _store?.GetAccountCards(account) ?? Array.Empty<CharacterStore.CardRow>(),
-            _store?.GetCardMounts(character) ?? Array.Empty<CharacterStore.CardMountRow>(),
-            _store?.GetCardCombines(account) ?? Array.Empty<CharacterStore.CardCombineRow>(),
-            _store?.GetCardBookRewards(account));   // T168
+            perfected ? Array.Empty<CharacterStore.CardMountRow>()
+                      : _store?.GetCardMounts(character) ?? Array.Empty<CharacterStore.CardMountRow>(),
+            perfected ? Array.Empty<CharacterStore.CardCombineRow>()
+                      : _store?.GetCardCombines(account) ?? Array.Empty<CharacterStore.CardCombineRow>(),
+            perfected ? Array.Empty<int>() : _store?.GetCardBookRewards(account));   // T168
         link.SendFrame(DBS_RESPONSE_CARD_DATA, reply);
         return true;
     }

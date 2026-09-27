@@ -289,6 +289,34 @@ public static class PartyWiring
         return true;
     }
 
+    /// <summary>
+    /// T208d. Replay every live party to a World that has just connected - our half of
+    /// <c>PartyManager::OnConnectWorldServer</c>; the decompile is on
+    /// <see cref="PartyManager.BuildWorldConnectReplay"/>.
+    ///
+    /// <para>Unicast, not broadcast: retail's function is literally
+    /// <c>Party::UnicastPartyInfoToSpecialWorldServer(int)</c>, and the live mirror path
+    /// (<see cref="RouteWorldAction"/>) already reaches every World for parties that form later.
+    /// The frames go out through <see cref="WorldBridge.SendFrame(int, ushort, byte[])"/>, the same
+    /// per-World send that path uses, so the replay lands on whichever link of that World would
+    /// have carried the original.</para>
+    ///
+    /// <para>Returns how many frames went out - 0 when no party exists, which is the normal case
+    /// for the first World to come up.</para>
+    /// </summary>
+    public static int ReplayToWorld(int worldId)
+    {
+        var world = Bridge;
+        if (world == null) return 0;
+        var frames = Manager.BuildWorldConnectReplay();
+        foreach (var (op, payload) in frames) world.SendFrame(worldId, op, payload);
+        if (frames.Count > 0)
+            PartyLog.LogInformation(
+                "party: world {W} connected while {N} party/parties existed - replayed {F} mirror frame(s)",
+                worldId, frames.Count / 2, frames.Count);
+        return frames.Count;
+    }
+
     private static IClientSink? Sink(GameSession? s) => s == null ? null : new SessionSinkAdapter(s);
 
     // T195: native party membership uses PDId, not bypass slot. cap_instance1
