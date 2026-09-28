@@ -150,3 +150,53 @@ Run on master HEAD, Linux, no capture fixtures and no `.def` tree: **945 passed,
 `T183_registry_separates_camp_and_guild_title_in_376012` passes again. The 10 further failures
 seen in that second configuration are this sandbox, not the code: no `tera_v100_MASTER_FINAL`
 (so every shipped-def test fails) plus the two that want Windows paths and a real World.
+
+## T207c - every call tera-api can make, and what it gets
+
+`arbiter-bg3.log` has `hub: unhandled OpUent call 3 (0 B)` every ten seconds from 20:47:30. That is
+`hubFunctions.js`'s `getServerStat`: inner id 3 to `gusid.userentity` with an empty
+`GetServerStatReq`, which is why the payload is zero bytes, run on a ten-second schedule.
+
+### OpUent (target `gusid.userentity`, 0xFF000000)
+
+| Id | tera-api call | Answer |
+|---|---|---|
+| 1 | `queryUser` | **answered** (T207) - `QueryUserAns { fixed64 userSrl, fixed32 serverId }`, serverId 0 when the account is not on this server |
+| 3 | `getServerStat` | **answered** (T207c) - one `ServerInfo { fixed32 serverId = 1, fixed32 userCnt = 2 }` at field 1 |
+| 5 | `getAllServerStat` | **refused by name** - its Ans wants `{ serverId, lastMsg, ip, port }` for every server in the platform; TeraSharp is one server with no registry to enumerate, and tera-api reads login ip/port from its own `server_info` table |
+
+**What 3 is actually for.** Not the admin panel's Online page - that uses `kickUser` / `bulkKick`
+and its own database. It is `ServerCheckActions.all` (`src/actions/serverCheck.actions.js`), the
+availability poll:
+
+```js
+stat?.serverList && stat.serverList.find(s => s.serverId == server.get("serverId"))
+```
+
+A match marks the server available with `method: "Hub"`; no match falls back to a TCP probe of
+`loginPort`, or to unavailable. So `serverId` in the answer is the **plain server number** tera-api
+keeps in `server_info` - `TERASHARP_HUB_SERVER_ID`, 2800 by default - **not a gusid**. Getting that
+wrong is silent: the row simply never matches and the panel keeps port-probing.
+
+`userCnt` is the number of **distinct accounts** in world; the message has no field for account
+ids, so "count + account ids" is a count. The de-duplication is in `HubServer.OnlineAccountIds`, so
+two characters of one account are one user whichever side supplies the list.
+
+### OpArb (target this server's gusid, or the box API)
+
+| Id | tera-api call | Answer |
+|---|---|---|
+| 1 | `opMsg` | **answered** - the box API: gufid 107 CreateBox, 115 GetPageServiceItem, 116 GetServiceItem, 117 CreateServiceItem, 118 SetDisableServiceItem |
+| 2 | `kickUser` | **answered** |
+| 4 | `sendMsg` | **answered** |
+| 6 | `bulkKick` | **answered** (acked, nothing kicked - TeraSharp has no maintenance kick) |
+| 15 | `boxNotiUser` | **answered** |
+| 38 | `addBenefit` | **answered** |
+| 40 | `removeBenefit` | **answered** |
+
+Nothing in `hubFunctions.js` reaches an unhandled branch any more. The branch stays, because an id
+tera-api does not have a function for is still worth a warning.
+
+Tests: `T207c_the_ten_second_server_stat_poll_is_answered` drives the captured 0-byte call through
+the real frame path; `T207c_an_empty_server_still_reports_itself`;
+`T207c_every_opuent_call_tera_api_can_make_is_decided`.

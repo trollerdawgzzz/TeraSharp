@@ -61,6 +61,11 @@ datasheets loaded from your tree rather than a built-in copy, and the handful of
 legal, silent and almost always wrong. `--selftest` opens every required file and exits non-zero if
 one is missing. Do not skip it.
 
+The first line to read in either is **`TERASHARP_AUTH`**. `setup.ps1` writes `auth.enabled = true`
+with an `auth.url`, and with those two off or empty every login is accepted whatever the name -
+`start.ps1` will not boot without them. The second is `TERASHARP_BIND`: off `127.0.0.1` it is a
+failed `--selftest`, because the client port does not check GM privilege on `C_ADMIN`.
+
 ### 5. Start
 
 ```powershell

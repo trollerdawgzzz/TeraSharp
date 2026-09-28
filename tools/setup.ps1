@@ -404,7 +404,10 @@ $settings = [ordered] @{
     }
     listener    = [ordered] @{ bind = '127.0.0.1' }
     planet      = [ordered] @{ dbServerName = ('PlanetDB_' + $PlanetId) }
-    auth        = [ordered] @{ enabled = $true; url = 'http://127.0.0.1:8080'; gmAccounts = $GmAccount }
+    # T215: enabled is FORCED true on every run - an open login is the one setting that turns
+    # this from a server into a free account generator, and start.ps1 refuses to boot without it.
+    # The url keeps an existing answer, so moving tera-api survives a re-run.
+    auth        = [ordered] @{ enabled = $true; url = (Get-Existing $existing 'auth' 'url' 'http://127.0.0.1:8080'); gmAccounts = $GmAccount }
     admin       = [ordered] @{ token = $adminToken; port = $adminPort }
     gateway     = [ordered] @{ address = '127.0.0.1:8800'; serve = $false; bind = ''; jwtSecret = $jwtSecret }
     knobs       = [ordered] @{ logLevel = 'Warning'; rankingSeason = 15; startOverride = ''; standalone = '' }
@@ -629,9 +632,12 @@ $startBody = @'
     is up.
 
     -Only <name> starts one process. -WaitSeconds changes the per-step timeout.
+
+    T215: it refuses to boot at all when teras.json says the login is open or the client port is
+    off loopback. -Insecure starts anyway and is for a laptop, never for a public host.
 #>
 [CmdletBinding()]
-param([string] $Only, [int] $WaitSeconds = 240)
+param([string] $Only, [int] $WaitSeconds = 240, [switch] $Insecure)
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
@@ -639,6 +645,45 @@ $here = $PSScriptRoot
 $cfg  = (Get-Content -LiteralPath (Join-Path $here 'teras.json') -Raw) | ConvertFrom-Json
 $root = $cfg.deployment.root
 $exe  = Join-Path $root 'Executable'
+
+# ---------------------------------------------------------------- T215 preflight
+# Two settings decide whether this stack is safe to have listening, and neither is worth a
+# warning nobody reads. auth.enabled=false accepts every login; listener.bind off loopback puts
+# the client port - which does NOT check GM privilege on C_ADMIN - on the network with only the
+# proxy in front of it. Both refuse the boot; -Insecure overrides, and says so in the log.
+function Get-Setting {
+    param($Node, [string] $Name, $Fallback = $null)
+    if ($null -eq $Node) { return $Fallback }
+    if (-not ($Node.PSObject.Properties.Name -contains $Name)) { return $Fallback }
+    $value = $Node.$Name
+    if ($null -eq $value) { return $Fallback }
+    return $value
+}
+
+$authNode = Get-Setting $cfg 'auth'
+$authOn   = [bool] (Get-Setting $authNode 'enabled' $false)
+$authUrl  = [string] (Get-Setting $authNode 'url' '')
+$bind     = [string] (Get-Setting (Get-Setting $cfg 'listener') 'bind' '127.0.0.1')
+
+$blockers = @()
+if (-not $authOn) {
+    $blockers += 'auth.enabled is false - every login would be accepted, whatever the name. Set it to true (TERASHARP_AUTH) and re-run tools\setup.ps1.'
+} elseif ([string]::IsNullOrWhiteSpace($authUrl)) {
+    $blockers += 'auth.enabled is true but auth.url is empty - there is nowhere to validate a ticket. Point it at tera-api (TERASHARP_AUTH_URL), e.g. http://127.0.0.1:8080.'
+}
+if ($bind.Trim() -ne '' -and $bind.Trim() -ne '127.0.0.1' -and $bind.Trim() -ne '::1' -and $bind.Trim() -ne 'localhost') {
+    $blockers += ('listener.bind is ' + $bind + ', not loopback - the client port does not check GM privilege on C_ADMIN. Set listener.bind to 127.0.0.1 (TERASHARP_BIND) and let the proxy face the network.')
+}
+
+if ($blockers.Count -gt 0) {
+    Write-Host '== refusing to start' -ForegroundColor Red
+    foreach ($b in $blockers) { Write-Host ('   ' + $b) -ForegroundColor Red }
+    if (-not $Insecure) {
+        Write-Host '   nothing was started. -Insecure boots anyway; never use it on a public host.' -ForegroundColor Yellow
+        exit 2
+    }
+    Write-Host '   -Insecure given: booting an UNSAFE configuration on purpose.' -ForegroundColor Yellow
+}
 
 function Wait-Port {
     param([int] $Port, [string] $What, [int] $Seconds)
@@ -790,6 +835,7 @@ if ($script:Problems -gt 0) {
 }
 Write-Host "Setup complete." -ForegroundColor Green
 Write-Host "  .\start.ps1     boots Topography, TeraSharp, the Worlds and the proxy, in order"
+Write-Host "                  it refuses to boot with auth off or the client port off loopback (-Insecure overrides)"
 Write-Host "  .\stop.ps1      announces, kicks, stops"
 Write-Host ("  players connect to " + $PublicHost + ":" + $proxyPort)
 Write-Host "  docs\QUICKSTART.md is the five-step version of this; docs\GO-LIVE.md before anyone else logs in."

@@ -263,6 +263,15 @@ in GO-LIVE.
 
 ## 5. Three settings a public server must never leave on
 
+Before those three, the two that `start.ps1` will not boot without (T215) - it exits 2 and starts
+nothing, and `-Insecure` is the override:
+
+| Setting | Production | What happens without it |
+|---|---|---|
+| `TERASHARP_AUTH` / `auth.enabled` | **true**, with `TERASHARP_AUTH_URL` pointing at tera-api | Every login is accepted whatever the name: `AcceptAllAuthProvider` does not ask anybody. This is the one that costs you the account table, which is why it is the first line of `--check-config` worth reading. |
+| `TERASHARP_BIND` / `listener.bind` | **`127.0.0.1`** | The client port faces the network, and it does not check GM privilege on `C_ADMIN` - the proxy on 7801 is the only gate. A FAILED `--selftest` since T215, not a warning. |
+
+
 | Setting | Production | What it does if left on |
 |---|---|---|
 | `TERASHARP_API_GATEWAY_SERVE` | **unset** | Starts the T132 probe listener at `apiServerAddress`. Unlike the admin web it is allowed to bind beyond loopback (`TERASHARP_API_GATEWAY_BIND`), it answers **every path**, and it logs each request's full headers and cookies. It is a measuring instrument, not the Alt+A gate (T144b) - on a public box it is an open HTTP port that writes what it is sent into your log. |

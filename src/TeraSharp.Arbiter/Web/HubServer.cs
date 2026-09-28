@@ -56,6 +56,11 @@ public sealed class HubServer : IDisposable
         public Func<long, int>? Kick { get; set; }
         /// <summary>True when the account has a session on this server.</summary>
         public Func<long, bool>? IsOnline { get; set; }
+        /// <summary>
+        /// T207c: every account with a session on this server, for GetServerStat's user count.
+        /// Null falls back to the live World, so Program wires nothing and a test injects.
+        /// </summary>
+        public Func<IReadOnlyList<long>>? OnlineAccounts { get; set; }
         /// <summary>Re-send S_ACCOUNT_BENEFIT_LIST after a benefit changed.</summary>
         public Action<long>? BenefitsChanged { get; set; }
     }
@@ -66,6 +71,8 @@ public sealed class HubServer : IDisposable
     private readonly TcpListener _listener;
     private readonly CancellationTokenSource _stop = new();
     private readonly uint _ourGusid;
+    private readonly int _serverId;
+    private bool _statAnswered;
     private Timer? _sweep;
 
     private HubServer(CharacterStore store, Hooks hooks, ILogger log, IPEndPoint endpoint, int serverId)
@@ -74,6 +81,7 @@ public sealed class HubServer : IDisposable
         _hooks = hooks;
         _log = log;
         _listener = new TcpListener(endpoint);
+        _serverId = serverId;
         _ourGusid = HubProtocol.Gusid(HubProtocol.CategoryArbiterGw, serverId);
     }
 
@@ -376,18 +384,98 @@ public sealed class HubServer : IDisposable
         return true;
     }
 
+    /// <summary>
+    /// T207c. The three OpUent calls tera-api's hubFunctions.js can make, all answered or refused
+    /// by name - none of them reaches the unhandled warning any more.
+    ///
+    /// <list type="table">
+    /// <item><term>1 QueryUser</term><description>answered: is this account on this server.</description></item>
+    /// <item><term>3 GetServerStat</term><description>answered below. This is the 0-byte call
+    /// arriving every 10 s (arbiter-bg3.log 20:47:30 onwards, "unhandled OpUent call 3 (0 B)") -
+    /// <c>GetServerStatReq</c> has no fields, so it serialises to nothing.</description></item>
+    /// <item><term>5 GetAllServerStat</term><description>refused by name, see below.</description></item>
+    /// </list>
+    /// </summary>
     private Answer? UserEntityCall(ushort innerId, byte[] body)
     {
-        if (innerId != HubProtocol.QueryUserReq)
+        switch (innerId)
         {
-            _log.LogWarning("hub: unhandled OpUent call {Id} ({Len} B)", innerId, body.Length);
-            return null;
+            case HubProtocol.QueryUserReq:
+            {
+                var fields = HubProtocol.Parse(body);
+                ulong account = HubProtocol.Scalar(fields, 1);
+                bool online = _hooks.IsOnline?.Invoke((long)account) ?? false;
+                var ans = new HubProtocol.Writer().Fixed64(1, account).Fixed32(2, online ? _ourGusid : 0u);
+                return new(HubProtocol.QueryUserAns, ans.ToArray());
+            }
+            case HubProtocol.GetServerStatReq:
+                return GetServerStat();
+            case HubProtocol.GetAllServerStatReq:
+                // GetAllServerStatAns.ServerInfo is { serverId, lastMsg, ip, port } for every
+                // server in the PLATFORM (opUent.js). TeraSharp is one server and keeps no
+                // platform registry, so there is nothing honest to put in it - and tera-api reads
+                // the login ip and port out of its own server_info table anyway. Refused, by name,
+                // at Information: tera-api catches it as a HubError and carries on.
+                _log.LogInformation("hub: GetAllServerStat (OpUent 5) refused - TeraSharp serves one "
+                    + "server and has no platform registry to enumerate");
+                return null;
+            default:
+                _log.LogWarning("hub: unhandled OpUent call {Id} ({Len} B)", innerId, body.Length);
+                return null;
         }
-        var fields = HubProtocol.Parse(body);
-        ulong account = HubProtocol.Scalar(fields, 1);
-        bool online = _hooks.IsOnline?.Invoke((long)account) ?? false;
-        var ans = new HubProtocol.Writer().Fixed64(1, account).Fixed32(2, online ? _ourGusid : 0u);
-        return new(HubProtocol.QueryUserAns, ans.ToArray());
+    }
+
+    /// <summary>
+    /// <c>GetServerStatAns</c>: one <c>ServerInfo { fixed32 serverId = 1, fixed32 userCnt = 2 }</c>
+    /// per live server, repeated at field 1 (opUent.js GetServerStatAns.ServerInfo.encode).
+    ///
+    /// <para>What tera-api does with it is the availability poll, not the Online page:
+    /// <c>ServerCheckActions.all</c> (src/actions/serverCheck.actions.js) matches
+    /// <c>stat.serverList.find(s =&gt; s.serverId == server.get("serverId"))</c> against its own
+    /// <c>server_info</c> rows and marks the server available ("method: Hub") when it is there,
+    /// falling back to a TCP probe of loginPort when it is not. So <c>serverId</c> here is the
+    /// PLAIN server number tera-api stores - <see cref="ServerIdVariable"/>, 2800 by default - not
+    /// a gusid. The Online page uses kickUser / bulkKick and its own database, not this call.</para>
+    ///
+    /// <para><c>userCnt</c> is the number of distinct accounts in world, which is what "users"
+    /// means on that panel; the message has no room for account ids.</para>
+    /// </summary>
+    private Answer GetServerStat()
+    {
+        var accounts = OnlineAccountIds();
+        var info = new HubProtocol.Writer().Fixed32(1, (uint)_serverId).Fixed32(2, (uint)accounts.Count);
+        var ans = new HubProtocol.Writer().Bytes(1, info.ToArray());
+        if (!_statAnswered)
+        {
+            _statAnswered = true;
+            _log.LogInformation("hub: GetServerStat answered - server {Server} is now reported "
+                + "available through the hub instead of a port probe", _serverId);
+        }
+        _log.LogDebug("hub: GetServerStat -> server {Server}, {Count} user(s)", _serverId, accounts.Count);
+        return new(HubProtocol.GetServerStatAns, ans.ToArray());
+    }
+
+    /// <summary>
+    /// The accounts with a session in world. The hook wins; with none, the live World is read
+    /// directly so Program has nothing to wire (Program.cs is not ours to edit).
+    /// </summary>
+    private static IEnumerable<long> AccountsInWorld()
+    {
+        foreach (var s in Program.World?.InWorldSessions() ?? new List<Network.GameSession>())
+            yield return (long)s.Account.AccountId;
+    }
+
+    /// <summary>
+    /// Distinct, whichever side supplies them: two characters of one account are one user, and
+    /// the de-duplication belongs here so the count means the same thing for the hook and for the
+    /// live World.
+    /// </summary>
+    private IReadOnlyList<long> OnlineAccountIds()
+    {
+        var ids = new List<long>();
+        foreach (long id in _hooks.OnlineAccounts is { } hook ? hook() : AccountsInWorld())
+            if (!ids.Contains(id)) ids.Add(id);
+        return ids;
     }
 
     /// <summary>An Ans whose only field is the result, which is 0 for success (FAILED is 1).</summary>

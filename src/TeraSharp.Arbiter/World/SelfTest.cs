@@ -95,6 +95,24 @@ public static class SelfTest
     }
 
     /// <summary>A file that only has to be there.</summary>
+    /// <summary>
+    /// T215. The client port is the one thing a player can reach directly, and it does NOT check
+    /// GM privilege on C_ADMIN - the proxy on 7801 is the only gate. Binding it anywhere but
+    /// loopback hands the admin opcodes to the internet, so this is a FAILED self-test, not a
+    /// note: <c>--selftest</c> exits non-zero and <c>start.ps1</c> refuses to boot without
+    /// <c>-Insecure</c>.
+    /// </summary>
+    public static SelfTestResult CheckLoopbackBind()
+    {
+        string bind = (TerasConfig.Get("TERASHARP_BIND") ?? "127.0.0.1").Trim();
+        bool loopback = bind.Length == 0 || bind == "127.0.0.1" || bind == "::1"
+                        || bind.Equals("localhost", StringComparison.OrdinalIgnoreCase);
+        return new SelfTestResult("listener bind", loopback,
+            loopback ? bind.Length == 0 ? "127.0.0.1 (default)" : bind
+                     : bind + " is not loopback - the client port does not check GM privilege on "
+                            + "C_ADMIN; put the proxy in front and keep TERASHARP_BIND=127.0.0.1");
+    }
+
     public static SelfTestResult CheckExists(string name, string? path, bool required = true)
         => string.IsNullOrEmpty(path) || !File.Exists(path)
             ? new SelfTestResult(name, false, $"not found (looked at {Show(path)})", required)
@@ -473,6 +491,7 @@ public static class SelfTest
             CheckFolder("Datasheet folder", Path.Combine(dataRoot, "Executable", "Datasheet"),
                 "DefaultSkillSet.xml", required: false),
             CheckDatabase(dbPath),
+            CheckLoopbackBind(),   // T215: not loopback is a failure, not a warning
         };
 
         // T58: the wiring checks. These run the real registration and allow-list code against
@@ -599,8 +618,16 @@ public static class SelfTest
                            + "matches and that account silently gets a normal login.";
         }
 
+        // T215: auth first - it is the one setting that decides whether this is a server or an
+        // open door, and setup.ps1 writes auth.enabled=true so an OFF here means somebody turned
+        // it off.
         if (!Auth.AuthProviders.EnabledFromEnvironment(TerasConfig.Get("TERASHARP_AUTH")))
-            yield return "! auth is OPEN - every login is accepted. Do not expose this build.";
+            yield return "! auth is OPEN - every login is accepted. TERASHARP_AUTH=true, with "
+                       + "TERASHARP_AUTH_URL pointing at tera-api. start.ps1 refuses to boot "
+                       + "without it unless it is given -Insecure.";
+        else if (string.IsNullOrWhiteSpace(TerasConfig.Get("TERASHARP_AUTH_URL")))
+            yield return "! TERASHARP_AUTH is on but TERASHARP_AUTH_URL is empty - there is nowhere "
+                       + "to validate a ticket against.";
 
         string? token = TerasConfig.Get("TERASHARP_ADMIN_TOKEN");
         if (string.IsNullOrWhiteSpace(token))
@@ -614,10 +641,12 @@ public static class SelfTest
             yield return "! the admin web is on 8050, which !SECURITY_TODO lists as tera-api's own "
                        + "admin panel. Whichever starts second loses. Set TERASHARP_ADMIN_PORT=8051.";
 
-        string? bind = TerasConfig.Get("TERASHARP_BIND");
-        if (!string.IsNullOrWhiteSpace(bind) && bind.Trim() != "127.0.0.1")
+        // T215: this one is now a FAILING self-test as well (CheckLoopbackBind), so the note
+        // says where the error comes from rather than being the only sign of it.
+        if (!CheckLoopbackBind().Pass)
             yield return "! TERASHARP_BIND is not 127.0.0.1. Port 7701 does not check GM privilege "
-                       + "on C_ADMIN - the proxy on 7801 is the only gate. Keep it on loopback.";
+                       + "on C_ADMIN - the proxy on 7801 is the only gate. Keep it on loopback: "
+                       + "--selftest fails on this and start.ps1 refuses to boot without -Insecure.";
 
         // T124: the two fields that open the In-Game Operation Tool. Not a failure - nothing
         // on this stack verifies the token - but an unset key is worth one line.

@@ -1891,3 +1891,29 @@ members both travel, exactly as `party.Members()` yields them.
 `PartyManager.BuildWorldConnectReplay` needed no change. The test now reads the roster size off the
 party table instead of hard-coding it. Suite on master HEAD: 1120 passed, 0 failed, 84 skipped.
 Details: `T208d-PARTY-REPLAY.md` T208d-b.
+
+## T207c - the 10-second hub poll is GetServerStat, and it is answered (2026-09-28)
+
+`unhandled OpUent call 3 (0 B)` in `arbiter-bg3.log` is `hubFunctions.js`'s `getServerStat` -
+`GetServerStatReq` has no fields, hence the 0-byte payload. It is tera-api's **availability poll**
+(`ServerCheckActions.all`), not the Online page, so the answer's `serverId` is the plain server
+number in tera-api's `server_info` (2800), not a gusid; a match flips the server to available
+through the hub instead of a TCP probe. Answered with one
+`ServerInfo { serverId, userCnt }`, `userCnt` = distinct accounts in world (the message has no
+field for account ids). `getAllServerStat` (5) is refused by name rather than left unhandled.
+Every OpArb call was already answered. Full table: `T207-HUB.md` T207c.
+
+## T215 - auth and the listener bind are boot blockers, not warnings (2026-09-28)
+
+| Change | Where |
+|---|---|
+| `auth.enabled` forced true on every run; `auth.url` keeps an existing answer | `tools/setup.ps1` |
+| `start.ps1` exits 2 with nothing started when `auth.enabled` is false, `auth.url` is empty, or `listener.bind` is off loopback; `-Insecure` overrides | `tools/setup.ps1` (`$startBody`) |
+| `listener bind` is a real self-test now - `--selftest` exits non-zero off loopback | `World/SelfTest.cs` `CheckLoopbackBind` |
+| auth on with an empty `TERASHARP_AUTH_URL` is its own note | `World/SelfTest.cs` `Notes` |
+| `TERASHARP_AUTH` listed first | `docs/GO-LIVE.md`, `docs/QUICKSTART.md`, `docs/OPERATIONS.md` |
+
+The PowerShell was not executed: this session has no shell on the deployment host. The generated
+`start.ps1` was checked structurally (the preflight and `-Insecure` are inside the `@'...'@` body,
+no stray here-string terminator) but not run - `.\setup.ps1 -NonInteractive` then `.\start.ps1` on a
+tree with `auth.enabled=false` is the one-minute confirmation.

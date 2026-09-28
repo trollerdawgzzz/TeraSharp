@@ -46,8 +46,14 @@ public static class HubProtocol
         BulkKickReq = 6, BulkKickAns = 7, BoxNotiUserReq = 15, BoxNotiUserAns = 16,
         AddBenefitReq = 38, AddBenefitAns = 39, RemoveBenefitReq = 40, RemoveBenefitAns = 41;
 
-    /// <summary>Inner ids on the OpUent channel, which is addressed to <see cref="UserEntityGusid"/>.</summary>
-    public const ushort QueryUserReq = 1, QueryUserAns = 2;
+    /// <summary>
+    /// Inner ids on the OpUent channel, which is addressed to <see cref="UserEntityGusid"/>.
+    /// The three tera-api can send are hubFunctions.js's queryUser (1), getServerStat (3) and
+    /// getAllServerStat (5); the Ans ids are Req + 1, the same convention as the OpArb pairs.
+    /// </summary>
+    public const ushort QueryUserReq = 1, QueryUserAns = 2,
+        GetServerStatReq = 3, GetServerStatAns = 4,
+        GetAllServerStatReq = 5, GetAllServerStatAns = 6;
 
     /// <summary>gusid = category &lt;&lt; 24 | number (tera-api lib/teraPlatformGuid.js).</summary>
     public static uint Gusid(int category, int number) => (uint)((category & 0xFF) << 24 | (number & 0xFFFFFF));

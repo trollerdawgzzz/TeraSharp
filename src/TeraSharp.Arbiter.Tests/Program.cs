@@ -11862,12 +11862,14 @@ bool   isGuildWarAcceptable
     [Test] public static void T113_check_config_reports_and_warns()
     {
         var saved = new Dictionary<string, string?>();
-        foreach (var v in new[] { "TERASHARP_AUTH", "TERASHARP_GM_ACCOUNTS", "TERASHARP_ADMIN_TOKEN",
-                                  "TERASHARP_ADMIN_PORT", "TERASHARP_BIND" })
+        foreach (var v in new[] { "TERASHARP_AUTH", "TERASHARP_AUTH_URL", "TERASHARP_GM_ACCOUNTS",
+                                  "TERASHARP_ADMIN_TOKEN", "TERASHARP_ADMIN_PORT", "TERASHARP_BIND" })
             saved[v] = Environment.GetEnvironmentVariable(v);
         try
         {
             Environment.SetEnvironmentVariable("TERASHARP_AUTH", "true");
+            // T215: auth on with nowhere to validate against is not a clean config either.
+            Environment.SetEnvironmentVariable("TERASHARP_AUTH_URL", "http://127.0.0.1:8080");
             Environment.SetEnvironmentVariable("TERASHARP_GM_ACCOUNTS", "2800,2801");
             Environment.SetEnvironmentVariable("TERASHARP_ADMIN_TOKEN", new string('x', 48));
             Environment.SetEnvironmentVariable("TERASHARP_ADMIN_PORT", "8051");
@@ -11893,9 +11895,18 @@ bool   isGuildWarAcceptable
             var notes = string.Join("\n", SelfTest.Notes());
             Hex.True(notes.Contains("accountDBID"), "a display name in GM_ACCOUNTS is called out");
             Hex.True(notes.Contains("auth is OPEN"), "so is auth being off");
+            Environment.SetEnvironmentVariable("TERASHARP_AUTH", "true");
+            Environment.SetEnvironmentVariable("TERASHARP_AUTH_URL", "");
+            Hex.True(string.Join("\n", SelfTest.Notes()).Contains("TERASHARP_AUTH_URL is empty"),
+                "T215: and so is auth being on with no tera-api to ask");
+            Environment.SetEnvironmentVariable("TERASHARP_AUTH", "false");
             Hex.True(notes.Contains("TERASHARP_ADMIN_TOKEN is short"), "so is a weak token");
             Hex.True(notes.Contains("8050"), "so is the tera-api admin-panel port collision");
             Hex.True(notes.Contains("loopback"), "so is binding 7701 off loopback");
+            // T215: that last one is a FAILING self-test now, not only a note.
+            Hex.True(!SelfTest.CheckLoopbackBind().Pass, "0.0.0.0 fails the listener-bind check");
+            Environment.SetEnvironmentVariable("TERASHARP_BIND", "127.0.0.1");
+            Hex.True(SelfTest.CheckLoopbackBind().Pass, "and loopback passes it");
         }
         finally
         {

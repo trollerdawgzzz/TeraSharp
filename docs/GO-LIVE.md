@@ -34,11 +34,13 @@ The admin token is printed as `(set, 48 chars)`, never as itself.
 
 Lines beginning `!` are the traps that are legal, silent and almost always wrong:
 
+- **auth OPEN** (`TERASHARP_AUTH`), or on with no `TERASHARP_AUTH_URL` to ask - first, because it
+  is the only one that costs you the account table
+- `TERASHARP_BIND` off `127.0.0.1` - also a FAILED `--selftest` since T215, and `start.ps1`
+  refuses to boot on it
 - `TERASHARP_GM_ACCOUNTS` holding a display name instead of an accountDBID
-- auth OPEN
 - a short or unset `TERASHARP_ADMIN_TOKEN`
 - the admin web still on 8050, where tera-api's own panel lives
-- `TERASHARP_BIND` off `127.0.0.1`
 
 A clean config prints no `!` line. `--selftest` is the sibling: that one asks whether the
 DEPLOY is complete, this one asks what the CONFIGURATION came out as.
@@ -65,12 +67,17 @@ These exist for test sessions. Every one must be in this state before players ar
 
 ## 1. Turn auth on
 
-Off by default, which is right for a laptop and wrong for the internet.
+`tools\setup.ps1` writes `auth.enabled = true` and an `auth.url` into `teras.json` on every run
+(T215), so a tree that came from setup already has this. Check it rather than assume it - and if
+you run without `teras.json`, set the two variables yourself:
 
 ```
 setx /M TERASHARP_AUTH true
 setx /M TERASHARP_AUTH_URL http://127.0.0.1:8080
 ```
+
+`start.ps1` refuses to boot with `auth.enabled` false or `auth.url` empty; `-Insecure` overrides it
+and belongs on a laptop, never here.
 
 With `TERASHARP_AUTH=true` the Arbiter validates the launcher's `authKey` against
 tera-api's `/authApi/GameAuthenticationLogin`. Without it, `AcceptAllAuthProvider`
