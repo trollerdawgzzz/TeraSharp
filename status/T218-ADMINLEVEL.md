@@ -33,12 +33,9 @@ it saw retail's.
 ## World's side
 
 `WorldServer.exe.c:847798-847802` registers `adminLevel` in the generated field-binding table at
-User offset **0xA474**, and `:935500` is the line that prints it:
-
-```c
-local_3c0 = *(undefined4 *)((longlong)param_1 + 0xa474);
-... L"[%4d,%4d] [%4d] SpawnComplete [%s] %s(%d) AdminLevel[%d]\n"
-```
+User offset **0xA474**, and `:935500` is the line that prints it: the SpawnComplete log reads the
+u32 at that offset into a local and formats it as the trailing `AdminLevel[%d]` of the
+`SpawnComplete [name] name(id)` line.
 
 The only other write to 0xA474 in the whole binary is `:803532`, `= 0` - the initialiser. So
 `AdminLevel[0]` means the field was never filled from the frame, on a frame that carries 5 exactly
