@@ -679,8 +679,13 @@ public sealed class CharacterHandlers
         if (hp > 0) element["hp"] = hp;
         if (mp > 0) element["mp"] = mp;
 
-        // NOT refreshed, on purpose: `isNewCharacter` (the caller hard-codes true and nothing
-        // in the row says otherwise yet), `maxRestBonusXp` (RestBonusDataSheet, which we do not
+        // T191f: isNewCharacter (entry+425) is TRUE only until the character has been in the world
+        // once. classic_live3's record 11 is 01 on entry 0 and 00 on entries 1..6; ours was 01 on
+        // every entry of every login, because the caller hard-coded it. The record is
+        // characters.entered_world, written by SDB_USER_ENTERWORLD.
+        if (store != null) element["isNewCharacter"] = !store.HasEnteredWorld(characterId);
+
+        // NOT refreshed, on purpose: `maxRestBonusXp` (RestBonusDataSheet, which we do not
         // load - see the note above), and exp, which S_GET_USER_LIST has no field for.
     }
 

@@ -11098,9 +11098,13 @@ bool   isGuildWarAcceptable
         for (int i = 0; i < opened.Length; i++) if (opened[i] != refused[i]) diffs++;
         Hex.True(opened.Length == 23 && refused.Length == 23 && diffs == 1,
             $"23 bytes each and one byte between them: {diffs}");
-        Hex.True(BitConverter.ToUInt32(opened, 6) == GmAccounts.LoginStatusOperator
-                 && BitConverter.ToUInt32(refused, 6) == GmAccounts.LoginStatusNormal,
-            "and that byte is status, 33 against 31");
+        Hex.True(BitConverter.ToUInt32(opened, 6) == GmAccounts.LoginStatusOperator,
+            "and that byte is status: 33 opens the tool");
+        // T191f: the 31 in cap_final_client2 is that stack's tera-api privilege, not a constant.
+        // classic_live3 record 7 - the live Classic+ server - sends 0 to an ordinary account, so
+        // LoginStatusNormal follows the reference server and this line pins the capture only.
+        Hex.True(BitConverter.ToUInt32(refused, 6) == 31 && GmAccounts.LoginStatusNormal == 0,
+            $"cap_final_client2 carried 31; we send classic_live3's {GmAccounts.LoginStatusNormal}");
 
         // T89b drove status from TERASHARP_GM_ACCOUNTS alone. Two things had to be true at once
         // for that to work, and neither is obvious.

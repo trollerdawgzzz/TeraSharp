@@ -5743,6 +5743,7 @@ public sealed partial class DbProxyHandlers
         long enterUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         CommitPlayTime(playerId, enterUnix);
         MarkEnteredWorld(playerId, enterUnix);
+        _store.MarkCharacterEnteredWorld(playerId);   // T191f: the isNewCharacter record
 
         // T121: arm the Alt+A push again. This is the one event a zone change does NOT raise
         // and a relog does, which is exactly the difference between cap_final_gm_client2's

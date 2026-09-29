@@ -52,7 +52,94 @@ public static class ClientSettingsHandlers
     private static readonly byte[] UserSetting = ParseHex(UserSettingHex);
 
     public static void SendChatOption(GameSession s) => s.SendRawBody("S_REPLY_CLIENT_CHAT_OPTION_SETTING", ChatOption);
-    public static void SendUiSetting(GameSession s) => s.SendRawBody("S_REPLY_CLIENT_UI_SETTING", UiSetting);
+    /// <summary>
+    /// T191g. The stored window layout, or the captured default when the account has none.
+    ///
+    /// <para>This used to hand back <see cref="UiSetting"/> - one captured client's three windows -
+    /// on every request, for every account, forever: cap_wasd2_client has S_REPLY_CLIENT_UI_SETTING
+    /// at 116 B in packets 26, 32, 50 and 463, unchanged by the client's own 115-byte
+    /// C_SAVE_CLIENT_UI_SETTING at 33. Retail's is the account's own and grows with it:
+    /// cap_2man_b_client1 replies 486 B and saves 461 B. That is the whole of "moved windows do
+    /// not persist" - the hotbar survives because it rides in the USER blob, which we do store.</para>
+    /// </summary>
+    public static void SendUiSetting(GameSession s)
+    {
+        ArgumentNullException.ThrowIfNull(s);
+        var saved = Program.Store?.LoadUiSetting((long)s.Account.AccountId);
+        var reply = saved == null ? null : BuildUiSettingReply(saved);
+        s.SendRawBody("S_REPLY_CLIENT_UI_SETTING", reply ?? UiSetting);
+    }
+
+    /// <summary>The captured default layout, for an account that has never saved one.</summary>
+    public static byte[] DefaultUiSettingBody() => (byte[])UiSetting.Clone();
+
+    // ------------------------------------------------------------------ T191g: the two shapes
+    //
+    // C_SAVE_CLIENT_UI_SETTING body: [u16 count][u16 firstOffset][u32 unk] then records
+    //     [u16 here][u16 next][u16 nameOffset][u8 flag][f32 x][f32 y][UTF-16 name + NUL]
+    // S_REPLY_CLIENT_UI_SETTING body: [u16 count][u16 firstOffset] then records
+    //     [u16 here][u16 next][u16 nameOffset][u32 flag][f32 x][f32 y][UTF-16 name + NUL]
+    //
+    // The flag is one byte on the way in and four on the way out, and the request has an extra
+    // 8-byte preamble the reply does not. Every offset is FRAME-relative, so a body index is the
+    // offset minus 4. The arithmetic checks on both captures: ours 115 B + 3x3 - 8 = 116, and
+    // retail's 461 B + 11x3 - 8 = 486 (cap_2man_b_client1 33 -> 513 and 539 -> 1894).
+
+    private const int UiFrameHeader = 4;
+    private const int UiSaveRecordHeader = 15;
+    private const int UiReplyRecordHeader = 18;
+
+    /// <summary>
+    /// T191g. Turn a stored C_SAVE_CLIENT_UI_SETTING body into an S_REPLY_CLIENT_UI_SETTING body.
+    /// Null when the stored bytes do not walk cleanly - the caller then serves the default rather
+    /// than a half-parsed layout.
+    /// </summary>
+    public static byte[]? BuildUiSettingReply(ReadOnlySpan<byte> saveBody)
+    {
+        if (saveBody.Length < 8) return null;
+        int count = BitConverter.ToUInt16(saveBody);
+        int cursor = BitConverter.ToUInt16(saveBody[2..]);
+        if (count <= 0 || count > 512) return null;
+
+        var records = new List<(uint Flag, float X, float Y, byte[] Name)>(count);
+        for (int i = 0; i < count; i++)
+        {
+            int at = cursor - UiFrameHeader;
+            if (at < 0 || at + UiSaveRecordHeader > saveBody.Length) return null;
+            int next = BitConverter.ToUInt16(saveBody[(at + 2)..]);
+            int nameAt = BitConverter.ToUInt16(saveBody[(at + 4)..]) - UiFrameHeader;
+            uint flag = saveBody[at + 6];
+            float x = BitConverter.ToSingle(saveBody[(at + 7)..]);
+            float y = BitConverter.ToSingle(saveBody[(at + 11)..]);
+            int nameEnd = next != 0 ? next - UiFrameHeader : saveBody.Length;
+            if (nameAt < at || nameEnd > saveBody.Length || nameAt > nameEnd) return null;
+            records.Add((flag, x, y, saveBody[nameAt..nameEnd].ToArray()));
+            cursor = next;
+            if (cursor == 0 && i != count - 1) return null;
+        }
+
+        int size = 4 + records.Sum(r => UiReplyRecordHeader + r.Name.Length);
+        var body = new byte[size];
+        BitConverter.GetBytes((ushort)records.Count).CopyTo(body, 0);
+        BitConverter.GetBytes((ushort)(4 + UiFrameHeader)).CopyTo(body, 2);
+        int pos = 4 + UiFrameHeader;                 // frame-relative offset of the first record
+        for (int i = 0; i < records.Count; i++)
+        {
+            var r = records[i];
+            int len = UiReplyRecordHeader + r.Name.Length;
+            int at = pos - UiFrameHeader;
+            int next = i == records.Count - 1 ? 0 : pos + len;
+            BitConverter.GetBytes((ushort)pos).CopyTo(body, at);
+            BitConverter.GetBytes((ushort)next).CopyTo(body, at + 2);
+            BitConverter.GetBytes((ushort)(pos + UiReplyRecordHeader)).CopyTo(body, at + 4);
+            BitConverter.GetBytes(r.Flag).CopyTo(body, at + 6);
+            BitConverter.GetBytes(r.X).CopyTo(body, at + 10);
+            BitConverter.GetBytes(r.Y).CopyTo(body, at + 14);
+            r.Name.CopyTo(body, at + UiReplyRecordHeader);
+            pos += len;
+        }
+        return body;
+    }
 
     public static bool OnRequestChatOption(GameSession s, ReadOnlyMemory<byte> body) { SendChatOption(s); return true; }
     public static bool OnRequestUiSetting(GameSession s, ReadOnlyMemory<byte> body) { SendUiSetting(s); return true; }

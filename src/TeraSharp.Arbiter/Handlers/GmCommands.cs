@@ -227,8 +227,13 @@ public static class GmAccounts
     /// </summary>
     public const uint LoginStatusOperator = 33;
 
-    /// <summary>The ordinary value - 31 in every non-operator capture we have.</summary>
-    public const uint LoginStatusNormal = 31;
+    /// <summary>
+    /// The ordinary value. T191f: <b>0</b>, which is what the live Classic+ server sends -
+    /// classic_live3 record 7 is <c>17 00 A6 92 01 00 00 00 00 00 ...</c>, status (body +2, packet
+    /// offset 6) = 0, against our <c>1F 00 00 00</c> in cap_queue4_client1's record 7. T89b read 31
+    /// off proxy captures and called 0 "a brand-new account"; the reference server disagrees.
+    /// </summary>
+    public const uint LoginStatusNormal = 0;
 
     /// <summary>
     /// <see cref="LoginStatusOperator"/> when this login should get the tool, otherwise

@@ -755,6 +755,14 @@ public static class ArbiterClientHandlers
     /// </summary>
     public static bool OnSaveClientUiSetting(GameSession s, ReadOnlyMemory<byte> body, ILogger log)
     {
+        ArgumentNullException.ThrowIfNull(s);
+        // T191g: it really is this handler's job - nothing else stored it, so every moved window
+        // was acked and dropped and the next login got the captured default back.
+        if (ClientSettingsHandlers.BuildUiSettingReply(body.Span) != null)
+            Program.Store?.SaveUiSetting((long)s.Account.AccountId, body.ToArray());
+        else
+            log?.LogWarning("C_SAVE_CLIENT_UI_SETTING: {Len} B that does not walk as a layout - not stored",
+                body.Length);
         s.Send(BuildSaveUiSettingAck(true));
         return true;
     }
@@ -2958,7 +2966,118 @@ public static class ArbiterClientHandlers
     /// <summary>Arm the push again. Called from SDB_USER_ENTERWORLD, and on leave-world.</summary>
     public static void ResetGmSkillPush(int playerId)
     {
-        if (playerId > 0) { GmSkillPushed.TryRemove(playerId, out _); GmInvisible.TryRemove(playerId, out _); }
+        if (playerId > 0)
+        {
+            GmSkillPushed.TryRemove(playerId, out _);
+            GmSpawnVaporize.TryRemove(playerId, out _);
+            SpawnVaporizePending.TryRemove(playerId, out _);
+            GmInvisible.TryRemove(playerId, out _);
+        }
+    }
+
+    /// <summary>Player ids whose spawn-time vaporize request has already gone to World. T191e.</summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, byte> GmSpawnVaporize = new();
+
+    /// <summary>
+    /// T191e. The second one-shot: true exactly once per world entry, for the spawn-time vaporize
+    /// request. It cannot share <see cref="TryTakeGmSkillPush"/> - that one is spent at S_LOAD_TOPO,
+    /// which arrives before S_SPAWN_ME.
+    /// </summary>
+    public static bool TryTakeGmSpawnVaporize(int playerId)
+        => playerId > 0 && GmSpawnVaporize.TryAdd(playerId, 1);
+
+    /// <summary>T191e-b. Has this world entry's spawn request already gone out?</summary>
+    public static bool SpawnVaporizeAsked(int playerId)
+        => playerId > 0 && GmSpawnVaporize.ContainsKey(playerId);
+
+    // ------------------------------------------------------------- T191e-c: ask until it lands
+    //
+    // arbiter-spawnvap.log 15:38:10 logged `spawn vaporize Sent` and World answered NOTHING - no
+    // SDB_USER_VAPORIZED, no tunnelled S_ADMIN_GM_SKILL, and cap_spawnvap_client 341/342 is
+    // S_SPAWN_ME followed by our own S_ADMIN_HOLD_CHARACTER and then straight into the S_SPAWN_NPC
+    // burst. Handler_AS_ADMIN_REQUEST_USERACTION says why: every case, ours (0x65) included, starts
+    // with `FUN_140d9bfd0(&user, linkId, targetDbId)` and does nothing at all when that returns
+    // null. At S_SPAWN_ME the user is not in the manager that lookup searches yet, so the frame is
+    // dropped without a word. The panel's identical 0x2827 seconds later is answered, so the
+    // request is right and only the MOMENT was wrong.
+    //
+    // Retail never had this problem because its World vaporizes the GM itself, during enter-world
+    // (cap_final 495 -> 496, adminLevel 1) - there is no request to time. Ours has to ask, and the
+    // only honest way to time a call whose precondition we cannot observe is to keep asking until
+    // World confirms. So the spawn anchor ARMS a pending request and every later tunnelled frame
+    // pumps it, bounded: at most SpawnVaporizeMaxTries attempts, SpawnVaporizeRetryGap apart,
+    // stopping the moment SDB_USER_VAPORIZED sets IsGmInvisible.
+
+    /// <summary>Players with a spawn vaporize still to land: attempts so far, and the earliest retry.</summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, (int Tries, long NotBefore)> SpawnVaporizePending = new();
+
+    /// <summary>How many times the spawn request is repeated before giving up.</summary>
+    public const int SpawnVaporizeMaxTries = 5;
+
+    /// <summary>The gap between attempts. World needs the user registered, which takes a beat.</summary>
+    public static readonly TimeSpan SpawnVaporizeRetryGap = TimeSpan.FromMilliseconds(750);
+
+    /// <summary>Arm the pending request. Called from the S_SPAWN_ME block, for operators only.</summary>
+    public static void ArmSpawnVaporize(int playerId)
+    {
+        // NotBefore 0: the first attempt goes out on the very next tunnelled frame, and only the
+        // retries wait out the gap.
+        if (playerId > 0 && !SpawnVaporizeAsked(playerId) && !IsGmInvisible(playerId))
+            SpawnVaporizePending[playerId] = (0, 0);
+    }
+
+    /// <summary>Is a spawn vaporize still waiting to land for this player?</summary>
+    public static bool SpawnVaporizePendingFor(int playerId)
+        => playerId > 0 && SpawnVaporizePending.ContainsKey(playerId);
+
+    /// <summary>What one pump of the pending request did.</summary>
+    public enum SpawnVaporizePump
+    {
+        /// <summary>Nothing pending for this player - the common case, one dictionary miss.</summary>
+        Idle,
+        /// <summary>Pending, but the retry gap has not elapsed.</summary>
+        Waiting,
+        /// <summary>An attempt went out.</summary>
+        Tried,
+        /// <summary>World answered: SDB_USER_VAPORIZED set IsGmInvisible. Done.</summary>
+        Confirmed,
+        /// <summary>Out of attempts. World never answered.</summary>
+        GaveUp,
+    }
+
+    /// <summary>
+    /// T191e-c. One pump of the pending spawn vaporize. Cheap when nothing is pending: the
+    /// dictionary is empty on a server with no operator mid-spawn, so this is one IsEmpty read.
+    /// </summary>
+    public static SpawnVaporizePump PumpSpawnVaporize(GameSession s, DateTimeOffset now)
+    {
+        ArgumentNullException.ThrowIfNull(s);
+        if (SpawnVaporizePending.IsEmpty) return SpawnVaporizePump.Idle;
+        int playerId = (int)s.PlayerId;
+        if (!SpawnVaporizePending.TryGetValue(playerId, out var state)) return SpawnVaporizePump.Idle;
+
+        if (IsGmInvisible(playerId))
+        {
+            SpawnVaporizePending.TryRemove(playerId, out _);
+            s.Log?.LogInformation("Spawn vaporize for player {Id}: World confirmed after {N} attempt(s)",
+                playerId, state.Tries);
+            return SpawnVaporizePump.Confirmed;
+        }
+        if (now.Ticks < state.NotBefore) return SpawnVaporizePump.Waiting;
+        if (state.Tries >= SpawnVaporizeMaxTries)
+        {
+            SpawnVaporizePending.TryRemove(playerId, out _);
+            s.Log?.LogWarning("Spawn vaporize for player {Id}: World did not answer {N} AS_ADMIN_REQUEST_USERACTION "
+                + "(0x2827) attempts - the GM stays visible and the movement guide stays up (T191e-c)",
+                playerId, state.Tries);
+            return SpawnVaporizePump.GaveUp;
+        }
+
+        var result = RequestSpawnVaporize(s);
+        SpawnVaporizePending[playerId] = (state.Tries + 1, now.Add(SpawnVaporizeRetryGap).Ticks);
+        s.Log?.LogInformation("Spawn vaporize for player {Id}: attempt {N} {Result}",
+            playerId, state.Tries + 1, result);
+        return SpawnVaporizePump.Tried;
     }
 
     /// <summary>
@@ -2969,6 +3088,8 @@ public static class ArbiterClientHandlers
     {
         if (playerId <= 0) return false;
         bool had = GmSkillPushed.TryRemove(playerId, out _);
+        had |= GmSpawnVaporize.TryRemove(playerId, out _);
+        had |= SpawnVaporizePending.TryRemove(playerId, out _);
         had |= GmInvisible.TryRemove(playerId, out _);
         had |= LastTopo.TryRemove(playerId, out _);
         return had;
@@ -3156,6 +3277,65 @@ public static class ArbiterClientHandlers
         return w.TrySendFrame(s.CurrentWorldId, op, payload);
     }
 
+    /// <summary>
+    /// T191e. Retail's GM enters the world VAPORIZED, and that is the whole of the WASD prompt.
+    ///
+    /// <para>cap_wasd2_client (operator, two logins after /api/reset-client-settings) clears every
+    /// other suspect: S_ADMIN_GM_SKILL is in its slot before the tunnelled S_LOAD_TOPO on both
+    /// entries (80/81 and 1557/1558), S_LOAD_CLIENT_USER_SETTING is 1133 B on the second login -
+    /// the exact size of the last C_SAVE_CLIENT_USER_SETTING and far under 9000 - and the client
+    /// sends no C_SIMPLE_TIP_REPEAT_CHECK at all, so there is nothing to answer. One byte differs
+    /// from cap_final_gm_client2's 99:</para>
+    ///
+    /// <code>
+    ///   retail 99   09 00 BE 64 00 00 00 00 01     &lt;- S_ADMIN_GM_SKILL payload+4 = 1
+    ///   ours   80   09 00 BE 64 00 00 00 00 00     &lt;- payload+4 = 0
+    /// </code>
+    ///
+    /// <para>Ours is honest: T191d ties that byte to <see cref="IsGmInvisible"/>, which follows
+    /// World's SDB_USER_VAPORIZED, and World does not vaporize OUR GM at spawn - T152 recorded that
+    /// it only does so at adminLevel 1 (cap_final 495), never at the 5 we send (cap_bag,
+    /// cap_skills2). Retail's 01 is real: its GM was vaporized at spawn, which is why the tool's
+    /// first toggle at 542 turns invisibility OFF rather than on.</para>
+    ///
+    /// <para>So the fix is not to fake the byte - that is the T152 desync that left a GM vaporized
+    /// for a session - but to put World in the state retail's World was in: ask it for the same
+    /// toggle the panel asks for, once per world entry, at S_SPAWN_ME. World answers with
+    /// SDB_USER_VAPORIZED 01 and its own tunnelled S_ADMIN_GM_SKILL 01, which is exactly the
+    /// exchange the operator gets today by pressing Invisible - the one that clears the prompt.
+    /// Pressing Invisible afterwards still turns it off; the one-shot does not re-arm until the
+    /// next world entry.</para>
+    /// </summary>
+    /// <summary>
+    /// T191e-b. Why the spawn request did or did not go out. The live run showed nothing at all at
+    /// spawn, which the boolean could not tell apart from "sent and World ignored it" - so the
+    /// outcome is named and logged either way.
+    /// </summary>
+    public enum SpawnVaporizeResult
+    {
+        /// <summary>The request reached World. Its SDB_USER_VAPORIZED is the confirmation.</summary>
+        Sent,
+        /// <summary>World already has this GM vaporized - asking again would turn them visible.</summary>
+        AlreadyInvisible,
+        /// <summary>Already asked this world entry. Re-armed by SDB_USER_ENTERWORLD.</summary>
+        AlreadyAsked,
+        /// <summary>No World to ask: standalone, not in world, or the link is down.</summary>
+        NoWorldLink,
+    }
+
+    public static SpawnVaporizeResult RequestSpawnVaporize(GameSession s)
+    {
+        ArgumentNullException.ThrowIfNull(s);
+        int playerId = (int)s.PlayerId;
+        if (IsGmInvisible(playerId)) return SpawnVaporizeResult.AlreadyInvisible;
+        if (SpawnVaporizeAsked(playerId)) return SpawnVaporizeResult.AlreadyAsked;
+        // T191e-b: take the one-shot only once the frame is actually away. Taking it first meant a
+        // send that failed (no link yet at spawn) burned the entry's only attempt silently.
+        if (!RequestWorldGmSkill(s, GmSkillInvisible)) return SpawnVaporizeResult.NoWorldLink;
+        TryTakeGmSpawnVaporize(playerId);
+        return SpawnVaporizeResult.Sent;
+    }
+
     /// <summary>T195: the named character's current World, never a default-link fallback.</summary>
     public static bool SendToWorld(int playerId, ushort op, byte[] payload)
         => Program.World?.SessionForPlayerId(playerId) is { } session && SendToWorld(session, op, payload);
@@ -3214,6 +3394,7 @@ public static class ArbiterClientHandlers
         // packet pays one u16 compare. World/BattlegroundRating.cs.
         BattlegroundRating.OnTunnelled(s, clientPacket, s.Log);
         ObserveLoadTopo((int)s.PlayerId, clientPacket);   // T148: zone + position for 0x2827
+        PumpSpawnVaporize(s, DateTimeOffset.UtcNow);      // T191e-c: keep asking until World answers
         // T152: NO enter-world S_ADMIN_GM_SKILL on the World path. The real one is WORLD's:
         // cap_final.log 495 SDB_USER_VAPORIZED 01 00 00 00 01, then 496 SA_BYPASS_TO_CLIENT
         // carrying 09 00 BE 64 00 00 00 00 01 - World vaporizes the GM and tells the client in
@@ -3252,7 +3433,16 @@ public static class ArbiterClientHandlers
         // or use items. T180: preserve an explicit panel hold across a spawn; otherwise release.
         if (clientPacket.Length >= 4 && clientPacket[2] == 0x65 && clientPacket[3] == 0x83   // S_SPAWN_ME 0x8365
             && OperatorGetsGmSkillPush(GmCommandHandlers.LevelOf(s, Program.Store)))
-            s.Send(BuildAdminHoldCharacter(Program.World?.DbProxy?.UserControls.IsHeld(s.PlayerId, DateTimeOffset.UtcNow) ?? false));
+        {
+            bool held = Program.World?.DbProxy?.UserControls.IsHeld(s.PlayerId, DateTimeOffset.UtcNow) ?? false;
+            s.Send(BuildAdminHoldCharacter(held));
+            // T191e-c: ARM here, do not send here. World drops a 0x2827 whose target is not in its
+            // user manager yet, and at S_SPAWN_ME it is not - arbiter-spawnvap.log 15:38:10 sent one
+            // and got nothing back. The pump below asks again on later frames until World answers.
+            ArmSpawnVaporize((int)s.PlayerId);
+            s.Log?.LogInformation("S_SPAWN_ME for operator {Id}: hold {Held}, spawn vaporize armed",
+                s.PlayerId, held);
+        }
         if (clientPacket.Length >= 4 && clientPacket[2] == 0x65 && clientPacket[3] == 0x83)
             WorldLevelSync.OnSpawn(s);   // T152b: a level set while offline reaches World here
     }

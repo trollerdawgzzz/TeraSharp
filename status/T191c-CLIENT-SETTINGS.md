@@ -125,3 +125,181 @@ re-arm GM skill and a relog does. Tests: `T191d_the_gm_skill_switch_matches_the_
 
 Live check: log in as the operator - the guide should not appear, and the panel's Invisible toggle
 should now start from the state World actually has.
+
+
+## T191e - the enabled byte is right; the STATE behind it is what differs
+
+`cap_wasd2_client` (caludesucks, id 9, operator, two logins after `/api/reset-client-settings`,
+T219c build) clears every other suspect:
+
+| check | result |
+|---|---|
+| S_ADMIN_GM_SKILL before the tunnelled S_LOAD_TOPO | sent on both entries - 80/81 and 1557/1558 |
+| its enabled byte vs World's SDB_USER_VAPORIZED | 00, and World has this GM visible - correct |
+| C_SIMPLE_TIP_REPEAT_CHECK | the client sends none (retail sends 22) - nothing to answer |
+| S_LOAD_CLIENT_USER_SETTING size | login 1: 8 B (the reset). login 2: 1133 B, far under 9000 |
+| served blob vs the last save | byte-identical to the 1133 B C_SAVE at 1247 |
+
+One byte differs from retail, and it is the last one in the frame:
+
+```
+  retail  cap_final_gm_client2  99    09 00 BE 64 00 00 00 00 01
+  ours    cap_wasd2_client      80    09 00 BE 64 00 00 00 00 00
+                                                           ^^  payload+4, frame offset 8
+```
+
+Retail's `01` is not a different opinion about the same state, it is a different state: T152
+recorded that World vaporizes a GM at spawn at **adminLevel 1** (`cap_final` 495
+`SDB_USER_VAPORIZED 01 00 00 00 01`, then 496 carries the `01` to the client) and never at the 5 we
+send (`cap_bag`, `cap_skills2`). Retail's GM entered the world vaporized - which is also why the
+tool's first toggle at 542 turns invisibility **off** rather than on.
+
+**Landed.** Writing `01` into a frame World disagrees with is the T152 desync, so instead the
+Arbiter asks World for the same toggle the panel asks for, once per world entry, anchored on
+S_SPAWN_ME (`ArbiterClientHandlers.RequestSpawnVaporize`). World answers with its own
+`SDB_USER_VAPORIZED` and its own tunnelled `S_ADMIN_GM_SKILL 01` - the exchange the operator
+performs by hand today, which is what clears the prompt. The GM therefore enters the world
+invisible, exactly as retail's does; pressing Invisible still turns it off, and the one-shot does
+not re-arm until the next world entry. Four T191e tests.
+
+
+### T191e-b - the spawn request was silent either way
+
+The live run logged nothing at spawn, and a `bool` return could not tell "the block never ran" from
+"the request went out and World ignored it". The spawn block now logs one Information line per
+operator spawn, whatever happens:
+
+```
+S_SPAWN_ME for operator 9: hold False, spawn vaporize Sent
+```
+
+`RequestSpawnVaporize` returns `SpawnVaporizeResult`: `Sent`, `AlreadyInvisible` (World already has
+them vaporized - asking again would make them visible), `AlreadyAsked` (one per world entry,
+re-armed by SDB_USER_ENTERWORLD), `NoWorldLink` (standalone, not in world, or the link is down).
+**No line at all on a relog means the tunnelled S_SPAWN_ME is not reaching `DeliverTunnelled`** -
+and that is the next thing to chase, not the gates.
+
+One real defect went with it: the one-shot was taken BEFORE the send, so a send that failed burned
+the entry's only attempt silently. It is taken after a successful send now.
+
+`T191e_b_a_tunnelled_spawn_me_reaches_the_operator_block_and_says_so` drives the captured 28-byte
+S_SPAWN_ME through `DeliverTunnelled` - the delegate `WorldBridge.RegisterPlayer` installs - for an
+operator, and asserts the spawn frame, the S_ADMIN_HOLD_CHARACTER that proves the block ran, the log
+line, and the unspent one-shot.
+
+
+### T191e-c - World drops a 0x2827 whose target it cannot look up yet
+
+`arbiter-spawnvap.log` 15:38:10 logged `spawn vaporize Sent` and World answered **nothing**: no
+`SDB_USER_VAPORIZED`, no tunnelled `S_ADMIN_GM_SKILL`. `cap_spawnvap_client` 341/342 is S_SPAWN_ME
+followed by our own S_ADMIN_HOLD_CHARACTER and then straight into the S_SPAWN_NPC burst; the only
+later S_ADMIN_GM_SKILL in the whole capture is the panel's.
+
+`Handler_AS_ADMIN_REQUEST_USERACTION` says why. Every case in its switch - ours is 0x65,
+`UserActionGmSkill` - opens with
+
+```c
+FUN_140d9bfd0(&user, linkId, targetDbId);   // UserManager lookup
+if (user != 0) { ... }                      // and nothing at all when it is null
+```
+
+At S_SPAWN_ME the user is not in that manager yet, so the frame is dropped without a word. The
+panel's identical 0x2827 seconds later is answered, so the request was right and only the moment was
+wrong. Retail never had to time this: its World vaporizes the GM itself during enter-world
+(`cap_final` 495 -> 496, adminLevel 1).
+
+**Landed.** S_SPAWN_ME now *arms* the request instead of sending it, and every later tunnelled frame
+pumps it: at most `SpawnVaporizeMaxTries` (5) attempts, `SpawnVaporizeRetryGap` (750 ms) apart,
+stopping the instant `SDB_USER_VAPORIZED` sets `IsGmInvisible`. The log reads
+
+```
+S_SPAWN_ME for operator 9: hold False, spawn vaporize armed
+Spawn vaporize for player 9: attempt 1 Sent
+Spawn vaporize for player 9: World confirmed after 2 attempt(s)
+```
+
+and, if World never answers, one Warning naming the count instead. Two T191e-c tests cover the pump
+(retry, bound, confirmation, and never arming a GM World already has vaporized).
+
+
+## T191f - two lobby fields, and what the settings frames are NOT
+
+`S_GET_USER_LIST` (0x6759) is a walked record list: body `[u16 count][u16 firstOffset]`, each record
+`[u16 here][u16 next]`. The brief's "+460" is entry 0 (which starts at 35) plus **425**, and 425 is
+`isNewCharacter`:
+
+| capture | count | +425 per entry |
+|---|---|---|
+| classic_live3 record 11 (retail) | 7 | `01 00 00 00 00 00 00` |
+| cap_queue4_client1 record 11 | 2 | `01 01` |
+| cap_wasd2_client record 11 | 5 | `01 01 01 01 01` |
+
+We hard-coded `true` for every character on every login. It now follows `characters.entered_world`,
+a new column written by `SDB_USER_ENTERWORLD` and backfilled once from `play_seconds > 0` or a
+`visited_sections` row.
+
+`S_LOGIN_ARBITER` record 7 differs in exactly one field, packet offset 6 (body +2, u32):
+
+```
+classic_live3        17 00 A6 92 01 00 00 00 00 00 ...   status 0
+cap_queue4_client1   17 00 A6 92 01 00 1F 00 00 00 ...   status 31
+```
+
+T89b read 31 off proxy captures and called 0 "a brand-new account"; the live Classic+ server is the
+better witness, so `LoginStatusNormal` is 0 and 33 still opens the tool for an operator (T104's pin
+keeps the captured 31 as a capture, not as the constant).
+
+### What the settings frames are not
+
+Two suspects checked and cleared, so the next brief does not re-open them:
+
+* **Position.** Ours is already retail's. `cap_2man_b_client1` 312 C_LOAD_TOPO_FIN -> 322
+  S_LOAD_CLIENT_ACCOUNT_SETTING -> 323 S_LOAD_CLIENT_USER_SETTING -> 334 S_SPAWN_ME;
+  `cap_wasd2_client` 327 -> 336 -> 337 -> 341. Same pair, same order, same slot.
+* **Re-entries.** The pair is sent from the `C_LOAD_TOPO_FIN` handler with no one-shot, so it goes
+  out on every world entry AND every re-entry, including the one the Invisible toggle causes.
+  Retail is in fact narrower: `cap_2man_b_client1` sends it on entries 1 and 2 (322/323, 2173/2174)
+  and on none of the five after that.
+
+Neither is the reason a UI layout does not come back. The remaining difference in that pair is the
+ACCOUNT blob - 895 B ours against retail's 663 B - which is T191b's ground, not this one's.
+
+
+## T191g - there are THREE client blobs, and the third one was never stored
+
+The hotbar survives a relog and a moved window does not, because they are not in the same blob:
+
+| blob | packets | stored? |
+|---|---|---|
+| per character (hotbar, shortcuts, presets) | C_SAVE_CLIENT_USER_SETTING -> S_LOAD_CLIENT_USER_SETTING | yes (T19) |
+| per account (graphics, sound, interface) | C_SAVE_CLIENT_ACCOUNT_SETTING -> S_LOAD_CLIENT_ACCOUNT_SETTING | yes (T191b) |
+| **window layout** | **C_SAVE_CLIENT_UI_SETTING (0xA98F) -> S_REPLY_CLIENT_UI_SETTING (0x5FAE)** | **no** |
+
+`OnSaveClientUiSetting` acked the save and dropped it, and `SendUiSetting` handed back a captured
+constant. cap_wasd2_client replies 116 B at packets 26, 32, 50 and 463 - identical every time, and
+unchanged by the client's own 115-byte save at 33. Retail's reply is the account's own and moves
+with it: cap_2man_b_client1 replies 486 B (29, 513, 1894) and saves 461 B (33, 539).
+
+The two shapes differ in one field:
+
+```
+C_SAVE_CLIENT_UI_SETTING body   [u16 count][u16 firstOffset][u32 unk]
+  record  [u16 here][u16 next][u16 nameOffset][u8  flag][f32 x][f32 y][UTF-16 name + NUL]
+S_REPLY_CLIENT_UI_SETTING body  [u16 count][u16 firstOffset]
+  record  [u16 here][u16 next][u16 nameOffset][u32 flag][f32 x][f32 y][UTF-16 name + NUL]
+```
+
+so a reply is the save plus 3 bytes per record minus the 8-byte preamble - ours 115 + 9 - 8 = 116,
+retail 461 + 33 - 8 = 486. Both captures agree. Every offset is frame-relative.
+
+**Landed.** New `ui_settings(account_id, blob, updated_at)` - per account, because the client asks
+for it before character select (cap_2man_b_client1 28, cap_wasd2_client 30).
+`OnSaveClientUiSetting` stores the save body verbatim once it walks, `SendUiSetting` rebuilds the
+reply from it with `ClientSettingsHandlers.BuildUiSettingReply`, and a blob that does not walk
+serves the captured default rather than half a layout. Four T191g tests, including the byte-exact
+conversion of cap_wasd2_client 33.
+
+The ACCOUNT blob's 895 B against retail's 663 B is not a fault: both are constant across their
+captures, ours is account 1's own stored 887 B (`account_settings`, last written 2026-09-28), and
+neither client sent a `C_SAVE_CLIENT_ACCOUNT_SETTING` in these sessions. Different accounts, not a
+broken round trip.

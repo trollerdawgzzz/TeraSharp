@@ -1064,6 +1064,15 @@ CREATE TABLE IF NOT EXISTS account_settings (
   blob       BLOB NOT NULL,
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+-- T191g. The WINDOW LAYOUT, which is neither of the two above: the client sends it as
+-- C_SAVE_CLIENT_UI_SETTING and reads it back with C_REQUEST_CLIENT_UI_SETTING, before character
+-- select, so it is per account. The stored blob is the SAVE body verbatim; the reply is built
+-- from it (ClientSettingsHandlers.BuildUiSettingReply).
+CREATE TABLE IF NOT EXISTS ui_settings (
+  account_id INTEGER PRIMARY KEY,
+  blob       BLOB NOT NULL,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 -- ---- Guilds (T39). Schema from status/GUILD-DESIGN.md section 3.3, which derives it
 -- column-by-column from the real Arbiter's spLoadAllGuild / spLoadAllGuildMemberData /
 -- spLoadGuildGroup binds. Two deliberate deviations from the original, both documented there:
@@ -1787,6 +1796,13 @@ CREATE TABLE IF NOT EXISTS eventsystem_progress (
         // A deliberate QA clear must remain empty instead of being mistaken for an unseeded bag.
         AddColumnIfMissing("characters", "inventory_cleared", "INTEGER NOT NULL DEFAULT 0");
         AddColumnIfMissing("characters", "tutorial_cleared", "INTEGER NOT NULL DEFAULT 0");
+
+        // T191f: the enter-world record S_GET_USER_LIST.isNewCharacter needs. Backfilled once, on
+        // the evidence the row already carries - a character that has banked play time or visited a
+        // section has been in the world, whatever this column says.
+        AddColumnIfMissing("characters", "entered_world", "INTEGER NOT NULL DEFAULT 0");
+        Exec("UPDATE characters SET entered_world = 1 WHERE entered_world = 0 AND (play_seconds > 0 "
+            + "OR id IN (SELECT character_id FROM visited_sections))");
         // T181: mark only experiment-created rows, so removing an operator from the allow-list
         // can remove its experiment grants without deleting separately granted benefits.
         AddColumnIfMissing("account_benefits", "teleport_experiment", "INTEGER NOT NULL DEFAULT 0");
@@ -2071,6 +2087,47 @@ ON CONFLICT(account_id) DO UPDATE SET blob = excluded.blob, updated_at = exclude
         }
         _log.LogDebug("Saved {Len} bytes of account settings for account {Id}", blob.Length, accountId);
         return true;
+    }
+
+    /// <summary>
+    /// T191g. The account's window layout, as the client sent it in C_SAVE_CLIENT_UI_SETTING.
+    /// Stored verbatim; the reply is a different record shape and is built at serve time.
+    /// </summary>
+    public bool SaveUiSetting(long accountId, byte[] blob)
+    {
+        if (blob == null || blob.Length == 0 || blob.Length > MaxClientSettingBytes)
+        {
+            _log.LogWarning("SaveUiSetting: refusing a {Len}-byte blob for account {Id}",
+                blob?.Length ?? -1, accountId);
+            return false;
+        }
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = @"
+INSERT INTO ui_settings(account_id, blob, updated_at) VALUES($a, $b, datetime('now'))
+ON CONFLICT(account_id) DO UPDATE SET blob = excluded.blob, updated_at = excluded.updated_at";
+            cmd.Parameters.AddWithValue("$a", accountId);
+            cmd.Parameters.AddWithValue("$b", blob);
+            cmd.ExecuteNonQuery();
+        }
+        _log.LogDebug("Saved {Len} bytes of UI layout for account {Id}", blob.Length, accountId);
+        return true;
+    }
+
+    /// <summary>T191g. The account's stored window layout, or null when nothing has been saved.</summary>
+    public byte[]? LoadUiSetting(long accountId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT blob FROM ui_settings WHERE account_id = $a";
+            cmd.Parameters.AddWithValue("$a", accountId);
+            using var r = cmd.ExecuteReader();
+            if (!r.Read()) return null;
+            var blob = (byte[])r["blob"];
+            return blob.Length == 0 ? null : blob;
+        }
     }
 
     /// <summary>One account's stored client settings, or null when nothing has been saved yet.</summary>
@@ -7930,6 +7987,40 @@ DELETE FROM restrictions      WHERE character_id = $id;";
     // warehouse, 3 guild, 9 character warehouse, 12 style, 14 equipped) and it is what picks
     // the container, exactly as it does inside the real Arbiter's TransSQLExec::GetInven.
     // status/MAIL-WAREHOUSE.md section 6.
+
+    /// <summary>
+    /// T191f. Has this character ever been in the world? <c>SDB_USER_ENTERWORLD</c> is the record:
+    /// World only sends it once it is actually bringing the character in, and a character that has
+    /// only ever been created has none.
+    ///
+    /// <para>It decides <c>S_GET_USER_LIST.isNewCharacter</c> (entry+425). The list used to
+    /// hard-code true for every character on every login, and retail does not: classic_live3's
+    /// record 11 carries 01 on its first entry and 00 on the other six, while ours
+    /// (cap_queue4_client1, cap_wasd2_client) is 01 on every entry.</para>
+    /// </summary>
+    public bool HasEnteredWorld(int characterId)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT entered_world FROM characters WHERE id = $id";
+            cmd.Parameters.AddWithValue("$id", characterId);
+            return Convert.ToInt64(cmd.ExecuteScalar() ?? 0L) != 0;
+        }
+    }
+
+    /// <summary>T191f. Record the first (and every later) enter-world. Idempotent.</summary>
+    public void MarkCharacterEnteredWorld(int characterId)
+    {
+        if (characterId <= 0) return;
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE characters SET entered_world = 1 WHERE id = $id AND entered_world = 0";
+            cmd.Parameters.AddWithValue("$id", characterId);
+            cmd.ExecuteNonQuery();
+        }
+    }
 
     /// <summary>One stored item row.</summary>
     public sealed record ItemRow(int ItemDbId, long OwnerDbId, int InvenType, int Slot,

@@ -1993,3 +1993,53 @@ every tenth tick, forever. T181 seeded 533/534/1000 on operator accounts and 100
 The seeding is retired, the rows are swept on the next benefit load (or by
 `POST /api/remove-benefit`), and an expired benefit is withheld from 0x28BC with a warning naming
 it. Five T219c tests; suite 1138/0/84. Details: `T217-MAKEITEM.md`.
+
+### T191e - the WASD guide: one byte, and it was honest
+
+`cap_wasd2_client` shows S_ADMIN_GM_SKILL in its slot on both logins, the settings blob served back
+byte-identical to the last save (1133 B), and no tip checks to answer. The only difference from
+`cap_final_gm_client2` is frame offset 8 of S_ADMIN_GM_SKILL: retail `01`, ours `00`. Retail's GM was
+vaporized at spawn (World does that at adminLevel 1, never at the 5 we send), so the Arbiter now asks
+World for the same toggle the GM panel asks for, once per world entry at S_SPAWN_ME, and World sends
+the `01` itself. Four T191e tests; suite 1142/0/84. Details: `T191c-CLIENT-SETTINGS.md`.
+
+### T191e-b - the spawn vaporize now says what it did
+
+The T191e request was silent, so "nothing in the log at spawn" was unreadable. The operator spawn
+block logs one Information line per spawn naming the outcome (`Sent`, `AlreadyInvisible`,
+`AlreadyAsked`, `NoWorldLink`); no line at all means the tunnelled S_SPAWN_ME never reached
+`DeliverTunnelled`, which is the next thing to chase. Also fixed: the one-shot was taken before the
+send, so a failed send burned the world entry's only attempt. One new test drives a captured
+S_SPAWN_ME through the live delegate for an operator. Suite 1143/0/84.
+
+### T191e-c - ask until it lands
+
+The T191e-b line proved the 0x2827 left at S_SPAWN_ME and World answered nothing.
+`Handler_AS_ADMIN_REQUEST_USERACTION` looks the target up in its user manager first and silently
+does nothing when it is not there yet, which at S_SPAWN_ME it is not. S_SPAWN_ME now arms the
+request and later tunnelled frames retry it - 5 attempts, 750 ms apart, stopping on
+`SDB_USER_VAPORIZED`, one Warning if World never answers. Two new tests; suite 1144/0/84. Details:
+`T191c-CLIENT-SETTINGS.md`.
+
+### T191f - isNewCharacter and the login status
+
+`S_GET_USER_LIST` entry+425 was hard-coded `true` for every character on every login; classic_live3
+record 11 carries `01` on one entry of seven. It now follows `characters.entered_world`, a new column
+written by `SDB_USER_ENTERWORLD` and backfilled from play time / visited sections.
+`S_LOGIN_ARBITER` status (packet offset 6) goes from 31 to **0** for ordinary accounts - classic_live3
+record 7 - with 33 unchanged for operators. Three T191f tests; T104's pin keeps the captured 31 as a
+capture. Suite 1147/0/84.
+
+Cleared, not the cause: the client-settings pair is already in retail's slot (cap_2man_b 312 ->
+322/323 vs ours 327 -> 336/337) and is resent on every world entry and re-entry - retail sends it on
+fewer. Details: `T191c-CLIENT-SETTINGS.md`.
+
+### T191g - the window layout was acked and dropped
+
+There are three client blobs, not two: the hotbar (per character) and the options (per account) were
+both stored, and the WINDOW LAYOUT - C_SAVE_CLIENT_UI_SETTING -> S_REPLY_CLIENT_UI_SETTING - was
+not. The save was acked and discarded and the reply was a captured constant (116 B in
+cap_wasd2_client at packets 26/32/50/463, against retail's own 486 B). Now stored per account in a
+new `ui_settings` table and rebuilt into the reply shape, which differs only in a u8 flag becoming a
+u32 plus an 8-byte preamble - the arithmetic checks on both captures (115+9-8=116, 461+33-8=486).
+Four T191g tests; suite 1151/0/84. Details: `T191c-CLIENT-SETTINGS.md`.
