@@ -86,6 +86,7 @@ public sealed class WorldReplayTable
         0x1562, // SA_CLEAR_BATTLE_FIELD_ENTER_COUNT     - answered, just noisy
         0x1626, // SA_SEND_USE_OPTIONAL_ITEM
         0x2927, // SDB_CANCEL_NPC_ARENA_BET              - the logout-countdown ticks
+        0x161E, // SA_GIVE_FIELD_EVENT_CLEAR_REWARD      - T217: a 7m20s field-event tick
     };
 
     /// <summary>True when this frame's arrival should be logged at Debug rather than Information.</summary>
@@ -116,6 +117,18 @@ public sealed class WorldReplayTable
         0x13E5, // BSA_REQUEST_BOUNTY_HUNT_SEASON_INFO (periodic heartbeat)
         // T201 0x13E8 is explicitly consumed by DbProxyHandlers, like the reply-less handlers below; never seal it too.
         0x164D, // SA_WORLD_SERVER_STATUS              (periodic)
+        // T217: SA_GIVE_FIELD_EVENT_CLEAR_REWARD. Arb_part_003.c:5812 gives it that name, and
+        // Handler_SA_GIVE_FIELD_EVENT_CLEAR_REWARD (FUN_140726070) reads
+        // [u32 offset @6][u32 byteLength @10][u32 fieldEventId @14] plus a vector of 16-byte
+        // rows, hands them to a FieldDataSheet holder and returns 1 with NO packet writer in it -
+        // one-way, like the audit writes below. Its guard is `len < 0x12`, so the bare 18-byte
+        // frame in every capture is the empty-vector form.
+        //
+        // It is a TIMER, not an answer to anything: cap_makeitem has it at 04:15:37, 04:22:57,
+        // 04:30:17, 04:37:37 and 04:44:57 - 7m20s apart to the second, two payloads alternating -
+        // and arbiter-makeitem2.log has the same cadence at 21:59:57 / 22:07:16 / 22:14:37, the
+        // first two before any character had logged in. status/T217-MAKEITEM.md.
+        0x161E, // SA_GIVE_FIELD_EVENT_CLEAR_REWARD    (periodic, one-way)
 
         // --- T74: the two audit-log writes. Both are fire-and-forget: Handler_SDB_ITEM_TRADE_LOG
         // (Arb_part_063.c:12031) and Handler_SDB_CASH_ITEM_LOG run to `return 1` with no packet

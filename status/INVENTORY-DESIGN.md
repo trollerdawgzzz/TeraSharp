@@ -756,3 +756,43 @@ a repeated frame is a no-op rather than an undo.
 No capture holds an unequip into an EMPTY slot - every equip swapped with the worn item - so that
 case is covered by construction (the destination is empty, the row simply moves) and by a
 synthetic test, not by a pin.
+
+## T219b - the stored record must follow its row
+
+The live DB after two weeks of play (110 item rows) refutes every id-shaped suspicion: no duplicate
+`item_db_id`, nothing at or above 65000000, nothing below `FirstItemId` (1000), no record of a
+length other than 536, and `counters.item_id` == `max(item_db_id)` == 1313, so allocation is
+monotonic. A record-less row is not the fault either - `WarehouseHandlers.BuildItemRecord`
+reproduces a stored record in every named field, and the bytes a stored one carries at 12, 14 and 54
+are UTF-16 SQL text from uninitialised Arbiter heap (section 2).
+
+What the DB does show is **stored records naming a different place than their row**, in swapped
+pairs, on exactly the characters that fail:
+
+| row | row says | record says |
+|---|---|---|
+| 1058 | pocket 0, slot 2 | pocket 14, slot 1 |
+| 1070 | pocket 14, slot 1 | pocket 0, slot 2 |
+
+Eight such rows on character 9, one on character 10; none on character 16, the fresh character that
+still works. `CharacterStore.MoveItem` only ever wrote the columns, and `UpsertItem` keeps the
+stored blob when it is called with no record, so every equip/unequip swap left both records claiming
+the other item's slot. `BagItems.BuildPayload` lays the row's id, owner, amount, pocket and slot
+over the record on the way out, so `DBS_USER_LOAD_INVENTORY` was already immune - but
+`SDB_VIEW_WAREHOUSE`, `ItemEdits` and the QA period commands hand the stored blob to World verbatim.
+
+Both writers now re-stamp (`CharacterStore.RestampRecord`), and `POST /api/repair-inventory`
+(`{"id":N}`, or no target for every character) runs the same stamp over existing rows and reports
+`scanned` / `restamped` / `noRecord`. To see what it would fix first:
+
+```sql
+SELECT item_db_id, owner_db_id, inven_type, slot,
+       CAST(substr(record,29,1) AS INTEGER) AS rec_pocket_lo,
+       CAST(substr(record,37,1) AS INTEGER) AS rec_slot_lo
+FROM items WHERE record IS NOT NULL;
+```
+
+This is a real inconsistency with a real fix, but it is **not proven** to be what World refuses:
+the empty 30-byte `SDB_ITEM_SINGLE` in `arbiter-box.log` arrives at load time, and the 22:48:10
+`makeitem` in that log produced no `0x2768` at all (the T217b silent drop). A tap that runs ~10 s
+past an accepted `/@makeitem` is still the missing evidence.

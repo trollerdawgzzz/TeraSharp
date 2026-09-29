@@ -3151,8 +3151,9 @@ public static class ArbiterClientHandlers
     {
         var w = Program.World;
         if (s == null || w == null || !s.InWorld || s.SelectedCharacter == null || !w.HasLinks(s.CurrentWorldId)) return false;
-        w.SendFrame(s.CurrentWorldId, op, payload);
-        return true;
+        // T217b: the bridge's answer, not an assumption. A link that dropped between HasLinks and
+        // here takes the frame and discards it; with this, GmCommands.ForwardToWorld tells the GM.
+        return w.TrySendFrame(s.CurrentWorldId, op, payload);
     }
 
     /// <summary>T195: the named character's current World, never a default-link fallback.</summary>

@@ -161,6 +161,8 @@ public sealed class AdminApi
         if (method == "POST" && path == "/api/unban") return Ban(body, sourceIp, false);
         if (method == "POST" && path == "/api/kick") return Kick(body, sourceIp);
         if (method == "POST" && path == "/api/reset-character") return ResetCharacter(body, sourceIp);
+        if (method == "POST" && path == "/api/repair-inventory") return RepairInventory(body, sourceIp);
+        if (method == "POST" && path == "/api/remove-benefit") return RemoveBenefit(body, sourceIp);
         if (method == "GET" && path == "/api/server-achievements") return ServerAchievements();
         if (method == "POST" && path == "/api/clear-server-achievement") return ClearServerAchievement(body, sourceIp);
         if (method == "POST" && path == "/api/announce") return Announcement(body, sourceIp);
@@ -603,6 +605,61 @@ public sealed class AdminApi
     }
 
     /// <summary>POST /api/set-money {"id":N,"money":M,"reason":"..."} - WA_CHANGE_MONEY.</summary>
+    /// <summary>
+    /// T219c. POST /api/remove-benefit {"account":N|"name":"...", "package":P} - drop one account
+    /// benefit, or every row T181's retired operator experiment wrote when "package" is left out.
+    /// With no target at all it sweeps the experiment rows off every account. An expired package
+    /// World cannot resolve as a user trait wedges that account's tick, so this is the repair.
+    /// </summary>
+    private AdminResponse RemoveBenefit(string? body, string? ip)
+    {
+        string reason = JsonString(body, "reason") ?? string.Empty;
+        double? package = JsonNumber(body, "package");
+        double? accountId = JsonNumber(body, "account");
+        string? accountName = JsonString(body, "name");
+
+        long? target = null;
+        if (accountId != null) target = (long)accountId.Value;
+        else if (accountName != null)
+        {
+            var a = _store.GetAccount(accountName);
+            if (a == null) { Log(ip, "remove-benefit", accountName, reason, ResultNotFound); return Json(404, ResultNotFound, "no such account"); }
+            target = a.Id;
+        }
+
+        if (package != null)
+        {
+            if (target == null) { Log(ip, "remove-benefit", "?", reason, ResultInvalid); return Json(400, ResultInvalid, "package needs an account"); }
+            bool gone = _store.RevokeAccountBenefit(target.Value, (int)package.Value);
+            Log(ip, "remove-benefit", accountName ?? target.Value.ToString(System.Globalization.CultureInfo.InvariantCulture), reason, gone ? ResultOk : ResultNotFound);
+            return gone ? Json(200, ResultOk, "benefit removed") : Json(404, ResultNotFound, "no such benefit");
+        }
+
+        int removed = _store.RemoveBenefitExperimentRows(target);
+        Log(ip, "remove-benefit", accountName ?? target?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "*", reason, ResultOk);
+        return new AdminResponse(200, "application/json; charset=utf-8",
+            "{\"result\":" + ResultOk + ",\"removed\":" + removed + "}");
+    }
+
+    /// <summary>
+    /// T219b. POST /api/repair-inventory {"id":N} - or no target for every character. Re-stamps
+    /// each stored 536-byte item record from its row, so a record can no longer name the pocket
+    /// and slot the item sat in before a move. Reports the rows it changed.
+    /// </summary>
+    private AdminResponse RepairInventory(string? body, string? ip)
+    {
+        string reason = JsonString(body, "reason") ?? string.Empty;
+        bool all = JsonNumber(body, "id") == null && JsonString(body, "name") == null;
+        var c = all ? null : Target(body);
+        if (!all && c == null) { Log(ip, "repair-inventory", "?", reason, ResultNotFound); return Json(404, ResultNotFound, "no such character"); }
+
+        var r = _store.RepairItemRecords(c?.Id);
+        Log(ip, "repair-inventory", c?.Name ?? "*", reason, ResultOk);
+        return new AdminResponse(200, "application/json; charset=utf-8",
+            "{\"result\":" + ResultOk + ",\"scanned\":" + r.Scanned
+            + ",\"restamped\":" + r.Restamped + ",\"noRecord\":" + r.NoRecord + "}");
+    }
+
     private AdminResponse SetMoney(string? body, string? ip)
     {
         var c = Target(body);

@@ -625,13 +625,53 @@ public sealed class GmCommandHandlers
 
     // ---- The forward ----
 
+    /// <summary>
+    /// T217. <see cref="ArbiterClientHandlers.SendToWorld(GameSession, ushort, byte[])"/> returns
+    /// FALSE and sends nothing when the session is not in world, has no character, or its World
+    /// has no link - and this used to discard that, so a forwarded command logged
+    /// "-&gt; ForwardToWorld" and then vanished. arbiter-makeitem2.log 22:14:25 and 22:14:31 are
+    /// exactly that: two `makeitem 69001 1`, both logged, and not one 0x2829 on the wire (the log
+    /// carries 21 other A-&gt;W frames, so it is not a logging gap). The working capture is one
+    /// millisecond apart - cap_makeitem 15690 A-&gt;W 0x2829 `makeitem 88384 1`, 15691 W-&gt;A 0x2768 -
+    /// so World answers a two-argument makeitem fine; the frame simply never reached it.
+    ///
+    /// <para>The GM now gets told, and the log names which gate closed, so the next attempt says
+    /// why instead of being silent. status/T217-MAKEITEM.md.</para>
+    /// </summary>
     private void ForwardToWorld(GameSession s, GmCommandLine line, int commandType)
     {
         var chr = s.SelectedCharacter;
         int playerId = chr == null ? (int)s.PlayerId : (int)chr.Id;
         var payload = BuildWorldForward(playerId, BypassModeWorld, line.Rebuilt());
         // T195: native uses User::GetBypassSession (Arb_part_067:6893, Arb_part_028:17295).
-        ArbiterClientHandlers.SendToWorld(s, AS_BYPASS_COMMAND, payload);
+        if (ArbiterClientHandlers.SendToWorld(s, AS_BYPASS_COMMAND, payload))
+        {
+            // T217b: say that it went, and say it at the same level as the "-> ForwardToWorld"
+            // line above. Without this pair the log cannot tell "never sent" from "sent, World
+            // said nothing", which is the whole of T217 and T217b: in cap_makeitem3 the frame DID
+            // leave (A->W#1 05:48:10.871 0x2829, 52 B) and only the capture ended before any
+            // answer could arrive. Program.World is non-null here - SendToWorld just tested it.
+            _log.LogInformation("{Name}: forwarded to world {World} as 0x{Op:X4}, {Len} B, player {Player}",
+                line.Name, s.CurrentWorldId, AS_BYPASS_COMMAND, payload.Length + 6, playerId);
+            return;
+        }
+
+        string why = ForwardBlockedReason(s);
+        _log.LogWarning("{Name}: NOT forwarded to World - {Why}. The command was accepted and "
+            + "nothing was sent (player {Player}, world {World}).", line.Name, why, playerId, s.CurrentWorldId);
+        SendCustom(s, line.Name + ": not forwarded - " + why + "\n");
+    }
+
+    /// <summary>Which of SendToWorld's gates closed, in the order it tests them.</summary>
+    internal static string ForwardBlockedReason(GameSession? s)
+    {
+        if (s == null) return "no session";
+        if (Program.World == null) return "no World bridge in this process";
+        if (s.SelectedCharacter == null) return "no character selected";
+        if (!s.InWorld) return "the session is not in world";
+        if (!Program.World.HasLinks(s.CurrentWorldId))
+            return "world " + s.CurrentWorldId + " has no link right now";
+        return "the World bridge refused the send";
     }
 
     /// <summary>

@@ -1320,10 +1320,18 @@ public sealed partial class DbProxyHandlers
         {
             // Deliberately account names only, not character-name aliases or stored admin_level.
             bool listed = Handlers.GmAccounts.IsListed(account.Name);
-            _store.SyncTeleportExperiment(account.Id, listed);
-            rows = _store.GetAccountBenefits(account.Id);
+            // T219c: the operator experiment is retired; this only cleans up rows it already wrote.
+            _store.RemoveBenefitExperimentRows(account.Id);
+            var stored = _store.GetAccountBenefits(account.Id);
+            var now = DateTimeOffset.UtcNow;
+            rows = stored.Where(r => AccountBenefitExperiment.IsLive(r, now)).ToList();
             _log.LogInformation("T181 account benefits: user {User} account {Account} operator={Operator} packages=[{Packages}]",
                 userDbId, account.Name, listed, string.Join(",", rows.Select(r => r.PackageId)));
+            if (rows.Count != stored.Count)
+                _log.LogWarning("Account benefits: account {Account} still holds {N} EXPIRED package(s) [{Packages}] - "
+                    + "withheld from World, which asserts on an expired package it cannot resolve as a user trait (T219c)",
+                    account.Name, stored.Count - rows.Count,
+                    string.Join(",", stored.Where(r => !AccountBenefitExperiment.IsLive(r, now)).Select(r => r.PackageId)));
         }
         link.SendFrame(0x28BC, AccountBenefitExperiment.BuildReply(dlmId, account != null, rows));
         return true;

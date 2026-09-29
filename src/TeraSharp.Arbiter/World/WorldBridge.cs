@@ -732,13 +732,22 @@ public sealed class WorldBridge
     /// the same link the old `_links[0]` primary did.
     /// </summary>
     public void SendFrame(int worldId, ushort op, byte[] payload)
+        => TrySendFrame(worldId, op, payload);
+
+    /// <summary>
+    /// T217b. The same send, reporting whether the bytes actually went. <see cref="SendFrame(int,
+    /// ushort, byte[])"/> stays void because several call sites pass it as an
+    /// <c>Action&lt;int, ushort, byte[]&gt;</c> (PartyWiring, GuildWiring); anything that has to
+    /// tell an operator uses this one.
+    /// </summary>
+    public bool TrySendFrame(int worldId, ushort op, byte[] payload)
     {
         WorldLink? primary;
         lock (_lock) primary = _links.FirstOrDefault(l => l.WorldId == worldId);
         if (primary == null)
         {
             _log.LogWarning("0x{Op:X4}: world {W} has no links - frame dropped", op, worldId);
-            return;
+            return false;
         }
         if (op == OpPlayerEnter)
         {
@@ -746,7 +755,7 @@ public sealed class WorldBridge
             DbProxy?.StampEnterWorldCrestPoints(payload); // T197: refresh earned extras before caching any entry/transfer/retry.
             _crossWorld.RememberEnter(worldId, payload);
         }
-        primary.SendFrame(op, payload);
+        return primary.TrySendFrame(op, payload);
     }
 
     /// <summary>
@@ -1031,15 +1040,33 @@ public sealed class WorldLink
         finally { try { _sock.Close(); } catch { } }
     }
 
-    public void SendFrame(ushort op, byte[] payload)
+    public void SendFrame(ushort op, byte[] payload) => TrySendFrame(op, payload);
+
+    /// <summary>
+    /// T217b: the send, reporting whether it went. The old body's FIRST line was a silent
+    /// <c>if (!_sock.Connected) return;</c> - a link that had dropped but had not yet been reaped
+    /// from <c>_links</c> passed <c>HasLinks</c>, took the frame and discarded it without a word,
+    /// so an accepted /@ command could vanish leaving nothing in the log. Both refusals say so now.
+    /// <see cref="SendFrame(ushort, byte[])"/> stays void for the method-group call sites.
+    /// </summary>
+    public bool TrySendFrame(ushort op, byte[] payload)
     {
-        if (!_sock.Connected) return;
+        if (!_sock.Connected)
+        {
+            _log.LogWarning("Link #{Id}: socket is not connected - 0x{Op:X4} ({Len} B) dropped",
+                Id, op, payload.Length + 6);
+            return false;
+        }
         int total = 6 + payload.Length;
         var frame = new byte[total];
         BitConverter.GetBytes(total).CopyTo(frame, 0);
         BitConverter.GetBytes(op).CopyTo(frame, 4);
         payload.CopyTo(frame, 6);
-        try { _sock.Send(frame); }
-        catch (Exception ex) { _log.LogWarning("Link #{Id} send failed: {Msg}", Id, ex.Message); }
+        try { _sock.Send(frame); return true; }
+        catch (Exception ex)
+        {
+            _log.LogWarning("Link #{Id} send failed: {Msg}", Id, ex.Message);
+            return false;
+        }
     }
 }

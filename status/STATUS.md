@@ -1917,3 +1917,79 @@ The PowerShell was not executed: this session has no shell on the deployment hos
 `start.ps1` was checked structurally (the preflight and `-Insecure` are inside the `@'...'@` body,
 no stray here-string terminator) but not run - `.\setup.ps1 -NonInteractive` then `.\start.ps1` on a
 tree with `auth.enabled=false` is the one-minute confirmation.
+
+## T217 - 0x161E is a field-event timer; the makeitem forward never left the Arbiter (2026-09-28)
+
+0x161E is `SA_GIVE_FIELD_EVENT_CLEAR_REWARD` (`Arb_part_003.c:5812`). Its handler reads
+`[u32 offset @6][u32 byteLength @10][u32 fieldEventId @14]` plus a vector of 16-byte rows, hands
+them to a `FieldDataSheet` holder and returns 1 **with no packet writer** - one-way. It is periodic:
+7m20s apart in `cap_makeitem` and in `arbiter-makeitem2.log`, where two of the three arrive before
+any character logged in. Not the create, not a pre-notice.
+
+The create pair is still `A->W 0x2829 AS_ADMIN_COMMAND` -> `W->A 0x2768 SDB_ITEM_SINGLE` one
+millisecond later, and `makeitem 88384 1` (two arguments, like the failing one) works in the
+capture. What broke is that **no 0x2829 left the Arbiter**: `SendToWorld` returns false on a closed
+gate and `ForwardToWorld` discarded it, so the command logged `-> ForwardToWorld` and vanished.
+That return is now checked, the gate is named in the log and told to the GM. Which gate closed on
+22:14:25 is not in that log - one `/@makeitem` on this build prints it. Details:
+`T217-MAKEITEM.md`.
+
+## T217b - the makeitem forward reached World; the capture just ended first (2026-09-28)
+
+`cap_makeitem3` frame 1295 is `A->W#1 05:48:10.871 0x2829 len=52` carrying `makeitem 88384 1` -
+byte-identical to the working `cap_makeitem` 15690 except the player id (9 vs 10). The forward was
+never lost, and T217's gate check was right to print nothing. No `0x2768` follows because **that
+frame is the last one in the tap** and `arbiter-makeitem3.log` ends on the same line: both were
+stopped the instant the command was issued. A capture that runs a few seconds longer settles
+whether World answers.
+
+Tracing the path did find a genuine silent drop: `WorldLink.SendFrame` began
+`if (!_sock.Connected) return;` with no log and a void return, so a link that had dropped but not
+yet been reaped passed `HasLinks`, swallowed the frame, and `SendToWorld` still reported success.
+`WorldBridge.cs` is human-owned - the fix is `status/T217b-PATCH.diff` (new `TrySendFrame` on link
+and bridge, the refusal logged, `SendToWorld` returning the real answer); applied it builds clean
+and the suite is 1126 / 0 / 84. Landed directly: `ForwardToWorld` logs the successful send too, so
+the log alone now distinguishes "never sent" from "sent, no answer". Details: `T217-MAKEITEM.md`.
+
+## T218 - the Arbiter already sends AdminLevel 5 (2026-09-28)
+
+`cap_makeitem3`'s `AS_ENTER_WORLD` for player 9 - the session whose console said
+`SpawnComplete caludesucks(9) AdminLevel[0]` - carries **`05 00 00 00` at payload+111**.
+`WorldEntry.cs:51` already builds the payload with `GmCommandHandlers.LevelOf(s, Program.Store)`,
+and the `C_ADMIN` line for that session resolves 5 too. Retail's own GM frame (`cap_final`, T46's
+adminLevel 1) puts `01` at the same offset, and a full 183-byte diff of the two frames leaves only
+per-session values differing - handles, UserDbId, SessionKey, continent, position, Ticket, GameId -
+so nothing is shifted.
+
+World's side: `WorldServer.exe.c:847798` binds `adminLevel` to User+0xA474 and `:935500` prints it;
+the only other write to 0xA474 in the binary is the `= 0` initialiser at `:803532`. So the Arbiter
+is not the one getting it wrong, and the likeliest reading is that the quoted console line came from
+a session entered before that account was listed in `TERASHARP_GM_ACCOUNTS`. One capture of the
+enter-world frame and the console line from the SAME session settles it. Pinned by three T218
+tests. Details: `T218-ADMINLEVEL.md`.
+
+### T219b - the item rows, not the allocator
+
+The live DB disproves the brief: no duplicate or out-of-range `item_db_id`, and
+`counters.item_id` == `max(item_db_id)` == 1313. A record-less row is not it either - the
+synthesised record matches a stored one in every named field. What it does show is eight rows on
+character 9 (one on character 10, none on the fresh character 16) whose stored 536-byte record names
+the pocket and slot the item sat in BEFORE a move: `MoveItem` wrote only the columns, and
+`UpsertItem` keeps the old blob when called with no record. Both now re-stamp the record from the
+row, and `POST /api/repair-inventory` fixes rows written earlier. Four T219b tests; suite
+1133/0/84. Still unproven as the cause of the refused create - see the T219b section of `INVENTORY-DESIGN.md`
+for the capture that would settle it.
+
+### T219c - the expired benefit, not the item
+
+`cap_makeitem` 15690/15691 vs `cap_item_new` 76558: the same `makeitem 88384 1` gets an 886-byte
+`0x2768` back for player 10 (account 2) and nothing at all for player 9 (account 1). World's
+create path reads no benefit, but its account tick does: `User::OnTickAccountTrait` ->
+`GetExpiredPackges` -> `DeletePropertyList`, which resolves each expired id in the UserTrait
+datasheet, logs `Unknown user trait 1000`, asserts at `AccountTrait.cpp(523)` and leaves the loop -
+every tenth tick, forever. T181 seeded 533/534/1000 on operator accounts and 1000 expired
+2026-08-15. Per account, and DB state, which is why the rollback changed nothing.
+
+The seeding is retired, the rows are swept on the next benefit load (or by
+`POST /api/remove-benefit`), and an expired benefit is withheld from 0x28BC with a warning naming
+it. Five T219c tests; suite 1138/0/84. Details: `T217-MAKEITEM.md`.

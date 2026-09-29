@@ -229,17 +229,23 @@ public static partial class Tests
         finally { Environment.SetEnvironmentVariable(GmAccounts.EnvVariable, saved); }
     }
 
+    /// <summary>T219c: the three cap_final2b packages the retired experiment used to seed.</summary>
+    internal static readonly (int PackageId, long ExpiresAt)[] T181CapturedPackages =
+    {
+        (533, 0x6ACF286F), (534, 0x7D31B36F), (1000, 0x6A800E6F)
+    };
+
+    /// <summary>
+    /// T219c: the capture pin now goes straight at the reply builder. Nothing seeds these three
+    /// packages any more, and the handler withholds the expired one, so running them through the
+    /// handler could no longer reproduce frame 171 - the wire format is what this ever pinned.
+    /// </summary>
     [Test] public static void T181_final2b_170_to_171_operator_benefits_byte_exact()
     {
-        using var store = T181Store();
-        T181WithOperators("acct2", () =>
-        {
-            var (op, body) = RunHandler1(0x28BB, Convert.FromHexString("1B000000EB030000"), store);
-            Hex.Eq(T180Frame(op, body), Convert.FromHexString("43000000BC2813000000300000001B0000000115020000550000006F28CF6A0000000016020000550000006FB3317D00000000E8030000550000006F0E806A00000000"), "cap_final2b 171 (67 B)");
-            Hex.True(store.GetAccountBenefits(store.GetAccount("acct2")!.Id).Count == 3, "three persisted rows");
-            RunHandler1(0x28BB, Convert.FromHexString("1B000000EB030000"), store);
-            Hex.True(store.GetAccountBenefits(store.GetAccount("acct2")!.Id).Count == 3, "idempotent relog");
-        });
+        var rows = T181CapturedPackages
+            .Select(p => new CharacterStore.AccountBenefitRow(1, p.PackageId, p.ExpiresAt, 0)).ToList();
+        var body = World.AccountBenefitExperiment.BuildReply(0x1B, true, rows);
+        Hex.Eq(T180Frame(0x28BC, body), Convert.FromHexString("43000000BC2813000000300000001B0000000115020000550000006F28CF6A0000000016020000550000006FB3317D00000000E8030000550000006F0E806A00000000"), "cap_final2b 171 (67 B)");
     }
 
     [Test] public static void T181_final2b_496_to_497_normal_account_empty()
@@ -253,12 +259,17 @@ public static partial class Tests
         });
     }
 
+    /// <summary>
+    /// T219c. Being listed, being an admin, or being neither: an operator's benefit load seeds
+    /// nothing at all now, and a grant made any other way survives the experiment cleanup.
+    /// </summary>
     [Test] public static void T181_allow_list_removal_and_unlisted_admin_do_not_grant_players_benefits()
     {
         using var store = T181Store();
         long account = store.GetAccount("acct2")!.Id;
         void Load() => RunHandler1(0x28BB, Convert.FromHexString("1B000000EB030000"), store);
         T181WithOperators("acct2", Load);
+        Hex.True(store.GetAccountBenefits(account).Count == 0, "a listed operator is seeded nothing");
         store.GrantAccountBenefit(account, 777, 12345, 99); // A separate grant is not ours to revoke.
         store.SetAdminLevel(account, 5);
         T181WithOperators("t30_2", Load); // Character-name aliases must not seed this experiment.

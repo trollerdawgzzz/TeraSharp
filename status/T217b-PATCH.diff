@@ -1,0 +1,98 @@
+# T217b - make the World send report whether it went.
+#
+# WorldBridge.cs is human-owned (CLAUDE.md section on human-owned files), so this is a patch
+# rather than an edit. ArbiterClientHandlers.cs is in the same patch because the two must land
+# together: TrySendFrame does not exist until the first hunk applies.
+#
+# Verified in the sandbox: applied on top of master HEAD it builds with 0 errors and the suite is
+# 1126 passed / 0 failed / 84 skipped - the same as without it.
+#
+# Apply from the repository root:  git apply status/T217b-PATCH.diff
+#
+--- a/src/TeraSharp.Arbiter/World/WorldBridge.cs
++++ b/src/TeraSharp.Arbiter/World/WorldBridge.cs
+@@ -729,13 +729,22 @@
+     /// the same link the old `_links[0]` primary did.
+     /// </summary>
+     public void SendFrame(int worldId, ushort op, byte[] payload)
++        => TrySendFrame(worldId, op, payload);
++
++    /// <summary>
++    /// T217b. The same send, reporting whether the bytes actually went. <see cref="SendFrame(int,
++    /// ushort, byte[])"/> stays void because several call sites pass it as an
++    /// <c>Action&lt;int, ushort, byte[]&gt;</c> (PartyWiring, GuildWiring); anything that has to
++    /// tell an operator uses this one.
++    /// </summary>
++    public bool TrySendFrame(int worldId, ushort op, byte[] payload)
+     {
+         WorldLink? primary;
+         lock (_lock) primary = _links.FirstOrDefault(l => l.WorldId == worldId);
+         if (primary == null)
+         {
+             _log.LogWarning("0x{Op:X4}: world {W} has no links - frame dropped", op, worldId);
+-            return;
++            return false;
+         }
+         if (op == OpPlayerEnter)
+         {
+@@ -743,7 +752,7 @@
+             DbProxy?.StampEnterWorldCrestPoints(payload); // T197: refresh earned extras before caching any entry/transfer/retry.
+             _crossWorld.RememberEnter(worldId, payload);
+         }
+-        primary.SendFrame(op, payload);
++        return primary.TrySendFrame(op, payload);
+     }
+ 
+     /// <summary>
+@@ -1028,15 +1037,33 @@
+         finally { try { _sock.Close(); } catch { } }
+     }
+ 
+-    public void SendFrame(ushort op, byte[] payload)
++    public void SendFrame(ushort op, byte[] payload) => TrySendFrame(op, payload);
++
++    /// <summary>
++    /// T217b: the send, reporting whether it went. The old body's FIRST line was a silent
++    /// <c>if (!_sock.Connected) return;</c> - a link that had dropped but had not yet been reaped
++    /// from <c>_links</c> passed <c>HasLinks</c>, took the frame and discarded it without a word,
++    /// so an accepted /@ command could vanish leaving nothing in the log. Both refusals say so now.
++    /// <see cref="SendFrame(ushort, byte[])"/> stays void for the method-group call sites.
++    /// </summary>
++    public bool TrySendFrame(ushort op, byte[] payload)
+     {
+-        if (!_sock.Connected) return;
++        if (!_sock.Connected)
++        {
++            _log.LogWarning("Link #{Id}: socket is not connected - 0x{Op:X4} ({Len} B) dropped",
++                Id, op, payload.Length + 6);
++            return false;
++        }
+         int total = 6 + payload.Length;
+         var frame = new byte[total];
+         BitConverter.GetBytes(total).CopyTo(frame, 0);
+         BitConverter.GetBytes(op).CopyTo(frame, 4);
+         payload.CopyTo(frame, 6);
+-        try { _sock.Send(frame); }
+-        catch (Exception ex) { _log.LogWarning("Link #{Id} send failed: {Msg}", Id, ex.Message); }
++        try { _sock.Send(frame); return true; }
++        catch (Exception ex)
++        {
++            _log.LogWarning("Link #{Id} send failed: {Msg}", Id, ex.Message);
++            return false;
++        }
+     }
+ }
+--- a/src/TeraSharp.Arbiter/Handlers/ArbiterClientHandlers.cs
++++ b/src/TeraSharp.Arbiter/Handlers/ArbiterClientHandlers.cs
+@@ -3148,8 +3148,9 @@
+     {
+         var w = Program.World;
+         if (s == null || w == null || !s.InWorld || s.SelectedCharacter == null || !w.HasLinks(s.CurrentWorldId)) return false;
+-        w.SendFrame(s.CurrentWorldId, op, payload);
+-        return true;
++        // T217b: the bridge's answer, not an assumption. A link that dropped between HasLinks and
++        // here takes the frame and discards it; with this, GmCommands.ForwardToWorld tells the GM.
++        return w.TrySendFrame(s.CurrentWorldId, op, payload);
+     }
+ 
+     /// <summary>T195: the named character's current World, never a default-link fallback.</summary>

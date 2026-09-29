@@ -2179,6 +2179,11 @@ array items
             // may not be in both places - see T115_the_log_opcodes_are_handlers_not_sealed.
             // T77: SDB_UPDATE_EP_DAILY_LIMIT-style write with no reply, and the festival push.
             0x28B8, 0x14CE,
+            // T217: SA_GIVE_FIELD_EVENT_CLEAR_REWARD. Handler_SA_GIVE_FIELD_EVENT_CLEAR_REWARD
+            // (FUN_140726070) hands its rows to a FieldDataSheet holder and returns 1 with no
+            // packet writer in it, and the frame arrives on a 7m20s timer whether anyone is
+            // playing or not (cap_makeitem 04:15:37 onwards).
+            0x161E,
             // T47 sealed the through-Arbiter contract family here (0x2809, 0x280C, 0x280D,
             // 0x280E). T60 UNSEALED all four: they are gated to ContractBroker off
             // WorldBridge's default arm instead, and a SEALED opcode never reaches a gate.

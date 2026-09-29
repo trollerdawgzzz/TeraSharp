@@ -7960,6 +7960,9 @@ DELETE FROM restrictions      WHERE character_id = $id;";
             cmd.Parameters.AddWithValue("$a", amount);
             cmd.Parameters.AddWithValue("$r", (object?)record ?? DBNull.Value);
             cmd.ExecuteNonQuery();
+            // T219b: an upsert with no record keeps the stored blob, which then still claims the
+            // position the item had before this call. Re-stamp it from the row.
+            if (record is null) RestampRecord(itemDbId);
         }
     }
 
@@ -7976,7 +7979,106 @@ DELETE FROM restrictions      WHERE character_id = $id;";
             cmd.Parameters.AddWithValue("$o", ownerDbId);
             cmd.Parameters.AddWithValue("$t", invenType);
             cmd.Parameters.AddWithValue("$s", slot);
-            return cmd.ExecuteNonQuery() > 0;
+            if (cmd.ExecuteNonQuery() <= 0) return false;
+            RestampRecord(itemDbId);
+            return true;
+        }
+    }
+
+    // T219b. Record field offsets inside the 536-byte ItemData blob, from
+    // status/INVENTORY-DESIGN.md section 2. World.BagItems names the same five; they are repeated
+    // here because the store deliberately does not reference the World layer.
+    private const int RecOwner = 16, RecAmount = 24, RecPocket = 28, RecSlot = 36, RecId = 0;
+
+    /// <summary>
+    /// T219b. Rewrite the five identity/position fields inside a row's stored record from the
+    /// row's own columns. A move or an amount change only ever touched the columns, so a bag that
+    /// had been reordered carried records claiming their OLD pocket and slot - two items naming
+    /// one slot once a pair was swapped. DBS_USER_LOAD_INVENTORY patches those five on the way out
+    /// (BagItems.BuildPayload), but SDB_VIEW_WAREHOUSE, ItemEdits and the QA period commands hand
+    /// the stored blob to World verbatim. Caller holds <c>_lock</c>.
+    /// </summary>
+    private void RestampRecord(int itemDbId)
+    {
+        byte[]? rec;
+        long owner; int pocket, slot; long amount;
+        using (var read = _db.CreateCommand())
+        {
+            read.CommandText =
+                "SELECT record, owner_db_id, inven_type, slot, amount FROM items WHERE item_db_id = $id";
+            read.Parameters.AddWithValue("$id", itemDbId);
+            using var r = read.ExecuteReader();
+            if (!r.Read() || r.IsDBNull(0)) return;
+            rec = (byte[])r[0];
+            owner = r.GetInt64(1); pocket = r.GetInt32(2); slot = r.GetInt32(3); amount = r.GetInt64(4);
+        }
+        if (!StampRecord(rec, itemDbId, owner, pocket, slot, amount)) return;
+        using var put = _db.CreateCommand();
+        put.CommandText = "UPDATE items SET record = $r WHERE item_db_id = $id";
+        put.Parameters.AddWithValue("$r", rec);
+        put.Parameters.AddWithValue("$id", itemDbId);
+        put.ExecuteNonQuery();
+    }
+
+    /// <summary>
+    /// T219b. Lay the row's id/owner/pocket/slot/amount over the record in place. False when the
+    /// blob is the wrong length or already agreed with the row, so a repair pass can count only
+    /// the rows it really changed.
+    /// </summary>
+    private static bool StampRecord(byte[]? rec, int itemDbId, long owner, int pocket, int slot, long amount)
+    {
+        if (rec is null || rec.Length < RecSlot + 4) return false;
+        bool changed = false;
+        changed |= Stamp32(rec, RecId, itemDbId);
+        changed |= Stamp32(rec, RecOwner, (int)owner);
+        changed |= Stamp32(rec, RecAmount, (int)amount);
+        changed |= Stamp32(rec, RecPocket, pocket);
+        changed |= Stamp32(rec, RecSlot, slot);
+        return changed;
+    }
+
+    private static bool Stamp32(byte[] rec, int at, int value)
+    {
+        if (BitConverter.ToInt32(rec, at) == value) return false;
+        BitConverter.TryWriteBytes(rec.AsSpan(at, 4), value);
+        return true;
+    }
+
+    /// <summary>
+    /// T219b. Repair pass for <c>items</c>: re-stamp every stored record from its row. Pass a
+    /// character id to limit it to one bag, or null for the whole table. Returns how many rows
+    /// carried a record that disagreed with its row, and how many rows have no record at all
+    /// (those are synthesised on demand and need no repair).
+    /// </summary>
+    public (int Restamped, int Scanned, int NoRecord) RepairItemRecords(long? ownerDbId = null)
+    {
+        var work = new List<(int Id, long Owner, int Pocket, int Slot, long Amount, byte[]? Rec)>();
+        lock (_lock)
+        {
+            using (var find = _db.CreateCommand())
+            {
+                find.CommandText =
+                    "SELECT item_db_id, owner_db_id, inven_type, slot, amount, record FROM items"
+                    + (ownerDbId is null ? "" : " WHERE owner_db_id = $o") + " ORDER BY item_db_id";
+                if (ownerDbId is not null) find.Parameters.AddWithValue("$o", ownerDbId.Value);
+                using var r = find.ExecuteReader();
+                while (r.Read())
+                    work.Add((r.GetInt32(0), r.GetInt64(1), r.GetInt32(2), r.GetInt32(3), r.GetInt64(4),
+                              r.IsDBNull(5) ? null : (byte[])r[5]));
+            }
+            int restamped = 0, noRecord = 0;
+            foreach (var w in work)
+            {
+                if (w.Rec is null) { noRecord++; continue; }
+                if (!StampRecord(w.Rec, w.Id, w.Owner, w.Pocket, w.Slot, w.Amount)) continue;
+                using var put = _db.CreateCommand();
+                put.CommandText = "UPDATE items SET record = $r WHERE item_db_id = $id";
+                put.Parameters.AddWithValue("$r", w.Rec);
+                put.Parameters.AddWithValue("$id", w.Id);
+                put.ExecuteNonQuery();
+                restamped++;
+            }
+            return (restamped, work.Count, noRecord);
         }
     }
 
@@ -8316,33 +8418,22 @@ DELETE FROM restrictions      WHERE character_id = $id;";
 
     /// <summary>T181. Seed the three captured packages only for an explicitly allow-listed
     /// account. Revocation removes only rows this experiment inserted. Existing grants survive.</summary>
-    public void SyncTeleportExperiment(long accountId, bool isOperator)
+    /// <summary>
+    /// T219c. Drop the rows T181's operator experiment wrote, for one account or - with null - for
+    /// every account. The experiment no longer seeds anything, so this is pure repair: an account
+    /// that still carries 533/534/1000 is cleaned on its next benefit load and no SQL is needed.
+    /// A benefit granted any other way is never touched; only <c>teleport_experiment=1</c> rows go.
+    /// Returns how many rows were removed.
+    /// </summary>
+    public int RemoveBenefitExperimentRows(long? accountId = null)
     {
         lock (_lock)
         {
-            using var tx = _db.BeginTransaction();
             using var cmd = _db.CreateCommand();
-            cmd.Transaction = tx;
-            cmd.Parameters.AddWithValue("$a", accountId);
-            if (!isOperator)
-            {
-                cmd.CommandText = "DELETE FROM account_benefits WHERE account_id=$a AND teleport_experiment=1";
-                cmd.ExecuteNonQuery();
-            }
-            else
-            {
-                cmd.CommandText = "INSERT OR IGNORE INTO account_benefits " +
-                    "(account_id,package_id,expires_at,value,teleport_experiment) VALUES($a,$p,$e,0,1)";
-                var package = cmd.Parameters.Add("$p", SqliteType.Integer);
-                var expires = cmd.Parameters.Add("$e", SqliteType.Integer);
-                foreach (var seed in World.AccountBenefitExperiment.Seeds)
-                {
-                    package.Value = seed.PackageId;
-                    expires.Value = seed.ExpiresAt;
-                    cmd.ExecuteNonQuery();
-                }
-            }
-            tx.Commit();
+            cmd.CommandText = "DELETE FROM account_benefits WHERE teleport_experiment=1"
+                + (accountId is null ? "" : " AND account_id=$a");
+            if (accountId is not null) cmd.Parameters.AddWithValue("$a", accountId.Value);
+            return cmd.ExecuteNonQuery();
         }
     }
 
