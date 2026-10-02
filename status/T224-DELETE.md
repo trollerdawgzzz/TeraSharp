@@ -49,8 +49,8 @@ into `S_DELETE_USER` (0xB80B) and then a `"DELETE_USER"` audit row. The window l
 manager, i.e. in `ServerConfig.xml`. Nothing else could supply it.
 
 Also visible there and **not** implemented (out of scope, worth a task): the handler refuses with
-system message `0x2B2` (690) when `lVar6 != 0 && *(int*)(lVar6+0x1b54) >= 1 && *(int*)(lVar6+7000) == 1`
-— a per-character state gate, almost certainly "can't delete a guild master", pairing with the
+system message `0x2B2` (690) on a per-character state gate (a non-zero guild id combined with a
+set flag on the character record) — almost certainly "can't delete a guild master", pairing with the
 `0x2B3` (691) no-free-slot refusal T88 already models on the cancel side.
 
 ## 2. The fix
