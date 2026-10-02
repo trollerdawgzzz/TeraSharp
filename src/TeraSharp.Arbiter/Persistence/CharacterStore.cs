@@ -167,7 +167,7 @@ public sealed class CharacterIdentity
 /// were ever in <c>S_SKILL_LIST</c>, so the client drew his whole skill tree as not-yet-learned:
 /// icons present, all locked.</para>
 ///
-/// <para>Generated from <c>Executable\Datasheet\DefaultSkillSet.xml</c> (99 rows, the complete
+/// <para>Generated from <c>Executable\Datasheet\DefaultSkillSet.xml</c> (106 rows, the complete
 /// sheet). Race, gender and class are the Arbiter's own numeric ids, decompiled from its
 /// name-&gt;id lookups: race <c>FUN_1400c4e20</c> (Arb_part_006.c:523) = Human 0, HighElf 1,
 /// Aman 2, Castanic 3, Popori 4, Baraka 5; class <c>FUN_140065e00</c> (Arb_part_003.c:2179) =
@@ -201,6 +201,8 @@ public static class DefaultSkillSet
         "0,1,6|10100;180100;9020100;380100;60401301|10002;19100;19101;19102",  // Human Female Priest
         "0,1,7|10100;170100;180100;9020100;60401301|10002;19100;19101;19102",  // Human Female Elementalist
         "0,1,10|10100;20100;400100;9020100;60401301|10002;19100;19101;19102;92001;92002;92003;92004;92005;92006;92007;92008;92009;92010;92011;92012",  // Human Female Fighter
+        "0,1,9|10100;400100;9020100;60401301|10003;19100;19101;19102;91013;91014;91003;91004;91006",  // Human Female Engineer
+        "0,1,12|10199;60199;140199;160199;9020100;60401301|10002;19100;19101;19102;94001;94002;94003;94005;94006;94007;94008;94009;94010;94011;94012;94013;94014;94015",  // Human Female Glaiver
         "1,0,0|10100;20100;9020100;60401301|10001;19200;19201",  // Highelf Male Warrior
         "1,0,1|10100;20100;9020100;260100;60401301|10000;19200;19201",  // Highelf Male Lancer
         "1,0,2|10100;40100;9020100;60401301|10002;19200;19201",  // Highelf Male Slayer
@@ -218,6 +220,7 @@ public static class DefaultSkillSet
         "1,1,6|10100;180100;9020100;380100;60401301|10002;19200;19201",  // Highelf Female Priest
         "1,1,7|10100;170100;180100;9020100;60401301|10002;19200;19201",  // Highelf Female Elementalist
         "1,1,9|10100;400100;9020100;60401301|10003;19200;19201;91013;91014;91003;91004;91006",  // Highelf Female Engineer
+        "1,1,12|10199;60199;140199;160199;9020100;60401301|10002;19200;19201;94001;94002;94003;94005;94006;94007;94008;94009;94010;94011;94012;94013;94014;94015",  // Highelf Female Glaiver
         "2,0,0|10100;20100;9020100;60401301|10001;19400;19401;19402",  // Aman Male Warrior
         "2,0,1|10100;20100;9020100;260100;60401301|10000;19400;19401;19402",  // Aman Male Lancer
         "2,0,2|10100;40100;9020100;60401301|10002;19400;19401;19402",  // Aman Male Slayer
@@ -261,6 +264,10 @@ public static class DefaultSkillSet
         "4,0,6|10100;180100;9020100;9030100;380100;60401301|10002;19500;19501",  // Popori Male Priest
         "4,0,7|10100;170100;180100;9020100;9030100;60401301|10002;19500;19501",  // Popori Male Elementalist
         "4,0,10|10100;20100;400100;9020100;9030100;60401301|10002;19500;19501;92001;92002;92003;92004;92005;92006;92007;92008;92009;92010;92011;92012",  // Popori Male Fighter
+        "4,0,8|10100;30100;400100;9020100;9030100;111111;60401301|10001;19500;19501;90001",  // Popori Male Soulless (T221: level-1 kit)
+        "4,0,9|10100;400100;9020100;9030100;60401301|10003;19500;19501;91013;91014;91003;91004;91006",  // Popori Male Engineer
+        "4,0,11|10100;20100;70100;9020100;9030100;60401301|10002;19500;19501;93001;93002;93003;93004;93005;93006;93008",  // Popori Male Assassin
+        "4,0,12|10199;60199;140199;160199;9020100;9030100;60401301|10002;19500;19501;94001;94002;94003;94005;94006;94007;94008;94009;94010;94011;94012;94013;94014;94015",  // Popori Male Glaiver
         "4,1,0|10100;20100;9020100;9030100;60401301|10001;19500;19501",  // Popori Female Warrior
         "4,1,1|10100;20100;9020100;9030100;260100;60401301|10000;19500;19501",  // Popori Female Lancer
         "4,1,2|10100;40100;9020100;9030100;60401301|10002;19500;19501",  // Popori Female Slayer
@@ -269,7 +276,7 @@ public static class DefaultSkillSet
         "4,1,5|10100;60100;9020100;9030100;60401301|10002;19500;19501",  // Popori Female Archer
         "4,1,6|10100;180100;9020100;9030100;380100;60401301|10002;19500;19501",  // Popori Female Priest
         "4,1,7|10100;170100;180100;9020100;9030100;60401301|10002;19500;19501",  // Popori Female Elementalist
-        "4,1,8|10100;30100;140100;150100;400100;9020100;9030100;111111;60401301|10001;19500;19501;90001",  // Popori Female Soulless
+        "4,1,8|10100;30100;400100;9020100;9030100;111111;60401301|10001;19500;19501;90001",  // Popori Female Soulless (T221: level-1 kit)
         "4,1,9|10100;400100;9020100;9030100;60401301|10003;19500;19501;91013;91014;91003;91004;91006",  // Popori Female Engineer
         "4,1,10|10100;20100;400100;9020100;9030100;60401301|10002;19500;19501;92001;92002;92003;92004;92005;92006;92007;92008;92009;92010;92011;92012",  // Popori Female Fighter
         "4,1,11|10100;20100;70100;9020100;9030100;60401301|10002;19500;19501;93001;93002;93003;93004;93005;93006;93008",  // Popori Female Assassin
@@ -2244,12 +2251,23 @@ ON CONFLICT(account_id) DO UPDATE SET blob = excluded.blob, updated_at = exclude
 
     public List<CharacterRecord> GetCharacters(long accountId)
     {
+        // T224: a row whose delete window has already run out is GONE as far as every caller is
+        // concerned. There was no delete_at predicate here at all, so a soft-deleted character came
+        // straight back in the next S_GET_USER_LIST - the reported "in-game delete doesn't stick".
+        // A delete that is still PENDING stays listed on purpose: retail's two S_GET_USER_LIST
+        // frames either side of a C_CANCEL_DELETE_USER are both 1183 bytes and differ in six bytes
+        // (cap_final_client2 frames 11/35), so the doomed character is in both.
+        long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        PurgeDueDeletes(now);
         lock (_lock)
         {
             var list = new List<CharacterRecord>();
             using var cmd = _db.CreateCommand();
-            cmd.CommandText = "SELECT * FROM characters WHERE account_id = $a ORDER BY position, id";
+            cmd.CommandText =
+                "SELECT * FROM characters WHERE account_id = $a AND (delete_at = 0 OR delete_at > $now) "
+                + "ORDER BY position, id";
             cmd.Parameters.AddWithValue("$a", accountId);
+            cmd.Parameters.AddWithValue("$now", now);
             using var r = cmd.ExecuteReader();
             while (r.Read()) list.Add(Read(r));
             return list;
@@ -2324,18 +2342,120 @@ ON CONFLICT(account_id) DO UPDATE SET blob = excluded.blob, updated_at = exclude
     }
 
     /// <summary>
-    /// Next free lobby slot for an account. S_GET_USER_LIST orders by `position`, so every
-    /// character on an account needs a distinct one or the select screen stacks them.
+    /// The lowest free lobby slot for an account, or 0 when every slot is taken.
+    /// S_GET_USER_LIST orders by `position`, so every character on an account needs a distinct one
+    /// or the select screen stacks them.
+    ///
+    /// <para>T228: this was <c>MAX(position) + 1</c>, which never reuses the slot a deleted
+    /// character freed. Account 1's five live characters sat at positions 5, 7, 8, 9 and 10 while
+    /// the lobby reported five of eight used, so the next two characters were created at slots 10
+    /// and 11 (arbiter-t228.log) and World refused to let them in: World's slot limit reads the
+    /// ORDINAL, not the count, which is why the symptom was "create without limit, then cannot
+    /// enter world".</para>
+    ///
+    /// <para>Slots are 1-based - the old COALESCE(MAX,0)+1 made the first one 1, and no row has
+    /// ever carried 0. Every row counts, soft-deleted ones included: a character pending deletion
+    /// keeps its slot while the timer runs (the T88 note on C_CANCEL_DELETE_USER), so the lobby can
+    /// list fewer characters than there are occupied slots. 0 here is the authoritative "full", and
+    /// callers test it instead of comparing counts that disagree.</para>
     /// </summary>
-    public int NextPosition(long accountId)
+    public int NextPosition(long accountId, int slots)
+    {
+        if (slots <= 0) return 0;
+        lock (_lock)
+        {
+            var taken = new HashSet<int>();
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT position FROM characters WHERE account_id = $a";
+            cmd.Parameters.AddWithValue("$a", accountId);
+            using (var r = cmd.ExecuteReader())
+                while (r.Read()) taken.Add(r.GetInt32(0));
+            for (int p = 1; p <= slots; p++)
+                if (!taken.Contains(p)) return p;
+            return 0;
+        }
+    }
+
+    /// <summary>T228. Every lobby slot an account's rows occupy, pending-delete rows included,
+    /// sorted. What /api/account reports and what the slot tests assert on.</summary>
+    public List<int> OccupiedPositions(long accountId)
     {
         lock (_lock)
         {
+            var taken = new List<int>();
             using var cmd = _db.CreateCommand();
-            cmd.CommandText = "SELECT COALESCE(MAX(position), 0) + 1 FROM characters WHERE account_id = $a";
+            cmd.CommandText = "SELECT position FROM characters WHERE account_id = $a ORDER BY position";
             cmd.Parameters.AddWithValue("$a", accountId);
-            return (int)(long)cmd.ExecuteScalar()!;
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) taken.Add(r.GetInt32(0));
+            return taken;
         }
+    }
+
+    /// <summary>
+    /// T228. Renumber an account's characters into 1..n in their current lobby order; returns how
+    /// many rows moved.
+    ///
+    /// <para><see cref="NextPosition"/> stops the drift for new characters; this repairs the
+    /// accounts that already have it, which is what actually clears World's refusal for characters
+    /// already sitting past the cap. Positions are parked in the negative range first, so an UPDATE
+    /// can never land on a position another row still holds - there is no UNIQUE index on
+    /// (account_id, position) to lean on, only the ORDER BY the lobby list uses.</para>
+    /// </summary>
+    public int CompactPositions(long accountId)
+    {
+        lock (_lock)
+        {
+            var rows = new List<(int Id, int Position)>();
+            using (var q = _db.CreateCommand())
+            {
+                q.CommandText = "SELECT id, position FROM characters WHERE account_id = $a ORDER BY position, id";
+                q.Parameters.AddWithValue("$a", accountId);
+                using var r = q.ExecuteReader();
+                while (r.Read()) rows.Add((r.GetInt32(0), r.GetInt32(1)));
+            }
+            int changed = 0;
+            for (int i = 0; i < rows.Count; i++)
+                if (rows[i].Position != i + 1) changed++;
+            if (changed == 0) return 0;
+            using var tx = _db.BeginTransaction();
+            for (int pass = 0; pass < 2; pass++)
+                for (int i = 0; i < rows.Count; i++)
+                {
+                    using var u = _db.CreateCommand();
+                    u.Transaction = tx;
+                    u.CommandText = "UPDATE characters SET position = $p WHERE id = $i";
+                    u.Parameters.AddWithValue("$p", pass == 0 ? -(i + 1) : i + 1);
+                    u.Parameters.AddWithValue("$i", rows[i].Id);
+                    u.ExecuteNonQuery();
+                }
+            tx.Commit();
+            return changed;
+        }
+    }
+
+    /// <summary>
+    /// T228. Compact only when a position has drifted past <paramref name="slots"/>, and say so in
+    /// the log. Called on the login path, where silence would hide the repair.
+    /// </summary>
+    public int CompactPositionsIfDrifted(long accountId, int slots)
+    {
+        if (slots <= 0) return 0;
+        int worst;
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT COALESCE(MAX(position), 0) FROM characters WHERE account_id = $a";
+            cmd.Parameters.AddWithValue("$a", accountId);
+            worst = (int)(long)cmd.ExecuteScalar()!;
+        }
+        if (worst <= slots) return 0;
+        int moved = CompactPositions(accountId);
+        if (moved > 0)
+            _log.LogWarning("Account {Account}: lobby slot {Worst} is past the {Slots} the account has - "
+                + "renumbered {Moved} character(s) into 1..n (T228; World refuses entry on the ordinal)",
+                accountId, worst, slots, moved);
+        return moved;
     }
 
     public int CreateCharacter(CharacterRecord c)
@@ -4027,7 +4147,8 @@ DELETE FROM guild_members     WHERE user_db_id = $id;
 DELETE FROM item_recipes      WHERE character_id = $id;
 DELETE FROM skill_profs       WHERE character_id = $id;
 DELETE FROM gathering_profs   WHERE character_id = $id;
-DELETE FROM restrictions      WHERE character_id = $id;";
+DELETE FROM restrictions      WHERE character_id = $id;
+DELETE FROM deleted_items     WHERE character_id = $id;";
             kids.Parameters.AddWithValue("$id", id);
             kids.ExecuteNonQuery();
             PurgeCharacterStateLocked(id);   // T172
@@ -5347,6 +5468,57 @@ DELETE FROM restrictions      WHERE character_id = $id;";
             if (c != null && DeleteCharacter(id, c.AccountId)) gone++;
         }
         if (gone > 0) _log.LogInformation("purged {N} character(s) past the {H} h delete window", gone, expireHours);
+        return gone;
+    }
+
+    /// <summary>How often <see cref="GetCharacters"/> may run the due-delete purge.</summary>
+    private const int DuePurgeThrottleSeconds = 30;
+    private long _lastDuePurge;
+
+    /// <summary>
+    /// T224. Purge by each row's OWN stamp - <c>delete_at</c>, which
+    /// <see cref="CharacterDeletion.Delete"/> wrote from that character's window - instead of one
+    /// global hour count. <see cref="PurgeExpiredDeletes"/> derives its cutoff from
+    /// <c>deleted_at</c> plus a fixed <c>expireHours</c>, so it cannot honour ServerConfig.xml's
+    /// expireHour1/expireHour2 split - and nothing in the server ever called it, only tests did.
+    /// This one runs from <see cref="GetCharacters"/>, i.e. whenever the lobby list is built,
+    /// throttled to once every <see cref="DuePurgeThrottleSeconds"/> seconds so the admin API's
+    /// per-account loops do not re-scan. <paramref name="force"/> bypasses the throttle.
+    /// Returns how many went.
+    /// </summary>
+    public int PurgeDueDeletes(long nowUnix, bool force = false)
+    {
+        lock (_lock)
+        {
+            if (!force && _lastDuePurge != 0 && nowUnix - _lastDuePurge < DuePurgeThrottleSeconds)
+                return 0;
+            _lastDuePurge = nowUnix;
+        }
+
+        List<int> doomed = new();
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT id FROM characters WHERE delete_at <> 0 AND delete_at <= $c";
+            cmd.Parameters.AddWithValue("$c", nowUnix);
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) doomed.Add(r.GetInt32(0));
+        }
+
+        int gone = 0;
+        foreach (int id in doomed)
+        {
+            lock (_lock)
+            {
+                using var drop = _db.CreateCommand();
+                drop.CommandText = "DELETE FROM deleted_items WHERE character_id=$id";
+                drop.Parameters.AddWithValue("$id", id);
+                drop.ExecuteNonQuery();
+            }
+            var c = GetCharacter(id);
+            if (c != null && DeleteCharacter(id, c.AccountId)) gone++;
+        }
+        if (gone > 0) _log.LogInformation("purged {N} character(s) whose delete_at came due", gone);
         return gone;
     }
 
@@ -8833,6 +9005,34 @@ DELETE FROM restrictions      WHERE character_id = $id;";
         }
     }
 
+    /// <summary>
+    /// T234. Drop this character's already-collected parcels of one type - the rows an earlier
+    /// build left in the mailbox after "Receive all", which is where T228 D's four <c>@2051</c>
+    /// reward mails came from. Returns how many went. <c>is_recved</c> is the whole test: an
+    /// unclaimed parcel is never touched, so a sweep can run on every listing.
+    /// </summary>
+    public int DeleteCollectedParcels(int receiverDbId, int parcelType)
+    {
+        lock (_lock)
+        {
+            // status<3 mirrors GetParcelsFor: the sweep never removes a row no listing shows.
+            const string Which = "SELECT parcel_id FROM parcels"
+                + " WHERE receiver_db_id=$r AND parcel_type=$t AND is_recved<>0 AND status<3";
+            using (var items = _db.CreateCommand())
+            {
+                items.CommandText = "DELETE FROM parcel_items WHERE parcel_id IN (" + Which + ")";
+                items.Parameters.AddWithValue("$r", receiverDbId);
+                items.Parameters.AddWithValue("$t", parcelType);
+                items.ExecuteNonQuery();
+            }
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "DELETE FROM parcels WHERE parcel_id IN (" + Which + ")";
+            cmd.Parameters.AddWithValue("$r", receiverDbId);
+            cmd.Parameters.AddWithValue("$t", parcelType);
+            return cmd.ExecuteNonQuery();
+        }
+    }
+
     /// <summary>Attach an item to a parcel. Slots 0..4; anything else is rejected.</summary>
     public bool AddParcelItem(int parcelId, int slot, int itemDbId, int templateId, long amount)
     {
@@ -8972,10 +9172,30 @@ DELETE FROM restrictions      WHERE character_id = $id;";
         "dungeon_rank_records", "hidden_passives", "servants", "deleted_items",
     };
 
+    /// <summary>
+    /// T232c. The pockets whose <c>items.owner_db_id</c> is a CHARACTER id: 0 bag, 9 character
+    /// warehouse, 12 style, 14 equipped. 1 (account warehouse) and 3 (guild) carry an account or a
+    /// guild db id in that column instead - the real Arbiter's own
+    /// <c>TransSQLExec::IsAccountDbIdInvenType</c> makes the same distinction - and those id spaces
+    /// overlap this one, so a purge by id alone would reach into another owner's container.
+    /// </summary>
+    public static readonly int[] CharacterOwnedPockets = { 0, 9, 12, 14 };
+
     private void PurgeCharacterStateLocked(int characterId)
     {
         using var cmd = _db.CreateCommand();
-        cmd.CommandText = string.Concat(CharacterStateTables.Select(t => $"DELETE FROM {t} WHERE character_id = $id;"));
+        // T232c: `items` is the same shape as the tables above - no foreign key to characters(id) -
+        // and it was missed because it keys on owner_db_id, not character_id, so the Select below
+        // never covered it. The player-initiated hard delete (DeleteCharacter(id, accountId)) left the
+        // rows behind; the next character took the id; SDB_USER_LOAD_INVENTORY found a non-empty
+        // inventory, skipped seeding the class kit and served the dead character's gear instead.
+        // Live 2026-10-02 (arbiter-t232c.log): ids 18-23 were hard-deleted at 06:15:50-06:16:05, the
+        // next three creations were reissued 15, 16 and 17, and each logged "N starter items for
+        // class X" with no "seeded" line and a row count that was not N - 10 rows for a 6-item Gunner,
+        // 6 for a 9-item soulless - so a Popori/M Warrior spawned in a runeglaive and Valkyrie armour.
+        // Restricted to CharacterOwnedPockets; see that field for why an unrestricted delete is unsafe.
+        cmd.CommandText = string.Concat(CharacterStateTables.Select(t => $"DELETE FROM {t} WHERE character_id = $id;"))
+            + $"DELETE FROM items WHERE owner_db_id = $id AND inven_type IN ({string.Join(",", CharacterOwnedPockets)});";
         cmd.Parameters.AddWithValue("$id", characterId);
         int n = cmd.ExecuteNonQuery();
         if (n > 0) _log.LogInformation("Character {Id}: {N} stale row(s) of an earlier character with this id removed", characterId, n);
@@ -9447,6 +9667,22 @@ DELETE FROM restrictions      WHERE character_id = $id;";
             using var cmd = _db.CreateCommand();
             cmd.CommandText = "DELETE FROM event_matching_reward";
             return cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>
+    /// T228. The named value in <c>counters</c>, or null when nobody has set one - so a caller can
+    /// tell "an operator pinned this to 8" from "absent, use the sheet".
+    /// </summary>
+    public long? TryGetCounterValue(string name)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT value FROM counters WHERE name = $k";
+            cmd.Parameters.AddWithValue("$k", name);
+            var v = cmd.ExecuteScalar();
+            return v is null or DBNull ? null : Convert.ToInt64(v);
         }
     }
 

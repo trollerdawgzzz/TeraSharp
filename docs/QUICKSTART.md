@@ -124,6 +124,18 @@ The admin web tool is at `http://127.0.0.1:8051/` - paste `admin.token` from `te
 in. Seven screens: Dashboard, Accounts, Characters, Mail, Guilds, Server, Settings. `docs/ADMIN.md`
 says what each one does and what it replaces in the retail GM tool.
 
+Four switches arrived after this file was first written, and two of them are **on by default**.
+`docs/OPERATIONS.md` section 5.1 is the full table; this is enough to recognise them:
+
+| Setting | Default | One line |
+|---|---|---|
+| `TERASHARP_SYNTH_ITEM_RECORDS` | **true** | Builds the starter kit's item records, so `data\starter_inventory.bin` is not needed. |
+| `TERASHARP_PARCEL_DELETE_ON_COLLECT` | **true** | A claimed reward parcel leaves the mailbox instead of staying there forever. |
+| `TERASHARP_API_GATEWAY_SERVE` | unset | Serves the Item Claim panel on **:8800**, the address Alt+A opens. |
+| `ServerConfig.xml` `<DeleteUser>` | the deployment's | The character-delete windows; since T224 TeraSharp reads them rather than assuming 72 hours. |
+
+`--check-config` prints every setting with where it came from. Read it after a deploy.
+
 ## When it does not work
 
 | Symptom | Where to look |

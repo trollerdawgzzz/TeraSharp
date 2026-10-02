@@ -537,6 +537,8 @@ public static class SelfTest
         "TERASHARP_BG_MAX_HEALERS", "TERASHARP_BG_MAX_TANKS", "TERASHARP_BROKER_FEE_PERCENT",
         // T207: the shop page and the hub tera-api delivers purchases through.
         "TERASHARP_SHOP_URL", "TERASHARP_HUB_LISTEN", "TERASHARP_HUB_ENABLED", "TERASHARP_HUB_SERVER_ID",
+        "TERASHARP_PARCEL_DELETE_ON_COLLECT",                                              // T234
+        "TERASHARP_ITEM_CLAIM_MAX_AGE",                                                    // T230
     };
 
     /// <summary>Variables whose value must never reach a log or a console.</summary>

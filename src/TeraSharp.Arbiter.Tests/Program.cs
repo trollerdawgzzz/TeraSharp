@@ -2679,6 +2679,165 @@ array items
         Hex.True(blob[344..408].All(v => v == 0), "shape: all zeros, none of the template's");
     }
 
+    // ---- T232: the row's four look columns come from the class's starter kit ----
+
+    [Test] public static void StarterInventory_WornLook_is_the_kit_s_worn_items()
+    {
+        // WornLook must be a view of the kit, not a second table: for every class the four values
+        // are exactly the pocket-14 items at INVTYPE slots 1/3/4/5, and nothing else.
+        for (int cls = 0; cls < StarterInventory.ClassNames.Length; cls++)
+        {
+            var kit = StarterInventory.ForClass(cls);
+            Hex.True(kit != null, $"class {cls} has a kit");
+            int weapon = 0, body = 0, hand = 0, feet = 0;
+            foreach (var it in kit!)
+            {
+                if (it.Pocket != StarterInventory.EquippedPocket) continue;
+                if (it.Slot == StarterInventory.WeaponSlot) weapon = it.TemplateId;
+                else if (it.Slot == StarterInventory.BodySlot) body = it.TemplateId;
+                else if (it.Slot == StarterInventory.HandSlot) hand = it.TemplateId;
+                else if (it.Slot == StarterInventory.FeetSlot) feet = it.TemplateId;
+            }
+            var look = StarterInventory.WornLook(cls);
+            Hex.True(look == (weapon, body, hand, feet),
+                $"class {cls} ({StarterInventory.ClassNames[cls]}): WornLook {look} = kit ({weapon}, {body}, {hand}, {feet})");
+            Hex.True(look.Weapon != 0 && look.Body != 0 && look.Hand != 0 && look.Feet != 0,
+                $"class {cls} ({StarterInventory.ClassNames[cls]}) starts with all four worn slots filled");
+        }
+
+        // A class id outside the 13 yields the column default rather than someone else's kit.
+        Hex.True(StarterInventory.WornLook(-1) == (0, 0, 0, 0), "class -1 -> zeros");
+        Hex.True(StarterInventory.WornLook(StarterInventory.ClassNames.Length) == (0, 0, 0, 0),
+            "class past the 13 -> zeros");
+    }
+
+    [Test] public static void CreateUser_row_look_columns_come_from_the_class_kit()
+    {
+        // The bug T232 fixes: BuildRecord left weapon/body/hand/feet at the column default of 0,
+        // so the lobby list and InventoryHandlers advertised item 0 in all four slots while the
+        // inventory carried the kit. Each class's row must now carry its OWN kit, which also means
+        // no class carries the capture character's Elin glaiver gear unless it is a glaiver.
+        var template = TeraSharp.Arbiter.Persistence.StarterBlob.Generate(
+            new TeraSharp.Arbiter.Persistence.StarterBlob.Seed());
+        int glaiver = Array.IndexOf(StarterInventory.ClassNames, "glaiver");
+        var captured = StarterInventory.WornLook(glaiver);      // 59053 / 15004 / 15005 / 15006
+
+        // T232b: and for every race/gender, because the kit is keyed by CLASS alone - a Popori/M
+        // Ninja must get the assassin's 58171, not a neighbouring class's weapon.
+        (int Race, int Gender, string Who)[] combos =
+        {
+            (0, 1, "Human/F"), (1, 1, "HighElf/F"), (4, 0, "Popori/M"), (4, 1, "Popori/F"),
+            (7, 1, "Castanic/F"), (0, 0, "Human/M"),
+        };
+        foreach (var (race, gender, who) in combos)
+        for (int cls = 0; cls < StarterInventory.ClassNames.Length; cls++)
+        {
+            var req = new CreateUserRequest
+            {
+                Race = race, Gender = gender, Class = cls, Name = $"Look{race}{gender}{cls}",
+                Appearance = new byte[8], Details = new byte[32], Shape = new byte[64],
+            };
+            var rec = CharacterHandlers.BuildRecord(req, accountId: 1, position: 1, template, playerId: 3);
+            var want = StarterInventory.WornLook(cls);
+            Hex.True((rec.Weapon, rec.Body, rec.Hand, rec.Feet) == want,
+                $"{who} class {cls} ({StarterInventory.ClassNames[cls]}) row look = kit {want}, got "
+                + $"({rec.Weapon}, {rec.Body}, {rec.Hand}, {rec.Feet})");
+            if (cls != glaiver)
+                Hex.True(rec.Weapon != captured.Weapon,
+                    $"{who} class {cls} ({StarterInventory.ClassNames[cls]}) does not carry the glaiver's weapon {captured.Weapon}");
+        }
+
+        // The slip T232b went looking for: every class's weapon slot is its own, so no two classes
+        // share one and none is empty - an off-by-one would collapse two of these.
+        var weapons = new HashSet<int>();
+        for (int cls = 0; cls < StarterInventory.ClassNames.Length; cls++)
+        {
+            int w = StarterInventory.WornLook(cls).Weapon;
+            Hex.True(w != 0, $"class {cls} ({StarterInventory.ClassNames[cls]}) has a weapon");
+            Hex.True(weapons.Add(w),
+                $"class {cls} ({StarterInventory.ClassNames[cls]}) weapon {w} is not another class's");
+        }
+    }
+
+    // ---- T232c: a reused character id must not inherit the dead character's inventory ----
+
+    [Test] public static void CreateUser_a_reused_id_does_not_inherit_the_dead_character_s_items()
+    {
+        // arbiter-t232c.log, 2026-10-02: ids 18-23 hard-deleted at 06:15:50-06:16:05, the next three
+        // creations reissued 15, 16 and 17, and each logged "N starter items for class X" with NO
+        // "seeded" line and a row count that was not N - 10 rows for a Gunner, 6 for a 9-item
+        // soulless. items has no foreign key to characters(id) and keys on owner_db_id, so the T172
+        // purge never covered it: the new character found a non-empty inventory, skipped seeding its
+        // kit, and wore the dead character's gear.
+        using var store = new TeraSharp.Arbiter.Persistence.CharacterStore(":memory:", QuietLog());
+        var acct = store.GetOrCreateAccount("t232c");
+        int glaiver = Array.IndexOf(StarterInventory.ClassNames, "glaiver");
+
+        int Create(string name, int cls)
+        {
+            var rec = new TeraSharp.Arbiter.Persistence.CharacterRecord
+            {
+                AccountId = acct.Id, Name = name, Gender = 1, Race = 0, Class = cls,
+                TemplateId = 10201 + cls,
+                Appearance = new byte[8], Details = new byte[32], Shape = new byte[64],
+            };
+            return store.CreateCharacter(rec);
+        }
+        void Seed(int id, int cls)
+        {
+            var kit = StarterInventory.BuildSynthetic(cls, id, reqId: 1);
+            Hex.True(kit != null, $"class {cls} has a synthetic kit");
+            Hex.True(DbProxyHandlers.SeedStarterRows(store, id, kit!) > 0, $"player {id} seeded rows");
+        }
+        int WeaponOf(int id)
+        {
+            foreach (var row in store.GetInventoryItems(id))
+                if (row.InvenType == StarterInventory.EquippedPocket
+                    && row.Slot == StarterInventory.WeaponSlot) return row.TemplateId;
+            return 0;
+        }
+
+        // Three consecutive creations, each with its own kit in the store.
+        int a = Create("Aaa", glaiver), b = Create("Bbb", 9), c = Create("Ccc", 0);
+        Seed(a, glaiver); Seed(b, 9); Seed(c, 0);
+        Hex.True(WeaponOf(a) == StarterInventory.WornLook(glaiver).Weapon, "glaiver holds its own weapon");
+        Hex.True(WeaponOf(b) == StarterInventory.WornLook(9).Weapon, "engineer holds its own weapon");
+
+        // The player-initiated hard delete must take the items with it.
+        foreach (int id in new[] { a, b, c })
+            Hex.True(store.DeleteCharacter(id, acct.Id), $"character {id} deleted");
+        foreach (int id in new[] { a, b, c })
+            Hex.True(store.CountInventoryItems(id) == 0,
+                $"deleting {id} removed its items, {store.CountInventoryItems(id)} left");
+
+        // Three more. Whatever ids SQLite reissues, a brand-new character owns nothing - which is
+        // what gates seeding in OnLoadInventory - and then wears its OWN class's weapon.
+        var second = new[] { (Create("Ddd", 0), 0), (Create("Eee", 11), 11), (Create("Fff", glaiver), glaiver) };
+        foreach (var (id, cls) in second)
+            Hex.True(store.CountInventoryItems(id) == 0,
+                $"new character {id} (class {cls}) starts with an empty inventory, "
+                + $"got {store.CountInventoryItems(id)} row(s)");
+        foreach (var (id, cls) in second)
+        {
+            Seed(id, cls);
+            Hex.True(WeaponOf(id) == StarterInventory.WornLook(cls).Weapon,
+                $"character {id} wears class {cls}'s weapon {StarterInventory.WornLook(cls).Weapon}, "
+                + $"got {WeaponOf(id)}");
+        }
+
+        // And the create-side repair, for rows a delete before this fix left behind: plant orphans
+        // under a freed id and create again. Only asserted when SQLite actually reissues that id.
+        int freed = Create("Ggg", 0);
+        Hex.True(store.DeleteCharacter(freed, acct.Id), "the donor character deleted");
+        var orphan = StarterInventory.BuildSynthetic(glaiver, freed, reqId: 1);
+        DbProxyHandlers.SeedStarterRows(store, freed, orphan!);
+        Hex.True(store.CountInventoryItems(freed) > 0, "orphan rows planted under the freed id");
+        int reused = Create("Hhh", 9);
+        if (reused == freed)
+            Hex.True(store.CountInventoryItems(reused) == 0,
+                $"creating {reused} purged the {freed} orphans, {store.CountInventoryItems(reused)} left");
+    }
+
     [Test] public static void CreateUser_blob_carries_the_requested_identity()
     {
         // End to end through BuildRecord, which is what OnCreateUser calls.
@@ -2824,7 +2983,7 @@ array items
             {
                 var acct = store.GetOrCreateAccount("t8");
                 Hex.True(store.CountCharacters(acct.Id) == 0, "new account starts empty");
-                Hex.True(store.NextPosition(acct.Id) == 1, "first character takes slot 1");
+                Hex.True(store.NextPosition(acct.Id, 8) == 1, "first character takes slot 1");
 
                 var req = CharacterHandlers.ParseCreateUser(Hex.B(CreateUserPkt35))!;
                 var first = CharacterHandlers.BuildRecord(req, acct.Id, position: 1, template, playerId: 0);
@@ -2835,7 +2994,7 @@ array items
                 Hex.True(store.CountCharacters(acct.Id) == 1, "one character after create");
                 Hex.True(store.NameExists("Test"), "NameExists must see the new name");
                 Hex.True(store.NameExists("tEsT"), "the name index is case-insensitive");
-                Hex.True(store.NextPosition(acct.Id) == 2, "second character takes slot 2");
+                Hex.True(store.NextPosition(acct.Id, 8) == 2, "second character takes slot 2");
 
                 // A duplicate name must be refused by the UNIQUE index, not silently inserted.
                 bool duplicateRefused = false;
@@ -4923,10 +5082,18 @@ array items
 
     [Test] public static void DefaultSkills_table_covers_the_sheet_and_fits_the_regions()
     {
-        // 99 rows is the whole of DefaultSkillSet.xml. If a row ever carried more ids than the
-        // blob has slots the extras would be dropped silently, so assert the headroom instead.
-        Hex.True(TeraSharp.Arbiter.Persistence.DefaultSkillSet.Count == 99,
-            $"the sheet has 99 race/gender/class rows, the table has {TeraSharp.Arbiter.Persistence.DefaultSkillSet.Count}");
+        // T224b/T222d: the size of the TRANSCRIBED table is the invariant worth pinning, and T222d
+        // brought it level with the sheet at 106. T220b's four popori-male rows and T222's three were
+        // only ever added to the XML, so a box without the sheet spawned those classes with NO
+        // skills at all. DefaultSkillSet.Count
+        // reads the LOADED table when a datasheet has been read, and DatasheetLoader.DefaultSkills is
+        // process-wide static, so once T159_the_loader_reads_the_real_sheets has run in the same
+        // process this is 103. Pin BuiltInTable exactly and require the live table to be a superset.
+        Hex.True(TeraSharp.Arbiter.Persistence.DefaultSkillSet.BuiltInTable.Count == 106,
+            "the transcribed table has 106 race/gender/class rows, not "
+            + TeraSharp.Arbiter.Persistence.DefaultSkillSet.BuiltInTable.Count);
+        Hex.True(TeraSharp.Arbiter.Persistence.DefaultSkillSet.Count >= 106,
+            $"and the live table covers it: {TeraSharp.Arbiter.Persistence.DefaultSkillSet.Count}");
 
         int maxActive = 0, maxPassive = 0, rows = 0;
         for (int race = 0; race <= 5; race++)
@@ -4940,7 +5107,13 @@ array items
             foreach (int id in a.Concat(p))
                 Hex.True(id > 0, $"race {race} gender {gender} class {cls} has a non-positive skill id {id}");
         }
-        Hex.True(rows == 99, $"walking race 0-5 / gender 0-1 / class 0-12 should find all 99 rows, found {rows}");
+        // T224b: the walk sees the LIVE table, so this is 103 in a process where
+        // T159_the_loader_reads_the_real_sheets has already read the sheet (DatasheetLoader's
+        // caches are process-wide static). Every transcribed row must be reachable - that is the
+        // invariant - and the sheet is free to carry more.
+        Hex.True(rows >= 106 && rows >= TeraSharp.Arbiter.Persistence.DefaultSkillSet.Count,
+            $"walking race 0-5 / gender 0-1 / class 0-12 should reach every row of the live table "
+            + $"({TeraSharp.Arbiter.Persistence.DefaultSkillSet.Count}), found {rows}");
         Hex.True(maxActive <= TeraSharp.Arbiter.Persistence.StarterBlob.ActiveSkillSlots,
             $"a row has {maxActive} active skills, more than the {TeraSharp.Arbiter.Persistence.StarterBlob.ActiveSkillSlots} slots");
         Hex.True(maxPassive <= TeraSharp.Arbiter.Persistence.StarterBlob.PassiveSkillSlots,
@@ -28662,7 +28835,13 @@ string message
             if (Has("DefaultSkillSet.xml"))
             {
                 var st = DatasheetLoader.DefaultSkills.Load(dir);
-                Hex.True(st.FromSheet && st.Entries == TeraSharp.Arbiter.Persistence.DefaultSkillSet.BuiltInTable.Count, st.Line);
+                // T224b: the sheet is allowed to carry MORE rows than the transcribed table - T220b
+                // added Popori/Male rows for the awakening classes and took it 99 -> 103, which broke
+                // an equality pin here. The real invariant is the loop below: every transcribed row
+                // must still resolve to the same ids after the sheet wins.
+                Hex.True(st.FromSheet
+                         && st.Entries >= TeraSharp.Arbiter.Persistence.DefaultSkillSet.BuiltInTable.Count,
+                    st.Line + $" (transcribed {TeraSharp.Arbiter.Persistence.DefaultSkillSet.BuiltInTable.Count})");
                 foreach (var (key, v) in TeraSharp.Arbiter.Persistence.DefaultSkillSet.BuiltInTable)
                     Hex.True(TeraSharp.Arbiter.Persistence.DefaultSkillSet.TryGet(key.Race, key.Gender, key.Class, out var a, out var p)
                              && a.SequenceEqual(v.Active) && p.SequenceEqual(v.Passive), $"skills {key}");
@@ -28670,8 +28849,21 @@ string message
             if (Has("CreateCharData.xml"))
             {
                 Hex.True(DatasheetLoader.StarterKits.Load(dir).FromSheet, "CreateCharData read");
+                // T228: the built-in now carries the level scroll (200999) for every class, where
+                // the shipped sheet carries it for soulless only until tools/add-starter-scroll.py
+                // has been run against that sheet. Compare the kits without it, so this stays a test
+                // of "the loader reads the real sheet" and not of whether that script has run yet;
+                // the scroll itself is asserted separately, and per class, just below.
+                static IEnumerable<StarterItem> WithoutScroll(IEnumerable<StarterItem> kit)
+                    => kit.Where(i => i.TemplateId != 200999);
                 for (int c = 0; c < StarterInventory.BuiltInKits.Length; c++)
-                    Hex.True(StarterInventory.ForClass(c)!.SequenceEqual(StarterInventory.BuiltInKits[c]), $"class {c}'s kit, slots included");
+                {
+                    Hex.True(WithoutScroll(StarterInventory.ForClass(c)!)
+                                 .SequenceEqual(WithoutScroll(StarterInventory.BuiltInKits[c])),
+                        $"class {c}'s kit, slots included");
+                    Hex.True(StarterInventory.BuiltInKits[c].Count(i => i.TemplateId == 200999) == 1,
+                        $"class {c} carries the level scroll exactly once in the built-in");
+                }
                 Hex.True(DatasheetLoader.CreatedLevels.Load(dir).FromSheet
                          && DatasheetLoader.CreatedLevels.Value.SequenceEqual(StarterInventory.BuiltInCreatedLevels), "createdLevel, T162");
             }
@@ -28822,8 +29014,8 @@ string message
             Hex.True(StarterInventory.CreatedLevelFor(GlaiverClassId) == 70, "glaiver made at 70");
             Hex.True(StarterInventory.CreatedLevelFor(1) == 1 && StarterInventory.CreatedLevelFor(WarriorClassId) == 1,
                 "0 and a missing createdLevel read as 1, as the Arbiter reads them");
-            Hex.True(StarterInventory.CreatedLevelFor(SoullessClassId) == 50 && StarterInventory.CreatedLevelFor(99) == 1,
-                "soulless, absent from this sheet, keeps the built-in 50");
+            Hex.True(StarterInventory.CreatedLevelFor(SoullessClassId) == 1 && StarterInventory.CreatedLevelFor(99) == 1,
+                "soulless, absent from this sheet, keeps the built-in (1 since T221/T231)");
             Hex.True(StarterInventory.ForClass(GlaiverClassId)!.SequenceEqual(new[] {
                     new StarterItem(59053, 1, 14, 1), new StarterItem(6550, 20, 0, 0), new StarterItem(207631, 1, 0, 1) }),
                 "the scroll goes to the bag behind the potion");
@@ -28851,7 +29043,7 @@ string message
 
             Directory.Delete(dir, true);
             Hex.True(!DatasheetLoader.CreatedLevels.Load(dir).FromSheet && StarterInventory.CreatedLevelFor(GlaiverClassId) == 1
-                     && StarterInventory.CreatedLevelFor(SoullessClassId) == 50, "no sheet: the transcribed levels");
+                     && StarterInventory.CreatedLevelFor(SoullessClassId) == 1, "no sheet: the transcribed levels (soulless 1 since T221/T231)");
         }
         finally
         {

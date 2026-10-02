@@ -16,9 +16,9 @@ public static class QaUtilityCommands
     public static IReadOnlySet<string> Names { get; } = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
     { "escape", "sticktogether", "clear_vote_cool", "pk_section", "help", "devdebug",
       "i_want_server_language_and_revision", "change_loading_screen_status", "unlock_all_movies", "reset_charsock", "gmevent_notice" };
-    public sealed record Data(int[] Movies, int? BaseSlots);
+    public sealed record Data(int[] Movies, int? BaseSlots, IReadOnlyDictionary<int, int> PackageSlots);
     public static readonly SheetValue<Data> Sheet = new("ReplayMovie.xml + AccountTrait.xml", "QA movies and character slots",
-        new(Array.Empty<int>(), null), dir =>
+        new(Array.Empty<int>(), null, new Dictionary<int, int>()), dir =>
         {
             string movies = Path.Combine(dir, "ReplayMovie.xml"), traits = Path.Combine(dir, "AccountTrait.xml");
             if (!File.Exists(movies) && !File.Exists(traits)) return null;
@@ -26,11 +26,46 @@ public static class QaUtilityCommands
             var doc = File.Exists(traits) ? XDocument.Load(traits) : null;
             var defaults = doc?.Descendants("Package").FirstOrDefault(p => (int?)p.Attribute("id") == 0);
             int? slots = (int?)defaults?.Elements("Property").FirstOrDefault(p => string.Equals((string?)p.Attribute("name"), "expandCharacterSlot", StringComparison.OrdinalIgnoreCase))?.Attribute("slot");
-            return new(ids, slots);
+            // T228: every package's expandCharacterSlot, not just the defaults'. `slot` is the
+            // TOTAL the package confers, not an increment: package 0 carries 3, and 34/102/334/434/
+            // 435 carry 8, 436 carries 10, 437 carries 12.
+            var per = new Dictionary<int, int>();
+            foreach (var pkg in doc?.Descendants("Package") ?? Enumerable.Empty<XElement>())
+            {
+                int? pid = (int?)pkg.Attribute("id");
+                int? v = (int?)pkg.Elements("Property").FirstOrDefault(p => string.Equals((string?)p.Attribute("name"), "expandCharacterSlot", StringComparison.OrdinalIgnoreCase))?.Attribute("slot");
+                if (pid.HasValue && v.HasValue && v.Value > 0) per[pid.Value] = v.Value;
+            }
+            return new(ids, slots, per);
         }, d => d.Movies.Length + (d.BaseSlots.HasValue ? 1 : 0));
     internal static Func<uint> TickCount { get; set; } = () => unchecked((uint)Environment.TickCount);
     public static bool LoadingScreenEnabled(CharacterStore? store) => store?.GetCounterValue("loading_screen_enabled", 0) != 0 && store != null;
-    public static int CharacterSlots(CharacterStore? store, long account) => checked((int)(store?.GetCounterValue("character_slots_" + account, CharacterHandlers.MaxCharactersPerAccount) ?? CharacterHandlers.MaxCharactersPerAccount));
+    /// <summary>
+    /// T228. The account's character slots: an operator-set counter when there is one, else the
+    /// larger of the sheet's base and <see cref="CharacterHandlers.MaxCharactersPerAccount"/>,
+    /// raised to the largest total any of the account's LIVE benefit packages confers.
+    ///
+    /// <para>This was a flat <see cref="CharacterHandlers.MaxCharactersPerAccount"/> and the sheet
+    /// value the loader already parses was never read. AccountTrait.xml package 0 carries
+    /// <c>expandCharacterSlot slot="3"</c> - retail's base - so the sheet alone would SHRINK every
+    /// unpackaged account from 8 to 3; the floor keeps that from happening to accounts that already
+    /// hold more than three characters.</para>
+    /// </summary>
+    public static int CharacterSlots(CharacterStore? store, long account)
+    {
+        long? pinned = store?.TryGetCounterValue("character_slots_" + account);
+        if (pinned.HasValue) return checked((int)pinned.Value);
+        var sheet = Sheet.Value;
+        int slots = Math.Max(sheet.BaseSlots ?? CharacterHandlers.MaxCharactersPerAccount,
+                             CharacterHandlers.MaxCharactersPerAccount);
+        if (store == null || sheet.PackageSlots.Count == 0) return slots;
+        var now = DateTimeOffset.UtcNow;
+        foreach (var row in store.GetAccountBenefits(account))
+            if (World.AccountBenefitExperiment.IsLive(row, now)
+                && sheet.PackageSlots.TryGetValue(row.PackageId, out int granted) && granted > slots)
+                slots = granted;
+        return slots;
+    }
 
     public static bool TryExecute(GameSession session, CharacterStore? store, GmCommandLine line, ILogger log,
         int commandType = GmCommandHandlers.CommandTypeAdmin)
@@ -149,14 +184,33 @@ public static class QaUtilityCommands
         else store.SetQaLocation(target.Id, source.Zone, channel, source.X, source.Y, source.Z);
         if (type == GmCommandHandlers.CommandTypeOp) GmCommandHandlers.SendCustom(caller, $"Summoned [{target.Name}]");
     }
+    /// <summary>How many WorldServer rows one /@help answer will list before it summarises.</summary>
+    public const int WorldHelpRowLimit = 40;
+
+    /// <summary>
+    /// /@help - the Arbiter's own catalogue, then WorldServer's.
+    ///
+    /// <para>T233: this used to forward <c>_helpworld &lt;term&gt;</c> to World for the second half.
+    /// <c>_helpworld</c> is not one of the 545 names WorldServer's CommandDistributor registers, so
+    /// that forward could only ever come back as "Invalid QA Command" - it answered nothing. World's
+    /// table is extracted instead (<see cref="WorldQaCommandData"/>) and searched here, which also
+    /// means /@help works with World down.</para>
+    ///
+    /// <para>The World rows carry a [world] tag because they do not run here, and the list is capped:
+    /// an empty keyword matches all 545, and one chat line each would flood the client.</para>
+    /// </summary>
     private static void ShowHelp(GameSession session, string keyword)
     {
         GmCommandHandlers.SendCustom(session, "*****Help search Result***** &#xa;");
         foreach (var row in QaCommandHelpData.Rows.Where(r => !r.Name.StartsWith('_') &&
             (r.Name.Contains(keyword, StringComparison.Ordinal) || r.Arguments.Contains(keyword, StringComparison.Ordinal) || r.Description.Contains(keyword, StringComparison.Ordinal))))
             GmCommandHandlers.SendCustom(session, $"{row.Name} {row.Arguments} // {row.Description} &#xa;");
-        string command = keyword.Length == 0 ? "_helpworld" : "_helpworld " + keyword;
-        ArbiterClientHandlers.SendToWorld(session, GmCommandHandlers.AS_ADMIN_COMMAND,
-            GmCommandHandlers.BuildWorldForward((int)session.PlayerId, GmCommandHandlers.BypassModeWorld, command));
+
+        var world = WorldQaCommandData.Search(keyword ?? string.Empty).ToList();
+        foreach (var row in world.Take(WorldHelpRowLimit))
+            GmCommandHandlers.SendCustom(session, $"{row.Name} {row.Arguments} // {row.Description} [world] &#xa;");
+        if (world.Count > WorldHelpRowLimit)
+            GmCommandHandlers.SendCustom(session,
+                $"... and {world.Count - WorldHelpRowLimit} more WorldServer command(s) - narrow the search &#xa;");
     }
 }

@@ -52,7 +52,12 @@
     // client is on another machine (a + prefix needs an urlacl - see ARCHITECTURE.md).
     "bind": "",
     // SECRET. Must equal tera-api's API_PORTAL_SECRET, or Alt+A breaks on every restart.
-    "jwtSecret": ""
+    "jwtSecret": "",
+    // T230. How old the Alt+A ticket may be when the Item Claim page checks it, in seconds.
+    // The minted exp is 120 s, which no player opening a panel can beat, so iat + this is what
+    // is enforced instead. The page refuses EVERY request while jwtSecret is unset: the ticket
+    // is the only thing separating one account's purchases from another's, so it fails closed.
+    "claimTokenMaxAge": 3600
   },
   // T207 - the tera-api shop and item delivery.
   "shop": {
@@ -95,6 +100,14 @@
     // part 2 was live-verified (created with the file absent, entered world, kit survived a
     // relog). Set it to false only to go back to copying a captured record you still have.
     "synthItemRecords": true
+  },
+  "parcels": {
+    // T234. Remove a SYSTEM reward parcel (ParcelType 102) once its attachments are claimed.
+    // OURS: retail keeps the row until the player presses Delete - cap_final2b lists the same
+    // two parcels before and after a collect, and the only caller that sends SDB_DELETE_PARCEL
+    // in WorldServer is User::Handler_C_DELETE_PARCEL. Default true: a reward mail that cannot
+    // be cleared is worse than the divergence. false restores retail behaviour.
+    "deleteSystemOnCollect": true
   },
   // Read by tools\setup.ps1, start.ps1 and stop.ps1 - NOT by the Arbiter. Changing a port here
   // and re-running setup.ps1 -Check tells you whether DeploymentConfig.xml still agrees.

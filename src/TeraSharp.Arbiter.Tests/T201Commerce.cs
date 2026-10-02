@@ -76,6 +76,16 @@ public static partial class Tests
                 Hex.True(accepted.body[ParcelDbHandlers.MakeRspSuccess] == 1
                     && h.Store.GetParcelsFor(1).Count == 2 && h.Store.GetParcelsFor(1).Any(x => x.ParcelType == 1),
                     "changed runtime limit governs the actual World DB handler and type remains preserved");
+                // T234b: the handler now tells the receiver their badge went up, which is what the
+                // real Arbiter does from Handler_SDB_MAKE_PARCEL (Arb_part_071.c:15656) and what
+                // this harness makes reachable - the receiver resolves to "g1", character 1, whose
+                // session is h.Client. Character 1 holds the type-103 parcel created above and this
+                // new one, neither opened, so the badge is two unread and nothing read-unclaimed.
+                // Draining it here is also what keeps the operator-gate block below counting zero.
+                Hex.Eq(h.Client.Frame(), ParcelHandlers.BuildReadRecvStatus(2, 0),
+                    "T234b: an accepted make-parcel pushes the receiver's mail badge");
+                Hex.True(h.Main.Available == 0 && h.Instance.Available == 0,
+                    "and nothing goes to World - the badge is the Arbiter's own packet");
                 h.Run("set_max_send_mail_cnt 1"); h.Store.CreateParcel(1, "g1", 2, "escrow", "", 0, 2);
                 Hex.True(!QaMailBrokerCommands.CanMakeParcel(h.Store, 1, 2, 2, out uint error, out bool senderFull)
                     && error == 0 && senderFull, "native escrow sender limit uses @1219 with zero DB error");

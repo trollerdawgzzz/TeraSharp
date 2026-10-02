@@ -77,6 +77,8 @@ public static class TerasConfig
         ["matchmaking.bgMaxTanks"] = "TERASHARP_BG_MAX_TANKS",
         ["matchmaking.bfEnterDelay"] = "TERASHARP_BF_ENTER_DELAY",
         ["economy.brokerFeePercent"] = "TERASHARP_BROKER_FEE_PERCENT",
+        ["parcels.deleteSystemOnCollect"] = "TERASHARP_PARCEL_DELETE_ON_COLLECT",
+        ["gateway.claimTokenMaxAge"] = "TERASHARP_ITEM_CLAIM_MAX_AGE",
     };
 
     private static readonly object Gate = new();

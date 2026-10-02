@@ -62,12 +62,22 @@ public sealed class FakeAccount
     public string Name { get; set; } = "1";
     public List<FakeCharacter> Characters { get; } = new();
 
-    /// <summary>Load account + characters from the store (creates the account if new).</summary>
+    /// <summary>
+    /// Load account + characters from the store (creates the account if new).
+    ///
+    /// <para>T228: this is the login path, and it is where a drifted lobby slot gets repaired.
+    /// Positions used to be handed out as MAX+1, so an account that had ever deleted a character
+    /// carried ordinals past its slot count - and World refuses entry on the ordinal. Compacting
+    /// here means an existing character is fixed the next time its owner logs in, before the lobby
+    /// list is built from these rows.</para>
+    /// </summary>
     public void LoadFromStore(CharacterStore store, string accountName)
     {
+        ArgumentNullException.ThrowIfNull(store);
         var acct = store.GetOrCreateAccount(accountName);
         AccountId = (ulong)acct.Id;
         Name = acct.Name;
+        store.CompactPositionsIfDrifted(acct.Id, Handlers.QaUtilityCommands.CharacterSlots(store, acct.Id));
         Characters.Clear();
         foreach (var r in store.GetCharacters(acct.Id))
             Characters.Add(FakeCharacter.FromRecord(r));

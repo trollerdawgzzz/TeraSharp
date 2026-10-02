@@ -91,7 +91,13 @@ public static partial class Tests
             e.Run("i_want_server_language_and_revision"); Hex.True(Encoding.Unicode.GetString(e.Caller.Frame()).Contains("server lang and revision [6],[376056]"), "agrees with S_SERVER_BUILD_INFO");
             e.Run("help unlock_all_movies"); var heading = Encoding.Unicode.GetString(e.Caller.Frame()); var row = Encoding.Unicode.GetString(e.Caller.Frame());
             Hex.True(heading.Contains("*****Help search Result***** &#xa;") && row.Contains("unlock_all_movies") && row.Contains(" // ") && row.Contains(" &#xa;"), "native help heading and row formatter");
-            Hex.Eq(e.Dungeon.Frame(), T180Frame(0x2829, GmCommandHandlers.BuildWorldForward(1, 1, "_helpworld unlock_all_movies")), "help also queries currentWorld's command catalog");
+            // T233: this used to assert a "_helpworld unlock_all_movies" forward to World. _helpworld is
+            // not one of the 545 names WorldServer's CommandDistributor registers, so the forward was
+            // always answered with "Invalid QA Command" - /@help's World half never worked. World's
+            // catalogue is searched locally now, and "unlock_all_movies" is an Arbiter-only name that
+            // matches no World row, so the answer ends after the one native row consumed above.
+            Hex.True(WorldQaCommandData.Search("unlock_all_movies").Count() == 0, "unlock_all_movies is not a WorldServer command");
+            Hex.True(e.Dungeon.Available == 0 && e.Main.Available == 0 && e.Caller.Available == 0, "help answers entirely from local catalogues - no World forward");
             e.Run("devdebug connection"); Hex.True(Encoding.Unicode.GetString(e.Caller.Frame()).Contains("AuthManager"), "does not fabricate unavailable admission counters");
         });
     }
@@ -111,9 +117,16 @@ public static partial class Tests
             e.Store.CreateCharacter(new CharacterRecord { AccountId = e.AccountId, Name = "Third" });
             e.Run("reset_charsock"); Hex.True(Encoding.Unicode.GetString(e.Caller.Frame()).Contains("reset!"), "under4 native guard");
             e.Caller.Session.Account.LoadFromStore(e.Store, "utility-op"); new CharacterHandlers(QuietLog()).OnCanCreateUser(e.Caller.Session, ReadOnlyMemory<byte>.Empty);
-            Hex.Eq(e.Caller.Frame(), Convert.FromHexString("0500727000"), "three existing users exhaust defaultPackage0 slot3");
+            // T228: the slot count is max(sheet base, MaxCharactersPerAccount) raised by packages,
+            // so defaultPackage0's slot="3" no longer caps this account at three - reading the sheet
+            // alone would have SHRUNK every unpackaged account from eight slots to three. Three
+            // characters against the floor of eight leaves room, so the answer is now ok=1.
+            Hex.Eq(e.Caller.Frame(), Convert.FromHexString("0500727001"), "three existing users do not exhaust the floored capacity");
             using (var reopened = new CharacterStore(Path.Combine(e.DirectoryPath, "store.db"), QuietLog()))
             {
+                // T228: reset_charsock pinned character_slots_<account> to the sheet's 3, and an explicit
+                // counter wins over the max(sheet, 8) floor in either direction - that is what keeps the
+                // command meaningful. So the persisted value read back after restart is 3.
                 Hex.True(QaUtilityCommands.LoadingScreenEnabled(reopened) && QaUtilityCommands.CharacterSlots(reopened, e.AccountId) == 3, "login consumes persisted loading and slot controls after restart");
                 Hex.True(reopened.GetWatchedMoviesForAccount(e.AccountId).Count == 2 && reopened.GetNonPkSections().Count == 1, "movies and PK row survive restart");
             }

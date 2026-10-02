@@ -7000,6 +7000,25 @@ public sealed partial class DbProxyHandlers
             return true;
         }
 
+        // T234: catch up on the rows that were collected before delete-on-collect existed.
+        // This is the listing the mailbox is built from, so sweeping here means the player never
+        // sees a row that is about to vanish - and an unclaimed parcel is never a candidate.
+        if (viewType == 0 && ParcelDbHandlers.DeleteSystemParcelOnCollect)
+        {
+            int swept = _store.DeleteCollectedParcels((int)userDbId, ParcelDbHandlers.ParcelTypeSystem);
+            if (swept > 0)
+            {
+                _log.LogInformation(
+                    "SDB_LIST_PARCEL: user {User} - removed {N} already-collected system parcel(s) (T234)",
+                    userDbId, swept);
+                // T234b: the sweep is OURS, so this push has no counterpart in the decompile -
+                // Handler_SDB_LIST_PARCEL has no SendReadRecvStatusInfo call site at all
+                // (Arb_part_071.c:15318..15525), because retail's listing never changes a count.
+                // Ours just did, so the badge has to be told.
+                PushParcelBadge((int)userDbId, "a listing sweep");
+            }
+        }
+
         // T202: ViewType 0 is the inbox, anything else is the Sent box - see BuildParcelList.
         var body = ParcelDbHandlers.BuildParcelList(_store, (int)userDbId, viewType, out uint count, out uint maxPage);
         _log.LogInformation("SDB_LIST_PARCEL: user {User} view {View} page {Page} -> {N} parcel(s)",
@@ -7073,6 +7092,7 @@ public sealed partial class DbProxyHandlers
             parcelId, pf.SenderName, pf.ReceiverName, recverDbId, pf.Title, pf.Money, slot, record.Length);
         link.SendFrame(DBS_MAKE_PARCEL,
             ParcelDbHandlers.BuildDbsMakeParcel(atoms, dlmId, ok: true, sendParcelError: 0, (uint)recverDbId));
+        PushParcelBadge(recverDbId, "new mail");           // T234b, Arb_part_071.c:15656
         return true;
     }
 
@@ -7124,13 +7144,23 @@ public sealed partial class DbProxyHandlers
 
         // The gold is paid on the COMMIT pass, with the attachments - not on the read.
         long gold = ClaimParcelMoney(row, applied);
-        if (row is not null) _store.SetParcelRecved((int)parcelId, row.ReceiverDbId);
+        bool removed = false;
+        if (row is not null)
+        {
+            _store.SetParcelRecved((int)parcelId, row.ReceiverDbId);
+            // T234. `record` was materialised above, before any of this, so the reply still
+            // carries the parcel the client asked for even once the row is gone.
+            removed = ParcelDbHandlers.ShouldDeleteOnCollect(row) && _store.DeleteParcel((int)parcelId);
+        }
 
         _log.LogInformation(
-            "SDB_RECV_PARCEL: parcel {Id} step {Step} -> {Ins} inserted, {Chg} amount, {Gold} gold",
-            parcelId, step, applied.Inserted, applied.AmountChanged, gold);
+            "SDB_RECV_PARCEL: parcel {Id} step {Step} -> {Ins} inserted, {Chg} amount, {Gold} gold{Removed}",
+            parcelId, step, applied.Inserted, applied.AmountChanged, gold, removed ? ", row removed" : string.Empty);
         link.SendFrame(DBS_RECV_PARCEL,
             ParcelDbHandlers.BuildDbsRecvParcel(record, atoms, dlmId, step, ok: row is not null));
+        // T234b, Arb_part_071.c:15957 - the owner's push is guarded by Step == 2 there, and step 1
+        // is a pure read here too (nothing sets is_read, so no count moves).
+        if (row is not null) PushParcelBadge(row.ReceiverDbId, removed ? "a collect that cleared the row" : "a collect");
         return true;
     }
 
@@ -7176,25 +7206,38 @@ public sealed partial class DbProxyHandlers
         if (ids.Count == 0)
             ids = _store.GetParcelsFor((int)ownerDbId).Where(r => !r.IsRecved).Select(r => r.ParcelId).ToList();
 
-        uint claimed = 0;
+        uint claimed = 0, removed = 0;
         long gold = 0;
+        // T234b: "Receive all" names one owner, but the id chain is World's and a commit could in
+        // principle carry parcels of more than one receiver - so the badge goes to whoever was
+        // actually touched, plus the request's own owner.
+        var badge = new HashSet<int> { (int)ownerDbId };
         foreach (int id in ids)
         {
             var row = _store.GetParcel(id);
             if (row is null || row.IsRecved) continue;
+            badge.Add(row.ReceiverDbId);
             gold += ClaimParcelMoney(row, applied);
             _store.SetParcelRecved(row.ParcelId, row.ReceiverDbId);
             claimed++;
+            // T234. "Receive all" is where the reward mail piles up, so this is the collect that
+            // matters: claim it, then drop the row rather than re-listing it as received. The
+            // gold and the atoms are already applied, so the row has nothing left to carry.
+            if (ParcelDbHandlers.ShouldDeleteOnCollect(row) && _store.DeleteParcel(row.ParcelId)) removed++;
             // Only one parcel of a receive-all can be the one the atoms carried money for; the
             // rest are credited from their own row.
             applied = applied with { CharacterMoneyDelta = 0 };
         }
 
         _log.LogInformation(
-            "SDB_RECV_PARCEL_EX: owner {Owner} step {Step} -> {N} parcel(s) claimed, {Ins} inserted, {Chg} amount, {Gold} gold",
-            ownerDbId, step, claimed, applied.Inserted, applied.AmountChanged, gold);
+            "SDB_RECV_PARCEL_EX: owner {Owner} step {Step} -> {N} parcel(s) claimed, {Rem} removed, {Ins} inserted, {Chg} amount, {Gold} gold",
+            ownerDbId, step, claimed, removed, applied.Inserted, applied.AmountChanged, gold);
         link.SendFrame(DBS_RECV_PARCEL_EX,
             ParcelDbHandlers.BuildDbsRecvParcelEx(null, atoms, dlmId, step, noParcel: claimed, ok: true));
+        // T234b, Arb_part_072.c:6733. This is the one the player notices: Receive all claims
+        // without reading, so before T234 the rows kept is_read = 0 and the badge stayed on its
+        // old count forever; now the rows are gone and the badge has to follow them down.
+        foreach (int who in badge) PushParcelBadge(who, "a receive-all");
         return true;
     }
 
@@ -7266,6 +7309,30 @@ public sealed partial class DbProxyHandlers
         return row.Money;
     }
 
+    /// <summary>
+    /// T234b. Refresh one character's mail badge after a parcel moved.
+    ///
+    /// <para>World caches the counts in its own <c>ParcelManager</c>, so a row we add or drop
+    /// behind its back leaves the client's badge on the old number until the next login. The real
+    /// Arbiter never relies on World for this: it pushes
+    /// <c>S_PARCEL_READ_RECV_STATUS</c> itself from every <c>SDB_*</c> handler that touches a
+    /// parcel - see <see cref="Handlers.ParcelHandlers.PushReadRecvStatus"/> for the six call
+    /// sites in the decompile. We sent none of them.</para>
+    ///
+    /// <para>One deliberate difference: <c>Handler_SDB_DELETE_PARCEL</c> pushes BEFORE its
+    /// <c>DBS_</c> reply and we push after, uniformly. The badge goes to the client socket and
+    /// the reply to the World link, so nothing observes the order - and an unanswered per-user DB
+    /// request head-blocks that user for the life of the World process (HANDOFF.md section 1),
+    /// which is reason enough to answer World first and always.</para>
+    /// </summary>
+    private void PushParcelBadge(int receiverDbId, string after)
+    {
+        if (receiverDbId <= 0) return;
+        if (Handlers.ParcelHandlers.PushReadRecvStatus(receiverDbId))
+            _log.LogInformation("S_PARCEL_READ_RECV_STATUS: {User}'s mail badge refreshed after {After} (T234b)",
+                receiverDbId, after);
+    }
+
     /// <summary>SDB_RETURN_PARCEL (0x2781) -> DBS_RETURN_PARCEL (0x2782): sender and receiver
     /// swap and the mail goes back unread.</summary>
     private bool OnReturnParcel(WorldLink link, byte[] payload)
@@ -7274,13 +7341,21 @@ public sealed partial class DbProxyHandlers
         uint parcelId = ParcelDbHandlers.U32(payload, ParcelDbHandlers.ReturnReqParcelId);
 
         bool ok = false;
+        CharacterStore.ParcelRow? row = null;
         if (payload.Length >= ParcelDbHandlers.ReturnRequestSize && _store is not null)
         {
-            var row = _store.GetParcel((int)parcelId);
+            row = _store.GetParcel((int)parcelId);
             ok = row is not null && _store.ReturnParcel((int)parcelId, row.ReceiverDbId);
         }
         _log.LogInformation("SDB_RETURN_PARCEL: parcel {Id} -> {Ok}", parcelId, ok);
         link.SendFrame(DBS_RETURN_PARCEL, ParcelDbHandlers.BuildDbsDlmAck(dlmId, ok));
+        // T234b, Arb_part_071.c:16213 and :16219 - a return moves the row between two inboxes, so
+        // the real Arbiter pushes to BOTH the old receiver and the old sender.
+        if (ok && row is not null)
+        {
+            PushParcelBadge(row.ReceiverDbId, "a parcel returned to its sender");
+            PushParcelBadge(row.SenderDbId, "a parcel returned to them");
+        }
         return true;
     }
 
@@ -7291,6 +7366,8 @@ public sealed partial class DbProxyHandlers
     private bool OnDeleteParcel(WorldLink link, byte[] payload)
     {
         uint dlmId = ParcelDbHandlers.U32(payload, ParcelDbHandlers.DeleteReqDlmId);
+        uint userDbId = ParcelDbHandlers.U32(payload, ParcelDbHandlers.DeleteReqUserDbId);
+        bool isSendParcel = ParcelDbHandlers.U8(payload, ParcelDbHandlers.DeleteReqIsSendParcel) != 0;
         var list = ParcelDbHandlers.Ref(payload, ParcelDbHandlers.DeleteReqDelListRef);
 
         int deleted = 0;
@@ -7299,8 +7376,13 @@ public sealed partial class DbProxyHandlers
             for (int at = 0; at + 4 <= list.Length; at += 4)
                 if (_store.DeleteParcel((int)BitConverter.ToUInt32(list, at))) deleted++;
         }
-        _log.LogInformation("SDB_DELETE_PARCEL: {N} of {M} parcel(s) deleted", deleted, list.Length / 4);
+        _log.LogInformation("SDB_DELETE_PARCEL: {N} of {M} parcel(s) deleted for user {User}, sent box {Sent}",
+            deleted, list.Length / 4, userDbId, isSendParcel);
         link.SendFrame(DBS_DELETE_PARCEL, ParcelDbHandlers.BuildDbsDlmAck(dlmId, ok: true));
+        // T234b, Arb_part_071.c:15231. The real handler's guard is exactly this: the push happens
+        // only for an INBOX delete, because the Sent box has no badge. Deleting by hand left the
+        // badge stale here too, so this is the same bug as the delete-on-collect one.
+        if (deleted > 0 && !isSendParcel) PushParcelBadge((int)userDbId, "a mailbox delete");
         return true;
     }
 

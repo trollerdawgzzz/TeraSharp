@@ -876,3 +876,144 @@ system reward is in the inbox and never in the Sent box, pinned to `cap_final2b`
   state (2) that the Receive-all enumerator skips (`Arb_part_072.c:6028`); T79 calls that field
   IsRead. `cap_social2` 2442 returns one row with `ParcelCount 0` for a Sent view and that is
   unexplained.
+* **Step 2 does not delete the row** - correct for retail, and T234 changes it for system parcels
+  on purpose. See section 15.
+
+## 15. T234 - "Receive all" left every reward mail listed, and retail is no better
+
+Research pass, then a deliberate divergence. `Receive all` claimed the attachments and then marked
+the row `is_recved`, so the next `SDB_LIST_PARCEL` served it again with status 2 - "received" -
+forever. The question was whether retail deletes it instead.
+
+### Retail keeps it. Three independent pins.
+
+| pin | evidence |
+| --- | --- |
+| the list does not change across a collect | `cap_final2b` 9986/9987 lists user 1003's inbox (ParcelCount **2**, DataList 0x13d0 = 2 x 0x9e8); 10030..10033 collects parcel **12** with the full two-step; 10062/10063 lists it again - **ParcelCount 2**, same 0x13d0, same leading `@Achievement:691x` record |
+| and not even when BOTH are collected | 28053/28054 lists user 1's inbox (**2**); 28067..28070 collects parcel **13**, 28086..28089 collects parcel **14**; 28107/28113 - **still 2**, byte-identical header and first record |
+| nothing sends the delete | **zero** `SDB_DELETE_PARCEL` (0x2811) frames in the whole of `cap_final2b` |
+
+### Who does send it, then: the player
+
+In `WorldServer.exe.c`, 0x2811 has one writer, `FUN_140cab160`
+`(pkt, link, DlmId, UserDbId, IsSendParcel, vector<int> ids)`, reached only from
+`DeleteParcelContext::ExecuteTransaction`. That context's constructor is `FUN_140cad600`, with
+three call sites: `FUN_14023fdd0` and `FUN_14029d190` are unreferenced template factories, and the
+only live one is inside **`User::Handler_C_DELETE_PARCEL`**. The delete is the Delete button,
+never a consequence of collecting.
+
+`cap_social2` is the same story from the other side: 2353/2354 lists one parcel
+(`@Achievement:690x`, id 3), 2372..2375 collects it, **2401** is `SDB_DELETE_PARCEL` carrying that
+one id (`03 00 00 00`, `IsSendParcel 0`, user 1003), and 2407/2408 returns an empty inbox. Our own
+`cap_mail1` 21518 is the bulk form: 7 ids after a 7-parcel receive-all, then 0 rows at 21526.
+
+### So this is OURS, and it is on by default
+
+`TERASHARP_PARCEL_DELETE_ON_COLLECT` / `parcels.deleteSystemOnCollect`, default **true**: a
+**system** parcel (`ParcelType 102`) is deleted the moment its attachments are claimed, in both
+`OnRecvParcel` step 2 and `OnRecvParcelEx` step 2. Set it to `0`/`false` for retail behaviour -
+the row survives and `ServedParcelRecord` reports status 2, exactly as before.
+
+A player's mail is untouched: it stays, read, until its owner presses Delete, which
+`SDB_DELETE_PARCEL` already handles. The scope is narrow on purpose - a system parcel's message
+is a generated template (`@2052\x0bAchievementName\x0b@Achievement:6900`), not correspondence, so
+once the reward is in the bag there is nothing left to keep.
+
+`SDB_LIST_PARCEL` (ViewType 0 only) also sweeps `DeleteCollectedParcels(user, 102)` first, which
+is the catch-up for rows collected before this existed. `is_recved` is the whole test, so an
+unclaimed parcel is never a candidate, and sweeping at the listing means the player never sees a
+row that is about to vanish.
+
+### This is T228 D
+
+`terasharp.db` as of the T228 run: character **13** holds six `@2051` rows (26..31) and character
+**9** holds seven (10, 11, 21..25) - every one `parcel_type 102`, `is_recved 1`. Those are the
+"four reward mails on every login". Nothing re-creates them - `arbiter-t228d.log` records zero
+parcel writes across two logins - they are collected rows that never left. The sweep clears them
+on the first mailbox open; delete-on-collect stops the next one accumulating.
+
+### One consequence worth knowing
+
+World keeps its own `ParcelManager` view per session, so a row deleted behind its back disappears
+from the client's mailbox list on the next listing (reopen the mailbox, or relog), not the instant
+the collect returns. **The count is a different matter and T234b fixes it - see section 16.** A
+later `SDB_RECV_PARCEL` for a deleted id answers `Success 0`, which is World's normal "already
+gone" path, and `SDB_DELETE_PARCEL` for one still answers `ok`.
+
+Tests (`T234.cs`): a collected system reward leaves the store while its items and gold stay, a
+player parcel survives its own collect with status 2, the switch off keeps everything, and the
+listing sweep clears the backlog without touching the unclaimed row.
+
+
+## 16. T234b - the badge is the Arbiter's to push, and we never pushed it
+
+T234 removed the claimed rows and the mailbox went empty, but the mail icon kept its old number
+until the next login: World caches the counts in its own `ParcelManager` and we changed the table
+behind its back. The fix is not to tell World - it is to send the client the packet the real
+Arbiter sends, which we had been sending from three places instead of nine.
+
+### The packet
+
+`S_PARCEL_READ_RECV_STATUS` `0xF26E`, 13 bytes:
+`[u16 13][u16 0xF26E][u32 totalUnread][u32 readUnclaimed][u8 flag]`. Already built by
+`ParcelHandlers.BuildReadRecvStatus`; the def declares only the two counters, the writer emits the
+trailing u8 (section 2.2).
+
+`cap_social2`'s client tap brackets the one collect it holds, and it is the whole mechanism:
+
+| seq | packet | body |
+| --- | --- | --- |
+| 1707 | `C_SHOW_PARCEL_MESSAGE` | parcel 4 |
+| 1709 | `S_PARCEL_READ_RECV_STATUS` | `00 00 00 00 \| 02 00 00 00 \| 00` - 0 unread, **2** read-unclaimed |
+| 1715 | `C_RECV_PARCEL` | parcel 4 |
+| 1716 | `S_PARCEL_READ_RECV_STATUS` | `00 00 00 00 \| 01 00 00 00 \| 00` - **1** |
+| 1717 | `S_RECV_PARCEL` | `01 \| 04 00 00 00` |
+
+The badge arrives **before** the collect's own ack, and `readUnclaimed` 2 -> 1 is
+`GetParcelCounts`' formula (`is_read <> 0 AND is_recved = 0`) confirmed on the wire. 270/355/476/
+1629/2311 agree at every other count.
+
+### Where retail sends it from
+
+One function, `ParcelManager::SendReadRecvStatusInfo(User*, bool)` = `FUN_140979060`
+(Arb_part_082.c:18805), called from every handler that moves a parcel - each one behind an
+online lookup (`FUN_14082d8a0(table, userDbId, 3)`) and usually an in-world test (`FUN_14038ca80`):
+
+| handler | call site | target | guard |
+| --- | --- | --- | --- |
+| `Handler_SDB_DELETE_PARCEL` | 071.c:15231 | request's `UserDbId` | **`IsSendParcel == 0`** - the Sent box has no badge |
+| `Handler_SDB_RECV_PARCEL` | 071.c:15953 / :15957 | caller / parcel owner | owner only on `Step == 2` |
+| `Handler_SDB_RECV_PARCEL_EX` | 072.c:6733 | the user | after the reply |
+| `Handler_SDB_MAKE_PARCEL` | 071.c:15656 | the receiver | - (the badge goes UP) |
+| `Handler_SDB_RETURN_PARCEL` | 071.c:16213 / :16219 | old receiver **and** old sender | the return succeeded |
+| `User::OnLoadTopoFin` | 029.c:12574 | the logging-in user | - (the one we already had) |
+| `Handler_SDB_LIST_PARCEL` | **none** | - | retail's listing changes no count, so it pushes nothing |
+
+### What T234b adds
+
+`ParcelHandlers.PushReadRecvStatus(receiverDbId)` - look the character up in
+`Program.World`, send if they are in world, return false otherwise (offline is normal; their badge
+is rebuilt from the DB at login). `DbProxyHandlers.PushParcelBadge` wraps it with the log line,
+and the six handlers above now call it. The seventh, `SDB_LIST_PARCEL`, pushes **only when the
+T234 sweep actually removed a row** - that sweep is ours, so this push has no counterpart in the
+decompile; an idle listing stays silent.
+
+One divergence: `Handler_SDB_DELETE_PARCEL` pushes before its `DBS_` reply and we push after,
+everywhere. The badge goes to the client socket and the reply to the World link, so no observer
+sees the order, and answering World first is the rule that keeps a per-user DB request from
+head-blocking that user for the life of the World process (HANDOFF.md section 1).
+
+### Why the stale number was "2" and not "0"
+
+"Receive all" claims without opening, so `is_read` stays 0 on every row it touches. Before T234
+those rows survived at `is_read = 0, is_recved = 1` and `totalUnread` counted them forever - the
+mailbox and the badge were at least consistent. T234's delete made the DB right and left the
+client wrong, which is what this section fixes. With the switch off the old behaviour returns in
+full, badge included: the push still fires, it just reports the rows that are still there.
+
+Tests (`T234.cs`, the `T234b_*` four): the badge frame is byte-exact against `cap_social2` 1709
+and 1716 and the counter formula is re-derived from the store; a receive-all that clears its rows
+pushes one frame carrying the new count, and with the switch off pushes the count the surviving
+row makes; the listing sweep pushes once and an idle listing not at all; an inbox delete pushes
+and a Sent-box delete does not, with the request layout pinned to `cap_social2` 2401; and an
+offline or invalid receiver is refused rather than broadcast.

@@ -182,6 +182,11 @@ public static class DatasheetLoader
         "CreateCharData.xml <Char createdLevel>", "new character level (CharacterHandlers)",
         StarterInventory.BuiltInCreatedLevels, ReadCreatedLevels, r => r.Length);
 
+    /// <summary>T221. Where a new character starts, per class id (CharacterHandlers.StartPositionFor).</summary>
+    public static readonly SheetValue<(int Zone, float X, float Y, float Z)[]> StartPositions = new(
+        "CreateCharData.xml <InitPos> / <InitLoc default>", "new character start position (CharacterHandlers)",
+        Handlers.CharacterHandlers.BuiltInStartPositions(), ReadStartPositions, r => r.Length);
+
     public static readonly SheetValue<int[]> PvpBoardIds = new(
         "BattleFieldData.xml <RankingCompetition>", "PvP leaderboard ids (S_PVP_LEADER_BOARD_INFO)",
         Handlers.ArbiterClientHandlers.LeaderBoardLivePvp, ReadPvpBoardIds, r => r.Length);
@@ -254,7 +259,7 @@ public static class DatasheetLoader
     /// <summary>Every sheet, in report order.</summary>
     public static IReadOnlyList<ISheetValue> All => new ISheetValue[]
     {
-        GuildSizes, ClassPositions, DefaultSkills, StarterKits, CreatedLevels, PvpBoardIds, PveBoardIds, DungeonTimelineIds,
+        GuildSizes, ClassPositions, DefaultSkills, StarterKits, CreatedLevels, StartPositions, PvpBoardIds, PveBoardIds, DungeonTimelineIds,
         EventMatchingTargets, GuardContinents, DailyBuyMenus, RaidPartyNames, PartyLootDefaults,
         EventMatchingTargets, EquipSlots, ReparationRates,
         BattleFieldSheet.Entry,   // T163: T157's reader, on master since T161
@@ -407,10 +412,14 @@ public static class DatasheetLoader
         if (doc == null) return null;
         var kits = (StarterItem[][])StarterInventory.BuiltInKits.Clone();
         int found = 0;
+        var seen = new HashSet<int>();
         foreach (var ch in doc.Descendants("Char"))
         {
             int cls = IndexOf(ClassNames, (string?)ch.Attribute("class"));
             if ((uint)cls >= (uint)kits.Length) continue;
+            // T232c: first row per class wins. A second row for one class used to overwrite the
+            // first silently, which is one of the two ways a sheet can hand a class the wrong kit.
+            if (!seen.Add(cls)) continue;
             var kit = new List<StarterItem>();
             int worn = 0, bag = 0;
             foreach (var it in ch.Elements("InitItem"))
@@ -425,7 +434,30 @@ public static class DatasheetLoader
             kits[cls] = kit.ToArray();
             found++;
         }
-        return found > 0 ? kits : null;
+        if (found == 0) return null;
+        // T232c. One weapon per class is an invariant of this sheet - the thirteen worn InitItem
+        // weapons are thirteen different items, and BuiltInKits is the transcription that says which
+        // belongs to which. A row copied from another class breaks it, and the break is invisible
+        // downstream: live 2026-10-02 a Popori/M Ninja was served the glaiver's 59053 + 15004/15005/
+        // 15006 while the Arbiter log and WornLook both correctly said class 11 (assassin), because
+        // the sheet the box reads carried the glaiver's items on its assassin row. So when a class's
+        // sheet weapon is ANOTHER class's own weapon, the row is a copy and this class keeps its
+        // transcribed kit. A sheet that re-weapons a class to something no other class owns is left
+        // alone, and only the colliding class falls back - the other twelve stay sheet-driven.
+        // tools/check-starter-kits.py reports the same thing without starting the server.
+        var ownWeapon = new Dictionary<int, int>();
+        for (int i = 0; i < StarterInventory.BuiltInKits.Length; i++)
+        {
+            int w = StarterInventory.WornLookOf(StarterInventory.BuiltInKits[i]).Weapon;
+            if (w != 0) ownWeapon[w] = i;
+        }
+        for (int i = 0; i < kits.Length; i++)
+        {
+            int w = StarterInventory.WornLookOf(kits[i]).Weapon;
+            if (w != 0 && ownWeapon.TryGetValue(w, out int owner) && owner != i)
+                kits[i] = StarterInventory.BuiltInKits[i];
+        }
+        return kits;
     }
 
     /// <summary>
@@ -448,6 +480,49 @@ public static class DatasheetLoader
             found++;
         }
         return found > 0 ? levels : null;
+    }
+
+    /// <summary>
+    /// T221. CreateCharData.xml's start position per class id, resolved the way the Arbiter's
+    /// <c>CreateUserCallback</c> does it: the class row's <c>&lt;InitPos&gt;</c> when its continent
+    /// and x/y/z are all non-zero, otherwise the <c>&lt;InitLoc default="true"&gt;&lt;Pos&gt;</c> row.
+    /// Race/gender-masked <c>&lt;InitLoc&gt;</c> rows are not modelled (the shipped sheet has none).
+    /// Null when the sheet has neither, so the built-in stays in use.
+    /// </summary>
+    public static (int Zone, float X, float Y, float Z)[]? ReadStartPositions(string dir)
+    {
+        var doc = ReadXml(dir, "CreateCharData.xml");
+        if (doc == null) return null;
+        bool found = false;
+        var fallback = Handlers.CharacterHandlers.DefaultStart;
+        var def = doc.Descendants("InitLoc")
+            .FirstOrDefault(e => string.Equals(((string?)e.Attribute("default"))?.Trim(), "true", StringComparison.OrdinalIgnoreCase))
+            ?.Element("Pos");
+        if (def != null && TryStartPos(def, out var d)) { fallback = d; found = true; }
+        var table = new (int Zone, float X, float Y, float Z)[ClassNames.Length];
+        for (int c = 0; c < table.Length; c++) table[c] = fallback;
+        foreach (var ch in doc.Descendants("Char"))
+        {
+            int cls = IndexOf(ClassNames, (string?)ch.Attribute("class"));
+            if ((uint)cls >= (uint)table.Length) continue;
+            var pos = ch.Element("InitPos");
+            if (pos != null && TryStartPos(pos, out var p)) { table[cls] = p; found = true; }
+        }
+        return found ? table : null;
+    }
+
+    private static bool TryStartPos(XElement e, out (int Zone, float X, float Y, float Z) pos)
+    {
+        pos = default;
+        int zone = Int(e, "continent", 0);
+        var xyz = (((string?)e.Attribute("pos")) ?? "").Split(',');
+        if (zone == 0 || xyz.Length != 3) return false;
+        var inv = System.Globalization.CultureInfo.InvariantCulture;
+        var any = System.Globalization.NumberStyles.Float;
+        if (!float.TryParse(xyz[0].Trim(), any, inv, out float x) || !float.TryParse(xyz[1].Trim(), any, inv, out float y)
+            || !float.TryParse(xyz[2].Trim(), any, inv, out float z) || x == 0 || y == 0 || z == 0) return false;
+        pos = (zone, x, y, z);
+        return true;
     }
 
     /// <summary>

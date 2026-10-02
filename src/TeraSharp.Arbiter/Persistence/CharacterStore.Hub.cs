@@ -26,12 +26,19 @@ public sealed partial class CharacterStore
 
     /// <summary>A box waiting for, or already turned into, a parcel. State 0 = pending, 1 = delivered.</summary>
     public sealed record HubBoxRow(long BoxSn, long AccountId, int CharacterId, string Title,
-        string Content, string Icon, long StartAt, long EndAt, string ExternalKey, int State, int ParcelId);
+        string Content, string Icon, long StartAt, long EndAt, string ExternalKey, int State, int ParcelId,
+        long ClaimedAt = 0, int ClaimedBy = 0);
 
     /// <summary>One line of a box: the service item, the template it resolves to, and the count.</summary>
     public sealed record HubBoxItemRow(long BoxSn, int Slot, long ServiceItemSn, int TemplateId, long Amount);
 
-    public const int HubBoxPending = 0, HubBoxDelivered = 1;
+    /// <summary>
+    /// 0 pending, 1 delivered as a system parcel (T207), 2 claimed through the Item Claim page
+    /// (T230). Two terminal states on purpose: the parcel path and the page are different
+    /// surfaces with different support answers, and "where did my item go" is answered by the
+    /// state plus <c>parcel_id</c> / <c>claimed_by</c>.
+    /// </summary>
+    public const int HubBoxPending = 0, HubBoxDelivered = 1, HubBoxClaimed = 2;
 
     private void EnsureHubTables()
     {
@@ -55,6 +62,11 @@ public sealed partial class CharacterStore
             "PRIMARY KEY(box_sn, slot));" +
             "CREATE INDEX IF NOT EXISTS hub_boxes_pending ON hub_boxes(state, account_id);";
         command.ExecuteNonQuery();
+        // T230: a box claimed through the page records who took it and when. Added by migration
+        // because EnsureHubTables only ever CREATEs IF NOT EXISTS, so a live DB already has the
+        // table without these.
+        AddColumnIfMissing("hub_boxes", "claimed_at", "INTEGER NOT NULL DEFAULT 0");
+        AddColumnIfMissing("hub_boxes", "claimed_by", "INTEGER NOT NULL DEFAULT 0");
     }
 
     /// <summary>Tests and --selftest: create the tables without a hub call having arrived.</summary>
@@ -268,10 +280,78 @@ public sealed partial class CharacterStore
 
     private const string HubBoxSelect =
         "SELECT box_sn,account_id,character_id,title,content,icon,start_at,end_at,external_key," +
-        "state,parcel_id FROM hub_boxes";
+        "state,parcel_id,claimed_at,claimed_by FROM hub_boxes";
 
     private static HubBoxRow ReadHubBox(Microsoft.Data.Sqlite.SqliteDataReader reader)
         => new(reader.GetInt64(0), reader.GetInt64(1), reader.GetInt32(2), reader.GetString(3),
             reader.GetString(4), reader.GetString(5), reader.GetInt64(6), reader.GetInt64(7),
-            reader.GetString(8), reader.GetInt32(9), reader.GetInt32(10));
+            reader.GetString(8), reader.GetInt32(9), reader.GetInt32(10),
+            reader.GetInt64(11), reader.GetInt32(12));
+
+    // ------------------------------------------------------------------ T230, the Item Claim page
+
+    /// <summary>
+    /// T230. Every box of one account, newest first - pending ones the page can claim and the
+    /// terminal ones it shows as already taken. The page needs both: a list that silently drops
+    /// what was claimed is a support ticket ("I bought it, where is it").
+    /// </summary>
+    public IReadOnlyList<HubBoxRow> HubBoxesForAccount(long accountId, int limit = 200)
+    {
+        lock (_lock)
+        {
+            EnsureHubTables();
+            using var command = _db.CreateCommand();
+            command.CommandText = HubBoxSelect + " WHERE account_id=$a ORDER BY box_sn DESC LIMIT $n";
+            command.Parameters.AddWithValue("$a", accountId);
+            command.Parameters.AddWithValue("$n", limit < 1 ? 1 : limit);
+            using var reader = command.ExecuteReader();
+            var rows = new List<HubBoxRow>();
+            while (reader.Read()) rows.Add(ReadHubBox(reader));
+            return rows;
+        }
+    }
+
+    /// <summary>
+    /// T230. Move a box to <see cref="HubBoxClaimed"/>, recording the character that took it and
+    /// the parcel when the delivery went through the mailbox.
+    ///
+    /// <para><b>This is the whole consumption record.</b> The guard is <c>state=0</c>, so two
+    /// concurrent claims of the same box cannot both win - the second returns false and its
+    /// caller hands out nothing. Nothing else on this stack tracks box state: tera-api's box
+    /// functions all address <c>gusid.boxapi</c>, and TeraSharp answers 11001 in its place, so
+    /// this row is the record of truth (status/T230-ITEM-CLAIM.md section 6.2).</para>
+    /// </summary>
+    /// <summary>
+    /// T230. Record the parcel a claimed box became, after the fact. The claim marks the state
+    /// FIRST - that is the double-claim guard - so the parcel id is only known a step later.
+    /// </summary>
+    public bool SetHubBoxParcel(long boxSn, int parcelId)
+    {
+        lock (_lock)
+        {
+            EnsureHubTables();
+            using var command = _db.CreateCommand();
+            command.CommandText = "UPDATE hub_boxes SET parcel_id=$p WHERE box_sn=$b AND state<>0";
+            command.Parameters.AddWithValue("$p", parcelId);
+            command.Parameters.AddWithValue("$b", boxSn);
+            return command.ExecuteNonQuery() > 0;
+        }
+    }
+
+    public bool MarkHubBoxClaimed(long boxSn, int characterId, int parcelId = 0)
+    {
+        lock (_lock)
+        {
+            EnsureHubTables();
+            using var command = _db.CreateCommand();
+            command.CommandText =
+                "UPDATE hub_boxes SET state=2, claimed_by=$c, claimed_at=$now, " +
+                "parcel_id=CASE WHEN $p<>0 THEN $p ELSE parcel_id END WHERE box_sn=$b AND state=0";
+            command.Parameters.AddWithValue("$c", characterId);
+            command.Parameters.AddWithValue("$now", HubNow());
+            command.Parameters.AddWithValue("$p", parcelId);
+            command.Parameters.AddWithValue("$b", boxSn);
+            return command.ExecuteNonQuery() > 0;
+        }
+    }
 }

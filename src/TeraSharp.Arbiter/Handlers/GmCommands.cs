@@ -865,8 +865,17 @@ public sealed class GmCommandHandlers
                 Appearance = new byte[8], Details = new byte[32], Shape = new byte[64],
             };
             long accountId = (long)s.Account.AccountId;
+            // T228: a GM create must not take an ordinal past the cap either - that is what World
+            // refuses on, so an uncapped GM path would quietly recreate the fault.
+            int slots = QaUtilityCommands.CharacterSlots(store, accountId);
+            int position = store.NextPosition(accountId, slots);
+            if (position == 0)
+            {
+                SendCustom(s, $"create_user: no free character slot (all {slots} taken).\n");
+                return;
+            }
             var record = CharacterHandlers.BuildRecord(
-                req, accountId, store.NextPosition(accountId), template, playerId: 0);
+                req, accountId, position, template, playerId: 0);
             int id = store.CreateCharacter(record);
             var (zone, x, y, z) = CharacterHandlers.StartPositionFor(req.Race, req.Class);
             store.SaveWorldBlob(id, StarterBlob.Build(

@@ -15,6 +15,7 @@ used only when the sheet is missing or does not parse. Folder: `TERASHARP_DATASH
 | DefaultSkillSet.xml `<Default>` | `DefaultSkillSet.Rows` (99 rows) | new-character skills | T18 |
 | CreateCharData.xml `<Char>/<InitItem>` | `StarterInventory.BuiltInKits` (13 classes) | new-character items | T16 |
 | CreateCharData.xml `<Char createdLevel>` (T162) | `StarterInventory.BuiltInCreatedLevels` (1, soulless 50) | new-character level (+ `WorldLevelSync` above 1) | T162 |
+| CreateCharData.xml `<Char><InitPos>` / `<InitLoc default><Pos>` (T221) | `CharacterHandlers.SoullessStart` (7087) / `DefaultStart` (5) | new-character start position (`StartPositionFor`) | T221 |
 | BattleFieldData.xml `<RankingCompetition active="true">` | `LeaderBoardLivePvp` 10 26 30 37 | S_PVP_LEADER_BOARD_INFO | T133 |
 | BattleFieldData.xml `<BattleField>` (T157 reader, listed T163) | none - missing sheet = no battleground | battleground tab + queue (`MatchComposition`) | T157 |
 | DungeonRankRecorder_&lt;id&gt;.xml (file names) | `LeaderBoardLivePve` (8 live ids) | S_PVE_LEADER_BOARD_INFO | T133 |

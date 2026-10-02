@@ -321,6 +321,10 @@ Start-Process -FilePath (Join-Path $root 'Executable\WorldServer.exe') `
       reconnects. Players in world are dropped and can log back in.
 - [ ] the Status tab's *world links* tile goes to 0 and back to 1 - that is the
       quickest way to confirm a restart actually took
+- [ ] **tera-api is not part of the restart.** It is a client of ours: the hub
+      connection is inbound, so when the Arbiter comes back tera-api redials it.
+      If shop or box traffic is still dead a minute later, restart *tera-api* -
+      it owns that connection, not us. OPERATIONS section 2.2 has the order.
 
 ---
 
@@ -368,6 +372,28 @@ at start, and TeraSharp reads the 14 values in `status/DATASHEETS.md` from the s
 5. Anything the client must also know (new items, strings) is in the client's data center, not
    in these sheets (T160); a sheet edit alone does not change what the client shows.
 
+Before the restart, run the two validators over the folder you just edited. They are the
+pre-restart check; a sheet that fails them takes World down or leaves a class frozen in place:
+
+```powershell
+pwsh -File tools\check-class-rows.ps1  D:\v100\TERA_SERVER.100\Executable\Datasheet
+pwsh -File tools\fix-animset-paths.ps1 D:\v100\TERA_SERVER.100\Executable\Datasheet
+```
+
+`check-class-rows` exits with the number of problems - 0 or do not restart. `fix-animset-paths`
+is a dry run until `-Apply` and refuses to write a value AnimationData does not key.
+
+The box keeps its own copy of the folder. Copy the box's `Datasheet` to a local folder, then:
+
+```powershell
+pwsh -File tools\check-box.ps1    <local copy> D:\v100\TERA_SERVER.100\Executable\Datasheet -PushList drift.txt
+pwsh -File tools\push-sheets.ps1  -ListFile drift.txt -From D:\v100\TERA_SERVER.100\Executable\Datasheet -To <box copy> -Tag t237 -Apply
+```
+
+`check-box` is size then SHA-256, backups excluded, exit = files that differ. `push-sheets` is a
+dry run without `-Apply` and writes one `.<tag>.bak` per file. Both are in OPERATIONS section 7.
+
+- [ ] never hash-sync or drag the whole folder over RDP - copy the names a script printed
 - [ ] the edit and its backup are recorded somewhere you will find in a month
 
 ---

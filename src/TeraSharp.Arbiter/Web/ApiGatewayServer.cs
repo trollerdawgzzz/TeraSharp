@@ -209,13 +209,28 @@ public sealed class ApiGatewayServer : IDisposable
             "api-gateway probe: {Ip} {Method} {Path}{Query} ua={Agent} :: {Token} :: headers {Headers}",
             ip, method, path, query, req.UserAgent ?? "?", DescribeToken(token), headers.ToString());
 
-        var bytes = Encoding.UTF8.GetBytes(Page(path, query, DescribeToken(token)));
-        ctx.Response.StatusCode = 200;
-        ctx.Response.ContentType = "text/html; charset=utf-8";
+        // T230: the panel, and the two JSON endpoints behind it. The client's own initial path
+        // is still unmeasured, so ANY path that is not one of ours answers with the Item Claim
+        // page rather than the probe page - whatever the client asks for, it gets the panel. The
+        // probe page is still at /probe, and the log line above is unchanged, so one Alt+A press
+        // still reveals the path and the ticket placement.
+        var reply = ItemClaimApi.Handles(path)
+            ? ItemClaimApi.Serve(global::TeraSharp.Arbiter.Program.Store, method, path, query, token,
+                                 DateTimeOffset.UtcNow.ToUnixTimeSeconds(), _log)
+            : path.Equals(ProbePath, StringComparison.OrdinalIgnoreCase)
+                ? new ItemClaimApi.Reply(200, "text/html; charset=utf-8", Page(path, query, DescribeToken(token)))
+                : new ItemClaimApi.Reply(200, "text/html; charset=utf-8", ItemClaimApi.Page());
+
+        var bytes = Encoding.UTF8.GetBytes(reply.Body);
+        ctx.Response.StatusCode = reply.Status;
+        ctx.Response.ContentType = reply.ContentType;
         ctx.Response.ContentLength64 = bytes.Length;
         ctx.Response.OutputStream.Write(bytes, 0, bytes.Length);
         ctx.Response.OutputStream.Close();
     }
+
+    /// <summary>T230. Where T132's probe page still lives, now that / serves the panel.</summary>
+    public const string ProbePath = "/probe";
 
     /// <summary>
     /// The minimal page. Awesomium is an old Chromium embed, so this is deliberately plain HTML

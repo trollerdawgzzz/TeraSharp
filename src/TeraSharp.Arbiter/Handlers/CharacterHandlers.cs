@@ -181,9 +181,17 @@ public sealed class CharacterHandlers
     /// <para>Not modelled: the datasheet's <c>dist</c> (spawn scatter radius) and <c>dir</c>
     /// (facing). The real Arbiter carries both into the new character's row; we have no field
     /// for either, and the blob offsets for them are unidentified.</para>
+    ///
+    /// <para>T221: read from the sheet (<see cref="World.DatasheetLoader.StartPositions"/>), so a
+    /// server that drops the soulless <c>&lt;InitPos&gt;</c> (tools/v31-feel.ps1, Reaper from level 1)
+    /// starts its Reapers at the <c>&lt;InitLoc&gt;</c> default like every other class. The two
+    /// positions below are the built-in, used only when the sheet is missing.</para>
     /// </summary>
     internal static (int Zone, float X, float Y, float Z) StartPositionFor(int race, int cls)
-        => cls == SoullessClassId ? SoullessStart : DefaultStart;
+    {
+        var table = World.DatasheetLoader.StartPositions.Value;
+        return (uint)cls < (uint)table.Length ? table[cls] : DefaultStart;
+    }
 
     /// <summary>Class id 8 — the one class with its own <c>&lt;InitPos&gt;</c>.</summary>
     internal const int SoullessClassId = 8;
@@ -193,6 +201,16 @@ public sealed class CharacterHandlers
 
     /// <summary><c>&lt;Char class="soulless"&gt;&lt;InitPos&gt;</c>.</summary>
     internal static readonly (int Zone, float X, float Y, float Z) SoullessStart = (7087, -48077f, -52002f, 642f);
+
+    /// <summary>T221. The shipped sheet as transcribed, per class id: soulless at its own
+    /// <c>&lt;InitPos&gt;</c>, every other class at the default - the built-in for
+    /// <see cref="World.DatasheetLoader.StartPositions"/>.</summary>
+    internal static (int Zone, float X, float Y, float Z)[] BuiltInStartPositions()
+    {
+        var table = new (int Zone, float X, float Y, float Z)[World.DatasheetLoader.ClassNames.Length];
+        for (int c = 0; c < table.Length; c++) table[c] = c == SoullessClassId ? SoullessStart : DefaultStart;
+        return table;
+    }
 
     // ---- Name validation ----
 
@@ -328,6 +346,10 @@ public sealed class CharacterHandlers
         CreateUserRequest req, long accountId, int position, byte[] blobTemplate, int playerId)
     {
         var (zone, x, y, z) = StartPositionFor(req.Race, req.Class);
+        // T232: the row's four look columns, from the class's own kit. They used to stay at the
+        // column default of 0 - the lobby list and InventoryHandlers both read them, so a new
+        // character advertised item 0 in all four slots while its inventory carried the kit.
+        var worn = TeraSharp.Arbiter.World.StarterInventory.WornLook(req.Class);
         return new CharacterRecord
         {
             Id = playerId,
@@ -342,6 +364,7 @@ public sealed class CharacterHandlers
             Details = req.Details,
             Shape = req.Shape,
             Zone = zone, X = x, Y = y, Z = z,
+            Weapon = worn.Weapon, Body = worn.Body, Hand = worn.Hand, Feet = worn.Feet,
             Position = position,
             // playerId is only known after the INSERT; when it is 0 here the caller patches
             // the blob again with the real row id (see OnCreateUser).
@@ -402,8 +425,15 @@ public sealed class CharacterHandlers
     /// </summary>
     public bool OnCanCreateUser(GameSession s, ReadOnlyMemory<byte> body)
     {
-        int capacity = QaUtilityCommands.CharacterSlots(Program.Store, (long)s.Account.AccountId);
-        bool ok = s.Account.Characters.Count < capacity;
+        var canStore = Program.Store;
+        long canAccount = (long)s.Account.AccountId;
+        int capacity = QaUtilityCommands.CharacterSlots(canStore, canAccount);
+        // T228: the same ORDINAL test C_CREATE_USER applies, so the greyed button and the refusal
+        // cannot disagree. A pending-delete character still holds its slot while the lobby stops
+        // listing it, so the visible count alone said "room" where the ordinal space said "full".
+        bool ok = canStore == null
+            ? s.Account.Characters.Count < capacity
+            : canStore.NextPosition(canAccount, capacity) != 0;
         _log.LogInformation("C_CAN_CREATE_USER from {Id} -> ok={Ok} ({N}/{Max})",
             s.Id, ok, s.Account.Characters.Count, capacity);
         s.SendByDef("S_CAN_CREATE_USER", new Dictionary<string, object> { ["ok"] = ok });
@@ -464,9 +494,25 @@ public sealed class CharacterHandlers
             return true;
         }
 
-        if (s.Account.Characters.Count >= QaUtilityCommands.CharacterSlots(Program.Store, (long)s.Account.AccountId))
+        var store = Program.Store;
+        if (store == null)
         {
-            _log.LogInformation("C_CREATE_USER from {Id}: character limit reached", s.Id);
+            _log.LogError("C_CREATE_USER from {Id}: no character store", s.Id);
+            SendCreateResult(s, false);
+            return true;
+        }
+
+        long accountId = (long)s.Account.AccountId;
+        int slots = QaUtilityCommands.CharacterSlots(store, accountId);
+        // T228: refuse on the ORDINAL, not on the visible count. The old count check passed while
+        // every low slot was still held, so a character was created at slot 10 or 11 on an eight-slot
+        // account and World then refused it with "delete 1 character before entering world" - World's
+        // own limit reads the ordinal. 0 means no free slot in 1..slots.
+        int position = store.NextPosition(accountId, slots);
+        if (position == 0)
+        {
+            _log.LogInformation("C_CREATE_USER from {Id}: no free character slot (account {A}, all {S} taken)",
+                s.Id, accountId, slots);
             SendCreateResult(s, false);
             return true;
         }
@@ -477,17 +523,6 @@ public sealed class CharacterHandlers
             SendCreateResult(s, false);
             return true;
         }
-
-        var store = Program.Store;
-        if (store == null)
-        {
-            _log.LogError("C_CREATE_USER from {Id}: no character store", s.Id);
-            SendCreateResult(s, false);
-            return true;
-        }
-
-        long accountId = (long)s.Account.AccountId;
-        int position = store.NextPosition(accountId);
 
         // T209: the record is generated from CreateCharData.xml unless an operator dropped a
         // capture in, so it is seeded with THIS character's account and slot. The captured
@@ -577,24 +612,34 @@ public sealed class CharacterHandlers
             return true;
         }
 
-        // T101b: SCHEDULE the delete instead of dropping the row. The character stays listed
-        // for the whole window - which is what S_GET_USER_LIST.deleteRemainSec reports, and
-        // what makes C_CANCEL_DELETE_USER and the admin tool s restore mean anything - and
-        // CharacterStore.PurgeExpiredDeletes removes it once deleteCharacterExpireHour2 (72 h,
-        // LoginHandlers) has run out. T88 left this as a hard delete; this is that gap closed.
-        long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        long deleteAt = now + (long)CharacterStore.DeleteExpireHours * 3600L;
-        bool deleted = Program.Store?.SoftDeleteCharacter(
-            charId, (long)s.Account.AccountId, chr.Name, deleteAt, now) ?? false;
-        if (!deleted)
+        // T101b SCHEDULED the delete instead of dropping the row, which is right - but it took the
+        // window from the hardcoded CharacterStore.DeleteExpireHours and never read
+        // ServerConfig.xml. T224: <DeleteUser expireHour1 expireHour2 deletionSectionClassifyLevel>
+        // is the policy, CharacterDeletion is the single code path, and expireHour 0 means an
+        // immediate HARD delete. With expireHour2="0" the old code still parked the row for three
+        // days and GetCharacters had no delete_at predicate, so the character was back in the next
+        // S_GET_USER_LIST: the reported "delete doesn't stick".
+        int level = Program.Store?.GetCharacter(charId)?.Level ?? 1;
+        var outcome = CharacterDeletion.Delete(
+            Program.Store, charId, (long)s.Account.AccountId, chr.Name,
+            level, DateTimeOffset.UtcNow, CharacterDeletion.Current, out long deleteAt, _log);
+        if (outcome == CharacterDeletion.Outcome.Refused)
         {
             _log.LogWarning("C_DELETE_USER from {Id}: store refused delete of {CId}", s.Id, charId);
             SendDeleteResult(s, false);
             return true;
         }
 
-        s.Account.Characters.Remove(chr);
-        _log.LogInformation("C_DELETE_USER from {Id}: deleted '{Name}' id={CId}", s.Id, chr.Name, charId);
+        // Only a HARD delete takes the character off the session's list. A scheduled one must stay:
+        // retail's S_GET_USER_LIST is the same 1183 bytes either side of a successful
+        // C_CANCEL_DELETE_USER (cap_final_client2 frames 11/35), and that handler's own slot check
+        // (Arb_part_079.c:9104, "current < max") only makes sense while the doomed character still
+        // occupies its slot. Removing it here also meant a cancel in the same session could not put
+        // it back - nothing re-adds to Account.Characters.
+        if (outcome == CharacterDeletion.Outcome.Hard) s.Account.Characters.Remove(chr);
+        _log.LogInformation(
+            "C_DELETE_USER from {Id}: '{Name}' id={CId} level {Level} -> {Outcome}, delete_at {At}",
+            s.Id, chr.Name, charId, level, outcome, deleteAt);
         SendDeleteResult(s, true);
         return true;
     }
@@ -644,6 +689,22 @@ public sealed class CharacterHandlers
         element["sectionId"] = r.LastSection;
         element["lastLogoutTime"] = UnixSeconds(r.LastLogout);
         element["restBonusXp"] = r.RestBonus;
+
+        // ---- T224: the delete countdown ----
+        //
+        // LoginHandlers ships (isDeleting false, deleteTime 0, deleteRemainSec 0) for every
+        // character, so a scheduled delete was invisible in character select. Retail keeps the
+        // doomed character listed and gates the UI on isDeleting: cap_final_client2 frame 11 reads
+        // (1, 1789879815, 259182) and frame 35 - after C_CANCEL_DELETE_USER answered ok at frame 33
+        // - reads (0, 1789879815, 259150). So the stamp SURVIVES the cancel, only the bool flips,
+        // and remainSec is deleteTime - now recomputed per send: the two frames are 32 s apart and
+        // banRemainSec drops by the same 32. 259200 s is 72 h, this deployment's expireHour2.
+        var (isDeleting, deleteTime, deleteRemainSec) = CharacterDeletion.LobbyFields(
+            store?.GetCharacterDeleteAt(characterId) ?? 0,
+            DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        element["isDeleting"] = isDeleting;
+        element["deleteTime"] = deleteTime;
+        element["deleteRemainSec"] = deleteRemainSec;
 
         // ---- T122: everything else the ROW owns ----
         //

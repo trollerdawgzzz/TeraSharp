@@ -26,6 +26,7 @@ public static partial class Tests
     [Test] public static void T196_EP_reward_parcel_defined_fields_notify_and_claim_match_retail()
     {
         using var frames = T196Frames(); if (frames == null) return;
+        using var retailRows = new T234Switch("0");  // T234 deletes a claimed system parcel; this test pins retail's kept row
         using var store = GuildStore(1);
         using var env = new T185Environment(null);
         string map = Path.GetTempFileName();

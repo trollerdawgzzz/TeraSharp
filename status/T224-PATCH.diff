@@ -1,0 +1,36 @@
+T224 - LoginHandlers.OnGetUserList: send the three S_GET_USER_LIST delete fields from
+ServerConfig.xml instead of the hardcoded 5 / 0 / 72.
+
+Handlers/LoginHandlers.cs is human-owned, so this is the diff rather than an edit. It is the
+ONLY change T224 needs in that file: the per-character isDeleting / deleteTime /
+deleteRemainSec are already overwritten by CharacterHandlers.FillLobbyFields, which this
+handler calls per element (T122's arrangement, unchanged).
+
+Why it matters: this deployment's <DeleteUser expireHour1="0" expireHour2="72"
+deletionSectionClassifyLevel="5" /> happens to equal the hardcoded values, so the three fields
+looked right. Set expireHour2="0" - as the T224 repro did - and the client is still told the
+window is 72 h while the server now deletes immediately, so character select shows a countdown
+for a character that is already gone.
+
+Pinned: cap_final_client2 frame 11, S_GET_USER_LIST fixed part at frame offset 8 reads
+veteran 0, bonusBufSec 0, maxCharacters 3, first 1, more 0, leftDelTimeAccountOver 0,
+deletionSectionClassifyLevel 5, deleteCharacterExpireHour1 0, deleteCharacterExpireHour2 72 -
+i.e. retail sends the file's own three numbers, and 259200 s (72 h) is exactly the
+deleteRemainSec the same frame carries for the character being deleted.
+
+--- a/src/TeraSharp.Arbiter/Handlers/LoginHandlers.cs
++++ b/src/TeraSharp.Arbiter/Handlers/LoginHandlers.cs
+@@
++        // T224: ServerConfig.xml <DeleteUser> owns these three, not this file. CharacterDeletion
++        // reads it once and caches; CharacterDeletion.UseForTests overrides it in the harness.
++        var delPolicy = Persistence.CharacterDeletion.Current;
++
+         s.SendByDef("S_GET_USER_LIST", new Dictionary<string, object>
+         {
+             ["characters"] = characters, ["veteran"] = false, ["bonusBufSec"] = 0, ["maxCharacters"] = QaUtilityCommands.CharacterSlots(Program.Store, (long)s.Account.AccountId),
+             ["first"] = true, ["more"] = false, ["leftDelTimeAccountOver"] = 0,
+-            ["deletionSectionClassifyLevel"] = 5, ["deleteCharacterExpireHour1"] = 0, ["deleteCharacterExpireHour2"] = 72,
++            ["deletionSectionClassifyLevel"] = delPolicy.ClassifyLevel,
++            ["deleteCharacterExpireHour1"] = delPolicy.ExpireHour1,
++            ["deleteCharacterExpireHour2"] = delPolicy.ExpireHour2,
+         });

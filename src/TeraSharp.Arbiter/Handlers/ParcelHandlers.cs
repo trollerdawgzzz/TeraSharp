@@ -172,6 +172,50 @@ public sealed class ParcelHandlers
     }
 
     /// <summary>
+    /// T234b. Push the badge to one character by db id, when they are online and in world.
+    ///
+    /// <para>This is the packet the mail badge is made of, and the real Arbiter sends it from
+    /// every <c>SDB_*</c> handler that moves a parcel - not just from the client-facing three.
+    /// Every one of those call sites is <c>ParcelManager::SendReadRecvStatusInfo</c>
+    /// (<c>FUN_140979060</c>, Arb_part_082.c:18805) guarded by an online lookup:</para>
+    ///
+    /// <list type="bullet">
+    /// <item><c>Handler_SDB_DELETE_PARCEL</c> - Arb_part_071.c:15231, only when
+    /// <c>IsSendParcel == 0</c> and <c>FUN_14082d8a0(table, UserDbId, 3)</c> finds the user.</item>
+    /// <item><c>Handler_SDB_RECV_PARCEL</c> - :15953 for the caller, :15957 for the parcel's
+    /// owner and only on <c>Step == 2</c>.</item>
+    /// <item><c>Handler_SDB_RECV_PARCEL_EX</c> - Arb_part_072.c:6733, after the reply.</item>
+    /// <item><c>Handler_SDB_MAKE_PARCEL</c> - :15656, so the receiver's badge goes UP.</item>
+    /// <item><c>Handler_SDB_RETURN_PARCEL</c> - :16213 and :16219, both sides of the swap.</item>
+    /// <item><c>User::OnLoadTopoFin</c> - Arb_part_029.c:12574, the login push below.</item>
+    /// </list>
+    ///
+    /// <para>The wire effect is in cap_social2's client tap: 1707 opens parcel 4, 1709 is
+    /// <c>00 00 00 00 | 02 00 00 00 | 00</c>; 1715 collects it, 1716 is
+    /// <c>00 00 00 00 | 01 00 00 00 | 00</c> and only then does 1717 <c>S_RECV_PARCEL</c> follow.
+    /// readUnclaimed 2 -&gt; 1 on the claim, which is <see cref="CharacterStore.GetParcelCounts"/>'s
+    /// formula exactly.</para>
+    ///
+    /// <para>We sent none of these, so the badge only ever matched the DB after a relog. With
+    /// T234 deleting a claimed system reward that became visible: an emptied mailbox still
+    /// showing "2", because "Receive all" claims without reading and those rows kept
+    /// <c>is_read = 0</c> until the delete removed them.</para>
+    ///
+    /// <para>Returns true when a session was found and the frame went out. Offline is the normal
+    /// case, not a failure - their badge is rebuilt from the DB at login.</para>
+    /// </summary>
+    public static bool PushReadRecvStatus(int receiverDbId)
+    {
+        if (receiverDbId <= 0) return false;
+        var session = Program.World?.SessionForPlayerId(receiverDbId);
+        // The real guard is FUN_14038ca80 - online AND in world. A session with no selected
+        // character has no counters to report, and SendReadRecvStatus would send (0, 0).
+        if (session?.SelectedCharacter is null) return false;
+        SendReadRecvStatus(session);
+        return true;
+    }
+
+    /// <summary>
     /// Push the counters. Called from the C_PARCEL_READ_RECV_STATUS handler, after a parcel is
     /// opened, and — this is the one that matters — unprompted at <c>C_LOAD_TOPO_FIN</c>, where
     /// the real Arbiter sends it from <c>User::OnLoadTopoFin</c> (Arb_part_029.c:12574). That is

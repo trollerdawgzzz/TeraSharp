@@ -152,6 +152,7 @@ public sealed class AdminApi
         if (method == "GET" && path == "/api/game-log") return GameLog(query);
         if (method == "POST" && path == "/api/restore-character") return RestoreCharacter(body, sourceIp);
         if (method == "POST" && path == "/api/delete-character") return DeleteCharacterNow(body, sourceIp);
+        if (method == "POST" && path == "/api/compact-positions") return CompactPositions(body, sourceIp);
 
         // ---- phase 2 (T101b) ----
         if (method == "POST" && path == "/api/set-money") return SetMoney(body, sourceIp);
@@ -579,9 +580,20 @@ public sealed class AdminApi
 
     // ------------------------------------------------------------------------- phase 2 (T101b)
 
-    /// <summary>POST /api/delete-character {"id":N,"reason":"..."} - immediate HARD delete (no 72 h
-    /// window, no restore). For test characters and GM clean-up; the row and its dependent rows go.
-    /// Refused while the character is online.</summary>
+    /// <summary>
+    /// POST /api/delete-character {"id":N,"reason":"...","hard":false} - the same delete the lobby
+    /// does.
+    ///
+    /// <para>T224: this used to be an unconditional hard delete while <c>C_DELETE_USER</c> was an
+    /// unconditional 72 h soft delete, so the two disagreed about what "delete" means and neither
+    /// read ServerConfig.xml. Both now go through <see cref="CharacterDeletion.Delete"/>, which
+    /// takes the window from <c>&lt;DeleteUser&gt;</c>: a zero window is a hard delete, anything
+    /// else is the soft delete <c>/api/restore-character</c> undoes. <c>"hard":true</c> keeps the
+    /// old behaviour for test characters and GM clean-up, and says so in the audit row.</para>
+    ///
+    /// <para>Refused while the character is online - a live session keeps its own state in World
+    /// until it leaves.</para>
+    /// </summary>
     private AdminResponse DeleteCharacterNow(string? body, string? sourceIp)
     {
         int id = (int)(JsonNumber(body, "id") ?? -1);
@@ -589,10 +601,24 @@ public sealed class AdminApi
         if (id <= 0) return Json(400, ResultInvalid, "id is required");
         var c = _store.GetCharacter(id);
         if (c == null) { Log(sourceIp, "delete-character", id.ToString(CultureInfo.InvariantCulture), reason, ResultNotFound); return Json(404, ResultNotFound, "no such character"); }
-        // (log the character out first - a live session keeps its own state in World until it leaves)
-        bool ok = _store.DeleteCharacter(id, c.AccountId);
-        Log(sourceIp, "delete-character", c.Name, reason, ok ? ResultOk : ResultRefused);
-        return ok ? Json(200, ResultOk, $"{c.Name} deleted") : Json(500, ResultRefused, "the store refused the delete (dependent rows?)");
+
+        bool forceHard = JsonBool(body, "hard") ?? false;
+        var policy = forceHard
+            ? new CharacterDeletion.Policy(0, 0, int.MaxValue)
+            : CharacterDeletion.Current;
+        var outcome = CharacterDeletion.Delete(
+            _store, id, c.AccountId, "admin:" + (sourceIp ?? "?"), c.Level,
+            DateTimeOffset.UtcNow, policy, out long deleteAt);
+        Log(sourceIp, "delete-character", c.Name, reason,
+            outcome == CharacterDeletion.Outcome.Refused ? ResultRefused : ResultOk);
+        return outcome switch
+        {
+            CharacterDeletion.Outcome.Hard => Json(200, ResultOk, $"{c.Name} deleted"),
+            CharacterDeletion.Outcome.Scheduled => Json(200, ResultOk,
+                $"{c.Name} scheduled for deletion at {deleteAt.ToString(CultureInfo.InvariantCulture)} - "
+                + "/api/restore-character undoes it"),
+            _ => Json(500, ResultRefused, "the store refused the delete (dependent rows?)"),
+        };
     }
 
     /// <summary>Resolve the target of a write: {"id":N} or {"name":"X"}.</summary>
@@ -959,6 +985,41 @@ public sealed class AdminApi
     }
 
     /// <summary>
+    /// <summary>
+    /// POST /api/compact-positions {"accountId":N} - renumber an account's lobby slots into 1..n.
+    ///
+    /// <para>T228. Positions were handed out as MAX(position)+1, so an account that had ever deleted
+    /// a character carried ordinals past its slot count - account 1's five live characters sat at
+    /// 5, 7, 8, 9 and 10 - and World refuses entry on the ordinal, not the count. New characters are
+    /// fixed by the allocator and existing ones at their next login; this is the same repair on
+    /// demand, for an account whose owner is not about to log in.</para>
+    /// </summary>
+    private AdminResponse CompactPositions(string? body, string? sourceIp)
+    {
+        long accountId = (long)(JsonNumber(body, "accountId") ?? -1);
+        if (accountId <= 0) return Json(400, ResultInvalid, "accountId is required");
+        var a = _store.GetAccountById(accountId);
+        if (a == null)
+        {
+            Log(sourceIp, "compact-positions", accountId.ToString(CultureInfo.InvariantCulture), string.Empty, ResultNotFound);
+            return Json(404, ResultNotFound, "no such account");
+        }
+        var before = _store.OccupiedPositions(accountId);
+        int moved = _store.CompactPositions(accountId);
+        var after = _store.OccupiedPositions(accountId);
+        Log(sourceIp, "compact-positions", accountId.ToString(CultureInfo.InvariantCulture),
+            moved.ToString(CultureInfo.InvariantCulture), ResultOk);
+        var sb = new StringBuilder();
+        sb.Append("{\"result\":").Append(ResultOk)
+          .Append(",\"accountId\":").Append(accountId)
+          .Append(",\"moved\":").Append(moved)
+          .Append(",\"slots\":").Append(Handlers.QaUtilityCommands.CharacterSlots(_store, accountId))
+          .Append(",\"before\":[").Append(string.Join(",", before)).Append(']')
+          .Append(",\"after\":[").Append(string.Join(",", after)).Append("]}");
+        return new AdminResponse(200, "application/json; charset=utf-8", sb.ToString());
+    }
+
+    /// <summary>
     /// GET /api/account?id=N or ?name=X - the account page. Everything the account HAS, rather
     /// than everything the account IS: TeraSharp's <c>accounts</c> row is only (id, name,
     /// admin_level, created_at, play_time_sec), so the rest is derived from its characters.
@@ -988,6 +1049,9 @@ public sealed class AdminApi
           .Append(",\"adminLevel\":").Append(a.AdminLevel)
           .Append(",\"playTimeSec\":").Append(_store.GetAccountPlayTime(a.Id))
           .Append(",\"characterCount\":").Append(chars.Count)
+          // T228: the cap, and every ordinal in use including pending-delete rows the list omits
+          .Append(",\"characterSlots\":").Append(Handlers.QaUtilityCommands.CharacterSlots(_store, a.Id))
+          .Append(",\"slotsOccupied\":[").Append(string.Join(",", _store.OccupiedPositions(a.Id))).Append(']')
           .Append(",\"lastLogin\":").Append(Str(lastLogin == default
               ? string.Empty : lastLogin.ToString("o", CultureInfo.InvariantCulture)))
           .Append('}');
@@ -2210,6 +2274,49 @@ public sealed class AdminApi
         string? raw = RawValue(body, key);
         if (raw == null) return null;
         return double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out double d) ? d : null;
+    }
+
+    /// <summary>
+    /// T224. The bool after "key": in a flat JSON body, or null when the key is absent.
+    ///
+    /// <para>Accepts <c>true</c>/<c>false</c>, <c>"true"</c>/<c>"false"</c> and <c>1</c>/<c>0</c>,
+    /// because the admin UI's own fetch calls, a hand-rolled curl and a form post disagree about
+    /// which they send.</para>
+    ///
+    /// <para><b>T224b:</b> this cannot be built on <see cref="RawValue"/>. That scanner only walks
+    /// number characters, so it stops dead on the <c>t</c> of <c>true</c> and returns null - which
+    /// made <c>{"hard":true}</c> read as "flag absent" and fall through to the ServerConfig policy,
+    /// i.e. <c>/api/delete-character</c> scheduled a 72 h soft delete for a caller who asked for an
+    /// immediate one. It walks the literal itself instead.</para>
+    /// </summary>
+    public static bool? JsonBool(string? body, string key)
+    {
+        if (body == null) return null;
+        int i = body.IndexOf("\"" + key + "\"", StringComparison.Ordinal);
+        if (i < 0) return null;
+        i = body.IndexOf(':', i);
+        if (i < 0) return null;
+        while (++i < body.Length && char.IsWhiteSpace(body[i])) { }
+        if (i >= body.Length) return null;
+
+        int start = i, end = i;
+        if (body[end] == '"')                                  // "hard":"true"
+        {
+            start = ++end;
+            while (end < body.Length && body[end] != '"') end++;
+        }
+        else                                                   // "hard":true / "hard":1
+        {
+            while (end < body.Length && (char.IsLetterOrDigit(body[end]) || body[end] == '.'
+                                         || body[end] == '-' || body[end] == '+')) end++;
+        }
+        if (end <= start) return null;
+
+        string raw = body[start..end];
+        if (raw.Equals("true", StringComparison.OrdinalIgnoreCase)) return true;
+        if (raw.Equals("false", StringComparison.OrdinalIgnoreCase)) return false;
+        return double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out double d)
+            ? d != 0 : null;
     }
 
     /// <summary>The string after "key": in a flat JSON body, with the standard escapes undone.</summary>

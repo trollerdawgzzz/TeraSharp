@@ -29,7 +29,8 @@ public static class BoxDelivery
     public const string Sender = "Shop";
 
     /// <summary>What a delivery attempt did, for the log and for the tests.</summary>
-    public readonly record struct Result(int Parcels, int Items, int CharacterId)
+    /// <param name="ParcelId">T230: the LAST parcel written, which is what a claim records.</param>
+    public readonly record struct Result(int Parcels, int Items, int CharacterId, int ParcelId = 0)
     {
         /// <summary>True when the box left the pending state.</summary>
         public bool Delivered => Parcels > 0;
@@ -66,6 +67,43 @@ public static class BoxDelivery
             return new(0, 0, characterId);
         }
 
+        var written = WriteParcels(store, box, characterId, target.Name, lines);
+        if (written.Parcels > 0) store.MarkHubBoxDelivered(box.BoxSn, written.ParcelId);
+        log?.LogInformation(
+            "hub: box {Box} delivered to character {Char} as {Parcels} parcel(s), {Items} item(s)",
+            box.BoxSn, characterId, written.Parcels, written.Items);
+        return written;
+    }
+
+    /// <summary>
+    /// T230. The parcels for a box that a CLAIM has already taken out of pending - same records,
+    /// same title, same five-slot paging, but it does not touch the box state. The claim owns that
+    /// (<see cref="BoxClaim"/>), because the state change is what stops a double claim and it has
+    /// to happen before anything is handed over.
+    /// </summary>
+    public static Result DeliverClaimed(CharacterStore store, CharacterStore.HubBoxRow box,
+                                        int characterId, ILogger? log = null)
+    {
+        ArgumentNullException.ThrowIfNull(store);
+        ArgumentNullException.ThrowIfNull(box);
+        var target = store.GetCharacter(characterId);
+        var lines = store.GetHubBoxItems(box.BoxSn);
+        if (target is null || lines.Count == 0) return new(0, 0, characterId);
+        var written = WriteParcels(store, box, characterId, target.Name, lines);
+        log?.LogInformation(
+            "hub: box {Box} handed to character {Char} as {Parcels} claimed parcel(s), {Items} item(s)",
+            box.BoxSn, characterId, written.Parcels, written.Items);
+        return written;
+    }
+
+    /// <summary>
+    /// The parcels one box becomes, five attachments each, and nothing else: no box state, no
+    /// log. Both the sweep and a page claim go through here so a box looks the same either way.
+    /// </summary>
+    private static Result WriteParcels(CharacterStore store, CharacterStore.HubBoxRow box,
+                                       int characterId, string receiverName,
+                                       IReadOnlyList<CharacterStore.HubBoxItemRow> lines)
+    {
         string title = box.Title.Length > 0 ? box.Title : Sender;
         int parcels = 0, delivered = 0, lastParcel = 0;
         for (int start = 0; start < lines.Count; start += CharacterStore.MaxParcelAttachments)
@@ -85,19 +123,14 @@ public static class BoxDelivery
                 store.AddParcelItem(parcelId, slot, 0, slice[slot].TemplateId, slice[slot].Amount);
             }
             store.SetParcelRecord(parcelId,
-                SystemParcelAttachments.BuildRecord(parcelId, characterId, target.Name, Sender,
+                SystemParcelAttachments.BuildRecord(parcelId, characterId, receiverName, Sender,
                     title, box.Content, 0, records));
 
             parcels++;
             delivered += slice.Count;
             lastParcel = parcelId;
         }
-
-        if (parcels > 0) store.MarkHubBoxDelivered(box.BoxSn, lastParcel);
-        log?.LogInformation(
-            "hub: box {Box} delivered to character {Char} as {Parcels} parcel(s), {Items} item(s)",
-            box.BoxSn, characterId, parcels, delivered);
-        return new(parcels, delivered, characterId);
+        return new(parcels, delivered, characterId, lastParcel);
     }
 
     /// <summary>Every pending box, oldest first. Returns how many boxes left the queue.</summary>

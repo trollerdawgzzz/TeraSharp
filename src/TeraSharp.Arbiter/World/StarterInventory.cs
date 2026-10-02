@@ -101,29 +101,38 @@ public static class StarterInventory
     /// </summary>
     private static StarterItem[][] ByClass => DatasheetLoader.StarterKits.Value;
 
-    /// <summary>The transcribed CreateCharData.xml - the built-in for <see cref="ByClass"/>.</summary>
+    /// <summary>
+    /// The transcribed CreateCharData.xml - the built-in for <see cref="ByClass"/>.
+    ///
+    /// <para>T228: item 200999 is the level scroll, and the shipped sheet gave it only to soulless -
+    /// the one class with <c>createdLevel=50</c>, which gets five. No other class had one, in the
+    /// sheet or here, which is why no new character of any other class has ever received it: nothing
+    /// was being dropped. Every other class now carries one, at bag slot 2 (slots 0 and 1 are the
+    /// two potion stacks). tools/add-starter-scroll.py puts the same row in the sheet, which
+    /// overrides this table whenever it loads.</para>
+    /// </summary>
     public static readonly StarterItem[][] BuiltInKits =
     {
-        new StarterItem[] { new(10001, 1, 14, 1), new(15004, 1, 14, 3), new(15005, 1, 14, 4), new(15006, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // warrior
-        new StarterItem[] { new(10002, 1, 14, 1), new(15001, 1, 14, 3), new(15002, 1, 14, 4), new(15003, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // lancer
-        new StarterItem[] { new(10003, 1, 14, 1), new(15004, 1, 14, 3), new(15005, 1, 14, 4), new(15006, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // slayer
-        new StarterItem[] { new(10004, 1, 14, 1), new(15001, 1, 14, 3), new(15002, 1, 14, 4), new(15003, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // berserker
-        new StarterItem[] { new(10005, 1, 14, 1), new(15007, 1, 14, 3), new(15008, 1, 14, 4), new(15009, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // sorcerer
-        new StarterItem[] { new(10006, 1, 14, 1), new(15004, 1, 14, 3), new(15005, 1, 14, 4), new(15006, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // archer
-        new StarterItem[] { new(10007, 1, 14, 1), new(15007, 1, 14, 3), new(15008, 1, 14, 4), new(15009, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // priest
-        new StarterItem[] { new(10008, 1, 14, 1), new(15007, 1, 14, 3), new(15008, 1, 14, 4), new(15009, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // elementalist
+        new StarterItem[] { new(10001, 1, 14, 1), new(15004, 1, 14, 3), new(15005, 1, 14, 4), new(15006, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1), new(200999, 1, 0, 2) },   // warrior
+        new StarterItem[] { new(10002, 1, 14, 1), new(15001, 1, 14, 3), new(15002, 1, 14, 4), new(15003, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1), new(200999, 1, 0, 2) },   // lancer
+        new StarterItem[] { new(10003, 1, 14, 1), new(15004, 1, 14, 3), new(15005, 1, 14, 4), new(15006, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1), new(200999, 1, 0, 2) },   // slayer
+        new StarterItem[] { new(10004, 1, 14, 1), new(15001, 1, 14, 3), new(15002, 1, 14, 4), new(15003, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1), new(200999, 1, 0, 2) },   // berserker
+        new StarterItem[] { new(10005, 1, 14, 1), new(15007, 1, 14, 3), new(15008, 1, 14, 4), new(15009, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1), new(200999, 1, 0, 2) },   // sorcerer
+        new StarterItem[] { new(10006, 1, 14, 1), new(15004, 1, 14, 3), new(15005, 1, 14, 4), new(15006, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1), new(200999, 1, 0, 2) },   // archer
+        new StarterItem[] { new(10007, 1, 14, 1), new(15007, 1, 14, 3), new(15008, 1, 14, 4), new(15009, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1), new(200999, 1, 0, 2) },   // priest
+        new StarterItem[] { new(10008, 1, 14, 1), new(15007, 1, 14, 3), new(15008, 1, 14, 4), new(15009, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1), new(200999, 1, 0, 2) },   // elementalist
         new StarterItem[] { new(80396, 1, 14, 1), new(80397, 1, 14, 3), new(80398, 1, 14, 4), new(80399, 1, 14, 5), new(6551, 20, 0, 0), new(6561, 20, 0, 1), new(362, 10, 0, 2), new(391, 3, 0, 3), new(200999, 5, 0, 4) },   // soulless
-        new StarterItem[] { new(55005, 1, 14, 1), new(15001, 1, 14, 3), new(15002, 1, 14, 4), new(15003, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // engineer
-        new StarterItem[] { new(82005, 1, 14, 1), new(15001, 1, 14, 3), new(15002, 1, 14, 4), new(15003, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // fighter
-        new StarterItem[] { new(58171, 1, 14, 1), new(15007, 1, 14, 3), new(15008, 1, 14, 4), new(15009, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // assassin
-        new StarterItem[] { new(59053, 1, 14, 1), new(15004, 1, 14, 3), new(15005, 1, 14, 4), new(15006, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1) },   // glaiver
+        new StarterItem[] { new(55005, 1, 14, 1), new(15001, 1, 14, 3), new(15002, 1, 14, 4), new(15003, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1), new(200999, 1, 0, 2) },   // engineer
+        new StarterItem[] { new(82005, 1, 14, 1), new(15001, 1, 14, 3), new(15002, 1, 14, 4), new(15003, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1), new(200999, 1, 0, 2) },   // fighter
+        new StarterItem[] { new(58171, 1, 14, 1), new(15007, 1, 14, 3), new(15008, 1, 14, 4), new(15009, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1), new(200999, 1, 0, 2) },   // assassin
+        new StarterItem[] { new(59053, 1, 14, 1), new(15004, 1, 14, 3), new(15005, 1, 14, 4), new(15006, 1, 14, 5), new(6550, 20, 0, 0), new(6560, 20, 0, 1), new(200999, 1, 0, 2) },   // glaiver
     };
 
     /// <summary>
     /// T162. CreateCharData.xml's <c>createdLevel</c> per class id, transcribed - the built-in for
     /// <see cref="DatasheetLoader.CreatedLevels"/>. Every row says 1 except soulless (50).
     /// </summary>
-    public static readonly int[] BuiltInCreatedLevels = { 1, 1, 1, 1, 1, 1, 1, 1, 50, 1, 1, 1, 1 };
+    public static readonly int[] BuiltInCreatedLevels = { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 };  // T221/T231: Reaper starts at 1
 
     /// <summary>The level a new character of this class is made at: the sheet's createdLevel, 1
     /// for a class id outside the 13.</summary>
@@ -131,6 +140,54 @@ public static class StarterInventory
     {
         var levels = DatasheetLoader.CreatedLevels.Value;
         return classId >= 0 && classId < levels.Length ? levels[classId] : 1;
+    }
+
+    /// <summary>INVTYPE slots of the four worn starter items, as ItemEquipRestriction.xml numbers
+    /// them and as the capture places them: WEAPON 1, BODY 3, HANDS 4, FEET 5 (HEAD 2 is unused -
+    /// no class starts with a helmet). The same four <see cref="DatasheetLoader.WornSlots"/> uses.
+    /// </summary>
+    public const int WeaponSlot = 1, BodySlot = 3, HandSlot = 4, FeetSlot = 5;
+
+    /// <summary>
+    /// T232. The class's four worn starter items, as the <c>characters</c> row's look columns want
+    /// them: <c>weapon, body, hand, feet</c>.
+    ///
+    /// <para>Those four columns are what the lobby list and <c>InventoryHandlers.SendInventory</c>
+    /// read, and nothing had ever written them - <c>BuildRecord</c> left them at the column default
+    /// of 0, so every character this server created said it was wearing item 0 while its actual
+    /// inventory (the kit) said otherwise. The kit is the only honest source: it is the same
+    /// <c>CreateCharData.xml</c> rows World is handed in <c>DBS_USER_LOAD_INVENTORY</c>, so the row
+    /// and the inventory now agree by construction rather than by coincidence.</para>
+    ///
+    /// <para>Read off <see cref="EquippedPocket"/> and the INVTYPE slot, not off position in the
+    /// kit: a sheet row with <c>initWear="true"</c> past the fourth goes to the bag
+    /// (<see cref="DatasheetLoader.ReadStarterKits"/>), and soulless carries nine items. A class id
+    /// outside the 13, or a kit missing a slot, yields 0 for that slot - which is what the column
+    /// held before, so a class we cannot place is no worse off.</para>
+    /// </summary>
+    public static (int Weapon, int Body, int Hand, int Feet) WornLook(int classId)
+        => WornLookOf(ForClass(classId));
+
+    /// <summary>T232c: the same, over a kit the caller already holds - so the sheet reader can check
+    /// a row it has just parsed without going back through <see cref="ForClass"/>.</summary>
+    public static (int Weapon, int Body, int Hand, int Feet) WornLookOf(IReadOnlyList<StarterItem>? kit)
+    {
+        int weapon = 0, body = 0, hand = 0, feet = 0;
+        if (kit != null)
+        {
+            foreach (var it in kit)
+            {
+                if (it.Pocket != EquippedPocket) continue;
+                switch (it.Slot)
+                {
+                    case WeaponSlot: weapon = it.TemplateId; break;
+                    case BodySlot:   body = it.TemplateId;   break;
+                    case HandSlot:   hand = it.TemplateId;   break;
+                    case FeetSlot:   feet = it.TemplateId;   break;
+                }
+            }
+        }
+        return (weapon, body, hand, feet);
     }
 
     /// <summary>The kit for a class, or null when the class id is not one of the 13.</summary>

@@ -453,6 +453,50 @@ public static class ParcelDbHandlers
     /// <summary>T151. ParcelType of system mail (SA_MAKE_SYS_PARCEL): 102 in every system row captured
     /// (cap_social2 seq 417, cap_social4 seq 4560 x5, cap_final seq 3365).</summary>
     public const int ParcelTypeSystem = 102;
+
+    /// <summary>T234. The one switch: <c>parcels.deleteSystemOnCollect</c>.</summary>
+    public const string DeleteOnCollectVariable = "TERASHARP_PARCEL_DELETE_ON_COLLECT";
+
+    /// <summary>
+    /// T234. Remove a system reward parcel once its attachments are claimed, instead of leaving
+    /// it in the mailbox as "received" forever. <b>This is OURS, not retail's.</b>
+    ///
+    /// <para>What retail does, pinned three ways. (1) The list is unchanged across a collect:
+    /// cap_final2b 9986/9987 lists user 1003's two parcels, 10030..10033 collects parcel 12 with
+    /// the full two-step, and 10062/10063 lists the same two again - same ParcelCount, same
+    /// 0x13d0 byte count, same leading record. 28053/28054 lists user 1's two, 28067..28089
+    /// collects BOTH (13 and 14), and 28107/28113 still lists two. (2) There is not one
+    /// <c>SDB_DELETE_PARCEL</c> (0x2811) frame in the whole of cap_final2b. (3) In WorldServer
+    /// the only writer of 0x2811 is <c>FUN_140cab160</c>, reached only from
+    /// <c>DeleteParcelContext::ExecuteTransaction</c>, and the only live caller of that context's
+    /// constructor (<c>FUN_140cad600</c>; the other two call sites are unreferenced template
+    /// factories) sits inside <c>User::Handler_C_DELETE_PARCEL</c>. So the delete is the player
+    /// pressing Delete, never a consequence of collecting - which is exactly what cap_social2
+    /// shows from the other side: parcel 3 collected at 2372..2375, then 0x2811 at 2401 carrying
+    /// that single id, then an empty inbox at 2408.</para>
+    ///
+    /// <para>We diverge because the UX does not survive it. A reward mail arrives per
+    /// achievement, nothing on our side ever sends the delete, and the mailbox fills up with
+    /// claimed rows the player cannot clear - six <c>@2051</c> rows for character 13 and seven
+    /// for character 9 in the live DB, every one of them <c>is_recved = 1</c>. That is T228 D's
+    /// "four reward mails every login": nothing re-creates them (arbiter-t228d.log records zero
+    /// parcel writes across two logins), they are collected rows that never leave.</para>
+    ///
+    /// <para>Scope is deliberately narrow: <see cref="ParcelTypeSystem"/> only. A player's mail
+    /// keeps retail behaviour - it stays, read, until its owner deletes it, and
+    /// <c>SDB_DELETE_PARCEL</c> already handles that. A system parcel's message is a generated
+    /// template (<c>@2052\x0bAchievementName\x0b@Achievement:6900</c>), not correspondence, so
+    /// there is nothing to keep once the reward is in the bag.</para>
+    /// </summary>
+    /// <remarks>Unset means ON, and so does an unrecognised value - a typo in a config file must
+    /// not be what quietly fills a player's mailbox back up. Only an explicit false turns it off.</remarks>
+    public static bool DeleteSystemParcelOnCollect
+        => TerasConfig.Get(DeleteOnCollectVariable)?.Trim()
+            is not ("0" or "false" or "False" or "FALSE" or "no" or "off");
+
+    /// <summary>T234. Whether this row goes away once it is collected.</summary>
+    public static bool ShouldDeleteOnCollect(CharacterStore.ParcelRow? row)
+        => row is not null && row.ParcelType == ParcelTypeSystem && DeleteSystemParcelOnCollect;
     /// <summary>
     /// T79. +0xA8 is the READ flag. Three captures agree: the first DBS_LIST_PARCEL that shows a
     /// parcel has it 0 and every later listing of the same parcel has it 1 - cap_social2 seq 417

@@ -146,6 +146,11 @@ Stop is the reverse: proxy, World, Arbiter, Topography. Two things follow from t
   (`status/T208d-PARTY-REPLAY.md`).
 - Topography is a shared-memory producer for World. Starting World without it, or restarting
   Topography under a running World, is not supported - take World with it.
+- **tera-api is not in that chain, and does not need stopping.** It is a *client* of ours: the hub
+  connection is inbound, and TeraSharp answers hub port 11001 in BoxAPI's place (section 6, and
+  `status/T230-ITEM-CLAIM.md` 7.2). So an Arbiter restart drops that link and nothing on our side
+  re-opens it - tera-api redials. If shop or box traffic is still dead a minute after a restart,
+  restart **tera-api**, not the Arbiter: it is the side that owns the connection.
 
 ### 2.3 Restarting World alone
 
@@ -274,9 +279,18 @@ nothing, and `-Insecure` is the override:
 
 | Setting | Production | What it does if left on |
 |---|---|---|
-| `TERASHARP_API_GATEWAY_SERVE` | **unset** | Starts the T132 probe listener at `apiServerAddress`. Unlike the admin web it is allowed to bind beyond loopback (`TERASHARP_API_GATEWAY_BIND`), it answers **every path**, and it logs each request's full headers and cookies. It is a measuring instrument, not the Alt+A gate (T144b) - on a public box it is an open HTTP port that writes what it is sent into your log. |
+| `TERASHARP_API_GATEWAY_SERVE` | **on, with a key** - or unset | Serves the Item Claim panel at `apiServerAddress` (section 6). It is allowed to bind beyond loopback (`TERASHARP_API_GATEWAY_BIND`), it answers **every path**, and it logs each request's full headers and cookies - so on a public box it is an open HTTP port that writes what it is sent into your log, and T132's probe page is still on `/probe`. Turn it on only with `TERASHARP_API_JWT_SECRET` set: without a key the panel refuses every request, which is safe but useless. Leave it unset and shop purchases still arrive, as mail. |
 | `TERASHARP_LOG_LEVEL` | `Warning` | Anything lower puts a console line on every World frame, which is what made the console unusable before T106. It does not lose you anything to leave at `Warning`: the daily file keeps Debug regardless. Set `Information` to chase something, then put it back - the Dashboard shows the live value so you can catch yourself. |
 | `TERASHARP_MATCH_MIN_MEMBERS` | **unset** | **Retired and ignored since T184h** - it no longer changes behaviour, and startup warns when it is still set. Clear it anyway: a setting that looks like it lowers the match floor and does not is how somebody ends up debugging the matcher for an hour. Dungeon capacity and roles come from `MatchingRoleTemplate.xml`, not from a variable. |
+
+### 5.1 Four more, added since T230
+
+| Setting | Default | What it is |
+|---|---|---|
+| `TERASHARP_SYNTH_ITEM_RECORDS` / `economy.synthItemRecords` | **true** (T209c part 2, live-verified) | Builds the starter kit's 536-byte item records instead of copying them out of `data\starter_inventory.bin`, so that file is not needed at all. Set `0`/`false` only to go back to copying a captured record you still have. |
+| `TERASHARP_PARCEL_DELETE_ON_COLLECT` (T234) | **true** | Removes a SYSTEM reward parcel (ParcelType 102) once its attachments are claimed, instead of leaving it in the mailbox as "received" forever. `OURS:` retail keeps the row - `cap_final2b`'s receive-all shows the same two parcels before and after the collect - but a reward mail the player cannot clear is worse than the divergence. `0`/`false` for retail behaviour. |
+| `TERASHARP_API_GATEWAY_SERVE` (T230) | unset | Serves the Item Claim panel at `apiServerAddress`, which on this deployment is **:8800** - the address the client's Alt+A view opens. Read the row in the table above before turning it on: it answers every path and logs what it is sent. |
+| `ServerConfig.xml` `<DeleteUser expireHour1 expireHour2 deletionSectionClassifyLevel>` (T224) | the deployment's own values | The character-delete windows, and since T224 TeraSharp actually reads them: `expireHour2="0"` means *delete now* rather than parking the row for the hardcoded 72 hours. The three numbers are what `S_GET_USER_LIST` carries, so a client that shows the wrong countdown is usually this. |
 
 Two more from the same table in GO-LIVE ("Production switches (T174)") that bite harder than the
 third row above, and belong on the same pre-flight:
@@ -287,3 +301,131 @@ third row above, and belong on the same pre-flight:
 
 `--check-config` prints every setting and where it came from (`teras.json`, `env` or `default`).
 Read it after a deploy; it is the only thing that tells you what the process actually resolved.
+
+---
+
+## 6. The Item Claim panel (T230)
+
+Alt+A in the client opens an Awesomium web view at `apiServerAddress`. There is no item-claim
+packet in 100.02 at all - zero `CLAIM` opcodes in all five protocol maps, zero `CLAIM`/`GIFT` defs
+in 917 schemas (`status/T230-ITEM-CLAIM.md` section 1) - so that web view **is** retail's Item
+Claim surface, and this is what serves it.
+
+### 6.1 Turning it on
+
+| Setting | Value | Why |
+|---|---|---|
+| `TERASHARP_API_GATEWAY_SERVE` / `gateway.serve` | `1` | Nothing listens without it and the panel stays blank. |
+| `TERASHARP_API_JWT_SECRET` / `gateway.jwtSecret` | tera-api's `API_PORTAL_SECRET` | **Mandatory.** The panel refuses every request while this is unset. The ticket is the only thing separating one account's purchases from another's, so it fails closed, the way `TERASHARP_AUTH` does. |
+| `TERASHARP_API_GATEWAY` / `gateway.address` | the address the client is told | The listener's port always comes from here; a listener on another port is not the thing the client opens. |
+| `TERASHARP_API_GATEWAY_BIND` / `gateway.bind` | `0.0.0.0` when the client is on another machine | A `+` or `0.0.0.0` prefix needs an urlacl: `netsh http add urlacl url=http://+:8800/ user=%USERNAME%`. The bind failure is logged, not thrown. |
+| `TERASHARP_ITEM_CLAIM_MAX_AGE` / `gateway.claimTokenMaxAge` | `3600` (default) | How old the Alt+A ticket may be, in seconds. The minted `exp` is 120 s and the ticket is minted at login, so no player opening a panel can beat it; the panel enforces `iat` + this instead and treats `exp` as advisory. Lower it if you prefer. |
+
+Then `--check-config` prints all five and where each came from.
+
+### 6.2 What the player sees, and where the items go
+
+`GET /itemclaim` is the panel; it fetches `GET /itemclaim/list` and posts `POST
+/itemclaim/claim?box=N`. Both endpoints are scoped to the `accountDbId` of the verified ticket, so
+a box number belonging to someone else answers exactly like a box that does not exist.
+
+A claim takes one of two paths, and the panel says which:
+
+| the character is | the items go | the player is told |
+|---|---|---|
+| **not in world** | straight into the bag, at the lowest free slots | "Added to your inventory. It will be there next time you log in." |
+| **in world** | into a system parcel in the in-game mailbox | "Sent to your in-game mailbox - open the mail window to collect it." |
+
+The split is not a preference. World owns the bag from `SDB_USER_LOAD_INVENTORY` onward and
+originates the insert atoms - the Arbiter only answers them - so rows written behind a live World
+are lost on its next save. The mailbox is the one path that is both immediate and safe: the item is
+created by World's own claim transaction.
+
+A claim that cannot be honoured changes nothing. A full bag says so and the box stays claimable; a
+box already claimed, already delivered, expired or not yet started is refused.
+
+### 6.3 With the panel off
+
+Nothing breaks. `BoxDelivery` still sweeps every pending box into a system parcel on
+`BoxNotiUser` and at startup, which is the T207 path, and the buyer is told in chat. The two
+outcomes are recorded as different states on purpose, so "where did my item go" has one answer:
+
+| `hub_boxes.state` | meaning | the rest of the row |
+|---|---|---|
+| 0 | pending | nothing yet |
+| 1 | swept into a parcel (T207) | `parcel_id` |
+| 2 | claimed from the panel (T230) | `claimed_by`, `claimed_at`, and `parcel_id` when it went by mail |
+
+**That row is the whole consumption record.** Nothing else on this stack tracks box state:
+tera-api's box functions (`createBox` 107, `getServiceItem` 115/116, `SetDisableServiceItem` 118)
+all address `gusid.boxapi`, and TeraSharp answers hub port 11001 in BoxAPI's place, so there is no
+second party to report consumption to - and the hub connection is inbound only, so there is no call
+we could originate if there were. See `status/T230-ITEM-CLAIM.md` section 7.2.
+
+---
+
+## 7. Sheets, the box, and the pre-restart check
+
+### 7.1 Two copies, and which one is authoritative
+
+The PC's `D:\v100\TERA_SERVER.100\Executable\Datasheet` is where sheets are edited. The box runs
+its own copy. Everything in this section exists because those two drift.
+
+### 7.2 Backup conventions
+
+Every sheet tool takes one backup per **job**, never per run, so re-running is safe and the first
+backup is always the untouched file:
+
+| suffix | written by | revert |
+|---|---|---|
+| `.m1.bak`, `.m5.bak` | the milestone sheet passes, over the set their own doc names (M5's is `QuestData\*.quest`, `TaskDef.xml`, `QuestGroupList.xml`, `ItemTemplate*.xml`, `EquipmentTemplate.xml`, `CreateCharData.xml`, `ServerConfig.xml`, `DungeonMatching.xml`, `EventMatching.xml`, `BuyList.xml`, `ItemMedalExchange.xml`) | that pass's own `-Revert` |
+| `.t220.bak`, `.t222.bak`, `.t236b.bak`, ... | the task tools - `unlock-classes.ps1`, `unlock-popori-male.ps1`, `patch_class_animationdata.py --job`, `fix-animset-paths.ps1` | `--revert --job <tag>`, or copy the `.bak` back |
+| `.stock` | `tools\ue3\copy_classic_ui.ps1` (client tree only) | `-Revert` |
+| `.orig` | hand copies | by hand |
+
+**An existing backup is never overwritten.** If a second pass finds one it keeps it, because the
+first one is the real pre-change file.
+
+### 7.3 Copying to the box
+
+- **Never hash-sync or mirror the whole folder over RDP.** The Datasheet is ~6,000 files and tens
+  of GB with the `.quest` tree; a mirror also carries the `.bak` files over and can delete things
+  the box needs. Copy a **named list**.
+- The list is whatever the tool that made the change printed. Every sheet tool ends by naming
+  exactly the files it touched - feed that to `push-sheets.ps1` rather than retyping it.
+- World must be **stopped** for a Datasheet push: it reads the sheets at start-up and does not
+  reload them.
+
+### 7.4 The pre-restart validator
+
+Two commands, in this order, before every restart that follows a sheet change:
+
+```powershell
+.\tools\fix-animset-paths.ps1 -Datasheet D:\v100\TERA_SERVER.100\Executable\Datasheet   # dry run
+.\tools\check-class-rows.ps1  D:\v100\TERA_SERVER.100\Executable\Datasheet
+```
+
+`check-class-rows.ps1` exits with the problem count, so it gates a deploy. It checks, per unlocked
+template, UserData / UserShape / UserBasicAction / `UserSkillData_*` / AnimationData coverage /
+DefaultSkillSet / SkillGetConList / CreateCharData, plus duplicate ids across the three id sheets
+(`status/T236-CHECK-CLASS-ROWS.md`). `fix-animset-paths.ps1` is what makes the animset column pass
+(`status/T236b-ANIMSET-PATHS.md`, `status/T236c-SHARE-ANIMSETS.md`).
+
+Run the checker again against the **box's** copy after the push. Same command, different folder.
+
+### 7.5 `check-box.ps1` and `push-sheets.ps1`
+
+```powershell
+# 1. what drifted - copy the box's Datasheet to a local folder first
+.\tools\check-box.ps1 -Box D:\packetlogs\box-datasheet -PushList drift.txt
+
+# 2. push what the first step named, with a .bak per file
+.\tools\push-sheets.ps1 -To D:\packetlogs\box-datasheet -ListFile drift.txt -Tag t236c -Apply
+```
+
+`check-box` compares size first and SHA-256 only when sizes match, excludes backups unless
+`-IncludeBackups`, and exits with the number of files that differ or are missing on one side.
+`push-sheets` also accepts `-Files a.xml,b.xml`; with `-ListFile` it scrapes sheet names out of
+whatever text is in the file, so a saved `check-box` run or a pasted console log both work. A name
+you **typed** that is not in `-From` stops the run; a name merely **scraped** is reported and
+skipped. Dry run unless `-Apply`.
